@@ -321,14 +321,17 @@ fn removal_cases() -> Vec<RemovalCase> {
             case: "the shortest name the model admits",
             app_id: APP_ID,
             environment: ENVIRONMENT,
-            forms: vec![("f", minimal_create("f"))],
+            forms: vec![("F", minimal_create("F"))],
             victim: 0,
         },
         RemovalCase {
             case: "the longest name the model admits",
             app_id: "d0mf86cg35xrtv",
             environment: "dev-2",
-            forms: vec![("longest", minimal_create(&"n".repeat(NAME_MAX_LENGTH)))],
+            forms: vec![(
+                "longest",
+                minimal_create(&format!("N{}", "n".repeat(NAME_MAX_LENGTH - 1))),
+            )],
             victim: 0,
         },
         RemovalCase {

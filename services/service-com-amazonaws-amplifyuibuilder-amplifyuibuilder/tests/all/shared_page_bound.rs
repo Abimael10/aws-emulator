@@ -177,7 +177,7 @@ impl Listed {
     /// The smallest payload the create of this collection admits — the members its request
     /// shape requires, which is all a case about the page bound needs.
     fn create_payload(&self, index: usize) -> Value {
-        let name = format!("bound-{index}");
+        let name = format!("Bound-{index}");
         match self.segment {
             "components" => json!({
                 "name": name,

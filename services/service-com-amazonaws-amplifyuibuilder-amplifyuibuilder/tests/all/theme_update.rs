@@ -29,6 +29,41 @@ use smithy_server_runtime::MultiServiceRouter;
 const THEME_NAME_MAX_LENGTH: usize = 255;
 const THEME_NAME_MIN_LENGTH: usize = 1;
 
+/// A `ThemeName` of exactly `length` characters that this service ACCEPTS: the initial is
+/// upper case, because a theme name whose initial is not an upper-case letter is refused
+/// whatever its length (`invalid_parameter_refusals.rs` holds that rule), so a row about a
+/// published LENGTH bound is then about that bound alone.
+fn name_of_length(length: usize) -> String {
+    match length {
+        0 => String::new(),
+        _ => format!("N{}", "n".repeat(length - 1)),
+    }
+}
+
+/// A `values` or `overrides` list as a REPORTED theme carries it: `ThemeValue$children` is
+/// reported for every theme value, so a value the request supplied without children reads
+/// back carrying the empty list, at every depth of the tree, while a value it supplied
+/// without `value` is not given one.
+fn reported_theme_values(supplied: &Value) -> Value {
+    let Some(entries) = supplied.as_array() else {
+        return supplied.clone();
+    };
+    Value::Array(
+        entries
+            .iter()
+            .map(|entry| {
+                let mut entry = entry.clone();
+                if let Some(mut value) = entry.get("value").cloned() {
+                    let children = value.get("children").cloned().unwrap_or_else(|| json!([]));
+                    value["children"] = reported_theme_values(&children);
+                    entry["value"] = value;
+                }
+                entry
+            })
+            .collect(),
+    )
+}
+
 /// A SigV4 credential scope naming this service: it is what routes a request to the
 /// amplifyuibuilder service.
 const SIGNED_FOR_AMPLIFYUIBUILDER: &str = "AWS4-HMAC-SHA256 \
@@ -224,14 +259,14 @@ fn merge_cases() -> Vec<(&'static str, Value)> {
         (
             "the longest name the model admits",
             json!({
-                "name": "n".repeat(THEME_NAME_MAX_LENGTH),
+                "name": name_of_length(THEME_NAME_MAX_LENGTH),
                 "values": [{"key": "a", "value": {"value": "b"}}],
             }),
         ),
         (
             "the shortest name the model admits",
             json!({
-                "name": "n".repeat(THEME_NAME_MIN_LENGTH),
+                "name": name_of_length(THEME_NAME_MIN_LENGTH),
                 "values": [{"key": "a", "value": {"value": "b"}}],
             }),
         ),
@@ -269,8 +304,9 @@ async fn update_theme_merges_the_patch_into_the_stored_theme() {
         // replaces what was stored.
         assert_eq!(
             at(&updated.body, "/values"),
-            patch["values"],
-            "case {case:?}: values must come back exactly as the patch supplied, got {:?}",
+            reported_theme_values(&patch["values"]),
+            "case {case:?}: values must come back as the patch supplied, with every theme \
+             value's children reported, got {:?}",
             at(&updated.body, "/values")
         );
         // `name` and `overrides` are optional: carried replaces, absent keeps.
@@ -286,7 +322,7 @@ async fn update_theme_merges_the_patch_into_the_stored_theme() {
         );
         let expected_overrides = patch
             .get("overrides")
-            .cloned()
+            .map(reported_theme_values)
             .unwrap_or_else(|| at(&before.body, "/overrides"));
         assert_eq!(
             at(&updated.body, "/overrides"),
@@ -440,7 +476,7 @@ async fn a_patched_name_outside_the_published_bounds_is_refused() {
         let refused = update(
             &router,
             &id,
-            json!({"name": "n".repeat(length), "values": []}),
+            json!({"name": name_of_length(length), "values": []}),
         )
         .await;
         assert_eq!(
@@ -461,7 +497,7 @@ async fn a_patched_name_outside_the_published_bounds_is_refused() {
         let accepted = update(
             &router,
             &id,
-            json!({"name": "n".repeat(length), "values": []}),
+            json!({"name": name_of_length(length), "values": []}),
         )
         .await;
         assert_eq!(

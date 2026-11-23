@@ -159,6 +159,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let data = input.component_to_create;
 
+        // A component's NAME is the identifier Amplify UI Builder generates the
+        // component's source under, and the service refuses a name it will not
+        // generate one from (`crate::state::invalid_entity_name`) with the modelled
+        // `InvalidParameterException`, storing nothing. The same check runs on every
+        // write path that sets an entity's name — `UpdateComponent`'s rename and the
+        // form and theme creates and renames.
+        if let Some(refusal) = crate::state::invalid_entity_name(&data.name) {
+            return Err(CreateComponentErrorModeled::InvalidParameterException(refusal).into());
+        }
+
         // Every map the model documents "You can't specify `tags` as a valid
         // property" for — a rule the model itself cannot express — is checked,
         // wherever the payload carries it: the component's own `properties`,

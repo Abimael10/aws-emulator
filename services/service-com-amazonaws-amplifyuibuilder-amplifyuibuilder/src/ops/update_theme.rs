@@ -198,6 +198,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The same entity-name rule `CreateTheme` enforces, over the rename an update
+        // can carry: a name this service does not accept for an entity is refused with
+        // the modelled `InvalidParameterException` rather than merged. A patch that
+        // names none renames nothing, so there is nothing to check.
+        if let Some(refusal) = patch
+            .name
+            .as_deref()
+            .and_then(crate::state::invalid_entity_name)
+        {
+            return Err(UpdateThemeErrorModeled::InvalidParameterException(refusal).into());
+        }
+
         let mut store = state.lock();
         // The clock is read with the store HELD (as `UpdateComponent` and every
         // other write of this crate reads it): the instant this call stamps into

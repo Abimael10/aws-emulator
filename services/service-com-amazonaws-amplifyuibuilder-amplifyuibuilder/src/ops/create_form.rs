@@ -5,7 +5,8 @@
 //! returned `Form` is computed from it. A repeated call carrying the same `clientToken`
 //! answers with the form that token already created. A payload whose `sectionalElements`
 //! carry a `type`, `level` or `orientation` outside the values the model documents for
-//! them is refused with the modelled `InvalidParameterException` (400) and stores nothing.
+//! them, or whose `name` is not one this service accepts for an entity, is refused with
+//! the modelled `InvalidParameterException` (400) and stores nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -158,6 +159,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let data = input.form_to_create;
+
+        // A form's NAME is the identifier Amplify UI Builder generates the form's
+        // source under, and the service refuses a name it will not generate one from
+        // (`crate::state::invalid_entity_name`) with the modelled
+        // `InvalidParameterException`, storing nothing. The same check runs on every
+        // write path that sets an entity's name — `UpdateForm`'s rename and the
+        // component and theme creates and renames.
+        if let Some(refusal) = crate::state::invalid_entity_name(&data.name) {
+            return Err(CreateFormErrorModeled::InvalidParameterException(refusal).into());
+        }
 
         // `SectionalElement$type`, `$level` and `$orientation` each target a plain
         // `String`/`Integer` while the model spells out the values they admit, so

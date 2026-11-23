@@ -215,12 +215,15 @@ async fn a_component_name_is_unique_within_its_app_environment() {
         ("the shortest name the model admits", "H".to_string()),
         (
             "the longest name the model admits",
-            "n".repeat(NAME_MAX_LENGTH),
+            format!("N{}", "n".repeat(NAME_MAX_LENGTH - 1)),
         ),
-        ("digits only", "2024".to_string()),
+        ("digits past the initial", "Hero2024".to_string()),
         ("punctuation", "Hero_Card-v2.1".to_string()),
         ("non-ASCII", "Überschrift".to_string()),
-        ("a lowercase spelling of an earlier row's name", "hero".to_string()),
+        (
+            "another case spelling of an earlier row's name",
+            "HERO".to_string(),
+        ),
     ];
 
     let router = emulator();

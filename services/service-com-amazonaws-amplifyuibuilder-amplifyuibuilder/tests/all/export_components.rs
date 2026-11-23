@@ -513,7 +513,7 @@ async fn export_components_pages_over_one_stable_order() {
                     &router,
                     APP_ID,
                     &environment,
-                    minimal_create(&format!("page-{index}")),
+                    minimal_create(&format!("Page-{index}")),
                 )
                 .await
                 .id(),
@@ -555,14 +555,14 @@ async fn export_components_pages_over_one_stable_order() {
 async fn export_components_refuses_a_token_it_never_issued() {
     let router = emulator();
     for index in 0..EXPORT_PAGE_LIMIT + 2 {
-        create(&router, minimal_create(&format!("token-{index}"))).await;
+        create(&router, minimal_create(&format!("Token-{index}"))).await;
     }
     for index in 0..EXPORT_PAGE_LIMIT + 2 {
         create_in(
             &router,
             APP_ID,
             "production",
-            minimal_create(&format!("other-{index}")),
+            minimal_create(&format!("Other-{index}")),
         )
         .await;
     }

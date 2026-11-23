@@ -238,7 +238,7 @@ fn create_cases() -> Vec<(&'static str, Value)> {
             // (`smithy_query(query="shape", shape="ThemeSummary")`), so a name on its
             // upper bound is one a summary has to report whole.
             "a name at the @length max of ThemeName",
-            minimal_create(&"n".repeat(255)),
+            minimal_create(&format!("N{}", "n".repeat(254))),
         ),
     ]
 }
@@ -392,7 +392,7 @@ async fn list_themes_pages_over_one_stable_order() {
     let mut created = Vec::new();
     for index in 0..7 {
         created.push(
-            create(&router, minimal_create(&format!("page-{index}")))
+            create(&router, minimal_create(&format!("Page-{index}")))
                 .await
                 .id(),
         );
@@ -521,14 +521,14 @@ async fn list_themes_pages_over_one_stable_order() {
 async fn list_themes_refuses_a_token_it_never_issued() {
     let router = emulator();
     for index in 0..3 {
-        create(&router, minimal_create(&format!("token-{index}"))).await;
+        create(&router, minimal_create(&format!("Token-{index}"))).await;
     }
     for index in 0..3 {
         create_in(
             &router,
             APP_ID,
             "production",
-            minimal_create(&format!("other-{index}")),
+            minimal_create(&format!("Other-{index}")),
         )
         .await;
     }

@@ -349,8 +349,8 @@ async fn a_cursor_outside_the_span_handed_out_is_refused_by_every_paginated_oper
     // token.
     let fixtures_per_collection = 2;
     for index in 0..fixtures_per_collection {
-        create(&router, "themes", minimal_theme(&format!("theme-{index}"))).await;
-        create(&router, "forms", minimal_form(&format!("form-{index}"))).await;
+        create(&router, "themes", minimal_theme(&format!("Theme-{index}"))).await;
+        create(&router, "forms", minimal_form(&format!("Form-{index}"))).await;
         create(&router, "codegen-jobs", minimal_codegen_job()).await;
     }
     let components = 4;
@@ -358,7 +358,7 @@ async fn a_cursor_outside_the_span_handed_out_is_refused_by_every_paginated_oper
         create(
             &router,
             "components",
-            minimal_component(&format!("component-{index}")),
+            minimal_component(&format!("Component-{index}")),
         )
         .await;
     }
@@ -534,8 +534,8 @@ async fn the_span_a_token_may_carry_follows_what_the_store_handed_out() {
     let router = emulator();
     let list_uri = collection_uri("components");
 
-    create(&router, "components", minimal_component("first")).await;
-    create(&router, "components", minimal_component("second")).await;
+    create(&router, "components", minimal_component("First")).await;
+    create(&router, "components", minimal_component("Second")).await;
     let issued = call(&router, "GET", &format!("{list_uri}?maxResults=1"), None)
         .await
         .next_token()
@@ -561,7 +561,7 @@ async fn the_span_a_token_may_carry_follows_what_the_store_handed_out() {
     );
 
     // The next create mints exactly that cursor, and the same token is then a page.
-    create(&router, "components", minimal_component("third")).await;
+    create(&router, "components", minimal_component("Third")).await;
     let served = call(
         &router,
         "GET",

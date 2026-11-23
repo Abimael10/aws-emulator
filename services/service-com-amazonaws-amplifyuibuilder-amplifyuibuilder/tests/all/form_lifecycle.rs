@@ -302,9 +302,9 @@ fn create_cases() -> Vec<(&'static str, Value)> {
         ),
         (
             "the longest name the model admits",
-            minimal_create(&"n".repeat(NAME_MAX_LENGTH)),
+            minimal_create(&format!("N{}", "n".repeat(NAME_MAX_LENGTH - 1))),
         ),
-        ("the shortest name the model admits", minimal_create("f")),
+        ("the shortest name the model admits", minimal_create("F")),
     ];
 
     // One row per published value of each enumerated member, so the catalog is covered

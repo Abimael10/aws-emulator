@@ -476,10 +476,12 @@ fn rows() -> Vec<Row> {
                         "name": "RoundTripTheme",
                         "values": [
                             {"key": "colors", "value": {"children": [
-                                {"key": "brand", "value": {"value": "#0b5"}}
+                                {"key": "brand", "value": {"value": "#0b5", "children": []}}
                             ]}}
                         ],
-                        "overrides": [{"key": "spacing", "value": {"value": "16px"}}]
+                        "overrides": [
+                            {"key": "spacing", "value": {"value": "16px", "children": []}}
+                        ]
                     }),
                     tags: &[
                         ("owner", "studio"),
@@ -613,8 +615,12 @@ Outputs:
                     name: "FirstTheme",
                     members: json!({
                         "name": "FirstTheme",
-                        "values": [{"key": "tokens", "value": {"value": "small"}}],
-                        "overrides": [{"key": "spacing", "value": {"value": "8px"}}]
+                        "values": [
+                            {"key": "tokens", "value": {"value": "small", "children": []}}
+                        ],
+                        "overrides": [
+                            {"key": "spacing", "value": {"value": "8px", "children": []}}
+                        ]
                     }),
                     tags: &[],
                 },
@@ -625,7 +631,9 @@ Outputs:
                     name: "SecondTheme",
                     members: json!({
                         "name": "SecondTheme",
-                        "values": [{"key": "tokens", "value": {"value": "large"}}]
+                        "values": [
+                            {"key": "tokens", "value": {"value": "large", "children": []}}
+                        ]
                     }),
                     tags: &[],
                 },
@@ -686,19 +694,19 @@ Outputs:
                     "values": [
                         {"key": "colors", "value": {"children": [
                             {"key": "brand", "value": {"children": [
-                                {"key": "10", "value": {"value": "#e0f5f7"}},
-                                {"key": "80", "value": {"value": "#047d95"}}
+                                {"key": "10", "value": {"value": "#e0f5f7", "children": []}},
+                                {"key": "80", "value": {"value": "#047d95", "children": []}}
                             ]}},
-                            {"key": "space", "value": {"value": "8px"}}
+                            {"key": "space", "value": {"value": "8px", "children": []}}
                         ]}},
                         {"key": "font", "value": {"children": [
-                            {"key": "primary", "value": {"value": "Amazon Ember"}}
+                            {"key": "primary", "value": {"value": "Amazon Ember", "children": []}}
                         ]}},
-                        {"key": "borderRadius", "value": {"value": "4px"}}
+                        {"key": "borderRadius", "value": {"value": "4px", "children": []}}
                     ],
                     "overrides": [
                         {"key": "dark", "value": {"children": [
-                            {"key": "primaryColor", "value": {"value": "#ffffff"}}
+                            {"key": "primaryColor", "value": {"value": "#ffffff", "children": []}}
                         ]}}
                     ]
                 }),
@@ -1084,7 +1092,9 @@ async fn an_update_applies_the_changed_declaration_to_the_entity_it_created() {
     );
     assert_eq!(
         reported.get("values"),
-        Some(&json!([{"key": "tokens", "value": {"value": "large"}}])),
+        Some(&json!([
+            {"key": "tokens", "value": {"value": "large", "children": []}}
+        ])),
         "case {case:?}: expected the re-declared values, got {reported}"
     );
     let listed = list_entities(&router, "themes", &app_id, ENVIRONMENT).await;

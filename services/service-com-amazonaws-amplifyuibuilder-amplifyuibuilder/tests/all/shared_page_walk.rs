@@ -172,7 +172,7 @@ impl Kind {
     /// The smallest payload the create of this kind admits — the members its request shape
     /// requires, which is all a case about paging needs.
     fn create_payload(self, index: usize) -> Value {
-        let name = format!("page-{index}");
+        let name = format!("Page-{index}");
         match self {
             Kind::Components => json!({
                 "name": name,

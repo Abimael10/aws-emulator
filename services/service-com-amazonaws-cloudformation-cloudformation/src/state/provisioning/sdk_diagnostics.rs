@@ -29,6 +29,24 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
     // emulator provisions over this signing name are all that service's
     // ([`crate::state::provisioner::create_ca_permission`] and the arms beside it).
     ("acm-pca", "AWSACMPCA", SdkDiagnostic::Proxied),
+    // Amplify UI Builder's SDK names it `AmplifyUiBuilder` — that model's own `sdkId`
+    // (`AmplifyUIBuilder`, `smithy_query(query="service_info")` on that service's model)
+    // written with only the initial of each word capitalised, which is the client name its
+    // SDK carries, exactly as Clean Rooms ML's below is. The shape is the ATTEMPT-counting
+    // one, as the recorded `ResourceStatusReason` of an `AWS::AmplifyUIBuilder::Form` whose
+    // declared `Name` that service does not accept for an entity carries it (in the
+    // behavioral corpus `simparity-behavioral-aws-v1`, check
+    // `amplify__amplifyuibuilder__cloudformation.deploy-amplifyuibuilder-form-invalid-name-rejected-and-rolled-back`,
+    // whose reason reads `Resource handler returned message: "<the service's sentence>
+    // (Service: AmplifyUiBuilder, Status Code: 400, Request ID: …) (SDK Attempt Count: …)"
+    // (RequestToken: …, HandlerErrorCode: InternalFailure)`). The three resource types this
+    // emulator provisions over this signing name are all that service's
+    // ([`provisioner::amplify_ui_builder`]).
+    (
+        "amplifyuibuilder",
+        "AmplifyUiBuilder",
+        SdkDiagnostic::Attempts,
+    ),
     // Amazon API Gateway's SDK names it `ApiGateway` — that model's own
     // `awsService.cloudFormationName`, which is also the name its SDK client carries
     // (`smithy_query(query="service_info")` on that service's model: `sdkId: "API Gateway"`,
@@ -1125,7 +1143,7 @@ pub(super) const HANDLER_ERROR_CLASSES: &[(&str, &[&str])] = &[
         &["Conflict", "InUse", "InvalidState", "Concurrent"],
     ),
     (
-        "InternalFailure",
+        HANDLER_ERROR_INTERNAL_FAILURE,
         &["InternalFailure", "SerializationException"],
     ),
     (
@@ -1158,6 +1176,14 @@ pub(crate) const HANDLER_ERROR_INVALID_REQUEST: &str = "InvalidRequest";
 /// CloudFormation's own record of the account and Region can say more about than the service
 /// that answered it ([`already_managed_reason`]).
 pub(super) const HANDLER_ERROR_ALREADY_EXISTS: &str = "AlreadyExists";
+
+/// The resource-provider plugin's own INTERNAL-FAILURE class.
+///
+/// Read by [`crate::state::provisioner::Provisioner::handler_error_class`] too: it is the
+/// class a provider that maps none of the owning service's own error codes reports a
+/// refusal under, where that provider's plugin falls back to this one rather than to the
+/// class for a service that failed ([`HANDLER_ERROR_SERVICE_FAILED`]).
+pub(crate) const HANDLER_ERROR_INTERNAL_FAILURE: &str = "InternalFailure";
 
 /// The lowest HTTP status that is the owning SERVICE failing rather than the request being
 /// wrong, for an answer that carried no error code at all ([`UNNAMED_CODE_PREFIX`]).

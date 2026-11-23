@@ -3426,6 +3426,26 @@ impl Provisioner {
         if matches!(self, Self::AcmPcaPermission) && code == ACMPCA_VALIDATION_EXCEPTION {
             return super::provisioning::HANDLER_ERROR_SERVICE_FAILED;
         }
+        // Each `AWS::AmplifyUIBuilder::*` provider maps none of Amplify UI Builder's
+        // validation refusals either — an entity name that service does not accept is one —
+        // and the plugin those three providers are written against falls back to its own
+        // INTERNAL-FAILURE class for an exception it has no mapping for, rather than to the
+        // class for a service that failed. Recorded behaviour, read from the reason of the
+        // failed resource of a stack declaring such a form (in the behavioral corpus
+        // `simparity-behavioral-aws-v1`, check `amplify__amplifyuibuilder__\
+        // cloudformation.deploy-amplifyuibuilder-form-invalid-name-rejected-and-rolled-back`,
+        // whose reason closes `HandlerErrorCode: InternalFailure`), and decided — as
+        // everywhere here — by what that service ANSWERED rather than by its message, so
+        // every refusal of a request it answers is reported this way whichever call made it.
+        if matches!(
+            self,
+            Self::AmplifyUiBuilderComponent
+                | Self::AmplifyUiBuilderForm
+                | Self::AmplifyUiBuilderTheme
+        ) && code == AMPLIFYUIBUILDER_REFUSED_REQUEST
+        {
+            return super::provisioning::HANDLER_ERROR_INTERNAL_FAILURE;
+        }
         let references_another_resource = match self {
             // A record set is written INSIDE a hosted zone its declaration names
             // (`HostedZoneId`/`HostedZoneName`), and the record set itself is the resource

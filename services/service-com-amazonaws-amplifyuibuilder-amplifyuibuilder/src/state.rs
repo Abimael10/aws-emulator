@@ -649,8 +649,15 @@ impl StoredTheme {
             name: self.name.clone(),
             created_at: ::aws_smithy_types::DateTime::from(self.created_at),
             modified_at: Some(::aws_smithy_types::DateTime::from(self.modified_at)),
-            values: self.values.clone(),
-            overrides: self.overrides.clone(),
+            // Every `ThemeValue` of a reported theme carries its `children`, empty
+            // where it nests none ([`reported_theme_values`]) — the projection both
+            // lists the shape appears in go through, so `values` and `overrides` are
+            // reported alike.
+            values: reported_theme_values(&self.values),
+            overrides: self
+                .overrides
+                .as_deref()
+                .map(reported_theme_values),
             tags: Some(self.tags.clone()),
         }
     }
@@ -1655,6 +1662,70 @@ pub fn invalid_sectional_element_value(
         }
         None
     })
+}
+
+/// The message this service answers for an entity name it will not create or rename
+/// an entity under.
+///
+/// ONE fixed literal for the class, like [`DUPLICATE_ITEM_NAME_MESSAGE`] and the other
+/// messages of this service: it interpolates nothing from the request — neither the
+/// name it refused nor which kind of entity it was refused for — so every entity write
+/// that names an unacceptable name is refused with the same sentence.
+pub const ENTITY_NAME_NOT_VALID_MESSAGE: &str = "Entity name is not a valid name";
+
+/// Whether `name` is a name this service accepts for one of its entities — a
+/// component, a form or a theme.
+///
+/// An entity's name is the identifier Amplify UI Builder generates its React source
+/// under, and such an identifier begins with an upper-case letter, so a name whose
+/// first character is anything else is not a name this service accepts. The three name
+/// shapes (`ComponentName`, `FormName`, `ThemeName`) are plain strings carrying
+/// `@length(min: 1, max: 255)` and NO `@pattern`
+/// (`smithy_query(query="shape",shape="ComponentName,FormName,ThemeName")`), so the
+/// validating walk cannot refuse a name outside the rule and this check does — exactly
+/// the situation [`SECTIONAL_ELEMENT_TYPES`] and the sets beside it are held here for.
+/// The length is the walk's: a name of no characters never reaches this check.
+pub fn entity_name_is_valid(name: &str) -> bool {
+    name.starts_with(char::is_uppercase)
+}
+
+/// The `InvalidParameterException` payload an entity write answers for a `name` this
+/// service does not accept, or `None` when the name is one it accepts.
+///
+/// The one place the entity-name rule lives, so every write path that SETS an entity's
+/// name refuses the same names the same way: the three creates and the three renames,
+/// the way [`invalid_sectional_element_value`] is shared by the two form write paths.
+pub fn invalid_entity_name(name: &str) -> Option<InvalidParameterException> {
+    (!entity_name_is_valid(name)).then(|| InvalidParameterException {
+        message: Some(ENTITY_NAME_NOT_VALID_MESSAGE.to_string()),
+    })
+}
+
+/// A `ThemeValues` list as a reported theme carries it: every `ThemeValue` in the tree
+/// reported WITH its `children` member — the empty list for one that nests none — at
+/// every depth.
+///
+/// `ThemeValue$children` is reported for every theme value, so a value stored without
+/// children carries the empty list rather than an absence, exactly as a `tags` map a
+/// create supplied none for is reported as `{}`. `ThemeValue$value` is NOT given the
+/// same treatment: a value stored without one stays without one.
+///
+/// The walk is level by level through an explicit queue rather than by recursion — the
+/// way [`reserved_name_in_children`] walks a component's `children` tree, and for the
+/// same reason: the tree's depth is whatever the request nested, so no payload can drive
+/// this walk into the call stack.
+fn reported_theme_values(values: &[ThemeValues]) -> Vec<ThemeValues> {
+    let mut reported = values.to_vec();
+    let mut pending: VecDeque<&mut Vec<ThemeValues>> = VecDeque::new();
+    pending.push_back(&mut reported);
+    while let Some(level) = pending.pop_front() {
+        for entry in level {
+            if let Some(value) = entry.value.as_mut() {
+                pending.push_back(value.children.get_or_insert_with(Vec::new));
+            }
+        }
+    }
+    reported
 }
 
 /// Which collection of an app environment a page of records was served over.

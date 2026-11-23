@@ -249,6 +249,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // And the same entity-name rule `CreateComponent` enforces, over the rename an
+        // update can carry: a name this service does not accept for an entity is
+        // refused with the modelled `InvalidParameterException` rather than merged. A
+        // patch that names none renames nothing, so there is nothing to check.
+        if let Some(refusal) = patch
+            .name
+            .as_deref()
+            .and_then(crate::state::invalid_entity_name)
+        {
+            return Err(UpdateComponentErrorModeled::InvalidParameterException(refusal).into());
+        }
+
         let mut store = state.lock();
         // The clock is read with the store HELD, never before taking it: the
         // instant this call stamps into the record is then the instant it

@@ -213,6 +213,22 @@ fn collection_uri(app_id: &str, environment: &str, collection: &str) -> String {
     format!("/app/{app_id}/environment/{environment}/{collection}")
 }
 
+/// An entity name of exactly `length` characters that this service ACCEPTS: `letter`
+/// repeated, with the initial upper-cased.
+///
+/// A name whose initial is not an upper-case letter is refused by the handler whatever
+/// its length (`an_entity_name_the_service_does_not_accept_is_refused` below holds that
+/// rule), so the rows that exercise a published LENGTH bound on its own build their names
+/// here — the bound is then the only thing such a row is about.
+fn upper_initial_name(letter: &str, length: usize) -> String {
+    let name = letter.repeat(length);
+    let mut characters = name.chars();
+    match characters.next() {
+        Some(first) => first.to_ascii_uppercase().to_string() + characters.as_str(),
+        None => name,
+    }
+}
+
 /// Every way an input value can fail a rule the model declares, over the operations and
 /// members that declare one.
 fn bound_cases() -> Vec<BoundCase> {
@@ -397,7 +413,7 @@ async fn each_published_bound_is_itself_accepted() {
             "POST",
             collection_uri(APP_ID, ENVIRONMENT, "components"),
             Some(component_data(
-                json!("n".repeat(NAME_MIN_LENGTH)),
+                json!(upper_initial_name("n", NAME_MIN_LENGTH)),
                 json!("View"),
             )),
         ),
@@ -406,7 +422,7 @@ async fn each_published_bound_is_itself_accepted() {
             "POST",
             collection_uri(APP_ID, ENVIRONMENT, "components"),
             Some(component_data(
-                json!("m".repeat(NAME_MAX_LENGTH)),
+                json!(upper_initial_name("m", NAME_MAX_LENGTH)),
                 json!("View"),
             )),
         ),
@@ -423,13 +439,13 @@ async fn each_published_bound_is_itself_accepted() {
             "a form name at @length max",
             "POST",
             collection_uri(APP_ID, ENVIRONMENT, "forms"),
-            Some(form_data(&"f".repeat(NAME_MAX_LENGTH))),
+            Some(form_data(&upper_initial_name("f", NAME_MAX_LENGTH))),
         ),
         (
             "a theme name at @length min",
             "POST",
             collection_uri(APP_ID, ENVIRONMENT, "themes"),
-            Some(theme_data(&"t".repeat(NAME_MIN_LENGTH))),
+            Some(theme_data(&upper_initial_name("t", NAME_MIN_LENGTH))),
         ),
         (
             "a maxResults at @range min",
@@ -548,5 +564,210 @@ async fn a_handler_found_invalid_value_is_answered_in_the_same_form() {
             "case {label:?}: the refusal must say why, got {:?}",
             answer.body
         );
+    }
+}
+
+/// The message this service answers for an entity name it will not create or rename an
+/// entity under: one fixed sentence, naming neither the name it refused nor the kind of
+/// entity it was refused for.
+const ENTITY_NAME_NOT_VALID: &str = "Entity name is not a valid name";
+
+/// One entity kind of this service, with the payloads a create and a rename of one take.
+///
+/// The three kinds — a component, a form and a theme — are the entities the name rule is
+/// about, so each row of the table below is driven against all three.
+struct EntityKind {
+    collection: &'static str,
+    /// The create payload carrying only the members that kind's create data requires,
+    /// under the name the row supplies.
+    create: fn(&str) -> Value,
+    /// The rename payload: the name, plus whatever else that kind's update data requires
+    /// (`UpdateThemeData$values` is `@required`, the other two require nothing).
+    rename: fn(&str) -> Value,
+}
+
+fn entity_kinds() -> Vec<EntityKind> {
+    vec![
+        EntityKind {
+            collection: "components",
+            create: |name| component_data(json!(name), json!("View")),
+            rename: |name| json!({"name": name}),
+        },
+        EntityKind {
+            collection: "forms",
+            create: form_data,
+            rename: |name| json!({"name": name}),
+        },
+        EntityKind {
+            collection: "themes",
+            create: theme_data,
+            rename: |name| json!({"name": name, "values": []}),
+        },
+    ]
+}
+
+/// The names this service does NOT accept for an entity, differing along the one thing the
+/// rule is about — the name's INITIAL character — with the rest of the name left well
+/// formed: the recorded case is the first row, which is the accepted name of the table
+/// below with its initial lower-cased.
+fn names_the_service_refuses() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("a lower-case initial", "postCreateForm"),
+        ("a lower-case initial on a one-character name", "f"),
+        ("a digit initial", "2024Form"),
+        ("an underscore initial", "_Form"),
+        ("a hyphen initial", "-Form"),
+        ("a space initial", " Form"),
+        ("a lower-case non-ASCII initial", "überschrift"),
+    ]
+}
+
+/// The names it accepts, differing along the same thing plus what follows the initial, so
+/// a row above is refused for its initial and not for the rest of the name or its length.
+fn names_the_service_accepts() -> Vec<(&'static str, String)> {
+    vec![
+        ("an upper-case initial", "PostCreateForm".to_string()),
+        ("a one-character upper-case name", "F".to_string()),
+        ("an upper-case non-ASCII initial", "Überschrift".to_string()),
+        ("punctuation and digits past the initial", "Form_v2-1".to_string()),
+        (
+            "an upper-case initial at the @length max",
+            upper_initial_name("n", NAME_MAX_LENGTH),
+        ),
+    ]
+}
+
+/// An entity name this service does not accept is refused with the same
+/// `InvalidParameterException` every other invalid input value is answered with — HTTP
+/// 400, no error type, and the one fixed sentence — on EVERY write path that sets an
+/// entity's name: the create and the rename of a component, a form and a theme alike. A
+/// refused create stores nothing and a refused rename leaves the stored name alone.
+#[tokio::test]
+async fn an_entity_name_the_service_does_not_accept_is_refused() {
+    for kind in entity_kinds() {
+        let router = emulator();
+        let collection = collection_uri(APP_ID, ENVIRONMENT, kind.collection);
+
+        // The entity a rename is attempted on, under a name the service accepts.
+        let live = call(&router, "POST", &collection, Some((kind.create)("Live"))).await;
+        assert_eq!(
+            live.status, 200,
+            "case {}: the fixture create must succeed, got {} with {:?}",
+            kind.collection, live.status, live.body
+        );
+        let live_id = live.id();
+
+        for (form, name) in names_the_service_refuses() {
+            let case = format!("{} / {form}", kind.collection);
+
+            for (operation, answer) in [
+                (
+                    "the create",
+                    call(&router, "POST", &collection, Some((kind.create)(name))).await,
+                ),
+                (
+                    "the rename",
+                    call(
+                        &router,
+                        "PATCH",
+                        &format!("{collection}/{live_id}"),
+                        Some((kind.rename)(name)),
+                    )
+                    .await,
+                ),
+            ] {
+                assert_eq!(
+                    answer.status, 400,
+                    "case {case:?}: {operation} naming {name:?} must be refused with HTTP \
+                     400, got {} with {:?}",
+                    answer.status, answer.body
+                );
+                assert_eq!(
+                    answer.message(),
+                    ENTITY_NAME_NOT_VALID,
+                    "case {case:?}: {operation} must answer the message \
+                     {ENTITY_NAME_NOT_VALID:?}, got {:?}",
+                    answer.message()
+                );
+                assert!(
+                    !answer.names_an_error_type(),
+                    "case {case:?}: {operation} must name no error type, got header {:?} and \
+                     body {:?}",
+                    answer.error_type_header,
+                    answer.body
+                );
+            }
+
+            // The refused create minted nothing and the refused rename moved nothing: the
+            // fixture is still the one entity of this app environment, under its own name.
+            let listed = call(&router, "GET", &collection, None).await;
+            let entities = listed.body["entities"].as_array().cloned().unwrap_or_default();
+            assert_eq!(
+                entities.len(),
+                1,
+                "case {case:?}: a refused write must leave the one fixture entity, got {:?}",
+                listed.body
+            );
+            let read = call(&router, "GET", &format!("{collection}/{live_id}"), None).await;
+            assert_eq!(
+                read.body["name"],
+                json!("Live"),
+                "case {case:?}: a refused rename must leave the stored name alone, got {:?}",
+                read.body
+            );
+        }
+    }
+}
+
+/// The names the service DOES accept are created and renamed to, so each row above is
+/// refused for the initial the rule is about rather than for the member it sat at.
+#[tokio::test]
+async fn an_entity_name_the_service_accepts_is_created_and_renamed_to() {
+    for kind in entity_kinds() {
+        let collection = collection_uri(APP_ID, ENVIRONMENT, kind.collection);
+
+        for (form, name) in names_the_service_accepts() {
+            let case = format!("{} / {form}", kind.collection);
+            let router = emulator();
+
+            let created = call(&router, "POST", &collection, Some((kind.create)(&name))).await;
+            assert_eq!(
+                created.status, 200,
+                "case {case:?}: creating {name:?} must succeed, got {} with {:?}",
+                created.status, created.body
+            );
+            assert_eq!(
+                created.body["name"],
+                json!(name),
+                "case {case:?}: the created entity must carry the name it was created \
+                 with, got {:?}",
+                created.body
+            );
+
+            // And the same name is one a rename may move another entity onto — in another
+            // app environment, since the entity just created holds it in this one.
+            let elsewhere = collection_uri("d9999zzzz", ENVIRONMENT, kind.collection);
+            let mover = call(&router, "POST", &elsewhere, Some((kind.create)("Mover"))).await;
+            let renamed = call(
+                &router,
+                "PATCH",
+                &format!("{elsewhere}/{}", mover.id()),
+                Some((kind.rename)(&name)),
+            )
+            .await;
+            assert_eq!(
+                renamed.status, 200,
+                "case {case:?}: renaming onto {name:?} must succeed, got {} with {:?}",
+                renamed.status, renamed.body
+            );
+            let read = call(&router, "GET", &format!("{elsewhere}/{}", mover.id()), None).await;
+            assert_eq!(
+                read.body["name"],
+                json!(name),
+                "case {case:?}: the renamed entity must read back under its new name, got \
+                 {:?}",
+                read.body
+            );
+        }
     }
 }

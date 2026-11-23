@@ -190,7 +190,7 @@ impl Collection {
     /// The smallest payload the create of this collection admits — the members its request
     /// shape requires, which is all a case about page tokens needs.
     fn create_payload(self, index: usize) -> Value {
-        let name = format!("scope-{index}");
+        let name = format!("Scope-{index}");
         match self {
             Collection::Components => json!({
                 "name": name,

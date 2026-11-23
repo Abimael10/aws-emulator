@@ -36,6 +36,41 @@ const THEME_NAME_MAX_LENGTH: usize = 255;
 /// The shortest `ThemeName` that member admits.
 const THEME_NAME_MIN_LENGTH: usize = 1;
 
+/// A `ThemeName` of exactly `length` characters that this service ACCEPTS: the initial is
+/// upper case, because a theme name whose initial is not an upper-case letter is refused
+/// whatever its length (`invalid_parameter_refusals.rs` holds that rule), so a row about a
+/// published LENGTH bound is then about that bound alone.
+fn name_of_length(length: usize) -> String {
+    match length {
+        0 => String::new(),
+        _ => format!("N{}", "n".repeat(length - 1)),
+    }
+}
+
+/// A `values` or `overrides` list as a REPORTED theme carries it: `ThemeValue$children` is
+/// reported for every theme value, so a value the request supplied without children reads
+/// back carrying the empty list, at every depth of the tree, while a value it supplied
+/// without `value` is not given one.
+fn reported_theme_values(supplied: &Value) -> Value {
+    let Some(entries) = supplied.as_array() else {
+        return supplied.clone();
+    };
+    Value::Array(
+        entries
+            .iter()
+            .map(|entry| {
+                let mut entry = entry.clone();
+                if let Some(mut value) = entry.get("value").cloned() {
+                    let children = value.get("children").cloned().unwrap_or_else(|| json!([]));
+                    value["children"] = reported_theme_values(&children);
+                    entry["value"] = value;
+                }
+                entry
+            })
+            .collect(),
+    )
+}
+
 /// A SigV4 credential scope naming this service: it is what routes a request to the
 /// amplifyuibuilder service.
 const SIGNED_FOR_AMPLIFYUIBUILDER: &str = "AWS4-HMAC-SHA256 \
@@ -237,14 +272,14 @@ fn patch_sequence() -> Vec<(&'static str, Value)> {
         (
             "the longest name the model admits",
             json!({
-                "name": "n".repeat(THEME_NAME_MAX_LENGTH),
+                "name": name_of_length(THEME_NAME_MAX_LENGTH),
                 "values": [{"key": "a", "value": {"value": "b"}}],
             }),
         ),
         (
             "the shortest name the model admits",
             json!({
-                "name": "n".repeat(THEME_NAME_MIN_LENGTH),
+                "name": name_of_length(THEME_NAME_MIN_LENGTH),
                 "values": [{"key": "a", "value": {"value": "b"}}],
             }),
         ),
@@ -293,7 +328,7 @@ async fn successive_updates_accumulate_on_one_record() {
 
     // What each member must read as, carried forward from one call to the next.
     let mut expected_name = base_theme()["name"].clone();
-    let mut expected_overrides = base_theme()["overrides"].clone();
+    let mut expected_overrides = reported_theme_values(&base_theme()["overrides"]);
     let mut previous_modified = epoch_seconds(&at(&created.body, "/modifiedAt"), "modifiedAt");
 
     for (case, patch) in patch_sequence() {
@@ -307,14 +342,15 @@ async fn successive_updates_accumulate_on_one_record() {
             expected_name = name.clone();
         }
         if let Some(overrides) = patch.get("overrides") {
-            expected_overrides = overrides.clone();
+            expected_overrides = reported_theme_values(overrides);
         }
 
         // `UpdateThemeData$values` is `@required`, so each call replaces the list.
         assert_eq!(
             at(&updated.body, "/values"),
-            patch["values"],
-            "case {case:?}: values must be the list the latest update carried, got {:?}",
+            reported_theme_values(&patch["values"]),
+            "case {case:?}: values must be the list the latest update carried, with every \
+             theme value's children reported, got {:?}",
             at(&updated.body, "/values")
         );
         // `name` and `overrides` are optional: a call that leaves one out keeps what the

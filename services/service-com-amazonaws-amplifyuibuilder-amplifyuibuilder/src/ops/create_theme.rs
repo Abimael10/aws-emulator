@@ -156,6 +156,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let data = input.theme_to_create;
+
+        // A theme's NAME is the identifier Amplify UI Builder generates the theme's
+        // source under, and the service refuses a name it will not generate one from
+        // (`crate::state::invalid_entity_name`) with the modelled
+        // `InvalidParameterException`, storing nothing. The same check runs on every
+        // write path that sets an entity's name — `UpdateTheme`'s rename and the
+        // component and form creates and renames.
+        if let Some(refusal) = crate::state::invalid_entity_name(&data.name) {
+            return Err(CreateThemeErrorModeled::InvalidParameterException(refusal).into());
+        }
+
         let key = (input.app_id.clone(), input.environment_name.clone());
         let mut store = state.lock();
         // The clock is read with the store HELD, exactly as `CreateComponent`

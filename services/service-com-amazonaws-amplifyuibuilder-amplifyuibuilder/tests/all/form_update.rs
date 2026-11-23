@@ -229,9 +229,9 @@ fn patch_cases() -> Vec<(&'static str, Value)> {
         ("just the name", json!({"name": "RenamedForm"})),
         (
             "the longest name the model admits",
-            json!({"name": "n".repeat(NAME_MAX_LENGTH)}),
+            json!({"name": format!("N{}", "n".repeat(NAME_MAX_LENGTH - 1))}),
         ),
-        ("the shortest name the model admits", json!({"name": "f"})),
+        ("the shortest name the model admits", json!({"name": "F"})),
         ("a new schemaVersion", json!({"schemaVersion": "2.1"})),
         (
             "a fields map of two entries, replacing the stored one",

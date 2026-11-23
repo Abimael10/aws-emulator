@@ -263,9 +263,9 @@ fn create_cases() -> Vec<(&'static str, Value)> {
             // `FormName` is `@length(min: 1, max: 255)`, so a name on its upper bound is
             // one a summary has to report whole.
             "a name at the @length max of FormName",
-            minimal_create(&"n".repeat(NAME_MAX_LENGTH)),
+            minimal_create(&format!("N{}", "n".repeat(NAME_MAX_LENGTH - 1))),
         ),
-        ("the shortest name the model admits", minimal_create("f")),
+        ("the shortest name the model admits", minimal_create("F")),
     ];
 
     // One row per published value of each enumerated member a summary reports, so the
@@ -446,7 +446,7 @@ async fn list_forms_pages_over_one_stable_order() {
     let mut created = Vec::new();
     for index in 0..7 {
         created.push(
-            create(&router, minimal_create(&format!("page-{index}")))
+            create(&router, minimal_create(&format!("Page-{index}")))
                 .await
                 .id(),
         );
@@ -575,14 +575,14 @@ async fn list_forms_pages_over_one_stable_order() {
 async fn list_forms_refuses_a_token_it_never_issued() {
     let router = emulator();
     for index in 0..3 {
-        create(&router, minimal_create(&format!("token-{index}"))).await;
+        create(&router, minimal_create(&format!("Token-{index}"))).await;
     }
     for index in 0..3 {
         create_in(
             &router,
             APP_ID,
             "production",
-            minimal_create(&format!("other-{index}")),
+            minimal_create(&format!("Other-{index}")),
         )
         .await;
     }

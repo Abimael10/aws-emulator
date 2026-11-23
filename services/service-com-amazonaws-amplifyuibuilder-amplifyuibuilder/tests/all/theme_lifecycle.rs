@@ -26,6 +26,41 @@ const THEME_NAME_MAX_LENGTH: usize = 255;
 /// The shortest `ThemeName` that member admits.
 const THEME_NAME_MIN_LENGTH: usize = 1;
 
+/// A `ThemeName` of exactly `length` characters that this service ACCEPTS: the initial is
+/// upper case, because a theme name whose initial is not an upper-case letter is refused
+/// whatever its length (`invalid_parameter_refusals.rs` holds that rule), so a row about a
+/// published LENGTH bound is then about that bound alone.
+fn name_of_length(length: usize) -> String {
+    match length {
+        0 => String::new(),
+        _ => format!("N{}", "n".repeat(length - 1)),
+    }
+}
+
+/// A `values` or `overrides` list as a REPORTED theme carries it: `ThemeValue$children` is
+/// reported for every theme value, so a value the request supplied without children reads
+/// back carrying the empty list, at every depth of the tree, while a value it supplied
+/// without `value` is not given one.
+fn reported_theme_values(supplied: &Value) -> Value {
+    let Some(entries) = supplied.as_array() else {
+        return supplied.clone();
+    };
+    Value::Array(
+        entries
+            .iter()
+            .map(|entry| {
+                let mut entry = entry.clone();
+                if let Some(mut value) = entry.get("value").cloned() {
+                    let children = value.get("children").cloned().unwrap_or_else(|| json!([]));
+                    value["children"] = reported_theme_values(&children);
+                    entry["value"] = value;
+                }
+                entry
+            })
+            .collect(),
+    )
+}
+
 /// A SigV4 credential scope naming this service: it is what routes a request to the
 /// amplifyuibuilder service.
 const SIGNED_FOR_AMPLIFYUIBUILDER: &str = "AWS4-HMAC-SHA256 \
@@ -262,14 +297,14 @@ fn create_cases() -> Vec<(&'static str, Value)> {
         (
             "the longest name the model admits",
             json!({
-                "name": "n".repeat(THEME_NAME_MAX_LENGTH),
+                "name": name_of_length(THEME_NAME_MAX_LENGTH),
                 "values": [{"key": "a", "value": {"value": "b"}}],
             }),
         ),
         (
             "the shortest name the model admits",
             json!({
-                "name": "n".repeat(THEME_NAME_MIN_LENGTH),
+                "name": name_of_length(THEME_NAME_MIN_LENGTH),
                 "values": [{"key": "a", "value": {"value": "b"}}],
             }),
         ),
@@ -325,13 +360,16 @@ async fn a_created_theme_is_read_back_from_what_was_stored() {
         );
         assert_eq!(
             at(&created.body, "/values"),
-            data["values"],
-            "case {case:?}: values must come back exactly as supplied, got {:?}",
+            reported_theme_values(&data["values"]),
+            "case {case:?}: values must come back as supplied, with every theme value's \
+             children reported, got {:?}",
             at(&created.body, "/values")
         );
         assert_eq!(
             at(&created.body, "/overrides"),
-            data.get("overrides").cloned().unwrap_or(Value::Null),
+            data.get("overrides")
+                .map(reported_theme_values)
+                .unwrap_or(Value::Null),
             "case {case:?}: an absent overrides stays absent and a supplied one comes back \
              as supplied, got {:?}",
             at(&created.body, "/overrides")
@@ -398,7 +436,7 @@ async fn a_name_outside_the_published_bounds_is_refused() {
     for length in [THEME_NAME_MIN_LENGTH - 1, THEME_NAME_MAX_LENGTH + 1] {
         let refused = create(
             &router,
-            json!({"name": "n".repeat(length), "values": []}),
+            json!({"name": name_of_length(length), "values": []}),
         )
         .await;
         assert_eq!(
@@ -419,7 +457,7 @@ async fn a_name_outside_the_published_bounds_is_refused() {
     for length in [THEME_NAME_MIN_LENGTH, THEME_NAME_MAX_LENGTH] {
         let created = create(
             &router,
-            json!({"name": "n".repeat(length), "values": []}),
+            json!({"name": name_of_length(length), "values": []}),
         )
         .await;
         assert_eq!(
@@ -553,4 +591,136 @@ async fn get_theme_refuses_an_id_that_names_no_theme_in_that_app_environment() {
         id,
         "a 404 lookup must not touch the store"
     );
+}
+
+/// Every `ThemeValue` a reported theme carries reports its `children`: the empty list for
+/// one that nests none, at every depth of the tree, while a `ThemeValue` stored without a
+/// `value` is not given one.
+///
+/// The rows differ along what the rule generalises over: where in the tree the childless
+/// value sits (a top-level value, a leaf under one level of children, a leaf three levels
+/// down, a value that carries both a `value` and children of its own), how many siblings
+/// it has, and whether it is reported through `values` or through `overrides` — and each
+/// row is read back through `CreateTheme`'s own answer, `GetTheme` and `ExportThemes`,
+/// which share one theme projection.
+#[tokio::test]
+async fn every_reported_theme_value_carries_its_children() {
+    /// A `ThemeValue$children` list nested `depth` levels under one key, with the leaf
+    /// carrying a `value` and no children of its own.
+    fn nested(depth: usize) -> Value {
+        let mut value = json!({"value": "Amazon Ember"});
+        for level in 0..depth {
+            value = json!({"children": [{"key": format!("level{level}"), "value": value}]});
+        }
+        value
+    }
+
+    let rows: Vec<(&str, Value)> = vec![
+        (
+            "a single flat value",
+            json!({"values": [{"key": "borderRadius", "value": {"value": "4px"}}]}),
+        ),
+        (
+            "three flat siblings",
+            json!({"values": [
+                {"key": "primaryColor", "value": {"value": "#047d95"}},
+                {"key": "secondaryColor", "value": {"value": "#ff6600"}},
+                {"key": "borderRadius", "value": {"value": "4px"}},
+            ]}),
+        ),
+        (
+            "a leaf one level down, beside a flat sibling",
+            json!({"values": [
+                {"key": "font", "value": nested(1)},
+                {"key": "borderRadius", "value": {"value": "4px"}},
+            ]}),
+        ),
+        (
+            "a leaf three levels down",
+            json!({"values": [{"key": "tokens", "value": nested(3)}]}),
+        ),
+        (
+            "a value carrying both a value of its own and children",
+            json!({"values": [{
+                "key": "colors",
+                "value": {"value": "#000000", "children": [
+                    {"key": "brand", "value": {"value": "#047d95"}},
+                ]},
+            }]}),
+        ),
+        (
+            "a value carrying neither a value nor children",
+            json!({"values": [{"key": "empty", "value": {}}]}),
+        ),
+        (
+            "a childless leaf under overrides",
+            json!({"values": [], "overrides": [{"key": "dark", "value": nested(2)}]}),
+        ),
+    ];
+
+    for (row, (case, declared)) in rows.into_iter().enumerate() {
+        let router = emulator();
+        let mut data = declared.clone();
+        data["name"] = json!(format!("Children{row}"));
+        let created = create(&router, data.clone()).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: expected HTTP 200 from CreateTheme, got {} with {:?}",
+            created.status, created.body
+        );
+        let id = created.id();
+
+        let read = get(&router, &id).await;
+        let exported = call(
+            &router,
+            "GET",
+            &format!("/export/app/{APP_ID}/environment/{ENVIRONMENT}/themes"),
+            None,
+        )
+        .await;
+        let listed = at(&exported.body, "/entities/0");
+
+        for (reader, reported) in [
+            ("CreateTheme", created.body.clone()),
+            ("GetTheme", read.body.clone()),
+            ("ExportThemes", listed),
+        ] {
+            for member in ["values", "overrides"] {
+                let Some(supplied) = declared.get(member) else {
+                    // A member the create did not carry stays absent: `overrides` is
+                    // optional and is not reported as an empty list.
+                    assert_eq!(
+                        at(&reported, &format!("/{member}")),
+                        Value::Null,
+                        "case {case:?} [{reader}]: an absent {member} must stay absent, got \
+                         {:?}",
+                        at(&reported, &format!("/{member}"))
+                    );
+                    continue;
+                };
+                let wanted = reported_theme_values(supplied);
+                assert_eq!(
+                    at(&reported, &format!("/{member}")),
+                    wanted,
+                    "case {case:?} [{reader}]: expected {member} {wanted:?}, got {:?}",
+                    at(&reported, &format!("/{member}"))
+                );
+            }
+        }
+
+        // The childless leaf of a nested row really carries `children` as an empty LIST
+        // (not a null and not an absence), read at the depth the row nested it.
+        if case == "a leaf three levels down" {
+            assert_eq!(
+                at(
+                    &read.body,
+                    "/values/0/value/children/0/value/children/0/value/children/0/value/children"
+                ),
+                json!([]),
+                "case {case:?}: the deepest theme value must report an empty children list, \
+                 got {:?}",
+                read.body
+            );
+        }
+    }
 }

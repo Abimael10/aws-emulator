@@ -180,6 +180,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(UpdateFormErrorModeled::InvalidParameterException(refusal).into());
         }
 
+        // And the same entity-name rule `CreateForm` enforces, over the rename an
+        // update can carry: a name this service does not accept for an entity is
+        // refused with the modelled `InvalidParameterException` rather than merged. A
+        // patch that names none renames nothing, so there is nothing to check.
+        if let Some(refusal) = patch
+            .name
+            .as_deref()
+            .and_then(crate::state::invalid_entity_name)
+        {
+            return Err(UpdateFormErrorModeled::InvalidParameterException(refusal).into());
+        }
+
         let mut store = state.lock();
 
         // The target is resolved before anything is merged, and the two ways it

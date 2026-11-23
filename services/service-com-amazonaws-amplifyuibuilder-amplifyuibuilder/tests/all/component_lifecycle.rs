@@ -364,7 +364,7 @@ fn create_cases() -> Vec<(&'static str, Value)> {
         (
             "the longest name the model admits and the shortest component type",
             json!({
-                "name": "n".repeat(NAME_MAX_LENGTH),
+                "name": format!("N{}", "n".repeat(NAME_MAX_LENGTH - 1)),
                 "componentType": "V",
                 "properties": {},
                 "variants": [],
@@ -583,7 +583,7 @@ async fn list_components_pages_over_one_stable_order() {
     let mut created = Vec::new();
     for index in 0..7 {
         created.push(
-            create(&router, minimal_create(&format!("page-{index}")))
+            create(&router, minimal_create(&format!("Page-{index}")))
                 .await
                 .id(),
         );
@@ -694,7 +694,7 @@ async fn list_components_pages_over_one_stable_order() {
                 &router,
                 APP_ID,
                 "production",
-                minimal_create(&format!("other-{index}")),
+                minimal_create(&format!("Other-{index}")),
             )
             .await;
         }

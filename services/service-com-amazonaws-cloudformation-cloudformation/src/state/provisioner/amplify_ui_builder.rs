@@ -66,6 +66,17 @@ const AMPLIFYUIBUILDER_SIGNING_NAME: &str = "amplifyuibuilder";
 /// (`ResourceNotFoundException`, the modelled 404 of every read, update and delete of one).
 const AMPLIFYUIBUILDER_RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
 
+/// The error code a REFUSED REQUEST of Amplify UI Builder reaches a provisioner as.
+///
+/// That service names NO exception on the wire — every refusal it answers carries its HTTP
+/// status and a message and nothing a client could branch on — so a refused call is
+/// identified by its STATUS, in the shape a call whose answer named no error at all is
+/// reported under (`HTTP <status>`, which [`super::super::provisioning`] builds and keeps to
+/// itself). 400 is the status that service's modelled `InvalidParameterException` carries,
+/// which is what an entity name it does not accept is refused with; a 404 is an entity it
+/// does not hold and keeps the not-found class its own status falls in.
+pub(super) const AMPLIFYUIBUILDER_REFUSED_REQUEST: &str = "HTTP 400";
+
 /// The three members of the create's payload that CloudFormation decides, as that payload
 /// spells them: the entity's name, and the tag map the propagated tags travel in.
 const NAME_MEMBER: &str = "name";

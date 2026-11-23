@@ -259,21 +259,25 @@ async fn listed_ids(
 /// The name forms the rule generalises over: both published length bounds, digits,
 /// punctuation, case and non-ASCII. The recorded case is the plain row; the others are
 /// what the rule has to hold for as well.
+///
+/// Every form starts with an upper-case letter, which is what this service accepts for an
+/// entity name at all (`invalid_parameter_refusals.rs` holds that rule): a name it refuses
+/// never reaches the uniqueness constraint this table is about.
 fn name_forms() -> Vec<(&'static str, String)> {
     vec![
         ("a plain name", "Contact".to_string()),
         (
             "the shortest name the model admits",
-            "n".repeat(NAME_MIN_LENGTH),
+            "N".repeat(NAME_MIN_LENGTH),
         ),
         (
             "the longest name the model admits",
-            "n".repeat(NAME_MAX_LENGTH),
+            format!("N{}", "n".repeat(NAME_MAX_LENGTH - 1)),
         ),
-        ("digits only", "2024".to_string()),
+        ("digits past the initial", "Form2024".to_string()),
         ("punctuation", "Contact_Form-v2.1".to_string()),
         ("non-ASCII", "Kontaktformular-Ü".to_string()),
-        ("lowercase letters only", "contact".to_string()),
+        ("upper-case letters only", "CONTACT".to_string()),
     ]
 }
 
