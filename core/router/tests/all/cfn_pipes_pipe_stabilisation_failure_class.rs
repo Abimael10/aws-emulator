@@ -61,34 +61,34 @@ const PATIENCE: Duration = Duration::from_secs(60);
 const LOOK_AGAIN: Duration = Duration::from_millis(50);
 
 /// The logical id every row declares its pipe under.
-const PIPE: &str = "ThePipe";
+pub(crate) const PIPE: &str = "ThePipe";
 
 /// The resource type the provider's report names, which is the type the template declares.
-const PIPE_TYPE: &str = "AWS::Pipes::Pipe";
+pub(crate) const PIPE_TYPE: &str = "AWS::Pipes::Pipe";
 
 /// The statuses this suite reads off a stack and off a resource event.
-const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
-const ROLLBACK_COMPLETE: &str = "ROLLBACK_COMPLETE";
-const CREATE_FAILED: &str = "CREATE_FAILED";
+pub(crate) const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
+pub(crate) const ROLLBACK_COMPLETE: &str = "ROLLBACK_COMPLETE";
+pub(crate) const CREATE_FAILED: &str = "CREATE_FAILED";
 
 /// What the state EventBridge Pipes reports a pipe that is moving records in is called.
-const RUNNING: &str = "RUNNING";
+pub(crate) const RUNNING: &str = "RUNNING";
 
 /// The `HandlerErrorCode` class a provider reports a resource THAT DID NOT STABILIZE under — a
 /// value of the CloudFormation model's own `HandlerErrorCode` enum.
-const NOT_STABILIZED: &str = "NotStabilized";
+pub(crate) const NOT_STABILIZED: &str = "NotStabilized";
 
 /// Where the envelope's quoted message ends: the token that follows is one run's own value, so
 /// what a row asserts is the message before it, that a token follows, and the class it closes
 /// with.
-const BEFORE_THE_TOKEN: &str = "\" (RequestToken: ";
+pub(crate) const BEFORE_THE_TOKEN: &str = "\" (RequestToken: ";
 
 /// The head of the envelope, which the quoted message must not carry a second time.
-const ENVELOPE_OPENS: &str = "Resource handler returned message: \"";
+pub(crate) const ENVELOPE_OPENS: &str = "Resource handler returned message: \"";
 
 /// The emulator with the four services this suite exercises, mounted on ONE engine exactly as
 /// `core/router/src/lib.rs` mounts them.
-fn build_router() -> MultiServiceRouter {
+pub(crate) fn build_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -122,7 +122,7 @@ fn authorization(service: &str) -> String {
 }
 
 /// Call one CloudFormation operation over its awsQuery wire.
-async fn cloudformation(
+pub(crate) async fn cloudformation(
     router: &MultiServiceRouter,
     action: &str,
     members: &[(&str, &str)],
@@ -150,7 +150,7 @@ async fn cloudformation(
 
 /// `DescribePipe` over EventBridge Pipes' own `restJson1` wire, on the URI that operation's
 /// `@http` binding declares (`GET /v1/pipes/{Name}`).
-async fn describe_pipe(router: &MultiServiceRouter, name: &str) -> (u16, Value) {
+pub(crate) async fn describe_pipe(router: &MultiServiceRouter, name: &str) -> (u16, Value) {
     let request = http::Request::builder()
         .method("GET")
         .uri(format!("/v1/pipes/{name}"))
@@ -167,7 +167,7 @@ async fn describe_pipe(router: &MultiServiceRouter, name: &str) -> (u16, Value) 
 
 /// The stack as it reads once its operation has reached a TERMINAL status, polled rather than
 /// slept for: how many spans the pipe's own moves take is the deployment's to decide.
-async fn settled_stack(router: &MultiServiceRouter, case: &str, stack: &str) -> String {
+pub(crate) async fn settled_stack(router: &MultiServiceRouter, case: &str, stack: &str) -> String {
     let deadline = Instant::now() + PATIENCE;
     loop {
         let (status, described) =
@@ -213,7 +213,7 @@ async fn stack_events(router: &MultiServiceRouter, case: &str, stack: &str) -> V
 }
 
 /// The `ResourceStatusReason` of every event that reports `logical_id` in `status`.
-async fn reasons_for(
+pub(crate) async fn reasons_for(
     router: &MultiServiceRouter,
     case: &str,
     stack: &str,
@@ -242,7 +242,7 @@ async fn reasons_for(
 
 /// The trust policy every declared role carries: EventBridge Pipes acts as the pipe's `RoleArn`,
 /// so a role a stack creates for a pipe has to admit that service principal.
-fn pipes_trust_policy() -> Value {
+pub(crate) fn pipes_trust_policy() -> Value {
     json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -257,7 +257,7 @@ fn pipes_trust_policy() -> Value {
 /// name Amazon SQS mints one from, so a statement naming it names the very resource the pipe's
 /// call is made on — and a `Source` written this way for a queue nobody created is well formed
 /// and names nothing.
-fn queue_arn(name: &str) -> String {
+pub(crate) fn queue_arn(name: &str) -> String {
     format!("arn:aws:sqs:{REGION}:{ACCOUNT}:{name}")
 }
 
@@ -270,9 +270,9 @@ fn queue_arn(name: &str) -> String {
 /// `services/service-com-amazonaws-pipes-pipes/tests/all/pipe_bring_up.rs` is each sentence's own
 /// table, over the source kinds that decide which call is named; they are written out again here
 /// because what this suite asserts is the text CloudFormation QUOTES.
-const WITHHELD_SOURCE_READ: &str = "Input parameter is invalid from the request due to : The \
-                                    provided customer role does not have permissions to call \
-                                    ReceiveMessage on SQS";
+pub(crate) const WITHHELD_SOURCE_READ: &str = "Input parameter is invalid from the request due \
+                                               to : The provided customer role does not have \
+                                               permissions to call ReceiveMessage on SQS";
 const FAILED_SOURCE_READ: &str = "Input parameter is invalid from the request due to : Error \
                                   occurs while ReceiveMessage on SQS";
 
@@ -425,7 +425,7 @@ const ROWS: &[Row] = &[
 /// The whole message CloudFormation quotes for a pipe its owning service settled in a failure
 /// state: the provider's report that the resource did not stabilize, naming the type it was asked
 /// for and the identifier it was asked about, with that service's own reason after the join.
-fn did_not_stabilize(identifier: &str, state_reason: &str) -> String {
+pub(crate) fn did_not_stabilize(identifier: &str, state_reason: &str) -> String {
     format!(
         "Resource of type '{PIPE_TYPE}' with identifier '{identifier}' did not stabilize. Status \
          Reason is {state_reason}"
