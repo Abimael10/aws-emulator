@@ -181,9 +181,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let method = resource
             .methods
             .get_mut(&method_key(&input.http_method))
-            .ok_or_else(|| not_found(crate::state::NO_SUCH_METHOD))?;
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_INTEGRATION))?;
         // A method with no integration carries no integration responses either: the
-        // identifiers in the URI name a record that does not exist.
+        // identifiers in the URI name a record that does not exist — the same refusal a
+        // verb the resource holds no method under answers, because an integration response
+        // is addressed through the integration and the integration through its method.
         let integration = method
             .integration
             .as_mut()

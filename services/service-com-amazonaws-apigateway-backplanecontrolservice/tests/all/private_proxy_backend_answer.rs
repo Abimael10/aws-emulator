@@ -388,7 +388,8 @@ async fn a_private_proxy_serves_the_backends_own_answer_behind_its_endpoint_gate
                 let message = authorization_message(&answered.body, &case);
                 let expected = format!(
                     "User: {ANONYMOUS} is not authorized to perform: execute-api:Invoke on \
-                     resource: {arn}",
+                     resource: {arn} because no resource-based policy allows the \
+                     execute-api:Invoke action",
                     arn = crate::stage_invoke_identity_policy::reported_resource(&method_arn(
                         &backend, path_part
                     ))

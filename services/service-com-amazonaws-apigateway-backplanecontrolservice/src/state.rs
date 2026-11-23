@@ -3989,9 +3989,24 @@ pub const INVALID_REST_API_IDENTIFIER: &str = "Invalid REST API identifier speci
 pub const NO_SUCH_RESOURCE: &str = "Invalid Resource identifier specified";
 
 /// The `NotFoundException` message for an `httpMethod` with no method on the resource.
+///
+/// It answers a call whose own target IS the method — the record itself, one of its method
+/// responses, or a simulated invocation of it. A call that addresses the method's
+/// INTEGRATION instead reports that integration ([`NO_SUCH_INTEGRATION`]), because a
+/// refusal names the record the call addressed rather than an intermediate one it walked
+/// through, the way a resource-addressed call reports the resource whichever half of the
+/// `(restApiId, resourceId)` pair is unresolvable ([`NO_SUCH_RESOURCE`]).
 pub const NO_SUCH_METHOD: &str = "Invalid Method identifier specified";
 
-/// The `NotFoundException` message for a method that carries no integration.
+/// The `NotFoundException` message for an address that resolves to no `Integration`.
+///
+/// Fixed text in full: nothing from the request is quoted back. An integration is addressed
+/// THROUGH the method that carries it, so it is unresolvable both for a verb the resource
+/// holds no method under and for a method carrying no integration — one address, one
+/// refusal, which is what lets a client tell "this method has no integration" from "this
+/// METHOD does not exist" ([`NO_SUCH_METHOD`], the refusal of a method-addressed call).
+/// Every call whose target is an integration or a record hanging off one (its integration
+/// responses) reports it.
 pub const NO_SUCH_INTEGRATION: &str = "Invalid Integration identifier specified";
 
 /// The `BadRequestException` message for a SIMULATED invocation of a method that carries
@@ -4966,3 +4981,7 @@ pub use rest_api_deletion::*;
 /// reaches each name as `crate::state::…`.
 mod serving_emulator;
 pub use serving_emulator::*;
+
+/// The references other records hold on ONE stage, and their reclamation when that stage is
+/// removed; re-exported whole, so a handler still reaches each name as `crate::state::…`.
+mod stage_references;

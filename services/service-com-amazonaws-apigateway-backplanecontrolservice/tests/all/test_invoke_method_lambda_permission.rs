@@ -568,9 +568,9 @@ async fn a_simulated_invocation_is_decided_by_the_functions_resource_policy() {
             );
             // The log covers the INTEGRATION's own phases, as a deployed stage's execution
             // log covers them: the integration request as this integration's transformation
-            // made it, and the backend's answer as it arrived before the api mapped it. By
-            // SIZE, because a simulated invocation has no stage `dataTrace` setting to gate
-            // the payloads themselves.
+            // made it, and the backend's answer as it arrived before the api mapped it —
+            // each stated as the payload that crossed that point, which is the log this
+            // operation hands back to the caller that asked for the invocation.
             for phase in [
                 "Endpoint request body after transformations",
                 "Endpoint response body before transformations",

@@ -447,13 +447,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resource = store
             .resource_mut(&input.rest_api_id, &input.resource_id)
             .map_err(|message| not_found(&message))?;
-        // An integration response belongs to the INTEGRATION of a method: the verb in the
-        // URI must name a method on the resource, and that method must already carry an
-        // integration, or there is nothing to add the response to.
+        // An integration response belongs to the INTEGRATION of a method, which is
+        // addressed through that method: the verb in the URI must name a method on the
+        // resource, and that method must already carry an integration, or there is nothing
+        // to add the response to — one address, so one refusal
+        // (`crate::state::NO_SUCH_INTEGRATION`).
         let method = resource
             .methods
             .get_mut(&method_key(&input.http_method))
-            .ok_or_else(|| not_found(crate::state::NO_SUCH_METHOD))?;
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_INTEGRATION))?;
         let integration = method
             .integration
             .as_mut()

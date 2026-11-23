@@ -8,9 +8,12 @@
 //! untouched.
 //!
 //! Each identifier the request carries is resolved against stored state before anything
-//! is removed, so a request naming an API, a resource or a verb that does not exist, or
-//! a method that carries no integration, is refused with the modelled
-//! `NotFoundException` (404) and changes nothing.
+//! is removed, so a request naming an API, a resource or a verb that does not exist is
+//! refused with the modelled `NotFoundException` (404) and changes nothing. A method that
+//! carries NO integration is not such a request: the integration is the one record that
+//! slot of the method holds and carries no identifier of its own, so the state this call
+//! asks for — a method with no integration — is the state that method is already in, and
+//! the call answers the modelled 204 having changed nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -181,31 +184,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
         let mut store = state.lock();
 
         // Every identifier the request carries is resolved against stored state before
-        // anything is removed, each naming its own record so the refusal says which one
-        // was not found. An integration is addressed THROUGH its resource, so the
-        // `(restApiId, resourceId)` pair is resolved as ONE lookup for that resource.
+        // anything is removed. An integration is addressed THROUGH its resource, so the
+        // `(restApiId, resourceId)` pair is resolved as ONE lookup for that resource, and
+        // THROUGH its method: the verb and the integration are ONE address of the record,
+        // so a verb the resource holds no method under leaves that address unresolvable and
+        // the refusal names the INTEGRATION it could not resolve rather than the method it
+        // walked through — the same name every call addressing an integration reports
+        // (`crate::state::NO_SUCH_INTEGRATION`).
         let resource = store
             .resource_mut(&input.rest_api_id, &input.resource_id)
             .map_err(|message| not_found(&message))?;
         let method = resource
             .methods
             .get_mut(&super::put_method::method_key(&input.http_method))
-            .ok_or_else(|| not_found(crate::state::NO_SUCH_METHOD))?;
-        // A method with no integration has nothing to delete: the identifier in the URI
-        // names a record that does not exist, and the refusal must leave state as it
-        // found it — so the record is TESTED before it is removed.
-        if method.integration.is_none() {
-            return Err(not_found(crate::state::NO_SUCH_INTEGRATION));
-        }
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_INTEGRATION))?;
+        // The integration is the ONE record that slot of the method holds — it carries no
+        // identifier of its own for a caller to get wrong — so what this call asks for is
+        // that the method carry none, and a method that already carries none is in exactly
+        // that state: the call answers the modelled 204 and changes nothing, rather than
+        // refusing a state the caller asked to reach. A record addressed by a key the
+        // CALLER names is the other case: an integration response's status code must
+        // resolve, which is why `DeleteIntegrationResponse` refuses a code that names no
+        // response.
         // Dropping the stored record is what makes a later read of the integration, and
         // of the integration responses stored on it, answer `NotFoundException`.
-        method.integration = None;
+        let removed = method.integration.take().is_some();
+        // The lock covers the state change only; everything below is owned.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome, the
+        // way the sibling deletes of this service record theirs. Metadata only — never a
+        // request body and never a stored mapping template.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            rest_api_id = ?input.rest_api_id,
+            resource_id = ?input.resource_id,
+            http_method = ?input.http_method,
+            outcome = if removed { "deleted" } else { "already absent" },
+            "integration deleted",
+        );
         Ok(DeleteIntegrationOutput)
     }
 }

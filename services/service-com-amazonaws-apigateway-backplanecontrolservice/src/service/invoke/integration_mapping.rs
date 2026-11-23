@@ -258,23 +258,24 @@ pub struct Performed {
     ///
     /// `pub(super)` rather than `pub` like the two members beside it, because the type is the
     /// serving path's own: only the data plane's funnel reads it, and a simulated invocation
-    /// reports payload SIZES rather than bytes, having no `dataTrace` setting to gate them.
+    /// reads the payloads off it through [`Self::exchanged_payloads`].
     pub(super) exchanged: Option<super::stage_logs::Exchanged>,
 }
 
 impl Performed {
-    /// How many BYTES this call exchanged with the integration's backend: the integration
-    /// request as it was sent, and the backend's answer as it arrived. `None` for an
-    /// integration performed from the api's own records, which reaches no backend at all.
+    /// What the call EXCHANGED with the integration's backend: the integration request as it
+    /// was SENT and the backend's answer as it ARRIVED. `None` for an integration performed
+    /// from the api's own records, which reaches no backend at all.
     ///
-    /// The SIZES, not the payloads: a simulated invocation reports the integration request
-    /// and response phases of its execution log by their size, having no `dataTrace` setting
-    /// of a stage to gate the bytes themselves — the same line a stage writes with data
-    /// tracing off ([`super::stage_logs`]).
-    pub fn exchanged_sizes(&self) -> Option<(usize, usize)> {
+    /// The PAYLOADS, which is what the two integration phases of an execution log state
+    /// ([`super::stage_logs::traced_payload_line`]): `TestInvokeMethod` hands the log back to
+    /// the caller that asked for this one invocation to be simulated, beside the response body
+    /// itself, so there is no further disclosure in stating what crossed each point and a log
+    /// of sizes would say nothing about the configuration it was asked about.
+    pub fn exchanged_payloads(&self) -> Option<(Vec<u8>, Vec<u8>)> {
         self.exchanged
             .as_ref()
-            .map(|exchanged| exchanged.sizes())
+            .map(|exchanged| (exchanged.sent.clone(), exchanged.received.clone()))
     }
 
     /// An answer that is no configuration error and crossed no backend, which is what an

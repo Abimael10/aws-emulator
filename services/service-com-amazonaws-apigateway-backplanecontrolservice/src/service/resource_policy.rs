@@ -259,10 +259,11 @@ impl Call<'_> {
 /// or `None` when the policy lets it through.
 ///
 /// Asked for a call the method AUTHENTICATES NOBODY for ([`Caller::Anonymous`]): API Gateway
-/// resolves no principal for such a request, so the api's document is the whole decision and
-/// the sentence ends at the resource — there is no identity-based half for a closing clause to
-/// name. A call the method authenticates a principal for is decided by the gate that takes
-/// BOTH halves at once, which reads this document through [`invoke_decision`]
+/// resolves no principal for such a request, so the api's own document is the whole decision
+/// and the clause the sentence closes with names THAT document as what failed to allow the
+/// call ([`refused_by_document`]) — which is how a client tells this refusal from the
+/// identity-based one. A call the method authenticates a principal for is decided by the gate
+/// that takes BOTH halves at once, which reads this document through [`invoke_decision`]
 /// ([`super::invoke::execute_api_authorization`]).
 ///
 /// `policy` is the document the api carries; an api carrying none is not asked at all.
@@ -272,14 +273,33 @@ pub fn denial(policy: &str, call: &Call<'_>) -> Option<String> {
     if !refuses(stated, call) {
         return None;
     }
-    let sentence = not_authorized(INVOKE_ACTION, call.principal_named(), &call.reported_resource());
-    // An explicit `Deny` is a fact about the document, and the clause IAM closes such a
-    // refusal with is what tells the caller no grant will lift it. A document that merely
-    // states nothing refused the call by leaving it ungranted, which is the sentence alone.
-    Some(match stated {
-        Decision::Denied => format!("{sentence} {RESOURCE_EXPLICIT_DENY}"),
-        Decision::Allowed | Decision::NotStated => sentence,
-    })
+    Some(refused_by_document(stated, INVOKE_ACTION, call))
+}
+
+/// The sentence a refusal the api's OWN document decided is worded with: the principal that
+/// asked, the action it asked for and the method it asked for, closed by the clause naming
+/// why that document withheld the grant.
+///
+/// The clause is the whole point of the two wordings IAM publishes: an explicit `Deny` is a
+/// fact about the document, and no grant anywhere lifts it ([`RESOURCE_EXPLICIT_DENY`]),
+/// while a document that merely states nothing withheld the grant by not allowing the action
+/// — which names the RESOURCE-BASED document as what failed to allow the call
+/// (`::service_common::iam_authorization::not_authorized_by_resource_policy`), so a client
+/// can tell this refusal from the identity-based one the gate beside this module takes. One
+/// wording for every action the document decides, so the invoke and the cache invalidation
+/// cannot word one decision differently.
+fn refused_by_document(stated: Decision, action: &str, call: &Call<'_>) -> String {
+    let principal = call.principal_named();
+    let resource = call.reported_resource();
+    match stated {
+        Decision::Denied => format!(
+            "{} {RESOURCE_EXPLICIT_DENY}",
+            not_authorized(action, principal, &resource)
+        ),
+        Decision::Allowed | Decision::NotStated => {
+            iam::not_authorized_by_resource_policy(principal, action, &resource)
+        }
+    }
 }
 
 /// Whether the document the api carries explicitly ALLOWS this call to invoke the method.
@@ -314,6 +334,19 @@ pub fn invoke_decision(policy: Option<&str>, call: &Call<'_>) -> Decision {
     })
 }
 
+/// What the document the api carries STATES about this call's ask to reload the stage's
+/// CACHED response — the counterpart of [`invoke_decision`] for the other action a resource
+/// policy decides, so the gate that admits the ask and the sentence that refuses it read ONE
+/// decision rather than taking it twice.
+///
+/// `policy` is `None` for an api carrying no document, which states nothing.
+#[must_use]
+pub fn invalidation_decision(policy: Option<&str>, call: &Call<'_>) -> Decision {
+    policy.map_or(Decision::NotStated, |policy| {
+        decision(policy, call, INVALIDATE_CACHE_ACTION)
+    })
+}
+
 /// Whether this call may ask for the stage's cached response to be reloaded, which is what
 /// a stage requiring authorization for a cache-control header asks about.
 ///
@@ -324,21 +357,23 @@ pub fn invoke_decision(policy: Option<&str>, call: &Call<'_>) -> Decision {
 /// [`denial`] gives an invoke (the module docs give the whole argument).
 #[must_use]
 pub fn authorizes_invalidation(policy: Option<&str>, call: &Call<'_>) -> bool {
-    let stated = policy.map_or(Decision::NotStated, |policy| {
-        decision(policy, call, INVALIDATE_CACHE_ACTION)
-    });
-    !refuses(stated, call)
+    !refuses(invalidation_decision(policy, call), call)
 }
 
 /// The sentence a cache invalidation this call is not authorized for is refused with: the
-/// principal that asked, the action it asked for and the method it asked for, as
-/// [`not_authorized`] words every such refusal.
+/// principal that asked, the action it asked for and the method it asked for, closed by the
+/// clause naming why the api's document withheld the grant, as [`refused_by_document`] words
+/// every refusal that document alone decides.
+///
+/// `policy` is the document the api carries, read through the same
+/// [`invalidation_decision`] [`authorizes_invalidation`] took the decision this sentence
+/// reports from.
 #[must_use]
-pub fn invalidation_not_authorized(call: &Call<'_>) -> String {
-    not_authorized(
+pub fn invalidation_not_authorized(policy: Option<&str>, call: &Call<'_>) -> String {
+    refused_by_document(
+        invalidation_decision(policy, call),
         INVALIDATE_CACHE_ACTION,
-        call.principal_named(),
-        &call.reported_resource(),
+        call,
     )
 }
 
@@ -390,22 +425,18 @@ fn decision(policy: &str, call: &Call<'_>, action: &str) -> Decision {
     }
 }
 
-/// The sentence AWS refuses a call with when the api's policy grants the caller nothing
-/// for the action it asked for, up to and including the resource: the principal that
-/// asked, that action and the method it asked for.
+/// The sentence AWS refuses a call with up to and including the resource: the principal that
+/// asked, the action it asked for and the method it asked for, with NO closing clause.
 ///
-/// Not `::service_common::iam_authorization::not_authorized_by_resource_policy`, whose
-/// sentence already closes with the clause OTHER services word their refusal with
-/// ("because no resource-based policy allows …").
-///
-/// `pub(crate)` because the IDENTITY-based gate beside this one refuses the same call about
-/// the same method in the same words up to the resource
-/// ([`super::invoke::execute_api_authorization`]) — one wording, so the two gates cannot
-/// diverge on it — and then closes its own sentence with the clause naming WHY the identity
-/// decision it took was a deny, which is a fact about the documents IT read rather than
-/// about the one the api carries.
+/// The clause is the caller's to add, because it names WHY the grant was withheld and that
+/// differs by which document decided: a refusal this module's own document decided closes it
+/// with [`refused_by_document`], and the IDENTITY-based gate beside this one refuses the same
+/// call about the same method in the same words up to the resource
+/// ([`super::invoke::execute_api_authorization`]) before closing it with the clause naming WHY
+/// the identity decision it took was a deny — one wording for the shared half, so the two
+/// gates cannot diverge on it.
 pub(crate) fn not_authorized(action: &str, principal: &str, method_arn: &str) -> String {
-    format!("User: {principal} is not authorized to perform: {action} on resource: {method_arn}")
+    ::service_common::iam_authorization::not_authorized_to_perform(principal, action, method_arn)
 }
 
 /// The clause IAM closes a refusal with when the document the API carries DENIES the action
@@ -679,14 +710,19 @@ mod tests {
         }
     }
 
+    /// RULE: a refusal the api's own document decided names the principal, the action, the
+    /// method and WHICH CLASS of document withheld the grant — the resource-based one, which
+    /// is what distinguishes it from the identity-based refusal the gate beside this module
+    /// takes about the same call.
     #[test]
-    fn a_refusal_names_the_principal_the_action_and_the_method() {
+    fn a_refusal_names_the_principal_the_action_the_method_and_the_document_class() {
         let refusal = denial("{\"Statement\":[]}", &call(None, Caller::Anonymous))
             .expect("a document stating nothing refuses a call the method authorizes nobody for");
         assert_eq!(
             refusal,
             "User: anonymous is not authorized to perform: execute-api:Invoke on resource: \
-             arn:aws:execute-api:us-west-2:********0000:abc1230000/s/GET/whoami",
+             arn:aws:execute-api:us-west-2:********0000:abc1230000/s/GET/whoami because no \
+             resource-based policy allows the execute-api:Invoke action",
             "case the refusal sentence: got {refusal:?}"
         );
     }
@@ -828,8 +864,9 @@ mod tests {
         );
     }
 
-    /// RULE: an explicit deny in the document closes the refusal with the clause naming it,
-    /// while a document that merely states nothing refuses with the sentence alone.
+    /// RULE: a refusal the document decided closes with the clause naming WHY it withheld
+    /// the grant — an explicit deny in that document, or no resource-based allow for the
+    /// action asked for.
     #[test]
     fn an_explicit_deny_closes_the_refusal_with_its_own_clause() {
         let deny_all = "{\"Statement\":[{\"Effect\":\"Deny\",\"Principal\":\"*\",\
@@ -845,7 +882,11 @@ mod tests {
                 deny_all,
                 format!("{sentence} with an explicit deny in a resource-based policy"),
             ),
-            ("a document stating nothing", "{\"Statement\":[]}", sentence.to_string()),
+            (
+                "a document stating nothing",
+                "{\"Statement\":[]}",
+                format!("{sentence} because no resource-based policy allows the {INVOKE_ACTION} action"),
+            ),
         ];
         for (case, document, expected) in rows {
             let refusal = denial(document, &call(None, Caller::Anonymous))
@@ -915,14 +956,40 @@ mod tests {
         }
     }
 
+    /// RULE: the invalidation refusal is worded exactly as the invoke's is — its own action
+    /// named, closed by the clause naming why the document withheld the grant.
     #[test]
     fn an_unauthorized_invalidation_names_its_own_action() {
-        let refusal = invalidation_not_authorized(&call(None, Caller::Anonymous));
-        assert_eq!(
-            refusal,
-            "User: anonymous is not authorized to perform: execute-api:InvalidateCache on \
-             resource: arn:aws:execute-api:us-west-2:********0000:abc1230000/s/GET/whoami",
-            "case the refusal sentence: got {refusal:?}"
+        let resource = "arn:aws:execute-api:us-west-2:********0000:abc1230000/s/GET/whoami";
+        // Rows differ along what the document stated about the invalidation: nothing at all,
+        // and an explicit deny.
+        let deny = format!(
+            "{{\"Statement\":[{{\"Effect\":\"Deny\",\"Principal\":\"*\",\
+             \"Action\":\"{INVALIDATE_CACHE_ACTION}\",\"Resource\":\"execute-api:/*\"}}]}}"
         );
+        let rows: Vec<(&str, Option<String>, String)> = vec![
+            (
+                "no document at all",
+                None,
+                format!(
+                    "User: anonymous is not authorized to perform: {INVALIDATE_CACHE_ACTION} on \
+                     resource: {resource} because no resource-based policy allows the \
+                     {INVALIDATE_CACHE_ACTION} action"
+                ),
+            ),
+            (
+                "an explicit deny",
+                Some(deny),
+                format!(
+                    "User: anonymous is not authorized to perform: {INVALIDATE_CACHE_ACTION} on \
+                     resource: {resource} with an explicit deny in a resource-based policy"
+                ),
+            ),
+        ];
+        for (case, document, expected) in rows {
+            let refusal =
+                invalidation_not_authorized(document.as_deref(), &call(None, Caller::Anonymous));
+            assert_eq!(refusal, expected, "case {case}: got {refusal:?}");
+        }
     }
 }

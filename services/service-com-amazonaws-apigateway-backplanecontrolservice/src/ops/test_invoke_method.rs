@@ -378,11 +378,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         log.line(crate::service::invoke::stage_logs::traced_header_names_line(
             &headers.names(),
         ));
-        // The body's SIZE, not the body: it is the caller's own text, and reporting its
-        // length says what the integration was handed without copying a payload into a log.
-        log.line(format!(
-            "Method request body before transformations: {} byte(s)",
-            input.body.as_deref().unwrap_or_default().len()
+        // The method request AS THE CALLER DESCRIBED IT, at the first of the four
+        // transformation points an execution log states: the simulated request's own body,
+        // through the one line builder a stage's data trace states a payload with
+        // ([`crate::service::invoke::stage_logs::traced_payload_line`]), so a transformation
+        // point is worded and bounded the same way whichever side drove the call. The log IS
+        // this operation's answer about the configuration it was asked to exercise, and it
+        // travels back to the caller that supplied the body beside the response rendered from
+        // it, so stating each payload discloses nothing the same response does not already
+        // carry — which is why a stage, whose trace goes to a log group, states one only
+        // under the method's own `dataTrace` setting.
+        log.line(crate::service::invoke::stage_logs::traced_payload_line(
+            "Method request body before transformations",
+            input.body.as_deref().unwrap_or_default().as_bytes(),
         ));
         let stage_variables = simulated_request::map_names(input.stage_variables.as_ref());
         if !stage_variables.is_empty() {
@@ -561,7 +569,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 (
                                     mapped,
                                     performed.configuration_error,
-                                    performed.exchanged_sizes(),
+                                    performed.exchanged_payloads(),
                                 )
                             })
                         })
@@ -577,11 +585,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // The INTEGRATION REQUEST as the integration's own transformation made it,
                 // where the call crossed to a backend at all: the step between the method
                 // request and the backend's answer, which the stage's own execution log
-                // records at this very point ([`crate::service::invoke::stage_logs`]). The
-                // SIZE, not the bytes, for the reason the method request's own line gives.
-                if let Some((sent, _)) = exchanged {
-                    log.line(format!(
-                        "Endpoint request body after transformations: {sent} byte(s)"
+                // records at this very point ([`crate::service::invoke::stage_logs`]).
+                if let Some((sent, _)) = exchanged.as_ref() {
+                    log.line(crate::service::invoke::stage_logs::traced_payload_line(
+                        "Endpoint request body after transformations",
+                        sent,
                     ));
                 }
                 // A backend answer API Gateway could not use is a configuration error of the
@@ -597,9 +605,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // And the BACKEND's own answer as it arrived, before this api's integration
                 // responses mapped it — the other half of the integration's phases, logged
                 // where the stage logs it.
-                if let Some((_, received)) = exchanged {
-                    log.line(format!(
-                        "Endpoint response body before transformations: {received} byte(s)"
+                if let Some((_, received)) = exchanged.as_ref() {
+                    log.line(crate::service::invoke::stage_logs::traced_payload_line(
+                        "Endpoint response body before transformations",
+                        received,
                     ));
                 }
                 (served.status, served.body, headers)
@@ -670,9 +679,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect::<Vec<String>>()
                 .join(", ")
         ));
-        log.line(format!(
-            "Method response body after transformations: {} byte(s)",
-            body.len()
+        log.line(crate::service::invoke::stage_logs::traced_payload_line(
+            "Method response body after transformations",
+            &body,
         ));
         log.line(format!("Method completed with status: {status}"));
 

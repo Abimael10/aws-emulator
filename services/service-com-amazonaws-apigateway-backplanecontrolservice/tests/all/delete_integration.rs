@@ -10,13 +10,16 @@
 //! existing harness, reused from `rest_api_lifecycle`, `method_integration` and
 //! `method_response`.
 //!
-//! The rule under test: a `DeleteIntegration` removes exactly the one integration its
-//! `(restApiId, resourceId, httpMethod)` names — and the integration responses stored on
-//! it — answering the modelled 204 with an empty body, so every later read of that
-//! integration or of one of its responses answers the modelled `NotFoundException` (404)
-//! while the owning method, its method responses and every other stored integration are
-//! untouched and the method is free to carry a new integration again; a request naming no
-//! stored record removes nothing and is refused 404.
+//! The rule under test: a `DeleteIntegration` leaves the method its
+//! `(restApiId, resourceId, httpMethod)` names carrying NO integration — and so removes the
+//! integration responses stored on it — answering the modelled 204 with an empty body, so
+//! every later read of that integration or of one of its responses answers the modelled
+//! `NotFoundException` (404) while the owning method, its method responses and every other
+//! stored integration are untouched and the method is free to carry a new integration again.
+//! The integration is the ONE record that slot of the method holds and carries no identifier
+//! of its own, so a method that already carries none is already in the state the call asks
+//! for: the call answers 204 and changes nothing. An address that resolves to no method at
+//! all is a different thing and is refused 404, removing nothing.
 //!
 //! The tables span what the rule generalises over: the integration type (every value of
 //! the modelled `IntegrationType`), the method's verb and a spelling of it the resource
@@ -198,9 +201,10 @@ async fn deleting_an_integration_removes_it_and_the_responses_stored_on_it() {
             deleted.body
         );
 
-        // The integration is gone for a reader, and a spelling of the verb the resource
-        // holds no method under reaches nothing either, and
-        // deleting it again finds nothing to delete.
+        // The integration is gone for a reader, while deleting it AGAIN leaves the method
+        // in the very state the call asks for and answers the modelled 204; a spelling of
+        // the verb the resource holds no method under reaches no method, so it is refused
+        // instead.
         for verb_probe in [verb.to_ascii_uppercase(), verb.to_ascii_lowercase()] {
             assert_failure(
                 &get_integration(&gateway, &api, &resource, &verb_probe).await,
@@ -208,11 +212,21 @@ async fn deleting_an_integration_removes_it_and_the_responses_stored_on_it() {
                 "NotFoundException",
                 &format!("{case} / GetIntegration({verb_probe})"),
             );
+        }
+        let again = delete_integration(&gateway, &api, &resource, &addressed).await;
+        assert_eq!(
+            again.status, 204,
+            "case {case}: expected 204 from DeleteIntegration({addressed}) again, got {} with \
+             {:?}",
+            again.status, again.body
+        );
+        let lowercase = verb.to_ascii_lowercase();
+        if lowercase != addressed {
             assert_failure(
-                &delete_integration(&gateway, &api, &resource, &verb_probe).await,
+                &delete_integration(&gateway, &api, &resource, &lowercase).await,
                 404,
                 "NotFoundException",
-                &format!("{case} / DeleteIntegration({verb_probe}) again"),
+                &format!("{case} / DeleteIntegration({lowercase}) again"),
             );
         }
 
@@ -382,9 +396,10 @@ async fn an_unknown_identifier_is_a_not_found_and_removes_nothing() {
     );
     let missing = "zzzzzzzzzz";
 
-    // Rows span each of the three identifiers this operation resolves, one unresolvable
-    // at a time: the API, the resource, a verb naming no method on the resource, a verb
-    // outside the catalog, and a method that exists but carries no integration.
+    // Rows span each of the identifiers this operation RESOLVES, one unresolvable at a
+    // time: the API, the resource, a verb naming no method on the resource, and a verb
+    // outside the catalog. A method that exists and carries no integration is NOT one of
+    // them — it is the state the call asks for, asserted below.
     let cases: Vec<(&str, String)> = vec![
         (
             "an unknown restApiId",
@@ -406,10 +421,6 @@ async fn an_unknown_identifier_is_a_not_found_and_removes_nothing() {
             "a verb outside the catalog",
             format!("/restapis/{api}/resources/{resource}/methods/TRACE/integration"),
         ),
-        (
-            "a method carrying no integration",
-            format!("/restapis/{api}/resources/{resource}/methods/POST/integration"),
-        ),
     ];
     for (case, uri) in &cases {
         assert_failure(
@@ -419,6 +430,27 @@ async fn an_unknown_identifier_is_a_not_found_and_removes_nothing() {
             case,
         );
     }
+
+    // The method that exists and carries no integration: the call asks for a method
+    // carrying none, which is what that method already is, so it answers the modelled 204
+    // and the method is still there to be read.
+    let bare_delete = delete_integration(&gateway, &api, &resource, "POST").await;
+    assert_eq!(
+        bare_delete.status, 204,
+        "case a method carrying no integration: expected the modelled 204, got {} with {:?}",
+        bare_delete.status, bare_delete.body
+    );
+    let bare_method = get_method(&gateway, &api, &resource, "POST").await;
+    assert_eq!(
+        bare_method.status, 200,
+        "case the method after the 204: expected 200, got {} with {:?}",
+        bare_method.status, bare_method.body
+    );
+    assert!(
+        bare_method.body["methodIntegration"].is_null(),
+        "case the method after the 204: expected no methodIntegration, got {:?}",
+        bare_method.body["methodIntegration"]
+    );
 
     // Every refused call removed nothing: the stored integration and its response are
     // still there.

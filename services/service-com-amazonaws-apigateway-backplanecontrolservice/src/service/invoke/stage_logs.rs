@@ -145,15 +145,6 @@ pub(super) struct Exchanged {
     pub(super) received: Vec<u8>,
 }
 
-impl Exchanged {
-    /// How many bytes crossed each way: the integration request as sent, and the backend's
-    /// answer as received. What a log line reports where the payloads themselves are not
-    /// reported ([`payload_line`], and a simulated invocation's own log).
-    pub(super) fn sizes(&self) -> (usize, usize) {
-        (self.sent.len(), self.received.len())
-    }
-}
-
 /// A configuration error of the method's integration, as the execution log records it.
 #[derive(Debug)]
 pub(super) struct Unperformed {
@@ -776,17 +767,26 @@ pub(crate) fn traced_header_names_line(names: &[String]) -> String {
 /// logging is enabled for this method, which affects the log entries pushed to Amazon
 /// CloudWatch Logs" (`MethodSetting$dataTrace`) — so the payload lines ARE the data trace: with
 /// it off the trace carries no line about a payload at all, and with it on the line carries the
-/// payload's bytes. A payload past [`MAX_TRACED_PAYLOAD_BYTES`] is reported by its size
+/// payload itself ([`traced_payload_line`]).
+fn payload_line(what: &str, payload: &[u8], data_trace: bool) -> Option<String> {
+    data_trace.then(|| traced_payload_line(what, payload))
+}
+
+/// The line one transformation point of a call writes: what that point is, and the payload
+/// that crossed it. A payload past [`MAX_TRACED_PAYLOAD_BYTES`] is reported by its size
 /// instead, which is this emulator's resource guard on one log event rather than a line API
 /// Gateway words that way.
-fn payload_line(what: &str, payload: &[u8], data_trace: bool) -> Option<String> {
-    if !data_trace {
-        return None;
-    }
+///
+/// One copy, shared with `TestInvokeMethod`: a stage's data trace and the log a simulated
+/// invocation returns word a transformation point the same way, and are bounded the same way.
+/// What differs is only WHETHER the line is written — a stage writes it under the method's
+/// `dataTrace` setting ([`payload_line`]), while a simulated invocation reaches no stage and
+/// no setting and returns the whole trace of the one call its caller asked for.
+pub(crate) fn traced_payload_line(what: &str, payload: &[u8]) -> String {
     if payload.len() <= MAX_TRACED_PAYLOAD_BYTES {
-        return Some(format!("{what}: {}", String::from_utf8_lossy(payload)));
+        return format!("{what}: {}", String::from_utf8_lossy(payload));
     }
-    Some(format!("{what}: {} byte(s)", payload.len()))
+    format!("{what}: {} byte(s)", payload.len())
 }
 
 /// The NAMES of the headers the request carries, in name order.

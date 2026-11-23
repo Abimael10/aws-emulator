@@ -26,6 +26,12 @@
 //! PRINCIPAL it names, the condition key it is written over (one this endpoint can answer
 //! for and one it cannot) and the endpoint the request arrives through (the named one,
 //! another, none at all).
+//!
+//! The refusal's own closing CLAUSE is part of the rule: the sentence names the document
+//! class that withheld the grant, so a client can tell a refusal the api's own document took
+//! from the identity-based one the gate beside it takes — an explicit `Deny` in the document
+//! closes it with that deny, and a document that merely allows the call nowhere closes it
+//! with no resource-based policy allowing the action asked for.
 
 use serde_json::{json, Value};
 
@@ -338,9 +344,9 @@ fn assert_served(case: &str, status: u16, body: &str) {
 
 /// Assert that the request was refused as unauthorized: `403`, the authorization sentence
 /// naming the principal, the action and the method ARN as the endpoint REPORTS it — the
-/// account masked but for its last four digits — closed by the explicit-deny clause where
-/// `expected` says the document DENIED the call, and NOTHING of the integration's body: a
-/// refused request never reached it.
+/// account masked but for its last four digits — closed by the clause naming WHY the api's
+/// document withheld the grant (its explicit `Deny`, or no resource-based allow for the
+/// action), and NOTHING of the integration's body: a refused request never reached it.
 fn assert_refused(
     case: &str,
     status: u16,
@@ -355,9 +361,9 @@ fn assert_refused(
     );
     let message = authorization_message(body, case);
     let closing = if expected == Expected::DeniedExplicitly {
-        " with an explicit deny in a resource-based policy"
+        " with an explicit deny in a resource-based policy".to_string()
     } else {
-        ""
+        " because no resource-based policy allows the execute-api:Invoke action".to_string()
     };
     assert_eq!(
         message,
@@ -402,7 +408,8 @@ fn source_vpce_is(endpoint: &str) -> Value {
 
 /// What the stage owes one row: the integration's own answer, or the refusal — whose
 /// sentence closes with the explicit-deny clause exactly where the document DENIED the call,
-/// rather than merely failing to allow it.
+/// and with the clause naming the RESOURCE-BASED document as what failed to allow the call
+/// where it merely stated nothing about it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Expected {
     /// The document admits the call and the integration answers.

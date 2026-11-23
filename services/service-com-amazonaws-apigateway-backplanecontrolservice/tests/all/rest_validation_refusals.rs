@@ -70,6 +70,12 @@ const AWS_URI_WITHOUT_PATH_OR_ACTION: &str = "AWS ARN for integration must conta
 /// this service's one sentence for an unresolved method identifier.
 const NO_SUCH_METHOD: &str = "Invalid Method identifier specified";
 
+/// The message a call whose target is the method's INTEGRATION earns for the same
+/// unresolvable verb: the verb and the integration are one ADDRESS of that integration, so a
+/// verb no method stands under leaves it unresolvable. `PutIntegration` is the exception
+/// among them: it CREATES the integration, so the record it has to find is the method.
+const NO_SUCH_INTEGRATION: &str = "Invalid Integration identifier specified";
+
 /// The sentence a `stageName` outside its alphabet is refused with: fixed text naming the
 /// set, with nothing of the request in it.
 const INVALID_STAGE_NAME: &str = "Stage name only allows a-zA-Z0-9_";
@@ -198,40 +204,64 @@ async fn a_method_is_addressed_only_by_the_verb_it_was_created_with() {
 
     // The rule is the method IDENTIFIER's, not one operation's: every call that addresses
     // a method by its `httpMethod` label resolves it the same way. One row per such call,
-    // each sent with a spelling the resource holds no method under.
-    let unresolved: Vec<(&str, &str, String)> = vec![
+    // each sent with a spelling the resource holds no method under, carrying the sentence
+    // that call's own unresolvable ADDRESS earns: a call addressing the method reports the
+    // method, one addressing the integration under it — or a response of that integration —
+    // reports the integration that address resolves to nothing, and a call that CREATES the
+    // integration reports the method it must attach it to.
+    let unresolved: Vec<(&str, &str, String, &str)> = vec![
         (
             "PutIntegration",
             "PUT",
             format!("/restapis/{api}/resources/{resource}/methods/get/integration"),
+            NO_SUCH_METHOD,
         ),
         (
             "GetIntegration",
             "GET",
             format!("/restapis/{api}/resources/{resource}/methods/get/integration"),
+            NO_SUCH_INTEGRATION,
+        ),
+        (
+            "DeleteIntegration",
+            "DELETE",
+            format!("/restapis/{api}/resources/{resource}/methods/get/integration"),
+            NO_SUCH_INTEGRATION,
+        ),
+        (
+            "GetIntegrationResponse",
+            "GET",
+            format!(
+                "/restapis/{api}/resources/{resource}/methods/get/integration/responses/200"
+            ),
+            NO_SUCH_INTEGRATION,
         ),
         (
             "PutMethodResponse",
             "PUT",
             format!("/restapis/{api}/resources/{resource}/methods/get/responses/200"),
+            NO_SUCH_METHOD,
         ),
         (
             "UpdateMethod",
             "PATCH",
             format!("/restapis/{api}/resources/{resource}/methods/get"),
+            NO_SUCH_METHOD,
         ),
         (
             "DeleteMethod",
             "DELETE",
             format!("/restapis/{api}/resources/{resource}/methods/get"),
+            NO_SUCH_METHOD,
         ),
         (
             "TestInvokeMethod",
             "POST",
             format!("/restapis/{api}/resources/{resource}/methods/get"),
+            NO_SUCH_METHOD,
         ),
     ];
-    for (operation, verb, uri) in &unresolved {
+    for (operation, verb, uri, message) in &unresolved {
         let case = format!("{operation} addressing the verb as \"get\"");
         let body = match *operation {
             "PutIntegration" => Some(json!({ "type": "MOCK" })),
@@ -239,7 +269,7 @@ async fn a_method_is_addressed_only_by_the_verb_it_was_created_with() {
             _ => None,
         };
         let answer = gateway.call(verb, uri, body).await;
-        assert_refusal(&answer, (404, "NotFoundException"), NO_SUCH_METHOD, &case);
+        assert_refusal(&answer, (404, "NotFoundException"), message, &case);
     }
 
     // And nothing was created under the other spelling: the resource still holds exactly

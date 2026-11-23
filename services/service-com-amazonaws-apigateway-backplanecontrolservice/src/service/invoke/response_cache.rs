@@ -122,7 +122,7 @@ pub(super) fn cache_plan(
                 .as_deref()
             {
                 Some(STRATEGY_FAIL_WITH_403) => {
-                    return Caching::Refused(invalidation_refusal(req, call));
+                    return Caching::Refused(invalidation_refusal(req, policy, call));
                 }
                 Some(STRATEGY_SUCCEED_WITH_RESPONSE_HEADER) => warn = true,
                 // `SUCCEED_WITHOUT_RESPONSE_HEADER`, and a stage that names no strategy at
@@ -151,9 +151,13 @@ pub(super) fn cache_plan(
 /// names a principal the api's policy decided against, which is an authorization failure: it
 /// is answered through `ACCESS_DENIED`, carrying the sentence AWS refuses the action it asked
 /// for with ([`resource_policy::invalidation_not_authorized`]).
-fn invalidation_refusal(req: &RtRequest, call: &resource_policy::Call<'_>) -> GatewayRefusal {
+fn invalidation_refusal(
+    req: &RtRequest,
+    policy: Option<&str>,
+    call: &resource_policy::Call<'_>,
+) -> GatewayRefusal {
     if carries_sigv4_credential(req) {
-        return access_denied(resource_policy::invalidation_not_authorized(call));
+        return access_denied(resource_policy::invalidation_not_authorized(policy, call));
     }
     MISSING_AUTHENTICATION_TOKEN
 }

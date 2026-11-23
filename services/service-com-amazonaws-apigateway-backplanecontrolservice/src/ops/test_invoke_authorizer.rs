@@ -330,11 +330,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         log.line(crate::service::invoke::stage_logs::traced_header_names_line(
             &headers.names(),
         ));
-        // The body's SIZE, not the body: it is the caller's own text, and reporting its
-        // length says what the simulation carried without copying a payload into a log.
-        log.line(format!(
-            "Method request body before transformations: {} byte(s)",
-            input.body.as_deref().unwrap_or_default().len()
+        // The method request AS THE CALLER DESCRIBED IT, at the first transformation point an
+        // execution log states, through the one line builder a payload is stated with
+        // ([`crate::service::invoke::stage_logs::traced_payload_line`]) — so the two
+        // `TestInvoke*` operations word and bound a transformation point alike. The log is
+        // this operation's answer about the authorizer it was asked to exercise and travels
+        // back to the caller that supplied the body, so stating it discloses nothing that
+        // caller does not hold.
+        log.line(crate::service::invoke::stage_logs::traced_payload_line(
+            "Method request body before transformations",
+            input.body.as_deref().unwrap_or_default().as_bytes(),
         ));
         let stage_variables = simulated_request::map_names(input.stage_variables.as_ref());
         if !stage_variables.is_empty() {

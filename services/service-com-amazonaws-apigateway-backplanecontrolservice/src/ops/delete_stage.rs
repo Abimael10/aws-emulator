@@ -2,7 +2,9 @@
 
 //! @op DeleteStage
 //! IMPLEMENTED: removes the stored `Stage` of `restApiId` named by `stageName`, so every
-//! later read of it answers the modelled `NotFoundException`.
+//! later read of it answers the modelled `NotFoundException`, and drops the `apiStages`
+//! association every usage plan held on that stage, so no plan meters a stage that no
+//! longer exists.
 //!
 //! ## Shape of an operation
 //!
@@ -192,11 +194,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // what lets another stage keep serving it and a later `CreateStage` point a new
         // stage at it, so it stays.
         //
-        // The records of OTHER resources that merely NAME a stage — an `ApiKey`'s
-        // `stageKeys`, a `UsagePlan`'s `apiStages` — are their own operations' to write:
-        // `DeleteStage` models no error for them and the model states no rule for
-        // rewriting them, so this call leaves them exactly as `DeleteRestApi` does, and
-        // dropping an association is `UpdateApiKey`'s / `UpdateUsagePlan`'s job.
+        // The records of OTHER resources that merely NAME a stage are each their own
+        // record's business, and they are not alike: an `ApiKey`'s `stageKeys` is written
+        // by `UpdateApiKey` and left exactly as `DeleteRestApi` leaves it, while a
+        // `UsagePlan`'s `apiStages` entry is an ASSOCIATION with this very stage — what the
+        // plan's throttle and quota meter — and a plan cannot meter a stage that does not
+        // exist. So the association goes with the stage ([`forget_api_stage`]) and no read
+        // of a plan reports a dangling one; the plan itself, its limits and the keys it
+        // meters are untouched.
 
         // A `BasePathMapping` that names this stage ROUTES to it: the calls arriving on
         // its base path of a custom domain name are served by this stage, so removing the
@@ -225,6 +230,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get_mut(&input.rest_api_id)
             .ok_or_else(crate::state::state_unavailable)?;
         api.stages.remove(&input.stage_name);
+        // The association every usage plan held on this stage goes with it, under the same
+        // hold of the lock as the removal: no call can read a plan between the stage's
+        // going and its associations'.
+        let unmetered = store.forget_api_stage(&input.rest_api_id, &input.stage_name);
         // The store lock is released before the record is formatted: the critical section
         // covers the state change only.
         drop(store);
@@ -238,6 +247,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             caller = ?crate::state::request_caller(ctx.parts()),
             rest_api_id = ?input.rest_api_id,
             stage_name = ?input.stage_name,
+            unmetered,
             outcome = "deleted",
             "stage deleted",
         );

@@ -233,10 +233,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resource = store
             .resource(&input.rest_api_id, &input.resource_id)
             .map_err(|message| not_found(&message))?;
+        // The integration is addressed THROUGH the method that carries it, so a verb the
+        // resource holds no method under leaves the INTEGRATION this call addresses
+        // unresolvable: the refusal reports that integration rather than the method it
+        // walked through, which is what a call whose own target is the method reports
+        // (`crate::state::NO_SUCH_METHOD`).
         let method = resource
             .methods
             .get(&super::put_method::method_key(&input.http_method))
-            .ok_or_else(|| not_found(crate::state::NO_SUCH_METHOD))?;
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_INTEGRATION))?;
         // A method with no integration has no `Integration` record to report: the
         // identifier in the URI names one that does not exist.
         method

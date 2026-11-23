@@ -503,10 +503,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resource = store
             .resource_mut(&input.rest_api_id, &input.resource_id)
             .map_err(|message| not_found(&message))?;
+        // ... and THROUGH its method, so a verb the resource holds no method under leaves
+        // the integration this call addresses unresolvable too: one address, one refusal
+        // (`crate::state::NO_SUCH_INTEGRATION`).
         let method = resource
             .methods
             .get_mut(&verb)
-            .ok_or_else(|| not_found(crate::state::NO_SUCH_METHOD))?;
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_INTEGRATION))?;
         // Patched on a COPY: a list whose later op is refused leaves the stored
         // integration untouched, rather than keeping the ops before it. A method with no
         // integration has none to patch: the identifier in the URI names one that does

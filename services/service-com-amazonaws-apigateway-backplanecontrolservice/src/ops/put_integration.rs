@@ -823,7 +823,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(|message| not_found(&message))?;
         let resource_id = resource.id.clone();
         // An integration belongs to a METHOD: the verb in the URI must already name one
-        // on the resource, or there is nothing to attach it to.
+        // on the resource, or there is nothing to attach it to, and the refusal names that
+        // METHOD — the record this write has to find before it can write anything.
         let method = resource
             .methods
             .get_mut(&method_key(&input.http_method))
