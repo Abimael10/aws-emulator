@@ -18,6 +18,14 @@
 //! * a `resourceArn` the model admits is not refused at all — it reaches the handler,
 //!   which answers for the resource it names.
 //!
+//! The plane's OTHER refusal class is asserted here as well, because it is the one a
+//! caller must be able to tell apart from the syntax one: an ARN the plane PARSED and
+//! resolved to no resource is refused with the plane's own absent-resource class — the
+//! wire error code [`ABSENT_RESOURCE_CODE`] and the fixed sentence
+//! [`ABSENT_RESOURCE_MESSAGE`], not the `ResourceNotFoundException` this service's model
+//! declares on those operations and its resource reads answer — identically on all three
+//! operations, and with a code that differs from the syntax refusal's.
+//!
 //! Every bound and pattern written out by hand names its source: `resourceArn` is an `Arn`
 //! (`@length(min 20, max 2048)`, `@pattern ^arn:aws[0-9a-zA-Z_\-:\/]+$`) bound
 //! `@httpLabel` on `ListTagsForResource` (`GET /tags/{resourceArn}` -> 200),
@@ -31,7 +39,9 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::front_door_validation::{arn_of_length, FRONT_DOOR_CODE, FRONT_DOOR_MESSAGE};
 use crate::landing_zone_lifecycle::{call, dispatch, emulator, Answer};
-use crate::resource_tags::{resources, tags_path};
+use crate::resource_tags::{
+    resources, tags_path, ABSENT_RESOURCE_CODE, ABSENT_RESOURCE_MESSAGE,
+};
 
 /// The message a `resourceArn` the service cannot read as an ARN is refused with: the
 /// sentence for that one parameter, which names neither the value the caller sent nor the
@@ -257,8 +267,9 @@ async fn every_other_pre_handler_refusal_keeps_the_generic_sentence() {
 
 /// RULE (the other side of it): a `resourceArn` the `Arn` shape admits is not refused at
 /// all. It reaches the handler, which answers for the resource it names — the modelled
-/// success for an ARN this service minted, and the modelled `ResourceNotFoundException`
-/// (404) for one it did not — and neither answer carries the ARN-syntax sentence.
+/// success for an ARN this service minted, and the plane's own absent-resource class
+/// (404 [`ABSENT_RESOURCE_CODE`]) for one it did not — and neither answer carries the
+/// ARN-syntax sentence.
 #[tokio::test]
 async fn a_resource_arn_the_model_admits_reaches_the_handler() {
     let router = emulator();
@@ -309,7 +320,7 @@ async fn a_resource_arn_the_model_admits_reaches_the_handler() {
                     None,
                 )
             } else {
-                (404, Some("ResourceNotFoundException"))
+                (404, Some(ABSENT_RESOURCE_CODE))
             };
             assert_eq!(
                 (answer.status, answer.error_code.as_deref()),
@@ -329,5 +340,194 @@ async fn a_resource_arn_the_model_admits_reaches_the_handler() {
                 answer.body
             );
         }
+    }
+}
+
+/// Every way a value can be a `resourceArn` the `Arn` shape ADMITS and this service
+/// resolves to no resource, built against the resources `created` holds so a near-miss of a
+/// real ARN is among them.
+///
+/// Rows differ along what the rule generalises over: which resource kind the ARN names
+/// (each of the three this service mints, one it mints no resources of, and another
+/// service's), the form and length of its id (the 32-character identifier form, a UUID, a
+/// bare word), its length against each published `Arn` bound, and how far it is from an ARN
+/// that DOES resolve — down to a single character.
+fn well_formed_arns_naming_nothing(created: &[crate::resource_tags::Resource]) -> Vec<(String, String)> {
+    let mut rows: Vec<(String, String)> = vec![
+        (
+            "a landing zone ARN nothing minted".to_string(),
+            "arn:aws:controltower:us-west-2:000000000000:landingzone/\
+             00000000-0000-0000-0000-000000000000"
+                .to_string(),
+        ),
+        (
+            "an enabled-control ARN whose id is 32 characters long".to_string(),
+            "arn:aws:controltower:us-west-2:000000000000:enabledcontrol/\
+             AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                .to_string(),
+        ),
+        (
+            "an enabled-baseline ARN nothing minted".to_string(),
+            "arn:aws:controltower:us-west-2:000000000000:enabledbaseline/\
+             deadbeef-dead-beef-dead-beefdeadbeef"
+                .to_string(),
+        ),
+        (
+            "a controltower ARN naming a resource kind this service mints none of".to_string(),
+            "arn:aws:controltower:us-west-2:000000000000:guardrail/unheard-of".to_string(),
+        ),
+        (
+            "another service's ARN".to_string(),
+            "arn:aws:organizations::000000000000:ou/o-emulatororg/ou-abcd-9z".to_string(),
+        ),
+        (
+            "a value exactly at the length min of 20".to_string(),
+            arn_of_length(20),
+        ),
+        (
+            "a value exactly at the length max of 2048".to_string(),
+            arn_of_length(2048),
+        ),
+    ];
+    for resource in created {
+        rows.push((
+            format!("the minted ARN of {}, one character off", resource.case),
+            crate::list_tags_for_resource::one_character_off(&resource.arn),
+        ));
+    }
+    rows
+}
+
+/// RULE: an ARN the tag plane PARSED and resolved to no resource is refused with the
+/// plane's own absent-resource class — 404, the wire error code [`ABSENT_RESOURCE_CODE`]
+/// in both the `x-amzn-errortype` header and the body's `__type`, and the fixed sentence
+/// [`ABSENT_RESOURCE_MESSAGE`] — identically on all three tag-plane operations, whatever
+/// the ARN names.
+#[tokio::test]
+async fn an_arn_naming_no_resource_is_refused_as_the_tag_planes_absent_resource() {
+    let router = emulator();
+    let created = resources(&router).await;
+
+    for (case, arn) in well_formed_arns_naming_nothing(&created) {
+        for request in tag_plane_calls() {
+            let refused = address(&router, &request, &arn).await;
+            assert_eq!(
+                (refused.status, refused.error_code.as_deref()),
+                (404, Some(ABSENT_RESOURCE_CODE)),
+                "case {case:?} on {}: expected 404 {ABSENT_RESOURCE_CODE}, got {:?} body \
+                 {:?}",
+                request.operation,
+                (refused.status, refused.error_code.as_deref()),
+                refused.body
+            );
+            assert_eq!(
+                wire_type(&refused),
+                ABSENT_RESOURCE_CODE,
+                "case {case:?} on {}: expected __type {ABSENT_RESOURCE_CODE} — the header \
+                 and the body name one class — got {:?}",
+                request.operation,
+                wire_type(&refused)
+            );
+            assert_eq!(
+                message(&refused),
+                ABSENT_RESOURCE_MESSAGE,
+                "case {case:?} on {}: expected the fixed sentence \
+                 {ABSENT_RESOURCE_MESSAGE:?}, got {:?}",
+                request.operation,
+                message(&refused)
+            );
+            assert!(
+                !message(&refused).contains(arn.as_str()),
+                "case {case:?} on {}: the sentence is fixed text and must not echo the \
+                 ARN, got {:?}",
+                request.operation,
+                message(&refused)
+            );
+        }
+    }
+}
+
+/// RULE (how far it reaches): the plane's two refusal classes stay DISTINGUISHABLE by
+/// code, and the plane's class is the plane's alone — this service's resource reads keep
+/// the `ResourceNotFoundException` their model declares for a resource they do not hold.
+#[tokio::test]
+async fn the_planes_two_refusals_differ_and_the_resource_reads_keep_the_modelled_code() {
+    // An account Control Tower has already been set up in, so a resource read answers for
+    // the resource the request names rather than for the absent landing zone its family's
+    // precondition would refuse first.
+    let router = crate::landing_zone_lifecycle::set_up_emulator().await;
+
+    assert_ne!(
+        ABSENT_RESOURCE_CODE, FRONT_DOOR_CODE,
+        "a client must be able to tell 'that is not an ARN' from 'that ARN names nothing'"
+    );
+
+    // The same operation, addressed twice: once with a value the `Arn` shape does not
+    // admit, once with one it admits that resolves to nothing.
+    let well_formed = "arn:aws:controltower:us-west-2:000000000000:enabledcontrol/\
+                       AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    for request in tag_plane_calls() {
+        let malformed = address(&router, &request, "totally-not-an-arn-but-long-enough").await;
+        let absent = address(&router, &request, well_formed).await;
+        assert_eq!(
+            (
+                malformed.error_code.as_deref(),
+                absent.error_code.as_deref()
+            ),
+            (Some(FRONT_DOOR_CODE), Some(ABSENT_RESOURCE_CODE)),
+            "on {}: expected the syntax refusal and the absent-resource refusal to carry \
+             their own codes, got {:?} and {:?}",
+            request.operation,
+            malformed.error_code,
+            absent.error_code
+        );
+        assert_eq!(
+            (message(&malformed), message(&absent)),
+            (
+                INVALID_RESOURCE_ARN.to_string(),
+                ABSENT_RESOURCE_MESSAGE.to_string()
+            ),
+            "on {}: expected each class's own sentence",
+            request.operation
+        );
+    }
+
+    // The resource reads of this service are NOT the tag plane: addressed with the same
+    // absent ARN, each keeps the modelled not-found code.
+    let reads: Vec<(&str, &str, serde_json::Value)> = vec![
+        (
+            "GetEnabledControl",
+            "/get-enabled-control",
+            serde_json::json!({ "enabledControlIdentifier": well_formed }),
+        ),
+        (
+            "GetEnabledBaseline",
+            "/get-enabled-baseline",
+            serde_json::json!({
+                "enabledBaselineIdentifier":
+                    "arn:aws:controltower:us-west-2:000000000000:enabledbaseline/\
+                     AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            }),
+        ),
+        (
+            "GetLandingZone",
+            "/get-landingzone",
+            serde_json::json!({
+                "landingZoneIdentifier":
+                    "arn:aws:controltower:us-west-2:000000000000:landingzone/\
+                     00000000-0000-0000-0000-000000000000",
+            }),
+        ),
+    ];
+    for (operation, path, body) in reads {
+        let refused = call(&router, path, body).await;
+        assert_eq!(
+            (refused.status, refused.error_code.as_deref()),
+            (404, Some("ResourceNotFoundException")),
+            "case {operation:?}: a resource read keeps the modelled not-found code, got \
+             {:?} body {:?}",
+            (refused.status, refused.error_code.as_deref()),
+            refused.body
+        );
     }
 }

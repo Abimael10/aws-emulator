@@ -10,8 +10,12 @@
 //! in [`crate::state`]'s one tag store, keyed by the tagged resource's ARN, which is where
 //! `TagResource` writes them and `ListTagsForResource` reads them back from.
 //!
-//! An ARN that names no resource of this service is refused with the modelled
-//! `ResourceNotFoundException` (404) and writes nothing, and so is a request naming a key
+//! An ARN that names no resource of this service is refused with the TAG PLANE's own
+//! not-found class — the wire code [`crate::state::TAGGING_NOT_FOUND_ERROR_CODE`] with the
+//! fixed sentence [`crate::state::TAGGING_NOT_FOUND_MESSAGE`], carrying the modelled
+//! `ResourceNotFoundException` payload and its 404, shared with `ListTagsForResource` and
+//! `TagResource` (see [`crate::state::TaggingRefusal`]) — and writes nothing, and so is a
+//! request naming a key
 //! in the reserved [`crate::state::RESERVED_TAG_KEY_PREFIX`] namespace, refused with the
 //! modelled `ValidationException` (400): such a key names a tag Amazon Web Services
 //! applies itself, which a caller may neither create nor delete. Success is HTTP 204 with
@@ -97,9 +101,11 @@ pub enum UntagResourceErrorModeled {
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::untag_resource::UntagResourceError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
-pub type UntagResourceError = crate::scaffolded::Scaffolded<UntagResourceErrorModeled>;
+/// (`crate::ops::untag_resource::UntagResourceError`). This is a TAG-PLANE endpoint, so the
+/// channel is the shared [`crate::state::TaggingError`]: the scaffold wrapper (this
+/// operation's modelled errors, and the refusals that wrapper words) plus the tag plane's
+/// own not-found refusal, which this model declares on no shape.
+pub type UntagResourceError = crate::state::TaggingError<UntagResourceErrorModeled>;
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
 /// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
@@ -107,7 +113,7 @@ pub type UntagResourceError = crate::scaffolded::Scaffolded<UntagResourceErrorMo
 /// this operation is implemented.
 impl From<UntagResourceErrorModeled> for UntagResourceError {
     fn from(modeled: UntagResourceErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        Self::Scaffolded(crate::scaffolded::Scaffolded::Modeled(modeled))
     }
 }
 
@@ -181,14 +187,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `resourceArn` is modelled as an `Arn`, so the only value the front door lets
         // through is an ARN — and the ARNs this service mints are the keys of its
-        // resource stores.
+        // resource stores. An ARN naming none of them is the TAG PLANE's own not-found
+        // refusal, the same one its two sibling operations answer.
         if !store.taggable_resource_exists(&input.resource_arn) {
-            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("no resource matches resourceArn {}", input.resource_arn),
-                },
-            )
-            .into());
+            return Err(UntagResourceError::not_found());
         }
 
         // The single removal site for the tag store: a key the resource does not carry has

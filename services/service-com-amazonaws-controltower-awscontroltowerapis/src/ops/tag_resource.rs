@@ -9,8 +9,12 @@
 //! resource's ARN, which is where `ListTagsForResource` reads them back from and where a
 //! resource's teardown drops them.
 //!
-//! An ARN that names no resource of this service is refused with the modelled
-//! `ResourceNotFoundException` (404) and writes nothing; a merge that would take one
+//! An ARN that names no resource of this service is refused with the TAG PLANE's own
+//! not-found class — the wire code [`crate::state::TAGGING_NOT_FOUND_ERROR_CODE`] with the
+//! fixed sentence [`crate::state::TAGGING_NOT_FOUND_MESSAGE`], carrying the modelled
+//! `ResourceNotFoundException` payload and its 404, shared with `ListTagsForResource` and
+//! `UntagResource` (see [`crate::state::TaggingRefusal`]) — and writes nothing; a merge
+//! that would take one
 //! resource past [`crate::state::MAX_TAGS_PER_RESOURCE`] — the `TagMap` `@length` max,
 //! beyond which `ListTagsForResource` could not report the result inside the model's own
 //! constraint — is refused with the modelled `ValidationException` (400) and writes
@@ -99,9 +103,11 @@ pub enum TagResourceErrorModeled {
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::tag_resource::TagResourceError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
-pub type TagResourceError = crate::scaffolded::Scaffolded<TagResourceErrorModeled>;
+/// (`crate::ops::tag_resource::TagResourceError`). This is a TAG-PLANE endpoint, so the
+/// channel is the shared [`crate::state::TaggingError`]: the scaffold wrapper (this
+/// operation's modelled errors, and the refusals that wrapper words) plus the tag plane's
+/// own not-found refusal, which this model declares on no shape.
+pub type TagResourceError = crate::state::TaggingError<TagResourceErrorModeled>;
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
 /// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
@@ -109,7 +115,7 @@ pub type TagResourceError = crate::scaffolded::Scaffolded<TagResourceErrorModele
 /// this operation is implemented.
 impl From<TagResourceErrorModeled> for TagResourceError {
     fn from(modeled: TagResourceErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        Self::Scaffolded(crate::scaffolded::Scaffolded::Modeled(modeled))
     }
 }
 
@@ -183,14 +189,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `resourceArn` is modelled as an `Arn`, so the only value the front door lets
         // through is an ARN — and the ARNs this service mints are the keys of its
-        // resource stores.
+        // resource stores. An ARN naming none of them is the TAG PLANE's own not-found
+        // refusal, the same one its two sibling operations answer.
         if !store.taggable_resource_exists(&input.resource_arn) {
-            return Err(TagResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("no resource matches resourceArn {}", input.resource_arn),
-                },
-            )
-            .into());
+            return Err(TagResourceError::not_found());
         }
 
         // The single merge site for the tag store: past the cap nothing is written and

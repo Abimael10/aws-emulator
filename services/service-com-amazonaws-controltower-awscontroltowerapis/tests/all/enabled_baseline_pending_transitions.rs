@@ -42,7 +42,7 @@ use service_com_amazonaws_controltower_awscontroltowerapis::state::{
 use crate::baseline_operations::{disable, enable, enablements};
 use crate::enabled_control_lifecycle::entries;
 use crate::landing_zone_lifecycle::{
-    call, emulator_with_engine, past_the_settle_span, set_up_account, Answer,
+    call, emulator_with_engine, past_the_settle_span, poll_until, set_up_account, Answer,
 };
 use crate::resource_tags::{apply_tags, read_tags, reported_tags, tags};
 
@@ -337,9 +337,15 @@ async fn a_teardown_whose_record_was_evicted_still_removes_the_enablement_and_it
         enabled.push((row.case, answer.string("arn")));
     }
 
-    // Nothing sleeps server-side: the clock makes the enables due, and the wait is the
-    // test's.
-    tokio::time::sleep(past_the_settle_span()).await;
+    // Nothing sleeps server-side: the clock makes each enable due on its own, so the case
+    // looks again until every enablement reads terminal rather than waiting a fixed time.
+    for (case, arn) in &enabled {
+        poll_until(case, "the enablement reads SUCCEEDED", || async {
+            let (_, details) = get_enabled_baseline(&router, arn).await;
+            status(&details) == Some("SUCCEEDED")
+        })
+        .await;
+    }
 
     for (case, arn) in &enabled {
         let tagged = apply_tags(&router, arn, &attached).await;
@@ -383,7 +389,14 @@ async fn a_teardown_whose_record_was_evicted_still_removes_the_enablement_and_it
         teardowns.push((case, arn.clone(), identifier));
     }
 
-    tokio::time::sleep(past_the_settle_span()).await;
+    // Each teardown falls due on the clock's own schedule, so the case looks again until
+    // every enablement it owed a removal for has stopped resolving.
+    for (case, arn, _) in &teardowns {
+        poll_until(case, "the torn-down enablement stops resolving", || async {
+            get_enabled_baseline(&router, arn).await.0.status == 404
+        })
+        .await;
+    }
 
     let listed = call(&router, "/list-enabled-baselines", serde_json::json!({})).await;
     assert_eq!(
@@ -412,9 +425,9 @@ async fn a_teardown_whose_record_was_evicted_still_removes_the_enablement_and_it
         let read = read_tags(&router, arn).await;
         assert_eq!(
             (read.status, read.error_code.as_deref()),
-            (404, Some("ResourceNotFoundException")),
+            (404, Some(crate::resource_tags::ABSENT_RESOURCE_CODE)),
             "case {case:?}: expected the tags of a torn-down enablement to be gone (404 \
-             ResourceNotFoundException), got {:?} tags {:?}",
+             from the tag plane's absent-resource class), got {:?} tags {:?}",
             (read.status, read.error_code.as_deref()),
             reported_tags(&read)
         );

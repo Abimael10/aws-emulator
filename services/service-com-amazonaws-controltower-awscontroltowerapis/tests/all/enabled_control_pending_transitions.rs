@@ -65,7 +65,7 @@ use crate::governed_target_mandatory_controls::{
 };
 use crate::in_flight_teardown_drift::{disable_control, get_enabled_control};
 use crate::landing_zone_lifecycle::{
-    call, emulator_with_engine, past_the_settle_span, set_up_account, Answer,
+    call, emulator_with_engine, past_the_settle_span, poll_until, set_up_account, Answer,
 };
 use crate::resource_tags::{apply_tags, read_tags, reported_tags, tags};
 
@@ -309,9 +309,17 @@ async fn a_control_teardown_is_decided_once_from_the_resource_not_from_the_log()
         });
     }
 
-    // Nothing sleeps server-side: the clock makes the enables due, and the wait is the
-    // test's. One wait for the whole table, since every row's enable was started before it.
-    tokio::time::sleep(past_the_settle_span()).await;
+    // Nothing sleeps server-side: the clock makes each enable due on its own, so the case
+    // looks again until every row's enablement reads terminal rather than waiting a fixed
+    // time for it.
+    for subject in &enabled {
+        poll_until(&subject.row.case, "the enablement reads SUCCEEDED", || async {
+            let reported = get_enabled_control(&subject.router, &subject.arn).await;
+            reported.status == 200
+                && status_summary_status(reported.get("enabledControlDetails")) == Some("SUCCEEDED")
+        })
+        .await;
+    }
 
     // Each row starts its teardown, and its record meets the fate the row names.
     let mut started: Vec<(Enabled, String)> = Vec::new();
@@ -376,7 +384,23 @@ async fn a_control_teardown_is_decided_once_from_the_resource_not_from_the_log()
         started.push((subject, identifier));
     }
 
-    tokio::time::sleep(past_the_settle_span()).await;
+    // The teardown each row parked falls due on the clock's own schedule, so the case looks
+    // again until the clock has decided it: the enablement is gone, or it has settled back
+    // out of the transient status the teardown left it in.
+    for (subject, _) in &started {
+        let removes = subject.row.fate.removes_the_enablement();
+        poll_until(&subject.row.case, "the clock has decided the parked teardown", || async {
+            let reported = get_enabled_control(&subject.router, &subject.arn).await;
+            if removes {
+                reported.status == 404
+            } else {
+                reported.status == 200
+                    && status_summary_status(reported.get("enabledControlDetails"))
+                        == Some("SUCCEEDED")
+            }
+        })
+        .await;
+    }
 
     // The teardown the clock has settled: removed, or decided to remove nothing — once.
     let mut survivors: Vec<Enabled> = Vec::new();
@@ -395,9 +419,9 @@ async fn a_control_teardown_is_decided_once_from_the_resource_not_from_the_log()
             );
             assert_eq!(
                 (read.status, read.error_code.as_deref()),
-                (404, Some("ResourceNotFoundException")),
+                (404, Some(crate::resource_tags::ABSENT_RESOURCE_CODE)),
                 "case {case:?}: expected the tags of a torn-down enablement to be gone (404 \
-                 ResourceNotFoundException), got {:?} tags {:?}",
+                 from the tag plane's absent-resource class), got {:?} tags {:?}",
                 (read.status, read.error_code.as_deref()),
                 reported_tags(&read)
             );
@@ -506,7 +530,16 @@ async fn a_control_teardown_is_decided_once_from_the_resource_not_from_the_log()
         repeated.push((subject, identifier));
     }
 
-    tokio::time::sleep(past_the_settle_span()).await;
+    // The repeated teardown falls due on the clock's own schedule, so the case looks again
+    // until the enablement it tore down has stopped resolving.
+    for (subject, _) in &repeated {
+        poll_until(
+            &subject.row.case,
+            "the repeated teardown's enablement stops resolving",
+            || async { get_enabled_control(&subject.router, &subject.arn).await.status == 404 },
+        )
+        .await;
+    }
 
     for (subject, identifier) in repeated {
         let case = subject.row.case.clone();
@@ -522,9 +555,9 @@ async fn a_control_teardown_is_decided_once_from_the_resource_not_from_the_log()
         let read = read_tags(&subject.router, &subject.arn).await;
         assert_eq!(
             (read.status, read.error_code.as_deref()),
-            (404, Some("ResourceNotFoundException")),
-            "case {case:?}: expected the tags to go with the enablement (404 \
-             ResourceNotFoundException), got {:?} tags {:?}",
+            (404, Some(crate::resource_tags::ABSENT_RESOURCE_CODE)),
+            "case {case:?}: expected the tags to go with the enablement (404 from the tag \
+             plane's absent-resource class), got {:?} tags {:?}",
             (read.status, read.error_code.as_deref()),
             reported_tags(&read)
         );

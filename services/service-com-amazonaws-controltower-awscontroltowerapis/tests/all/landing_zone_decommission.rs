@@ -31,7 +31,7 @@
 //! `RemediationType` value `INHERITANCE_DRIFT`.
 
 use crate::landing_zone_lifecycle::{
-    call, emulator, is_operation_identifier, manifest_governing, past_the_settle_span,
+    call, emulator, is_operation_identifier, manifest_governing, past_the_settle_span, poll_until,
     simple_manifest, Answer,
 };
 use crate::resource_tags::{read_tags, reported_tags, tags};
@@ -237,8 +237,16 @@ async fn a_landing_zone_stays_a_resource_until_its_delete_is_due() {
         );
 
         // Once the clock has made the DELETE due the decommissioning is complete: the
-        // operation is terminal and the landing zone, and its tags, are gone.
-        tokio::time::sleep(past_the_settle_span()).await;
+        // operation is terminal and the landing zone, and its tags, are gone. The case looks
+        // again for that record rather than waiting a fixed time for it.
+        poll_until(case, "the DELETE operation reads SUCCEEDED", || async {
+            operation_details(&router, case, &delete_operation)
+                .await
+                .get("status")
+                .and_then(|value| value.as_str())
+                == Some("SUCCEEDED")
+        })
+        .await;
         let settled = operation_details(&router, case, &delete_operation).await;
         assert_eq!(
             (
@@ -272,7 +280,7 @@ async fn a_landing_zone_stays_a_resource_until_its_delete_is_due() {
         let untagged = read_tags(&router, &arn).await;
         assert_eq!(
             (untagged.status, untagged.error_code.as_deref()),
-            (404, Some("ResourceNotFoundException")),
+            (404, Some(crate::resource_tags::ABSENT_RESOURCE_CODE)),
             "case {case:?}: expected the tags to go with the resource, got {:?} body {:?}",
             (untagged.status, untagged.error_code.as_deref()),
             untagged.body

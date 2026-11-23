@@ -16,8 +16,8 @@
 //!   repeating it answers the same way and changes nothing more, and a key that differs
 //!   from an attached one only in letter case is a DIFFERENT key;
 //! * one resource's tags are its own: untagging one never changes another's;
-//! * an `Arn` that names no resource of this service is `ResourceNotFoundException` (404)
-//!   and removes nothing;
+//! * an `Arn` that names no resource of this service is the tag plane's own
+//!   [`ABSENT_RESOURCE_CODE`] (404) and removes nothing;
 //! * a key in the reserved namespace (`state::RESERVED_TAG_KEY_PREFIX`) names a tag Amazon
 //!   Web Services applies itself, which a caller may not delete: the call is refused with
 //!   the modelled `ValidationException` (400) and removes nothing at all.
@@ -36,9 +36,12 @@ use std::collections::BTreeMap;
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::landing_zone_lifecycle::{call, dispatch, emulator, past_the_settle_span, Answer};
+use crate::landing_zone_lifecycle::{call, dispatch, emulator, poll_until, Answer};
 use crate::reserved_tag_keys::reserved_keys;
-use crate::resource_tags::{apply_tags, read_tags, reported_tags, resources, tags, tags_path};
+use crate::resource_tags::{
+    apply_tags, read_tags, reported_tags, resources, tags, tags_path, ABSENT_RESOURCE_CODE,
+    ABSENT_RESOURCE_MESSAGE,
+};
 
 /// `UntagResource`: DELETE the tags `keys` names from `arn`.
 ///
@@ -287,8 +290,9 @@ async fn untagging_one_resource_leaves_the_others_alone() {
     }
 }
 
-/// RULE: an `Arn` that names no resource of this service is `ResourceNotFoundException`
-/// (404), and such a refusal removes nothing from the resources that DO exist.
+/// RULE: an `Arn` that names no resource of this service is the tag plane's own
+/// [`ABSENT_RESOURCE_CODE`] (404), and such a refusal removes nothing from the resources
+/// that DO exist.
 #[tokio::test]
 async fn an_arn_that_names_no_resource_is_not_found() {
     let router = emulator();
@@ -357,8 +361,14 @@ async fn an_arn_that_names_no_resource_is_not_found() {
     // it, so the ARN names nothing again. Taken last, because decommissioning a landing
     // zone deletes what was deployed under it, the enablements above among them. The create
     // must be due before the delete is accepted, and the delete due before the landing zone
-    // is gone.
-    tokio::time::sleep(past_the_settle_span()).await;
+    // is gone — so each wait looks again for that condition instead of waiting a fixed
+    // time.
+    poll_until(
+        "the landing zone's own ARN",
+        "the landing zone leaves the status its create left it in",
+        || async { landing_zone_status(&router, &resources[0].arn).await != Some("PROCESSING") },
+    )
+    .await;
     let deleted = call(
         &router,
         "/delete-landingzone",
@@ -370,7 +380,12 @@ async fn an_arn_that_names_no_resource_is_not_found() {
         "delete-landingzone: expected 200, got {} body {:?}",
         deleted.status, deleted.body
     );
-    tokio::time::sleep(past_the_settle_span()).await;
+    poll_until(
+        "the landing zone's own ARN",
+        "the decommissioned landing zone stops resolving",
+        || async { landing_zone_status(&router, &resources[0].arn).await.is_none() },
+    )
+    .await;
     assert_not_found(
         &router,
         "the landing zone's own ARN, after it was deleted",
@@ -379,20 +394,47 @@ async fn an_arn_that_names_no_resource_is_not_found() {
     .await;
 }
 
-/// Assert `UntagResource` refuses `arn` with 404 `ResourceNotFoundException`, naming the
-/// ARN it could not resolve.
+/// The `status` `GetLandingZone` reports for `arn`, or `None` when it resolves no landing
+/// zone at all — the two conditions the waits above are about.
+async fn landing_zone_status(router: &MultiServiceRouter, arn: &str) -> Option<&'static str> {
+    let answer = call(
+        router,
+        "/get-landingzone",
+        serde_json::json!({ "landingZoneIdentifier": arn }),
+    )
+    .await;
+    if answer.status != 200 {
+        return None;
+    }
+    // The statuses `LandingZoneStatus` declares
+    // (`smithy_query(query="shape", shape="LandingZoneStatus")`), as `'static` strings so
+    // the answer itself need not outlive the look.
+    ["ACTIVE", "PROCESSING", "FAILED"]
+        .into_iter()
+        .find(|status| {
+            answer
+                .get("landingZone")
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                == Some(*status)
+        })
+}
+
+/// Assert `UntagResource` refuses `arn` with 404 [`ABSENT_RESOURCE_CODE`] and the plane's
+/// fixed sentence, which names nothing of the request — the offending ARN included.
 async fn assert_not_found(router: &MultiServiceRouter, case: &str, arn: &str) {
     let refused = remove_tags(router, arn, &["Owner"]).await;
     assert_eq!(
         (refused.status, refused.error_code.as_deref()),
-        (404, Some("ResourceNotFoundException")),
-        "case {case:?}: expected 404 ResourceNotFoundException, got {:?} body {:?}",
+        (404, Some(ABSENT_RESOURCE_CODE)),
+        "case {case:?}: expected 404 {ABSENT_RESOURCE_CODE}, got {:?} body {:?}",
         (refused.status, refused.error_code.as_deref()),
         refused.body
     );
-    assert!(
-        refused.string("message").contains(arn),
-        "case {case:?}: expected the refusal to name the ARN it could not resolve, got {:?}",
+    assert_eq!(
+        refused.string("message"),
+        ABSENT_RESOURCE_MESSAGE,
+        "case {case:?}: expected the fixed sentence {ABSENT_RESOURCE_MESSAGE:?}, got {:?}",
         refused.string("message")
     );
 }

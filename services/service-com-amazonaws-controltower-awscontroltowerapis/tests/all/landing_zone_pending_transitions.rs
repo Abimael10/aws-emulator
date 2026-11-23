@@ -42,7 +42,7 @@ use service_com_amazonaws_controltower_awscontroltowerapis::state::{
 };
 
 use crate::landing_zone_lifecycle::{
-    call, emulator_with_engine, manifest_governing, past_the_settle_span, Answer,
+    call, emulator_with_engine, manifest_governing, past_the_settle_span, poll_until, Answer,
 };
 use crate::resource_tags::{apply_tags, read_tags, reported_tags, tags};
 
@@ -506,7 +506,13 @@ async fn a_failed_landing_zone_operation_applies_nothing() {
             owed.status
         );
 
-        tokio::time::sleep(past_the_settle_span()).await;
+        // The parked transition is the clock's to take, so the case looks again until the
+        // landing zone has left the transient status rather than waiting a fixed time.
+        poll_until(case, "the landing zone leaves PROCESSING", || async {
+            let answer = get_landing_zone(&router, &arn).await;
+            answer.status == 200 && member(&detail(&answer), "status") != Some("PROCESSING")
+        })
+        .await;
 
         let after = get_landing_zone(&router, &arn).await;
         let after_detail = detail(&after);
@@ -557,7 +563,19 @@ async fn a_failed_landing_zone_operation_applies_nothing() {
             "case {case:?}: expected the repeated call to start a FRESH operation"
         );
 
-        tokio::time::sleep(past_the_settle_span()).await;
+        // The repeated call's transition falls due on the clock's own schedule: the case
+        // looks again until the landing zone is gone (a decommissioning) or has left the
+        // transient status (every other call).
+        let removes = row.started == Started::Delete;
+        poll_until(case, "the repeated transition is applied", || async {
+            let answer = get_landing_zone(&router, &arn).await;
+            if removes {
+                answer.status == 404
+            } else {
+                answer.status == 200 && member(&detail(&answer), "status") != Some("PROCESSING")
+            }
+        })
+        .await;
 
         let succeeded = get_landing_zone(&router, &arn).await;
         if row.started == Started::Delete {
@@ -572,9 +590,9 @@ async fn a_failed_landing_zone_operation_applies_nothing() {
             let gone = read_tags(&router, &arn).await;
             assert_eq!(
                 (gone.status, gone.error_code.as_deref()),
-                (404, Some("ResourceNotFoundException")),
+                (404, Some(crate::resource_tags::ABSENT_RESOURCE_CODE)),
                 "case {case:?}: expected the tags of a decommissioned landing zone to be \
-                 gone (404 ResourceNotFoundException), got {:?} tags {:?}",
+                 gone (404 from the tag plane's absent-resource class), got {:?} tags {:?}",
                 (gone.status, gone.error_code.as_deref()),
                 reported_tags(&gone)
             );

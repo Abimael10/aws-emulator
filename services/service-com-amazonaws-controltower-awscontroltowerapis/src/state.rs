@@ -111,6 +111,15 @@
 //! [`record_enablement`]: ComAmazonawsControltowerAwscontroltowerapisState::record_enablement
 //! [`apply_governance_controls`]: ComAmazonawsControltowerAwscontroltowerapisState::apply_governance_controls
 
+/// How the TAG PLANE refuses an ARN it resolves to no resource, and the error channel its
+/// three operations carry that refusal in: the plane's own wire vocabulary, which no
+/// operation's generated error enum can hold.
+mod tagging_refusal;
+
+pub use tagging_refusal::{
+    TaggingError, TaggingRefusal, TAGGING_NOT_FOUND_ERROR_CODE, TAGGING_NOT_FOUND_MESSAGE,
+};
+
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
@@ -2635,8 +2644,9 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
     /// The three resource stores are the whole set: a landing zone, an enabled control
     /// and an enabled baseline are the resources this service mints ARNs for, and every
     /// one of those ARNs is its store's key. An ARN outside them names no resource here,
-    /// which is what the tagging operations refuse with `ResourceNotFoundException`.
-    /// Call [`settle`] first, so a resource the clock has already torn down is gone.
+    /// which is what the tagging operations refuse with the tag plane's own not-found
+    /// class ([`TaggingRefusal`]). Call [`settle`] first, so a resource the clock has
+    /// already torn down is gone.
     ///
     /// [`settle`]: Self::settle
     pub fn taggable_resource_exists(&self, arn: &str) -> bool {

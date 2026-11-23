@@ -9,7 +9,8 @@
 //! * which `resourceArn` values the HANDLER answers for and which the front door refuses
 //!   first: every value inside `Arn`'s published `@length` bounds and matching its
 //!   `@pattern` reaches the handler, which answers 200 for an ARN this service minted and
-//!   the modelled `ResourceNotFoundException` (404) for one it did not — including a value
+//!   the tag plane's own not-found class (404 [`ABSENT_RESOURCE_CODE`]) for one it did not
+//!   — including a value
 //!   sitting exactly ON each bound — while a value outside those bounds never reaches it;
 //! * a resource is named by its WHOLE ARN: a value that differs from a minted ARN in any
 //!   single character, or carries anything before or after it, names no resource and is
@@ -28,7 +29,9 @@
 
 use crate::front_door_validation::{arn_of_length, FRONT_DOOR_CODE};
 use crate::landing_zone_lifecycle::{emulator, past_the_settle_span};
-use crate::resource_tags::{apply_tags, read_tags, reported_tags, resources, tags};
+use crate::resource_tags::{
+    apply_tags, read_tags, reported_tags, resources, tags, ABSENT_RESOURCE_CODE,
+};
 
 /// `arn` with the last character of its resource id replaced by a DIFFERENT one, so the
 /// value is still an `Arn` of the same length and shape but names nothing: the smallest
@@ -50,7 +53,7 @@ pub(crate) fn one_character_off(arn: &str) -> String {
 }
 
 /// RULE: inside `Arn`'s published bounds the HANDLER decides — 200 for an ARN this
-/// service minted, 404 `ResourceNotFoundException` for one it did not — including on each
+/// service minted, 404 [`ABSENT_RESOURCE_CODE`] for one it did not — including on each
 /// bound itself.
 #[tokio::test]
 async fn an_arn_inside_the_modeled_bounds_is_answered_by_the_handler() {
@@ -73,31 +76,31 @@ async fn an_arn_inside_the_modeled_bounds_is_answered_by_the_handler() {
             "an ARN exactly at the length min of 20".to_string(),
             arn_of_length(20),
             404,
-            Some("ResourceNotFoundException"),
+            Some(ABSENT_RESOURCE_CODE),
         ),
         (
             "an ARN exactly at the length max of 2048".to_string(),
             arn_of_length(2048),
             404,
-            Some("ResourceNotFoundException"),
+            Some(ABSENT_RESOURCE_CODE),
         ),
         (
             "an ARN midway through the length range".to_string(),
             arn_of_length(512),
             404,
-            Some("ResourceNotFoundException"),
+            Some(ABSENT_RESOURCE_CODE),
         ),
         (
             "a well-formed enabled-control ARN nothing minted".to_string(),
             "arn:aws:controltower:us-west-2:000000000000:enabledcontrol/absent".to_string(),
             404,
-            Some("ResourceNotFoundException"),
+            Some(ABSENT_RESOURCE_CODE),
         ),
         (
             "an ARN of another AWS service".to_string(),
             "arn:aws:organizations::000000000000:ou/o-emulatororg/ou-abcd-9z".to_string(),
             404,
-            Some("ResourceNotFoundException"),
+            Some(ABSENT_RESOURCE_CODE),
         ),
     ]);
 
@@ -196,8 +199,8 @@ async fn only_the_exact_minted_arn_names_the_resource() {
             let read = read_tags(&router, &arn).await;
             assert_eq!(
                 (read.status, read.error_code.as_deref()),
-                (404, Some("ResourceNotFoundException")),
-                "case {:?}/{mutant_case:?}: expected 404 ResourceNotFoundException — a \
+                (404, Some(ABSENT_RESOURCE_CODE)),
+                "case {:?}/{mutant_case:?}: expected 404 {ABSENT_RESOURCE_CODE} — a \
                  near-miss ARN names no resource and inherits no tags — got {:?} body {:?}",
                 resource.case,
                 (read.status, read.error_code.as_deref()),

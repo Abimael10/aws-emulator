@@ -29,6 +29,40 @@ pub(crate) fn past_the_settle_span() -> std::time::Duration {
         + std::time::Duration::from_millis(400)
 }
 
+/// How long a case that waits for a clock-owed transition keeps LOOKING before it gives up.
+///
+/// Generous on purpose: what such a case waits for is a CONDITION the emulator reaches on
+/// its own clock, so a slow or loaded host only makes it look again, and only a transition
+/// that never comes at all trips this.
+const POLL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long a case leaves between two looks.
+const BETWEEN_LOOKS: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Look again until `holds` answers true, and fail once [`POLL_DEADLINE`] has passed.
+///
+/// THE poll loop of this crate's suites: a case waits for the condition it is about — an
+/// operation that reads terminal, an enablement the clock has torn down — never for a
+/// duration it measures, so what it asserts cannot depend on how fast the host runs.
+/// `what` names that condition in the failure.
+pub(crate) async fn poll_until<F, Fut>(case: &str, what: &str, holds: F)
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = std::time::Instant::now() + POLL_DEADLINE;
+    loop {
+        if holds().await {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: {what} never became true inside the deadline"
+        );
+        tokio::time::sleep(BETWEEN_LOOKS).await;
+    }
+}
+
 /// A fresh emulator: one engine, one Control Tower service, authentication off (these
 /// tests are about the service's behaviour, not SigV4). Shared with the sibling suites
 /// in this test target.

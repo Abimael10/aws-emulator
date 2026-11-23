@@ -56,7 +56,7 @@ use crate::enabled_control_lifecycle::{
 };
 use crate::front_door_validation::arn_of_length;
 use crate::landing_zone_lifecycle::{
-    call, emulator, is_operation_identifier, past_the_settle_span, set_up_emulator,
+    call, emulator, is_operation_identifier, past_the_settle_span, poll_until, set_up_emulator,
     simple_manifest, Answer,
 };
 use crate::resource_tags::{read_tags, reported_tags};
@@ -361,9 +361,18 @@ async fn every_enablement_tears_down_through_its_own_operation() {
         enabled.push((case, arn, enable_operation));
     }
 
-    // Nothing sleeps server-side: the clock makes the enables due, and the wait is the
-    // test's.
-    tokio::time::sleep(past_the_settle_span()).await;
+    // Nothing sleeps server-side: the clock makes each enable due on its own, so the case
+    // looks again until every enable's own record reads terminal rather than waiting a
+    // fixed time for it.
+    for (case, _, enable_operation) in &enabled {
+        poll_until(case, "the enable's own operation reads SUCCEEDED", || async {
+            member(
+                &control_operation(&router, enable_operation).await,
+                "status",
+            ) == Some("SUCCEEDED")
+        })
+        .await;
+    }
 
     // case, ARN, the DISABLE_CONTROL operation's identifier.
     let mut teardowns: Vec<(&'static str, String, String)> = Vec::new();
@@ -459,7 +468,14 @@ async fn every_enablement_tears_down_through_its_own_operation() {
         minted.push((case, kind, identifier));
     }
 
-    tokio::time::sleep(past_the_settle_span()).await;
+    // Each teardown falls due on the clock's own schedule, so the case looks again until
+    // every teardown's record reads terminal.
+    for (case, _, identifier) in &teardowns {
+        poll_until(case, "the teardown's operation reads SUCCEEDED", || async {
+            member(&control_operation(&router, identifier).await, "status") == Some("SUCCEEDED")
+        })
+        .await;
+    }
 
     for (row, (case, arn, identifier)) in rows.iter().zip(&teardowns) {
         let record = control_operation(&router, identifier).await;
@@ -494,7 +510,7 @@ async fn every_enablement_tears_down_through_its_own_operation() {
         let tagged = read_tags(&router, arn).await;
         assert_eq!(
             (tagged.status, tagged.error_code.as_deref()),
-            (404, Some("ResourceNotFoundException")),
+            (404, Some(crate::resource_tags::ABSENT_RESOURCE_CODE)),
             "case {case:?}: a torn-down enablement's tags must go with it, got {:?} body {:?}",
             (tagged.status, tagged.error_code.as_deref()),
             tagged.body

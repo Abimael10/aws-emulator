@@ -7,7 +7,11 @@
 //! `TagResource` and the `tags` member of the create/enable operations write. A resource
 //! with no tags reports an EMPTY map, which is how a caller tells an untagged resource
 //! from an absent one: an ARN that names no resource of this service is refused with the
-//! modelled `ResourceNotFoundException` (404).
+//! TAG PLANE's own not-found class — the wire code
+//! [`crate::state::TAGGING_NOT_FOUND_ERROR_CODE`] with the fixed sentence
+//! [`crate::state::TAGGING_NOT_FOUND_MESSAGE`], carrying the modelled
+//! `ResourceNotFoundException` payload and its 404, shared with `TagResource` and
+//! `UntagResource` (see [`crate::state::TaggingRefusal`]).
 //!
 //! `@readonly`: this handler writes nothing beyond the transitions the clock already
 //! owed (`settle`), so a resource whose teardown has become due is reported as gone
@@ -97,9 +101,11 @@ pub enum ListTagsForResourceErrorModeled {
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::list_tags_for_resource::ListTagsForResourceError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
-pub type ListTagsForResourceError = crate::scaffolded::Scaffolded<ListTagsForResourceErrorModeled>;
+/// (`crate::ops::list_tags_for_resource::ListTagsForResourceError`). This is a TAG-PLANE
+/// endpoint, so the channel is the shared [`crate::state::TaggingError`]: the scaffold
+/// wrapper (this operation's modelled errors, and the refusals that wrapper words) plus the
+/// tag plane's own not-found refusal, which this model declares on no shape.
+pub type ListTagsForResourceError = crate::state::TaggingError<ListTagsForResourceErrorModeled>;
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
 /// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
@@ -107,7 +113,7 @@ pub type ListTagsForResourceError = crate::scaffolded::Scaffolded<ListTagsForRes
 /// this operation is implemented.
 impl From<ListTagsForResourceErrorModeled> for ListTagsForResourceError {
     fn from(modeled: ListTagsForResourceErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        Self::Scaffolded(crate::scaffolded::Scaffolded::Modeled(modeled))
     }
 }
 
@@ -166,13 +172,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `@readonly` and writes nothing else.
         store.settle(::std::time::SystemTime::now());
 
+        // The tag plane's own not-found class, shared with the sibling tag-plane
+        // operations: a client branches on the code the plane sends, not on the shape the
+        // model names.
         if !store.taggable_resource_exists(&input.resource_arn) {
-            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("no resource matches resourceArn {}", input.resource_arn),
-                },
-            )
-            .into());
+            return Err(ListTagsForResourceError::not_found());
         }
 
         Ok(ListTagsForResourceOutput {

@@ -45,7 +45,8 @@ use crate::baseline_catalog::served_arn;
 use crate::enabled_control_lifecycle::{control, entries, ou};
 use crate::governed_target_mandatory_controls::mandatory;
 use crate::landing_zone_lifecycle::{
-    call, emulator, emulator_with_engine, manifest_governing, past_the_settle_span, Answer,
+    call, emulator, emulator_with_engine, manifest_governing, past_the_settle_span, poll_until,
+    Answer,
 };
 use crate::landing_zone_pending_transitions::fail_the_operation;
 use crate::resource_tags::{read_tags, reported_tags, tags};
@@ -466,9 +467,14 @@ async fn decommissioning_deletes_what_was_deployed_under_the_landing_zone() {
         let router = emulator();
         let landing_zone = settled_landing_zone(&router, case).await;
         let created = deploy(&router, &row).await;
-        // The enables are asynchronous too: wait for the clock to make them due, so what
-        // the decommissioning removes is a deployed, settled set.
-        tokio::time::sleep(past_the_settle_span()).await;
+        // The enables are asynchronous too, and the governing baseline applies the
+        // service's own controls as it settles: the case looks again until the deployed set
+        // is the one the row expects rather than waiting a fixed time for it.
+        poll_until(case, "every enablement the row deploys is listed", || async {
+            listed(&router, case, Kind::Control).await.len() == deployed_controls(&row)
+                && listed(&router, case, Kind::Baseline).await.len() == deployed_baselines(&row)
+        })
+        .await;
 
         // What is deployed under the landing zone, the service's own enablements included.
         let controls = listed(&router, case, Kind::Control).await;
@@ -507,7 +513,12 @@ async fn decommissioning_deletes_what_was_deployed_under_the_landing_zone() {
              expected controls {controls:?} baselines {baselines:?}"
         );
 
-        tokio::time::sleep(past_the_settle_span()).await;
+        // The decommissioning falls due on the clock's own schedule: the case looks again
+        // until the landing zone has stopped resolving.
+        poll_until(case, "the landing zone stops resolving", || async {
+            get_landing_zone(&router, &landing_zone).await.status == 404
+        })
+        .await;
 
         // The landing zone is decommissioned, and so is everything deployed under it.
         let gone = get_landing_zone(&router, &landing_zone).await;
@@ -541,7 +552,7 @@ async fn decommissioning_deletes_what_was_deployed_under_the_landing_zone() {
             let untagged = read_tags(&router, &enablement.arn).await;
             assert_eq!(
                 (untagged.status, untagged.error_code.as_deref()),
-                (404, Some("ResourceNotFoundException")),
+                (404, Some(crate::resource_tags::ABSENT_RESOURCE_CODE)),
                 "case {case:?}: expected the tags of {} to go with it, got {:?} body {:?}",
                 enablement.what,
                 (untagged.status, untagged.error_code.as_deref()),
