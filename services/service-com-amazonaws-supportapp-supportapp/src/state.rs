@@ -6,8 +6,9 @@
 //! handlers share — the stored-record-to-modelled-shape conversion, the listing
 //! pagination rule, the documented `notifyOnCaseSeverity` consistency rule, the account
 //! a caller-supplied `channelRoleArn` must name together with which refusal that member
-//! draws and in which order its rules are judged, the part of a `.`-based `@pattern` the
-//! request boundary's walk cannot apply (`channelName`'s among them),
+//! draws and in which order its rules are judged, the parts of a modelled `@pattern` the
+//! request boundary's walk cannot apply (`channelName`'s `.` and `accountAlias`'s `\w`
+//! among them),
 //! which stored Slack channel configuration a `(teamId, channelId)` pair names and how a
 //! pair the account holds none for is refused,
 //! whether a Slack workspace is registered
@@ -668,28 +669,102 @@ const CHANNEL_NAME_PATH: &str = "channelName";
 /// is the walk's, which applies it to every request that carries the member.
 ///
 /// The refusal is the one a declared constraint draws, because this IS the member's
-/// declared `@pattern`: the standard validation envelope over one clause naming the
-/// rejected value, the member path and the expression, built by the framework's own
-/// renderer ([`::aws_smithy_schema_server::constraints::envelope`]) from the same
-/// violation the walk raises for a value its own reading of the expression does catch, and
-/// with the `^` / `$` pair this service drops from a reported expression
-/// (`src/service.rs`, `as_stated`) dropped by the same shared rendering. So one request is
-/// refused one way whichever reading of the expression caught it. The value is echoed
-/// through the tree's shared [`::service_common::validation::quoted_echo`], so a
-/// handler-worded clause quotes a value under the same ceiling as one the walk restored.
+/// declared `@pattern`, and it is stated through [`declared_pattern_refusal`] — the one
+/// rendering every `@pattern` this module applies by hand goes through, so one request is
+/// refused one way whichever reading of the expression caught it.
 pub fn channel_name_refusal(channel_name: &str) -> Option<String> {
     if !carries_pattern_dot_excluded_char(channel_name) {
         return None;
     }
+    declared_pattern_refusal(CHANNEL_NAME_PATH, CHANNEL_NAME_PATTERN, channel_name)
+}
+
+/// The message a value outside its member's own declared `@pattern` is refused with.
+///
+/// The refusal is the one a declared constraint draws, because such a value IS outside the
+/// member's declared `@pattern`: the standard validation envelope over one clause naming the
+/// rejected value, the member path and the expression, built by the framework's own renderer
+/// ([`::aws_smithy_schema_server::constraints::envelope`]) from the same violation the walk
+/// raises for a value its own reading of the expression does catch, and with the `^` / `$`
+/// pair this service drops from a reported expression (`src/service.rs`, `as_stated`)
+/// dropped by the same shared rendering. So one request is refused one way whichever reading
+/// of the expression caught it. The value is echoed through the tree's shared
+/// [`::service_common::validation::quoted_echo`], so a handler-worded clause quotes a value
+/// under the same ceiling as one the walk restored.
+///
+/// `declared` is the expression as the MODEL spells it, anchors and all, and `path` is the
+/// member the clause names, in the lowerCamel spelling the envelope states a member with.
+fn declared_pattern_refusal(path: &str, declared: &str, value: &str) -> Option<String> {
     let violation = ::aws_smithy_schema_server::constraints::Violation {
-        path: CHANNEL_NAME_PATH.to_string(),
+        path: path.to_string(),
         kind: ::aws_smithy_schema_server::constraints::ViolationKind::Pattern(
-            ::service_common::validation::unanchored(CHANNEL_NAME_PATTERN),
+            ::service_common::validation::unanchored(declared),
         ),
-        value: Some(::service_common::validation::quoted_echo(channel_name).into_owned()),
+        value: Some(::service_common::validation::quoted_echo(value).into_owned()),
         sensitive: false,
     };
     ::aws_smithy_schema_server::constraints::envelope(::std::slice::from_ref(&violation))
+}
+
+/// `accountAlias`'s declared `@pattern`, as the model spells it — ANCHORED, which is the
+/// text a clause reporting it is rendered from
+/// (`smithy_query(query="shape",shape="awsAccountAlias")`).
+pub const ACCOUNT_ALIAS_PATTERN: &str = r"^[\w\- ]+$";
+
+/// The member path a clause about `accountAlias` names, in the lowerCamel spelling the
+/// validation envelope states a member with.
+const ACCOUNT_ALIAS_PATH: &str = "accountAlias";
+
+/// The characters [`ACCOUNT_ALIAS_PATTERN`]'s class admits BESIDE its `\w`: the escaped
+/// literal hyphen the expression writes, and a space.
+const ACCOUNT_ALIAS_LITERAL_CHARS: [char; 2] = ['-', ' '];
+
+/// Whether `character` is one a modelled `@pattern`'s `\w` matches.
+///
+/// A Smithy `@pattern` is an ECMA-262 regular expression, and there `\w` is the ASCII class
+/// `[A-Za-z0-9_]`: a letter of another script, a digit of another numbering system, a
+/// combining mark and a connector punctuation character are none of them, however much a
+/// reader would call them word characters.
+///
+/// Stated here because such a class has to be applied by hand (see
+/// [`account_alias_refusal`]), and because the engine the framework's centralized constraint
+/// walk compiles a `@pattern` with reads `\w` as the UNICODE class, so every character
+/// outside the ASCII one would be admitted there whatever the modelled expression says.
+fn is_pattern_word_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '_'
+}
+
+/// Whether `account_alias` is what [`ACCOUNT_ALIAS_PATTERN`] admits, with the `^` / `$` pair
+/// that anchors it: at least one character, and every one of them a member of the
+/// expression's class — an ECMA-262 `\w` ([`is_pattern_word_char`]) or one of
+/// [`ACCOUNT_ALIAS_LITERAL_CHARS`].
+pub fn satisfies_account_alias_pattern(account_alias: &str) -> bool {
+    !account_alias.is_empty()
+        && account_alias.chars().all(|character| {
+            is_pattern_word_char(character) || ACCOUNT_ALIAS_LITERAL_CHARS.contains(&character)
+        })
+}
+
+/// Why the `accountAlias` a write carried is outside that member's declared `@pattern`
+/// ([`ACCOUNT_ALIAS_PATTERN`]), as the message the refusal carries, or `None` when the value
+/// is one the expression admits.
+///
+/// The member's expression is `\w`-based, and the framework's centralized constraint walk
+/// cannot apply such an expression in full: it compiles a `@pattern` with an engine whose
+/// `\w` is the Unicode class, where the modelled ECMA-262 expression's `\w` is the ASCII one
+/// ([`is_pattern_word_char`]). So the part of the expression that walk admits but the model
+/// does not is applied HERE, by the one operation that writes the member
+/// (`PutAccountAlias`), before the store is reached: the same shape with the same `@pattern`
+/// is an OUTPUT member — `GetAccountAlias` answers the stored alias through
+/// `GetAccountAliasResult$accountAlias` — so a value the expression does not admit could not
+/// be reported back through the shape it was stored in. The rest of the expression (its `+`,
+/// and the member's declared `@length` 1..30) is the walk's, which applies it to every
+/// request that carries the member.
+pub fn account_alias_refusal(account_alias: &str) -> Option<String> {
+    if satisfies_account_alias_pattern(account_alias) {
+        return None;
+    }
+    declared_pattern_refusal(ACCOUNT_ALIAS_PATH, ACCOUNT_ALIAS_PATTERN, account_alias)
 }
 
 /// The `AccessDeniedException` message a refused pass-role attempt carries, as AWS words

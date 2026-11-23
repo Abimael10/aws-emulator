@@ -144,6 +144,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(PutAccountAliasErrorModeled::AccessDeniedException(denied).into());
         }
 
+        // `accountAlias`'s declared `@pattern` is `\w`-based, and the request boundary's
+        // walk reads a `\w` more widely than the modelled ECMA-262 expression does, so the
+        // part of that expression the walk admits is applied here — before the store is
+        // reached, because it is a modelled constraint on the REQUEST and so is request
+        // validation. See [`crate::state::account_alias_refusal`].
+        if let Some(message) = crate::state::account_alias_refusal(&input.account_alias) {
+            return Err(
+                PutAccountAliasErrorModeled::ValidationException(ValidationException {
+                    message: Some(message),
+                })
+                .into(),
+            );
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             PutAccountAliasErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the Support App store is unavailable".to_string()),
@@ -152,9 +166,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Creates or updates an individual alias for each Amazon Web Services account
         // ID": one alias per account, so a later put replaces the stored value rather
-        // than adding a second one. `accountAlias` is `@required`, `len 1..30` and
-        // `pattern ^[\w\- ]+$`, all of which the boundary validator already refused
-        // anything outside of.
+        // than adding a second one. `accountAlias` is `@required` and `len 1..30`, which the
+        // boundary validator already refused anything outside of, and the rule above
+        // applied the rest of the member's declared `pattern ^[\w\- ]+$` — so the alias
+        // reaching the store is one `GetAccountAlias` can report back through the same
+        // shape.
         state.lock().account_alias = Some(input.account_alias);
 
         Ok(PutAccountAliasOutput {})
