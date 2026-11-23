@@ -54,6 +54,11 @@ async fn named_request(
 /// modelled "not found" rather than a malformed identifier.
 const ABSENT_KEY_ID: &str = "11111111-2222-3333-4444-555555555555";
 
+/// A custom key store id of the right form that this account holds no key store for: the
+/// row about the 501 class drives an operation this emulator has not implemented, which
+/// answers that status before it judges the identifier at all.
+const ABSENT_CUSTOM_KEY_STORE_ID: &str = "cks-1111111111111111111";
+
 /// The message every cryptographic row below seals.
 const MESSAGE: &[u8] = b"the request a response names";
 
@@ -103,12 +108,8 @@ async fn every_response_names_the_request_it_answered() {
         ),
         (
             "an operation this emulator has not implemented",
-            "DeriveSharedSecret",
-            json!({
-                "KeyId": key_id,
-                "KeyAgreementAlgorithm": "ECDH",
-                "PublicKey": b64(MESSAGE),
-            }),
+            "DeleteCustomKeyStore",
+            json!({"CustomKeyStoreId": ABSENT_CUSTOM_KEY_STORE_ID}),
             Some(501),
         ),
         (

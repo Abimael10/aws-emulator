@@ -35,6 +35,37 @@ sm2 = { version = "0.14", default-features = false, features = [
     "pkcs8",
     "std",
 ] }
+# The Elliptic Curve Cryptography Cofactor Diffie-Hellman primitive `DeriveSharedSecret`
+# runs, over each NIST-standard curve a KEY_AGREEMENT KMS key pair can be on, together
+# with the DER decoding (PKCS#8 private half, X.509 SubjectPublicKeyInfo public half) the
+# two halves it runs over are held and submitted in: aws-lc-rs performs no agreement over
+# a stored PKCS#8 private key.
+p256 = { version = "0.14", default-features = false, features = [
+    "arithmetic",
+    "ecdh",
+    "pkcs8",
+    "std",
+] }
+p384 = { version = "0.14", default-features = false, features = [
+    "arithmetic",
+    "ecdh",
+    "pkcs8",
+    "std",
+] }
+p521 = { version = "0.14", default-features = false, features = [
+    "arithmetic",
+    "ecdh",
+    "pkcs8",
+    "std",
+] }
+# The curve-generic half of that stack: the one agreement primitive, run over whichever
+# curve a key's spec names — including the SM2 curve, which `sm2` itself exposes no
+# agreement for.
+elliptic-curve = { version = "0.14", default-features = false, features = [
+    "ecdh",
+    "pkcs8",
+    "std",
+] }
 # Ed25519ph, the PREHASHED Edwards25519 signature scheme of RFC 8032 Section 5.1, which
 # aws-lc-rs does not expose; already in this workspace's lock file. `hazmat` is what lets
 # the scheme be driven from the digest a caller submits, with the scheme's own hashing

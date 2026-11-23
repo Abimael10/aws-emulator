@@ -59,6 +59,7 @@ mod cryptography;
 mod ed25519ph;
 mod grants;
 mod import;
+mod key_agreement;
 mod macs;
 mod ml_kem;
 mod multi_region;
@@ -70,6 +71,7 @@ pub use call_request_id::*;
 pub use cryptography::*;
 pub use grants::*;
 pub use import::*;
+pub use key_agreement::*;
 pub use macs::*;
 pub use ml_kem::*;
 pub use multi_region::*;
@@ -4101,7 +4103,7 @@ const RSA_ENCRYPTION_ALGORITHMS: &[&str] = &[
 
 /// The only `KeyAgreementAlgorithmSpec` (`smithy_query(shape="KeyAgreementAlgorithmSpec")`),
 /// which every spec that can derive a shared secret supports.
-const ECDH: &[&str] = &["ECDH"];
+const ECDH: &[&str] = &[KEY_AGREEMENT_ALGORITHM_ECDH];
 
 /// The only `KeyEncapsulationAlgorithm`
 /// (`smithy_query(shape="KeyEncapsulationAlgorithm")`), which every spec that can

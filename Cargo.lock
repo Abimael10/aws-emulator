@@ -3652,6 +3652,7 @@ checksum = "914c195c4d7fbc5ed7f88d14cbf85914d5c664967658d43404b263913a477e82"
 dependencies = [
  "cpubits",
  "ctutils",
+ "getrandom 0.4.3",
  "hybrid-array",
  "num-traits",
  "rand_core 0.10.1",
@@ -3675,6 +3676,7 @@ version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
 dependencies = [
+ "getrandom 0.4.3",
  "hybrid-array",
  "rand_core 0.10.1",
 ]
@@ -4188,13 +4190,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "ecdsa"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0681a4fc24c767085329728d8dfba959af91228aa4610cca4f8ce317ba46ae0"
+dependencies = [
+ "der 0.8.3",
+ "digest 0.11.3",
+ "elliptic-curve",
+ "signature 3.0.0",
+ "spki 0.8.1",
+ "zeroize",
+]
+
+[[package]]
 name = "ed25519"
 version = "2.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "115531babc129696a58c64a4fef0a8bf9e9698629fb97e9e40767d235cfbcd53"
 dependencies = [
  "pkcs8 0.10.2",
- "signature",
+ "signature 2.2.0",
 ]
 
 [[package]]
@@ -4207,7 +4223,7 @@ dependencies = [
  "ed25519",
  "serde",
  "sha2 0.10.9",
- "signature",
+ "signature 2.2.0",
  "subtle",
  "zeroize",
 ]
@@ -4239,8 +4255,10 @@ dependencies = [
  "base16ct 1.0.0",
  "crypto-bigint",
  "crypto-common 0.2.2",
+ "digest 0.11.3",
  "ff",
  "group",
+ "hkdf 0.13.0",
  "hybrid-array",
  "pkcs8 0.11.0",
  "rand_core 0.10.1",
@@ -5049,6 +5067,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7"
 dependencies = [
  "hmac 0.12.1",
+]
+
+[[package]]
+name = "hkdf"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4aaa26c720c68b866f2c96ef5c1264b3e6f473fe5d4ce61cd44bbe913e553018"
+dependencies = [
+ "hmac 0.13.0",
 ]
 
 [[package]]
@@ -7203,6 +7230,44 @@ dependencies = [
  "oxiri",
  "oxrdf",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "p256"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2c9239b2dbc807adbbe147e8cf72ea7450c3a0aabe62cb8e75ff4ec22e1f72a"
+dependencies = [
+ "ecdsa",
+ "elliptic-curve",
+ "primefield",
+ "primeorder",
+]
+
+[[package]]
+name = "p384"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d17b851e6b3e378ab4ecb07fa2ed23f4d15f075735f8fec9fa1e7bdce5f8301f"
+dependencies = [
+ "ecdsa",
+ "elliptic-curve",
+ "fiat-crypto 0.3.0",
+ "primefield",
+ "primeorder",
+]
+
+[[package]]
+name = "p521"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ad64cc32c2dc466317c12ee5853e61f159f9eab1fe7efade0395dc2e7b43449"
+dependencies = [
+ "base16ct 1.0.0",
+ "ecdsa",
+ "elliptic-curve",
+ "primefield",
+ "primeorder",
 ]
 
 [[package]]
@@ -12632,7 +12697,7 @@ dependencies = [
  "csv",
  "data-encoding",
  "hex",
- "hkdf",
+ "hkdf 0.12.4",
  "hmac 0.12.1",
  "http",
  "ipnet",
@@ -16461,8 +16526,12 @@ dependencies = [
  "aws-smithy-types",
  "bytes",
  "ed25519-dalek",
+ "elliptic-curve",
  "hex",
  "http",
+ "p256",
+ "p384",
+ "p521",
  "ring",
  "serde_json",
  "service-com-amazonaws-cloudhsmv2-baldrapiservice",
@@ -16553,7 +16622,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.3.4",
  "hex",
- "hkdf",
+ "hkdf 0.12.4",
  "hmac 0.12.1",
  "http",
  "http-body-util",
@@ -22792,6 +22861,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "signature"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
+dependencies = [
+ "digest 0.11.3",
+ "rand_core 0.10.1",
+]
+
+[[package]]
 name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -23045,7 +23124,7 @@ dependencies = [
  "rand_core 0.6.4",
  "sec1 0.7.3",
  "sha2 0.10.9",
- "signature",
+ "signature 2.2.0",
  "ssh-cipher",
  "ssh-encoding",
  "subtle",
