@@ -29,6 +29,11 @@
 //! session, an IAM user's long-term access key, the account's own published credential) and
 //! the resource an `Allow` is scoped to (everything, exactly this resource, every resource
 //! of this type, another resource of this type, the other resource type).
+//!
+//! The harness below — the emulator, the signed call, the principals made with IAM's and
+//! STS's own operations, and the two refusal assertions — is shared with
+//! `bcm_dashboards_write_authorization`, which pins what a refused WRITE must not have left
+//! behind. It lives here, once, so both suites assert against the same IAM wording.
 
 use std::sync::Arc;
 
@@ -50,7 +55,7 @@ const REGION: &str = "us-east-1";
 /// The access-key id standing for the account's own published credential: neither STS nor
 /// IAM holds a record for it, so it resolves to the account's ambient identity, which holds
 /// no IAM policies — the position AWS account root credentials are in.
-const ACCOUNT_KEY: &str = "EMULATORTESTKEY12345";
+pub(crate) const ACCOUNT_KEY: &str = "EMULATORTESTKEY12345";
 
 /// The wire name and status of the refusal the authorization step answers with.
 const ACCESS_DENIED: &str = "AccessDeniedException";
@@ -59,19 +64,19 @@ const ACCESS_DENIED_STATUS: u16 = 403;
 /// A well-formed `ServiceRoleArn` for a scheduled report's execution role (pattern
 /// `^arn:aws[-a-z0-9]*:iam::[0-9]{12}:role/[a-zA-Z0-9+=,.@_/-]+$`): the report's own
 /// execution role, which has nothing to do with the CALLER this suite varies.
-const EXECUTION_ROLE_ARN: &str = "arn:aws:iam::123456789012:role/BCMDashboardsReportRole";
+pub(crate) const EXECUTION_ROLE_ARN: &str = "arn:aws:iam::123456789012:role/BCMDashboardsReportRole";
 
 /// One answer, reduced to what a client branches on.
 #[derive(Debug)]
-struct Reply {
-    status: u16,
-    body: Value,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
 }
 
 impl Reply {
     /// The wire error code (`__type`), which this protocol may qualify with the model's
     /// namespace.
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         self.body["__type"]
             .as_str()
             .unwrap_or("<none>")
@@ -79,7 +84,7 @@ impl Reply {
     }
 
     /// The `message` the error document carries.
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         self.body["message"].as_str().unwrap_or_default().to_string()
     }
 }
@@ -87,9 +92,9 @@ impl Reply {
 /// A principal a call is signed as: the access key id it presents, and the ARN a refusal
 /// must blame it by — what `sts:GetCallerIdentity` reports for that key.
 #[derive(Debug)]
-struct Principal {
-    access_key_id: String,
-    arn: String,
+pub(crate) struct Principal {
+    pub(crate) access_key_id: String,
+    pub(crate) arn: String,
 }
 
 /// A SigV4 `Authorization` header whose credential scope names `service`. The signature is
@@ -106,7 +111,13 @@ fn authorization(access_key_id: &str, service: &str) -> String {
 /// principals and their policies are made with, and the EventBridge an execution's
 /// notification is delivered to, on ONE engine, as `core/router/src/lib.rs` mounts them.
 fn build_router() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    build_router_on(Arc::new(engine::InMemoryEngine::new()))
+}
+
+/// That same emulator mounted on an engine the CALLER holds, so a suite can also read
+/// another mounted service's store back through it — the event bus an execution delivers
+/// its notification to, for one.
+pub(crate) fn build_router_on(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
@@ -132,7 +143,7 @@ fn build_router() -> MultiServiceRouter {
 
 /// One BCM Dashboards call: `awsJson1_0` under this service's credential scope, routed by
 /// `X-Amz-Target`, signed with `access_key_id`.
-async fn dashboards(
+pub(crate) async fn dashboards(
     router: &MultiServiceRouter,
     access_key_id: &str,
     operation: &str,
@@ -161,7 +172,12 @@ async fn dashboards(
 
 /// One call signed as the account itself, which must succeed: the suite's setup and
 /// read-back legs.
-async fn served(router: &MultiServiceRouter, case: &str, operation: &str, body: &Value) -> Value {
+pub(crate) async fn served(
+    router: &MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    body: &Value,
+) -> Value {
     let reply = dashboards(router, ACCOUNT_KEY, operation, body).await;
     assert_eq!(
         reply.status, 200,
@@ -172,7 +188,7 @@ async fn served(router: &MultiServiceRouter, case: &str, operation: &str, body: 
 
 /// One awsQuery call to IAM or STS, signed with the account's own credential, which must
 /// succeed: these are the suite's setup legs.
-async fn query(
+pub(crate) async fn query(
     router: &MultiServiceRouter,
     signing_name: &str,
     version: &str,
@@ -207,7 +223,11 @@ async fn query(
 /// Create an IAM user carrying `policy` as its inline policy (none at all when `policy` is
 /// `None`), mint a long-term access key for it, and answer that key id with the user's own
 /// ARN.
-async fn user(router: &MultiServiceRouter, user_name: &str, policy: Option<&str>) -> Principal {
+pub(crate) async fn user(
+    router: &MultiServiceRouter,
+    user_name: &str,
+    policy: Option<&str>,
+) -> Principal {
     let created = query(
         router,
         "iam",
@@ -248,7 +268,7 @@ async fn user(router: &MultiServiceRouter, user_name: &str, policy: Option<&str>
 /// Create an IAM role carrying `policy` as its inline policy (none at all when `policy` is
 /// `None`), assume it through STS, and answer the session's access key id with the session
 /// ARN.
-async fn assumed_role(
+pub(crate) async fn assumed_role(
     router: &MultiServiceRouter,
     role_name: &str,
     policy: Option<&str>,
@@ -309,7 +329,7 @@ async fn assumed_role(
 }
 
 /// A policy document whose one statement allows `action` on `resource`.
-fn allow(action: &Value, resource: &Value) -> String {
+pub(crate) fn allow(action: &Value, resource: &Value) -> String {
     json!({
         "Version": "2012-10-17",
         "Statement": [{ "Effect": "Allow", "Action": action, "Resource": resource }],
@@ -476,7 +496,7 @@ fn gated(fixture: &Fixture) -> Vec<Gated> {
 
 /// Which of IAM's two refusals a row expects.
 #[derive(Debug, Clone, Copy)]
-enum Refusal {
+pub(crate) enum Refusal {
     /// The default deny of a request no readable statement allows.
     DefaultDeny,
     /// The explicit deny of a request a `Deny` statement covers.
@@ -485,7 +505,7 @@ enum Refusal {
 
 impl Refusal {
     /// The clause IAM closes the refusal with.
-    fn reason(self, action: &str) -> String {
+    pub(crate) fn reason(self, action: &str) -> String {
         match self {
             Self::DefaultDeny => {
                 format!("because no identity-based policy allows the {action} action")
@@ -552,7 +572,7 @@ fn documents_in_force(action: &str, other: &str) -> Vec<(&'static str, Option<St
 }
 
 /// Require `reply` to be IAM's refusal, with the sentence it states.
-fn assert_refused(case: &str, reply: &Reply, expected_message: &str) {
+pub(crate) fn assert_refused(case: &str, reply: &Reply, expected_message: &str) {
     assert_eq!(
         reply.status, ACCESS_DENIED_STATUS,
         "case {case:?}: expected HTTP {ACCESS_DENIED_STATUS}, got {reply:?}"
@@ -571,7 +591,7 @@ fn assert_refused(case: &str, reply: &Reply, expected_message: &str) {
 
 /// Require `reply` not to be an authorization refusal: an allowed request reaches the
 /// operation's own answer.
-fn assert_not_refused(case: &str, reply: &Reply) {
+pub(crate) fn assert_not_refused(case: &str, reply: &Reply) {
     assert_ne!(
         reply.status, ACCESS_DENIED_STATUS,
         "case {case:?}: an allowed request must not be refused, got {reply:?}"
