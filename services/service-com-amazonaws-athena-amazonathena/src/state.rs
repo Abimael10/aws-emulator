@@ -1482,16 +1482,27 @@ pub const QUERY_STATE_CANCELLED: &str = "CANCELLED";
 ///
 /// Athena hands back a query execution in a non-terminal state and the terminal state
 /// arrives later, so this is a transition the CLOCK owes: the instant is stored on the
-/// record and every read derives the state from it. The span is this emulator's, not a
-/// duration AWS publishes (a real query takes as long as the data it scans), and it is
-/// never zero — a caller reading straight back must still observe the transient states
-/// and the errors they carry.
-pub const QUERY_EXECUTION_COMPLETION: Duration = Duration::from_secs(3);
+/// record and every read derives the state from it.
+///
+/// A query execution is a unit of WORK rather than a resource being provisioned, so what
+/// decides when it is terminal is WHEN ITS WORK IS OVER: this span is only the FLOOR under
+/// that, so that a caller reading straight back still observes the transient states and the
+/// errors they carry, while a run whose work took longer stays non-terminal until the engine
+/// has reported ([`ComAmazonawsAthenaAmazonathenaState::complete_query_execution`]). It is
+/// therefore held to the order of magnitude the service itself settles a statement in — a
+/// definition against the Data Catalog or a scan of a few objects is sub-second — and not to
+/// a provisioning wait: a client that runs a SEQUENCE of statements, as a deployment's
+/// setup/query/reset walk does, waits for each one in turn, so a floor far above the work
+/// turns a walk the service answers in seconds into one no client budget covers. The same
+/// span this emulator's stack operations report their terminal status after, for the same
+/// reason: `STATUS_TRANSITION_DELAY` in
+/// `services/service-com-amazonaws-cloudformation-cloudformation/src/state.rs`.
+pub const QUERY_EXECUTION_COMPLETION: Duration = Duration::from_millis(500);
 
 /// How long a query stays [`QUERY_STATE_QUEUED`] before it is [`QUERY_STATE_RUNNING`]:
 /// the first half of [`QUERY_EXECUTION_COMPLETION`], so both non-terminal states Athena
 /// reports are observable and neither is skipped.
-pub const QUERY_EXECUTION_QUEUED: Duration = Duration::from_millis(1_500);
+pub const QUERY_EXECUTION_QUEUED: Duration = Duration::from_millis(250);
 
 /// The `StateChangeReason` of a query a `StopQueryExecution` call interrupted.
 pub const QUERY_CANCELLED_BY_USER: &str = "Query cancelled by user";
