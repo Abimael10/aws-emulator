@@ -69,11 +69,13 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 /// Every requirement but two is worded exactly as the framework words it:
 ///
 /// * `@pattern` is reported as the expression this service PUBLISHES for the
-///   member's shape, which is the modelled expression without the whole-value
-///   anchor pair the model wraps it in (`crate::state::pattern_requirement`): a
-///   caller lifts that expression out of the message and compiles it, so it is the
-///   one the service advertises rather than the model's spelling of it. The CHECK
-///   still uses the model's pattern as written.
+///   member's shape, which for most of this model's shapes is the modelled
+///   expression without the whole-value anchor pair the model wraps it in and for
+///   the shapes this service publishes as declared is the model's own text, that
+///   pair included (`crate::state::pattern_requirement`): a caller lifts that
+///   expression out of the message and compiles it, so it is the one the service
+///   advertises rather than a normalisation of it. The CHECK still uses the
+///   model's pattern as written.
 /// * an enum value set is listed in the order this service lists that type's values
 ///   in, which is not the order the model declares them in: the violations are
 ///   restated through [`enum_value_sets`] before they are worded, so the requirement

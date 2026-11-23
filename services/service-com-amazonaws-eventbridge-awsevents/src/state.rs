@@ -4577,21 +4577,14 @@ pub fn constraint_clause(member_path: &str, value: Option<&str>, requirement: &s
     format!("{subject} at '{member_path}' failed to satisfy constraint: {requirement}")
 }
 
-/// The requirement clause for a `@pattern` violation: the expression the value
-/// had to satisfy, as the service PUBLISHES it.
-///
-/// A modelled whole-value `@pattern` is the expression the service advertises for
-/// the member's shape with a `^`/`$` pair written around it by the model, and the
-/// clause quotes the expression itself — so the pair is dropped by the tree's one
-/// reading of that wrapping ([`::service_common::validation::unanchored`]), which
-/// is what a caller lifting the expression out of the message compiles. The CHECK
-/// is unchanged: a value is still matched against the model's pattern as written.
-pub fn pattern_requirement(pattern: &str) -> String {
-    format!(
-        "Member must satisfy regular expression pattern: {}",
-        ::service_common::validation::unanchored(pattern)
-    )
-}
+/// Which expression a `@pattern` violation's requirement clause quotes: the one
+/// this service PUBLISHES for the member's shape, which for most of this model's
+/// shapes is the modelled expression without the whole-value `^`/`$` pair the
+/// model writes around it and for the shapes that module names is the model's own
+/// text, that pair included. [`pattern_requirement`] is reached from here, beside
+/// the other refusal wording above.
+mod published_pattern;
+pub use published_pattern::pattern_requirement;
 
 /// The `ValidationException` message over one or more clauses: how many
 /// constraints were violated, then the clauses themselves.

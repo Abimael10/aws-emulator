@@ -5,13 +5,20 @@
 //! `X-Amz-Target: AWSEvents.<Operation>`) through the real `MultiServiceRouter`.
 //!
 //! The RULE asserted here: the requirement clause quotes the expression this
-//! service PUBLISHES for the member's shape, which is the modelled `@pattern`
-//! without the `^`/`$` pair the model wraps a whole-value match in — a caller
-//! lifts that expression out of the message and compiles it, so it is the one the
-//! service advertises rather than the model's spelling of it. The CHECK is
-//! unchanged: the value is still matched against the model's own pattern. The
-//! refusal is `ValidationException` (HTTP 400) over the constraint-clause
-//! template, and it leaves the resource it was made against exactly as it was.
+//! service PUBLISHES for the shape the member targets — the model's own text, the
+//! `^`/`$` pair a whole-value match is wrapped in included, for a shape this
+//! service publishes as declared, and the expression inside that pair for every
+//! other shape. A caller lifts that expression out of the message and compiles it,
+//! so it is the one the service advertises for the shape rather than a
+//! normalisation of it. The CHECK is unchanged: the value is still matched against
+//! the model's own pattern. The refusal is `ValidationException` (HTTP 400) over
+//! the constraint-clause template, and it leaves the resource it was made against
+//! exactly as it was.
+//!
+//! Which shapes are published in which form is reference data about those shapes;
+//! the rows spanning both forms over this service's shapes and operations are in
+//! `published_pattern_expression`, and these rows pin the form of the shapes they
+//! name.
 //!
 //! The expressions below are the model's own
 //! (`smithy_query(query="shape", shape="KmsKeyIdentifier,ConnectionName,RuleName")`),
@@ -40,6 +47,15 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 const KMS_KEY_IDENTIFIER_PATTERN: &str = r"^[a-zA-Z0-9_\-/:]*$";
 const CONNECTION_NAME_PATTERN: &str = r"^[\.\-_A-Za-z0-9]+$";
 const RULE_NAME_PATTERN: &str = r"^[\.\-_A-Za-z0-9]+$";
+
+/// Which of the two forms this service publishes an expression in.
+#[derive(Debug, Clone, Copy)]
+enum Quoting {
+    /// The model's own text, the whole-value anchoring pair included.
+    AsDeclared,
+    /// The expression inside the whole-value pair the model writes around it.
+    WithoutTheWholeValuePair,
+}
 
 /// The connection the update rows are made against.
 const CONNECTION: &str = "pattern-rows";
@@ -111,28 +127,33 @@ fn error_message(body: &Value) -> String {
 /// one clause naming the value that was rejected, the member path it sat at and
 /// the expression it failed, as the service publishes that expression
 /// ([`published_expression`]).
-fn expected_message(value: &str, path: &str, pattern: &str) -> String {
+fn expected_message(value: &str, path: &str, pattern: &str, quoting: Quoting) -> String {
     format!(
         "1 validation error detected: Value '{value}' at '{path}' failed to satisfy \
          constraint: Member must satisfy regular expression pattern: {}",
-        published_expression(pattern)
+        published_expression(pattern, quoting)
     )
 }
 
-/// The expression a clause quotes for the modelled whole-value `pattern`: its body,
-/// without the `^`/`$` pair the model writes around it.
+/// The expression a clause quotes for the modelled whole-value `pattern`, in the form
+/// this service publishes that expression in: the model's own text, or its body without
+/// the `^`/`$` pair the model writes around it.
 ///
 /// Spelled out here rather than imported so that the implementation's own reading of
 /// the wrapping cannot make a row pass, and it panics on a constant that is not a
 /// whole-value expression, so a model text that changed shape fails this suite
 /// rather than quietly weakening it.
-fn published_expression(model_pattern: &str) -> &str {
-    model_pattern
+fn published_expression(model_pattern: &str, quoting: Quoting) -> &str {
+    let body = model_pattern
         .strip_prefix('^')
-        .and_then(|body| body.strip_suffix('$'))
+        .and_then(|inside| inside.strip_suffix('$'))
         .unwrap_or_else(|| {
             panic!("the modelled pattern {model_pattern:?} must wrap the whole value")
-        })
+        });
+    match quoting {
+        Quoting::AsDeclared => model_pattern,
+        Quoting::WithoutTheWholeValuePair => body,
+    }
 }
 
 /// The `API_KEY` connection the update rows are made against, carrying a
@@ -160,8 +181,9 @@ async fn a_pattern_refusal_quotes_the_published_expression() {
     let router = emulator();
     given_connection(&router).await;
 
-    // (case, operation, request, the rejected value, the member path, the pattern)
-    let rows: Vec<(&str, &str, Value, &str, &str, &str)> = vec![
+    // (case, operation, request, the rejected value, the member path, the pattern, the
+    // form this service publishes that pattern in)
+    let rows: Vec<(&str, &str, Value, &str, &str, &str, Quoting)> = vec![
         (
             "UpdateConnection's KmsKeyIdentifier",
             "UpdateConnection",
@@ -169,6 +191,7 @@ async fn a_pattern_refusal_quotes_the_published_expression() {
             "!!!not-a-kms-identifier!!!",
             "kmsKeyIdentifier",
             KMS_KEY_IDENTIFIER_PATTERN,
+            Quoting::AsDeclared,
         ),
         (
             "CreateConnection's KmsKeyIdentifier",
@@ -184,6 +207,7 @@ async fn a_pattern_refusal_quotes_the_published_expression() {
             "alias/not valid!",
             "kmsKeyIdentifier",
             KMS_KEY_IDENTIFIER_PATTERN,
+            Quoting::AsDeclared,
         ),
         (
             "UpdateEventBus's KmsKeyIdentifier",
@@ -192,6 +216,7 @@ async fn a_pattern_refusal_quotes_the_published_expression() {
             "key#one",
             "kmsKeyIdentifier",
             KMS_KEY_IDENTIFIER_PATTERN,
+            Quoting::AsDeclared,
         ),
         (
             "DescribeConnection's Name",
@@ -200,6 +225,7 @@ async fn a_pattern_refusal_quotes_the_published_expression() {
             "not a connection name!",
             "name",
             CONNECTION_NAME_PATTERN,
+            Quoting::WithoutTheWholeValuePair,
         ),
         (
             "ListConnections' NamePrefix",
@@ -208,6 +234,7 @@ async fn a_pattern_refusal_quotes_the_published_expression() {
             "not a prefix!",
             "namePrefix",
             CONNECTION_NAME_PATTERN,
+            Quoting::WithoutTheWholeValuePair,
         ),
         (
             "PutRule's Name",
@@ -216,10 +243,11 @@ async fn a_pattern_refusal_quotes_the_published_expression() {
             "not a rule name!",
             "name",
             RULE_NAME_PATTERN,
+            Quoting::WithoutTheWholeValuePair,
         ),
     ];
 
-    for (case, operation, request, value, path, pattern) in &rows {
+    for (case, operation, request, value, path, pattern, quoting) in &rows {
         let (status, refused) = events(&router, operation, request).await;
         assert_eq!(
             status, 400,
@@ -230,7 +258,7 @@ async fn a_pattern_refusal_quotes_the_published_expression() {
             VALIDATION_EXCEPTION,
             "case {case:?}: answered {refused}"
         );
-        let expected = expected_message(value, path, pattern);
+        let expected = expected_message(value, path, pattern, *quoting);
         let actual = error_message(&refused);
         assert_eq!(
             actual, expected,
