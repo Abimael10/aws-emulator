@@ -11,9 +11,9 @@
 //!   whatever authority its certificates belong to and whatever they assert, is handed
 //!   back by `GetCertificate` as it was sent, and never contributes a fact the record
 //!   reports (`Issuer` stays the name the imported certificate's own DER carries);
-//! * the only things a chain is held to are being a PEM encoding of certificates and
-//!   carrying no certificate whose validity window has run out, each refused with the
-//!   modelled constraint failure for supplied input under its own fixed sentence;
+//! * the only thing a chain is held to is being a PEM encoding of certificates, refused
+//!   with the modelled constraint failure for supplied input under its own fixed
+//!   sentence;
 //! * a `PrivateKey` that is well formed but belongs to another key pair is the same
 //!   class of refusal, under its own fixed sentence, and leaves the certificate stored
 //!   at the ARN the request named exactly as it was;
@@ -29,8 +29,8 @@
 //! chain of an unrelated authority, of the leaf itself, of a certificate that is
 //! explicitly not a CA, and of several certificates in either order; the chain defects
 //! in each form (no PEM framing at all, PEM framing whose content is not a
-//! certificate, a PEM of another type, a type mixed in below a certificate, an expired
-//! member first and last); and key mismatches within one curve and across curves, on a
+//! certificate, a PEM of another type, a type mixed in below a certificate); and key
+//! mismatches within one curve and across curves, on a
 //! fresh import and on a reimport.
 
 use serde_json::{json, Value};
@@ -43,8 +43,6 @@ use crate::certificate_lifecycle::{
 
 /// The fixed sentence each material refusal this suite exercises carries. They are the
 /// only thing telling the refusals apart, so each is asserted in full.
-const CHAIN_EXPIRED: &str = "A certificate in the chain is expired. You can Import a \
-                             certificate only during its validity period.";
 const CHAIN_NOT_PEM: &str = "The certificate chain is not PEM-encoded or is not valid.";
 const CHAIN_WRONG_PEM: &str = "Passed PEM is not a certificate chain.";
 const KEY_MISMATCH: &str = "Key provided does not match the certificate.";
@@ -299,9 +297,9 @@ async fn a_chain_is_stored_as_sent_and_decides_nothing() {
     }
 }
 
-/// RULE: a chain is held to being a PEM encoding of certificates and to its members'
-/// validity windows, and nothing else — each failure the modelled constraint failure
-/// for supplied input, under its own fixed sentence, with nothing stored.
+/// RULE: a chain is held to being a PEM encoding of certificates, and nothing else —
+/// each failure the modelled constraint failure for supplied input, under its own fixed
+/// sentence, with nothing stored.
 #[tokio::test]
 async fn a_chain_that_is_not_servable_is_refused() {
     let router = router();
@@ -311,22 +309,10 @@ async fn a_chain_that_is_not_servable_is_refused() {
         ..Spec::default()
     });
     let valid_ca = Authority::new("valid-ca.example.com");
-    // An authority whose own validity window closed before any instant a test runs at.
-    let expired_ca = Authority::new("expired-ca.example.com");
-    let expired = params(&Spec {
-        common_name: "expired-ca.example.com",
-        ca: true,
-        validity: (2000, 2001),
-        ..Spec::default()
-    })
-    .self_signed(&expired_ca.key)
-    .expect("an expired certificate authority")
-    .pem();
 
-    // One row per form the two held-to properties can fail in: no PEM framing at all,
-    // framing whose content is not a certificate, a well-formed PEM of another type
-    // alone and mixed in below a certificate, and an expired member in first and last
-    // position.
+    // One row per form the held-to property can fail in: no PEM framing at all, framing
+    // whose content is not base64, framing whose content is not a certificate, and a
+    // well-formed PEM of another type alone and mixed in below a certificate.
     let cases: &[(&str, String, &str)] = &[
         ("text that frames no PEM message", "not a chain".to_string(), CHAIN_NOT_PEM),
         (
@@ -348,21 +334,6 @@ async fn a_chain_that_is_not_servable_is_refused() {
             "a PEM private key below a certificate",
             format!("{}{}", valid_ca.pem, leaf.private_key),
             CHAIN_WRONG_PEM,
-        ),
-        (
-            "an expired certificate alone",
-            expired.clone(),
-            CHAIN_EXPIRED,
-        ),
-        (
-            "an expired certificate below a valid one",
-            format!("{}{}", valid_ca.pem, expired),
-            CHAIN_EXPIRED,
-        ),
-        (
-            "an expired certificate above a valid one",
-            format!("{}{}", expired, valid_ca.pem),
-            CHAIN_EXPIRED,
         ),
     ];
 

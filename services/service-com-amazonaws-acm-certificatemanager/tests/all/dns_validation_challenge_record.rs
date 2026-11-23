@@ -30,13 +30,9 @@ use crate::certificate_domain_validations::{
     assert_resource_record, described_validations, summaries, PRIVATE_CA_ARN,
 };
 use crate::certificate_lifecycle::{
-    call, hold_pending_validations, request_certificate, router_with_engine,
+    call, hold_pending_validations, request_certificate, router_with_engine, validation_zone,
 };
 use crate::certificate_validation_state_machine::make_validation_due_now;
-
-/// The zone ACM publishes DNS-validation CNAME targets under, as the
-/// `ResourceRecord$Value` doc shows (`_3639ac533e.acm-validations.aws.`).
-const ACM_VALIDATIONS_ZONE: &str = "acm-validations.aws";
 
 /// The status a validation that has not resolved stands at
 /// (`com.amazonaws.acm#DomainStatus`).
@@ -91,14 +87,16 @@ fn challenge_record(case: &str, list: &[Value], domain: &str) -> Value {
         "case {case}: a DNS-validated name carries the DNS challenge arm, got {configuration}"
     );
     assert_resource_record(case, &challenge["ResourceRecord"], &summary["DomainName"]);
-    // The CNAME target is a name under the zone ACM publishes its challenges in, so a
-    // client that follows the record reaches ACM rather than a name of its own.
+    // The CNAME target is a name under the zone this emulator publishes its challenges
+    // in, so a client that follows the record reaches this emulator rather than a name
+    // of its own.
     let value = challenge["ResourceRecord"]["Value"]
         .as_str()
         .unwrap_or_default();
+    let zone = validation_zone();
     assert!(
-        value.starts_with('_') && value.ends_with(&format!(".{ACM_VALIDATIONS_ZONE}.")),
-        "case {case}: expected a CNAME target in {ACM_VALIDATIONS_ZONE}, got {value:?}"
+        value.starts_with('_') && value.ends_with(&format!(".{zone}.")),
+        "case {case}: expected a CNAME target in {zone}, got {value:?}"
     );
     challenge["ResourceRecord"].clone()
 }

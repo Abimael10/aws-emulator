@@ -196,7 +196,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The zone a re-minted DNS validation's target is published in, read off the
+        // endpoint this request reached before the store is taken.
+        let validation_zone = crate::state::announced_validation_zone(ctx);
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateCertificateOptionsErrorModeled::ValidationException(
                 ValidationException {
@@ -356,6 +358,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         &record.domain_name,
                         &method,
                         record.requested_validation_domain.as_deref(),
+                        &validation_zone,
                     );
                     *record = crate::state::DomainValidationRecord {
                         validation_status: record.validation_status.clone(),

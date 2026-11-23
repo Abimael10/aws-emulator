@@ -613,8 +613,43 @@ pub const EXPORT_ENABLED: &str = "ENABLED";
 /// (`ResourceRecord$Type` doc).
 pub const RECORD_TYPE_CNAME: &str = "CNAME";
 
-/// The zone ACM publishes DNS-validation CNAME targets under.
-pub const ACM_VALIDATIONS_ZONE: &str = "acm-validations.aws";
+/// The label every ACM DNS-validation target carries ahead of the zone it is published
+/// in, as `ResourceRecord$Value`'s own doc shows one (`_3639ac533e.acm-validations.aws.`):
+/// the first label names the validation surface itself, and the labels behind it name the
+/// zone that surface answers from ([`announced_validation_zone`]).
+pub const ACM_VALIDATIONS_LABEL: &str = "acm-validations";
+
+/// The zone this service publishes a domain-validation target in: the validation label
+/// ([`ACM_VALIDATIONS_LABEL`]) under the zone this emulator may announce a name of its own
+/// in.
+///
+/// `DomainValidation$ResourceRecord` "contains the CNAME record that you add to your DNS
+/// database for domain validation": the target is what the client points its record at and
+/// a resolver then follows, so the surface that observes the published record has to answer
+/// for it. Here that surface is this emulator, and the zone it may announce a name of its
+/// own in is the zone of the endpoint the request reached it on
+/// (`service_common::data_plane_addressing::announced_zone_of_authority`, the tree's one
+/// reading of that question) — the loopback zone RFC 6761 reserves ("`localhost`, and any
+/// names falling within `.localhost.`", which resolve to the interface the core binds its
+/// listeners on) whenever this emulator is reached at an address rather than at a name of
+/// its own. A name in a zone AWS serves resolves nowhere near this process, so none is
+/// published.
+///
+/// Read from the request that MINTS a validation and persisted on it, so every later read of
+/// that validation reports the target it was handed out as.
+pub fn announced_validation_zone(ctx: &::smithy_server_runtime::OperationContext<'_>) -> String {
+    let addressed = ::service_common::data_plane_addressing::reached_emulator_endpoint_of_parts(
+        ctx.parts(),
+    )
+    .or_else(|| {
+        ::service_common::data_plane_addressing::served_endpoint_authority(ctx.endpoint().as_str())
+    })
+    .unwrap_or_default();
+    format!(
+        "{ACM_VALIDATIONS_LABEL}.{}",
+        ::service_common::data_plane_addressing::announced_zone_of_authority(&addressed)
+    )
+}
 
 /// The path a CA fetches an HTTP domain-validation token from — the
 /// `/.well-known/pki-validation/` location the CA/Browser Forum baseline
@@ -3614,15 +3649,31 @@ pub fn serial_number(bytes: &[u8]) -> String {
 }
 
 /// A wall-clock instant as the modelled `TStamp`.
+///
+/// The ONE place a timestamp member of this service is built — a certificate's `CreatedAt`,
+/// `IssuedAt`, `ImportedAt`, `NotBefore`, `NotAfter` and `RevokedAt`, a renewal's and an
+/// ACME resource's instants, in a response body or in a summary — so every operation serves
+/// an instant in the same form.
+///
+/// That form carries at most MILLISECONDS: this service's protocol puts a timestamp on the
+/// wire as epoch seconds, and the resolution AWS states one at is thousandths of a second
+/// (`1985-04-12T23:20:50.52Z`, the sample form this family of APIs documents). So the
+/// sub-millisecond part of the clock's own reading is DROPPED here rather than serialized,
+/// and a client that reads one of these timestamps reads an instant of the resolution AWS
+/// publishes it at however finely the clock behind it ticks.
 pub fn to_date_time(at: SystemTime) -> ::aws_smithy_types::DateTime {
     let since_epoch = at
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
     ::aws_smithy_types::DateTime::from_secs_and_nanos(
         i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX),
-        since_epoch.subsec_nanos(),
+        since_epoch.subsec_millis() * NANOS_PER_MILLISECOND,
     )
 }
+
+/// How many nanoseconds one millisecond is, for dropping the part of a clock reading below
+/// the resolution [`to_date_time`] serves an instant at.
+const NANOS_PER_MILLISECOND: u32 = 1_000_000;
 
 /// A fingerprint of the parameters one request builds a record from, for an operation
 /// that honours an `@idempotencyToken`: re-sending a token must answer with what it
@@ -3753,6 +3804,7 @@ pub fn domain_validation_record(
     domain_name: &str,
     validation_method: &str,
     validation_domain: Option<&str>,
+    validation_zone: &str,
 ) -> DomainValidationRecord {
     let target = validation_target(domain_name);
     let mut record = DomainValidationRecord {
@@ -3789,7 +3841,7 @@ pub fn domain_validation_record(
             record.resource_record = Some(ResourceRecord {
                 name: format!("_{name}.{target}."),
                 r#type: RECORD_TYPE_CNAME.to_string(),
-                value: acm_validations_cname_target(certificate_id, domain_name),
+                value: acm_validations_cname_target(certificate_id, domain_name, validation_zone),
             });
         }
         "HTTP" => {
@@ -3798,7 +3850,7 @@ pub fn domain_validation_record(
             record.http_redirect = Some(HttpRedirect {
                 redirect_from: Some(format!("http://{target}{path}{token}.txt")),
                 redirect_to: Some(format!(
-                    "http://{token}.{ACM_VALIDATIONS_ZONE}{path}{token}.txt"
+                    "http://{token}.{validation_zone}{path}{token}.txt"
                 )),
             });
         }
@@ -3824,30 +3876,32 @@ pub fn domain_validation_record(
 pub fn acme_prevalidation_resource_record(
     validation_id: &str,
     domain_name: &str,
+    validation_zone: &str,
 ) -> ResourceRecord {
     let target = validation_target(domain_name);
     let name = validation_label(validation_id, domain_name, "dns-name");
     ResourceRecord {
         name: format!("_{name}.{target}."),
         r#type: RECORD_TYPE_CNAME.to_string(),
-        value: acm_validations_cname_target(validation_id, domain_name),
+        value: acm_validations_cname_target(validation_id, domain_name, validation_zone),
     }
 }
 
-/// The number of label characters a validation's own subdomain under
-/// [`ACM_VALIDATIONS_ZONE`] carries, as the recorded targets show that label: a short
-/// run of lower-case alphanumerics, far shorter than the 32-character challenge token
-/// beside it.
+/// The number of label characters a validation's own subdomain under the validation zone
+/// ([`announced_validation_zone`]) carries, as the recorded targets show that label: a
+/// short run of lower-case alphanumerics, far shorter than the 32-character challenge
+/// token beside it.
 const VALIDATION_ZONE_LABEL_LENGTH: usize = 10;
 
 /// The CNAME target a DNS validation's challenge record points at:
-/// `_<token>.<per-validation label>.acm-validations.<zone>.`
+/// `_<token>.<per-validation label>.<validation zone>.`
 ///
 /// Three parts, and every one of them is required: the challenge TOKEN, then the
-/// validation's OWN label, then [`ACM_VALIDATIONS_ZONE`]. The middle label is what
-/// makes the target a name under the validation's own subdomain of the ACM validation
-/// zone rather than a name directly in it — the shape a client that publishes the
-/// record and then checks the delegation structure reads it as.
+/// validation's OWN label, then the zone the target is published in
+/// ([`announced_validation_zone`]). The middle label is what makes the target a name
+/// under the validation's own subdomain of that zone rather than a name directly in it —
+/// the shape a client that publishes the record and then checks the delegation structure
+/// reads it as.
 ///
 /// Both labels are derived from the id of whatever the validation belongs to (a
 /// certificate, an ACME domain validation) through [`validation_label`], so repeated
@@ -3855,13 +3909,17 @@ const VALIDATION_ZONE_LABEL_LENGTH: usize = 10;
 /// of it comes from anything the caller sent. Rendered here so the certificate path
 /// ([`domain_validation_record`]) and the ACME prevalidation path
 /// ([`acme_prevalidation_resource_record`]) publish one shape.
-pub fn acm_validations_cname_target(owner_id: &str, domain_name: &str) -> String {
+pub fn acm_validations_cname_target(
+    owner_id: &str,
+    domain_name: &str,
+    validation_zone: &str,
+) -> String {
     let token = validation_label(owner_id, domain_name, "dns-value");
     let label: String = validation_label(owner_id, domain_name, "dns-zone-label")
         .chars()
         .take(VALIDATION_ZONE_LABEL_LENGTH)
         .collect();
-    format!("_{token}.{label}.{ACM_VALIDATIONS_ZONE}.")
+    format!("_{token}.{label}.{validation_zone}.")
 }
 
 /// The tag-key prefix Amazon Web Services reserves for its own tags: neither half of

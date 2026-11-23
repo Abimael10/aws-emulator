@@ -410,6 +410,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     name,
                     &validation_method,
                     validation_domains.get(name.as_str()).map(String::as_str),
+                    &crate::state::announced_validation_zone(ctx),
                 )
             })
             .collect();

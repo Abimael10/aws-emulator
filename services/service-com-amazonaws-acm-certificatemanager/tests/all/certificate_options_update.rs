@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 
 use crate::certificate_lifecycle::{
     call, describe, error_code, error_message, hold_pending_validations, request_certificate,
-    router_with_engine,
+    router_with_engine, validation_zone,
 };
 use crate::certificate_revocation::mark_exported;
 use crate::certificate_validation_state_machine::{make_validation_due_now, PRIVATE_CA_ARN};
@@ -40,10 +40,6 @@ use crate::certificate_validation_state_machine::{make_validation_due_now, PRIVA
 /// Every `ValidationMethod` the model declares
 /// (`smithy_query(query="shape", shape="com.amazonaws.acm#ValidationMethod")`).
 const VALIDATION_METHODS: &[&str] = &["DNS", "EMAIL", "HTTP"];
-
-/// The zone ACM publishes DNS-validation CNAME targets under, as the
-/// `ResourceRecord$Value` doc shows (`_3639ac533e.acm-validations.aws.`).
-const ACM_VALIDATIONS_ZONE: &str = "acm-validations.aws";
 
 /// The path a CA fetches an HTTP validation token from, as `HttpRedirect$RedirectFrom`
 /// shows (`http://example.com/.well-known/pki-validation/abc.txt`).
@@ -200,9 +196,10 @@ fn assert_evidence(case: &str, validation: &Value, method: &str) {
                 "case {case}: expected a validation label under {proven}, got {name:?}"
             );
             let value = record["Value"].as_str().unwrap_or_default();
+            let zone = validation_zone();
             assert!(
-                value.starts_with('_') && value.ends_with(&format!(".{ACM_VALIDATIONS_ZONE}.")),
-                "case {case}: expected a CNAME target in {ACM_VALIDATIONS_ZONE}, got {value:?}"
+                value.starts_with('_') && value.ends_with(&format!(".{zone}.")),
+                "case {case}: expected a CNAME target in {zone}, got {value:?}"
             );
             assert!(
                 validation["ValidationEmails"].is_null(),
@@ -237,9 +234,10 @@ fn assert_evidence(case: &str, validation: &Value, method: &str) {
                  got {from:?}"
             );
             let to = redirect["RedirectTo"].as_str().unwrap_or_default();
+            let zone = validation_zone();
             assert!(
-                to.contains(ACM_VALIDATIONS_ZONE) && to.ends_with(".txt"),
-                "case {case}: expected the redirect target in {ACM_VALIDATIONS_ZONE}, got {to:?}"
+                to.contains(&zone) && to.ends_with(".txt"),
+                "case {case}: expected the redirect target in {zone}, got {to:?}"
             );
             assert!(
                 validation["ResourceRecord"].is_null(),

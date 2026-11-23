@@ -58,11 +58,21 @@ pub(crate) async fn revoke_binding(router: &MultiServiceRouter, case: &str, arn:
     );
 }
 
-/// `SystemTime` as the epoch seconds a wire timestamp is compared against.
+/// `SystemTime` as the epoch seconds a wire timestamp is compared against, with the
+/// sub-millisecond part DROPPED.
+///
+/// This service publishes an instant at the resolution AWS states one at — thousandths
+/// of a second — so a reading taken here is comparable with a published one down to the
+/// millisecond and no further. Flooring both ends of a bracket keeps it exact: a
+/// published instant is the floor of the instant it was read at, and flooring is
+/// monotonic, so a reading between two bracketing reads still falls between their
+/// floors.
 fn unix_seconds(at: SystemTime) -> f64 {
-    at.duration_since(UNIX_EPOCH)
+    let since_epoch = at
+        .duration_since(UNIX_EPOCH)
         .expect("the clock is past the epoch")
-        .as_secs_f64()
+        .as_secs_f64();
+    (since_epoch * 1_000.0).floor() / 1_000.0
 }
 
 /// How many external account bindings the store holds.

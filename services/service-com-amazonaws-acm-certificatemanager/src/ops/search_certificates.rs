@@ -597,7 +597,9 @@ fn epoch_pair(at: &::aws_smithy_types::DateTime) -> (i64, u32) {
 }
 
 /// The same pair for a stored instant, so a record's timestamp and a filter's bound
-/// are compared in one representation.
+/// are compared in one representation — the one a response PUBLISHES the record's
+/// instant at, so a range a caller bounds with a value it read back contains the record
+/// it read it from.
 fn stored_epoch_pair(at: ::std::time::SystemTime) -> (i64, u32) {
     epoch_pair(&crate::state::to_date_time(at))
 }
@@ -874,18 +876,28 @@ fn flag_key(value: bool) -> String {
 /// the renderings compares the instants. An absent instant renders as the empty
 /// string, which sorts before every rendered instant.
 ///
+/// Read off the STORED instant at its own resolution, not at the resolution a response
+/// publishes it at ([`crate::state::to_date_time`], thousandths of a second): an ORDER is
+/// a total order this service imposes, so two records whose instants fall in one
+/// published millisecond still order by the instants they were actually recorded at,
+/// while a FILTER compares a record against a bound the CALLER named and therefore keeps
+/// comparing what the caller can see ([`stored_epoch_pair`]).
+///
 /// The seconds are biased into the unsigned range before they are padded, so the
 /// rendering stays monotonic over the whole signed domain: a negative decimal does not
-/// sort lexicographically in instant order. (Today [`crate::state::to_date_time`]
-/// reports a pre-epoch instant as the epoch itself, so no stored record reaches the
+/// sort lexicographically in instant order. (An instant before the epoch renders as the
+/// epoch itself, exactly as a response reports one, so no stored record reaches the
 /// negative range — the bias is what keeps this key correct if one ever does.)
 fn instant_key(at: Option<::std::time::SystemTime>) -> String {
     match at {
         None => String::new(),
         Some(at) => {
-            let (secs, nanos) = stored_epoch_pair(at);
+            let since_epoch = at
+                .duration_since(::std::time::SystemTime::UNIX_EPOCH)
+                .unwrap_or_default();
+            let secs = i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX);
             let biased = i128::from(secs) - i128::from(i64::MIN);
-            format!("{biased:020}.{nanos:09}")
+            format!("{biased:020}.{:09}", since_epoch.subsec_nanos())
         }
     }
 }

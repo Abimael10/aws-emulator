@@ -61,17 +61,6 @@ const NOT_ONE_CERTIFICATE: &str = "The certificate field contains more than one 
                                    certificate. You can specify only one certificate in \
                                    this field.";
 
-/// The sentence ACM answers for a certificate whose validity window has run out
-/// ("the current time must be between the Not Before and Not After certificate fields",
-/// `ImportCertificate` doc), as recorded against the real service.
-const CERTIFICATE_EXPIRED: &str = "The certificate is expired. You can Import a certificate \
-                                   only during its validity period.";
-
-/// The same sentence for the other end of that window: a certificate whose Not Before
-/// has not arrived yet.
-const CERTIFICATE_NOT_YET_VALID: &str = "The certificate is not valid yet. You can Import a \
-                                         certificate only during its validity period.";
-
 /// The sentence ACM answers for a `PrivateKey` body it cannot read as an unencrypted
 /// PEM private key — the same form as the one for the other two bodies an import
 /// carries.
@@ -201,26 +190,6 @@ async fn import_material_defects_are_one_class_under_their_own_sentence() {
     });
     let stored = import(&router, "a valid import", &import_body(&valid)).await;
 
-    // Certificates whose validity windows are closed and not yet open: two closed
-    // windows, decades apart and on different curves, and one that opens in the far
-    // future.
-    let long_expired = generate(&Blueprint {
-        common_name: Some("long-expired.probe-domain.net"),
-        validity: (2000, 2001),
-        ..Blueprint::default()
-    });
-    let recently_expired = generate(&Blueprint {
-        common_name: Some("recently-expired.probe-domain.net"),
-        algorithm: &rcgen::PKCS_ECDSA_P384_SHA384,
-        validity: (2015, 2016),
-        ..Blueprint::default()
-    });
-    let not_yet_valid = generate(&Blueprint {
-        common_name: Some("not-yet-valid.probe-domain.net"),
-        validity: (2990, 2999),
-        ..Blueprint::default()
-    });
-
     // The one key form an import may not carry: the same key framed as an encrypted
     // private key (RFC 7468 section 11).
     let encrypted = format!(
@@ -230,8 +199,8 @@ async fn import_material_defects_are_one_class_under_their_own_sentence() {
     // A blob that is not text at all, so it cannot be a PEM encoding of anything.
     let not_text: Value = json!(aws_smithy_types::base64::encode([0xff_u8, 0xfe, 0x00, 0x80]));
 
-    // Rows differ along the member the defect sits in, the FORM the defect takes, the
-    // curve of the certificate and the end of the validity window that excludes it.
+    // Rows differ along the member the defect sits in, the FORM the defect takes and the
+    // curve of the certificate.
     let cases: Vec<(&str, Value, &str)> = vec![
         (
             "a Certificate framing no PEM message at all",
@@ -260,21 +229,6 @@ async fn import_material_defects_are_one_class_under_their_own_sentence() {
             "a Certificate body that is not text",
             json!({ "Certificate": not_text, "PrivateKey": blob(&valid.private_key) }),
             NOT_ONE_CERTIFICATE,
-        ),
-        (
-            "a certificate whose validity window closed decades ago",
-            import_body(&long_expired),
-            CERTIFICATE_EXPIRED,
-        ),
-        (
-            "a P-384 certificate whose validity window closed later",
-            import_body(&recently_expired),
-            CERTIFICATE_EXPIRED,
-        ),
-        (
-            "a certificate whose validity window has not opened",
-            import_body(&not_yet_valid),
-            CERTIFICATE_NOT_YET_VALID,
         ),
         (
             "a PrivateKey framing no PEM message at all",

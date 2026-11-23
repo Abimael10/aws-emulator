@@ -34,7 +34,9 @@ use service_com_amazonaws_acm_certificatemanager::state;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::acme_endpoint_lifecycle::{create_endpoint, AUTHORIZATION_BEHAVIORS};
-use crate::certificate_lifecycle::{call, error_code, error_message, router_with_engine, ACCOUNT};
+use crate::certificate_lifecycle::{
+    call, error_code, error_message, router_with_engine, validation_zone, ACCOUNT,
+};
 
 /// Every `DomainScopeOption` the model declares
 /// (`smithy_query(query="shape", shape="com.amazonaws.acm#DomainScopeOption")`).
@@ -353,10 +355,9 @@ async fn describe_reports_what_create_acme_domain_validation_stored() {
             "case {case:?}: expected a validation label under {domain}, got {name:?}"
         );
         assert!(
-            value.starts_with('_')
-                && value.ends_with(&format!(".{}.", state::ACM_VALIDATIONS_ZONE)),
+            value.starts_with('_') && value.ends_with(&format!(".{}.", validation_zone())),
             "case {case:?}: expected a CNAME target in {}, got {value:?}",
-            state::ACM_VALIDATIONS_ZONE
+            validation_zone()
         );
         assert!(
             seen_records.insert(value.clone()),

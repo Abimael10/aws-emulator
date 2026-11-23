@@ -657,19 +657,8 @@ async fn a_reimport_replaces_the_certificate_under_the_same_arn() {
 async fn an_import_that_breaks_a_guideline_is_refused() {
     let router = router();
 
-    // A certificate whose validity window is closed, one whose window has not opened,
-    // one of an algorithm outside the `KeyAlgorithm` enum (Ed25519), and the key and
-    // chain bodies in each form the guidelines exclude.
-    let expired = generate(&Blueprint {
-        common_name: Some("expired.example.com"),
-        validity: (2000, 2001),
-        ..Blueprint::default()
-    });
-    let not_yet = generate(&Blueprint {
-        common_name: Some("future.example.com"),
-        validity: (2990, 2999),
-        ..Blueprint::default()
-    });
+    // A certificate of an algorithm outside the `KeyAlgorithm` enum (Ed25519), and the
+    // key and chain bodies in each form the guidelines exclude.
     let unsupported = generate(&Blueprint {
         common_name: Some("ed25519.example.com"),
         algorithm: &rcgen::PKCS_ED25519,
@@ -702,16 +691,6 @@ async fn an_import_that_breaks_a_guideline_is_refused() {
                 "Certificate": blob("-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----\n"),
                 "PrivateKey": blob(&valid.private_key),
             }),
-            "ValidationException",
-        ),
-        (
-            "the certificate's validity window has closed",
-            import_body(&expired),
-            "ValidationException",
-        ),
-        (
-            "the certificate's validity window has not opened",
-            import_body(&not_yet),
             "ValidationException",
         ),
         (
@@ -907,7 +886,7 @@ async fn a_reimport_is_refused_where_it_does_not_apply() {
     );
 }
 
-/// RULE: a PEM-encoded chain of unexpired certificates is accepted beside the
+/// RULE: a PEM-encoded chain of certificates is accepted beside the
 /// certificate whatever it carries — the chain is material stored to be served back,
 /// not a claim about the certificate — and the certificate stored is still the leaf the
 /// request named.

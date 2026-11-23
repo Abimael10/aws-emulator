@@ -25,6 +25,19 @@ pub(crate) const REGION: &str = "us-west-2";
 /// The canonical emulator account id every ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
 pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
+/// The zone a DNS-validation target is published in for a request dispatched here: the
+/// validation label under the zone this emulator may announce a name of its own in, which
+/// for a router serving no socket of its own is the loopback zone RFC 6761 reserves.
+///
+/// A test asserts the published target against THIS, so no suite names a zone of its own.
+pub(crate) fn validation_zone() -> String {
+    format!(
+        "{}.{}",
+        state::ACM_VALIDATIONS_LABEL,
+        service_common::data_plane_addressing::LOOPBACK_ZONE
+    )
+}
+
 /// Every `ValidationMethod` the model declares
 /// (`smithy_query(query="shape", shape="com.amazonaws.acm#ValidationMethod")`).
 const VALIDATION_METHODS: &[&str] = &["DNS", "EMAIL", "HTTP"];
@@ -468,9 +481,10 @@ async fn describe_reports_what_request_certificate_stored() {
                         "case {case}: expected a _<32 hex>.{target}. record name, got {record_name:?}"
                     );
                     let value = record["Value"].as_str().unwrap_or_default();
+                    let zone = validation_zone();
                     assert!(
-                        value.ends_with(".acm-validations.aws."),
-                        "case {case}: expected a CNAME target in acm-validations.aws, got {value:?}"
+                        value.ends_with(&format!(".{zone}.")),
+                        "case {case}: expected a CNAME target in {zone}, got {value:?}"
                     );
                     assert!(
                         validation["ValidationEmails"].is_null()

@@ -375,6 +375,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             resource_record: Some(crate::state::acme_prevalidation_resource_record(
                 &validation_id,
                 &input.domain_name,
+                &crate::state::announced_validation_zone(ctx),
             )),
             status: crate::state::ACME_DOMAIN_VALIDATION_STATUS_VALIDATING.to_string(),
             // Nothing has failed: `FailureDetails` carries "details about the failure, if
