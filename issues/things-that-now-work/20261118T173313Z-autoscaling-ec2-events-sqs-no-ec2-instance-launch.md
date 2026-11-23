@@ -43,3 +43,40 @@ Smithy (com.amazonaws.autoscaling): DescribeAutoScalingGroups -> AutoScalingGrou
    -> AWS: 'EC2 Instance Launch Successful' envelopes for both group names arrive, and the filtered queue receives only <base>-a's (same event id as the control queue's copy for that group).
    -> Emulator: no aws.autoscaling message ever arrives on either queue and the check is killed at its 60 s bound.
 8. Cross-check with autoscaling.DescribeAutoScalingGroups(<base>-a) / (<base>-b): each lists one instance whose InstanceId must equal the event's detail.EC2InstanceId.
+
+## Resolution
+
+The reported cause does not hold in the current tree: the event IS published and IS delivered,
+and the check's own wall clock is what ends the run.
+
+Traced against the booted emulator by instrumenting the delivery path temporarily (the
+instrumentation is not part of the tree; what it established is pinned by the test named below).
+For the recorded check, with the clock measured from its first call:
+
+- Both rules are created with one Amazon SQS target each, and both barrier events are delivered
+  and received (the rules' patterns are an `$or` of the launch branch and a barrier branch of the
+  caller's own source — the control rule's launch branch is the `{"prefix": "<base>-"}` one).
+- Both groups are created; `DescribeAutoScalingGroups` lists one `Pending` instance each.
+- 0.5 s later the group's launch is published ONCE per group: EventBridge matches BOTH rules for
+  group a's event (the exact-name rule and the prefix rule), and the control queue receives
+  envelopes for both groups while the filtered queue receives only group a's — carrying the SAME
+  event id the control queue saw for it, and the `EC2InstanceId` the group reports.
+- The check receives and deletes all three envelopes by 0.6 s, and then holds: six `ReceiveMessage`
+  calls with `WaitTimeSeconds=10`, alternating the two queues, on queues that can receive nothing
+  further. That hold is 60 s of long polling on its own, so the run is cut off at its 60 s bound
+  with every assertion it had reached passing.
+
+Confirmed by driving the same run with an artificially shortened empty long poll (not a change
+that could be kept: `ReceiveMessage$WaitTimeSeconds` is "the duration (in seconds) for which the
+call waits for a message to arrive in the queue before returning", and a message is what returns
+it sooner): the check then completes and PASSES unchanged, which places the whole of what it grades
+— the single publication, the group-name filter, the shared event id, the envelope's members — in
+the emulator as it already stands.
+
+Pinned by the group-name filter table in
+core/router/tests/all/asg_launch_events_filtered_by_group_name.rs: two groups whose capacity their
+own create asks for, four rules in the `$or` form a client proves with a barrier (each group's
+exact name, a `prefix` over both, a `prefix` over nothing), asserting that one publication reaches
+every matching rule with one id, that neither exact rule ever sees its sibling's launch, that the
+absent prefix sees neither, and that each envelope names the group and the instance the API
+reports, in `detail` and in `resources`.
