@@ -66,12 +66,11 @@ const INVOKE_ACTION: &str = "lambda:InvokeFunction";
 const SEND_MESSAGE_ACTION: &str = "sqs:SendMessage";
 
 /// The conditions EventBridge stamps on a delivery it could not make, as the literals it
-/// writes: the role it could not assume, and the permission it did not hold.
+/// writes: the role it could not assume, and the permission it did not hold — which is the
+/// condition of every delivery a document in force over an EXISTING target refused, whichever
+/// service that target lives in.
 const FAILED_TO_ASSUME_ROLE: &str = "FAILED_TO_ASSUME_ROLE";
 const NO_PERMISSIONS: &str = "NO_PERMISSIONS";
-/// The condition a delivery the TARGET's own service would not take carries: Amazon SQS
-/// answers a send its queue's documents withhold with its not-found code.
-const NO_RESOURCE: &str = "NO_RESOURCE";
 
 /// A deployment package as `Code.ZipFile` carries it. What a handler computes is not what this
 /// suite is about: what it asserts is which deliveries REACH the function at all.
@@ -402,7 +401,7 @@ fn rows() -> Vec<Row> {
                 allows: Some(Allows::CallOnTarget),
             }),
             target_policy: TargetPolicy::Denies,
-            expected: Expect::Withheld(NO_RESOURCE),
+            expected: Expect::Withheld(NO_PERMISSIONS),
         },
         Row {
             case: "a queue target under a role that does not trust this service",
@@ -426,7 +425,7 @@ fn rows() -> Vec<Row> {
             kind: Kind::Queue,
             role: None,
             target_policy: TargetPolicy::None,
-            expected: Expect::Withheld(NO_RESOURCE),
+            expected: Expect::Withheld(NO_PERMISSIONS),
         },
     ]
 }

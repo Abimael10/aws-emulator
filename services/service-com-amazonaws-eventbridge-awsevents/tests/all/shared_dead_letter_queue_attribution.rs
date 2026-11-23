@@ -48,7 +48,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state::{
     DEFAULT_EVENT_BUS_NAME, EVENT_BUS_NAME_DIMENSION, INVOCATIONS_SENT_TO_DLQ_METRIC,
-    METRIC_NAMESPACE, NO_PERMISSIONS, NO_RESOURCE, RULE_NAME_DIMENSION, SERVICE_PRINCIPAL,
+    METRIC_NAMESPACE, NO_PERMISSIONS, RULE_NAME_DIMENSION, SERVICE_PRINCIPAL,
     SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC,
 };
 use service_com_amazonaws_lambda_awsgirapiservice::state::STATE_ACTIVE;
@@ -646,8 +646,8 @@ enum Refused {
 /// on, how many matching events the round publishes, and the CONDITION the parked
 /// copy carries — EventBridge's own classification of the answer the target's
 /// service gave the invocation, which is `NO_PERMISSIONS` for a target that is
-/// there and withheld the grant from this principal and `NO_RESOURCE` for one whose
-/// service answers a withheld send by denying the resource exists.
+/// there and withheld the grant from this principal and `NO_RESOURCE` for a target
+/// whose service answers that it is not there at all.
 struct Row {
     case: &'static str,
     refused: Refused,
@@ -677,7 +677,7 @@ fn rows() -> Vec<Row> {
             refused: Refused::QueueWithNoPolicy,
             bus: DEFAULT_EVENT_BUS_NAME,
             events: 3,
-            condition: NO_RESOURCE,
+            condition: NO_PERMISSIONS,
         },
     ]
 }

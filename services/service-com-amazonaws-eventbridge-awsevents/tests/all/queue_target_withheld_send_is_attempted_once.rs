@@ -11,17 +11,18 @@
 //! destination queue's own resource policy alone authorizes the send (`PutTargets`:
 //! "for Lambda functions, Amazon SNS topics and Amazon SQS queues, EventBridge relies
 //! on resource-based policies"); what the delivery reads back from a queue whose
-//! documents do not permit the send is the ONE answer that service has for a send it
-//! will not make — `QueueDoesNotExist`, HTTP 400 under
-//! `AWS.SimpleQueueService.NonExistentQueue`
-//! (`smithy_query(query="shape", shape="QueueDoesNotExist",
-//! model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`),
-//! `SendMessage` modelling no authorization failure at all — and EventBridge
-//! classifies that answer, so the class is the resource one (`NO_RESOURCE`) and the
-//! sentence beside it is that service's own. Such an answer is the same however often
-//! it is asked for, so nothing retries the handover: ONE attempt is counted, ONE dead
-//! letter is parked, and the letter accounts for no retry whatever the target's
-//! `RetryPolicy` allows.
+//! documents do not permit the send is that service's refusal of the CALL — the code
+//! and status AWS answers an unauthorized call with (`AccessDenied`, HTTP 403), which
+//! `SendMessage` models no more than any other operation does because such a refusal
+//! is answered ahead of the operation (`smithy_query(query="operation",
+//! operation="SendMessage",
+//! model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`)
+//! — and EventBridge classifies that answer, so the class is the permission one
+//! (`NO_PERMISSIONS`) and the sentence beside it is that service's own, naming the
+//! principal, the action and the queue of the refused send. Such an answer is the
+//! same however often it is asked for, so nothing retries the handover: ONE attempt
+//! is counted, ONE dead letter is parked, and the letter accounts for no retry
+//! whatever the target's `RetryPolicy` allows.
 //!
 //! The table spans that rule rather than one case: its rows differ along the
 //! `RetryPolicy` the target carries — none at all (the documented defaults apply),
@@ -48,7 +49,7 @@ use service_com_amazonaws_eventbridge_awsevents::state::retry_bounds::{
 };
 use service_com_amazonaws_eventbridge_awsevents::state::{
     rule_arn, DEFAULT_EVENT_BUS_NAME, FAILED_INVOCATIONS_METRIC, INVOCATIONS_SENT_TO_DLQ_METRIC,
-    INVOCATION_ATTEMPTS_METRIC, NO_RESOURCE, SERVICE_PRINCIPAL,
+    INVOCATION_ATTEMPTS_METRIC, NO_PERMISSIONS, SERVICE_PRINCIPAL,
     SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC,
 };
 
@@ -72,14 +73,19 @@ const ERROR_MESSAGE_ATTRIBUTE: &str = "ERROR_MESSAGE";
 const RULE_ARN_ATTRIBUTE: &str = "RULE_ARN";
 const TARGET_ARN_ATTRIBUTE: &str = "TARGET_ARN";
 
-/// Amazon SQS's own error code for a send it will not make (`QueueDoesNotExist`'s
-/// `awsQueryError` code), the status it answers under, and the fixed sentence it
-/// carries — stated here rather than read from the implementation's own constants, so
-/// a wrong answer there cannot make this suite pass.
-const QUEUE_DOES_NOT_EXIST: &str = "AWS.SimpleQueueService.NonExistentQueue";
-const QUEUE_DOES_NOT_EXIST_STATUS: u16 = 400;
-const QUEUE_DOES_NOT_EXIST_MESSAGE: &str =
-    "The specified queue does not exist or you do not have access to it.";
+/// The error code AWS answers a call no document in force over the resource permits,
+/// the status it answers under, and the sentence it carries — stated here rather than
+/// read from the implementation's own constants, so a wrong answer there cannot make
+/// this suite pass. The sentence names the principal the send was made as, the action
+/// and the queue, which is what an authorization refusal is about.
+const QUEUE_ACCESS_DENIED: &str = "AccessDenied";
+const QUEUE_ACCESS_DENIED_STATUS: u16 = 403;
+fn queue_access_denied_message(queue_arn: &str) -> String {
+    format!(
+        "User: {SERVICE_PRINCIPAL} is not authorized to perform: {SEND_MESSAGE} on resource: \
+         {queue_arn} because no resource-based policy allows the {SEND_MESSAGE} action"
+    )
+}
 
 /// A statement list wrapped as a policy document.
 fn document(statements: Value) -> String {
@@ -299,21 +305,21 @@ async fn a_withheld_queue_delivery_is_attempted_once_under_every_retry_policy() 
             "case {case:?}: expected exactly one dead letter, got {parked:?}"
         );
         let message = &parked[0];
-        // The class is the one the ANSWER belongs to: that service's code names a
-        // resource the delivery could not address, and it says nothing about which of
-        // the two reasons it was.
+        // The class is the one the ANSWER belongs to: that service answered a refusal
+        // of the call on a queue that is there, which is the permission class.
         let class = attribute(message, ERROR_CODE_ATTRIBUTE);
         assert_eq!(
-            class, NO_RESOURCE,
-            "case {case:?}: expected the dead-letter {ERROR_CODE_ATTRIBUTE} {NO_RESOURCE:?}, \
+            class, NO_PERMISSIONS,
+            "case {case:?}: expected the dead-letter {ERROR_CODE_ATTRIBUTE} {NO_PERMISSIONS:?}, \
              got {class:?} in {message:?}"
         );
-        // The sentence beside it is that service's own answer, in full: its fixed text
-        // with the metadata block of the one refused call, whose id is the only part
-        // that varies.
+        // The sentence beside it is that service's own answer, in full: the refusal of
+        // the call the delivery made, with the metadata block of the one refused call,
+        // whose id is the only part that varies.
         let head = format!(
-            "{QUEUE_DOES_NOT_EXIST_MESSAGE} (Service: AmazonSQS; Status Code: \
-             {QUEUE_DOES_NOT_EXIST_STATUS}; Error Code: {QUEUE_DOES_NOT_EXIST}; Request ID: "
+            "{} (Service: AmazonSQS; Status Code: \
+             {QUEUE_ACCESS_DENIED_STATUS}; Error Code: {QUEUE_ACCESS_DENIED}; Request ID: ",
+            queue_access_denied_message(&target_arn)
         );
         let reported = attribute(message, ERROR_MESSAGE_ATTRIBUTE);
         assert!(

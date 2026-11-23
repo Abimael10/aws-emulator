@@ -12,19 +12,19 @@
 //! message, and the two can never name two different failures. For a queue target the
 //! send is authorized by the queue's own resource policy alone ("for Lambda functions,
 //! Amazon SNS topics and Amazon SQS queues, EventBridge relies on resource-based
-//! policies", `PutTargets`), and that service answers a send it will not make with ONE
-//! refusal whichever of the two reasons it was — the queue is not there, or the
-//! documents in force do not permit the sender: `QueueDoesNotExist`, HTTP 400 under
-//! `AWS.SimpleQueueService.NonExistentQueue`
+//! policies", `PutTargets`), and which refusal that service answers depends on which
+//! of the two reasons it was: a queue that is THERE and did not permit the sender
+//! answers a refusal of the CALL, under the code and status AWS answers an
+//! unauthorized call with (`AccessDenied`, HTTP 403 — a refusal answered ahead of the
+//! operation, which is why `SendMessage` declares none:
+//! `smithy_query(query="operation", operation="SendMessage",
+//! model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`),
+//! and that code's class is the permission one; a queue that is NOT there answers
+//! `QueueDoesNotExist`, HTTP 400 under `AWS.SimpleQueueService.NonExistentQueue`
 //! (`smithy_query(query="shape", shape="QueueDoesNotExist",
 //! model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`),
-//! `SendMessage` declaring no authorization failure at all because that service does
-//! not disclose a queue it will not let the caller write to. That code's class is the
-//! resource one, so every row below is in it; the permission class belongs to a target
-//! whose service really does answer an authorization refusal — the key an encrypted
-//! queue's messages are encrypted under, which is
-//! `tests/all/encrypted_queue_target_key_policy.rs`'s rule — and the table below still
-//! carries that code, so a row whose answer named it instead would fail.
+//! whose class is the resource one. Both codes are in the table below, so a row whose
+//! two attributes named different classes would fail.
 //!
 //! The table spans that rule rather than one case: its rows differ along the FORM a
 //! refusal takes (no document at all, an explicit `Deny`, a grant scoped by
@@ -68,25 +68,34 @@ const ERROR_MESSAGE_ATTRIBUTE: &str = "ERROR_MESSAGE";
 const RULE_ARN_ATTRIBUTE: &str = "RULE_ARN";
 const TARGET_ARN_ATTRIBUTE: &str = "TARGET_ARN";
 
-/// The error code a target service answers under when it refuses the IDENTITY the
-/// invocation was made as — which for a queue target is the key an encrypted queue's
-/// messages are encrypted under (`KMS.AccessDeniedException` names it) and never the
-/// queue's own document.
+/// The error code a target service answers under when it refuses the CALL on a
+/// resource that is there — for a queue target the queue's own document withholding
+/// the send, and the key an encrypted queue's messages are encrypted under
+/// (`KMS.AccessDeniedException` names it).
 const ACCESS_DENIED: &str = "AccessDenied";
-
-/// Amazon SQS's own error code for a send it will not make: `QueueDoesNotExist`'s
-/// `awsQueryError` code.
-const QUEUE_DOES_NOT_EXIST: &str = "AWS.SimpleQueueService.NonExistentQueue";
-
-/// The fixed sentence that answer carries, which states both of the reasons it covers
-/// — stated here rather than read from the implementation's own constant, so a wrong
-/// sentence there cannot make this suite pass.
-const QUEUE_DOES_NOT_EXIST_MESSAGE: &str =
-    "The specified queue does not exist or you do not have access to it.";
 
 /// The status that refusal is answered with, which the reported answer states beside
 /// the code.
-const QUEUE_DOES_NOT_EXIST_STATUS: u16 = 400;
+const ACCESS_DENIED_STATUS: u16 = 403;
+
+/// The sentence it carries — built here rather than read from the implementation's own
+/// helper, so a wrong sentence there cannot make this suite pass. An authorization
+/// refusal names the call it refused: the principal, the action and the resource.
+fn access_denied_message(queue_arn: &str) -> String {
+    format!(
+        "User: {SERVICE_PRINCIPAL} is not authorized to perform: {SEND_MESSAGE} on resource: \
+         {queue_arn} because no resource-based policy allows the {SEND_MESSAGE} action"
+    )
+}
+
+/// Amazon SQS's own error code for a send on a queue that is not there:
+/// `QueueDoesNotExist`'s `awsQueryError` code.
+const QUEUE_DOES_NOT_EXIST: &str = "AWS.SimpleQueueService.NonExistentQueue";
+
+/// The fixed sentence that answer carries — stated here rather than read from the
+/// implementation's own constant, so a wrong sentence there cannot make this suite
+/// pass.
+const QUEUE_DOES_NOT_EXIST_MESSAGE: &str = "The specified queue does not exist.";
 
 /// Which class each error code a queue target's service answers belongs to. Source:
 /// the two refusals above, as the services that answer them publish them.
@@ -259,38 +268,38 @@ async fn a_dead_letters_class_and_message_come_from_one_answer() {
         Row {
             case: "a queue carrying no policy at all",
             setup: Setup::Queue(None),
-            code: QUEUE_DOES_NOT_EXIST,
-            class: NO_RESOURCE,
+            code: ACCESS_DENIED,
+            class: NO_PERMISSIONS,
         },
         Row {
             case: "a queue whose policy denies the send beside granting it",
             setup: Setup::Queue(Some(denying)),
-            code: QUEUE_DOES_NOT_EXIST,
-            class: NO_RESOURCE,
+            code: ACCESS_DENIED,
+            class: NO_PERMISSIONS,
         },
         Row {
             case: "a queue whose grant is scoped by aws:SourceArn to another rule",
             setup: Setup::Queue(Some(granting_another_rule)),
-            code: QUEUE_DOES_NOT_EXIST,
-            class: NO_RESOURCE,
+            code: ACCESS_DENIED,
+            class: NO_PERMISSIONS,
         },
         Row {
             case: "a queue whose grant is scoped by aws:SourceAccount to another account",
             setup: Setup::Queue(Some(granting_another_account)),
-            code: QUEUE_DOES_NOT_EXIST,
-            class: NO_RESOURCE,
+            code: ACCESS_DENIED,
+            class: NO_PERMISSIONS,
         },
         Row {
             case: "a queue granting this service another action",
             setup: Setup::Queue(Some(granting_another_action)),
-            code: QUEUE_DOES_NOT_EXIST,
-            class: NO_RESOURCE,
+            code: ACCESS_DENIED,
+            class: NO_PERMISSIONS,
         },
         Row {
             case: "a queue granting the send to another service principal",
             setup: Setup::Queue(Some(granting_another_principal)),
-            code: QUEUE_DOES_NOT_EXIST,
-            class: NO_RESOURCE,
+            code: ACCESS_DENIED,
+            class: NO_PERMISSIONS,
         },
         Row {
             case: "a queue ARN no queue was created for",
@@ -381,13 +390,12 @@ async fn a_dead_letters_class_and_message_come_from_one_answer() {
     }
 }
 
-/// The answer a withheld send earns states the ONE call it refused and nothing of the
-/// delivery: its sentence is that service's fixed text, so a second delivery to the
-/// same queue reports the same sentence with a fresh id for its own refused call — and
-/// neither reports the queue, the principal or the action, which is what that service
-/// withholds from a sender it refused.
+/// The answer a withheld send earns states the ONE call it refused: a second delivery
+/// to the same queue reports the same refusal with a fresh id for its own refused
+/// call, and each names the queue, the principal and the action that call asked for,
+/// which is what an authorization refusal is about.
 #[tokio::test]
-async fn the_withheld_send_answer_states_one_call_and_names_nothing_of_the_delivery() {
+async fn the_withheld_send_answer_states_one_call_and_names_what_it_refused() {
     let case = "a queue granting this service nothing";
     let emulator = emulator();
     let (dead_letter_url, dead_letter_arn) = given_queue(&emulator, "named-dlq").await;
@@ -415,8 +423,9 @@ async fn the_withheld_send_answer_states_one_call_and_names_nothing_of_the_deliv
         "case {case:?}: expected one dead letter per refused delivery, got {parked:?}"
     );
     let head = format!(
-        "{QUEUE_DOES_NOT_EXIST_MESSAGE} (Service: AmazonSQS; Status Code: \
-         {QUEUE_DOES_NOT_EXIST_STATUS}; Error Code: {QUEUE_DOES_NOT_EXIST}; Request ID: "
+        "{} (Service: AmazonSQS; Status Code: \
+         {ACCESS_DENIED_STATUS}; Error Code: {ACCESS_DENIED}; Request ID: ",
+        access_denied_message(&target_arn)
     );
     let mut ids = Vec::new();
     for message in &parked {
@@ -425,13 +434,6 @@ async fn the_withheld_send_answer_states_one_call_and_names_nothing_of_the_deliv
             reported.starts_with(head.as_str()) && reported.ends_with("; Proxy: null)"),
             "case {case:?}: expected {head:?} then the id of the refused call, got {reported:?}"
         );
-        for withheld in [target_arn.as_str(), SERVICE_PRINCIPAL, SEND_MESSAGE] {
-            assert!(
-                !reported.contains(withheld),
-                "case {case:?}: expected {withheld:?} to be absent from the answer, got \
-                 {reported:?}"
-            );
-        }
         let id = reported
             .strip_prefix(head.as_str())
             .and_then(|rest| rest.strip_suffix("; Proxy: null)"))
@@ -444,16 +446,21 @@ async fn the_withheld_send_answer_states_one_call_and_names_nothing_of_the_deliv
             vec![8, 4, 4, 4, 12],
             "case {case:?}: expected a request id in the 8-4-4-4-12 form, got {id:?}"
         );
-        // That answer is the one a queue nobody may write to gives: it names
-        // neither the caller nor the queue, which is what keeps it from telling an
-        // unauthorized caller the queue is there.
-        for withheld in [target_arn.as_str(), SERVICE_PRINCIPAL, SEND_MESSAGE] {
+        // That answer is about the CALL, so it names what the call asked for — and
+        // not the absence of a queue that answered it.
+        for named in [target_arn.as_str(), SERVICE_PRINCIPAL, SEND_MESSAGE] {
             assert!(
-                !reported.contains(withheld),
-                "case {case:?}: expected nothing of the refused send in that answer, got \
-                 {withheld:?} in {reported:?}"
+                reported.contains(named),
+                "case {case:?}: expected the refused send's {named:?} in that answer, got \
+                 {reported:?}"
             );
         }
+        assert!(
+            !reported.contains(QUEUE_DOES_NOT_EXIST)
+                && !reported.contains(QUEUE_DOES_NOT_EXIST_MESSAGE),
+            "case {case:?}: a queue that answered the send does not report an absence, got \
+             {reported:?}"
+        );
         ids.push(id);
     }
     assert_ne!(

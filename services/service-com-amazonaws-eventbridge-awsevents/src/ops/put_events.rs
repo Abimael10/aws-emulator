@@ -3764,10 +3764,10 @@ const STRING_ATTRIBUTE_TYPE: &str = "String";
 /// service's own answer gives it ([`crate::state::queue_access_refusal`] for the
 /// policy, [`queue_key_send_refusal`] for the key) — each one's condition read off
 /// that answer's error code through the one classifier every answered refusal goes
-/// through ([`delivery_condition`]), which is why the two land in different
-/// classes: Amazon SQS answers a send its queue's documents withhold with its
-/// not-found code, while the key's refusal comes back as that service's
-/// `KMS.AccessDeniedException`.
+/// through ([`delivery_condition`]), which puts both in the class of a call an
+/// existing target refused: Amazon SQS answers a send its queue's documents
+/// withhold with its authorization code, and the key's refusal comes back as that
+/// service's `KMS.AccessDeniedException`.
 ///
 /// The attributes are read through the queue's own `GetQueueAttributes`, so what
 /// decides a delivery is what a client's last write left on the queue — a policy
@@ -3807,7 +3807,7 @@ fn queue_delivery_refusal(
             "an EventBridge delivery was withheld: the queue's own policy does not allow this \
              service to send it a message"
         );
-        let (code, message) = crate::state::queue_access_refusal();
+        let (code, message) = crate::state::queue_access_refusal(resource, action);
         return Some(crate::state::InvocationOutcome::Failed {
             code: delivery_condition(code).to_string(),
             message,

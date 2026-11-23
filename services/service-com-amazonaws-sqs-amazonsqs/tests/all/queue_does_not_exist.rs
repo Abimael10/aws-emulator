@@ -484,10 +484,8 @@ fn the_exported_refusal_message_is_awss_own_sentence() {
 /// where the queue IS there and the caller may not address it, which names both facts
 /// without saying which holds.
 ///
-/// RECORDED: it is what a delivery EventBridge makes to a queue whose own policy admits it
-/// nothing reads back from Amazon SQS, and what that dead letter reports. Written out here so
-/// the two classes of the one code stay distinguishable: every row of this suite is the
-/// ABSENCE class, so none of them may read this sentence.
+/// RECORDED, and written out here so the two classes of the one code stay distinguishable:
+/// every row of this suite is the ABSENCE class, so none of them may read this sentence.
 const NOT_DISCLOSED_SENTENCE: &str =
     "The specified queue does not exist or you do not have access to it.";
 

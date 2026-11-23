@@ -8,16 +8,17 @@
 //!
 //! The rule pinned here: EventBridge invokes an Amazon SQS target by calling
 //! `sqs:SendMessage` as the service principal `events.amazonaws.com`, so the TARGET queue's
-//! own resource policy is what admits the send; a send no statement admits is refused with
-//! that service's own not-found-or-not-permitted answer, nothing is enqueued on the target,
-//! and — because the target carries a `DeadLetterConfig` — the envelope is written to that
-//! queue instead with the message attributes `RULE_ARN`, `TARGET_ARN`, `ERROR_CODE` and
-//! `ERROR_MESSAGE`, under the resource class (`NO_RESOURCE`) that answer belongs to and with
-//! no retries. None of that depends on how the rule, its target or the queue policy came to
-//! exist: a stack's `AWS::Events::Rule` and `AWS::SQS::QueuePolicy` leave behind the same
-//! rule, target and document a client's own `PutRule`/`PutTargets`/`SetQueueAttributes` do,
-//! and a stack UPDATE that adds the missing grant makes the next matching event deliver
-//! normally with the rule and the queue untouched.
+//! own resource policy is what admits the send; a send no statement admits is refused by that
+//! service with the code and status AWS answers an unauthorized call with, nothing is
+//! enqueued on the target, and — because the target carries a `DeadLetterConfig` — the
+//! envelope is written to that queue instead with the message attributes `RULE_ARN`,
+//! `TARGET_ARN`, `ERROR_CODE` and `ERROR_MESSAGE`, under the authorization class
+//! (`NO_PERMISSIONS`) that answer belongs to and with no retries. None of that depends on how
+//! the rule, its target or the queue policy came to exist: a stack's `AWS::Events::Rule` and
+//! `AWS::SQS::QueuePolicy` leave behind the same rule, target and document a client's own
+//! `PutRule`/`PutTargets`/`SetQueueAttributes` do, and a stack UPDATE that adds the missing
+//! grant makes the next matching event deliver normally with the rule and the queue
+//! untouched.
 //!
 //! The rows differ along what the rule generalises over, and nothing else: the FORM the
 //! dead-letter queue's grant takes (unconditioned, scoped by `aws:SourceArn` to the deployed
@@ -102,17 +103,20 @@ const ERROR_MESSAGE_ATTRIBUTE: &str = "ERROR_MESSAGE";
 const RETRY_ATTEMPTS_ATTRIBUTE: &str = "RETRY_ATTEMPTS";
 const EXHAUSTED_RETRY_CONDITION_ATTRIBUTE: &str = "EXHAUSTED_RETRY_CONDITION";
 
-/// The class EventBridge records for a delivery whose target could not be addressed, which
-/// is the class Amazon SQS's answer to an unauthorized send belongs to.
-const NO_RESOURCE: &str = "NO_RESOURCE";
+/// The class EventBridge records for a delivery the target's own document refused, which is
+/// the class Amazon SQS's answer to an unauthorized send belongs to.
+const NO_PERMISSIONS: &str = "NO_PERMISSIONS";
 
 /// The answer Amazon SQS gives a sender its documents did not permit, up to the id of the
-/// refused call: that service answers such a send the way it answers one addressing a queue
-/// that is not there, disclosing neither the queue nor the caller.
-const WITHHELD_ANSWER_HEAD: &str = "The specified queue does not exist or you do not have \
-                                    access to it. (Service: AmazonSQS; Status Code: 400; \
-                                    Error Code: AWS.SimpleQueueService.NonExistentQueue; \
-                                    Request ID: ";
+/// refused call: the refusal of that CALL, naming the principal it was made as, the action it
+/// asked for and the queue it asked for — so the head is built from the target queue's ARN.
+fn withheld_answer_head(queue_arn: &str) -> String {
+    format!(
+        "User: {EVENTS_PRINCIPAL} is not authorized to perform: {SEND_MESSAGE} on resource: \
+         {queue_arn} because no resource-based policy allows the {SEND_MESSAGE} action \
+         (Service: AmazonSQS; Status Code: 403; Error Code: AccessDenied; Request ID: "
+    )
+}
 
 /// What closes that answer, after the id of the refused call.
 const ANSWER_TAIL: &str = "; Proxy: null)";
@@ -739,7 +743,7 @@ async fn a_deployed_queue_target_without_a_policy_dead_letters_until_an_update_g
         for (name, expected) in [
             (RULE_ARN_ATTRIBUTE, rule_arn.clone()),
             (TARGET_ARN_ATTRIBUTE, target_arn.clone()),
-            (ERROR_CODE_ATTRIBUTE, NO_RESOURCE.to_string()),
+            (ERROR_CODE_ATTRIBUTE, NO_PERMISSIONS.to_string()),
         ] {
             let actual = attribute(parked, name);
             assert_eq!(
@@ -749,15 +753,16 @@ async fn a_deployed_queue_target_without_a_policy_dead_letters_until_an_update_g
             );
         }
         let reported = attribute(parked, ERROR_MESSAGE_ATTRIBUTE);
+        let head = withheld_answer_head(&target_arn);
         assert!(
-            reported.starts_with(WITHHELD_ANSWER_HEAD) && reported.ends_with(ANSWER_TAIL),
+            reported.starts_with(head.as_str()) && reported.ends_with(ANSWER_TAIL),
             "case {case:?}: expected the answer that service gives an unauthorized send, got \
              {reported:?}"
         );
         // What varies in that answer is the id of the ONE refused call, and nothing else: an
         // AWS request id is a UUID in the canonical 8-4-4-4-12 form.
         let request_id = reported
-            .strip_prefix(WITHHELD_ANSWER_HEAD)
+            .strip_prefix(head.as_str())
             .and_then(|rest| rest.strip_suffix(ANSWER_TAIL))
             .unwrap_or_default();
         let widths: Vec<usize> = request_id.split('-').map(str::len).collect();

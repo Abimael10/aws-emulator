@@ -14,29 +14,30 @@
 //! service really answers, and is NOT one verdict this service reaches for every
 //! target whose document granted nothing:
 //!
-//! * Amazon SQS answers a send it will not make with `QueueDoesNotExist` (HTTP 400,
-//!   `awsQueryError` code `AWS.SimpleQueueService.NonExistentQueue`) and models no
-//!   authorization failure on `SendMessage` at all
-//!   (`smithy_query(query="operation", operation="SendMessage",
-//!   model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`),
-//!   because it does not disclose a queue it will not let the caller write to — so a
-//!   queue whose policy withheld the send is the RESOURCE class, its sentence stating
-//!   both reasons that one answer covers and naming nothing of the delivery;
+//! * Amazon SQS answers a send the queue's own document does not permit with the code
+//!   and status AWS answers an unauthorized call with (HTTP 403, `AccessDenied`),
+//!   naming the principal, the action and the queue — a refusal of the CALL on a queue
+//!   that answered it, so the PERMISSION class — and keeps `QueueDoesNotExist` (HTTP
+//!   400, `awsQueryError` code `AWS.SimpleQueueService.NonExistentQueue`,
+//!   `smithy_query(query="operation", operation="SendMessage",
+//!   model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`)
+//!   for a queue that is not THERE, which is the RESOURCE class;
 //! * Amazon SNS answers a publish its topic's policy does not permit with
 //!   `AuthorizationErrorException` (HTTP 403, `awsQueryError` code
 //!   `AuthorizationError`,
 //!   `smithy_query(query="shape", shape="AuthorizationErrorException",
 //!   model_path="services/service-com-amazonaws-sns-amazonsimplenotificationservice/smithy-model/com-amazonaws-sns-amazonsimplenotificationservice.json")`)
 //!   — an authorization refusal, so a topic whose policy withheld the publish is the
-//!   PERMISSION class.
+//!   PERMISSION class too.
 //!
-//! The table's rows therefore differ along the target's SERVICE and along the FORM the
+//! The table's rows therefore differ along the target's SERVICE, along the FORM the
 //! withholding takes (no document at all, an explicit `Deny` beside a grant, the
-//! document that service generates for the resource's owner), each row stating both
-//! the class and the error code the message must name — so a class flipped for every
-//! withheld delivery, or one read off anything but the answer, fails here. A control
-//! row whose queue DOES grant the send receives the event and parks no dead letter, so
-//! no row passes because nothing was delivered anywhere.
+//! document that service generates for the resource's owner) and along whether the
+//! target is there at all, each row stating both the class and the error code the
+//! message must name — so a class read off anything but the answer, or one collapsed
+//! for every failed delivery, fails here. A control row whose queue DOES grant the
+//! send receives the event and parks no dead letter, so no row passes because nothing
+//! was delivered anywhere.
 //!
 //! The harness (the router with EventBridge, Amazon SQS, Amazon SNS, Step Functions,
 //! IAM and CloudWatch on one engine) is `tests/all/target_dispatch.rs`'s.
@@ -48,7 +49,7 @@ use service_com_amazonaws_eventbridge_awsevents::state::{
 
 use crate::target_dispatch::{
     drain, emulator, given_queue, given_queue_with_policy, given_rule, granting_events, publish,
-    sns, xml_text, Emulator,
+    sns, xml_text, Emulator, REGION,
 };
 
 /// The rule every row below publishes through.
@@ -68,6 +69,7 @@ const PUBLISH: &str = "sns:Publish";
 
 /// The error code each answering service reports its refusal under.
 const QUEUE_DOES_NOT_EXIST: &str = "AWS.SimpleQueueService.NonExistentQueue";
+const QUEUE_ACCESS_DENIED: &str = "AccessDenied";
 const AUTHORIZATION_ERROR: &str = "AuthorizationError";
 
 /// A statement list wrapped as a policy document.
@@ -102,6 +104,9 @@ enum Setup {
     /// A topic carrying `Some` document beside the one Amazon SNS generates for its
     /// owner, or only that generated one when `None`.
     Topic(Option<fn(&str) -> String>),
+    /// A queue ARN of this account and Region that no queue was ever created for — the
+    /// target that is not there, which earns the other class.
+    NeverCreated,
 }
 
 /// One row: the case, how its target is brought about, and the answer the dead letter
@@ -190,6 +195,13 @@ async fn given_target(
             given_topic(emulator, case, &format!("classified-topic-{index}"), *policy).await,
             None,
         ),
+        Setup::NeverCreated => (
+            format!(
+                "arn:aws:sqs:{REGION}:{}:classified-never-created-{index}",
+                ::engine::emulator_account_id()
+            ),
+            None,
+        ),
     }
 }
 
@@ -201,11 +213,16 @@ async fn a_withheld_deliverys_class_is_the_class_of_the_answering_services_code(
         Row {
             case: "a queue carrying no policy at all",
             setup: Setup::Queue(None),
-            expected: Some((QUEUE_DOES_NOT_EXIST, NO_RESOURCE)),
+            expected: Some((QUEUE_ACCESS_DENIED, NO_PERMISSIONS)),
         },
         Row {
             case: "a queue whose policy denies the send beside granting it",
             setup: Setup::Queue(Some(queue_denying)),
+            expected: Some((QUEUE_ACCESS_DENIED, NO_PERMISSIONS)),
+        },
+        Row {
+            case: "a queue ARN no queue was created for",
+            setup: Setup::NeverCreated,
             expected: Some((QUEUE_DOES_NOT_EXIST, NO_RESOURCE)),
         },
         Row {

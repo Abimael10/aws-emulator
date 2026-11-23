@@ -11,35 +11,35 @@
 //! answer the TARGET's service gave it — the sentence that service worded, inside
 //! the metadata block naming that service, the status and the error code it answered
 //! with — and the `ERROR_CODE` beside it is this service's classification of that
-//! code, so the two can never name different failures. Amazon SQS answers a sender
-//! it has not authorized the way it answers one addressing a queue that is not
-//! there: `SendMessage` declares `QueueDoesNotExist` (`awsQueryError` code
-//! `AWS.SimpleQueueService.NonExistentQueue` at HTTP 400) and NO authorization
-//! failure at all (`smithy_query(query="operation", operation="SendMessage",
+//! code, so the two can never name different failures. A queue whose own `Policy`
+//! does not authorize the send ANSWERED the send: Amazon SQS refuses it under the
+//! code and status AWS answers an unauthorized call with (`AccessDenied` at HTTP
+//! 403, a refusal answered ahead of the operation, which is why `SendMessage`
+//! declares none — `smithy_query(query="operation", operation="SendMessage",
 //! model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`),
-//! because it does not disclose a queue it will not let the caller write to. So a
-//! queue whose own `Policy` does not authorize the send and a queue that is not
-//! there earn ONE class (`NO_RESOURCE`) — and two distinct fixed sentences, neither
-//! naming the queue, the principal or the action: the withheld send reads "does not
-//! exist or you do not have access to it", the absent queue that service's plain
-//! not-found sentence.
+//! and the sentence names what was asked for: the principal the call was made as,
+//! the action and the queue. A queue that is NOT THERE earns that service's own
+//! not-found answer instead (`QueueDoesNotExist`, `awsQueryError` code
+//! `AWS.SimpleQueueService.NonExistentQueue` at HTTP 400, "The specified queue does
+//! not exist."). So the two are two classes: the withheld send is the PERMISSION
+//! class and the absent queue the RESOURCE class.
 //!
 //! The first table spans the class rather than the one case the defect was found on:
 //! its rows differ along the FORM the withholding takes (no document at all, a
 //! document with no statement in it, an explicit `Deny` beside the grant, a grant
 //! scoped by `aws:SourceArn` to another rule, a grant of another action of the same
 //! service, a grant naming another queue as its resource, a grant to another service
-//! principal) and include a target queue that is NOT there, which earns the same
+//! principal) and include a target queue that is NOT there, which earns the other
 //! class with ITS OWN sentence — because that is the answer that service gives such
 //! a send.
 //!
-//! The second test pins what in the reported answer is per-call and what is fixed
-//! text: two refused deliveries carry two request ids, while nothing of the delivery
-//! — neither the queue it was refused on nor the principal it was made as — reaches
-//! the sentence, which is what the target's service discloses to a sender it refused.
+//! The second test pins what in the reported answer is per-call and what comes from
+//! the delivery: two refused deliveries carry two request ids, while the queue the
+//! send was refused on, the principal it was made as and the action it asked for are
+//! the refused call's own and are named in the sentence.
 //!
-//! The refusal of an ENCRYPTED queue's key is the other class and keeps its own
-//! answer (`KMS.AccessDeniedException` under `NO_PERMISSIONS`); that is
+//! The refusal of an ENCRYPTED queue's key is reported under the same class with its
+//! own answer (`KMS.AccessDeniedException`); that is
 //! `tests/all/encrypted_queue_target_key_policy.rs`'s rule and is not re-asserted
 //! here.
 //!
@@ -48,7 +48,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state::{
-    rule_arn, DEFAULT_EVENT_BUS_NAME, NO_RESOURCE, SERVICE_PRINCIPAL,
+    rule_arn, DEFAULT_EVENT_BUS_NAME, NO_PERMISSIONS, NO_RESOURCE, SERVICE_PRINCIPAL,
 };
 
 use crate::target_dispatch::{
@@ -68,19 +68,25 @@ const SEND_MESSAGE: &str = "sqs:SendMessage";
 const ERROR_CODE_ATTRIBUTE: &str = "ERROR_CODE";
 const ERROR_MESSAGE_ATTRIBUTE: &str = "ERROR_MESSAGE";
 
-/// The error code Amazon SQS answers a send it will not let the caller make,
-/// whichever of the two reasons it was: `QueueDoesNotExist`'s `awsQueryError` code.
+/// The error code Amazon SQS answers a queue that is not THERE under:
+/// `QueueDoesNotExist`'s `awsQueryError` code.
 const ABSENCE_CODE: &str = "AWS.SimpleQueueService.NonExistentQueue";
 
+/// The error code and status AWS answers a call no document in force over the
+/// resource permits, which is what the withheld send reads.
+const WITHHELD_CODE: &str = "AccessDenied";
+const WITHHELD_STATUS: u16 = 403;
+
 /// The text the reported answer opens with, up to the id of the refused call: the
-/// sentence Amazon SQS gives a sender whose send its documents did not permit — which
-/// states both of the reasons that one answer covers and nothing of the delivery — and
-/// the metadata block naming that service, the status and the error code it answered
-/// with.
-fn answer_head() -> String {
+/// sentence Amazon SQS gives a sender whose send the queue's documents did not permit
+/// — which names the principal the call was made as, the action it asked for and the
+/// queue `queue_arn` it asked for — and the metadata block naming that service, the
+/// status and the error code it answered with.
+fn answer_head(queue_arn: &str) -> String {
     format!(
-        "The specified queue does not exist or you do not have access to it. (Service: \
-         AmazonSQS; Status Code: 400; Error Code: {ABSENCE_CODE}; Request ID: "
+        "User: {SERVICE_PRINCIPAL} is not authorized to perform: {SEND_MESSAGE} on resource: \
+         {queue_arn} because no resource-based policy allows the {SEND_MESSAGE} action (Service: \
+         AmazonSQS; Status Code: {WITHHELD_STATUS}; Error Code: {WITHHELD_CODE}; Request ID: "
     )
 }
 
@@ -88,11 +94,9 @@ fn answer_head() -> String {
 const ANSWER_TAIL: &str = "; Proxy: null)";
 
 /// The sentence Amazon SQS answers for a queue that is not there at all, which a
-/// target naming one earns INSTEAD of the one above, under the same code: one fixed
-/// text per reason, and the clause the withheld send's sentence adds is what tells
-/// them apart.
+/// target naming one earns INSTEAD of the one above: one answer per reason, under its
+/// own code and class.
 const ABSENCE_SENTENCE: &str = "The specified queue does not exist.";
-const WITHHELD_CLAUSE: &str = "or you do not have access to it";
 
 /// The account every resource below belongs to.
 fn account() -> &'static str {
@@ -192,17 +196,17 @@ enum Setup {
 enum Answer {
     /// The answer for a queue that is there and did not authorize the send.
     Withheld,
-    /// The answer for a queue that is not there, which that service answers under
-    /// the SAME code: it tells the two apart for nobody.
+    /// The answer for a queue that is not there, which that service answers under its
+    /// own code — a different failure, so a different class.
     Absent,
 }
 
 impl Answer {
-    /// The class this service puts that answer's code in — one class, because one
-    /// code answers both.
+    /// The class this service puts that answer's code in.
     fn class(self) -> &'static str {
         match self {
-            Self::Withheld | Self::Absent => NO_RESOURCE,
+            Self::Withheld => NO_PERMISSIONS,
+            Self::Absent => NO_RESOURCE,
         }
     }
 }
@@ -340,7 +344,7 @@ async fn a_withheld_queue_delivery_reports_the_answer_that_service_gave() {
         let reported = attribute(&parked, ERROR_MESSAGE_ATTRIBUTE);
         match row.answer {
             Answer::Withheld => {
-                let head = answer_head();
+                let head = answer_head(&target_arn);
                 assert!(
                     reported.starts_with(&head) && reported.ends_with(ANSWER_TAIL),
                     "case {case:?}: expected {head:?} then the id of the refused call and \
@@ -358,21 +362,24 @@ async fn a_withheld_queue_delivery_reports_the_answer_that_service_gave() {
                     "case {case:?}: expected a request id in the 8-4-4-4-12 form, got \
                      {request_id:?}"
                 );
-                // That answer discloses nothing about the queue or the caller: it is
-                // the same sentence a queue that is not there earns.
-                for withheld in [target_arn.as_str(), SERVICE_PRINCIPAL, SEND_MESSAGE] {
+                // An authorization refusal is about the call that was refused, so it
+                // names what that call asked for and nothing of the queue's state.
+                for named in [target_arn.as_str(), SERVICE_PRINCIPAL, SEND_MESSAGE] {
                     assert!(
-                        !reported.contains(withheld),
-                        "case {case:?}: that service names nothing of the refused send, so \
-                         {withheld:?} must not appear in {reported:?}"
+                        reported.contains(named),
+                        "case {case:?}: that service names the refused send, so {named:?} must \
+                         appear in {reported:?}"
                     );
                 }
+                assert!(
+                    !reported.contains(ABSENCE_CODE),
+                    "case {case:?}: a queue that answered the send does not report the absence \
+                     code {ABSENCE_CODE:?}, got {reported:?}"
+                );
             }
             Answer::Absent => {
                 assert!(
-                    reported.contains(ABSENCE_SENTENCE)
-                        && reported.contains(ABSENCE_CODE)
-                        && !reported.contains(WITHHELD_CLAUSE),
+                    reported.contains(ABSENCE_SENTENCE) && reported.contains(ABSENCE_CODE),
                     "case {case:?}: expected that service's own answer for an absent queue, \
                      got {reported:?}"
                 );
@@ -382,9 +389,9 @@ async fn a_withheld_queue_delivery_reports_the_answer_that_service_gave() {
 }
 
 /// What varies in the reported answer and what does not: the id belongs to the ONE
-/// refused call, so two refused deliveries report two ids — and nothing else of the
-/// delivery is in the sentence, because a sender the target's service refused is told
-/// neither which queue it was nor who it was refused as.
+/// refused call, so two refused deliveries report two ids — and the rest of the
+/// sentence is that call's own, because an authorization refusal names the principal
+/// it was made as, the action it asked for and the queue it asked for.
 #[tokio::test]
 async fn the_reported_answer_states_one_call_and_the_refusal_it_was() {
     let case = "two events withheld by the same queue";
@@ -419,16 +426,16 @@ async fn the_reported_answer_states_one_call_and_the_refusal_it_was() {
         first, second,
         "case {case:?}: expected each refused call its own request id, got {first:?} twice"
     );
-    let head = answer_head();
+    let head = answer_head(&target_arn);
     for reported in [&first, &second] {
         assert!(
             reported.starts_with(head.as_str()) && reported.ends_with(ANSWER_TAIL),
             "case {case:?}: expected the answer that service gave, got {reported:?}"
         );
-        for withheld in [target_arn.as_str(), SERVICE_PRINCIPAL, SEND_MESSAGE] {
+        for named in [target_arn.as_str(), SERVICE_PRINCIPAL, SEND_MESSAGE] {
             assert!(
-                !reported.contains(withheld),
-                "case {case:?}: expected {withheld:?} to be absent from the reported answer, \
+                reported.contains(named),
+                "case {case:?}: expected {named:?} to be named in the reported answer, \
                  got {reported:?}"
             );
         }
