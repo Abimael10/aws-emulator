@@ -66,6 +66,28 @@
 //! until they are ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::start_due_containers`]),
 //! and nothing runs its program before then.
 //!
+//! # The containers that GIVE UP
+//!
+//! A wait that cannot end is not waited out for ever. `ContainerDefinition$startTimeout` is
+//! the rule: "time duration (in seconds) to wait before giving up on resolving dependencies
+//! for a container. For example, you specify two containers in a task definition with
+//! containerA having a dependency on containerB reaching a `COMPLETE`, `SUCCESS`, or
+//! `HEALTHY` status. If a `startTimeout` value is specified for containerB and it doesn't
+//! reach the desired status within that time then containerA gives up and not start. This
+//! results in the task transitioning to a `STOPPED` state."
+//!
+//! So a waiting container gives up when the condition it waits for can no longer be reached —
+//! at once when the container it waits on has reached a state that condition EXCLUDES (one
+//! that exited non-zero can never satisfy `SUCCESS`, and one that has exited can never pass a
+//! health check for `HEALTHY`), and otherwise at the end of the `startTimeout` that container
+//! declared ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::give_up_on_unresolved_dependencies`]).
+//! The container never starts, so the task never ran the work it was placed for: it is
+//! stopped as a task whose launch could not be made ([`STOP_CODE_TASK_FAILED_TO_START`]) with
+//! a `stoppedReason` naming the container that gave up and the dependency it gave up on —
+//! the stop a task whose essential container EXITED earns states something else entirely
+//! ([`STOP_CODE_ESSENTIAL_CONTAINER_EXITED`]), and a container that never started cannot have
+//! exited.
+//!
 //! # Who runs a probe
 //!
 //! Probes are RECONCILED from the task map, never run by whoever happened to call
@@ -485,6 +507,120 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         }
     }
 
+    /// Stop every task holding a container that has GIVEN UP on a dependency, as of `now`.
+    ///
+    /// `ContainerDefinition$startTimeout` is the rule: a container waiting on another "gives
+    /// up and not start" once the condition it waits for can no longer be reached, and "this
+    /// results in the task transitioning to a `STOPPED` state". The container never started,
+    /// so the task never ran: it takes the stop a launch that could not be made earns
+    /// ([`TaskRecord::fail_launch`], [`STOP_CODE_TASK_FAILED_TO_START`]) with the reason that
+    /// names the container and the dependency it gave up on
+    /// ([`dependency_given_up_reason`]) — never the stop an essential container's EXIT earns,
+    /// which a container that never ran cannot have produced.
+    ///
+    /// Read in one pass and applied in another, because the `startTimeout` the wait is
+    /// measured against lives on the task definition's own container definition rather than
+    /// on the task.
+    pub(super) fn give_up_on_unresolved_dependencies(&mut self, now: SystemTime) {
+        let given_up: Vec<(String, UnresolvedDependency)> = self
+            .tasks
+            .values()
+            .filter_map(|task| {
+                let unresolved = self.unresolved_dependency(task, now)?;
+                (unresolved.at <= now).then(|| (task.task_arn.clone(), unresolved))
+            })
+            .collect();
+        for (task_arn, unresolved) in given_up {
+            let reason = dependency_given_up_reason(
+                &unresolved.dependent,
+                &unresolved.dependency,
+                &unresolved.condition,
+            );
+            let Some(task) = self.tasks.get_mut(&task_arn) else {
+                continue;
+            };
+            // The failure belongs to the container that gave up, which is where the task
+            // records the detail of a launch it could not make
+            // ([`TaskRecord::launch_failure_container`]).
+            task.launch_failure_container = Some(unresolved.dependent.clone());
+            task.fail_launch(&reason, unresolved.at);
+        }
+    }
+
+    /// The earliest instant at which a container of this store GIVES UP on a dependency, if
+    /// any — one of the instants the clock pump waits for, because the stop it earns is owed
+    /// whether or not anybody calls again.
+    pub(super) fn next_dependency_give_up_due_at(&self, now: SystemTime) -> Option<SystemTime> {
+        self.tasks
+            .values()
+            .filter_map(|task| self.unresolved_dependency(task, now))
+            .map(|unresolved| unresolved.at)
+            .min()
+    }
+
+    /// The dependency ONE task has given up on, or will give up on, and when — and `None`
+    /// for a task every waiting container of which can still have what it waits for.
+    ///
+    /// Only a task that is RUNNING and wanted running has containers waiting at all: one on
+    /// its way out is being stopped for the reason that put it there, and one that has not
+    /// started has not begun creating its containers.
+    fn unresolved_dependency(
+        &self,
+        task: &TaskRecord,
+        now: SystemTime,
+    ) -> Option<UnresolvedDependency> {
+        if task.last_status != STATUS_RUNNING || task.desired_status != STATUS_RUNNING {
+            return None;
+        }
+        let reached: Vec<ContainerReading> =
+            task.containers.iter().map(ContainerReading::of).collect();
+        let definition = self.revision_of_arn(&task.task_definition_arn);
+        task.containers
+            .iter()
+            .filter(|container| container.last_status == STATUS_PENDING)
+            .flat_map(|container| {
+                container
+                    .depends_on
+                    .iter()
+                    .map(move |dependency| (container, dependency))
+            })
+            .filter_map(|(container, dependency)| {
+                let reading = reached.iter().find(|candidate| {
+                    candidate.name.as_deref() == Some(dependency.container_name.as_str())
+                })?;
+                if reading.satisfies(&dependency.condition) {
+                    return None;
+                }
+                // The wait is over at once where the state the dependency has REACHED
+                // excludes the condition, and otherwise at the end of the `startTimeout`
+                // that dependency declared — measured from the instant Amazon ECS began
+                // creating the task's containers, which is the task's own start.
+                let at = if reading.cannot_satisfy(&dependency.condition) {
+                    now
+                } else {
+                    let timeout = definition
+                        .and_then(|definition| {
+                            definition.container_definitions.iter().find(|candidate| {
+                                candidate.name.as_deref()
+                                    == Some(dependency.container_name.as_str())
+                            })
+                        })
+                        .and_then(|candidate| candidate.start_timeout)
+                        .filter(|seconds| *seconds > 0)
+                        .and_then(|seconds| u64::try_from(seconds).ok())
+                        .map(Duration::from_secs)?;
+                    SystemTime::try_from(task.started_at?).ok()? + timeout
+                };
+                Some(UnresolvedDependency {
+                    dependent: container.name.clone().unwrap_or_default(),
+                    dependency: dependency.container_name.clone(),
+                    condition: dependency.condition.clone(),
+                    at,
+                })
+            })
+            .min_by_key(|unresolved| unresolved.at)
+    }
+
     /// The health-check probes whose instant has come, as of `now`, each marked in flight so
     /// one container is probed once at a time.
     ///
@@ -808,6 +944,53 @@ impl ContainerReading {
             _ => false,
         }
     }
+
+    /// Whether one dependency condition on this container can NEVER hold again, because the
+    /// state this container has reached EXCLUDES it.
+    ///
+    /// A container that has exited has run its course: it can no longer exit with the zero
+    /// status `SUCCESS` requires ("it also requires that the container exits with a `zero`
+    /// status"), and it can no longer pass the health check `HEALTHY` requires, because
+    /// Amazon ECS probes a container that is running. `START` and `COMPLETE` are reachable
+    /// from every state a container that has not exited is in — one that HAS exited satisfies
+    /// both — so neither is ever excluded.
+    fn cannot_satisfy(&self, condition: &str) -> bool {
+        match condition {
+            CONTAINER_CONDITION_SUCCESS | CONTAINER_CONDITION_HEALTHY => {
+                self.has_exited() && !self.satisfies(condition)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// What one container of a task is WAITING for, and when that wait is GIVEN UP on
+/// ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::give_up_on_unresolved_dependencies`]).
+#[derive(Debug, Clone)]
+struct UnresolvedDependency {
+    /// `ContainerDefinition$name` of the container that is waiting.
+    dependent: String,
+    /// `ContainerDependency$containerName`: the container it waits on.
+    dependency: String,
+    /// `ContainerDependency$condition`: what it waits for that container to reach.
+    condition: String,
+    /// When the wait is given up on: the instant the dependency reached a state the condition
+    /// excludes, or the end of the `startTimeout` that dependency declared.
+    at: SystemTime,
+}
+
+/// `Task$stoppedReason` ("The reason that the task was stopped") of a task a container of
+/// which gave up on a dependency.
+///
+/// The stop is [`STOP_CODE_TASK_FAILED_TO_START`], and this sentence states what
+/// `ContainerDefinition$startTimeout` describes — "giving up on resolving dependencies for a
+/// container" — with the two container names and the condition taken from the task definition
+/// the task runs.
+fn dependency_given_up_reason(dependent: &str, dependency: &str, condition: &str) -> String {
+    format!(
+        "Container {dependent} gave up on resolving its dependency on container {dependency} \
+         reaching a {condition} status."
+    )
 }
 
 /// `ContainerDependency$condition` `START`, from the `ContainerCondition` enum

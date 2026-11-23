@@ -783,6 +783,70 @@ pub(crate) async fn cloud_map_instance_count(
     count(&read["Service"], "InstanceCount", case)
 }
 
+/// A router carrying this service AND CloudWatch over ONE shared engine — the store the
+/// `AWS/ECS` series are published into and the one the alarms a rollout is watched by live
+/// in, mounted the way the production router mounts them.
+///
+/// The ONE such harness of these suites, so a suite that reads a published series and one
+/// that moves an alarm reach CloudWatch the same way ([`cloudwatch`]).
+pub(crate) fn emulator_with_cloudwatch() -> MultiServiceRouter {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(
+        service_com_amazonaws_ecs_amazonec2containerservicev20141113::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
+    router.register_service(
+        service_com_amazonaws_cloudwatch_graniteserviceversion20100801::EmulatedService::new(
+            engine,
+        ),
+    );
+    router
+}
+
+/// One `x-amz-json-1.0` call to the CloudWatch service, the way a client makes it, returning
+/// its parsed body. A metric or an alarm these suites read or move is read and moved through
+/// CloudWatch's OWN API, never written into a store by hand.
+pub(crate) async fn cloudwatch(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+) -> Value {
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("host", format!("monitoring.{SIGNED_REGION}.amazonaws.com"))
+        .header("content-type", "application/x-amz-json-1.0")
+        .header(
+            "x-amz-target",
+            format!("GraniteServiceVersion20100801.{operation}"),
+        )
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDECSTEST/20260101/{SIGNED_REGION}\
+                 /monitoring/aws4_request, SignedHeaders=host;x-amz-target, Signature=00"
+            ),
+        )
+        .body(bytes::Bytes::from(body.to_string()))
+        .expect("a well-formed request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let payload = response.into_body();
+    let parsed: Value = if payload.is_empty() {
+        json!({})
+    } else {
+        serde_json::from_slice(&payload).unwrap_or(Value::Null)
+    };
+    assert_eq!(
+        status, 200,
+        "expected CloudWatch {operation} to answer 200, got {status} with {parsed}"
+    );
+    parsed
+}
+
 /// A router carrying this service AND the Amazon EC2 service over ONE shared engine — the
 /// two stores the image-fetch rule reads across, mounted the way the production router
 /// mounts them. Amazon EC2 Auto Scaling is mounted beside them, so a capacity provider

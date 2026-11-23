@@ -82,6 +82,47 @@ pub const CIRCUIT_BREAKER_STOPPED_REASON: &str =
 /// took it there. Stored and compared, never slept on.
 pub const CIRCUIT_BREAKER_ROLLBACK_SPAN: Duration = Duration::from_secs(5);
 
+/// WHICH failure-detection method a deployment configuration turned on failed a rollout.
+///
+/// `DeploymentAlarms` and `DeploymentCircuitBreaker` are each "one of the methods which
+/// provide a way for you to quickly identify when a deployment has failed", and a read of the
+/// rollout reports which of them FIRED — [`ROLLBACK_MONITORS_TRIGGERED`] on that method's own
+/// status — so the monitor is stored rather than inferred from what else the failure carried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RolloutMonitor {
+    /// The deployment circuit breaker, which counts the launches a rollout lost
+    /// ([`super::circuit_breaker`]).
+    CircuitBreaker,
+    /// The CloudWatch alarms the rollout was watched by ([`super::deployment_alarms`]).
+    Alarms,
+}
+
+/// What FAILED a rollout, as the monitor that detected it words the end it takes.
+///
+/// `DeploymentAlarms` and `DeploymentCircuitBreaker` are each "one of the methods which
+/// provide a way for you to quickly identify when a deployment has failed, and then to
+/// optionally roll back the failure to the last working deployment", so both take a rollout
+/// to the same terminal state through the same path
+/// ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::fail_rollout`]); what differs
+/// is the sentences they word it with and which of them a read reports as having fired.
+#[derive(Debug, Clone)]
+pub struct RolloutFailure {
+    /// Which method detected the failure.
+    pub monitor: RolloutMonitor,
+    /// `Deployment$rolloutStateReason` ("a description of the rollout state of a
+    /// deployment") of the failed rollout.
+    pub reason: String,
+    /// The entry the scheduler writes on the service's own event stream for the failure.
+    pub event: String,
+    /// `ServiceDeploymentBrief$statusReason` of a rollout this monitor ended where it stood,
+    /// for a configuration that asked for no rollback.
+    pub stopped_reason: String,
+    /// The alarms that fired, for a failure the rollout's CloudWatch alarms detected
+    /// (`ServiceDeploymentAlarms$triggeredAlarmNames`), and EMPTY for one the circuit
+    /// breaker detected.
+    pub triggered_alarms: Vec<String>,
+}
+
 /// What the circuit breaker has counted for ONE rollout, read off the tasks that rollout
 /// placed.
 #[derive(Debug, Clone, Default)]
@@ -269,7 +310,20 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             return;
         };
         if failures.count >= threshold {
-            self.fail_rollout(key, latest, breaker.rollback);
+            let service_name = service.name.clone();
+            let deployment_id = service.deployment_id.clone();
+            self.fail_rollout(
+                key,
+                latest,
+                breaker.rollback,
+                &RolloutFailure {
+                    monitor: RolloutMonitor::CircuitBreaker,
+                    reason: CIRCUIT_BREAKER_FAILURE_REASON.to_string(),
+                    event: deployment_failed_event(&service_name, &deployment_id),
+                    stopped_reason: CIRCUIT_BREAKER_STOPPED_REASON.to_string(),
+                    triggered_alarms: Vec::new(),
+                },
+            );
         }
     }
 
@@ -336,28 +390,40 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         }
     }
 
-    /// Fail the rollout `key`'s service is on, as of `at`: the breaker counted as many failed
-    /// launches as it tolerates, so "the deployment transitions to a `FAILED` state" with the
-    /// reason that names the breaker, and the rollback it configured is owed one span later.
+    /// Fail the rollout `key`'s service is on, as of `at`: a monitor its deployment
+    /// configuration turned on detected a failure, so "the deployment transitions to a
+    /// `FAILED` state" with the reason that monitor words, and the rollback it configured is
+    /// owed one span later.
+    ///
+    /// Shared by both monitors a deployment configuration can turn on — the circuit breaker
+    /// and the CloudWatch alarms ([`super::deployment_alarms`]) — because the END they take a
+    /// rollout to is the same one: `DeploymentAlarms` and `DeploymentCircuitBreaker` are "one
+    /// of the methods which provide a way for you to quickly identify when a deployment has
+    /// failed, and then to optionally roll back the failure to the last working deployment",
+    /// and only the SENTENCES differ ([`RolloutFailure`]).
     ///
     /// The rollout reaches no steady state and no stability confirmation after this: the
     /// instants both were owed at are dropped, so nothing can settle a rollout that has
     /// failed.
-    fn fail_rollout(&mut self, key: &(String, String), at: SystemTime, rollback: bool) {
+    pub(super) fn fail_rollout(
+        &mut self,
+        key: &(String, String),
+        at: SystemTime,
+        rollback: bool,
+        failure: &RolloutFailure,
+    ) {
         let Some(service) = self.services.get(key) else {
             return;
         };
-        let service_name = service.name.clone();
         let deployment_id = service.deployment_id.clone();
         let deployment_arn = self
             .current_service_deployment(service)
             .map(|deployment| deployment.arn.clone());
-        let event =
-            self.mint_service_event(at, deployment_failed_event(&service_name, &deployment_id));
+        let event = self.mint_service_event(at, failure.event.clone());
         let Some(service) = self.services.get_mut(key) else {
             return;
         };
-        service.deployment_rollout_failure = Some(CIRCUIT_BREAKER_FAILURE_REASON.to_string());
+        service.deployment_rollout_failure = Some(failure.reason.clone());
         service.deployment_steady_due_at = None;
         service.deployment_stable_due_at = None;
         service.deployment_rollback_due_at = rollback.then(|| at + CIRCUIT_BREAKER_ROLLBACK_SPAN);
@@ -371,7 +437,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             &service_arn,
             &deployment_id,
             ROLLOUT_FAILED,
-            CIRCUIT_BREAKER_FAILURE_REASON,
+            &failure.reason,
             at,
         );
         let Some(record) = deployment_arn.and_then(|arn| self.service_deployments.get_mut(&arn))
@@ -384,23 +450,27 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         if record.is_finished() || record.stop_requested() {
             return;
         }
+        // WHICH monitor detected the failure, kept on the rollout's own record: the alarms
+        // it names are `ServiceDeploymentAlarms$triggeredAlarmNames` ("one or more CloudWatch
+        // alarm names that have been triggered during the service deployment"), and the
+        // breaker's own `ServiceDeploymentCircuitBreaker$status` reports that IT fired.
+        record.triggered_alarms = failure.triggered_alarms.clone();
+        record.circuit_breaker_triggered = failure.monitor == RolloutMonitor::CircuitBreaker;
         if rollback {
-            // The rollback has been asked for — by the breaker — and has not begun yet, so
-            // the status reason is what the breaker detected.
+            // The rollback has been asked for — by the monitor that fired — and has not begun
+            // yet, so the status reason is what that monitor detected.
             record.status = SERVICE_DEPLOYMENT_ROLLBACK_REQUESTED.to_string();
-            record.status_reason = CIRCUIT_BREAKER_FAILURE_REASON.to_string();
-            record.circuit_breaker_triggered = true;
+            record.status_reason = failure.reason.clone();
         } else {
             // "If it is turned on, a service deployment will transition to a failed state and
             // stop launching new tasks": with no rollback configured the rollout ends where
             // it stands, which is the end a rollout that stopped without reaching its steady
             // state is recorded under.
-            record.circuit_breaker_triggered = true;
             finish_deployment(
                 record,
                 reported_instant(at),
                 SERVICE_DEPLOYMENT_STOPPED,
-                CIRCUIT_BREAKER_STOPPED_REASON,
+                &failure.stopped_reason,
             );
         }
     }
@@ -436,30 +506,37 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 .cloned();
             // A service with no earlier rollout to put back, and one whose revision is no
             // longer there to run again, are the same case: there is nothing to roll back to.
+            // The sentence the rollback carries is the one the MONITOR that failed the
+            // rollout words, read off what that monitor recorded on the rollout
+            // ([`Self::fail_rollout`]): a failure the alarms detected names the alarms that
+            // moved, and one the circuit breaker detected names the breaker.
+            let rolled_back_reason = if record.circuit_breaker_triggered {
+                CIRCUIT_BREAKER_ROLLED_BACK_REASON.to_string()
+            } else {
+                alarm_rolled_back_reason(&record.triggered_alarms)
+            };
             let rolled_back = match source {
                 Some(source) => self.roll_back_service_deployment_to(
                     &record,
                     &source,
                     at,
-                    CIRCUIT_BREAKER_ROLLED_BACK_REASON,
+                    &rolled_back_reason,
                 ),
                 None => Err(LifecycleHookRefusal::NoPreviousRevision),
             };
             if let Some(stored) = self.service_deployments.get_mut(&record.arn) {
                 match rolled_back {
-                    // The rollback the BREAKER performed is reported as the breaker's: the
+                    // The rollback the monitor performed is reported as that monitor's: the
                     // sentence the rolled-back rollout carries is the one its `rollback`
-                    // carries, and the breaker that fired is the one that watched it.
+                    // carries, and the monitor that fired is the one that watched it.
                     Ok(()) => {
-                        stored.status_reason = CIRCUIT_BREAKER_ROLLED_BACK_REASON.to_string();
-                        stored.circuit_breaker_triggered = true;
+                        stored.status_reason = rolled_back_reason;
                     }
                     // Nothing was put back, and nobody is left to refuse the rollback to, so
                     // the rollout ends where it stands rather than reporting a rollback that
                     // did not happen.
                     Err(_) => {
                         let reason = no_previous_revision_reason(&stored.service_arn);
-                        stored.circuit_breaker_triggered = true;
                         finish_deployment(
                             stored,
                             reported_instant(at),

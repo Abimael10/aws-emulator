@@ -329,6 +329,10 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             // nothing calls again between one datapoint and the next
             // ([`super::service_utilization`]).
             self.next_service_utilization_due_at(),
+            // And so is the stop a task holding a container that GAVE UP on resolving a
+            // dependency earns: that container never starts, so nothing else will ever move
+            // the task ([`super::container_health`], `ContainerDefinition$startTimeout`).
+            self.next_dependency_give_up_due_at(now),
         ]
         .into_iter()
         .flatten()
@@ -774,6 +778,10 @@ pub fn drive_task_clock<Eng: Send + Sync + 'static>(
     // finds a pump already running still has the containers of the task it just wrote
     // started or signalled ([`super::settle_container_runtime`]).
     super::settle_container_runtime(ctx.callback(), engine, region);
+    // And the rollouts whose CloudWatch alarms have fired: an alarm moves with no further
+    // Amazon ECS call, so a door that has just written a service reads what those alarms have
+    // made of its rollout before the pump is claimed ([`super::settle_deployment_alarms`]).
+    super::settle_deployment_alarms(&**engine);
     spawn_task_clock_pump(ctx.callback(), engine, region);
 }
 
@@ -878,6 +886,12 @@ fn spawn_task_clock_pump<Eng: Send + Sync + 'static>(
             // effect the door that wrote a status settles, owed here for the statuses NO
             // door wrote ([`super::settle_container_runtime`]).
             super::settle_container_runtime(&callback, &engine, &region);
+            // A rollout whose CloudWatch alarms have moved into their `ALARM` state is one
+            // Amazon ECS has failed, whether or not anybody called to look: the alarm is
+            // moved by the metric it watches, and a client that drives that metric and then
+            // polls the service makes no call that would otherwise notice
+            // ([`super::settle_deployment_alarms`]). Read with no guard of this store held.
+            super::settle_deployment_alarms(&*engine);
             publish_pending(&callback, &*engine, &region).await;
         }
         if capped {

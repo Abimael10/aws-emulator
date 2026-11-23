@@ -318,6 +318,11 @@ mod store;
 mod circuit_breaker;
 pub use circuit_breaker::*;
 
+/// The CloudWatch ALARMS a rollout is watched by: the ones that MOVED into their `ALARM`
+/// state while it was deploying, and the failure and rollback that earns it.
+mod deployment_alarms;
+pub use deployment_alarms::*;
+
 /// The HOST ports the containers of a task placed on a container instance are bound to —
 /// `Container$networkBindings`, and what an `instance` target of such a task is reached at.
 mod host_port_bindings;

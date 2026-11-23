@@ -1521,21 +1521,29 @@ pub(super) fn stopped_by_request_reason(deployment_id: &str) -> String {
 /// deployment fails", as the rollout's own deployment configuration set them.
 pub(super) fn deployment_alarms_view(
     configuration: &DeploymentConfiguration,
+    triggered: &[String],
     finished: bool,
 ) -> ServiceDeploymentAlarms {
     let alarms = configuration.alarms.as_ref();
     ServiceDeploymentAlarms {
+        // Alarms that FAILED the rollout they watched report that they fired; a watch that
+        // merely ran its course reports the end of the watch.
         status: Some(
-            rollback_monitors_status(alarms.is_some_and(|alarms| alarms.enable), finished)
-                .to_string(),
+            if triggered.is_empty() {
+                rollback_monitors_status(alarms.is_some_and(|alarms| alarms.enable), finished)
+            } else {
+                ROLLBACK_MONITORS_TRIGGERED
+            }
+            .to_string(),
         ),
         // "The name of the CloudWatch alarms that determine when a service deployment
         // failed": the names the configuration carries, and none when it carries none.
         alarm_names: Some(alarms.map(|alarms| alarms.alarm_names.clone()).unwrap_or_default()),
         // "One or more CloudWatch alarm names that have been triggered during the service
-        // deployment": an alarm is moved into its `ALARM` state by the metric it watches,
-        // which nothing in this slice publishes, so none has been triggered.
-        triggered_alarm_names: Some(Vec::new()),
+        // deployment": the ones that moved into their `ALARM` state while this rollout was
+        // deploying, as the pass that read them recorded them
+        // ([`super::deployment_alarms`]).
+        triggered_alarm_names: Some(triggered.to_vec()),
     }
 }
 

@@ -23,13 +23,14 @@
 //! `PutMetricData` writes into, and the counts they are compared against are read back
 //! through `DescribeClusters`.
 
-use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::ecs_wire::{count, list, ok, register_capacity, string, SIGNED_REGION};
+use crate::ecs_wire::{
+    cloudwatch, count, emulator_with_cloudwatch, list, ok, register_capacity, string,
+};
 
 /// The namespace Amazon ECS publishes Container Insights metrics in, and the two metric
 /// names this suite reads — spelled out here rather than imported, so a wrong constant in
@@ -98,57 +99,9 @@ const ROWS: &[Row] = &[
 ];
 
 /// An emulator with Amazon ECS and CloudWatch — which owns the metric store the series is
-/// published into — on ONE shared engine.
+/// published into — on ONE shared engine ([`crate::ecs_wire::emulator_with_cloudwatch`]).
 fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_ecs_amazonec2containerservicev20141113::EmulatedService::new(
-            Arc::clone(&engine),
-        ),
-    );
-    router.register_service(
-        service_com_amazonaws_cloudwatch_graniteserviceversion20100801::EmulatedService::new(
-            engine,
-        ),
-    );
-    router
-}
-
-/// One CloudWatch call, the way a client makes it.
-async fn cloudwatch(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
-    let request = http::Request::builder()
-        .method("POST")
-        .uri("/")
-        .header("host", format!("monitoring.{SIGNED_REGION}.amazonaws.com"))
-        .header("content-type", "application/x-amz-json-1.0")
-        .header(
-            "x-amz-target",
-            format!("GraniteServiceVersion20100801.{operation}"),
-        )
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDECSTEST/20260101/{SIGNED_REGION}\
-                 /monitoring/aws4_request, SignedHeaders=host;x-amz-target, Signature=00"
-            ),
-        )
-        .body(bytes::Bytes::from(body.to_string()))
-        .expect("a well-formed request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let payload = response.into_body();
-    let parsed: Value = if payload.is_empty() {
-        json!({})
-    } else {
-        serde_json::from_slice(&payload).unwrap_or(Value::Null)
-    };
-    assert_eq!(
-        status, 200,
-        "expected CloudWatch {operation} to answer 200, got {status} with {parsed}"
-    );
-    parsed
+    emulator_with_cloudwatch()
 }
 
 /// Epoch seconds, for the window a statistics read asks about.

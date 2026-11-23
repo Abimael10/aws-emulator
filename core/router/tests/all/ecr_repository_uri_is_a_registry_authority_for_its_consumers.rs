@@ -271,8 +271,8 @@ impl Derived {
 /// template declares, and the authority the published address must therefore carry.
 struct Row {
     case: &'static str,
-    /// The address this emulator is SERVED at for this row, which is the authority every
-    /// address these services announce is anchored on.
+    /// The address this emulator is SERVED at for this row, which is the zone and the port
+    /// every address these services announce is anchored on.
     served_base: &'static str,
     region: &'static str,
     stack: &'static str,

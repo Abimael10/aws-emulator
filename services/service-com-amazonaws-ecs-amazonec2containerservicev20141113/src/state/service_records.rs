@@ -485,6 +485,15 @@ pub struct ServiceDeploymentRecord {
     /// from the watch that ran its course over a rollout nothing went wrong with, so the
     /// outcome is stored rather than guessed from the status.
     pub circuit_breaker_triggered: bool,
+    /// The alarms of this rollout's own `DeploymentAlarms$alarmNames` that MOVED into their
+    /// `ALARM` state while it was deploying.
+    ///
+    /// `ServiceDeploymentAlarms$triggeredAlarmNames`: "one or more CloudWatch alarm names
+    /// that have been triggered during the service deployment" — and, through it, which
+    /// monitor failed this rollout: a non-empty list is what an alarms status of
+    /// [`ROLLBACK_MONITORS_TRIGGERED`] reports ([`super::deployment_alarms`]). Empty for
+    /// every rollout no alarm fired on, the circuit breaker's failures included.
+    pub triggered_alarms: Vec<String>,
 }
 
 /// One PAUSE lifecycle hook of a rollout, as the rollout reached it.

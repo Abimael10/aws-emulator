@@ -309,6 +309,12 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         // the task pass above, so a task that has just reached `RUNNING` has its independent
         // containers started by the same pass.
         self.start_due_containers(now);
+        // And the tasks whose containers can wait no longer: a container that has given up on
+        // resolving a dependency never starts, so its task is stopped as one whose launch
+        // could not be made ([`super::container_health`],
+        // `ContainerDefinition$startTimeout`). Run after the pass above, so a container whose
+        // dependencies have just been met is started rather than given up on.
+        self.give_up_on_unresolved_dependencies(now);
         // The execute-command agent of every container of an exec-enabled task, brought up
         // to where its container has got to: Amazon ECS put that agent in the container
         // because the launch asked for the feature, so it came up with the container whether
@@ -1146,6 +1152,9 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 stop_type: None,
                 // Nothing has fired the breaker on a rollout that is only now starting.
                 circuit_breaker_triggered: false,
+                // And no alarm has been triggered during a rollout that is only now
+                // starting either.
+                triggered_alarms: Vec::new(),
             },
         );
         self.prune_service_deployments(&service_arn);
@@ -1946,6 +1955,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             )),
             alarms: Some(deployment_alarms_view(
                 &record.deployment_configuration,
+                &record.triggered_alarms,
                 finished,
             )),
         }
