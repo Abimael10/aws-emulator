@@ -676,6 +676,16 @@ fn group_due_instants(group: &StoredGroup) -> Vec<SystemTime> {
                 .iter()
                 .filter_map(|instance| instance.transition_due),
         )
+        .chain(
+            // And the preparation of the instances that pool is SHORT of, owed from the
+            // instant the change that left it short was made — only where that preparation
+            // will ACT when the instant arrives, through the one reading of it
+            // ([`StoredGroup::warm_pool_preparation_due_at`]), exactly as the health check
+            // above names only the instants it acts on: a pool a client configured and then
+            // left alone is brought to its size with no further call from anybody, while one
+            // nothing can be launched into names no instant to wait on.
+            group.warm_pool_preparation_due_at(),
+        )
         .collect()
 }
 

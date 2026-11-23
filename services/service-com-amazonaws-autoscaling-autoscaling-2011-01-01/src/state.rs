@@ -159,10 +159,10 @@ pub mod warm_pools;
 pub mod termination_policies;
 
 pub use warm_pools::{
-    too_large_warm_pool_message, warm_pool_change_cause, warmed_lifecycle_state, StoredWarmPool,
-    WarmPoolPut, DEFAULT_WARM_POOL_MIN_SIZE, DEFAULT_WARM_POOL_STATE,
-    MAX_GROUP_PREPARED_CAPACITY_UNSET, MAX_WARM_POOL_RECORDS, WARMED_PENDING,
-    WARMED_STATE_PREFIX, WARMED_TERMINATING, WARM_POOL_IN_USE_MESSAGE,
+    absent_warm_pool_message, too_large_warm_pool_message, warm_pool_change_cause,
+    warmed_lifecycle_state, StoredWarmPool, WarmPoolPut, DEFAULT_WARM_POOL_MIN_SIZE,
+    DEFAULT_WARM_POOL_STATE, MAX_GROUP_PREPARED_CAPACITY_UNSET, MAX_WARM_POOL_RECORDS,
+    WARMED_PENDING, WARMED_STATE_PREFIX, WARMED_TERMINATING, WARM_POOL_IN_USE_MESSAGE,
 };
 
 /// The scaling processes a group has suspended: the collection `SuspendProcesses` writes
@@ -2396,6 +2396,11 @@ impl AutoScalingState {
             .expect("the group was present a moment ago");
         group.desired_capacity = desired_capacity;
         group.pending_capacity = None;
+        // The capacity a group holds is one half of the difference its warm pool maintains
+        // (`StoredWarmPool::target_size`), so THIS change is what owes the preparation of
+        // whatever the pool is now short of ([`warm_pools`]) — from this instant, not from
+        // whenever the pool is next read.
+        group.owe_warm_pool_preparation(now);
         // A cooldown FOLLOWS a scaling activity — it is what "helps to ensure that your Auto
         // Scaling group doesn't launch or terminate additional instances before the previous
         // scaling activity takes effect" (`AutoScalingGroup$DefaultCooldown`'s own

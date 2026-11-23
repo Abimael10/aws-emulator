@@ -297,7 +297,8 @@ async fn a_warm_pool_is_deleted_with_its_instances_only_when_the_request_forces_
         "case {case:?}: expected the group to hold no pool"
     );
 
-    // A group that holds no pool is already in the state the delete asks for.
+    // A group that holds no pool holds nothing this delete can address, so it is refused for
+    // the POOL — the sentence this service states for a warm pool a group does not hold.
     let case = "a group that holds no pool";
     let (status, body) = query(
         &router,
@@ -306,8 +307,19 @@ async fn a_warm_pool_is_deleted_with_its_instances_only_when_the_request_forces_
     )
     .await;
     assert_eq!(
-        status, 200,
-        "case {case:?}: expected the delete to be accepted, got {status} with {body}"
+        status, 400,
+        "case {case:?}: expected the delete to be refused, got {status} with {body}"
+    );
+    assert_eq!(
+        (
+            tag_value(&body, "Code"),
+            xml_unescape(&tag_value(&body, "Message"))
+        ),
+        (
+            "ValidationError".to_string(),
+            format!("No warm pool found for Auto Scaling group '{poolless}'.")
+        ),
+        "case {case:?}: unexpected refusal, got {body}"
     );
 
     // The pool that HOLDS an instance is not deleted without the force: the refusal is the

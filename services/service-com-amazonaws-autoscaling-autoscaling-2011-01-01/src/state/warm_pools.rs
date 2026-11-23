@@ -36,6 +36,15 @@
 //! launched warm-pool instance is reported [`WARMED_PENDING`] until
 //! [`super::LIFECYCLE_TRANSITION`] takes it to the pool's own state.
 //!
+//! That shortfall is owed to the clock from the instant the change that created it was
+//! made: preparing an instance is work this service does AFTER the call that left the pool
+//! short, so each such write records the preparation it owes
+//! ([`StoredGroup::owe_warm_pool_preparation`], read back as
+//! [`StoredWarmPool::prepare_due`]), the reconcile launches it once that instant has passed,
+//! and the clock pump waits on it like every other instant this store owes — so a pool a
+//! caller reads straight after configuring it has prepared nothing at all, and one nobody
+//! calls again is still brought to its size.
+//!
 //! # What the pool is for
 //!
 //! A group that has to ADD instances to reach the capacity it maintains CONSUMES what its
@@ -43,7 +52,9 @@
 //! ([`super::AutoScalingState::consume_warm_pool`], reached from the one capacity
 //! convergence): the warmed states live in the same `LifecycleState` value set as `Pending`
 //! and `InService`, so a prepared instance moves out of the pool and into service under its
-//! own `InstanceId` instead of a cold launch taking its place.
+//! own `InstanceId` instead of a cold launch taking its place — and the pool is left short of
+//! it, so that consumption owes the preparation of its replacement like every other change
+//! that leaves the pool short.
 
 use std::time::SystemTime;
 
@@ -157,6 +168,15 @@ pub const WARM_POOL_IN_USE_MESSAGE: &str =
     "You cannot delete a warm pool while there are instances still in it unless you use the \
      force delete option.";
 
+/// The sentence a call addressed at the warm pool of a group that holds none is refused
+/// with.
+///
+/// Amazon EC2 Auto Scaling's own sentence for that refusal: fixed text apart from the group
+/// the call addressed the pool on, quoted, and taken verbatim from the request.
+pub fn absent_warm_pool_message(group_name: &str) -> String {
+    format!("No warm pool found for Auto Scaling group '{group_name}'.")
+}
+
 /// The `Activity$Cause` the launches and terminations that bring a warm pool to its
 /// target size record: when the pool was brought to size, what asked for it, and the sizes
 /// they moved the pool between — the shape every cause this service records takes
@@ -213,6 +233,24 @@ pub struct StoredWarmPool {
     /// cannot place an instance records one failure per CHANGE rather than one per call
     /// that re-attempted it.
     pub unplaced_reported: usize,
+    /// When the instances this pool is short of are LAUNCHED: the instant the clock owes
+    /// them, recorded by the change that left the pool short
+    /// ([`StoredGroup::owe_warm_pool_preparation`]) and cleared once that shortfall has been
+    /// launched or has gone away. `None` for a pool that owes no preparation.
+    ///
+    /// Preparing an instance is work Amazon EC2 Auto Scaling does after the fact — it
+    /// "launches and maintains" the pool's size
+    /// (`PutWarmPoolType$MaxGroupPreparedCapacity`) rather than launching within the call
+    /// that left the pool short — so a caller that reads the pool straight after
+    /// configuring it finds a pool that has prepared nothing yet. The instant is the
+    /// CHANGE's own, never the reading call's, so what a later caller sees does not depend
+    /// on who read the pool in between, and the clock pump waits on it
+    /// ([`super::lifecycle_events`]) so a pool nobody calls about again is prepared anyway.
+    ///
+    /// The span is the one this service owes its other lifecycle transitions
+    /// ([`LIFECYCLE_TRANSITION`], chosen rather than documented), so the preparation of an
+    /// instance and the transition it then makes cannot drift apart.
+    pub prepare_due: Option<SystemTime>,
 }
 
 impl StoredWarmPool {
@@ -263,12 +301,30 @@ impl StoredWarmPool {
     /// higher than the MaxGroupPreparedCapacity, the capacity of the warm pool is 0,
     /// unless you specify a value for MinSize", which is the floor the pool's own minimum
     /// puts under the difference.
+    ///
+    /// The answer is held to [`super::MAX_GROUP_CAPACITY`], the ceiling this process holds
+    /// ONE GROUP to: a group's maximum is stored as the headroom it may later grow within
+    /// ([`super::size_past_ceiling`]) and is not itself bounded, so without this a pool
+    /// whose size follows that maximum would MAINTAIN more instances than the group may
+    /// hold — and this is the number every reader of the pool's target acts on, the
+    /// reconcile that prepares the difference included.
     pub fn target_size(&self, desired_capacity: i32, max_size: i32) -> i32 {
         let prepared = self.max_group_prepared_capacity.unwrap_or(max_size);
         prepared
             .saturating_sub(desired_capacity)
             .max(self.min_size)
-            .max(0)
+            .clamp(0, super::MAX_GROUP_CAPACITY)
+    }
+
+    /// Record that the preparation of what this pool may now be short of is owed from `at`
+    /// ([`Self::prepare_due`]).
+    ///
+    /// The EARLIER of the two instants stands: a shortfall already owed is not pushed back
+    /// by a later change, so a pool left short and then changed again is still prepared one
+    /// span after the first change that left it short.
+    fn owe_preparation(&mut self, at: SystemTime) {
+        let due = at + LIFECYCLE_TRANSITION;
+        self.prepare_due = Some(self.prepare_due.map_or(due, |owed| owed.min(due)));
     }
 }
 
@@ -332,6 +388,41 @@ impl StoredGroup {
             .map_or(0, |pool| pool.target_size(self.desired_capacity, self.max_size))
     }
 
+    /// The instant this group's warm pool owes the preparation of its shortfall at
+    /// ([`StoredWarmPool::prepare_due`]) — and ONLY where that preparation will ACT when the
+    /// instant arrives, which is what the clock waits on
+    /// ([`super::lifecycle_events`]).
+    ///
+    /// A pool short of nothing, a group with no zone to place an instance in and one already
+    /// holding the ceiling this process holds a group to name no instant at which anything
+    /// happens, so the clock does not wait on them: the debt stays recorded and is launched
+    /// by the reconcile of whichever change makes room for it.
+    pub fn warm_pool_preparation_due_at(&self) -> Option<SystemTime> {
+        let pool = self.warm_pool.as_ref()?;
+        let due = pool.prepare_due?;
+        let owed = self.warm_pool_target_size() - pool.live_size();
+        (owed > 0 && !self.availability_zones.is_empty() && self.launch_headroom() > 0)
+            .then_some(due)
+    }
+
+    /// Record that a change made at `at` may have left this group's warm pool short of the
+    /// instances it maintains, so the preparation of that shortfall falls due one
+    /// [`LIFECYCLE_TRANSITION`] after the CHANGE ([`StoredWarmPool::prepare_due`]).
+    ///
+    /// Every write that can move the pool's size or its target calls this — the put that
+    /// configures the pool, the capacity changes of the group it sits beside, and the
+    /// departure of an instance it held — so the instant the preparation is owed from is the
+    /// change's own rather than whenever somebody next calls. A debt already owed STANDS: an
+    /// earlier shortfall is not pushed back by a later change, and a pool that owes nothing
+    /// clears the record on its next reconcile.
+    ///
+    /// Does nothing for a group with no warm pool: there is no pool to prepare for.
+    pub fn owe_warm_pool_preparation(&mut self, at: SystemTime) {
+        if let Some(pool) = self.warm_pool.as_mut() {
+            pool.owe_preparation(at);
+        }
+    }
+
     /// Create or update this group's warm pool, per the update rule in this module's own
     /// documentation.
     ///
@@ -339,6 +430,10 @@ impl StoredGroup {
     /// each settled one re-enters [`WARMED_PENDING`] and reaches the new state when
     /// [`LIFECYCLE_TRANSITION`] is due, exactly as a freshly launched one does, so a
     /// caller that reads the pool straight after the change still sees the transition.
+    ///
+    /// The put is also a change that can leave the pool short — of what it now maintains —
+    /// so it records the preparation it owes from its own instant
+    /// ([`Self::owe_warm_pool_preparation`]).
     pub fn put_warm_pool(&mut self, put: &WarmPoolPut, now: SystemTime) {
         match self.warm_pool.as_mut() {
             // An UPDATE: every member the request omits keeps the value the pool already
@@ -384,9 +479,12 @@ impl StoredGroup {
                     instance_reuse_policy: put.instance_reuse_policy.clone(),
                     instances: Vec::new(),
                     unplaced_reported: 0,
+                    prepare_due: None,
                 });
             }
         }
+        // Whatever the put left the pool maintaining, preparing it is owed from THIS call.
+        self.owe_warm_pool_preparation(now);
     }
 }
 
@@ -401,8 +499,10 @@ impl AutoScalingState {
     /// ([`AutoScalingState::resize_warm_pool`]) — and the pool's record goes with them, so no
     /// later reconcile launches into a pool the group no longer has.
     ///
-    /// `false` for a group this store holds nothing for and for one with no warm pool: the
-    /// group is then already in the state a delete of its pool asks for.
+    /// `false` for a group this store holds nothing for and for one with no warm pool —
+    /// neither of which a caller reaches through `DeleteWarmPool`, whose handler refuses both
+    /// before it gets here ([`absent_warm_pool_message`]): it is the floor under a caller that
+    /// deletes a pool it did not read first, and what it answers is that there was none.
     pub fn delete_warm_pool<Eng: Send + Sync + 'static>(
         &mut self,
         engine: &Eng,
@@ -485,6 +585,13 @@ impl AutoScalingState {
                 }
             }
             pool.instances = kept;
+            // Every instance this call takes leaves the pool short of it, and THIS is the
+            // change that owes its replacement: the preparation falls due a span from here
+            // rather than from whenever the pool is next read
+            // ([`StoredGroup::owe_warm_pool_preparation`]).
+            if !taken.is_empty() {
+                pool.owe_preparation(now);
+            }
         }
         if taken.is_empty() {
             return Vec::new();
@@ -578,9 +685,18 @@ impl AutoScalingState {
                 }
             }
         }
+        let before = pool.instances.len();
         pool.instances.retain(|instance| {
             instance.lifecycle_state != WARMED_TERMINATING || instance.transition_due.is_some()
         });
+        // An instance that has LEFT the pool is itself a change that can leave the pool
+        // short — of the instance that just went — so it owes the preparation of whatever
+        // the pool is now missing, from the instant it left, which the clock made due at
+        // `now` ([`StoredGroup::owe_warm_pool_preparation`]). A pool short of nothing clears
+        // that record on the resize that follows.
+        if pool.instances.len() < before {
+            pool.owe_preparation(now);
+        }
         let settled: Vec<String> = pool
             .instances
             .iter()
@@ -615,13 +731,37 @@ impl AutoScalingState {
         let zoneless = group.availability_zones.is_empty();
         let held = pool.live_size();
         let target = group.warm_pool_target_size();
-        // Without a zone to place an instance in, nothing can be launched; a group
-        // always holds at least one, so this is the floor under the launch rather than a
-        // case any request reaches.
-        let to_launch = if zoneless {
+        // What the pool is SHORT of, and how much of that this pass could launch: without a
+        // zone to place an instance in nothing can be launched, and a group that is already
+        // holding this process's ceiling has no room for another instance either.
+        let owed = (target - held).max(0);
+        let launchable = if zoneless {
             0
         } else {
-            (target - held).max(0).min(group.launch_headroom())
+            owed.min(group.launch_headroom())
+        };
+        // The shortfall is launched when the CLOCK has made it due, never within the call
+        // that left the pool short: Amazon EC2 Auto Scaling "launches and maintains" the
+        // pool's size, and the instant it owes the preparation from is the one the CHANGE
+        // recorded ([`StoredGroup::owe_warm_pool_preparation`]), so this pass only CONSUMES
+        // that debt — it never starts one of its own, which would make the clock of a pool
+        // depend on who read it.
+        let launching = launchable > 0 && pool.prepare_due.is_some_and(|due| due <= now);
+        let to_launch = if launching { launchable } else { 0 };
+        let prepare_due = if owed == 0 {
+            // Short of nothing: there is nothing left to prepare, so the record is cleared.
+            None
+        } else if launching && launchable >= owed {
+            // This pass launches the whole shortfall.
+            None
+        } else if launching {
+            // It launches only what there was room for, so the REST is owed again — by this
+            // attempt, from this instant, which is also what keeps the clock pump waiting on
+            // an instant still ahead of it rather than one already past.
+            Some(now + LIFECYCLE_TRANSITION)
+        } else {
+            // Still waiting for the instant the change owed the preparation from.
+            pool.prepare_due
         };
         let surplus = (held - target).max(0);
         let taken: Vec<String> = pool
@@ -632,9 +772,17 @@ impl AutoScalingState {
             .take(usize::try_from(surplus).unwrap_or(0))
             .map(|instance| instance.instance_id.clone())
             .collect();
+        if let Some(pool) = self
+            .groups
+            .get_mut(group_name)
+            .and_then(|group| group.warm_pool.as_mut())
+        {
+            pool.prepare_due = prepare_due;
+        }
         if to_launch == 0 && taken.is_empty() {
-            // Nothing is owed, so nothing can be unplaced: the next shortfall is a change
-            // from none and records its own failure.
+            // This pass launches nothing and takes nothing out, so nothing can be unplaced:
+            // the next shortfall it does launch is a change from none and records its own
+            // failure.
             if let Some(pool) = self
                 .groups
                 .get_mut(group_name)
@@ -665,6 +813,14 @@ impl AutoScalingState {
         let unplaced_message = launch.unplaced_message(UNPLACED_WARM_POOL_INSTANCE_MESSAGE);
         let unplaced_status_code = launch.unplaced_status_code();
         let unplaced = launch.unplaced;
+        // A unit the account could not place leaves the pool short of it still, and this
+        // FAILED ATTEMPT is the change that owes the next one: the re-attempt falls due a
+        // span after the attempt rather than when somebody next reads the pool.
+        if unplaced > 0 {
+            if let Some(group) = self.groups.get_mut(group_name) {
+                group.owe_warm_pool_preparation(now);
+            }
+        }
         if !taken.is_empty() {
             if let Some(pool) = self
                 .groups

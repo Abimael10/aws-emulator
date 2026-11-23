@@ -655,6 +655,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .expect("the group was present a moment ago");
         group.min_size = min_size;
         group.max_size = max_size;
+        // The group's MAXIMUM is the other half of the difference its warm pool maintains
+        // when the pool names no prepared capacity of its own
+        // (`crate::state::StoredWarmPool::target_size`), so this update owes the preparation
+        // of whatever the pool is now short of, from this instant. A capacity change this
+        // update also makes owes its own, through the one capacity path
+        // (`crate::state::AutoScalingState::apply_capacity`).
+        group.owe_warm_pool_preparation(now);
         if let Some(value) = input.launch_configuration_name {
             group.launch_configuration_name = Some(value);
             // A group launches from a launch configuration or from a launch

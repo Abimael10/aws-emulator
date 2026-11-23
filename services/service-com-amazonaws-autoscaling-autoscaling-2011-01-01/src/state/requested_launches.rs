@@ -276,6 +276,9 @@ impl AutoScalingState {
         };
         if let Some(group) = self.groups.get_mut(request.group_name) {
             group.desired_capacity = new_desired;
+            // As every capacity change does, this one owes the preparation of what the
+            // group's warm pool is now short of, from this instant (`warm_pools`).
+            group.owe_warm_pool_preparation(now);
             // The group's cooldown is left where it is: it is "the amount of time, in
             // seconds, between one scaling activity ending and another one starting due to
             // simple scaling policies" (`CreateAutoScalingGroupType$DefaultCooldown`), and a

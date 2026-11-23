@@ -4,8 +4,9 @@
 //!
 //! The warm pool of one group is a SINGLE CHILD of it ([`crate::state::warm_pools`]), so this
 //! delete is addressed by the group alone: the pool's record is removed and the instances it
-//! holds are shut down where they live. A pool that still holds instances is protected unless
-//! the request asks for the force delete the model publishes for exactly that.
+//! holds are shut down where they live. A group that holds no pool holds nothing this call
+//! addresses, and a pool that still holds instances is protected unless the request asks for
+//! the force delete the model publishes for exactly that.
 //!
 //! ## Shape of an operation
 //!
@@ -190,8 +191,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ([`crate::state::absent_group_message_as_no_such_group`]) — resolved FIRST, before
         // anything else of the request is read.
         let Some(group) = state.groups.get(&group_name) else {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &group_name,
+                "refused: no such group",
+            );
             return Err(crate::scaffolded::Scaffolded::validation_error(
                 crate::state::absent_group_message_as_no_such_group(&group_name),
+            ));
+        };
+        // A warm pool is the group's SINGLE CHILD, so a group that holds none holds nothing
+        // this call addresses — refused for the pool, as this service refuses every call
+        // addressed at a child a group does not hold.
+        let Some(pool) = group.warm_pool() else {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &group_name,
+                "refused: the group holds no warm pool",
+            );
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::absent_warm_pool_message(&group_name),
             ));
         };
         // "The operation can't be performed because the resource is in use"
@@ -199,7 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // force delete, so the instances a client warmed are not taken out from under it by a
         // request that did not ask for that. An instance already on its way out does not hold
         // the pool: it is leaving on its own.
-        if !forced && group.warm_pool().is_some_and(|pool| pool.live_size() > 0) {
+        if !forced && pool.live_size() > 0 {
             crate::state::audit(
                 ctx.parts(),
                 Self::NAME,
@@ -214,8 +235,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A group with no warm pool is already in the state this delete asks for, so the
-        // answer is the same either way: what the call states is that the group has no pool.
+        // The pool's record goes with the instances it held, which are shut down where they
+        // live: the group outlives its pool.
         state.delete_warm_pool(&*self.engine, &group_name, now);
 
         crate::state::audit(ctx.parts(), Self::NAME, &group_name, "warm pool deleted");
