@@ -61,13 +61,20 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 /// `STARTING` while the cluster starts it, so a read that lands in either is the same case.
 const NOT_YET_READY_STATES: [&str; 2] = ["SUBMITTED", "STARTING"];
 
-/// The states a session is in once the end has been asked for: `TERMINATING` while it is
-/// being torn down and `TERMINATED` after ("the session enters the TERMINATING state and
-/// then transitions to TERMINATED", `TerminateSession` doc).
-const ENDING_STATES: [&str; 2] = ["TERMINATING", "TERMINATED"];
+/// The states a session is in once the end has been asked for, in the order it passes
+/// through them: `TERMINATING` while it is being torn down and `TERMINATED` after ("the
+/// session enters the TERMINATING state and then transitions to TERMINATED",
+/// `TerminateSession` doc).
+///
+/// `pub(crate)` so the sibling suite that drives a REPEATED end reads the same two states
+/// off this one declaration.
+pub(crate) const ENDING_STATES: [&str; 2] = ["TERMINATING", "TERMINATED"];
 
 /// Start a session on `cluster_id` and answer its id.
-async fn start_session(emr: &Emr, cluster_id: &str, name: &str) -> String {
+///
+/// `pub(crate)` so the sibling suite that drives a REPEATED end starts and reads its
+/// sessions through these two rather than its own copies.
+pub(crate) async fn start_session(emr: &Emr, cluster_id: &str, name: &str) -> String {
     let answer = emr
         .ok(
             "StartSession",
@@ -81,7 +88,7 @@ async fn start_session(emr: &Emr, cluster_id: &str, name: &str) -> String {
 }
 
 /// `GetSession` for one session, as the wire reports it.
-async fn get_session(emr: &Emr, cluster_id: &str, session_id: &str) -> Value {
+pub(crate) async fn get_session(emr: &Emr, cluster_id: &str, session_id: &str) -> Value {
     emr.ok(
         "GetSession",
         json!({ "ClusterId": cluster_id, "SessionId": session_id }),
@@ -92,7 +99,13 @@ async fn get_session(emr: &Emr, cluster_id: &str, session_id: &str) -> Value {
 
 /// The sessions `ListSessions` reports for `cluster_id`, keeping only the states `states`
 /// names where a case names any.
-async fn listed_sessions(emr: &Emr, cluster_id: &str, states: Option<&[&str]>) -> Vec<Value> {
+///
+/// `pub(crate)` for the reason [`start_session`] is.
+pub(crate) async fn listed_sessions(
+    emr: &Emr,
+    cluster_id: &str,
+    states: Option<&[&str]>,
+) -> Vec<Value> {
     let mut request = json!({ "ClusterId": cluster_id });
     if let Some(states) = states {
         request["SessionStates"] = json!(states);
@@ -104,7 +117,7 @@ async fn listed_sessions(emr: &Emr, cluster_id: &str, states: Option<&[&str]>) -
 }
 
 /// The ids in a `ListSessions` page.
-fn ids_of(sessions: &[Value]) -> Vec<String> {
+pub(crate) fn ids_of(sessions: &[Value]) -> Vec<String> {
     sessions
         .iter()
         .filter_map(|session| session["Id"].as_str())
