@@ -253,12 +253,16 @@
 //! gives the status and body a call no integration can serve is answered with. That
 //! operation REPORTS what this module performs FROM THE API'S OWN RECORDS — including the
 //! call an `AWS` integration makes to another service, which it is handed the same
-//! transport for — so neither can answer one stored configuration differently. Passing a
-//! request through is not that: the answer is another endpoint's response to a request this
-//! one forwarded, and a simulated invocation forwards nothing, so it keeps reporting such
-//! an integration as a configuration error. Neither is the stage's response cache:
-//! `TestInvokeMethod` is not a request to the stage, so it neither reads nor fills what the
-//! cluster holds — it reports what the integration answers for the records as they stand.
+//! transport for — so neither can answer one stored configuration differently. An
+//! integration naming an HTTP ENDPOINT is performed for it too, by handing the integration
+//! request this module builds to the endpoint OF THIS EMULATOR its `uri` names
+//! ([`simulated_integration`]) — in process, over the same two paths the data plane carries
+//! one by, so no connection is opened and no address is dialled: the backend is what answers
+//! a method's test invocation, which is what lets a method be exercised before any stage
+//! serves it. What a simulated invocation does NOT touch is the stage's response
+//! cache: `TestInvokeMethod` is not a request to the stage, so it neither reads nor fills
+//! what the cluster holds — it reports what the integration answers for the records as they
+//! stand.
 
 pub mod aws_integration;
 /// WHICH release of the api one request to a stage is served from: the stage's own
@@ -287,6 +291,10 @@ pub mod sigv4_authentication;
 /// What one `Authorizer` makes of a SIMULATED request, which is what
 /// `TestInvokeAuthorizer` reports. `pub(crate)` because that operation is its one caller.
 pub(crate) mod simulated_authorizer;
+/// How a SIMULATED invocation performs an integration that names an HTTP ENDPOINT: the
+/// integration request this plane builds, carried to that endpoint. `pub(crate)` because
+/// `TestInvokeMethod` is its one caller.
+pub(crate) mod simulated_integration;
 /// What a SIMULATED request carries, read the one way for both `TestInvoke*` operations.
 pub(crate) mod simulated_request;
 /// What the stage LOGS about a request it served: its access-log record and the execution
@@ -1359,8 +1367,7 @@ async fn serving<Eng: Send + Sync + 'static>(
             // is. A call no deployed method serves is not a routing answer but an
             // AUTHORIZATION one: the stage decides whether the caller may invoke the ARN it
             // named before it says whether that method is there ([`unrouted_call`]).
-            let routed = match_resource_path(deployment, &resource_path)
-                .and_then(|path| match_method(deployment, path, req.method()).map(|m| (path, m)));
+            let routed = routed_method(deployment, &resource_path, req.method());
             let Some((matched_path, (verb, snapshot))) = routed else {
                 break 'planned Planned::answered(refusal_response(
                     Some(api),
@@ -3754,21 +3761,27 @@ fn carries_directive_at(rest: &str, performed_aside: bool) -> bool {
         })
 }
 
-/// The resource path of the DEPLOYMENT that matches `request_path`, most specific first.
+/// The deployed path and the method of it that SERVE this call: the matching resource paths
+/// of the DEPLOYMENT in specificity order, and the FIRST of them that declares the verb.
 ///
 /// A literal segment is more specific than a `{parameter}`, which is more specific than a
-/// greedy `{proxy+}` — the order API Gateway resolves a request in. Returns `None` when the
-/// deployment holds no path that matches.
+/// greedy `{proxy+}` — the order API Gateway resolves a request in. The resolution is of a
+/// METHOD rather than of a resource: a resource wins the call only for the verbs it declares,
+/// and a verb it does not declare resolves against the next matching resource — the
+/// parameterised sibling that does declare it, with the literal segment bound as that
+/// resource's path parameter. `None` when NO matching resource declares the verb, which is
+/// the call no deployed method serves ([`unrouted_call`]).
 ///
 /// Only the paths a METHOD is deployed under are candidates, which is what makes this the
 /// path that SERVES the call; the path the request ADDRESSED is
 /// [`unrouted_call::addressed_resource_path`], which offers the whole resource tree to the
-/// same selection ([`most_specific_match`]).
-fn match_resource_path<'d>(
+/// same ordering ([`most_specific_match`]).
+fn routed_method<'d>(
     deployment: &'d DeploymentEntry,
     request_path: &str,
-) -> Option<&'d str> {
-    most_specific_match(
+    verb: &str,
+) -> Option<(&'d str, (&'d str, &'d crate::ops::types::MethodSnapshot))> {
+    matching_paths(
         deployment
             .api_summary
             .iter()
@@ -3776,6 +3789,8 @@ fn match_resource_path<'d>(
             .map(|(path, _)| path.as_str()),
         request_path,
     )
+    .into_iter()
+    .find_map(|path| match_method(deployment, path, verb).map(|method| (path, method)))
 }
 
 /// The one of `candidates` that matches `request_path` most specifically, by the score
@@ -3789,12 +3804,27 @@ pub(super) fn most_specific_match<'d>(
     candidates: impl Iterator<Item = &'d str>,
     request_path: &str,
 ) -> Option<&'d str> {
-    candidates
+    matching_paths(candidates, request_path).into_iter().next()
+}
+
+/// Every one of `candidates` that matches `request_path`, MOST SPECIFIC FIRST — the order API
+/// Gateway considers the resources of a path in, which is what lets the resolution of a method
+/// go on to the next candidate ([`routed_method`]).
+///
+/// One ordering for every reader of a deployment's paths: the score [`match_score`] gives each
+/// candidate, highest first, ties broken on the path itself, lowest first, so the order is the
+/// same whatever order the candidates arrive in.
+fn matching_paths<'d>(
+    candidates: impl Iterator<Item = &'d str>,
+    request_path: &str,
+) -> Vec<&'d str> {
+    let mut scored: Vec<(Vec<u8>, &'d str)> = candidates
         .filter_map(|path| match_score(path, request_path).map(|score| (score, path)))
-        .max_by(|(left, left_path), (right, right_path)| {
-            left.cmp(right).then_with(|| right_path.cmp(left_path))
-        })
-        .map(|(_, path)| path)
+        .collect();
+    scored.sort_by(|(left, left_path), (right, right_path)| {
+        right.cmp(left).then_with(|| left_path.cmp(right_path))
+    });
+    scored.into_iter().map(|(_, path)| path).collect()
 }
 
 /// How specifically the resource path `template` matches `request_path`, or `None` when it

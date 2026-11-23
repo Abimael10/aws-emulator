@@ -435,9 +435,8 @@ fn planned<Eng: Send + Sync + 'static>(
     // and verb the CLIENT addressed.
     let deployment = api.deployments.get(&stage.deployment_id);
     let matched = deployment.and_then(|deployment| {
-        let path = super::match_resource_path(deployment, &resource_path)?;
-        let (verb, _) = super::match_method(deployment, path, req.method())?;
-        Some((path, verb))
+        super::routed_method(deployment, &resource_path, req.method())
+            .map(|(path, (verb, _))| (path, verb))
     });
     let (matched_path, verb) = matched.unwrap_or((resource_path.as_str(), req.method()));
     // The verb the CLIENT SENT, which is what a log says about the request's HTTP method:

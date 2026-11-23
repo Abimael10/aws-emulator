@@ -264,10 +264,8 @@ fn planned<Eng: Send + Sync + 'static>(
     // serving itself reads it — because the per-method series are of that method: a request
     // that matched none has no verb and no resource path of the deployment to name, so it is
     // counted in the two stage-level series alone.
-    let matched = super::match_resource_path(deployment, &resource_path).and_then(|path| {
-        let (verb, _) = super::match_method(deployment, path, req.method())?;
-        Some((path, verb))
-    });
+    let matched = super::routed_method(deployment, &resource_path, req.method())
+        .map(|(path, (verb, _))| (path, verb));
     if let Some((path, verb)) = matched {
         if super::response_cache::method_settings_in_force(stage, path, verb)
             .is_some_and(|settings| settings.metrics_enabled)

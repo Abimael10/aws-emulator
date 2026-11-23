@@ -129,11 +129,11 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::service::invoke::{
     integration_response, matched_path_parameters, parameters_refusal, pending_body_check,
-    performed_integration, refusal_rendering, sent_query_parameters, with_stage_variables,
-    MethodRequest, JSON_CONTENT_TYPE,
+    refusal_rendering, sent_query_parameters, with_stage_variables, MethodRequest,
+    JSON_CONTENT_TYPE,
 };
 use crate::service::invoke::lambda_proxy::ProxyInputs;
-use crate::service::invoke::simulated_request;
+use crate::service::invoke::{simulated_integration, simulated_request};
 use crate::service::invoke::trace_context::{reported_header, TRACE_HEADER};
 use crate::service::mapping_template::TemplateInputs;
 
@@ -490,6 +490,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 tracing_enabled: false,
             },
         );
+        // The request the simulated invocation is PERFORMED as: an integration's own
+        // mappings read a request — its headers, its query string and its payload — so the
+        // members the caller described the invocation with are assembled into one
+        // ([`simulated_integration::simulated_request_of`]), and the integration request
+        // carried to an HTTP endpoint is built from it exactly as it is off the wire.
+        let simulated_call = simulated_integration::simulated_request_of(
+            &verb,
+            input
+                .path_with_query_string
+                .as_deref()
+                .filter(|addressed| !addressed.is_empty())
+                .unwrap_or(resource_path.as_str()),
+            &resource_path,
+            &headers.every_value(),
+            input
+                .body
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes()
+                .to_vec(),
+        );
         // The method's own REQUEST VALIDATOR, before the integration is performed: "a
         // RequestValidator ... validates a request before the integration is invoked"
         // (`RequestValidator`), and that holds for a SIMULATED request too — a body the
@@ -511,9 +532,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // answer to the method response — the same two steps, in the same order,
                     // the data plane takes ([`integration_response::mapped`]), so a
                     // simulated invocation reports what an invoke of the records as they
-                    // stand is served.
-                    performed_integration(ctx, api.arn_region(), Some(&resolved), &call)
-                        .await
+                    // stand is served. An integration naming an HTTP ENDPOINT is performed
+                    // by handing the integration request to THIS EMULATOR, which is the step
+                    // the simulated request assembled above is what carries
+                    // ([`simulated_integration`]): the endpoint is reached either by
+                    // re-entering this plane's own serving or over the in-process transport
+                    // the context holds, which dispatches into this process's own router. No
+                    // connection is opened, no name is resolved and no address is dialled —
+                    // an address this emulator publishes nothing on reaches nothing at all,
+                    // and is reported as the integration this api cannot perform.
+                    simulated_integration::performed(
+                        &*self.engine,
+                        ctx,
+                        api.arn_region(),
+                        &input.rest_api_id,
+                        &resolved,
+                        &call,
+                        &simulated_call,
+                    )
+                    .await
                         .and_then(|performed| {
                             integration_response::mapped(
                                 Some(&resolved),

@@ -64,7 +64,7 @@ fn resource_not_found(route: &str, verb: &str) -> GatewayRefusal {
 
 /// The resource path of the DEPLOYMENT that matches `request_path`, whether or not it carries
 /// a method — the resource the request ADDRESSED, as against the one that SERVES it
-/// ([`super::match_resource_path`], which reads only the paths a method is deployed under).
+/// ([`super::routed_method`], which reads only the paths a method is deployed under).
 ///
 /// The selection itself is [`super::most_specific_match`], the one this plane resolves every
 /// request with, so the two readers cannot drift on which path wins: what differs here is only

@@ -170,6 +170,12 @@ const MAX_DEFINITION_NODES: usize = 50_000;
 /// OpenAPI document's paths → path item → operation → responses → schema trees.
 const MAX_DEFINITION_DEPTH: usize = 64;
 
+/// The refusal for a definition that nests deeper than [`MAX_DEFINITION_DEPTH`], stated once
+/// for both spellings: the YAML reader refuses it as it builds
+/// ([`DefinitionBuilder::open_frame`]) and the JSON spelling's parsed tree is refused by
+/// [`bound_definition_nodes`], so a caller gets the same sentence either way.
+const TOO_DEEPLY_NESTED: &str = "the definition nests more deeply than this emulator reads";
+
 /// The most leading spaces one line of a YAML definition may carry, which is what block
 /// nesting costs per level ([`guard_yaml_nesting`]). Chosen: far past the indentation of a
 /// definition written at any sane indent step.
@@ -308,12 +314,78 @@ pub fn put_mode(mode: Option<&str>) -> Result<PutModeKind, String> {
     }
 }
 
+/// The document key API Gateway's OpenAPI extensions use for the api's REQUEST VALIDATORS: a
+/// mapping keyed by the validator's NAME whose entries carry the two flags
+/// `CreateRequestValidator` takes.
+const REQUEST_VALIDATORS_EXTENSION: &str = "x-amazon-apigateway-request-validators";
+
+/// The document key that SELECTS one of [`REQUEST_VALIDATORS_EXTENSION`]'s entries by name: at
+/// the document root it is the validator every operation is imported under, and on an
+/// operation it overrides that for that method alone — which is what
+/// `Method$requestValidatorId` names.
+const REQUEST_VALIDATOR_EXTENSION: &str = "x-amazon-apigateway-request-validator";
+
+/// The members one entry of [`REQUEST_VALIDATORS_EXTENSION`] carries: the two
+/// `RequestValidator` flags, each `@default false`, so an entry that declares neither
+/// validates nothing.
+const VALIDATE_REQUEST_BODY: &str = "validateRequestBody";
+
+/// See [`VALIDATE_REQUEST_BODY`].
+const VALIDATE_REQUEST_PARAMETERS: &str = "validateRequestParameters";
+
+/// The text a boolean member of a definition is declared `true` by. A definition's scalars are
+/// read as the text they were written in ([`Node`]), so a flag is read off that text.
+const DECLARED_TRUE: &str = "true";
+
+/// Swagger 2.0's key for the schemas a document NAMES, which are the `Model` records an import
+/// creates for it.
+const DEFINITIONS_KEY: &str = "definitions";
+
+/// OpenAPI 3's key for the same set, under the document's `components`; see
+/// [`DEFINITIONS_KEY`].
+const COMPONENT_SCHEMAS_KEY: &str = "schemas";
+
 /// One path of an imported definition: the path as the document writes it, and the
 /// `Method`s the operations the document puts on it become, in document order.
 #[derive(Debug, Clone)]
 pub struct ImportedPath {
     pub path: String,
+    /// The methods, each as the record it becomes — except for `requestValidatorId`, which
+    /// carries the NAME of the validator in force for the method
+    /// ([`REQUEST_VALIDATOR_EXTENSION`]): a document NAMES the validator it selects and the
+    /// record names it by the id this import mints for the entry of that name, which is a
+    /// value only the materialisation holds ([`materialise_definition`] substitutes it).
     pub methods: Vec<MethodEntry>,
+}
+
+/// One entry of [`REQUEST_VALIDATORS_EXTENSION`]: the `RequestValidator` an import creates
+/// for it.
+#[derive(Debug, Clone)]
+pub struct ImportedRequestValidator {
+    /// The entry's KEY, which is the validator's name — what the document's own selector and
+    /// an operation's override name it by, and the `name` the created record carries.
+    pub name: String,
+    /// [`VALIDATE_REQUEST_BODY`].
+    pub validate_request_body: bool,
+    /// [`VALIDATE_REQUEST_PARAMETERS`].
+    pub validate_request_parameters: bool,
+}
+
+/// One `Model` an import creates out of a schema the definition NAMES ([`DEFINITIONS_KEY`],
+/// [`COMPONENT_SCHEMAS_KEY`]).
+#[derive(Debug, Clone)]
+pub struct ImportedModel {
+    /// The schema's own key in the document, which is the `Model`'s name — the name a
+    /// method's `requestModels` and a method response's `responseModels` reference it by.
+    pub name: String,
+    /// The media type the model describes a payload of, which is `Model$contentType`.
+    pub content_type: String,
+    /// The schema as the JSON document it was declared as ([`Node::json`]), with every
+    /// reference to a sibling schema of the document still spelled as the document spelled
+    /// it: the materialisation rewrites each onto the api's own model-schema URL, which is
+    /// the identifier API Gateway gives a stored model's schema and the only thing a stored
+    /// schema's `$ref` can resolve against.
+    pub schema: String,
 }
 
 /// The refusal for a document whose FORMAT is settled and which is not a readable
@@ -450,6 +522,12 @@ pub struct ImportedDefinition {
     pub gateway_responses: BTreeMap<String, GetGatewayResponseOutput>,
     /// The document's paths, in document order.
     pub paths: Vec<ImportedPath>,
+    /// The request validators [`REQUEST_VALIDATORS_EXTENSION`] declares, in document order;
+    /// empty when the document declares none.
+    pub request_validators: Vec<ImportedRequestValidator>,
+    /// The models the schemas the document NAMES become, in document order; empty when the
+    /// document names none.
+    pub models: Vec<ImportedModel>,
     /// What the import could not carry over — reported in the response's `warnings`, and
     /// what `failOnWarnings` rolls the update back for.
     pub warnings: Vec<String>,
@@ -468,7 +546,14 @@ pub enum Node {
     Null,
     /// A scalar, as its text: a definition is read for strings, and for the SHAPE of
     /// everything else, so a number or a boolean is kept as it was written.
-    Scalar(String),
+    ///
+    /// `plain` is whether it was written WITHOUT quotes — a JSON number, boolean or `null`,
+    /// and a YAML plain scalar — which is what says the text stands for a value of another
+    /// type rather than for itself. Every reader below takes the text either way
+    /// ([`Node::text`]); the one place the distinction matters is a document a JSON document
+    /// is rebuilt from, where a quoted `3` is the string and a plain one is the number
+    /// ([`Node::json`]).
+    Scalar { text: String, plain: bool },
     /// A sequence, in order.
     Sequence(Vec<Node>),
     /// A mapping, entries in document order. A document that repeats a key keeps both
@@ -478,6 +563,61 @@ pub enum Node {
 }
 
 impl Node {
+    /// A scalar written WITH quotes, which stands for the text itself.
+    fn quoted(text: String) -> Self {
+        Node::Scalar { text, plain: false }
+    }
+
+    /// A scalar written WITHOUT quotes: a JSON number or boolean, or a YAML plain scalar.
+    fn unquoted(text: String) -> Self {
+        Node::Scalar { text, plain: true }
+    }
+
+    /// This node as the JSON document it was read from — the document a `Model`'s schema is
+    /// stored as, so a schema a definition declares is stored as the JSON it was written in.
+    ///
+    /// A mapping keeps the document's own order (`serde_json`'s object preserves insertion
+    /// order under its `preserve_order` feature, and the entries are inserted in document
+    /// order either way), and an UNQUOTED scalar is the value its text spells where that text
+    /// spells a JSON number or boolean — which is how a JSON number read into a scalar, and a
+    /// YAML plain scalar, become numbers again. A quoted scalar is the string it was written
+    /// as, whatever it looks like, so `"3"` in a schema's `enum` stays the string `3`.
+    fn json(&self) -> ::serde_json::Value {
+        self.json_at(1)
+    }
+
+    /// [`Node::json`] at nesting level `depth`, which bounds the recursion explicitly: a node
+    /// past [`MAX_DEFINITION_DEPTH`] is rebuilt as the null value rather than descended into.
+    ///
+    /// Unreachable for a parsed definition — a document nesting that deeply is refused before
+    /// anything reads it ([`bound_definition_nodes`], [`DefinitionBuilder::open_frame`]) — and
+    /// written as a bound anyway, because the stack is the one resource a tree walk consumes
+    /// that no later check can give back.
+    fn json_at(&self, depth: usize) -> ::serde_json::Value {
+        if depth > MAX_DEFINITION_DEPTH {
+            return ::serde_json::Value::Null;
+        }
+        match self {
+            Node::Null => ::serde_json::Value::Null,
+            Node::Scalar { text, plain } => {
+                let literal = plain
+                    .then(|| ::serde_json::from_str::<::serde_json::Value>(text).ok())
+                    .flatten()
+                    .filter(|value| value.is_number() || value.is_boolean());
+                literal.unwrap_or_else(|| ::serde_json::Value::String(text.clone()))
+            }
+            Node::Sequence(items) => ::serde_json::Value::Array(
+                items.iter().map(|item| item.json_at(depth + 1)).collect(),
+            ),
+            Node::Mapping(entries) => ::serde_json::Value::Object(
+                entries
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.json_at(depth + 1)))
+                    .collect(),
+            ),
+        }
+    }
+
     /// A member of this mapping by name; `None` for any other node.
     fn member(&self, key: &str) -> Option<&Node> {
         match self {
@@ -492,7 +632,7 @@ impl Node {
     /// This node's text, when it is a scalar.
     fn text(&self) -> Option<&str> {
         match self {
-            Node::Scalar(value) => Some(value),
+            Node::Scalar { text, .. } => Some(text),
             _ => None,
         }
     }
@@ -542,23 +682,23 @@ impl<'de> Visitor<'de> for NodeVisitor {
     }
 
     fn visit_bool<E: ::serde::de::Error>(self, value: bool) -> Result<Node, E> {
-        Ok(Node::Scalar(value.to_string()))
+        Ok(Node::unquoted(value.to_string()))
     }
 
     fn visit_i64<E: ::serde::de::Error>(self, value: i64) -> Result<Node, E> {
-        Ok(Node::Scalar(value.to_string()))
+        Ok(Node::unquoted(value.to_string()))
     }
 
     fn visit_u64<E: ::serde::de::Error>(self, value: u64) -> Result<Node, E> {
-        Ok(Node::Scalar(value.to_string()))
+        Ok(Node::unquoted(value.to_string()))
     }
 
     fn visit_f64<E: ::serde::de::Error>(self, value: f64) -> Result<Node, E> {
-        Ok(Node::Scalar(value.to_string()))
+        Ok(Node::unquoted(value.to_string()))
     }
 
     fn visit_str<E: ::serde::de::Error>(self, value: &str) -> Result<Node, E> {
-        Ok(Node::Scalar(value.to_owned()))
+        Ok(Node::quoted(value.to_owned()))
     }
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Node, A::Error> {
@@ -639,7 +779,7 @@ impl DefinitionBuilder {
                 pending_key,
             }) => match pending_key.take() {
                 None => match node {
-                    Node::Scalar(key) => *pending_key = Some(key),
+                    Node::Scalar { text, .. } => *pending_key = Some(text),
                     _ => {
                         self.refused = Some("every key of the definition must be a string");
                     }
@@ -656,7 +796,7 @@ impl DefinitionBuilder {
             return;
         }
         if self.open.len() >= MAX_DEFINITION_DEPTH {
-            self.refused = Some("the definition nests more deeply than this emulator reads");
+            self.refused = Some(TOO_DEEPLY_NESTED);
             return;
         }
         self.open.push(frame);
@@ -693,7 +833,7 @@ impl ::yaml_rust2::parser::EventReceiver for DefinitionBuilder {
                 {
                     Node::Null
                 } else {
-                    Node::Scalar(value)
+                    Node::Scalar { text: value, plain }
                 };
                 self.place(node);
             }
@@ -940,28 +1080,42 @@ pub fn parse_definition(body: &[u8], scope: &ImportScope) -> Result<ImportedDefi
     read_definition(&document, scope)
 }
 
-/// Refuse a parsed definition carrying more nodes than [`MAX_DEFINITION_NODES`].
+/// Refuse a parsed definition carrying more nodes than [`MAX_DEFINITION_NODES`], or nesting
+/// deeper than [`MAX_DEFINITION_DEPTH`].
 ///
-/// Counts with the bound as a budget, so a document past it is refused after that many
-/// nodes rather than after however many it carries.
+/// Both bounds are budgets, so a document past either is refused at the node that breaks it
+/// rather than after however much it carries. The walk is ITERATIVE, over a worklist on the
+/// heap: the one check that bounds the nesting of a tree cannot itself recurse to the bottom
+/// of the tree it is checking, and the worklist is bounded by the node budget.
+///
+/// The DEPTH bound is what every later walk over the parsed document rests on
+/// ([`Node::json`], [`ReferenceWalk::visit`]): a document this refuses never reaches one.
+/// `serde_json` enforces a recursion limit of its own while it BUILDS the tree, which is
+/// what keeps this check reachable at all; the bound applied here is this emulator's, and is
+/// the same one the YAML reader applies as it builds ([`DefinitionBuilder::open_frame`]), so
+/// both spellings of a definition are read under one nesting bound.
 fn bound_definition_nodes(document: &Node) -> Result<(), String> {
-    fn count(node: &Node, budget: &mut usize) -> bool {
-        if *budget == 0 {
-            return false;
-        }
-        *budget -= 1;
-        match node {
-            Node::Mapping(entries) => entries.iter().all(|(_, value)| count(value, budget)),
-            Node::Sequence(items) => items.iter().all(|item| count(item, budget)),
-            _ => true,
-        }
-    }
+    let mut pending: Vec<(&Node, usize)> = vec![(document, 1)];
     let mut budget = MAX_DEFINITION_NODES;
-    if count(document, &mut budget) {
-        Ok(())
-    } else {
-        Err("the definition carries more nodes than this emulator reads".to_string())
+    while let Some((node, depth)) = pending.pop() {
+        if budget == 0 {
+            return Err("the definition carries more nodes than this emulator reads".to_string());
+        }
+        budget -= 1;
+        if depth > MAX_DEFINITION_DEPTH {
+            return Err(TOO_DEEPLY_NESTED.to_string());
+        }
+        match node {
+            Node::Mapping(entries) => {
+                pending.extend(entries.iter().map(|(_, value)| (value, depth + 1)));
+            }
+            Node::Sequence(items) => {
+                pending.extend(items.iter().map(|item| (item, depth + 1)));
+            }
+            _ => {}
+        }
     }
+    Ok(())
 }
 
 /// The base path a definition declares its paths under, as [`ImportedDefinition`]'s
@@ -1022,6 +1176,8 @@ fn read_definition(document: &Node, scope: &ImportScope) -> Result<ImportedDefin
             }),
         paths: Vec::new(),
         gateway_responses: BTreeMap::new(),
+        request_validators: Vec::new(),
+        models: Vec::new(),
         warnings: Vec::new(),
     };
 
@@ -1076,6 +1232,15 @@ fn read_definition(document: &Node, scope: &ImportScope) -> Result<ImportedDefin
     // rather than per operation ([`DocumentSecurity`]).
     let document_security = DocumentSecurity::of(document, &sigv4_schemes);
 
+    // The REQUEST VALIDATORS the document's own extension declares, and the SCHEMAS it
+    // names: each is a record of the api rather than of one of its paths, so both are read
+    // once here, and what the operations below reference is named out of them
+    // ([`DocumentReferences`]).
+    definition.request_validators = imported_request_validators(document);
+    definition.models = imported_models(document);
+    let references =
+        DocumentReferences::of(document, &definition.request_validators, &definition.models);
+
     // `paths` is optional from OpenAPI 3.1 on, and a document without it describes an
     // API with no resources rather than a malformed definition.
     let Some(paths) = document.member("paths") else {
@@ -1105,6 +1270,7 @@ fn read_definition(document: &Node, scope: &ImportScope) -> Result<ImportedDefin
                     declared,
                     path,
                     &document_security,
+                    &references,
                     scope,
                     &mut definition.warnings,
                 ));
@@ -1185,6 +1351,161 @@ fn imported_gateway_responses(
         );
     }
     responses
+}
+
+/// The request validators [`REQUEST_VALIDATORS_EXTENSION`] declares, in document order: one
+/// per entry of that mapping, named by the entry's key and carrying the two flags the entry
+/// declares.
+///
+/// Both flags are `RequestValidator`'s own, each `@default false`
+/// (`smithy_query(query="shape", shape="RequestValidator")`), so an entry that declares
+/// neither is a validator that checks nothing — which is a validator API Gateway creates and
+/// a method may name, and not something an import invents a value for. An entry whose value
+/// is not a mapping declares no flags and is read the same way.
+fn imported_request_validators(document: &Node) -> Vec<ImportedRequestValidator> {
+    document
+        .member(REQUEST_VALIDATORS_EXTENSION)
+        .and_then(Node::entries)
+        .unwrap_or_default()
+        .iter()
+        .map(|(name, declared)| ImportedRequestValidator {
+            name: name.clone(),
+            validate_request_body: declares_flag(declared, VALIDATE_REQUEST_BODY),
+            validate_request_parameters: declares_flag(declared, VALIDATE_REQUEST_PARAMETERS),
+        })
+        .collect()
+}
+
+/// Whether `node` declares the boolean member `key` as true.
+///
+/// A definition's scalars are read as the text they were written in ([`Node`]), so a flag is
+/// read off that text — case-insensitively, because the two spellings a definition may be
+/// written in differ in it: JSON writes a boolean `true`, and YAML's core schema resolves
+/// `True` and `TRUE` to the same value.
+fn declares_flag(node: &Node, key: &str) -> bool {
+    node.string_member(key)
+        .is_some_and(|declared| declared.eq_ignore_ascii_case(DECLARED_TRUE))
+}
+
+/// The `Model` records the schemas a definition NAMES become, in document order.
+///
+/// A model is "the data structure of a transferred payload" (`Model`) and it is addressed BY
+/// NAME, so what becomes one is a schema the document itself names: an entry of Swagger 2.0's
+/// `definitions` or of OpenAPI 3's `components.schemas`. A schema written INLINE in an
+/// operation's body names nothing, so there is no name for a model of it to be stored under —
+/// the method keeps the body it declares and names no model for that media type.
+///
+/// The schema is carried over as the JSON document it was declared as ([`Node::json`]), which
+/// is what `Model$schema` holds — "the schema for the model. For application/json models,
+/// this should be JSON schema draft 4 model" — and the media type it describes a payload of is
+/// the JSON one those schemas type.
+fn imported_models(document: &Node) -> Vec<ImportedModel> {
+    declared_schemas(document)
+        .into_iter()
+        .map(|(name, schema)| ImportedModel {
+            name,
+            content_type: DEFAULT_BODY_MEDIA_TYPE.to_string(),
+            schema: schema.json().to_string(),
+        })
+        .collect()
+}
+
+/// The schemas a definition NAMES, in document order: Swagger 2.0's `definitions`, or OpenAPI
+/// 3's `components.schemas`.
+fn declared_schemas(document: &Node) -> Vec<(String, &Node)> {
+    document
+        .member(DEFINITIONS_KEY)
+        .or_else(|| {
+            document
+                .member("components")
+                .and_then(|components| components.member(COMPONENT_SCHEMAS_KEY))
+        })
+        .and_then(Node::entries)
+        .unwrap_or_default()
+        .iter()
+        .map(|(name, schema)| (name.clone(), schema))
+        .collect()
+}
+
+/// What the DOCUMENT says about the records its operations REFERENCE, read ONCE for the whole
+/// document: which request validator an operation is imported under, which names a body's
+/// schema reference may resolve to, and the media types a schema written without one is
+/// declared for.
+///
+/// Read here rather than per operation for the reason [`DocumentSecurity`] gives: each of
+/// these is one value of the document, and resolving it per operation would walk a
+/// caller-sized part of the document once per operation. The names are SETS, so a reference
+/// is answered by one lookup.
+///
+/// `pub` because [`imported_method`] takes one, as the operation's own reader of what the
+/// document says; every member of it stays private to this module.
+#[derive(Debug, Default)]
+pub struct DocumentReferences {
+    /// The name [`REQUEST_VALIDATOR_EXTENSION`] selects at the document root: the validator
+    /// every operation that overrides it with none is imported under.
+    request_validator: Option<String>,
+    /// The names of the validators the document declares, which is what a selector may name.
+    validators: BTreeSet<String>,
+    /// The names of the schemas the document declares, which is what a body's reference may
+    /// name.
+    models: BTreeSet<String>,
+    /// The first media type the document `consumes`, which a bare Swagger 2.0 request
+    /// `schema` is declared for.
+    consumed: Option<String>,
+    /// The first media type the document `produces`; see [`Self::consumed`].
+    produced: Option<String>,
+}
+
+impl DocumentReferences {
+    /// What `document` references, against the validators and models this import creates for
+    /// it.
+    fn of(
+        document: &Node,
+        validators: &[ImportedRequestValidator],
+        models: &[ImportedModel],
+    ) -> Self {
+        Self {
+            request_validator: document.string_member(REQUEST_VALIDATOR_EXTENSION),
+            validators: validators
+                .iter()
+                .map(|declared| declared.name.clone())
+                .collect(),
+            models: models.iter().map(|model| model.name.clone()).collect(),
+            consumed: first_media_type(document, "consumes"),
+            produced: first_media_type(document, "produces"),
+        }
+    }
+
+    /// The NAME of the request validator in force for `operation`: the one the operation
+    /// selects for itself, else the document's own — and `None` when neither selects one the
+    /// document DECLARES.
+    ///
+    /// An operation's own selector overrides the document's rather than falling back to it,
+    /// which is what overriding one means. A selector naming no declared entry names no
+    /// validator of the api, so the method is imported naming none: that is the same thing a
+    /// method whose `requestValidatorId` resolves to nothing is validated by
+    /// (`crate::service::invoke::declared_validator`), and refusing the import for it would
+    /// refuse a definition AWS imports.
+    fn request_validator_of(&self, operation: &Node) -> Option<String> {
+        let selected = match operation.string_member(REQUEST_VALIDATOR_EXTENSION) {
+            Some(declared) => declared,
+            None => self.request_validator.clone()?,
+        };
+        self.validators.contains(&selected).then_some(selected)
+    }
+
+    /// The MODEL a declared schema names, or `None` for a schema that names none: an inline
+    /// schema, or a reference to something the document does not declare — which
+    /// [`model_reference_warnings`] already reports.
+    ///
+    /// A `$ref` is a JSON Pointer into the document and the schemas it may name are keyed by
+    /// their own name ([`declared_schemas`]), so the model it names is the pointer's last
+    /// token.
+    fn referenced_model(&self, schema: &Node) -> Option<String> {
+        let reference = schema.member(REFERENCE_KEY).and_then(Node::text)?;
+        let name = reference.rsplit('/').next()?;
+        self.models.contains(name).then(|| name.to_string())
+    }
 }
 
 /// The refusal a definition import answers when the caller asked it to roll back on a
@@ -1420,14 +1741,39 @@ fn declared_body_schemas<'d>(
     consumed: Option<&str>,
     produced: Option<&str>,
 ) -> Vec<(String, &'d Node)> {
-    let media_type = |key: &str, document: Option<&str>| -> String {
-        first_media_type(operation, key)
-            .or_else(|| document.map(str::to_string))
-            .unwrap_or_else(|| DEFAULT_BODY_MEDIA_TYPE.to_string())
-    };
+    let mut declared = request_body_schemas(operation, consumed);
+    // The media type a RESPONSE's bare schema is declared for is what the OPERATION
+    // produces, failing that what the document does: resolved once here, so reading an
+    // operation costs what that operation declares.
+    let produced = body_media_type(operation, "produces", produced);
+    for (_, response) in operation
+        .member("responses")
+        .and_then(Node::entries)
+        .unwrap_or_default()
+    {
+        declared.extend(response_body_schemas(response, Some(produced.as_str())));
+    }
+    declared
+}
+
+/// The media type a body of `operation` written with no media type of its own is declared
+/// for: what the operation itself declares under `key` (`consumes`, `produces`), failing that
+/// what the DOCUMENT declares (resolved once by the caller), failing that
+/// [`DEFAULT_BODY_MEDIA_TYPE`].
+fn body_media_type(operation: &Node, key: &str, document: Option<&str>) -> String {
+    first_media_type(operation, key)
+        .or_else(|| document.map(str::to_string))
+        .unwrap_or_else(|| DEFAULT_BODY_MEDIA_TYPE.to_string())
+}
+
+/// The schemas `operation` declares for its own REQUEST payload, each beside the media type
+/// it is declared for: OpenAPI 3's `requestBody.content`, keyed by media type, and Swagger
+/// 2.0's `body` parameter, whose media type is what the operation or the document `consumes`.
+fn request_body_schemas<'d>(
+    operation: &'d Node,
+    consumed: Option<&str>,
+) -> Vec<(String, &'d Node)> {
     let mut declared = Vec::new();
-    // The request payload: OpenAPI 3's `requestBody.content`, then Swagger 2.0's `body`
-    // parameter.
     if let Some(content) = operation
         .member("requestBody")
         .and_then(|body| body.member("content"))
@@ -1446,26 +1792,41 @@ fn declared_body_schemas<'d>(
     {
         if parameter.string_member("in").as_deref() == Some("body") {
             if let Some(schema) = parameter.member("schema") {
-                declared.push((media_type("consumes", consumed), schema));
+                declared.push((
+                    body_media_type(operation, "consumes", consumed),
+                    schema,
+                ));
             }
         }
     }
-    // Each response: the same two spellings.
-    for (_, response) in operation
-        .member("responses")
-        .and_then(Node::entries)
-        .unwrap_or_default()
-    {
-        if let Some(content) = response.member("content").and_then(Node::entries) {
-            for (keyed, schema) in content {
-                if let Some(schema) = schema.member("schema") {
-                    declared.push((keyed.clone(), schema));
-                }
+    declared
+}
+
+/// The schemas one RESPONSE of an operation declares, each beside the media type it is
+/// declared for — the two spellings [`request_body_schemas`] reads, on the response side.
+///
+/// The operation-level `produces` is not read here: a response's own bare `schema` is
+/// declared for what the OPERATION produces, which the caller resolved once and passes as
+/// `produced`.
+fn response_body_schemas<'d>(
+    response: &'d Node,
+    produced: Option<&str>,
+) -> Vec<(String, &'d Node)> {
+    let mut declared = Vec::new();
+    if let Some(content) = response.member("content").and_then(Node::entries) {
+        for (keyed, schema) in content {
+            if let Some(schema) = schema.member("schema") {
+                declared.push((keyed.clone(), schema));
             }
         }
-        if let Some(schema) = response.member("schema") {
-            declared.push((media_type("produces", produced), schema));
-        }
+    }
+    if let Some(schema) = response.member("schema") {
+        declared.push((
+            produced
+                .map(str::to_string)
+                .unwrap_or_else(|| DEFAULT_BODY_MEDIA_TYPE.to_string()),
+            schema,
+        ));
     }
     declared
 }
@@ -1512,18 +1873,25 @@ const REQUEST_PARAMETER_SECTIONS: &[(&str, &str)] = &[
 ///
 /// Everything of an OpenAPI operation object that a `Method` has a member for is carried
 /// over: its `operationId`, the `parameters` it declares as request parameters, the
-/// `responses` it declares as method responses, and API Gateway's own integration
-/// extension as the method's integration. What the import cannot carry over is reported
-/// in `warnings`.
+/// `responses` it declares as method responses, the MODELS its declared bodies name, the
+/// request validator in force for it, and API Gateway's own integration extension as the
+/// method's integration. What the import cannot carry over is reported in `warnings`.
 ///
 /// `security` is what the DOCUMENT says about the authorization of its operations, read once
 /// for the whole document ([`DocumentSecurity`]), which an operation that states no
-/// requirement of its own is imported under.
+/// requirement of its own is imported under; `references` is what it says about the records
+/// its operations reference ([`DocumentReferences`]) — the validator and the models an
+/// operation that names none of its own is imported with.
+///
+/// `requestValidatorId` carries the validator's NAME rather than its id: the record is named
+/// by the id this import mints for the entry of that name, which only the materialisation
+/// holds ([`ImportedPath::methods`]).
 pub fn imported_method(
     verb: &str,
     operation: &Node,
     path: &str,
     security: &DocumentSecurity,
+    references: &DocumentReferences,
     scope: &ImportScope,
     warnings: &mut Vec<String>,
 ) -> MethodEntry {
@@ -1534,12 +1902,14 @@ pub fn imported_method(
         api_key_required: false,
         operation_name: operation.string_member("operationId"),
         request_parameters: imported_request_parameters(operation),
-        // A request model names a `Model` resource, which nothing in this emulator
-        // creates yet, so an operation's request body has no model to be stored under.
-        request_models: BTreeMap::new(),
-        request_validator_id: None,
+        // "A key-value map specifying data schemas, specified as the request body for the
+        // method. A key is a content type and the value is a `Model` name"
+        // (`Method$requestModels`): the model a declared body names, for each media type the
+        // operation declares one for.
+        request_models: imported_request_models(operation, references),
+        request_validator_id: references.request_validator_of(operation),
         authorization_scopes: Vec::new(),
-        method_responses: imported_method_responses(operation),
+        method_responses: imported_method_responses(operation, references),
         integration: None,
     };
 
@@ -1616,14 +1986,43 @@ fn imported_request_parameters(operation: &Node) -> BTreeMap<String, bool> {
     parameters
 }
 
+/// The MODELS an operation's declared REQUEST body names, keyed by the media type each is
+/// declared for — `Method$requestModels`, "a key-value map specifying data schemas …  a key
+/// is a content type and the value is a `Model` name".
+///
+/// A model is named by a REFERENCE to a schema the document declares
+/// ([`DocumentReferences::referenced_model`]): a body whose schema is written inline names
+/// none, so the method maps no model for that media type and the method's own request
+/// validator has nothing to validate that body against.
+fn imported_request_models(
+    operation: &Node,
+    references: &DocumentReferences,
+) -> BTreeMap<String, String> {
+    let mut models = BTreeMap::new();
+    for (media_type, schema) in request_body_schemas(operation, references.consumed.as_deref()) {
+        if let Some(name) = references.referenced_model(schema) {
+            models.insert(media_type, name);
+        }
+    }
+    models
+}
+
 /// The method responses an operation's `responses` become, keyed by status code.
 ///
 /// A response's declared headers become the response parameters the method may map onto,
-/// named by the `method.response.header.<name>` mapping expression. A key that is not a
+/// named by the `method.response.header.<name>` mapping expression, and the model a declared
+/// response body names becomes the `responseModels` entry for its media type — the response
+/// side of [`imported_request_models`]. A key that is not a
 /// status code (`default`, a vendor extension) describes no method response: a
 /// `MethodResponse` is addressed BY its status code, so there is nothing for such an
 /// entry to be stored under.
-fn imported_method_responses(operation: &Node) -> BTreeMap<String, GetMethodResponseOutput> {
+fn imported_method_responses(
+    operation: &Node,
+    references: &DocumentReferences,
+) -> BTreeMap<String, GetMethodResponseOutput> {
+    // The media type a bare response schema is declared for is what the OPERATION produces,
+    // failing that what the document does: read once for the operation.
+    let produced = body_media_type(operation, "produces", references.produced.as_deref());
     let mut responses = BTreeMap::new();
     for (code, response) in operation
         .member("responses")
@@ -1640,14 +2039,24 @@ fn imported_method_responses(operation: &Node) -> BTreeMap<String, GetMethodResp
             .iter()
             .map(|(name, _)| (format!("method.response.header.{name}"), false))
             .collect();
+        let models: ::std::collections::HashMap<String, String> =
+            response_body_schemas(response, Some(produced.as_str()))
+                .into_iter()
+                .filter_map(|(media_type, schema)| {
+                    references
+                        .referenced_model(schema)
+                        .map(|name| (media_type, name))
+                })
+                .collect();
         responses.insert(
             code.clone(),
             GetMethodResponseOutput {
                 status_code: Some(code.clone()),
                 response_parameters: crate::state::non_empty_map(Some(headers)),
-                // A response model names a `Model` resource, which nothing in this
-                // emulator creates yet.
-                response_models: None,
+                // "Specifies the `Model` resources used for the response's content-type"
+                // (`MethodResponse$responseModels`): the model this response's own declared
+                // body names, for each media type it declares one for.
+                response_models: crate::state::non_empty_map(Some(models)),
             },
         );
     }
@@ -1943,16 +2352,17 @@ fn unresolved_references(document: &Node) -> Vec<String> {
         unresolved: Vec::new(),
         budget: MAX_DEFINITION_REFERENCES,
     };
-    walk.visit(document);
+    walk.visit(document, 1);
     walk.unresolved
 }
 
 /// [`unresolved_references`]' walk over a parsed definition.
 ///
 /// Every step is bounded: a reference is resolved at most once (`resolved` answers a
-/// repeat), at most [`MAX_DEFINITION_REFERENCES`] resolutions happen per document, and the
-/// walk ends as soon as it holds as many unresolved references as an import can report —
-/// finding more than a response can carry is work no caller sees.
+/// repeat), at most [`MAX_DEFINITION_REFERENCES`] resolutions happen per document, the walk
+/// descends at most [`MAX_DEFINITION_DEPTH`] levels, and it ends as soon as it holds as many
+/// unresolved references as an import can report — finding more than a response can carry is
+/// work no caller sees.
 struct ReferenceWalk<'a> {
     /// The whole document, which every reference is resolved against.
     document: &'a Node,
@@ -1972,8 +2382,15 @@ impl ReferenceWalk<'_> {
     }
 
     /// Resolve every reference `node` carries, and then those of the nodes under it.
-    fn visit(&mut self, node: &Node) {
-        if self.exhausted() {
+    ///
+    /// `depth` is this node's nesting level, which bounds the recursion explicitly: the walk
+    /// does not descend past [`MAX_DEFINITION_DEPTH`]. A parsed definition never nests that
+    /// deeply — one that does is refused before anything reads it
+    /// ([`bound_definition_nodes`], [`DefinitionBuilder::open_frame`]) — and the bound is
+    /// written here anyway, because the stack is the one resource a tree walk consumes that
+    /// no later check can give back.
+    fn visit(&mut self, node: &Node, depth: usize) {
+        if self.exhausted() || depth > MAX_DEFINITION_DEPTH {
             return;
         }
         match node {
@@ -1984,7 +2401,7 @@ impl ReferenceWalk<'_> {
                             self.inspect(reference);
                         }
                     }
-                    self.visit(value);
+                    self.visit(value, depth + 1);
                     if self.exhausted() {
                         return;
                     }
@@ -1992,7 +2409,7 @@ impl ReferenceWalk<'_> {
             }
             Node::Sequence(items) => {
                 for item in items {
-                    self.visit(item);
+                    self.visit(item, depth + 1);
                     if self.exhausted() {
                         return;
                     }
@@ -2090,14 +2507,68 @@ pub fn plan_resources(
     Ok(planned)
 }
 
-/// Materialise `definition`'s resource tree into `api`: insert every resource `planned`
-/// names under the id and creation rank reserved for it, then put every operation the
-/// definition declares on a path as a `Method` on that path's resource.
+/// The ids and creation ranks an import reserved from the store for the records it creates.
+///
+/// Reserved in ONE pass over the store, before the api is borrowed for writing, exactly as
+/// each creating operation draws its own: the resources at the width a record held INSIDE an
+/// api carries ([`crate::state::ComAmazonawsApigatewayBackplanecontrolserviceState::reserve_sub_resource_ids`]),
+/// and the validators and models from the store's own minter, the way
+/// `CreateRequestValidator` and `CreateModel` mint one. One creation rank per record, so the
+/// imported records are listed in the order the definition declares them.
+///
+/// Shared by the two operations that import a definition, so neither can reserve what the
+/// materialisation does not then use.
+#[derive(Debug, Default)]
+pub struct ReservedIds {
+    /// One id per planned resource, in the plan's order.
+    pub resources: Vec<String>,
+    /// One creation rank per planned resource, in the plan's order.
+    pub resource_sequences: Vec<u64>,
+    /// One `(id, creation rank)` per declared request validator, in document order.
+    pub request_validators: Vec<(String, u64)>,
+    /// One `(id, creation rank)` per declared model, in document order.
+    pub models: Vec<(String, u64)>,
+}
+
+impl ReservedIds {
+    /// Reserve what `definition` needs to be materialised into an api that is to hold
+    /// `planned` new resources.
+    pub fn of(
+        definition: &ImportedDefinition,
+        planned: usize,
+        store: &mut crate::state::ComAmazonawsApigatewayBackplanecontrolserviceState,
+    ) -> Self {
+        Self {
+            resources: store.reserve_sub_resource_ids(planned),
+            resource_sequences: (0..planned).map(|_| store.next_sequence()).collect(),
+            request_validators: definition
+                .request_validators
+                .iter()
+                .map(|_| (store.mint_id(), store.next_sequence()))
+                .collect(),
+            models: definition
+                .models
+                .iter()
+                .map(|_| (store.mint_id(), store.next_sequence()))
+                .collect(),
+        }
+    }
+}
+
+/// Materialise `definition` into `api`: the `RequestValidator` and `Model` records it
+/// declares, every resource `planned` names under the id and creation rank reserved for it,
+/// and then every operation the definition declares on a path as a `Method` on that path's
+/// resource.
 ///
 /// The imported definition wins over what a path already carried, which is what an
-/// import means for a path the definition declares. `ids` and `sequences` are reserved
-/// from the store before it is mutated — one per planned resource, in the plan's order —
-/// so the imported resources are listed in the order the definition declares them.
+/// import means for a path the definition declares. `reserved` holds the ids and creation
+/// ranks drawn from the store before it was mutated ([`ReservedIds`]), so the imported
+/// records are listed in the order the definition declares them.
+///
+/// A validator or a model the api ALREADY holds under the declared name keeps its own id and
+/// creation rank: both are addressed by a name the document chose, so re-importing a
+/// definition restates what that name means rather than leaving a second record behind under
+/// a new id.
 ///
 /// Shared by the two operations that import a definition, so the tree `ImportRestApi`
 /// builds for a document and the tree `PutRestApi` builds for the same document are the
@@ -2106,17 +2577,74 @@ pub fn materialise_definition(
     api: &mut RestApiEntry,
     definition: &ImportedDefinition,
     planned: &[PlannedResource],
-    ids: &[String],
-    sequences: &[u64],
+    reserved: &ReservedIds,
 ) -> Result<(), Inconsistent> {
+    // The api's own id, read before the records below are borrowed for writing: a model's
+    // schema names a sibling model by the URL that api's schema resource carries.
+    let api_id = api.id.clone();
+    // The `RequestValidator` records [`REQUEST_VALIDATORS_EXTENSION`] declares: one per
+    // entry, carrying the entry's own name and flags, and keyed — as every stored validator
+    // is — by its minted id, which is what a method's `requestValidatorId` names.
+    let mut validator_ids: BTreeMap<String, String> = BTreeMap::new();
+    for (index, declared) in definition.request_validators.iter().enumerate() {
+        let (minted, next_rank) = reserved
+            .request_validators
+            .get(index)
+            .ok_or(Inconsistent)?
+            .clone();
+        let held = api
+            .request_validators
+            .values()
+            .find(|held| held.name.as_deref() == Some(declared.name.as_str()))
+            .map(|held| (held.id.clone(), held.sequence));
+        let (id, sequence) = held.unwrap_or((minted, next_rank));
+        validator_ids.insert(declared.name.clone(), id.clone());
+        api.request_validators.insert(
+            id.clone(),
+            crate::state::RequestValidatorEntry {
+                id,
+                name: Some(declared.name.clone()),
+                validate_request_body: declared.validate_request_body,
+                validate_request_parameters: declared.validate_request_parameters,
+                sequence,
+            },
+        );
+    }
+    // The `Model` records the schemas the definition NAMES become, keyed by that name as
+    // every stored model is.
+    for (index, declared) in definition.models.iter().enumerate() {
+        let (minted, next_rank) = reserved.models.get(index).ok_or(Inconsistent)?.clone();
+        let held = api
+            .models
+            .get(&declared.name)
+            .map(|held| (held.id.clone(), held.sequence));
+        let (id, sequence) = held.unwrap_or((minted, next_rank));
+        api.models.insert(
+            declared.name.clone(),
+            crate::state::ModelEntry {
+                id,
+                name: declared.name.clone(),
+                // `CreateModel$description` is optional and a schema the document names
+                // carries no description of its own, so the stored model reports none
+                // rather than one invented for it.
+                description: None,
+                content_type: declared.content_type.clone(),
+                schema: Some(model_schema_references_resolved(&declared.schema, &api_id)),
+                sequence,
+            },
+        );
+    }
     let mut by_path: BTreeMap<String, String> = api
         .resources
         .values()
         .map(|resource| (resource.path.clone(), resource.id.clone()))
         .collect();
     for (index, resource) in planned.iter().enumerate() {
-        let id = ids.get(index).ok_or(Inconsistent)?.clone();
-        let sequence = *sequences.get(index).ok_or(Inconsistent)?;
+        let id = reserved.resources.get(index).ok_or(Inconsistent)?.clone();
+        let sequence = *reserved
+            .resource_sequences
+            .get(index)
+            .ok_or(Inconsistent)?;
         // A path is planned only after every one of its ancestors, so the parent is in
         // the API or in what this loop has already inserted.
         let parent_id = by_path
@@ -2149,6 +2677,12 @@ pub fn materialise_definition(
             .ok_or(Inconsistent)?;
         for method in &imported.methods {
             let mut method = method.clone();
+            // The validator the document NAMED for this method, as the id the record it
+            // became is held under ([`ImportedPath::methods`]).
+            method.request_validator_id = method
+                .request_validator_id
+                .as_deref()
+                .and_then(|name| validator_ids.get(name).cloned());
             if let Some(integration) = &mut method.integration {
                 // The one member of an imported integration that depends on where the
                 // method landed: "By default, API Gateway uses the resource ID as the
@@ -2170,6 +2704,35 @@ pub fn materialise_definition(
             .insert(response_type.clone(), response.clone());
     }
     Ok(())
+}
+
+/// `schema` with every reference to a SIBLING schema of the document rewritten onto the model
+/// of the api that schema became.
+///
+/// A stored `Model`'s schema is a JSON Schema resource identified by the api's own model-schema
+/// URL (`crate::service::invoke::model_schema_url`), which is the identifier a reference from
+/// another model of that api resolves against — so a reference the DOCUMENT wrote as a pointer
+/// into itself (`#/definitions/{name}`, `#/components/schemas/{name}`) names the model of that
+/// name once the document's schemas are stored one per model.
+///
+/// Rewritten on the stored text, which is the JSON the schema was declared as, and ANCHORED to
+/// the start of a JSON string: a reference is the whole value of the member that carries it, so
+/// the pointer is matched with its opening quote and text that merely CONTAINS the pointer's
+/// spelling (a description, an enumerated value) is left as the document wrote it.
+fn model_schema_references_resolved(schema: &str, api_id: &str) -> String {
+    // The URL prefix every model of this api is identified under: the schema resource of the
+    // model named by what follows the pointer's last `/`.
+    let models = format!("\"{}", crate::service::invoke::model_schema_url(api_id, ""));
+    let mut resolved = schema.to_string();
+    for pointer in [
+        format!("\"#/{DEFINITIONS_KEY}/"),
+        format!("\"#/components/{COMPONENT_SCHEMAS_KEY}/"),
+    ] {
+        if resolved.contains(&pointer) {
+            resolved = resolved.replace(&pointer, &models);
+        }
+    }
+    resolved
 }
 
 /// Refuse a definition whose paths, or the operations on them, would grow the store past a
@@ -2208,6 +2771,31 @@ pub fn bound_definition(definition: &ImportedDefinition) -> Result<(), String> {
         definition.paths.len(),
         crate::state::MAX_RESOURCES_PER_API,
     )?;
+    // The records the definition's own extensions declare, bounded exactly as the operations
+    // that create one bound it: a validator's name as `CreateRequestValidator` bounds it, a
+    // model's name and schema as `CreateModel` does, and each set by the per-API quota.
+    bound_entries(
+        REQUEST_VALIDATORS_EXTENSION,
+        definition.request_validators.len(),
+        crate::state::MAX_REQUEST_VALIDATORS_PER_API,
+    )?;
+    for validator in &definition.request_validators {
+        bound_chars("name", &validator.name, MAX_STRING_CHARS)?;
+    }
+    bound_entries(
+        "the schemas of the API definition",
+        definition.models.len(),
+        crate::state::MAX_MODELS_PER_API,
+    )?;
+    for model in &definition.models {
+        bound_chars("name", &model.name, MAX_STRING_CHARS)?;
+        bound_chars("contentType", &model.content_type, MAX_STRING_CHARS)?;
+        bound_chars(
+            "schema",
+            &model.schema,
+            super::create_model::MAX_MODEL_SCHEMA_CHARS,
+        )?;
+    }
     // A gateway response is keyed by a `responseType` the model declares as an enum, so
     // their COUNT needs no cap of its own; what a caller sizes is each one's two maps.
     for response in definition.gateway_responses.values() {
@@ -2597,12 +3185,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // One id and one creation rank per resource the import creates, so the imported
-        // resources are listed in the order the definition declares them.
-        let ids = store.reserve_sub_resource_ids(planned.len());
-        let sequences: Vec<u64> = (0..planned.len())
-            .map(|_| store.next_sequence())
-            .collect();
+        // One id and one creation rank per record the import creates, so the imported
+        // records are listed in the order the definition declares them.
+        let reserved = ReservedIds::of(&definition, planned.len(), &mut store);
 
         let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {
             PutRestApiErrorModeled::NotFoundException(NotFoundException {
@@ -2624,12 +3209,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // response type this document says nothing about goes back to the response
             // API Gateway generates for it.
             api.gateway_responses.clear();
+            // Nor the request validators it declared: a validator is a record the
+            // definition's own extension creates, so one this document does not declare is
+            // not part of the definition the api now holds. The MODELS are not cleared with
+            // them: an api is never empty of models — every one holds the two API Gateway
+            // seeds it with — and a model is addressed by name, so a name this document
+            // declares restates that name and one it does not say nothing about.
+            api.request_validators.clear();
         }
 
-        // The planned resources, and then every operation the definition puts on a path
-        // as a method on that path's resource. One id and one rank was reserved per
-        // planned resource, so the materialisation cannot be short of either.
-        materialise_definition(api, &definition, &planned, &ids, &sequences)
+        // The planned resources, the records the definition's extensions declare, and then
+        // every operation the definition puts on a path as a method on that path's
+        // resource. One id and one rank was reserved per record, so the materialisation
+        // cannot be short of either.
+        materialise_definition(api, &definition, &planned, &reserved)
             .map_err(|_| crate::state::state_unavailable())?;
 
         // The definition also describes the API itself: the `info` object is where an

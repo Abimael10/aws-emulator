@@ -143,7 +143,7 @@ use crate::state::{ResourceEntry, RestApiEntry};
 use super::create_rest_api::{API_STATUS_AVAILABLE, ROOT_RESOURCE_PATH};
 use super::put_rest_api::{
     bound_definition, materialise_definition, parse_definition, plan_resources, warnings_refusal,
-    ImportScope, ImportedDefinition,
+    ImportScope, ImportedDefinition, ReservedIds,
 };
 
 /// The `parameters` key that chooses the created API's endpoint type, from the member's
@@ -503,14 +503,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The API's own id and the id of the ROOT RESOURCE it is created with are minted
         // at the width a record of the account carries, as a created API reports them;
         // the resources the definition declares are records held inside the API, so their
-        // ids carry the narrower width. One creation rank for the API, and one per planned
-        // resource so the imported resources are listed in the order the definition
-        // declares them.
-        let resource_ids = store.reserve_sub_resource_ids(planned.len());
+        // ids carry the narrower width. One creation rank for the API, and one per record
+        // the definition declares, so the imported records are listed in the order the
+        // definition declares them.
+        let reserved = ReservedIds::of(&definition, planned.len(), &mut store);
         let id = store.mint_id();
         let root_resource_id = store.mint_id();
         let sequence = store.next_sequence();
-        let sequences: Vec<u64> = (0..planned.len()).map(|_| store.next_sequence()).collect();
 
         let mut resources = BTreeMap::new();
         resources.insert(
@@ -563,12 +562,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // API created from a request.
             stages: BTreeMap::new(),
             deployments: BTreeMap::new(),
-            // Nor with a documentation part, a documentation version, an authorizer or a
-            // request validator: each is written by the operation that owns it. An
-            // imported definition's schemas are left to the issue that owns importing
-            // them. The gateway responses the definition customizes ARE imported, by
-            // `materialise_definition` below, and the models every created API already
-            // holds are seeded after it.
+            // Nor with a documentation part, a documentation version or an authorizer:
+            // each is written by the operation that owns it. The REQUEST VALIDATORS and the
+            // MODELS the definition's own schemas and extension declare ARE imported, by
+            // `materialise_definition` below, as are the gateway responses the definition
+            // customizes; the models every created API already holds are seeded after it.
             gateway_responses: BTreeMap::new(),
             documentation_parts: BTreeMap::new(),
             documentation_versions: BTreeMap::new(),
@@ -578,17 +576,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             sequence,
         };
 
-        // The definition's resource tree, under the ids and ranks reserved for it. One of
-        // each was reserved per planned resource, so the materialisation cannot be short
-        // of either.
-        materialise_definition(
-            &mut entry,
-            &definition,
-            &planned,
-            &resource_ids,
-            &sequences,
-        )
-        .map_err(|_| crate::state::state_unavailable())?;
+        // The definition's resource tree, the records its extensions declare, and the
+        // methods on each path, under the ids and ranks reserved for them. One of each was
+        // reserved per record, so the materialisation cannot be short of either.
+        materialise_definition(&mut entry, &definition, &planned, &reserved)
+            .map_err(|_| crate::state::state_unavailable())?;
 
         // An imported API is an API Gateway REST API like any other, so it is created
         // with the same two default models — seeded after the definition has been

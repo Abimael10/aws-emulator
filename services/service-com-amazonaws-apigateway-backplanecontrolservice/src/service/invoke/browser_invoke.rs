@@ -291,8 +291,7 @@ fn served_by<'s>(resolved: &Resolved<'s, '_>, req: &RtRequest) -> Option<ServedB
         .stages
         .get(stage_name)
         .and_then(|stage| resolved.api.deployments.get(&stage.deployment_id))?;
-    let matched_path = match_resource_path(deployment, &resource_path)?;
-    let (verb, _) = match_method(deployment, matched_path, req.method())?;
+    let (matched_path, (verb, _)) = routed_method(deployment, &resource_path, req.method())?;
     let resource = deployment
         .resources
         .values()

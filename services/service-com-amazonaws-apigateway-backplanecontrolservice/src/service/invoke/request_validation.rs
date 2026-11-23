@@ -109,7 +109,13 @@ pub(super) fn missing_parameters(method: &MethodEntry, call: &MethodRequest) -> 
 /// The URL the model `model_name` of the API `api_id` is a JSON Schema resource under —
 /// the identifier API Gateway gives a model's schema, which is what a `$ref` from another
 /// model of the same API names.
-pub(super) fn model_schema_url(api_id: &str, model_name: &str) -> String {
+///
+/// `pub` because an OPENAPI IMPORT writes that identifier: a schema the document references
+/// by a pointer into itself is stored as a reference to the model that schema became
+/// (`crate::ops::put_rest_api`), so the import and this validator cannot spell one model's
+/// schema resource two ways.
+#[must_use]
+pub fn model_schema_url(api_id: &str, model_name: &str) -> String {
     format!("https://apigateway.amazonaws.com/restapis/{api_id}/models/{model_name}")
 }
 

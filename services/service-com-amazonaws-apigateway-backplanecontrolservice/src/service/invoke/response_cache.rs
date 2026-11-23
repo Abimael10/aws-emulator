@@ -246,7 +246,7 @@ pub(super) fn cache_key(
 /// The value each `{parameter}` segment of the matched resource path takes in the path this
 /// request addressed.
 ///
-/// A deployed resource path is matched by TEMPLATE ([`match_resource_path`]), so a
+/// A deployed resource path is matched by TEMPLATE ([`routed_method`]), so a
 /// `method.request.path.{name}` source names a `{name}` segment of that template and its
 /// value is the segment the REQUEST carried in that position; a greedy `{name+}` takes
 /// every remaining segment, which is what makes it greedy.
