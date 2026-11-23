@@ -35,6 +35,16 @@
 //! only the one-entry page the tables above read — has to report each element in
 //! full.
 //!
+//! Two further tables take the projection off a single untouched domain. One
+//! holds several domains in ONE emulator, where an element's identity has to be
+//! the listed template's own: its ARN is scoped to the domain that holds it, the
+//! listing reports that domain's templates and no other's, and the identity it
+//! reports reaches the template there and nowhere else. The other changes the
+//! SET a domain holds between listings — deleting the first, a middle and the
+//! last element, and creating one after each — so what an element reports
+//! depends on the stored record and not on its position or on the set having
+//! been left alone.
+//!
 //! The suite closes on what the projection is FOR: a listing entry is
 //! self-describing, so the last table walks the whole list-then-use chain a
 //! client performs with the identity an entry reported and nothing else — the
@@ -54,8 +64,8 @@ use service_com_amazonaws_connectcases_amazonconnectcases::state::MAX_PAGE_SIZE;
 // the tagging calls and the case create and read this suite consumes a listed
 // identity through among them, rather than a copy of its own.
 use crate::harness::{
-    case_template, create_case, domain, is_minted_id, listed_tags, string_at, tag_resource,
-    Emulator,
+    case_template, create_case, domain, is_minted_id, listed_tags, refused_as_not_found, string_at,
+    tag_resource, Emulator,
 };
 use crate::template_update::text_field;
 
@@ -911,6 +921,284 @@ async fn every_page_of_a_cut_listing_carries_the_full_projection() {
                  {gathered:?}"
             ),
         }
+    }
+}
+
+/// One template a listing has to report, as the create that stored it reported
+/// it: the identity it minted, and the members the summary must project from the
+/// stored record.
+struct Created {
+    template_id: String,
+    arn: String,
+    name: String,
+    status: String,
+    tag_propagation_configurations: Vec<Value>,
+}
+
+/// Create the templates of `rows` in `domain_id`, named off `prefix`.
+async fn create_each(
+    emulator: &Emulator,
+    domain_id: &str,
+    prefix: &str,
+    rows: &[Row],
+) -> Vec<Created> {
+    let mut created = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        let name = format!("{prefix}-{index:03}");
+        let case = format!("create {name}");
+        let (template_id, arn) = create(emulator, &case, domain_id, &name, row).await;
+        created.push(Created {
+            template_id,
+            arn,
+            name,
+            status: row.status.unwrap_or(TEMPLATE_ACTIVE).to_string(),
+            tag_propagation_configurations: row.tag_propagation_configurations.clone(),
+        });
+    }
+    created
+}
+
+/// Assert one gathered listing reports EXACTLY `created`, each element the full
+/// projection of the template it was created as — and that the identity the
+/// element reported is the one the create minted.
+fn assert_listing(
+    case: &str,
+    region: &str,
+    domain_id: &str,
+    gathered: &[Value],
+    created: &[Created],
+) {
+    assert_eq!(
+        gathered.len(),
+        created.len(),
+        "case {case:?}: the listing must report the {} template(s) the domain holds, got \
+         {gathered:?}",
+        created.len()
+    );
+    for template in created {
+        let element = format!("{case}, template {}", template.name);
+        let summary = summary_among(&element, gathered, &template.template_id);
+        assert_summary(
+            &element,
+            &summary,
+            &Stored {
+                region,
+                domain_id,
+                template_id: &template.template_id,
+                name: &template.name,
+                status: &template.status,
+                tag_propagation_configurations: &template.tag_propagation_configurations,
+            },
+        );
+        // The create and the listing report ONE identity for one template: a
+        // summary that minted an ARN of its own would differ here.
+        for member in ["arn", "templateArn"] {
+            let reported = string_at(&summary, member, &element);
+            assert_eq!(
+                reported, template.arn,
+                "case {element:?}: the summary's {member} must be the ARN the create reported \
+                 ({}), got {reported}",
+                template.arn
+            );
+        }
+    }
+    // Nothing else: an element the domain does not hold would be reported to a
+    // client as one of its templates.
+    let expected: BTreeSet<&str> = created
+        .iter()
+        .map(|template| template.template_id.as_str())
+        .collect();
+    let reported: BTreeSet<String> = gathered
+        .iter()
+        .map(|summary| string_at(summary, "id", case))
+        .collect();
+    for id in &reported {
+        assert!(
+            expected.contains(id.as_str()),
+            "case {case:?}: the listing may report only the domain's own templates \
+             ({expected:?}), got {reported:?}"
+        );
+    }
+}
+
+/// Assert `GetTemplate` for `template_id` in `domain_id` is the modelled 404,
+/// which is how a domain that does not hold a template answers for it. The
+/// status and `__type` assertion is the shared harness one.
+async fn template_not_found(
+    emulator: &Emulator,
+    case: &str,
+    domain_id: &str,
+    template_id: &str,
+) {
+    let path = format!("/domains/{domain_id}/templates/{template_id}");
+    let body = refused_as_not_found(emulator, case, "POST", &path, Some(json!({}))).await;
+    assert_eq!(
+        body.get("resourceId").and_then(Value::as_str),
+        Some(template_id),
+        "case {case:?}: the refusal must report the template {template_id} that {domain_id} does \
+         not hold, got {body:?}"
+    );
+}
+
+/// One emulator holds MANY domains, so the identity a page element reports has
+/// to be the listed template's own: a summary's ARN is scoped to the domain that
+/// holds the template, the listing reports that domain's templates and no
+/// other's, and the identity alone reaches the template there — and nowhere
+/// else.
+///
+/// The rows span how many templates a domain holds (one, a few, and the rest of
+/// this suite's table, so each domain's elements differ in tag-propagation shape
+/// and status) crossed with which domain of the one emulator holds them. A
+/// single-domain listing cannot tell a per-template ARN from a per-domain one;
+/// these rows can.
+#[tokio::test]
+async fn a_listing_projects_the_identity_of_the_domains_own_templates() {
+    // The region the caller signs for, which the ARN of every template below is
+    // scoped to.
+    const REGION: &str = "us-west-2";
+
+    let emulator = Emulator::in_region(REGION);
+    let table = rows();
+    // One domain per slice of the table: 1 template, 2, then the rest.
+    let slices: [(usize, usize); 3] = [(0, 1), (1, 3), (3, table.len())];
+
+    let mut domains: Vec<(String, Vec<Created>)> = Vec::new();
+    for (index, (from, to)) in slices.iter().enumerate() {
+        let domain_id = domain(&emulator, &format!("own-identity-domain-{index}")).await;
+        let created = create_each(
+            &emulator,
+            &domain_id,
+            &format!("own-identity-template-{index}"),
+            &table[*from..*to],
+        )
+        .await;
+        domains.push((domain_id, created));
+    }
+
+    for (index, (domain_id, created)) in domains.iter().enumerate() {
+        // Gathered one entry per page, so the projection is read on each page a
+        // client would have to follow.
+        let case = format!("domain {index} ({} template(s))", created.len());
+        let gathered =
+            summaries_page_by_page(&emulator, &case, domain_id, Some(1), created.len()).await;
+        assert_listing(&case, REGION, domain_id, &gathered, created);
+
+        // List-then-use across the emulator's domains: the identity a summary
+        // reported reaches the template in the domain the summary's ARN
+        // addresses, and that domain only.
+        for template in created {
+            let element = format!("{case}, template {}", template.name);
+            let summary = summary_among(&element, &gathered, &template.template_id);
+            let arn = string_at(&summary, "arn", &element);
+            let (addressed_domain, addressed_template) = identity_in(&element, &arn);
+            assert_eq!(
+                addressed_domain, *domain_id,
+                "case {element:?}: a summary's arn must address the domain that holds the \
+                 template ({domain_id}), got {arn}"
+            );
+            let record =
+                get_template(&emulator, &element, &addressed_domain, &addressed_template).await;
+            assert_eq!(
+                string_at(&record, "name", &element),
+                template.name,
+                "case {element:?}: the identity the summary reported must reach the template it \
+                 listed, got {record:?}"
+            );
+            for (other, _) in domains.iter().filter(|(other, _)| other != domain_id) {
+                template_not_found(&emulator, &element, other, &addressed_template).await;
+            }
+        }
+    }
+}
+
+/// Which element of the stored order a change takes out of the listing.
+#[derive(Debug, Clone, Copy)]
+enum Removed {
+    /// Nothing is deleted: the listing of the untouched set.
+    Nothing,
+    First,
+    Middle,
+    Last,
+}
+
+/// A listing reports the templates the domain holds NOW: a template deleted
+/// since the last listing is gone from the page, one created since is on it, and
+/// every element that remains is still the full projection of its stored
+/// template — identity under both names it is reported by, and the
+/// tag-propagation list present whatever it holds.
+///
+/// The rows are the set changes a listing has to follow: nothing deleted, the
+/// first element deleted, one in the middle deleted, the last deleted, and after
+/// each of them a template created — so no element's projection depends on its
+/// position in the stored order or on the set having been left untouched.
+#[tokio::test]
+async fn a_listing_projects_every_template_that_remains_after_the_set_changes() {
+    // The region the caller signs for, which the ARN of every template below is
+    // scoped to.
+    const REGION: &str = "eu-west-1";
+
+    let emulator = Emulator::in_region(REGION);
+    let domain_id = domain(&emulator, "changing-set-domain").await;
+    let table = rows();
+    let mut remaining = create_each(&emulator, &domain_id, "changing-set-template", &table).await;
+    // How many templates were ever created here, which is what the pages a
+    // traversal may hand out is bounded by, and what names an appended template
+    // apart from every earlier one.
+    let mut minted = remaining.len();
+
+    for change in [
+        Removed::Nothing,
+        Removed::First,
+        Removed::Middle,
+        Removed::Last,
+    ] {
+        let case = format!("deleted: {change:?}");
+        let index = match change {
+            Removed::Nothing => None,
+            Removed::First => Some(0),
+            Removed::Middle => Some(remaining.len() / 2),
+            Removed::Last => Some(remaining.len() - 1),
+        };
+        if let Some(index) = index {
+            let template = remaining.remove(index);
+            emulator
+                .ok(
+                    &case,
+                    "DELETE",
+                    &format!("/domains/{domain_id}/templates/{}", template.template_id),
+                    json!({}),
+                )
+                .await;
+            // The deleted template leaves the listing; the ones beside it stay.
+            let gathered = summaries_page_by_page(&emulator, &case, &domain_id, None, minted).await;
+            assert!(
+                gathered.iter().all(|summary| {
+                    summary.get("id").and_then(Value::as_str) != Some(&template.template_id)
+                }),
+                "case {case:?}: a deleted template must leave the listing, got {gathered:?}"
+            );
+        }
+
+        // What remains, each element in full, after the change.
+        let gathered = summaries_page_by_page(&emulator, &case, &domain_id, None, minted).await;
+        assert_listing(&case, REGION, &domain_id, &gathered, &remaining);
+
+        // And a template created after the change is projected the same way, on
+        // whatever page it lands.
+        let appended = format!("{case}, then a template created");
+        let row = &table[minted % table.len()];
+        let mut created = create_each(
+            &emulator,
+            &domain_id,
+            &format!("appended-template-{minted:03}"),
+            std::slice::from_ref(row),
+        )
+        .await;
+        minted += created.len();
+        remaining.append(&mut created);
+        let gathered =
+            summaries_page_by_page(&emulator, &appended, &domain_id, Some(2), minted).await;
+        assert_listing(&appended, REGION, &domain_id, &gathered, &remaining);
     }
 }
 

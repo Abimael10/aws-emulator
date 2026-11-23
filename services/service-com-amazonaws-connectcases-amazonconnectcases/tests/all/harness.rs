@@ -158,6 +158,30 @@ impl Emulator {
     }
 }
 
+/// Send a call that must be the modelled not-found refusal, and hand back its
+/// parsed body: the 404 status and the `ResourceNotFoundException` the model
+/// declares, as the wire reports it (`__type`).
+///
+/// The ONE place a suite asserts that pair, so a suite that goes on to check
+/// what the refusal reports about the resource — its `resourceType`,
+/// `resourceId` and sentence — starts from the same assertion as one that only
+/// needs the refusal itself.
+pub async fn refused_as_not_found(
+    emulator: &Emulator,
+    case: &str,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> Value {
+    let (status, response) = emulator.send(method, path, body).await;
+    assert_eq!(
+        (status, response.get("__type").and_then(Value::as_str)),
+        (404, Some("ResourceNotFoundException")),
+        "case {case:?}: expected 404 ResourceNotFoundException, got {status} {response:?}"
+    );
+    response
+}
+
 /// Percent-encode one request value, so it travels in the non-greedy `{arn}`
 /// label of `/tags/{arn}`, or as a query-string value: every byte outside the
 /// unreserved set is escaped, which both a path segment and a query value

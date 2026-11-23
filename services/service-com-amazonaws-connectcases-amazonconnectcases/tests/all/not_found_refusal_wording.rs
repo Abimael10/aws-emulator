@@ -21,7 +21,10 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{domain, field_of_type, fields_of_every_type, string_at, template, Emulator};
+use crate::harness::{
+    domain, field_of_type, fields_of_every_type, refused_as_not_found, string_at, template,
+    Emulator,
+};
 
 /// The service's generic not-found sentence, written out here rather than taken
 /// from the crate so the expectations are independent of the code under test.
@@ -60,7 +63,10 @@ struct Refusal<'a> {
 }
 
 /// Assert one call is the modelled 404 whose body reports `expected`.
-async fn refused_as_not_found(
+///
+/// The status and `__type` pair every not-found refusal carries is the shared
+/// harness assertion; what THIS suite is about is the body beside it.
+async fn refused_as(
     emulator: &Emulator,
     case: &str,
     method: &str,
@@ -73,12 +79,7 @@ async fn refused_as_not_found(
         resource_id,
         sentence,
     } = *expected;
-    let (status, response) = emulator.send(method, path, body).await;
-    assert_eq!(
-        (status, response.get("__type").and_then(Value::as_str)),
-        (404, Some("ResourceNotFoundException")),
-        "case {case:?}: expected 404 ResourceNotFoundException, got {status} {response:?}"
-    );
+    let response = refused_as_not_found(emulator, case, method, path, body).await;
     let reported = string_at(&response, "resourceType", case);
     assert_eq!(
         reported, resource_type,
@@ -216,7 +217,7 @@ async fn every_not_found_refusal_reports_the_lowercase_token_and_its_own_sentenc
     ];
 
     for (case, method, path, body, resource_type, resource_id, sentence) in rows {
-        refused_as_not_found(
+        refused_as(
             &emulator,
             case,
             method,
@@ -286,7 +287,7 @@ async fn the_create_case_domain_sentence_quotes_the_requested_domain_identifier(
 
     for (identifier_case, missing_domain) in &identifiers {
         let case = format!("CreateCase with {identifier_case}");
-        refused_as_not_found(
+        refused_as(
             &emulator,
             &case,
             "POST",
@@ -403,7 +404,7 @@ async fn a_case_refusal_is_worded_by_the_operation_that_raises_it() {
 
     for (id_case, case_id) in &ids {
         let read = format!("GetCase with {id_case}");
-        refused_as_not_found(
+        refused_as(
             &emulator,
             &read,
             "POST",
@@ -418,7 +419,7 @@ async fn a_case_refusal_is_worded_by_the_operation_that_raises_it() {
         .await;
 
         let associate = format!("CreateRelatedItem with {id_case}");
-        refused_as_not_found(
+        refused_as(
             &emulator,
             &associate,
             "POST",
