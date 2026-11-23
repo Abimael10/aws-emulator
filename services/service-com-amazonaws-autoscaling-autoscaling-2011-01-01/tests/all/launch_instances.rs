@@ -474,8 +474,8 @@ async fn a_launch_request_launches_instances_into_the_group() {
         );
         assert_eq!(
             tag_value(&body, "Message"),
-            "The parameters in the current request do not match the parameters from a previous \
-             request with the same client token",
+            "Different request parameters found in the last request used with the provided \
+             token name",
             "case {:?}: expected the fixed one-token-two-requests sentence, got {body}",
             row.case
         );

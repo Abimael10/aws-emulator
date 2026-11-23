@@ -375,12 +375,21 @@ async fn a_paginated_read_resolves_the_group_before_its_pagination_members() {
     // The controls, on a group that EXISTS: the cursor is still checked and still refused
     // naming the token submitted — never as an absent group — and a read carrying no
     // pagination member at all is still served.
+    //
+    // The page size travels with the cursor here because one of these reads
+    // (`DescribeLoadBalancers`) refuses a cursor sent WITHOUT one for that pair, ahead of
+    // reading the cursor at all (`refusal_classification_and_wording`), so stating it is what
+    // reaches the cursor check in every read.
     let held = "asg-paged";
     create_group(&router, held).await;
     let stale = "not-a-token-this-service-issued";
     for read in &reads {
         let case = format!("{} on the stored group {held:?}", read.action);
-        let mut params = vec![p("AutoScalingGroupName", held), p("NextToken", stale)];
+        let mut params = vec![
+            p("AutoScalingGroupName", held),
+            p("NextToken", stale),
+            p("MaxRecords", "1"),
+        ];
         params.extend(read.extra.iter().cloned());
         let (status, code, message) = answer(&router, read.action, &params).await;
         assert_eq!(

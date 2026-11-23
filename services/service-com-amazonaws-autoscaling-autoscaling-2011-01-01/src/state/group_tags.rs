@@ -197,11 +197,11 @@ impl TagWriteRefusal {
             // names no group: the absent-group refusal of this service with its detail
             // field unfilled, because there is no name to state in it.
             Self::NoResourceId => super::ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL.to_string(),
-            // The refusal class this service states for a request naming something an
-            // operation does not accept: what was named, and what is accepted.
+            // The refusal AWS states for a tag naming a kind of resource this service does
+            // not tag: what was named, and the one type that is accepted.
             Self::UnsupportedResourceType(resource_type) => format!(
-                "Resource type {resource_type} is not correct. Allowed Resource types are: \
-                 {GROUP_RESOURCE_TYPE}"
+                "Invalid resourceType: {resource_type}. Valid resource types are: \
+                 {GROUP_RESOURCE_TYPE} "
             ),
             // A group the account does not hold carries no tags, so the write is refused
             // with this service's absent-group refusal in the wording BOTH writers of a
@@ -215,12 +215,14 @@ impl TagWriteRefusal {
 
 /// The most tags ONE call that writes a group's tags may carry.
 ///
-/// How many tags one request may state is a fact of the REQUEST's shape, which is why this
-/// service's other batch writes carry the same kind of per-call bound
-/// (`MAX_INSTANCE_IDS_PER_CALL`, `MAX_TARGET_GROUPS_PER_CALL`) and refuse past it with the
-/// service-common `ValidationError` before the batch is looked at at all. A group carries
-/// at most [`MAX_TAGS_PER_GROUP`] tags, so a call stating more than that many is past every
-/// quota it could be applied against.
+/// A group carries at most [`MAX_TAGS_PER_GROUP`] tags, so a call stating more than that many
+/// is past every quota it could be applied against — which is why the two bounds are one
+/// number. A call that ASKS for more tags than that is refused under the quota the model
+/// declares the error for ([`too_many_tags_message`]); a call that only names that many tags
+/// to REMOVE grows no group, so it is refused as the per-call bound this service's other
+/// batch writes carry (`MAX_INSTANCE_IDS_PER_CALL`, `MAX_TARGET_GROUPS_PER_CALL`), with the
+/// service-common `ValidationError` before the batch is looked at at all
+/// ([`too_many_tags_in_one_call_message`]).
 pub const MAX_TAGS_PER_CALL: usize = 50;
 
 /// The message a call naming more tags than [`MAX_TAGS_PER_CALL`] is refused with, which
@@ -230,14 +232,15 @@ pub fn too_many_tags_in_one_call_message() -> String {
     format!("Trying to update too many tags at once. The limit is {MAX_TAGS_PER_CALL}")
 }
 
-/// The message a write that would take a group past the tag quota is refused with: the
-/// group it would have grown and the quota it would have crossed, which is what the caller
-/// has to come back under.
-pub fn too_many_tags_message(group_name: &str) -> String {
-    format!(
-        "You have already reached the limit of {MAX_TAGS_PER_GROUP} tags for Auto Scaling \
-         group {group_name}"
-    )
+/// The message a write that asks for more tags than a group may carry is refused with.
+///
+/// Wholly fixed text: the quota refusal states the class of the failure and nothing of the
+/// request — not the group, not the quota, not how many tags were asked for — so one
+/// sentence serves every writer of a group's tags and every way the quota is crossed (the
+/// call stating more tags than a group may hold, or the keys it adds to what the group
+/// already carries).
+pub fn too_many_tags_message() -> String {
+    "You tried to create more tags than allowed".to_string()
 }
 
 /// The keys a request would write to each group it names, in ONE pass over the request.

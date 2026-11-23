@@ -179,11 +179,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // How many tags ONE call may state, checked FIRST — before the request is read for
         // the groups it names, before the store is locked and before any quota is counted:
         // every pass below is then over a bounded list, so no caller decides how much work
-        // this request costs.
+        // this request costs. A group carries at most that many tags, so a call stating more
+        // ASKS for more tags than a resource may hold: that is the quota the model declares
+        // `LimitExceededFault` for, and the sentence is the quota's own.
         if requested.len() > crate::state::MAX_TAGS_PER_CALL {
-            return Err(crate::scaffolded::Scaffolded::validation_error(
-                crate::state::too_many_tags_in_one_call_message(),
-            ));
+            return Err(CreateOrUpdateTagsErrorModeled::LimitExceededFault(
+                LimitExceededFault {
+                    message: Some(crate::state::too_many_tags_message()),
+                },
+            )
+            .into());
         }
 
         // Tagging a group is an action IAM judges against THAT group, so every group this
@@ -229,7 +234,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if would_carry > crate::state::MAX_TAGS_PER_GROUP {
                     return Err(CreateOrUpdateTagsErrorModeled::LimitExceededFault(
                         LimitExceededFault {
-                            message: Some(crate::state::too_many_tags_message(group_name)),
+                            message: Some(crate::state::too_many_tags_message()),
                         },
                     )
                     .into());

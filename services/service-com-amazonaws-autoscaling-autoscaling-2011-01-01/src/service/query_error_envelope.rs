@@ -148,9 +148,9 @@ pub fn with_request_id(resp: RtResponse) -> RtResponse {
 }
 
 /// The modelled operation this request is served by: the one this service serves behind
-/// the decimal renderer when that partial table holds it
-/// ([`crate::service::decimal_floats`]), else the one the service's routing table names —
-/// or `None` when the request names no modelled operation.
+/// the wrappers it owns when that table holds it ([`crate::service::quoted_values`]), else
+/// the one the service's routing table names — or `None` when the request names no modelled
+/// operation.
 fn modeled_operation<'s>(
     served: &'s OperationRoutingTable,
     svc: &'s dyn Service,
@@ -166,10 +166,10 @@ fn modeled_operation<'s>(
 /// then adds the envelope's `<RequestId>` to the response.
 ///
 /// It re-implements no operation: the one it delegates to is the one this service serves
-/// for the request — the row of its own [`crate::service::decimal_floats`] table when that
-/// partial table holds the request's operation, else the one the service's generated
-/// routing table names, resolved from the `svc` the framework passes into
-/// [`ErasedOperation::run`]. So the framework still owns the whole
+/// for the request — the row of its own [`crate::service::quoted_values`] table, which holds
+/// every modelled operation behind the wrappers this service owns, else the one the
+/// service's generated routing table names, resolved from the `svc` the framework passes
+/// into [`ErasedOperation::run`]. So the framework still owns the whole
 /// deserialize → validate → handle → serialize sequence (and every status, code and
 /// message it answers with), and this wrapper owns one element of the envelope.
 ///
@@ -181,18 +181,18 @@ fn modeled_operation<'s>(
 /// framework hands `run` the SERVICE, whose engine is behind an engine-erased accessor.
 pub struct RequestIdEnvelopeOperation<Eng: Send + Sync + 'static> {
     engine: std::sync::Arc<Eng>,
-    /// The operations this service serves behind the decimal renderer, built once from
-    /// the shared engine ([`crate::service::decimal_floats::table`]). A PARTIAL table:
-    /// every other request is served by the operation the service's own routing table
-    /// names.
-    decimal_floats: OperationRoutingTable,
+    /// The operations this service serves behind the wrappers it owns, built once from the
+    /// shared engine ([`crate::service::quoted_values::table`]): every modelled operation,
+    /// each with the value half of a constraint clause restored, and the three whose
+    /// response carries a floating-point member behind the decimal renderer as well.
+    served: OperationRoutingTable,
 }
 
 impl<Eng: Send + Sync + 'static> RequestIdEnvelopeOperation<Eng> {
     /// Build the wrapper over the shared engine.
     pub fn new(engine: std::sync::Arc<Eng>) -> Self {
         Self {
-            decimal_floats: crate::service::decimal_floats::table(&engine),
+            served: crate::service::quoted_values::table(&engine),
             engine,
         }
     }
@@ -215,7 +215,7 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for RequestIdEnvelopeOperation<
             {
                 return response;
             }
-            match modeled_operation(&self.decimal_floats, svc, req) {
+            match modeled_operation(&self.served, svc, req) {
                 Some(op) => with_request_id(op.run(svc, req, ctx).await),
                 // Unreachable through `Service::override_operation`, which claims a
                 // request only when the routing table holds its key; answered as the

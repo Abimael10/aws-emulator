@@ -31,6 +31,12 @@
 //! have rendered it. Only the clause's value half changes, and only where the framework
 //! elided it.
 //!
+//! WHICH clauses have that value half restored is the service's own choice, because what AWS
+//! quotes at a position is each operation's recorded fact: [`QuotedRefusals::new`] states the
+//! submitted value at every position the walk can render one for, a collection included, and
+//! [`QuotedRefusals::restoring_elided_values`] restores only the clause whose stored text is
+//! the framework's elision of a value and leaves every other clause the framework's own text.
+//!
 //! # Services still carrying their own copy
 //!
 //! The restoring rule predates this wrapper and is inlined in the service crates that
@@ -77,6 +83,24 @@ impl<O: Operation> QuotedRefusals<O> {
             collect: crate::validation::refusing_violations::<O>,
         }
     }
+
+    /// The same wrapper, restoring ONLY the clause whose stored text IS the framework's
+    /// elision of the submitted value ([`crate::validation_message::quoting_the_whole_submitted_value`]).
+    ///
+    /// For a service whose OTHER clauses are recorded as the framework already writes them:
+    /// the count summary of a collection whose own `@length` was broken (`<n> items`), a value
+    /// with no text rendering, a `@sensitive` value the validating walk withheld. [`Self::new`]
+    /// states the value AWS quotes at every one of those positions too, which is right for a
+    /// service whose recordings show it and a regression for one whose recordings show the
+    /// summary — so which of the two a service serves is the service's own choice, and this is
+    /// the narrower one. Everything else is [`Self::new`]'s: the same collecting walk, the same
+    /// violations, the same bounds, the same wording through the service's own refusal channel.
+    pub fn restoring_elided_values(operation: O) -> Self {
+        Self {
+            operation,
+            collect: restoring_elided_values::<O>,
+        }
+    }
 }
 
 impl<O> QuotedRefusals<O> {
@@ -87,6 +111,15 @@ impl<O> QuotedRefusals<O> {
         Self {
             operation,
             collect: crate::validation::refusing_violations::<S>,
+        }
+    }
+
+    /// [`Self::over`] for a service that restores only the clause the framework elided
+    /// ([`Self::restoring_elided_values`]).
+    pub fn over_restoring_elided_values<S: Operation>(operation: O) -> Self {
+        Self {
+            operation,
+            collect: restoring_elided_values::<S>,
         }
     }
 
@@ -105,6 +138,26 @@ impl<O> QuotedRefusals<O> {
         let chosen = svc.override_refusal(&Refusal::Invalid(violations.clone()));
         Some(definition.refusal_response(ProtocolError::Invalid(violations), chosen, req))
     }
+}
+
+/// The violations that refuse one request against `O`'s input schema, with the value half of
+/// a clause restored ONLY where the framework's own walk elided it
+/// ([`QuotedRefusals::restoring_elided_values`]).
+///
+/// The same collecting walk every other mode runs, read through the echo it pairs each
+/// violation with ([`crate::validation::refusing_violations_with_echoes`]) rather than through
+/// the restoring walk, so a clause the framework wrote from something that is not an elided
+/// value keeps the framework's own text.
+fn restoring_elided_values<O: Operation>(
+    protocol: &dyn smithy_server_runtime::ServerHttpProtocol,
+    req: &RtRequest,
+) -> Vec<Violation> {
+    crate::validation::refusing_violations_with_echoes::<O>(protocol, req)
+        .into_iter()
+        .map(|(violation, echo)| {
+            crate::validation_message::quoting_the_whole_submitted_value(violation, &echo)
+        })
+        .collect()
 }
 
 impl<O> ErasedOperation for QuotedRefusals<O>

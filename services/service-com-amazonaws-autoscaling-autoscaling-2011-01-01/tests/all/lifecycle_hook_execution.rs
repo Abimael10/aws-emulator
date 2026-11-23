@@ -591,9 +591,9 @@ enum Addressed {
     Nothing,
 }
 
-/// RULE 4: a callback addressed at no held action is refused naming what the caller has to
-/// correct — and naming the hook as well exactly when the instance it named IS waiting at a
-/// hook of the group.
+/// RULE 4: a callback addressed at no held action is refused naming the address it sent —
+/// the token when it named one, and otherwise the INSTANCE together with the HOOK the
+/// lookup was made under, because an instance has one held action per hook.
 ///
 /// The rows differ along which half of the address matched nothing — including a group the
 /// account does not hold, which holds no active action either — and each row is driven
@@ -654,11 +654,17 @@ async fn a_callback_naming_no_held_action_says_which_half_matched_nothing() {
             ),
             Addressed::ConsumedAction => (
                 vec![("InstanceId", instance_id.as_str())],
-                format!("No active Lifecycle Action found with instance ID {instance_id}"),
+                format!(
+                    "No active Lifecycle Action found with instance ID {instance_id} and HookName \
+                     {hook}"
+                ),
             ),
             Addressed::AbsentInstance => (
                 vec![("InstanceId", absent_instance)],
-                format!("No active Lifecycle Action found with instance ID {absent_instance}"),
+                format!(
+                    "No active Lifecycle Action found with instance ID {absent_instance} and \
+                     HookName {hook}"
+                ),
             ),
             Addressed::UnknownToken => (
                 vec![("LifecycleActionToken", unknown_token)],

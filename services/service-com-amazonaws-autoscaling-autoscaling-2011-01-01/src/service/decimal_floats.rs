@@ -22,8 +22,9 @@
 //!
 //! # Which operations are served through it
 //!
-//! Every operation whose MODELLED OUTPUT can reach a floating-point member. This model
-//! declares two floating-point shapes —
+//! Every operation whose MODELLED OUTPUT can reach a floating-point member — named where
+//! the service's operations are served ([`crate::service::quoted_values`]), which wraps each
+//! of them in [`rendering_decimals`]. This model declares two floating-point shapes —
 //! `smithy_query(query="shape",shape="MetricScale,NullablePositiveDouble")`, both
 //! `double` — and three operations' outputs reach them:
 //!
@@ -40,85 +41,47 @@
 //! An operation whose output declares no floating-point member is not listed, because for
 //! it the wrapper is a no-op: the rule reaches a value only where the model puts one.
 
-use std::sync::Arc;
-
 use service_common::query_decimal_floats::DecimalFloatsOperation;
-use smithy_server_runtime::{
-    ErasedOperation, Operation, OperationRoutingTable, PreDispatchProtocol,
-};
+use smithy_server_runtime::PreDispatchProtocol;
 
 /// The envelope a pre-dispatch failure of a wrapped operation renders in: this service
 /// speaks `awsQuery` (not the EC2 dialect), which is the same value the generated
 /// per-operation shim passes.
 const QUERY_ENVELOPE: PreDispatchProtocol<'static> = PreDispatchProtocol::Query { ec2: false };
 
-/// The operations of this service whose response can carry a floating-point member, each
-/// served behind the renderer above, keyed by the routing key the protocol resolves.
+/// One already-constructed operation, served with every floating-point member of its
+/// response rendered as decimal text.
 ///
-/// A PARTIAL table: a request it does not hold is served by the generated routing table
-/// unchanged (see [`crate::service::query_error_envelope`]). Each row is filed under the
-/// operation's own [`Operation::NAME`], the model-derived key the generated table uses, so
-/// a wrapped operation cannot land under a key the protocol never resolves.
-pub fn table<Eng: Send + Sync + 'static>(engine: &Arc<Eng>) -> OperationRoutingTable {
-    let mut table = OperationRoutingTable::new();
-    serve(
-        &mut table,
-        crate::ops::describe_policies::DescribePolicies::new(Arc::clone(engine)),
-    );
-    serve(
-        &mut table,
-        crate::ops::describe_auto_scaling_groups::DescribeAutoScalingGroups::new(Arc::clone(
-            engine,
-        )),
-    );
-    serve(
-        &mut table,
-        crate::ops::get_predictive_scaling_forecast::GetPredictiveScalingForecast::new(
-            Arc::clone(engine),
-        ),
-    );
-    table
-}
-
-/// File one already-constructed operation under its modelled name, served behind the
-/// decimal renderer.
-fn serve<O: Operation + ErasedOperation + 'static>(
-    table: &mut OperationRoutingTable,
-    operation: O,
-) {
-    table.add_operation(
-        O::NAME,
-        Box::new(DecimalFloatsOperation::new(operation, QUERY_ENVELOPE)),
-    );
+/// The wrapper is still an operation of the same name, input schema and modelled errors
+/// ([`DecimalFloatsOperation`]), so it composes inside the wrapper that quotes a refused
+/// value ([`crate::service::quoted_values`]) without either rule knowing about the other.
+pub fn rendering_decimals<O>(operation: O) -> DecimalFloatsOperation<O> {
+    DecimalFloatsOperation::new(operation, QUERY_ENVELOPE)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::table;
+    use super::rendering_decimals;
+    use smithy_server_runtime::Operation;
     use std::sync::Arc;
 
-    /// Every operation this module serves is filed under the key the protocol resolves —
-    /// its modelled operation name — and nothing else is, so a request for an operation
-    /// with no floating-point member in its output still reaches the generated table.
+    /// The modelled name of whatever operation `operation` is, read off its own
+    /// [`Operation`] impl.
+    fn modelled_name<O: Operation>(_operation: &O) -> &'static str {
+        O::NAME
+    }
+
+    /// Wrapping an operation in the decimal renderer leaves its modelled identity alone: the
+    /// name the protocol resolves, which is what files it in the service's table, is still
+    /// the operation's own.
     #[test]
-    fn each_wrapped_operation_is_filed_under_its_modelled_name() {
-        let table = table(&Arc::new(()));
-        for name in [
-            "DescribePolicies",
-            "DescribeAutoScalingGroups",
-            "GetPredictiveScalingForecast",
-        ] {
-            assert!(
-                table.get(name).is_some(),
-                "case {name:?}: expected the operation to be served behind the decimal \
-                 renderer"
-            );
-        }
-        for name in ["PutScalingPolicy", "DescribeScalingActivities", "Nonesuch"] {
-            assert!(
-                table.get(name).is_none(),
-                "case {name:?}: expected no row, so the generated table serves it"
-            );
-        }
+    fn the_renderer_keeps_the_operations_modelled_name() {
+        let wrapped =
+            rendering_decimals(crate::ops::describe_policies::DescribePolicies::new(Arc::new(())));
+        let name = modelled_name(&wrapped);
+        assert_eq!(
+            name, "DescribePolicies",
+            "expected the wrapper to keep the operation's modelled name, got {name:?}"
+        );
     }
 }

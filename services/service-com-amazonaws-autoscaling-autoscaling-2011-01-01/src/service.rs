@@ -56,7 +56,10 @@
 //! That wrapper is also where the operations whose response carries a floating-point
 //! member are served behind the renderer that writes one as AWS does ([`decimal_floats`]):
 //! the rule is the XML protocol's, so it is applied once for every such operation rather
-//! than per handler.
+//! than per handler. For the same reason it is where every operation is served behind the
+//! wrapper that restores the VALUE half of a constraint clause ([`quoted_values`]): what an
+//! AWS validation message quotes is the request's own bytes, which is a fact of that message
+//! rather than of any one operation.
 //!
 //! That same wrapper is where the AUTHORIZATION gate runs ([`authorization`]): whether the
 //! caller may perform the action at all is a fact of the CREDENTIAL the request presented
@@ -73,6 +76,7 @@ pub mod decimal_floats;
 pub mod enum_value_sets;
 pub mod malformed_input;
 pub mod query_error_envelope;
+pub mod quoted_values;
 pub mod xsd_boolean;
 
 use query_error_envelope::{AutoScalingDefinition, RequestIdEnvelopeOperation};

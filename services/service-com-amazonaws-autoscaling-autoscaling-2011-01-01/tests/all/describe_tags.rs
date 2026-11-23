@@ -1007,8 +1007,7 @@ async fn a_group_carries_at_most_the_account_quota_of_tags() {
     );
     let message = crate::support::xml_unescape(&tag_value(&body, "Message"));
     assert_eq!(
-        message,
-        format!("You have already reached the limit of {QUOTA} tags for Auto Scaling group {ALPHA}"),
+        message, "You tried to create more tags than allowed",
         "expected the quota sentence, got {message:?}"
     );
     let after = described_tags_of_account("after the refusal", &router).await;
@@ -1049,7 +1048,21 @@ async fn one_call_states_at_most_the_per_call_bound_of_tags() {
         params.push(p(&format!("Tags.member.{member}.Value"), "x"));
     }
 
-    for operation in ["CreateOrUpdateTags", "DeleteTags"] {
+    // A call stating more tags than a group may carry ASKS for more tags than allowed, which
+    // is the quota the model declares `LimitExceededFault` for; a call naming that many tags
+    // to REMOVE grows no group, so it is refused as the per-call bound it crossed.
+    for (operation, code, expected) in [
+        (
+            "CreateOrUpdateTags",
+            "LimitExceeded",
+            "You tried to create more tags than allowed".to_string(),
+        ),
+        (
+            "DeleteTags",
+            "ValidationError",
+            format!("Trying to update too many tags at once. The limit is {LIMIT}"),
+        ),
+    ] {
         let (status, body) = query(&router, operation, &borrowed(&params)).await;
         assert_eq!(
             status, 400,
@@ -1058,14 +1071,13 @@ async fn one_call_states_at_most_the_per_call_bound_of_tags() {
         );
         assert_eq!(
             tag_value(&body, "Code"),
-            "ValidationError",
-            "case {operation:?}: expected the code ValidationError, got {body}"
+            code,
+            "case {operation:?}: expected the code {code}, got {body}"
         );
         let message = crate::support::xml_unescape(&tag_value(&body, "Message"));
         assert_eq!(
-            message,
-            format!("Trying to update too many tags at once. The limit is {LIMIT}"),
-            "case {operation:?}: expected the per-call sentence, got {message:?}"
+            message, expected,
+            "case {operation:?}: expected {expected:?}, got {message:?}"
         );
         assert_eq!(
             described_tags_of_account(operation, &router).await,
@@ -1162,8 +1174,8 @@ const WRITE_REFUSALS: &[WriteRefusal] = &[
             ("Tags.member.1.Key", "env"),
             ("Tags.member.1.Value", "prod"),
         ],
-        message: "Resource type auto-scaling-instance is not correct. Allowed Resource types \
-                  are: auto-scaling-group",
+        message: "Invalid resourceType: auto-scaling-instance. Valid resource types are: \
+                  auto-scaling-group ",
     },
     WriteRefusal {
         case: "a SECOND tag of the call naming a group the account does not hold",

@@ -1207,8 +1207,14 @@ async fn only_a_held_action_is_announced_and_only_its_token_completes_it() {
                 ("LifecycleActionResult", CONTINUE.to_string()),
             ],
             code: "ValidationError",
-            message: "No active Lifecycle Action found with instance ID i-0123456789abcdef0"
-                .to_string(),
+            // Addressed by the instance, so the refusal names both halves of the address — the
+            // instance and the hook the lookup was made under — because an instance has one
+            // held action per hook.
+            message: format!(
+                "No active Lifecycle Action found with instance ID i-0123456789abcdef0 and \
+                 HookName {}",
+                hook.0
+            ),
         },
         Refusal {
             case: "a hook of the group that is holding nothing",
@@ -1219,8 +1225,7 @@ async fn only_a_held_action_is_announced_and_only_its_token_completes_it() {
                 ("LifecycleActionResult", CONTINUE.to_string()),
             ],
             code: "ValidationError",
-            // The instance IS waiting — just not at the hook this call named — so the hook
-            // is the half of the address that matched nothing and the refusal names it too.
+            // The same address, with the hook half naming a hook that holds nothing.
             message: format!(
                 "No active Lifecycle Action found with instance ID {instance_id} and HookName \
                  not-a-hook"

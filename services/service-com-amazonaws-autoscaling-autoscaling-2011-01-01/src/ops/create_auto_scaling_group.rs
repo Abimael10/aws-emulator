@@ -779,12 +779,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resource_id = state.mint_resource_id();
         let arn = crate::state::group_arn(&region, &resource_id, &name);
         // How many tags ONE call may state, checked on the request's own length before the
-        // tags are read, exactly as the two tag-writing operations check it.
+        // tags are read, exactly as the two tag-writing operations check it: a group carries
+        // at most that many, so a create stating more asks for more tags than a resource may
+        // hold — the quota the model declares `LimitExceededFault` for.
         let requested_tags = input.tags.unwrap_or_default();
         if requested_tags.len() > crate::state::MAX_TAGS_PER_CALL {
-            return Err(crate::scaffolded::Scaffolded::validation_error(
-                crate::state::too_many_tags_in_one_call_message(),
-            ));
+            return Err(CreateAutoScalingGroupErrorModeled::LimitExceededFault(
+                LimitExceededFault {
+                    message: Some(crate::state::too_many_tags_message()),
+                },
+            )
+            .into());
         }
         // A tag on an Auto Scaling group is stored against that group, under the one
         // supported resource type, and with the propagation decision the request stated
@@ -799,7 +804,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if tags.len() > crate::state::MAX_TAGS_PER_GROUP {
             return Err(CreateAutoScalingGroupErrorModeled::LimitExceededFault(
                 LimitExceededFault {
-                    message: Some(crate::state::too_many_tags_message(&name)),
+                    message: Some(crate::state::too_many_tags_message()),
                 },
             )
             .into());

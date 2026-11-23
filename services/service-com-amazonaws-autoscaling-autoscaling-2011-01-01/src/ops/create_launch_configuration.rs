@@ -2,10 +2,11 @@
 
 //! @op CreateLaunchConfiguration
 //!
-//! Refused outright: launch configurations are not a resource this account can
-//! create, so no request stores one. The refusal is HTTP 400 with the error code
-//! `UnsupportedOperation` (a `Sender` fault), and it does not depend on the
-//! request or on this service's state.
+//! Refused twice over: a request that states no launch source is refused for its own
+//! parameters (HTTP 400 `ValidationError`), and a well-formed one is refused because launch
+//! configurations are not a resource this account can create (HTTP 400 `UnsupportedOperation`,
+//! a `Sender` fault). Neither refusal depends on this service's state, and no request stores
+//! a launch configuration.
 //!
 //! ## Shape of an operation
 //!
@@ -260,19 +261,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Nothing is read and nothing is written: the refusal is the whole
-        // behaviour, so it depends neither on the request's members nor on this
-        // service's state. Touching the store here is exactly the fault this
-        // handler had — a refused create must leave no resource behind. The three
-        // bindings are discarded the way the scaffold does it, which is also what
-        // keeps the constructor-injected `engine` field read somewhere.
-        let _ = (&input, ctx, &self.engine);
+        // Nothing is read and nothing is written: the refusals below depend on the
+        // request's own members alone, never on this service's state. Touching the
+        // store here is exactly the fault this handler had — a refused create must
+        // leave no resource behind. The two bindings are discarded the way the
+        // scaffold does it, which is also what keeps the constructor-injected
+        // `engine` field read somewhere.
+        let _ = (ctx, &self.engine);
+
+        // The request's OWN parameters are validated first: `ImageId`, `InstanceType` and
+        // `InstanceId` are all optional in the model, while a launch source is not — "if you
+        // specify InstanceId, an ImageId is not required" and "if you specify InstanceId, an
+        // InstanceType is not required"
+        // (`smithy_query(query="doc",shape="CreateLaunchConfigurationType",member="ImageId")`
+        // and `member="InstanceType"`) — so a request naming neither an instance to copy nor
+        // both halves of an image-and-type source states no launch source at all. A malformed
+        // request is refused for what it says, ahead of anything about the account: a caller
+        // told the feature is unavailable cannot tell that its request was also unusable.
+        if !states_a_launch_source(&input) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                NO_LAUNCH_SOURCE_MESSAGE.to_string(),
+            ));
+        }
 
         Err(crate::scaffolded::Scaffolded::unsupported_operation(
             CREATION_UNAVAILABLE,
         ))
     }
 }
+
+/// Whether the request states a launch source the operation admits: an instance to copy the
+/// configuration from, or BOTH halves of the image-and-type source.
+///
+/// A member stating the empty string names nothing, so it is read the same way an absent one
+/// is: the model's `@length` minimum of 1 on each of the three is what makes that the only
+/// other way they can be unstated.
+fn states_a_launch_source(input: &CreateLaunchConfigurationInput) -> bool {
+    let stated = |member: &Option<String>| member.as_deref().is_some_and(|value| !value.is_empty());
+    stated(&input.instance_id) || (stated(&input.image_id) && stated(&input.instance_type))
+}
+
+/// What a `CreateLaunchConfiguration` call stating no launch source is refused with.
+///
+/// Fixed text naming the members a valid request may use, with nothing taken from the
+/// request — the same shape as this service's other argument-combination refusals
+/// ([`crate::state::NO_INSTANCE_TO_TERMINATE_MESSAGE`]).
+const NO_LAUNCH_SOURCE_MESSAGE: &str = "Valid requests must contain either the InstanceID \
+                                        parameter or both the ImageId and InstanceType \
+                                        parameters.";
 
 /// What the service answers a `CreateLaunchConfiguration` call with.
 ///

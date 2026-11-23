@@ -91,14 +91,11 @@ pub enum AttachRefusal {
     /// Attaching the named instances would take the group's desired capacity past its own
     /// `MaxSize`, which the operation documents as a failure.
     PastMaxSize {
-        /// The desired capacity the attach would leave the group with.
-        after: i32,
-        /// The group's own `MinSize`.
-        min_size: i32,
-        /// The group's own `MaxSize`, which it is never left over.
-        max_size: i32,
-        /// The desired capacity it has now.
-        desired_capacity: i32,
+        /// The three sizes the group is configured with now, which is what the caller has to
+        /// change for the attach to be admitted.
+        sizes: super::GroupSizes,
+        /// How many instances the request asked to attach.
+        attaching: usize,
     },
 }
 
@@ -133,15 +130,14 @@ impl AttachRefusal {
                 "Instance {instance_id} is in Availability Zone {availability_zone}, which is \
                  not one of the Availability Zones of Auto Scaling group {group_name}."
             ),
-            Self::PastMaxSize {
-                after,
-                min_size,
-                max_size,
-                desired_capacity,
-            } => format!(
-                "AutoScalingGroup {group_name} has min-size={min_size}, max-size={max_size}, \
-                 desired-size={desired_capacity}. New desired-size={after} must be between \
-                 min-size and max-size."
+            // The group's own sizes do not admit the attach, so the refusal is the one both
+            // moves of a group's instances state ([`super::group_size_bounds`]): the sizes it
+            // holds now, the instances this call asked for, and the remedy.
+            Self::PastMaxSize { sizes, attaching } => super::group_sizes_refuse_move_message(
+                group_name,
+                *sizes,
+                super::GroupSizeMove::Attach,
+                *attaching,
             ),
         }
     }
@@ -251,10 +247,14 @@ impl AutoScalingState {
         let after = desired_capacity.saturating_add(units);
         if after > max_size {
             return Err(AttachRefusal::PastMaxSize {
-                after,
-                min_size,
-                max_size,
-                desired_capacity,
+                sizes: super::GroupSizes {
+                    min_size,
+                    max_size,
+                    desired_capacity,
+                },
+                // The instances the attach would take, each id once: an id the request
+                // repeats names one instance, so it is one instance the refusal counts.
+                attaching: wanted.len(),
             });
         }
 

@@ -448,8 +448,9 @@ struct RefusalRow {
 
 /// The ways a request to this read can be unusable: a group the account does not hold, a
 /// page size outside the bounds the member documents (one below the floor and one past the
-/// ceiling), a token this service never issued, and a token naming a page past the sources
-/// the group holds. Every sentence is written out here rather than taken from the crate.
+/// ceiling), a token sent with no page size at all, a token this service never issued, and a
+/// token naming a page past the sources the group holds. Every sentence is written out here
+/// rather than taken from the crate.
 fn refusal_rows(stored_group: &str) -> Vec<RefusalRow> {
     vec![
         RefusalRow {
@@ -483,9 +484,17 @@ fn refusal_rows(stored_group: &str) -> Vec<RefusalRow> {
                 .to_string(),
         },
         RefusalRow {
-            case: "a token this service never issued",
+            case: "a token with no page size beside it",
             group: stored_group.to_string(),
             extra: vec![p("NextToken", "not-a-token")],
+            status: 400,
+            code: "ValidationError",
+            message: "Cannot specify NextToken without MaxRecords".to_string(),
+        },
+        RefusalRow {
+            case: "a token this service never issued",
+            group: stored_group.to_string(),
+            extra: vec![p("NextToken", "not-a-token"), p("MaxRecords", "50")],
             status: 400,
             code: "ValidationError",
             message: "NextToken: not-a-token".to_string(),
@@ -493,7 +502,7 @@ fn refusal_rows(stored_group: &str) -> Vec<RefusalRow> {
         RefusalRow {
             case: "a token naming a page past the sources the group holds",
             group: stored_group.to_string(),
-            extra: vec![p("NextToken", "next-9")],
+            extra: vec![p("NextToken", "next-9"), p("MaxRecords", "50")],
             status: 400,
             code: "ValidationError",
             message: "NextToken: next-9".to_string(),

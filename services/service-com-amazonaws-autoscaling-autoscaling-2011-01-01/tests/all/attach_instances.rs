@@ -598,8 +598,8 @@ async fn an_attach_that_cannot_be_made_is_refused_whole() {
             group: full.to_string(),
             ids: vec![spare.clone()],
             message: format!(
-                "AutoScalingGroup {full} has min-size=0, max-size=1, desired-size=1. New \
-                 desired-size=2 must be between min-size and max-size."
+                "AutoScalingGroup {full} has min-size=0, max-size=1, and desired-size=1. To \
+                 attach 1 instance, please update the AutoScalingGroup sizes appropriately."
             ),
         },
         RefusalRow {

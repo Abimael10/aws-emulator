@@ -3,12 +3,15 @@
 //! The launch configuration surface, end to end over the awsQuery wire.
 //!
 //! Launch configurations are not a resource this account can create: every
-//! `CreateLaunchConfiguration` call is refused with HTTP 400 and the error code
-//! `UnsupportedOperation` (a `Sender` fault), whatever the request carries. The
-//! rest of the surface follows from that — `DescribeLaunchConfigurations` reports
-//! the required-but-empty `LaunchConfigurations` element for every page it can be
-//! asked for, `DeleteLaunchConfiguration` answers `ValidationError` for every
-//! name, and a group that names a launch configuration cannot be created either.
+//! `CreateLaunchConfiguration` call that states a launch source is refused with HTTP 400 and
+//! the error code `UnsupportedOperation` (a `Sender` fault), whatever else it carries, and a
+//! call that states none is refused for its own parameters first (`ValidationError`,
+//! `the_launch_source_is_validated_before_the_account_refusal` in
+//! `refusal_classification_and_wording`). The rest of the surface follows from that —
+//! `DescribeLaunchConfigurations` reports the required-but-empty `LaunchConfigurations`
+//! element for every page it can be asked for, `DeleteLaunchConfiguration` answers
+//! `ValidationError` for every name, and a group that names a launch configuration cannot be
+//! created either.
 //!
 //! Each assertion below spans a SET of requests, because none of this behaviour
 //! depends on any one request's values.
@@ -29,10 +32,10 @@ fn carries_the_launch_configurations_element(xml: &str) -> bool {
 /// One request, named by the case it stands for.
 type RequestCase<'a> = (&'static str, Vec<(&'a str, &'a str)>);
 
-/// Every `CreateLaunchConfiguration` request is refused with HTTP 400 /
-/// `UnsupportedOperation`, whatever it carries, and stores nothing.
+/// Every `CreateLaunchConfiguration` request that states a launch source is refused with
+/// HTTP 400 / `UnsupportedOperation`, whatever else it carries, and stores nothing.
 ///
-/// The rows differ along everything a request can differ along: which optional
+/// The rows differ along everything such a request can differ along: which optional
 /// members it sets, how many, their size, the launch source it names (an image
 /// and instance type, an instance to copy), and a name at each end of the
 /// modelled `XmlStringMaxLen255` length range.
@@ -44,8 +47,12 @@ async fn every_launch_configuration_create_is_refused() {
     let longest_name = "n".repeat(255);
     let cases: Vec<RequestCase<'_>> = vec![
         (
-            "the required member alone",
-            vec![("LaunchConfigurationName", "lc-bare")],
+            "the required member and the smallest launch source",
+            vec![
+                ("LaunchConfigurationName", "lc-bare"),
+                ("ImageId", "ami-0123456789abcdef0"),
+                ("InstanceType", "t3.micro"),
+            ],
         ),
         (
             "the usual create: a name, an image and an instance type",

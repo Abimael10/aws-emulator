@@ -141,10 +141,11 @@ pub enum StandbyRefusal {
     /// Parking the named instances and decrementing the capacity would leave the group
     /// below its own `MinSize`.
     BelowMinSize {
-        /// The desired capacity the group would be left with.
-        after: i32,
-        /// The group's own `MinSize`, which it is never left under.
-        min_size: i32,
+        /// The three sizes the group is configured with now, which is what the caller has to
+        /// change for the park to be admitted.
+        sizes: super::GroupSizes,
+        /// How many instances the request asked to park.
+        parking: usize,
     },
 }
 
@@ -154,7 +155,8 @@ impl StandbyRefusal {
     /// Each is about ONE thing the request asked for: the fixed text states the rule — for
     /// an instance on the wrong side of the move, the state the operation REQUIRES it to be
     /// in — and the variable parts come from the request and the group: the instance id, the
-    /// group name and the two sizes the decrement crossed.
+    /// group name, the sizes the group is configured with and how many instances the request
+    /// named.
     #[must_use]
     pub fn message(&self, group_name: &str, move_kind: StandbyMove) -> String {
         match self {
@@ -165,11 +167,16 @@ impl StandbyRefusal {
                 "The instance {instance_id} is not in {}.",
                 move_kind.from_state()
             ),
-            Self::BelowMinSize { after, min_size } => format!(
-                "The desired capacity of the Auto Scaling group after the instances are placed \
-                 into Standby ({after}) is below the minimum capacity of the group ({min_size}). \
-                 Either set ShouldDecrementDesiredCapacity flag to false or lower group's min \
-                 size."
+            // The group's own sizes do not admit the park, so the refusal is the one both
+            // moves of a group's instances state ([`super::group_size_bounds`]): the sizes it
+            // holds now, the instances this call asked for, and the remedy. Only a park can
+            // reach it — a return from `Standby` moves the capacity the other way — so the
+            // clause is that move's whichever way `move_kind` points.
+            Self::BelowMinSize { sizes, parking } => super::group_sizes_refuse_move_message(
+                group_name,
+                *sizes,
+                super::GroupSizeMove::Standby,
+                *parking,
             ),
         }
     }
@@ -246,7 +253,14 @@ impl AutoScalingState {
             StandbyMove::Enter => {
                 let after = desired_capacity.saturating_sub(units);
                 if after < min_size {
-                    return Err(StandbyRefusal::BelowMinSize { after, min_size });
+                    return Err(StandbyRefusal::BelowMinSize {
+                        sizes: super::GroupSizes {
+                            min_size,
+                            max_size,
+                            desired_capacity,
+                        },
+                        parking: moving.len(),
+                    });
                 }
                 after
             }

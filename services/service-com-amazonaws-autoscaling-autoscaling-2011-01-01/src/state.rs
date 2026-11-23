@@ -139,8 +139,7 @@ pub use lifecycle_hooks::{
 pub mod lifecycle_actions;
 
 pub use lifecycle_actions::{
-    abandoned_launch_cause, abandoned_lifecycle_action_message,
-    no_active_action_by_instance_message, no_active_action_by_token_message,
+    abandoned_launch_cause, abandoned_lifecycle_action_message, no_active_action_by_token_message,
     no_active_action_under_hook_message, not_addressed_message, HeldStep, HeldTransition,
     LifecycleActionEnding, LifecycleActionKey, LifecycleActionRefusal, LifecycleActionResolution,
     PendingLifecycleActionEvent, StoredLifecycleAction, LAUNCH_LIFECYCLE_ACTION,
@@ -289,6 +288,12 @@ pub mod group_defaults;
 pub mod standby;
 
 pub use standby::{StandbyMove, StandbyRefusal};
+
+/// The refusal a move of a group's instances states when the group's own sizes do not admit
+/// it: the one sentence `AttachInstances` and `EnterStandby` share.
+pub mod group_size_bounds;
+
+pub use group_size_bounds::{group_sizes_refuse_move_message, GroupSizeMove, GroupSizes};
 
 /// Bringing the account's own Amazon EC2 instances into a group: the one transition
 /// `AttachInstances` performs, and the rules an instance it takes has to meet.
@@ -4730,6 +4735,21 @@ pub fn invalid_next_token_message_terminated(token: &str) -> String {
 /// part.
 pub fn next_token_value_violation_message(token: &str) -> String {
     format!("NextToken: {token}")
+}
+
+/// The refusal those same reads answer a request that carries a `NextToken` WITHOUT a
+/// `MaxRecords` with.
+///
+/// `DescribeLoadBalancers` and `DescribeTrafficSources` page a group's attachments against the
+/// page size the request states, and their recorded refusal of a token sent with no page size
+/// is this sentence: a resumption token names a position inside a page sequence, so the size
+/// that sequence was produced under has to be stated beside it. Wholly fixed text — it names
+/// the two members the rule is about and nothing the request carried — and it is answered
+/// BEFORE the token itself is read, because a token without the page size is unusable whatever
+/// it says. `DescribeLoadBalancerTargetGroups` answers its own recorded refusal for that
+/// request ([`next_token_value_violation_message`]), so the precedence is each read's.
+pub fn next_token_without_max_records_message() -> String {
+    "Cannot specify NextToken without MaxRecords".to_string()
 }
 
 /// The message `DescribePolicies` refuses an unusable `NextToken` with: the sentence that

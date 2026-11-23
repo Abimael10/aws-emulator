@@ -984,9 +984,14 @@ async fn a_standby_move_the_group_cannot_make_is_refused() {
     .await;
     assert_eq!(status, 400, "a decrement below MinSize: got {status}: {body}");
     let message = xml_unescape(&tag_value(&body, "Message"));
-    assert!(
-        message.contains("below the minimum capacity of the group (1)"),
-        "the refusal must state the bound it crossed, got {message:?}"
+    assert_eq!(
+        message,
+        format!(
+            "AutoScalingGroup {name} has min-size=1, max-size=2, and desired-size=1. To place \
+             into standby 1 instance, please update the AutoScalingGroup sizes appropriately."
+        ),
+        "the refusal must state the group's sizes and the move it was asked for, got \
+         {message:?}"
     );
 
     // An instance not in Standby cannot be returned from it.

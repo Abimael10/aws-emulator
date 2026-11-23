@@ -474,14 +474,11 @@ fn request_fingerprint(input: &LaunchInstancesInput) -> String {
 /// What a request carrying a client token another request already used, for other
 /// parameters, is refused with.
 ///
-/// The rule the modelled error states, worded as the sentence that states it: "the
-/// parameters in the current request do not match the parameters from a previous request
-/// with the same client token"
-/// (`smithy_query(query="shape",shape="IdempotentParameterMismatchError")`). Fixed text: it
-/// carries no value of either request.
+/// The sentence AWS states for this refusal: wholly fixed text, carrying no value of either
+/// request — the token is not quoted and neither is the parameter that differed, so one
+/// sentence states every mismatch.
 const IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE: &str =
-    "The parameters in the current request do not match the parameters from a previous request \
-     with the same client token";
+    "Different request parameters found in the last request used with the provided token name";
 
 /// What a request naming an Availability Zone the group is not configured with is refused
 /// with.

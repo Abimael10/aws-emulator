@@ -224,6 +224,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
+        // A resumption token without the page size it was produced under is unusable: this
+        // read pages the group's attachments against the `MaxRecords` the request states, so
+        // the two members are stated together and a token sent on its own is refused for
+        // THAT — before the token itself is read, whatever it says.
+        if input.next_token.is_some() && input.max_records.is_none() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::next_token_without_max_records_message(),
+            ));
+        }
         // The page this read resumes at, from the token a previous one issued: a token this
         // read did not issue is a bad VALUE for the member that carried it, which this read
         // answers the service-common `ValidationError` for, naming the member and the value
