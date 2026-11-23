@@ -19,6 +19,7 @@
 
 use std::sync::Arc;
 
+use service_common::dialable_data_planes::DialablePlanes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -87,7 +88,69 @@ pub(crate) async fn open(case: &str, address: &str, port: &str) -> Session {
 /// Open a RESP session over TLS, which is how a client reaches a cache with in-transit
 /// encryption — the wire the core terminates for such a cache.
 pub(crate) async fn open_tls(case: &str, address: &str, port: &str) -> Session {
-    let conn = open(case, address, port).await;
+    secured(case, open(case, address, port).await).await
+}
+
+/// Open a plaintext RESP session on the published endpoint of a cache placed in a VPC of the
+/// account, as a client INSIDE that VPC reaches it.
+///
+/// Such a cache is reachable only from inside that VPC, and each of its NODES is published at
+/// an address of its own — so the vantage point the endpoint is reachable from is inside the
+/// VPC, and the connection is opened through the register of the data planes this emulator
+/// serves ([`service_common::dialable_data_planes`]), exactly as the code of a function
+/// attached to that VPC opens one.
+///
+/// The EXACT published authority is what has to be open, asserted before the dial: the
+/// register also resolves another spelling of the same interface by port, so a session alone
+/// would be served even for an address the control plane should not have published.
+pub(crate) async fn open_in_vpc(
+    emulator: &Emulator,
+    case: &str,
+    address: &str,
+    port: &str,
+) -> Session {
+    let port: u16 = port
+        .parse()
+        .unwrap_or_else(|_| panic!("case {case}: the published port must be a port, got {port:?}"));
+    let planes = DialablePlanes::of(&**emulator.engine())
+        .expect("the engine vends the register of served data planes");
+    let authority = ::service_common::data_plane_addressing::host_port_authority(address, port);
+    let served = planes.served_by(&authority);
+    assert_eq!(
+        served.as_deref(),
+        Some("elasticache"),
+        "case {case}: the published endpoint {authority} must be open as an address this \
+         service serves a cache at, got {served:?}"
+    );
+    let dialed = planes.dialable(address, port).unwrap_or_else(|| {
+        panic!(
+            "case {case}: the published endpoint {address}:{port} must be an address this \
+             emulator serves a cache at"
+        )
+    });
+    let conn = dialed
+        .plane
+        .dial(None)
+        .await
+        .unwrap_or_else(|error| panic!("case {case}: {address}:{port} must answer, got {error}"));
+    Box::new(conn)
+}
+
+/// [`open_in_vpc`] over TLS, for a cache with in-transit encryption: the core runs the
+/// server side of the handshake on an in-process connection too, so the client end runs its
+/// own.
+pub(crate) async fn open_tls_in_vpc(
+    emulator: &Emulator,
+    case: &str,
+    address: &str,
+    port: &str,
+) -> Session {
+    secured(case, open_in_vpc(emulator, case, address, port).await).await
+}
+
+/// The client side of the TLS handshake a cache with in-transit encryption answers, over a
+/// connection already opened to it.
+async fn secured(case: &str, conn: Session) -> Session {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
         .with_safe_default_protocol_versions()
@@ -105,6 +168,39 @@ pub(crate) async fn open_tls(case: &str, address: &str, port: &str) -> Session {
             panic!("case {case}: the cache's socket must complete a TLS handshake, got {error}")
         });
     Box::new(stream)
+}
+
+/// The node endpoint the member cluster `id` publishes: `(address, port)`, read through
+/// `DescribeCacheClusters(ShowCacheNodeInfo=true)` exactly as a client reads it.
+///
+/// `pub(crate)` for the reason the openers above are: a suite that dials ONE node of a cache
+/// reads that node's own endpoint, and a second copy of this read would be a second thing to
+/// keep correct.
+pub(crate) async fn node_endpoint(emulator: &Emulator, case: &str, id: &str) -> (String, String) {
+    let described = emulator
+        .call(
+            "DescribeCacheClusters",
+            &params(&[("CacheClusterId", id), ("ShowCacheNodeInfo", "true")]),
+        )
+        .await;
+    assert_eq!(
+        described.status, 200,
+        "case {case:?}: {id} must be a cluster of this account, got {} {}",
+        described.status, described.body
+    );
+    let endpoint = ["Address", "Port"].map(|member| {
+        described
+            .text(&format!("CacheNodes/CacheNode/Endpoint/{member}"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: {id} must publish a node endpoint {member}, got {}",
+                    described.body
+                )
+            })
+            .to_string()
+    });
+    let [address, port] = endpoint;
+    (address, port)
 }
 
 /// The verifier a client of the emulator's OWN socket uses: the certificate is the one the

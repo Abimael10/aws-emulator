@@ -35,7 +35,7 @@
 
 use std::time::Duration;
 
-use crate::cache_data_plane::{command, endpoint_of, open_tls, Resp};
+use crate::cache_data_plane::{command, endpoint_of, open_tls_in_vpc, Resp};
 use crate::harness::{
     assert_own_endpoint, every_pending_change_due_in, params, Emulator, Reply, HELD_OUT_OF_REACH,
 };
@@ -416,7 +416,7 @@ async fn attaching_and_detaching_a_user_group_decides_who_the_replication_group_
             // A credential the member does not hold authenticates nobody, for a member that
             // holds one at all.
             if member.wrong_credential_refused {
-                let mut session = open_tls(&row, &address, &port).await;
+                let mut session = open_tls_in_vpc(&emulator, &row, &address, &port).await;
                 let refused = command(
                     &row,
                     &mut session,
@@ -428,7 +428,7 @@ async fn attaching_and_detaching_a_user_group_decides_who_the_replication_group_
 
             // The credential the member DOES hold, and the keyspace the session it opens
             // serves.
-            let mut session = open_tls(&row, &address, &port).await;
+            let mut session = open_tls_in_vpc(&emulator, &row, &address, &port).await;
             let accepted =
                 command(&row, &mut session, &["AUTH", member.id, member.credential]).await;
             assert_eq!(
@@ -472,7 +472,7 @@ async fn attaching_and_detaching_a_user_group_decides_who_the_replication_group_
         // With no user group attached the cache is the open cache it was: an unauthenticated
         // session acts as the unrestricted default user, and the keyspace it reaches is the
         // one the members wrote — the cache's own, not a second one.
-        let mut open_session = open_tls(case, &address, &port).await;
+        let mut open_session = open_tls_in_vpc(&emulator, case, &address, &port).await;
         let open_key = format!("{replication_group}:default-access");
         let open_value = "written-with-no-group-attached";
         let written = command(case, &mut open_session, &["SET", &open_key, open_value]).await;
@@ -501,7 +501,7 @@ async fn attaching_and_detaching_a_user_group_decides_who_the_replication_group_
 
             // The IDENTICAL credential, now that no group of this replication group holds the
             // member.
-            let mut session = open_tls(&row, &address, &port).await;
+            let mut session = open_tls_in_vpc(&emulator, &row, &address, &port).await;
             let refused =
                 command(&row, &mut session, &["AUTH", member.id, member.credential]).await;
             assert_auth_refused(
@@ -529,7 +529,7 @@ async fn attaching_and_detaching_a_user_group_decides_who_the_replication_group_
 
         for member in &MEMBERS {
             let row = format!("{case}, {}", member.case);
-            let mut session = open_tls(&row, &address, &port).await;
+            let mut session = open_tls_in_vpc(&emulator, &row, &address, &port).await;
             let reaccepted =
                 command(&row, &mut session, &["AUTH", member.id, member.credential]).await;
             assert_eq!(

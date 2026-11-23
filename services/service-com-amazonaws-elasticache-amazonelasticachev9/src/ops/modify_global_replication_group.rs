@@ -214,6 +214,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // WHICH of the members this request names is work the service has to
+        // carry out on the datastore's nodes: moving it onto another engine, onto
+        // another engine version, onto another node type, or changing whether its
+        // members fail over. A request confined to the members that are only how
+        // the datastore is DESCRIBED carries no such work — the same reading
+        // `ModifyReplicationGroup` makes of its own request
+        // (`crate::ops::modify_replication_group`) — so it is applied at once and
+        // the datastore keeps the status it had settled at, which is what a client
+        // that reads the change back and then calls a state-gated operation needs.
+        let applies_async_change = engine.is_some()
+            || input.engine_version.is_some()
+            || input.cache_node_type.is_some()
+            || input.automatic_failover_enabled.is_some();
+
         let key = input.global_replication_group_id.to_ascii_lowercase();
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
@@ -295,9 +309,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 member.automatic_failover = status.to_string();
             }
         }
-        // The change is applied at once, and this call answers `modifying` with
-        // the clock owing the datastore its settled status from this call.
-        group.begin_transition(crate::state::STATUS_MODIFYING, now);
+        // The change is applied at once. A change the service has to carry out on
+        // the datastore's nodes leaves it `modifying`, with the clock owing it its
+        // settled status from this call; a change confined to how the datastore is
+        // described is done when this call answers, so the datastore is reported
+        // in the status it had already settled at.
+        if applies_async_change {
+            group.begin_transition(crate::state::STATUS_MODIFYING, now);
+        }
 
         Ok(ModifyGlobalReplicationGroupOutput {
             global_replication_group: Some(group.to_modeled(true)),

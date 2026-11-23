@@ -34,7 +34,7 @@
 
 use std::time::Duration;
 
-use crate::cache_data_plane::{command, endpoint_of, open_tls, Resp};
+use crate::cache_data_plane::{command, endpoint_of, open_tls_in_vpc, Resp};
 use crate::harness::{
     assert_own_endpoint, every_pending_change_due_in, params, Emulator, Reply, HELD_OUT_OF_REACH,
 };
@@ -324,7 +324,8 @@ async fn every_wait_of_the_revocation_flow_is_answered_by_the_first_read_once_du
     .await;
 
     // The address the flow dials, read out of the control plane exactly as the client reads
-    // it: an address of the emulator's OWN, which is the only kind a client can reach.
+    // it: the address the group's primary holds in the VPC it was placed in, which is where
+    // a client of a VPC-only cache endpoint reaches it from.
     let described = emulator
         .call("DescribeReplicationGroups", &replication_group_report())
         .await;
@@ -343,7 +344,7 @@ async fn every_wait_of_the_revocation_flow_is_answered_by_the_first_read_once_du
 
     for (case, id, secret) in MEMBERS {
         // The positive control: the member authenticates and the session serves it.
-        let mut session = open_tls(case, &address, &port).await;
+        let mut session = open_tls_in_vpc(&emulator, case, &address, &port).await;
         let accepted = command(case, &mut session, &["AUTH", id, secret]).await;
         assert_eq!(
             accepted,
@@ -394,7 +395,7 @@ async fn every_wait_of_the_revocation_flow_is_answered_by_the_first_read_once_du
         );
 
         // The IDENTICAL credential, now that the group no longer holds the member.
-        let mut refused_session = open_tls(case, &address, &port).await;
+        let mut refused_session = open_tls_in_vpc(&emulator, case, &address, &port).await;
         let refused = command(case, &mut refused_session, &["AUTH", id, secret]).await;
         assert!(
             matches!(&refused, Resp::Error(message) if message.starts_with("WRONGPASS")),
@@ -408,7 +409,7 @@ async fn every_wait_of_the_revocation_flow_is_answered_by_the_first_read_once_du
             .find(|(_, other, _)| *other != id)
             .copied()
             .expect("the table holds a second member");
-        let mut other = open_tls(other_case, &address, &port).await;
+        let mut other = open_tls_in_vpc(&emulator, other_case, &address, &port).await;
         let still_accepted = command(other_case, &mut other, &["AUTH", other_id, other_secret])
             .await;
         assert_eq!(
@@ -439,7 +440,7 @@ async fn every_wait_of_the_revocation_flow_is_answered_by_the_first_read_once_du
         .await;
 
         // The IDENTICAL credential once more, on a fresh session.
-        let mut again = open_tls(case, &address, &port).await;
+        let mut again = open_tls_in_vpc(&emulator, case, &address, &port).await;
         let reaccepted = command(case, &mut again, &["AUTH", id, secret]).await;
         assert_eq!(
             reaccepted,

@@ -28,8 +28,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use service_common::dialable_data_planes::DialablePlanes;
-
 use crate::cache_cluster_lifecycle::{account_subnet_ids, subnet_group_params};
 use crate::cache_data_plane::{command, Resp, Session};
 use crate::harness::{params, poll_until, Emulator, Reply, REGION};
@@ -142,52 +140,24 @@ fn shards_of(reply: &Reply) -> Vec<Shard> {
     shards
 }
 
-/// The node endpoint the member cluster `id` publishes: `(address, port)`.
+/// The node endpoint the member cluster `id` publishes: `(address, port)` — the crate's one
+/// reading of that read ([`crate::cache_data_plane::node_endpoint`]), with the port as this
+/// suite carries it.
 async fn node_endpoint(emulator: &Emulator, case: &str, id: &str) -> (String, u16) {
-    let described = emulator
-        .call(
-            "DescribeCacheClusters",
-            &params(&[("CacheClusterId", id), ("ShowCacheNodeInfo", "true")]),
-        )
-        .await;
-    assert_eq!(
-        described.status, 200,
-        "case {case:?}: {id} must be a cluster of this account, got {} {}",
-        described.status, described.body
-    );
-    let address = described
-        .text("Endpoint/Address")
-        .unwrap_or_else(|| {
-            panic!("case {case:?}: {id} must publish a node endpoint, got {}", described.body)
-        })
-        .to_string();
-    let port: u16 = described
-        .text("Endpoint/Port")
-        .unwrap_or_default()
+    let (address, port) = crate::cache_data_plane::node_endpoint(emulator, case, id).await;
+    let port: u16 = port
         .parse()
-        .unwrap_or_else(|_| {
-            panic!("case {case:?}: {id} must publish a port, got {}", described.body)
-        });
+        .unwrap_or_else(|_| panic!("case {case:?}: {id} must publish a port, got {port:?}"));
     (address, port)
 }
 
 /// Open a RESP session on the endpoint the control plane published, as a client INSIDE the
 /// cache's VPC reaches it: through the register of the data planes this emulator serves.
+///
+/// The crate's one reading of that vantage point ([`crate::cache_data_plane::open_in_vpc`]),
+/// taken with the port as this suite carries it.
 async fn session_in_vpc(emulator: &Emulator, case: &str, address: &str, port: u16) -> Session {
-    let planes = DialablePlanes::of(&**emulator.engine())
-        .expect("the engine vends the register of served data planes");
-    let dialed = planes.dialable(address, port).unwrap_or_else(|| {
-        panic!(
-            "case {case:?}: the published endpoint {address}:{port} must be an address this \
-             emulator serves a cache at"
-        )
-    });
-    let conn = dialed
-        .plane
-        .dial(None)
-        .await
-        .unwrap_or_else(|error| panic!("case {case:?}: {address}:{port} must answer, got {error}"));
-    Box::new(conn)
+    crate::cache_data_plane::open_in_vpc(emulator, case, address, &port.to_string()).await
 }
 
 /// The `CLUSTER SLOTS` map one node answers: `(first slot, last slot, [(address, port)])`,

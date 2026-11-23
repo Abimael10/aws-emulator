@@ -12,7 +12,10 @@
 //! connect to a cache node" (`Endpoint$Address` "the DNS hostname of the cache node",
 //! `Endpoint$Port` "the port number that the cache engine is listening on"); and that very
 //! address and port is one this emulator accepts a connection on and serves the cluster's own
-//! keyspace at. A client therefore needs no read beyond the one that told it the cluster was
+//! keyspace at, from the vantage point that endpoint is reachable from — a cache PLACED in a
+//! VPC of the account publishes the address its node holds there, which a client inside that
+//! VPC reaches, and a cache in no VPC publishes the address its socket answers at. A client
+//! therefore needs no read beyond the one that told it the cluster was
 //! ready: what that read published is what it dials, and what answers there keeps the value
 //! it writes.
 //!
@@ -51,7 +54,7 @@
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
 use crate::cache_cluster_lifecycle::subnet_group_params;
-use crate::cache_data_plane::{command, open, Resp};
+use crate::cache_data_plane::{command, open, open_in_vpc, Resp, Session};
 use crate::harness::{assert_own_endpoint, params, poll_until, Emulator, REGION};
 
 /// The cache subnet group the placed row is created in: the account's own subnets, in two
@@ -205,7 +208,7 @@ async fn a_single_node_cluster_serves_the_endpoint_its_first_available_read_publ
         assert_own_endpoint(row.id, "the node endpoint", address, port);
 
         let port = port.unwrap_or_default();
-        let mut session = open(row.id, address, port).await;
+        let mut session = session_on(&emulator, row, address, port).await;
         for (key, value) in &row.values {
             assert_eq!(
                 command(row.id, &mut session, &["SET", key, value]).await,
@@ -230,7 +233,7 @@ async fn a_single_node_cluster_serves_the_endpoint_its_first_available_read_publ
         );
         // The values OUTLIVE the session that wrote them: a second connection to the same
         // published address reads every one of them back.
-        let mut again = open(row.id, address, port).await;
+        let mut again = session_on(&emulator, row, address, port).await;
         for (key, value) in &row.values {
             assert_eq!(
                 command(row.id, &mut again, &["GET", key]).await,
@@ -240,5 +243,17 @@ async fn a_single_node_cluster_serves_the_endpoint_its_first_available_read_publ
                 row.id
             );
         }
+    }
+}
+
+/// A RESP session on the endpoint `row`'s cluster published, opened from the vantage point
+/// that endpoint is reachable from: a cluster PLACED in a VPC of the account publishes the
+/// address its node holds in that VPC, which a client inside the VPC reaches (the register of
+/// the data planes this emulator serves), and a cluster in no VPC publishes the address its
+/// own socket answers at, which is dialled over a real socket.
+async fn session_on(emulator: &Emulator, row: &Row, address: &str, port: &str) -> Session {
+    match row.placed {
+        true => open_in_vpc(emulator, row.id, address, port).await,
+        false => open(row.id, address, port).await,
     }
 }

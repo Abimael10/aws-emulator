@@ -168,6 +168,8 @@ pub fn settle_cache_node_interfaces<Eng: ::std::marker::Send + ::std::marker::Sy
 /// cluster spread across the placement the group describes rather than piling into one
 /// subnet.
 ///
+/// A node a delete has begun on is owed NONE: see the first comment in the body.
+///
 /// A pass over the clusters this store holds, which is bounded by the service's own cluster
 /// and node quotas, so what one call costs follows what the store HOLDS rather than
 /// anything in a request.

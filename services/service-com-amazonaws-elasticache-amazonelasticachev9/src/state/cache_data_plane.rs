@@ -33,6 +33,14 @@
 //! The socket's life is the cache's: the handle lives on the store under the cache's own
 //! key, and dropping it (the delete) closes the port and severs every connection on it.
 //!
+//! WHICH ADDRESS of that socket is published follows where the cache was placed. A cache in
+//! no VPC of the account is published at the address its socket answers on, which a client of
+//! this machine dials. A cache placed in a cache subnet group runs in the account's VPC and is
+//! reachable only from INSIDE it, and each of its nodes is reached there at an endpoint of its
+//! own — so each node is published at its OWN address on the interface the core bound
+//! ([`own_node_address`]), with the port of its own socket: a group of N nodes publishes N
+//! addresses, instead of one address wearing every shard's name.
+//!
 //! The same RESP server also answers the connections an IN-PROCESS client of this emulator
 //! opens to the published address ([`::service_common::dialable_data_planes`]): a cache
 //! endpoint is reachable only from inside the VPC the cache was placed in, so the client
@@ -59,8 +67,11 @@ use slow_log::{SlowLog, SlowLogDelivery, SlowLogPolicy};
 
 /// The address one cache's own socket answers on, as the control plane publishes it.
 ///
-/// The host and the port come from the core listener, never from a `format!` of a service
-/// hostname: it is the one address a client on this machine can reach the cache at.
+/// The port comes from the core listener and the host from the interface the core bound it
+/// on, never from a `format!` of a service hostname: it is an address a client of this
+/// emulator can reach the cache at. A cache placed in a VPC of the account is published at
+/// its NODE's own spelling of that same interface ([`own_node_address`]), because each node of
+/// such a cache is reached at an endpoint of its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServedEndpoint {
     pub host: String,
@@ -905,12 +916,25 @@ fn group_member<'store>(
 /// cannot open a host socket — the code of a Lambda function attached to the cache's VPC,
 /// which is the only vantage point a VPC-only cache endpoint is reachable from — opens its
 /// connection to the published address and is served by this same RESP server.
+///
+/// `in_vpc` says whether the cache was placed in a VPC of the account (a cache subnet group).
+/// Such a cache is reachable only from INSIDE that VPC, and each of its nodes is reached at an
+/// endpoint of its own — so what the control plane publishes for it is that node's OWN
+/// spelling of the interface this emulator's listeners are bound on ([`own_node_address`]),
+/// with the port the core assigned that node's socket. Every spelling of that interface names
+/// the same socket and the register above resolves one by its PORT
+/// (`service_common::dialable_data_planes`), so a client inside the VPC that dials what it was
+/// told reaches THIS node's own RESP server — and a group of N nodes publishes N addresses
+/// instead of one address wearing every shard's name. A cache in no VPC of the account is
+/// published at the address its socket answers on, which is the address a client of this
+/// machine dials.
 pub async fn open_cache_data_plane<Eng: Send + Sync + 'static>(
     engine: &Eng,
     state: &::engine::ServiceState<super::ComAmazonawsElasticacheAmazonelasticachev9State>,
     identity: CacheIdentity,
     tls: bool,
     keyspace: Option<SharedKeyspace>,
+    in_vpc: bool,
 ) -> Option<CacheDataPlane> {
     let shared = (engine as &dyn ::std::any::Any).downcast_ref::<::engine::InMemoryEngine>()?;
     let listeners = shared.listeners();
@@ -969,19 +993,68 @@ pub async fn open_cache_data_plane<Eng: Send + Sync + 'static>(
     // client dialling it reaches this cache's own RESP server instead of being answered as
     // a client of an address nothing listens at. The record goes with the handle, exactly
     // as the port goes with the listener.
+    //
+    // WHERE the cache answers: the socket's own address, and — for a cache placed in a VPC of
+    // the account — this node's own spelling of that same interface. Both are recorded,
+    // because a client reaching either is reaching this node.
+    let published = in_vpc
+        .then(|| own_node_address(&host, port))
+        .flatten()
+        .filter(|address| *address != host);
+    let in_vpc_authority = published.as_deref().and_then(|address| {
+        let port = u16::try_from(port).ok()?;
+        Some(::service_common::data_plane_addressing::host_port_authority(
+            address, port,
+        ))
+    });
+    let authorities: Vec<String> = [Some(authority), in_vpc_authority]
+        .into_iter()
+        .flatten()
+        .collect();
     let dialable = in_process
         .then(|| ::service_common::dialable_data_planes::DialablePlanes::of(engine))
         .flatten()
         .map(|planes| {
             let plane = ::service_common::dialable_data_planes::served_in_process(served, upgrader);
-            planes.opening([authority], SIGNING_NAME, &plane)
+            planes.opening(authorities, SIGNING_NAME, &plane)
         });
     Some(CacheDataPlane {
-        endpoint: ServedEndpoint { host, port },
+        endpoint: ServedEndpoint {
+            host: published.unwrap_or(host),
+            port,
+        },
         keyspace,
         _listener: listener,
         _dialable: dialable,
     })
+}
+
+/// The address ONE node of a cache placed in a VPC of the account is published at: that
+/// node's own address in the IPv4 loopback block the core bound its socket on, carrying the
+/// port the core assigned that socket.
+///
+/// A cache placed in the account's VPC is reachable only from inside that VPC, and each of its
+/// nodes is reached at an endpoint of its own — on AWS the address of the interface that node
+/// holds in the VPC. This emulator's listeners are all bound on the one interface the operator
+/// chose, so a node cannot be given a socket of its own on an address of its own; what it is
+/// given instead is its own address out of the `127.0.0.0/8` block RFC 1122 reserves for host
+/// loopback, derived from its own port so that it is unique per node and the same on every
+/// read. Every address of that block names the interface the core bound, and the register of
+/// served planes resolves one of them by its port
+/// (`service_common::data_plane_addressing::names_the_loopback_interface`), so a client inside
+/// the VPC that dials the published address reaches this node's own plane.
+///
+/// `None` unless the socket is bound on an IPv4 loopback address: for an IPv6 or a routable
+/// bind this emulator has no second address of that same interface and family to publish — one
+/// of another family is an address the bound socket would not accept a connection at — so the
+/// socket's own address is what the node is reached at.
+fn own_node_address(host: &str, port: i32) -> Option<String> {
+    let bound: ::std::net::IpAddr = host.trim_matches(['[', ']']).parse().ok()?;
+    if !matches!(bound, ::std::net::IpAddr::V4(address) if address.is_loopback()) {
+        return None;
+    }
+    let port = u16::try_from(port).ok()?;
+    Some(format!("127.0.{}.{}", port >> 8, port & 0xff))
 }
 
 /// Whether this emulator serves a data plane for a cache running `engine`.
@@ -1028,7 +1101,7 @@ pub async fn serve_cache_cluster_holding<Eng: Send + Sync + 'static>(
     let identity = CacheIdentity::CacheCluster {
         cache_cluster_id: cache_cluster_id.to_string(),
     };
-    let tls = {
+    let (tls, in_vpc) = {
         let store = state.lock();
         let Some(cluster) = store.cache_clusters.get(cache_cluster_id) else {
             return;
@@ -1038,9 +1111,13 @@ pub async fn serve_cache_cluster_holding<Eng: Send + Sync + 'static>(
         {
             return;
         }
-        cluster.transit_encryption_enabled.unwrap_or(false)
+        (
+            cluster.transit_encryption_enabled.unwrap_or(false),
+            cluster.cache_subnet_group_name.is_some(),
+        )
     };
-    let Some(plane) = open_cache_data_plane(engine, state, identity.clone(), tls, keyspace).await
+    let Some(plane) =
+        open_cache_data_plane(engine, state, identity.clone(), tls, keyspace, in_vpc).await
     else {
         return;
     };
@@ -1084,7 +1161,7 @@ pub async fn serve_replication_group_holding<Eng: Send + Sync + 'static>(
     // no socket, and a member it could not open one for ends it — so it runs at most as
     // many times as the group has members, which the group's own quota bounds.
     loop {
-        let (identity, keyspace, tls) = {
+        let (identity, keyspace, tls, in_vpc) = {
             let store = state.lock();
             let Some(group) = store.replication_groups.get(replication_group_id) else {
                 return;
@@ -1147,7 +1224,12 @@ pub async fn serve_replication_group_holding<Eng: Send + Sync + 'static>(
                 });
                 Some(Arc::new(Mutex::new(held)))
             });
-            (identity, keyspace, group.transit_encryption_enabled)
+            (
+                identity,
+                keyspace,
+                group.transit_encryption_enabled,
+                group.cache_subnet_group_name.is_some(),
+            )
         };
         let CacheIdentity::ReplicationGroupMember {
             ref cache_cluster_id,
@@ -1158,7 +1240,7 @@ pub async fn serve_replication_group_holding<Eng: Send + Sync + 'static>(
         };
         let member_id = cache_cluster_id.clone();
         let Some(plane) =
-            open_cache_data_plane(engine, state, identity.clone(), tls, keyspace).await
+            open_cache_data_plane(engine, state, identity.clone(), tls, keyspace, in_vpc).await
         else {
             return;
         };
@@ -1233,7 +1315,10 @@ pub async fn serve_serverless_cache<Eng: Send + Sync + 'static>(
         Some(keyspace) => keyspace,
         None => {
             let Some(plane) =
-                open_cache_data_plane(engine, state, writer.clone(), true, restored).await
+                // A serverless cache holds no cache node of its own, so there is no
+                // interface of the account to publish an address from: ElastiCache runs it,
+                // and what it answers at is the socket this emulator opened for it.
+                open_cache_data_plane(engine, state, writer.clone(), true, restored, false).await
             else {
                 return;
             };
@@ -1244,7 +1329,7 @@ pub async fn serve_serverless_cache<Eng: Send + Sync + 'static>(
     };
     if state.lock().cache_data_planes.get(&reader).is_none() {
         let Some(plane) =
-            open_cache_data_plane(engine, state, reader.clone(), true, Some(keyspace)).await
+            open_cache_data_plane(engine, state, reader.clone(), true, Some(keyspace), false).await
         else {
             return;
         };
@@ -1358,5 +1443,48 @@ pub fn close_serverless_cache_data_plane(
         },
     ] {
         store.cache_data_planes.remove(&identity);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RULE: a node of a cache placed in the account's VPC is published at an address of its
+    /// own in the IPv4 loopback block its socket is bound on, unique per node and the same on
+    /// every read — and at none at all when the socket is bound on another family or on an
+    /// address of another host, where this emulator has no such address to publish.
+    ///
+    /// The rows span what the reading generalises over: the two spellings of the IPv4 loopback
+    /// address a listener is bound on, two ports of one such interface, the IPv6 loopback
+    /// address (as written and bracketed), a wildcard bind and a routable one.
+    #[test]
+    fn a_node_of_a_vpc_placed_cache_is_published_at_its_own_loopback_address() {
+        let rows: &[(&str, &str, i32, Option<&str>)] = &[
+            ("the interface the core binds by default", "127.0.0.1", 38189, Some("127.0.149.45")),
+            ("another port of that same interface", "127.0.0.1", 38190, Some("127.0.149.46")),
+            ("a port in another high byte", "127.0.0.1", 1024, Some("127.0.4.0")),
+            ("another address of the same block", "127.0.0.5", 40000, Some("127.0.156.64")),
+            ("an IPv6 loopback bind", "::1", 38189, None),
+            ("an IPv6 loopback bind as a listener spells it", "[::1]", 38189, None),
+            ("a wildcard bind", "0.0.0.0", 38189, None),
+            ("a routable bind", "10.4.1.9", 38189, None),
+            ("a host that is no address at all", "localhost", 38189, None),
+        ];
+        let mut published: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (case, host, port, expected) in rows {
+            let address = own_node_address(host, *port);
+            assert_eq!(
+                address.as_deref(),
+                *expected,
+                "case {case:?}: expected {expected:?} for {host}:{port}, got {address:?}"
+            );
+            if let Some(address) = address {
+                assert!(
+                    published.insert(address.clone()),
+                    "case {case:?}: {address} is already published by another node"
+                );
+            }
+        }
     }
 }
