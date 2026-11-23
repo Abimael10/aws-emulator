@@ -101,6 +101,31 @@ impl Wired {
         self.emulator.call(op, Some(REGION), body).await
     }
 
+    /// A security group id EC2 ISSUED in `vpc_id` and then released: the id is one of this
+    /// account's own, and the group it named is gone, which is what makes it a group EC2
+    /// does not hold rather than a value EC2 cannot read as a group id.
+    async fn released_group(&self, vpc_id: &str, name: &str) -> String {
+        let group_id = self
+            .ec2
+            .create_security_group()
+            .vpc_id(vpc_id)
+            .group_name(name)
+            .description("a group released before the refusal rows run")
+            .send()
+            .await
+            .expect("setup: EC2 must create the security group")
+            .group_id()
+            .expect("setup: EC2 must report the group's id")
+            .to_string();
+        self.ec2
+            .delete_security_group()
+            .group_id(&group_id)
+            .send()
+            .await
+            .expect("setup: EC2 must delete the security group");
+        group_id
+    }
+
     /// One VPC of the account, with `subnets` subnets and `groups` security groups in it —
     /// all minted by EC2's own operations, so every id below is one EC2 handed out.
     async fn network(&self, second_octet: u8, subnets: usize, groups: usize) -> Network {
@@ -397,8 +422,13 @@ async fn a_project_vpc_config_is_resolved_against_ec2_before_it_is_stored() {
             SUBNET_NOT_FOUND,
         ));
     }
+    // A group id EC2 ISSUED and then released: EC2 reads a LONG-form group id as the
+    // obfuscated identifier it minted, so an id of that form it never issued is no group id
+    // at all rather than one of the account's groups that is gone. The other two forms carry
+    // no identifier for EC2 to decode, so a hand-written one of each is reported absent.
+    let released_group = wired.released_group(&first.vpc_id, "devicefarm-released").await;
     for (form, unknown) in [
-        ("EC2's 17-hex id form", "sg-0f1e2d3c4b5a69780"),
+        ("EC2's 17-hex id form, released by EC2", released_group.as_str()),
         ("EC2's older 8-hex id form", "sg-1a2b3c4d"),
         (
             "UPPER-CASE hex, which no normalisation may fold",

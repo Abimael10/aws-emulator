@@ -2950,6 +2950,25 @@ pub fn vpc_id_is_malformed<E>(vpc_id: &str) -> Scaffolded<E> {
 }
 
 impl ComAmazonawsEc2Amazonec2State {
+    /// Whether this service can READ `group_id` as a security group id at all.
+    ///
+    /// [`security_group_id_is_well_formed`]'s printed form PLUS the decode EC2 makes of a
+    /// long-form id before it resolves anything: a long-form value whose obfuscated
+    /// identifier this service never issued names no group it could ever have held
+    /// ([`Self::long_form_id_was_never_issued`], where that clause and its reasoning live) —
+    /// the `sg-0123456789abcdef0` shape documentation examples and hand-written probes reach
+    /// for. The retired SHORT form carries no identifier to decode, so a short-form id the
+    /// account holds no group for is reported absent instead.
+    ///
+    /// Which of the two readings an operation takes is a fact of that operation, the way it
+    /// is for an instance id ([`instance_id_reads_as_one`]): this is the reading of one
+    /// recorded telling a value it cannot read apart from a group that is not there, while
+    /// an operation recorded reporting every unresolvable id absent keeps
+    /// [`security_group_id_is_well_formed`].
+    pub fn security_group_id_is_readable(&self, group_id: &str) -> bool {
+        security_group_id_is_well_formed(group_id) && !self.long_form_id_was_never_issued(group_id)
+    }
+
     /// Whether this service can READ `vpc_id` as a VPC id at all.
     ///
     /// The printed form the model publishes for one

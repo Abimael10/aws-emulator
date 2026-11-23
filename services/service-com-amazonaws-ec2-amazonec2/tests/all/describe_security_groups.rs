@@ -698,6 +698,12 @@ async fn group_ids_and_group_names_select_the_groups_they_name() {
 }
 
 /// An id or a name no group of the account carries is an error, not an absent row.
+///
+/// Every id here is one this account could have been issued — a long-form identifier its
+/// mint has already counted, or the retired short form, which carries no identifier to
+/// decode — because a long-form id above the mint is a value EC2 cannot decode at all and is
+/// refused as unreadable instead
+/// ([`a_group_id_this_account_was_never_issued_is_unreadable`]).
 #[tokio::test]
 async fn an_unknown_group_id_or_name_is_refused() {
     let (router, engine) = super::ec2_query::emulator();
@@ -705,7 +711,9 @@ async fn an_unknown_group_id_or_name_is_refused() {
 
     // (the parameter, the value it carries)
     let cases = [
-        ("GroupId", "sg-00000000000000999".to_string()),
+        // A long-form identifier the mint has already spent (on the default network), so it
+        // reads as an id this account was issued while no GROUP of it carries that id.
+        ("GroupId", "sg-00000000000000001".to_string()),
         ("GroupId", "sg-0123abcd".to_string()),
         ("GroupName", "no-such-group".to_string()),
         // A known id under the wrong parameter is as unknown as any other name.
@@ -734,6 +742,66 @@ async fn an_unknown_group_id_or_name_is_refused() {
 // ---------------------------------------------------------------------------
 // Pagination, DryRun and tokens
 // ---------------------------------------------------------------------------
+
+/// RULE: a `GroupIds` entry this service could never have issued is no group id at all, so
+/// the read is refused `InvalidGroupId.Malformed` with EC2's `Invalid id: "<value>"` instead
+/// of reporting a group that is not there — EC2 hands a long id out as an obfuscated
+/// identifier and decodes it before it resolves anything, so a long-form value above
+/// everything the mint has counted names no group it could ever have held.
+///
+/// The rows differ along the way a value fails that reading: the shape documentation
+/// examples reach for, the top of the long form, a long form carrying no hexadecimal, and a
+/// value in no id form at all. The groups the account DOES hold are read back afterwards, so
+/// the reading refuses nothing EC2 issued.
+#[tokio::test]
+async fn a_group_id_this_account_was_never_issued_is_unreadable() {
+    let (router, engine) = super::ec2_query::emulator();
+    let seeded = seed(&engine);
+
+    // (case, the id the request names)
+    let cases = [
+        (
+            "the long-id shape documentation examples use",
+            "sg-0123456789abcdef0",
+        ),
+        ("the top of the long id form", "sg-fffffffffffffffff"),
+        ("a long form carrying no hexadecimal", "sg-zzzzzzzzzzzzzzzzz"),
+        ("a value in no id form at all", "sg-nope"),
+    ];
+
+    for (case, value) in cases {
+        let (status, body) = describe(&router, &indexed("GroupId", &[value])).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400 for {value}, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidGroupId.Malformed",
+            "case {case:?}: expected InvalidGroupId.Malformed for {value}, got {body}"
+        );
+        assert!(
+            unescaped(&body).contains(&format!("Invalid id: \"{value}\"")),
+            "case {case:?}: expected the message to quote {value}, got {body}"
+        );
+    }
+
+    // Every id the account WAS issued still resolves, so the reading above refuses nothing
+    // EC2 handed out.
+    let reported = described_ids(
+        &router,
+        "the groups the account holds",
+        &indexed(
+            "GroupId",
+            &seeded.ids.iter().map(String::as_str).collect::<Vec<_>>(),
+        ),
+    )
+    .await;
+    assert_eq!(
+        reported, seeded.ids,
+        "the ids this account was issued must still describe, got {reported:?}"
+    );
+}
 
 /// `MaxResults` bounds the page and the token resumes from where it ended, so walking the
 /// pages reports the whole store exactly once, in store order; a request naming no

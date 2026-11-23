@@ -62,10 +62,6 @@ const EC2_SERVICE_NAME: &str = "AmazonEC2";
 /// The tail of that clause: there is no proxy in front of the call this emulator made.
 const CLAUSE_TAIL: &str = "; Proxy: null)";
 
-/// A well-formed security group id this account holds no group for: EC2 mints ids of 17
-/// hexadecimal digits, and nothing in this suite creates this one.
-const ABSENT_GROUP: &str = "sg-0fedcba9876543210";
-
 /// The values a row names a security group by that EC2 mints no id in the form of.
 ///
 /// The form itself is EC2's: `sg-` followed by the 8 or 17 hexadecimal digits of its short
@@ -88,11 +84,15 @@ const MALFORMED_VALUES: &[(&str, &str)] = &[
 
 /// The network every row runs against: one VPC with two subnets in different zones and a
 /// security group of its own, beside a second VPC whose group is one this load balancer
-/// cannot be given.
+/// cannot be given, and one group of its own VPC that EC2 has since released.
 struct Network {
     subnets: Vec<String>,
     security_group: String,
     other_security_group: String,
+    /// A group id EC2 ISSUED and then released: EC2 reads a long-form group id as the
+    /// obfuscated identifier it minted, so only an id it issued is looked up at all — which
+    /// is what keeps the account-holds-no-such-group class reachable.
+    released_security_group: String,
 }
 
 /// Create that network through EC2 itself, so every id a row names is one EC2 minted.
@@ -151,7 +151,37 @@ fn seed(router: &MultiServiceRouter, runtime: &tokio::runtime::Runtime) -> Netwo
         subnets,
         security_group,
         other_security_group,
+        released_security_group: released_group(router, runtime, &vpc),
     }
+}
+
+/// One group of `vpc` that EC2 minted and then released, so its id is one of this account's
+/// own naming no group now.
+fn released_group(
+    router: &MultiServiceRouter,
+    runtime: &tokio::runtime::Runtime,
+    vpc: &str,
+) -> String {
+    let group_id = element(
+        &ec2_ok(
+            router,
+            runtime,
+            "CreateSecurityGroup",
+            &[
+                ("GroupName", "elbv2-relay-released"),
+                ("GroupDescription", "released before the rows run"),
+                ("VpcId", vpc),
+            ],
+        ),
+        "groupId",
+    );
+    ec2_ok(
+        router,
+        runtime,
+        "DeleteSecurityGroup",
+        &[("GroupId", group_id.as_str())],
+    );
+    group_id
 }
 
 /// The refusal an answer carries: its status, code and message, so one assertion names all
@@ -355,7 +385,7 @@ fn a_value_that_is_no_security_group_id_relays_the_fault_ec2_answered() {
             let controls: Vec<(&str, Vec<&str>, &str, &str)> = vec![
                 (
                     "a WELL-FORMED id the account holds no group under",
-                    vec![ABSENT_GROUP],
+                    vec![network.released_security_group.as_str()],
                     INVALID_CONFIGURATION,
                     INVALID_SECURITY_GROUPS,
                 ),

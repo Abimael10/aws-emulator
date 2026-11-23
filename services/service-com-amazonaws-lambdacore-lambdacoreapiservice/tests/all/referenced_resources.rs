@@ -134,6 +134,38 @@ impl Wired {
             .collect()
     }
 
+    /// A security group EC2 holds, minted by EC2 itself.
+    async fn held_group(&self, name: &str) -> String {
+        self.ec2
+            .create_security_group()
+            .group_name(name)
+            .description("a group the rows name while EC2 still holds it")
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("setup: EC2 must create the group {name}: {error:?}"))
+            .group_id()
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("setup: EC2 must report an id for the group {name}"))
+    }
+
+    /// A security group id EC2 ISSUED and then released.
+    ///
+    /// The id is one of this account's own — EC2 minted it — and the group it named is gone,
+    /// which is what makes a request naming it a request for a group that does not exist,
+    /// rather than one carrying a value EC2 cannot read as a group id at all.
+    async fn released_group(&self, name: &str) -> String {
+        let group_id = self.held_group(name).await;
+        self.ec2
+            .delete_security_group()
+            .group_id(&group_id)
+            .send()
+            .await
+            .unwrap_or_else(|error| {
+                panic!("setup: EC2 must delete the group {group_id}: {error:?}")
+            });
+        group_id
+    }
+
     /// Create a role through IAM itself, with `trust_document` and the inline policy
     /// `grant` (when one is given), and answer the ARN IAM minted for it.
     async fn role(
@@ -232,6 +264,32 @@ fn ec2_failure(call: &str, code: &str, message: &str) -> String {
     format!("Error occurred while {call}. EC2 Error Code: {code}. EC2 Error Message: {message}")
 }
 
+/// How long a poll loop here keeps looking before it gives up. Generous: the state it waits
+/// for is owed by the emulator's clock, and nothing here measures how long it took.
+const DEADLINE: ::std::time::Duration = ::std::time::Duration::from_secs(120);
+
+/// How long a poll loop waits between two looks.
+const BETWEEN_LOOKS: ::std::time::Duration = ::std::time::Duration::from_millis(25);
+
+/// Look again until `GetNetworkConnector` reports `connector` as `ACTIVE`, the state an
+/// update needs it in. Panics when the deadline passes.
+async fn poll_until_active(router: &MultiServiceRouter, connector: &str) {
+    let deadline = ::std::time::Instant::now() + DEADLINE;
+    loop {
+        let answer = get(router, connector).await;
+        if answer.status == 200 && text(&answer.body, "/State") == "ACTIVE" {
+            return;
+        }
+        assert!(
+            ::std::time::Instant::now() < deadline,
+            "{connector:?} never reached ACTIVE: last answer {} with {:?}",
+            answer.status,
+            answer.body
+        );
+        ::std::thread::sleep(BETWEEN_LOOKS);
+    }
+}
+
 /// Assert that `answer` is the modelled 400 carrying exactly `message`.
 fn assert_refused(case: &str, answer: &crate::network_connector_lifecycle::Answer, message: &str) {
     assert_eq!(
@@ -273,10 +331,12 @@ async fn a_create_naming_an_ec2_resource_the_account_does_not_hold_is_refused() 
         "setup: EC2 must answer for at least two subnets and one security group, got \
          {subnets:?} and {groups:?}"
     );
-    // Well-formed identifiers of EC2's own id form that name nothing: the account holds no
-    // subnet or group carrying them, which is what makes a request naming one refusable.
+    // Identifiers that name nothing: the account holds no subnet carrying this subnet id,
+    // and the group this group id names was issued by EC2 and then released, so each names
+    // nothing while still reading as an id of its own kind.
     let absent_subnet = "subnet-00000000000000fff";
-    let absent_group = "sg-00000000000000fff";
+    let absent_group = wired.released_group("ec2-rows-released").await;
+    let absent_group = absent_group.as_str();
 
     let rows: Vec<(&str, Value, Option<String>)> = vec![
         (
@@ -410,7 +470,8 @@ async fn an_update_naming_an_ec2_resource_the_account_does_not_hold_changes_noth
     let subnets = wired.subnets().await;
     let groups = wired.security_groups().await;
     let absent_subnet = "subnet-00000000000000eee";
-    let absent_group = "sg-00000000000000eee";
+    let absent_group = wired.released_group("update-rows-released").await;
+    let absent_group = absent_group.as_str();
 
     let original = vpc_egress(&[&subnets[0]], &[&groups[0]], Some("IPv4"), None);
     let created = create(
@@ -427,8 +488,9 @@ async fn an_update_naming_an_ec2_resource_the_account_does_not_hold_changes_noth
         "setup: the create must succeed, got {} with {:?}",
         created.status, created.body
     );
-    // An update needs an ACTIVE connector, which the clock owes the new one.
-    wait_for_the_clock();
+    // An update needs an ACTIVE connector, which the clock owes the new one: look until it
+    // is there rather than waiting a fixed time for it.
+    poll_until_active(&wired.router, "updated-connector").await;
 
     let rows: Vec<(&str, Value, String)> = vec![
         (
@@ -789,4 +851,227 @@ async fn nothing_is_refused_on_a_reference_no_service_was_asked_about() {
             answer.status, answer.body
         );
     }
+}
+
+/// The EC2 error code for a value EC2 cannot read as a security group id.
+const GROUP_ID_MALFORMED: &str = "InvalidGroupId.Malformed";
+
+/// The EC2 error code for a group id EC2 issued that names no group now.
+const GROUP_NOT_FOUND: &str = "InvalidGroup.NotFound";
+
+/// The whole message a value EC2 cannot read as a group id earns, wrapper and all.
+fn unreadable_group(id: &str) -> String {
+    ec2_failure(
+        "DescribeSecurityGroups",
+        GROUP_ID_MALFORMED,
+        &format!("Invalid id: \"{id}\""),
+    )
+}
+
+/// The whole message a group id EC2 issued that names no group now earns.
+fn absent_group_message(id: &str) -> String {
+    ec2_failure(
+        "DescribeSecurityGroups",
+        GROUP_NOT_FOUND,
+        &format!("The security group '{id}' does not exist"),
+    )
+}
+
+/// RULE: the refusal reports WHICH `DescribeSecurityGroups` failure EC2 answered, because
+/// the inner EC2 code is the only thing a client can branch on — both classes arrive as the
+/// same 400 `InvalidParameterValueException`. EC2 answers `InvalidGroupId.Malformed` with
+/// `Invalid id: "<value>"` for a value it cannot read as a group id (it hands a long id out
+/// as an obfuscated identifier and decodes it before resolving anything, so one it never
+/// issued names no group it could ever have held), and `InvalidGroup.NotFound` with
+/// `The security group '<id>' does not exist` for an id it issued whose group is gone.
+///
+/// The rows differ along what the rule generalises over: which class the value falls in, the
+/// FORM of the value (the long-id shape documentation examples use, the top of the long
+/// form, a value outside the printed form, the prefix alone — the modelled element pattern
+/// `^sg-[0-9a-zA-Z]*$` admits every one of them, so each reaches the resolution), how many
+/// ids the member carries, and where in the list the offending one sits.
+#[tokio::test]
+async fn a_create_reports_which_security_group_failure_ec2_answered() {
+    let wired = Wired::new();
+    let operator_role = wired.usable_role("group-reading-operator").await;
+    let subnets = wired.subnets().await;
+    let held = wired.held_group("group-reading-held").await;
+    let released = wired.released_group("group-reading-released").await;
+
+    // (case, the security group ids the configuration names, the refusal it earns)
+    let rows: Vec<(&str, Vec<String>, Option<String>)> = vec![
+        ("a group EC2 holds", vec![held.clone()], None),
+        (
+            "the long-id shape documentation examples use",
+            vec!["sg-0123456789abcdef0".to_string()],
+            Some(unreadable_group("sg-0123456789abcdef0")),
+        ),
+        (
+            "that same value LAST in a list that starts with a group EC2 holds",
+            vec![held.clone(), "sg-0123456789abcdef0".to_string()],
+            Some(unreadable_group("sg-0123456789abcdef0")),
+        ),
+        (
+            "the top of the long id form",
+            vec!["sg-fffffffffffffffff".to_string()],
+            Some(unreadable_group("sg-fffffffffffffffff")),
+        ),
+        (
+            "a value in no id form at all",
+            vec!["sg-nope".to_string()],
+            Some(unreadable_group("sg-nope")),
+        ),
+        (
+            "the prefix alone, which the modelled pattern admits",
+            vec!["sg-".to_string()],
+            Some(unreadable_group("sg-")),
+        ),
+        (
+            "an id EC2 issued whose group is gone",
+            vec![released.clone()],
+            Some(absent_group_message(&released)),
+        ),
+        (
+            "that released id LAST in a list that starts with a group EC2 holds",
+            vec![held.clone(), released.clone()],
+            Some(absent_group_message(&released)),
+        ),
+        (
+            "two groups EC2 holds",
+            vec![held.clone(), wired.held_group("group-reading-second").await],
+            None,
+        ),
+    ];
+
+    for (index, (case, groups, refusal)) in rows.iter().enumerate() {
+        let name = format!("group-reading-row-{index}");
+        let named: Vec<&str> = groups.iter().map(String::as_str).collect();
+        let answer = create(
+            &wired.router,
+            json!({
+                "Name": name,
+                "Configuration": vpc_egress(&[&subnets[0]], &named, None, None),
+                "OperatorRole": operator_role,
+            }),
+        )
+        .await;
+        match refusal {
+            None => assert_eq!(
+                answer.status, 202,
+                "case {case:?}: every group resolves, so expected HTTP 202, got {} with {:?}",
+                answer.status, answer.body
+            ),
+            Some(message) => {
+                assert_refused(case, &answer, message);
+                // The refusal came before any state did.
+                let fetched = get(&wired.router, &name).await;
+                assert_eq!(
+                    fetched.status, 404,
+                    "case {case:?}: a refused create must persist no connector, got {} with {:?}",
+                    fetched.status, fetched.body
+                );
+            }
+        }
+    }
+}
+
+/// RULE, on the update: the same resolution gates the configuration an update hands the
+/// connector, so it reports the same two classes — and a refused update changes nothing,
+/// while the configuration the rule admits is stored and read back.
+#[tokio::test]
+async fn an_update_reports_which_security_group_failure_ec2_answered() {
+    let wired = Wired::new();
+    let operator_role = wired.usable_role("group-update-operator").await;
+    let subnets = wired.subnets().await;
+    let held = wired.held_group("group-update-held").await;
+    let released = wired.released_group("group-update-released").await;
+    let original = vpc_egress(&[&subnets[0]], &[&held], Some("IPv4"), None);
+
+    let created = create(
+        &wired.router,
+        json!({
+            "Name": "group-reading-updated",
+            "Configuration": original,
+            "OperatorRole": operator_role,
+        }),
+    )
+    .await;
+    assert_eq!(
+        created.status, 202,
+        "setup: the create must succeed, got {} with {:?}",
+        created.status, created.body
+    );
+    poll_until_active(&wired.router, "group-reading-updated").await;
+
+    // (case, the ids the update names, the message it must answer)
+    let rows: Vec<(&str, Vec<String>, String)> = vec![
+        (
+            "a value EC2 cannot read as a group id",
+            vec!["sg-0123456789abcdef0".to_string()],
+            unreadable_group("sg-0123456789abcdef0"),
+        ),
+        (
+            "a value outside the printed id form",
+            vec!["sg-nope".to_string()],
+            unreadable_group("sg-nope"),
+        ),
+        (
+            "an id EC2 issued whose group is gone",
+            vec![released.clone()],
+            absent_group_message(&released),
+        ),
+    ];
+
+    for (case, groups, message) in &rows {
+        let named: Vec<&str> = groups.iter().map(String::as_str).collect();
+        let refused = update(
+            &wired.router,
+            "group-reading-updated",
+            json!({
+                "Configuration": vpc_egress(&[&subnets[0]], &named, Some("IPv4"), None),
+            }),
+        )
+        .await;
+        assert_refused(case, &refused, message);
+
+        let fetched = get(&wired.router, "group-reading-updated").await;
+        assert_eq!(
+            at(&fetched.body, "/Configuration"),
+            original,
+            "case {case:?}: a refused update must leave the configuration standing, got {:?}",
+            at(&fetched.body, "/Configuration")
+        );
+        assert_eq!(
+            at(&fetched.body, "/LatestVersion"),
+            json!(1),
+            "case {case:?}: a refused update appends no version, got {:?}",
+            at(&fetched.body, "/LatestVersion")
+        );
+    }
+
+    // And the update the rule admits goes through, on another group EC2 holds.
+    let other = wired.held_group("group-update-other").await;
+    let accepted = update(
+        &wired.router,
+        "group-reading-updated",
+        json!({
+            "Configuration": vpc_egress(&[&subnets[0]], &[&other], Some("IPv4"), None),
+        }),
+    )
+    .await;
+    assert_eq!(
+        accepted.status, 202,
+        "a group EC2 holds must be accepted, got {} with {:?}",
+        accepted.status, accepted.body
+    );
+    let fetched = get(&wired.router, "group-reading-updated").await;
+    assert_eq!(
+        at(
+            &fetched.body,
+            "/Configuration/VpcEgressConfiguration/SecurityGroupIds"
+        ),
+        json!([other]),
+        "the accepted update must be the configuration reported back, got {:?}",
+        at(&fetched.body, "/Configuration")
+    );
 }

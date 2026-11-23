@@ -72,15 +72,25 @@ const INVALID_GROUP_ID_MALFORMED: &str = "InvalidGroupId.Malformed";
 
 /// Which of the two EC2 answers a value naming no security group of the account earns.
 ///
-/// EC2 mints a group id as `sg-` followed by 8 or 17 hexadecimal digits: a value of that form
-/// the account holds no group under is reported ABSENT, while a value outside it names no
-/// group in any account and the read is refused as MALFORMED. The refusal MediaConnect states
-/// relays whichever of the two EC2 answered, so each row expects the one its value earns.
+/// EC2 mints a group id as `sg-` followed by 8 or 17 hexadecimal digits, and hands the LONG
+/// form out as an obfuscated identifier it decodes before it resolves anything. So a value
+/// outside that printed form, and a long-form value whose identifier EC2 never issued — every
+/// long-form id a row below names is hand-written, so none of them is one it issued — name no
+/// group in any account and the read is refused as MALFORMED, while a value EC2 can read as
+/// one of its own ids is looked up and reported ABSENT. The refusal MediaConnect states relays
+/// whichever of the two EC2 answered, so each row expects the one its value earns.
 fn group_refusal_code(value: &str) -> &'static str {
-    let is_group_id = value.strip_prefix("sg-").is_some_and(|suffix| {
+    let suffix = value.strip_prefix("sg-");
+    let in_printed_form = suffix.is_some_and(|suffix| {
         matches!(suffix.len(), 8 | 17) && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
     });
-    if is_group_id {
+    let carries_a_long_form_identifier = suffix.is_some_and(|suffix| {
+        suffix.len() == 17
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    });
+    if in_printed_form && !carries_a_long_form_identifier {
         INVALID_GROUP_NOT_FOUND
     } else {
         INVALID_GROUP_ID_MALFORMED
@@ -754,7 +764,7 @@ async fn a_flow_vpc_interface_placement_is_resolved_against_ec2_too() {
                 None,
             )]),
             "VpcInterfaces[0].SecurityGroupIds".to_string(),
-            INVALID_GROUP_NOT_FOUND,
+            group_refusal_code(unknown_group),
         ),
         (
             "the SECOND entry of a request naming a subnet EC2 does not hold".to_string(),

@@ -54,16 +54,17 @@ const IPV6_CIDR_REQUIRED: &str = "You must specify subnets with an associated IP
 /// balancer's traffic.
 const INVALID_SECURITY_GROUPS: &str = "One or more security groups are invalid";
 
-/// A well-formed security group id this account holds no group for: EC2 mints ids of 17
-/// hexadecimal digits, and nothing in this suite creates this one.
-const ABSENT_GROUP: &str = "sg-0fedcba987654321f";
-
 /// The network every row runs against: one VPC with two subnets — IPv4 only, which is what
-/// `CreateSubnet` makes — and a security group, beside a second VPC with its own group.
+/// `CreateSubnet` makes — and a security group, beside a second VPC with its own group, plus
+/// one group of the first VPC that EC2 has since released.
 struct Network {
     subnets: Vec<String>,
     security_group: String,
     other_security_group: String,
+    /// A group id EC2 ISSUED and then released: EC2 reads a long-form group id as the
+    /// obfuscated identifier it minted, so only an id it issued is looked up at all — which
+    /// is what keeps the account-holds-no-such-group class reachable.
+    released_security_group: String,
 }
 
 /// Create that network through EC2 itself, so every id below is one EC2 minted.
@@ -122,10 +123,30 @@ fn seed(router: &MultiServiceRouter, runtime: &tokio::runtime::Runtime) -> Netwo
         ),
         "groupId",
     );
+    let released_security_group = element(
+        &ec2_ok(
+            router,
+            runtime,
+            "CreateSecurityGroup",
+            &[
+                ("GroupName", "elbv2-classes-released"),
+                ("GroupDescription", "released before the rows run"),
+                ("VpcId", vpc.as_str()),
+            ],
+        ),
+        "groupId",
+    );
+    ec2_ok(
+        router,
+        runtime,
+        "DeleteSecurityGroup",
+        &[("GroupId", released_security_group.as_str())],
+    );
     Network {
         subnets,
         security_group,
         other_security_group,
+        released_security_group,
     }
 }
 
@@ -385,7 +406,7 @@ fn an_ipv6_address_type_is_refused_until_the_subnets_carry_an_ipv6_range() {
             let group_rows: Vec<(&str, Vec<&str>, &str, &str)> = vec![
                 (
                     "an id the account holds no group for",
-                    vec![ABSENT_GROUP],
+                    vec![network.released_security_group.as_str()],
                     INVALID_CONFIGURATION,
                     INVALID_SECURITY_GROUPS,
                 ),
@@ -445,7 +466,7 @@ fn an_ipv6_address_type_is_refused_until_the_subnets_carry_an_ipv6_range() {
                     ("Scheme", "internal"),
                     ("Subnets.member.1", network.subnets[0].as_str()),
                     ("Subnets.member.2", network.subnets[1].as_str()),
-                    ("SecurityGroups.member.1", ABSENT_GROUP),
+                    ("SecurityGroups.member.1", network.released_security_group.as_str()),
                 ],
             );
             assert_eq!(

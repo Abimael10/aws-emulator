@@ -260,7 +260,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused as malformed rather than reported absent from this one — the ordering
         // every other operation that takes a group id keeps
         // ([`crate::state::invalid_group_id_malformed`]), so one malformed id earns one
-        // refusal wherever it is named.
+        // refusal wherever it is named. The PRINTED form is settled from the request alone,
+        // here; the DECODE that tells an id this service never issued apart from a group
+        // that is gone needs the store, and is asked below.
         if let Some(malformed) = requested_ids
             .iter()
             .find(|id| !crate::state::security_group_id_is_well_formed(id))
@@ -289,8 +291,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // VPC "in each AWS Region", so that group is already the account's whatever it has
         // created. The call is idempotent per Region and materialises a group owed since
         // the account existed rather than one this read created, so it changes nothing a
-        // later caller would not have seen anyway.
+        // later caller would not have seen anyway. It runs BEFORE the ids are read, so the
+        // group it mints counts among the ones this account has been issued.
         store.ensure_default_network(&region);
+
+        // The REST of the id reading: EC2 hands a long id out as an OBFUSCATED identifier
+        // and decodes it before it resolves anything, so a long-form value whose identifier
+        // this service never issued names no group it could ever have held — it is no group
+        // id rather than a group that is not there
+        // ([`crate::state::ComAmazonawsEc2Amazonec2State::security_group_id_is_readable`],
+        // where that reading and its reasoning live). Answered through the same refusal the
+        // printed-form reading above answers, so one unreadable id is worded once.
+        if let Some(unreadable) = requested_ids
+            .iter()
+            .find(|id| !store.security_group_id_is_readable(id))
+        {
+            return Err(crate::state::invalid_group_id_malformed(unreadable));
+        }
 
         // "The IDs of the security groups" / "the names of the security groups"
         // (`DescribeSecurityGroupsRequest$GroupIds`, `$GroupNames`): an id or a name that
