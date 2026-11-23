@@ -37,6 +37,11 @@
 //! 6. `Branch$totalNumberOfJobs` counts the BUILDS a branch has run, and deploying content
 //!    runs none — while the deployment is still the branch's `activeJobId` and still in
 //!    its job listing.
+//! 7. Read as the LIST a client reads it as, that sequence is the deploy of the content
+//!    first and, for a deployment that published a site, the post-deploy verification —
+//!    named `VERIFY`, carrying the job's terminal status — last and nothing after it; and
+//!    reading a settled job again answers the same list, because reporting a job runs
+//!    nothing.
 //!
 //! The harness (`Emulator`, `Reply`) is the one `app_branch_lifecycle` already drives;
 //! only the cases are new.
@@ -383,6 +388,57 @@ fn deployment_rows() -> Vec<DeploymentRow> {
             status: FAILED,
         },
     ]
+}
+
+/// Drive one row's deployment up to the job its start call created, exactly as a client
+/// does: reserve it where the row reserves one, follow every destination the reservation
+/// handed back, then start it. Answers the `jobId` of the job that start created.
+///
+/// Shared by the rules that are about the job AFTER it has run rather than about the
+/// reservation, so each of them drives the one client sequence.
+async fn started_deployment_of(
+    emulator: &Emulator,
+    app_id: &str,
+    branch: &str,
+    row: &DeploymentRow,
+) -> String {
+    let start = match &row.reservation {
+        Some(request) => {
+            let reserved = create_deployment(emulator, app_id, branch, request).await;
+            assert_eq!(
+                reserved.status, 200,
+                "case {:?}: expected HTTP 200 from CreateDeployment, got {reserved:?}",
+                row.case
+            );
+            let job_id = string_member(&reserved.body, "jobId");
+            if let Some(entries) = row.archive {
+                let url = string_member(&reserved.body, "zipUploadUrl");
+                upload(emulator, row.case, &url, &zip_of(entries)).await;
+            }
+            for file_name in row.files {
+                let url = destination_for(&reserved, file_name, row.case);
+                upload(
+                    emulator,
+                    row.case,
+                    &url,
+                    format!("the bytes of {file_name}").as_bytes(),
+                )
+                .await;
+            }
+            json!({ "jobId": job_id })
+        }
+        None => row
+            .source
+            .clone()
+            .expect("a row deploys either a reservation or a source URL"),
+    };
+    let started = start_deployment(emulator, app_id, branch, &start).await;
+    assert_eq!(
+        started.status, 200,
+        "case {:?}: expected HTTP 200 from StartDeployment, got {started:?}",
+        row.case
+    );
+    string_member(&started.member("jobSummary"), "jobId")
 }
 
 /// Rules 1, 2 and 3: what a deployment's job reports, wherever it is answered, and what
@@ -884,44 +940,7 @@ async fn a_settled_deployment_reports_every_step_it_ran_and_serves_each_step_out
         let branch = format!("steps-{index}");
         branch_arn_of_new_branch(&emulator, &app_id, &branch).await;
 
-        let start = match &row.reservation {
-            Some(request) => {
-                let reserved = create_deployment(&emulator, &app_id, &branch, request).await;
-                assert_eq!(
-                    reserved.status, 200,
-                    "case {:?}: expected HTTP 200 from CreateDeployment, got {reserved:?}",
-                    row.case
-                );
-                let job_id = string_member(&reserved.body, "jobId");
-                if let Some(entries) = row.archive {
-                    let url = string_member(&reserved.body, "zipUploadUrl");
-                    upload(&emulator, row.case, &url, &zip_of(entries)).await;
-                }
-                for file_name in row.files {
-                    let url = destination_for(&reserved, file_name, row.case);
-                    upload(
-                        &emulator,
-                        row.case,
-                        &url,
-                        format!("the bytes of {file_name}").as_bytes(),
-                    )
-                    .await;
-                }
-                json!({ "jobId": job_id })
-            }
-            None => row
-                .source
-                .clone()
-                .expect("a row deploys either a reservation or a source URL"),
-        };
-
-        let started = start_deployment(&emulator, &app_id, &branch, &start).await;
-        assert_eq!(
-            started.status, 200,
-            "case {:?}: expected HTTP 200 from StartDeployment, got {started:?}",
-            row.case
-        );
-        let job_id = string_member(&started.member("jobSummary"), "jobId");
+        let job_id = started_deployment_of(&emulator, &app_id, &branch, &row).await;
 
         // What this row's deployment publishes: the archive's entries, or the files its
         // reservation named one at a time. A row that publishes nothing settles FAILED.
@@ -1247,6 +1266,117 @@ async fn a_branch_counts_the_builds_it_ran_and_not_the_content_it_deployed() {
             list_member(&listed.body, "jobSummaries").len(),
             jobs,
             "case {case:?}: every job the branch ran is listed, got {listed:?}"
+        );
+    }
+}
+
+/// The members every `Step` of a job reports: `stepName`, `startTime`, `status` and
+/// `endTime` are each `@required` (`smithy_query(query="shape",shape="Step")`).
+const REQUIRED_STEP_MEMBERS: &[&str] = &["stepName", "startTime", "status", "endTime"];
+
+/// The `(stepName, status)` pairs of a job's steps, in the order they are reported: the
+/// list a client reads `job.steps` as to report a deployment's progress and to decide
+/// whether what it deployed was verified.
+fn step_sequence(job: &Value) -> Vec<(String, String)> {
+    list_member(job, "steps")
+        .iter()
+        .map(|step| (string_member(step, "stepName"), string_member(step, "status")))
+        .collect()
+}
+
+/// The sequence a deployment whose job settled to `status` ran: a deployment that
+/// published a site was VERIFIED after its content was deployed, and one that published
+/// nothing verified nothing, so it ran the deploy step alone.
+fn expected_sequence(status: &str) -> Vec<(String, String)> {
+    let deploy = (DEPLOY_STEP.to_string(), status.to_string());
+    match status == SUCCEED {
+        true => vec![deploy, (VERIFY_STEP.to_string(), SUCCEED.to_string())],
+        false => vec![deploy],
+    }
+}
+
+/// Rule 7: read as the LIST a client reads it as, a settled deployment's `job.steps` is
+/// the deploy of the content first and, for a deployment that published a site, the
+/// post-deploy verification last — the step named `VERIFY`, carrying the job's terminal
+/// status — with nothing after it; and reading the settled job again answers the same
+/// list, because reporting a job runs nothing.
+///
+/// The rows are `deployment_rows()`: the table the rules above are asserted over, which
+/// spans whether the content was reserved or named by URL, whether it arrived as one
+/// archive or as one upload per file, how many files it carries, and whether the
+/// deployment publishes anything at all — so the sequence follows the EXECUTION and not
+/// the shape of the request that started it.
+#[tokio::test]
+async fn a_settled_deployments_step_sequence_ends_with_the_verification_it_ran() {
+    let emulator = Emulator::new();
+    let app_id = emulator.app_id_of_new_app("deployment-step-sequence").await;
+
+    // (case, branch, jobId, terminal status)
+    let mut queued: Vec<(&'static str, String, String, &'static str)> = Vec::new();
+    for (index, row) in deployment_rows().into_iter().enumerate() {
+        // One row per BRANCH: a branch serializes its deployments, and this rule is about
+        // the steps of one deployment's job.
+        let branch = format!("sequence-{index}");
+        branch_arn_of_new_branch(&emulator, &app_id, &branch).await;
+        let job_id = started_deployment_of(&emulator, &app_id, &branch, &row).await;
+        queued.push((row.case, branch, job_id, row.status));
+    }
+
+    for (case, branch, job_id, status) in &queued {
+        let read = settled_job(&emulator, &app_id, branch, job_id, case).await;
+        let job = read.member("job");
+        let sequence = step_sequence(&job);
+        let expected = expected_sequence(status);
+        assert_eq!(
+            sequence, expected,
+            "case {case:?}: a settled deployment reports the steps its execution ran, \
+             expected {expected:?}, got {sequence:?}"
+        );
+        assert_eq!(
+            sequence.last().map(|(name, _)| name.as_str()),
+            Some(if *status == SUCCEED {
+                VERIFY_STEP
+            } else {
+                DEPLOY_STEP
+            }),
+            "case {case:?}: the last step is the last one the execution ran, got \
+             {sequence:?}"
+        );
+
+        // Every step the sequence holds is a whole `Step`: the members the model requires
+        // of one, and a span that starts before it ends.
+        let steps = list_member(&job, "steps").clone();
+        for (position, step) in steps.iter().enumerate() {
+            for member in REQUIRED_STEP_MEMBERS {
+                assert!(
+                    step.get(member).is_some(),
+                    "case {case:?}: step {position} must report {member}, got {step:?}"
+                );
+            }
+            assert!(
+                timestamp_member(step, "startTime") <= timestamp_member(step, "endTime"),
+                "case {case:?}: step {position} must start before it ends, got {step:?}"
+            );
+        }
+        // The verification followed the deploy: it begins where the deploy ended, so the
+        // two divide the job's execution instead of covering each other.
+        if *status == SUCCEED {
+            assert_eq!(
+                timestamp_member(&steps[0], "endTime"),
+                timestamp_member(&steps[1], "startTime"),
+                "case {case:?}: the verification begins where the deploy ends, got \
+                 {steps:?}"
+            );
+        }
+
+        // READ AGAIN: `GetJob` reports the execution that ran, so the same sequence comes
+        // back — the steps are not recomputed per read and no step is appended by one.
+        let again = get_job(&emulator, &app_id, branch, job_id).await;
+        let read_again = step_sequence(&again.member("job"));
+        assert_eq!(
+            read_again, sequence,
+            "case {case:?}: a second read of the settled job answers the same steps, \
+             expected {sequence:?}, got {read_again:?}"
         );
     }
 }
