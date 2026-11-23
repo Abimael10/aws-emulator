@@ -40,7 +40,10 @@
 //! * a bucket-configuration PUT on a directory bucket is refused for the DOCUMENT it submits —
 //!   `CreateBucketConfiguration` is the one bucket-configuration document that endpoint parses
 //!   — which is a different class of answer from the 501 naming a feature the bucket does not
-//!   have (`crate::service::directory_bucket`).
+//!   have (`crate::service::directory_bucket`);
+//! * and the READ of such a subresource is a third class again: the Zonal endpoint serves no
+//!   method at that address, so it answers the 405 `MethodNotAllowed` and the fixed sentence
+//!   that code publishes.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -1212,8 +1215,8 @@ type FeatureRefusalRow = (
 ///
 /// The rows span every subresource the rule covers (and so every configuration member name the
 /// message interpolates), a document whose root is NOT the member the model binds for the call,
-/// and four refusals of the other class — a read, a canned-ACL write that submits no document,
-/// an object-level tag write, and a configuration PUT carrying no document at all — so what is
+/// and three refusals of the feature class — a canned-ACL write that submits no document, an
+/// object-level tag write, and a configuration PUT carrying no document at all — so what is
 /// pinned is which refusal each class of call earns rather than one recorded call's answer.
 #[tokio::test]
 async fn a_bucket_configuration_put_on_a_directory_bucket_names_the_document_it_submitted() {
@@ -1273,16 +1276,11 @@ async fn a_bucket_configuration_put_on_a_directory_bucket_names_the_document_it_
     // A call that submits no such document is refused for what the bucket does not HAVE, which
     // is a different class of answer: the published 501 naming that feature. The last row is a
     // configuration PUT whose body carries no document at all, which therefore submits none for
-    // the refusal above to name.
+    // the refusal above to name. A READ of one of these subresources is a third class again —
+    // the method refusal, pinned by
+    // [`a_read_of_a_subresource_a_directory_bucket_does_not_serve_is_refused_for_the_method`].
     // (case, method, the subresource under the bucket, the headers, the feature named)
-    let feature_rows: [FeatureRefusalRow; 4] = [
-        (
-            "a read of the versioning state",
-            "GET",
-            "?versioning",
-            &[],
-            "Versioning",
-        ),
+    let feature_rows: [FeatureRefusalRow; 3] = [
         (
             "an ACL named in headers, which submits no document",
             "PUT",
@@ -1369,5 +1367,199 @@ async fn a_bucket_configuration_put_on_a_directory_bucket_names_the_document_it_
             served.status,
             text(&served)
         );
+    }
+}
+
+/// One READ of a subresource a directory bucket does not serve: `(case, the subresource query
+/// under the bucket)`.
+///
+/// The queries are the ones the model binds the catalogued reads at
+/// (`smithy_query(query="operation",operation="GetBucketAccelerateConfiguration,…")` ->
+/// `GET /{Bucket}?accelerate` and its siblings); every catalogued read of a bucket subresource
+/// is here, including the two whose subresource is shared between a read of one configuration
+/// (`&id=`) and the listing of them all, and the version listing.
+const SUBRESOURCE_READS: [(&str, &str); 20] = [
+    ("transfer acceleration", "?accelerate"),
+    ("the versioning state", "?versioning"),
+    ("the bucket ACL", "?acl"),
+    ("the CORS configuration", "?cors"),
+    ("the bucket tag set", "?tagging"),
+    ("static website hosting", "?website"),
+    ("server access logging", "?logging"),
+    ("event notifications", "?notification"),
+    ("request payment", "?requestPayment"),
+    ("the replication configuration", "?replication"),
+    ("the bucket location", "?location"),
+    ("the bucket policy status", "?policyStatus"),
+    ("the Object Lock configuration", "?object-lock"),
+    ("the public access block", "?publicAccessBlock"),
+    ("object ownership", "?ownershipControls"),
+    ("one analytics configuration", "?analytics&id=absent"),
+    ("the analytics configurations of the bucket", "?analytics"),
+    (
+        "one S3 Intelligent-Tiering configuration",
+        "?intelligent-tiering&id=absent",
+    ),
+    (
+        "the S3 Intelligent-Tiering configurations of the bucket",
+        "?intelligent-tiering",
+    ),
+    ("the version listing", "?versions"),
+];
+
+/// RULE: a READ of a subresource a DIRECTORY bucket does not serve is refused for the METHOD —
+/// HTTP 405 `MethodNotAllowed` with the fixed sentence that code publishes — because the Zonal
+/// endpoint serves no method at that address, while a call it does route (the bucket's own
+/// listing, an object's subresource) keeps the 501 naming the feature the bucket lacks, the
+/// write of the same subresource keeps the 400 naming the document it submitted, and the same
+/// reads on a general purpose bucket are served.
+///
+/// The rows span the whole class the rule covers — every catalogued read of a bucket
+/// subresource, so every subresource query the model binds one at, the two that are shared with
+/// a listing of the same configurations included — rather than the one recorded call; the rows
+/// below them are the neighbouring classes, which the rule must leave where they are.
+#[tokio::test]
+async fn a_read_of_a_subresource_a_directory_bucket_does_not_serve_is_refused_for_the_method() {
+    let router = router();
+    let directory = "subresourceread--use1-az4--x-s3";
+    directory_bucket(&router, directory, "use1-az4").await;
+    bucket(&router, "subresourceread-general-purpose").await;
+
+    for (case, subresource) in SUBRESOURCE_READS {
+        let refused = send(
+            &router,
+            "GET",
+            &format!("/{directory}{subresource}"),
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(
+            refused.status, 405,
+            "case {case:?}: expected HTTP 405 for a method this endpoint does not serve, got {} \
+             with body {:?}",
+            refused.status,
+            text(&refused)
+        );
+        assert_eq!(
+            refused.error_code(),
+            "MethodNotAllowed",
+            "case {case:?}: expected the MethodNotAllowed code, got {:?}",
+            refused.error_code()
+        );
+        assert_eq!(
+            refused.error_message(),
+            "The specified method is not allowed against this resource.",
+            "case {case:?}: the sentence that code publishes is fixed text, got {:?}",
+            refused.error_message()
+        );
+    }
+
+    // The neighbouring classes, which this rule does not move: a call the Zonal endpoint does
+    // route is refused for the FEATURE the bucket does not have (the v1 listing of the bucket
+    // itself, and an OBJECT's subresource — recorded verbatim for the object tag-set plane),
+    // and the WRITE of one of the subresources above is refused for the document it submitted.
+    // (case, method, the path under the bucket, the body, status, code, message)
+    let neighbours: [(&str, &str, &str, &str, u16, &str, &str); 3] = [
+        (
+            "the v1 listing of the bucket itself, which addresses no subresource",
+            "GET",
+            "",
+            "",
+            501,
+            "NotImplemented",
+            "This bucket does not support ListObjects.",
+        ),
+        (
+            "an object's tag set, which is not a subresource of the bucket",
+            "GET",
+            "/tagged.txt?tagging",
+            "",
+            501,
+            "NotImplemented",
+            "This bucket does not support Object Tags.",
+        ),
+        (
+            "the write of the same subresource, which submits a document",
+            "PUT",
+            "?accelerate",
+            "<AccelerateConfiguration><Status>Enabled</Status></AccelerateConfiguration>",
+            400,
+            "InvalidArgument",
+            "AccelerateConfiguration is not valid, expected CreateBucketConfiguration",
+        ),
+    ];
+    for (case, method, path, body, status, code, message) in neighbours {
+        let refused = send(&router, method, &format!("/{directory}{path}"), &[], body).await;
+        assert_eq!(
+            refused.status, status,
+            "case {case:?}: expected HTTP {status}, got {} with body {:?}",
+            refused.status,
+            text(&refused)
+        );
+        assert_eq!(
+            refused.error_code(),
+            code,
+            "case {case:?}: expected the {code} code, got {:?}",
+            refused.error_code()
+        );
+        assert_eq!(
+            refused.error_message(),
+            message,
+            "case {case:?}: expected {message:?}, got {:?}",
+            refused.error_message()
+        );
+    }
+
+    // And the other half of the rule: the same reads are SERVED on a general purpose bucket, so
+    // the refusal belongs to the bucket's kind and not to the subresource — including the
+    // round trip of the recorded case, whose configuration is written and read back.
+    let general_purpose = "subresourceread-general-purpose";
+    let configured = send(
+        &router,
+        "PUT",
+        &format!("/{general_purpose}?accelerate"),
+        &[],
+        "<AccelerateConfiguration><Status>Enabled</Status></AccelerateConfiguration>",
+    )
+    .await;
+    assert!(
+        (200..300).contains(&configured.status),
+        "case \"transfer acceleration on a general purpose bucket\": the configuration must be \
+         taken, got {} with body {:?}",
+        configured.status,
+        text(&configured)
+    );
+    for (case, subresource, expected) in [
+        (
+            "transfer acceleration",
+            "?accelerate",
+            Some("<Status>Enabled</Status>"),
+        ),
+        ("the versioning state", "?versioning", None),
+        ("the bucket location", "?location", None),
+    ] {
+        let served = send(
+            &router,
+            "GET",
+            &format!("/{general_purpose}{subresource}"),
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(
+            served.status, 200,
+            "case {case:?}: a general purpose bucket serves this read, got {} with body {:?}",
+            served.status,
+            text(&served)
+        );
+        if let Some(expected) = expected {
+            let body = text(&served);
+            assert!(
+                body.contains(expected),
+                "case {case:?}: the read must report the configuration that was written \
+                 ({expected}), got {body:?}"
+            );
+        }
     }
 }

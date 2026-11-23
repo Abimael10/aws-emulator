@@ -9,10 +9,13 @@
 //! request that addresses a directory bucket and names such an operation is REFUSED rather
 //! than served, and the answer states WHAT refused it: a call asking for a FEATURE its KIND
 //! does not have earns the 501 `NotImplemented` and a sentence naming that feature ("This
-//! bucket does not support Object Tags." for the object tag-set plane), while a PUT that
+//! bucket does not support Object Tags." for the object tag-set plane), a PUT that
 //! SUBMITS a bucket-configuration document earns the request-shape refusal for that document
 //! (400 `InvalidArgument`, "<Element> is not valid, expected CreateBucketConfiguration", that
-//! being the one bucket-configuration document such a bucket's endpoint parses). Two further
+//! being the one bucket-configuration document such a bucket's endpoint parses), and a READ of
+//! a subresource of the bucket earns the method refusal (405 `MethodNotAllowed`, "The specified
+//! method is not allowed against this resource."), that endpoint serving no method at such an
+//! address at all. Two further
 //! members of the same rule are pinned here: a `CopyObject` into a directory bucket may write
 //! no tags at all ("only the empty tag-set is supported … any requests that attempt to write
 //! non-empty tags into directory buckets will receive a `501 Not Implemented` status code",
@@ -206,7 +209,10 @@ async fn general_purpose_bucket(router: &MultiServiceRouter, name: &str) {
 /// WHICH refusal a call of this surface earns, which is not one answer for all of them.
 ///
 /// A call that asks for a FEATURE the bucket's kind does not have is answered 501
-/// `NotImplemented` with the sentence naming that feature. A PUT that SUBMITS a
+/// `NotImplemented` with the sentence naming that feature. A READ of a subresource of the
+/// bucket is answered for the METHOD — HTTP 405 `MethodNotAllowed` with the fixed sentence that
+/// code publishes — because the Zonal endpoint serves no method at that address (recorded
+/// against this surface for the `?accelerate` read of a directory bucket). A PUT that SUBMITS a
 /// bucket-configuration document is answered for the DOCUMENT instead — HTTP 400
 /// `InvalidArgument` naming the root element the request carried beside
 /// `CreateBucketConfiguration`, the one bucket-configuration document a directory bucket's
@@ -223,11 +229,20 @@ enum Refusal {
     Feature(&'static str),
     /// The root element of the configuration document the request submitted.
     Document(&'static str),
+    /// The method the endpoint serves none of at the subresource the request addressed.
+    Method,
 }
 
 /// The code and status a submitted document the endpoint does not parse is refused with.
 const INVALID_ARGUMENT: &str = "InvalidArgument";
 const INVALID_ARGUMENT_STATUS: u16 = 400;
+
+/// The code, status and fixed sentence a method the addressed resource does not serve is
+/// refused with.
+const METHOD_NOT_ALLOWED: &str = "MethodNotAllowed";
+const METHOD_NOT_ALLOWED_STATUS: u16 = 405;
+const METHOD_NOT_ALLOWED_MESSAGE: &str =
+    "The specified method is not allowed against this resource.";
 
 impl Refusal {
     /// The status, the code and the whole sentence this refusal is answered with.
@@ -242,6 +257,11 @@ impl Refusal {
                 INVALID_ARGUMENT_STATUS,
                 INVALID_ARGUMENT,
                 format!("{element} is not valid, expected CreateBucketConfiguration"),
+            ),
+            Self::Method => (
+                METHOD_NOT_ALLOWED_STATUS,
+                METHOD_NOT_ALLOWED,
+                METHOD_NOT_ALLOWED_MESSAGE.to_string(),
             ),
         }
     }
@@ -264,10 +284,11 @@ type Call = (
 /// versioning, notification, replication, ACL, location, request-payment, logging and
 /// public-access planes, so the refusal is pinned for the surface the model marks rather than
 /// for the four operations the report cited. Beside each is the refusal it earns ([`Refusal`]):
-/// every call asking for one plane names that plane, so the read of it and a write that submits
-/// no document tell a client the same thing, while a write that submits a configuration DOCUMENT
-/// is answered for that document.
-const UNSUPPORTED_CALLS: [Call; 16] = [
+/// a call asking for one plane of an OBJECT, and a call addressed at the bucket itself, name the
+/// plane the bucket does not have; a write that submits a configuration DOCUMENT is answered for
+/// that document; and a read of a SUBRESOURCE of the bucket is answered for the method, there
+/// being none at that address.
+const UNSUPPORTED_CALLS: [Call; 17] = [
     (
         "PutObjectTagging",
         "PUT",
@@ -289,13 +310,7 @@ const UNSUPPORTED_CALLS: [Call; 16] = [
         "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
         Refusal::Document("VersioningConfiguration"),
     ),
-    (
-        "GetBucketVersioning",
-        "GET",
-        "?versioning",
-        "",
-        Refusal::Feature("Versioning"),
-    ),
+    ("GetBucketVersioning", "GET", "?versioning", "", Refusal::Method),
     (
         "PutBucketNotificationConfiguration",
         "PUT",
@@ -308,7 +323,7 @@ const UNSUPPORTED_CALLS: [Call; 16] = [
         "GET",
         "?notification",
         "",
-        Refusal::Feature("Notifications"),
+        Refusal::Method,
     ),
     (
         "PutBucketReplication",
@@ -326,7 +341,7 @@ const UNSUPPORTED_CALLS: [Call; 16] = [
         "GET",
         "?replication",
         "",
-        Refusal::Feature("Replication"),
+        Refusal::Method,
     ),
     (
         "PutBucketTagging",
@@ -335,41 +350,18 @@ const UNSUPPORTED_CALLS: [Call; 16] = [
         "<Tagging><TagSet><Tag><Key>team</Key><Value>storage</Value></Tag></TagSet></Tagging>",
         Refusal::Document("Tagging"),
     ),
+    ("GetBucketTagging", "GET", "?tagging", "", Refusal::Method),
+    ("GetBucketAcl", "GET", "?acl", "", Refusal::Method),
+    ("GetBucketLocation", "GET", "?location", "", Refusal::Method),
+    ("GetBucketRequestPayment", "GET", "?requestPayment", "", Refusal::Method),
+    ("GetBucketLogging", "GET", "?logging", "", Refusal::Method),
+    ("GetPublicAccessBlock", "GET", "?publicAccessBlock", "", Refusal::Method),
     (
-        "GetBucketTagging",
+        "GetBucketAccelerateConfiguration",
         "GET",
-        "?tagging",
+        "?accelerate",
         "",
-        Refusal::Feature("Bucket Tagging"),
-    ),
-    ("GetBucketAcl", "GET", "?acl", "", Refusal::Feature("ACL")),
-    (
-        "GetBucketLocation",
-        "GET",
-        "?location",
-        "",
-        Refusal::Feature("GetBucketLocation"),
-    ),
-    (
-        "GetBucketRequestPayment",
-        "GET",
-        "?requestPayment",
-        "",
-        Refusal::Feature("Request Payment"),
-    ),
-    (
-        "GetBucketLogging",
-        "GET",
-        "?logging",
-        "",
-        Refusal::Feature("Logging"),
-    ),
-    (
-        "GetPublicAccessBlock",
-        "GET",
-        "?publicAccessBlock",
-        "",
-        Refusal::Feature("Public Access Block"),
+        Refusal::Method,
     ),
     (
         "ListObjects",
@@ -383,8 +375,10 @@ const UNSUPPORTED_CALLS: [Call; 16] = [
 /// RULE: a request addressing a DIRECTORY bucket and naming an operation the model says such a
 /// bucket does not serve is REFUSED — for the FEATURE that bucket's kind does not have (501
 /// `NotImplemented`), or, where the call submits a bucket-configuration document, for that
-/// DOCUMENT (400 `InvalidArgument`, naming it beside `CreateBucketConfiguration`) — while the
-/// SAME call against a general purpose bucket is not refused that way at all.
+/// DOCUMENT (400 `InvalidArgument`, naming it beside `CreateBucketConfiguration`), or, where it
+/// READS a subresource of the bucket, for the METHOD that endpoint serves none of there (405
+/// `MethodNotAllowed`) — while the SAME call against a general purpose bucket is not refused
+/// that way at all.
 #[tokio::test]
 async fn an_operation_a_directory_bucket_does_not_serve_is_refused() {
     let (router, _engine) = emulator();

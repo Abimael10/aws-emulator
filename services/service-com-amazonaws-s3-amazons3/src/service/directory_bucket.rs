@@ -260,6 +260,63 @@ pub fn not_a_create_bucket_configuration_message(element: &str) -> String {
     format!("{element} is not valid, expected {CREATE_BUCKET_CONFIGURATION_ELEMENT}")
 }
 
+/// The catalogued operations that READ a SUBRESOURCE of the bucket they address — every one of
+/// them bound by the model at `GET /{Bucket}?<subresource>`
+/// (`smithy_query(query="operation",operation="GetBucketAccelerateConfiguration,GetBucketAcl,…")`).
+///
+/// A directory bucket's endpoint serves no such METHOD: the subresource is a plane that kind of
+/// bucket does not have at all, so there is nothing at that address for a `GET` to report, and
+/// S3 answers the method rather than the feature — [`crate::state::METHOD_NOT_ALLOWED_CODE`] at
+/// [`crate::state::METHOD_NOT_ALLOWED_STATUS`] with the fixed sentence that code publishes
+/// ([`crate::state::METHOD_NOT_ALLOWED_MESSAGE`]), which is what the `?accelerate` read of one
+/// is recorded answering. This is the READ counterpart of [`CONFIGURATION_DOCUMENT_PUTS`]: the
+/// two directions of one unsupported subresource are each refused in their own specific class,
+/// never in the unimplemented-feature class ([`unsupported_message`]) that says the emulator or
+/// the service has not built the call yet.
+///
+/// Membership is the model's own binding and nothing else — method `GET` and a uri that opens
+/// `/{Bucket}?` — read out of the model by the suite below, so this list cannot drift from it.
+/// Two kinds of catalogued read are therefore NOT here, because neither addresses a subresource
+/// of the bucket: a call addressed at the bucket itself (`GET /{Bucket}`, the v1 listing) and a
+/// call addressed at an OBJECT's subresource (`GET /{Bucket}/{Key+}?…`). Those are methods the
+/// Zonal endpoint does serve, and what such a call asks for is a feature the bucket does not
+/// have — the refusal recorded for the object tag-set plane.
+///
+/// A catalogued DELETE of one of these same subresources (`DELETE /{Bucket}?cors` and its
+/// siblings) submits no document either, and it keeps the unimplemented-feature refusal: the
+/// REMOVAL of a configuration a bucket of that kind never holds asks for the plane rather than
+/// for a method at an address, and the refusal of a subresource method is recorded for the read
+/// alone. A recording of such a delete is what would move it, and then it moves by joining a
+/// table here rather than by a case of its own.
+pub const SUBRESOURCE_READS: [&str; 20] = [
+    "GetBucketAccelerateConfiguration",
+    "GetBucketAcl",
+    "GetBucketAnalyticsConfiguration",
+    "GetBucketCors",
+    "GetBucketIntelligentTieringConfiguration",
+    "GetBucketLocation",
+    "GetBucketLogging",
+    "GetBucketNotificationConfiguration",
+    "GetBucketOwnershipControls",
+    "GetBucketPolicyStatus",
+    "GetBucketReplication",
+    "GetBucketRequestPayment",
+    "GetBucketTagging",
+    "GetBucketVersioning",
+    "GetBucketWebsite",
+    "GetObjectLockConfiguration",
+    "GetPublicAccessBlock",
+    "ListBucketAnalyticsConfigurations",
+    "ListBucketIntelligentTieringConfigurations",
+    "ListObjectVersions",
+];
+
+/// Whether `operation` READS a subresource of the bucket it addresses
+/// ([`SUBRESOURCE_READS`]) — the calls whose refusal on a directory bucket is the method one.
+pub fn reads_a_bucket_subresource(operation: &str) -> bool {
+    SUBRESOURCE_READS.contains(&operation)
+}
+
 /// The root element of the document `req` submitted, when its body is markup at all.
 ///
 /// Read off the REQUEST, because that is what the refusal above names: a document whose root is
@@ -305,6 +362,11 @@ pub fn refusal_key(operation: &str) -> Option<&'static str> {
 /// wording family S3 answers a PARAMETER a directory bucket does not serve with ("this bucket
 /// does not support start-after query parameter for ListObjectsV2 API.",
 /// `crate::ops::list_objects_v2`).
+///
+/// It is NOT what a read of a bucket SUBRESOURCE earns ([`SUBRESOURCE_READS`]) or what a PUT
+/// submitting a bucket-configuration document earns
+/// ([`not_a_create_bucket_configuration_message`]): each of those is refused in its own class,
+/// and this sentence answers the calls that are left.
 pub fn unsupported_message(feature: &str) -> String {
     format!("This bucket does not support {feature}.")
 }
@@ -340,7 +402,7 @@ impl RefuseUnsupportedOperation {
         }
     }
 
-    /// The envelope, which is one of two documents:
+    /// The envelope, which is one of three documents:
     ///
     /// * a PUT that SUBMITS a bucket-configuration document ([`CONFIGURATION_DOCUMENT_PUTS`]
     ///   names the calls, [`submitted_document_element`] reads what the request carried) is
@@ -348,6 +410,11 @@ impl RefuseUnsupportedOperation {
     ///   ([`crate::state::INVALID_ARGUMENT_CODE`], HTTP 400) naming the element the request
     ///   carried beside the one document a directory bucket's endpoint parses
     ///   ([`not_a_create_bucket_configuration_message`]);
+    /// * a READ of a subresource of the bucket ([`SUBRESOURCE_READS`]) is refused for the
+    ///   METHOD — that endpoint serves none at that address, so the answer is
+    ///   [`crate::state::METHOD_NOT_ALLOWED_CODE`] at
+    ///   [`crate::state::METHOD_NOT_ALLOWED_STATUS`] carrying the fixed sentence that code
+    ///   publishes;
     /// * every other catalogued call is refused for the FEATURE the bucket does not have: the
     ///   code S3 answers a request whose address implies functionality it does not implement
     ///   for the resource addressed ([`crate::state::NOT_IMPLEMENTED_CODE`], HTTP 501) and the
@@ -362,6 +429,11 @@ impl RefuseUnsupportedOperation {
                 crate::state::INVALID_ARGUMENT_CODE,
                 crate::state::INVALID_ARGUMENT_STATUS,
                 not_a_create_bucket_configuration_message(&element),
+            ),
+            None if reads_a_bucket_subresource(self.operation) => (
+                crate::state::METHOD_NOT_ALLOWED_CODE,
+                crate::state::METHOD_NOT_ALLOWED_STATUS,
+                crate::state::METHOD_NOT_ALLOWED_MESSAGE.to_string(),
             ),
             None => (
                 crate::state::NOT_IMPLEMENTED_CODE,
@@ -552,6 +624,84 @@ mod tests {
             ["uri"]
             .as_str()
             .map(str::to_string)
+    }
+
+    /// The `@http` method `operation` is bound with, as the model binds it.
+    fn http_method_in_the_model(operation: &str) -> Option<String> {
+        let model = model();
+        model["shapes"][format!("com.amazonaws.s3#{operation}")]["traits"]["smithy.api#http"]
+            ["method"]
+            .as_str()
+            .map(str::to_string)
+    }
+
+    /// RULE: a catalogued call is in [`SUBRESOURCE_READS`] exactly when the model binds it as a
+    /// `GET` of a subresource of the bucket it addresses (`GET /{Bucket}?…`) — so the class
+    /// answered for the METHOD cannot drift from the model, in either direction.
+    ///
+    /// Both halves are read out of the model rather than listed by hand: a catalogued read of a
+    /// bucket subresource that was forgotten here would keep the unimplemented-feature refusal,
+    /// and a call that addresses the bucket itself or an object's subresource must not be moved
+    /// into the method class.
+    #[test]
+    fn a_subresource_read_is_what_the_model_binds_as_one() {
+        for (operation, _, _) in UNSUPPORTED_BY_A_DIRECTORY_BUCKET {
+            let method = http_method_in_the_model(operation).unwrap_or_default();
+            let uri = http_uri_in_the_model(operation).unwrap_or_default();
+            let reads_a_subresource = method == "GET" && uri.starts_with("/{Bucket}?");
+            assert_eq!(
+                reads_a_bucket_subresource(operation),
+                reads_a_subresource,
+                "case {operation:?}: the model binds {method} {uri:?}, so this call {} a \
+                 subresource of the bucket; the table says {}",
+                match reads_a_subresource {
+                    true => "reads",
+                    false => "does not read",
+                },
+                reads_a_bucket_subresource(operation)
+            );
+        }
+        // No call is in two classes at once: what a read of a subresource earns is the method
+        // refusal, and what a configuration PUT earns is the document one.
+        for operation in SUBRESOURCE_READS {
+            assert_eq!(
+                configuration_document(operation),
+                None,
+                "case {operation:?}: a read submits no bucket-configuration document, so it must \
+                 resolve to none, got {:?}",
+                configuration_document(operation)
+            );
+        }
+    }
+
+    /// RULE: the refusal a read of an unsupported subresource earns is S3's published
+    /// method-not-allowed one — that code, that status and its FIXED sentence, with nothing of
+    /// the request or of the feature in it.
+    #[test]
+    fn a_subresource_read_is_refused_for_the_method() {
+        assert_eq!(
+            crate::state::METHOD_NOT_ALLOWED_CODE, "MethodNotAllowed",
+            "the published code for this refusal is \"MethodNotAllowed\", got {:?}",
+            crate::state::METHOD_NOT_ALLOWED_CODE
+        );
+        assert_eq!(
+            crate::state::METHOD_NOT_ALLOWED_STATUS, 405,
+            "the published status for this refusal is 405, got {}",
+            crate::state::METHOD_NOT_ALLOWED_STATUS
+        );
+        assert_eq!(
+            crate::state::METHOD_NOT_ALLOWED_MESSAGE,
+            "The specified method is not allowed against this resource.",
+            "the sentence is fixed text, got {:?}",
+            crate::state::METHOD_NOT_ALLOWED_MESSAGE
+        );
+        for operation in SUBRESOURCE_READS {
+            assert!(
+                refusal_key(operation).is_some(),
+                "case {operation:?}: a method refusal only ever answers an operation a \
+                 directory bucket does not serve, and this one is not catalogued"
+            );
+        }
     }
 
     /// RULE, the converse: EVERY catalogued call the model binds a required XML document payload
