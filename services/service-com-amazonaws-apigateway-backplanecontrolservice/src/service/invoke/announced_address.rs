@@ -16,10 +16,12 @@
 //! `super::resolve` reads). An announced address a caller cannot reach is an artifact that
 //! points every client built from it away from the emulated API.
 //!
-//! ONE reading for every artifact that names it, so a definition and a generated SDK of one
-//! stage cannot hand two unrelated addresses out: the exported document's `host` (Swagger
-//! 2.0) and `servers[].url` (OpenAPI 3.0) are built on it, and so is the endpoint `GetSdk`
-//! binds its client to.
+//! ONE reading for every artifact that DIALS it, so a definition and a generated SDK of one
+//! stage cannot hand two unrelated addresses out: the exported 2.0 document's `host` is built
+//! on it, and so is the endpoint `GetSdk` binds its client to. The ONE templated server URL
+//! of a 3.0 document is the api's own default `execute-api` endpoint instead — a 3.0 document
+//! is read by tooling that recovers the api and the Region from that URL — which
+//! [`execute_api_host`] states and `GetExport` renders.
 
 use super::{EMULATOR_PATH_NAMESPACE, EXECUTE_API_LABEL};
 

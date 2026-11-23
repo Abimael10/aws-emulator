@@ -13,10 +13,16 @@
 //! The two RULES the rows assert, each one level above the recorded case:
 //!
 //! > 1. Every invoke address this emulator publishes for a deployed stage is an address the
-//! >    publishing client can dial: the endpoint that client REACHED this emulator at, with
-//! >    the api named behind the reserved data-plane prefix, and one of AWS's own
-//! >    `execute-api` hosts only for a client that addressed one of AWS's own hosts — and a
-//! >    request to the published address reaches the method the stage deployed.
+//! >    publishing client can dial. Where the artifact states the address a client of THAT
+//! >    artifact dials — a Swagger 2.0 document's `host` beside the stage's `basePath` — it is
+//! >    the endpoint that client REACHED this emulator at, with the api named behind the
+//! >    reserved data-plane prefix, and one of AWS's own `execute-api` hosts only for a client
+//! >    that addressed one of AWS's own hosts. The ONE templated server URL of an OpenAPI 3.0
+//! >    document is the api's own DEFAULT invoke endpoint instead, built from the api's id and
+//! >    the Region (`{api-id}.execute-api.{region}.amazonaws.com`, no path ahead of the
+//! >    `{basePath}` variable), because that single URL is what a reader parses to recover the
+//! >    api and the Region. Either way a request to the published address reaches the method
+//! >    the stage deployed, since this data plane claims both addressings.
 //! > 2. A request to a `COGNITO_USER_POOLS`-gated method presenting a token that a pool the
 //! >    authorizer trusts signed and whose own `exp` has elapsed is refused `401` with the
 //! >    sentence AWS words an expired token with, `{"message":"The incoming token has
@@ -476,6 +482,9 @@ struct PublishedAddress {
     artifact: &'static str,
     /// The base URL, `{scheme}://{host}{path}`, with no trailing slash.
     base_url: String,
+    /// Whether this artifact states the address a client of IT dials — the endpoint the
+    /// reading client reached — rather than the api's own default invoke endpoint.
+    names_the_reached_endpoint: bool,
 }
 
 /// The export document of the stage in `dialect`, as the JSON file a caller downloads, read
@@ -536,10 +545,12 @@ async fn published_addresses(
         PublishedAddress {
             artifact: "the oas30 export's server URL",
             base_url: templated.replace("{basePath}", &base_path),
+            names_the_reached_endpoint: false,
         },
         PublishedAddress {
             artifact: "the swagger export's host and basePath",
             base_url: format!("{INVOKE_SCHEME}{host}{swagger_base}"),
+            names_the_reached_endpoint: true,
         },
     ]
 }
@@ -646,11 +657,15 @@ async fn a_gated_stage_is_published_at_an_address_this_emulator_serves() {
         let addresses = published_addresses(&router, endpoint.host, &api_id).await;
         for published in &addresses {
             let case = format!("{} via {}", endpoint.case, published.artifact);
-            // 1. The address names an authority the reading client can dial.
-            let expected_authority = if endpoint.own_endpoint {
+            // 1. The address names an authority the reading client can dial: the endpoint it
+            //    reached, where the artifact states that, and otherwise the api's own default
+            //    invoke endpoint — which this data plane claims host-style.
+            let own_default = format!("{api_id}.execute-api.{REGION}.{AWS_HOST_SUFFIX}");
+            let expected_authority = if endpoint.own_endpoint && published.names_the_reached_endpoint
+            {
                 endpoint.host.to_string()
             } else {
-                format!("{api_id}.execute-api.{REGION}.{AWS_HOST_SUFFIX}")
+                own_default
             };
             let authority = published
                 .base_url
@@ -663,7 +678,7 @@ async fn a_gated_stage_is_published_at_an_address_this_emulator_serves() {
                  got {:?}",
                 published.base_url
             );
-            if endpoint.own_endpoint {
+            if endpoint.own_endpoint && published.names_the_reached_endpoint {
                 assert!(
                     !authority.ends_with(AWS_HOST_SUFFIX),
                     "case {case:?}: a client that reached the emulator's own endpoint must not \
@@ -711,8 +726,9 @@ async fn an_expired_pool_token_is_refused_in_its_own_sentence_at_the_published_a
     let api_id = gated_stage(&router, endpoint, "expired-token-api", &pool.arn).await;
     let published = published_addresses(&router, endpoint, &api_id).await;
     let base_url = published
-        .first()
-        .expect("the stage's artifacts publish an address")
+        .iter()
+        .find(|address| address.names_the_reached_endpoint)
+        .expect("an artifact of the stage publishes the address the reading client reached")
         .base_url
         .clone();
     assert!(

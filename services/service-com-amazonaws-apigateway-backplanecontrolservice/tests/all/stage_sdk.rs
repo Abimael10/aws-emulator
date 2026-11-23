@@ -135,8 +135,12 @@ const DEPLOYED: &[(&str, &str, &str)] = &[
 ];
 
 /// One row of the missing-parameter table: the generator, the `parameters` the request
-/// carries, and the property the refusal has to name.
-type MissingRow<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str);
+/// carries, and every property the refusal has to name, in the order it names them.
+type MissingRow<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
+
+/// One row of the resolution-order table: the case, the `restApiId` the request names, its
+/// `sdkType` and the `parameters` it carries.
+type PrecedenceRow<'a> = (&'a str, &'a str, &'a str, &'a [(&'a str, &'a str)]);
 
 /// One answered `GetSdk`: the status, the error code of a refusal, the two headers the
 /// operation binds, and the body bytes.
@@ -758,21 +762,31 @@ async fn a_generator_missing_a_required_parameter_is_the_modelled_bad_request() 
     let gateway = Gateway::new();
     let (api, _, _) = deployed_api(&gateway).await;
 
-    // Every generator that declares a required property, configured without it: the
-    // refusal names the first property the generator cannot be run without.
+    // Every generator that declares a required property, configured without it: the refusal
+    // names EVERY property the generator cannot be run without that the request left unset,
+    // so the rows differ along how many are missing (all of them, one of several, one of
+    // one) and along which spelling satisfied the ones that are set.
     let missing: &[MissingRow<'_>] = &[
-        ("java", &[], "service.name"),
+        ("java", &[], &["service.name", "java.package-name"][..]),
         (
             "java",
             &[("service.name", "Pet Store")],
-            "java.package-name",
+            &["java.package-name"][..],
         ),
-        ("java", &[("javaPackageName", "com.pets")], "service.name"),
-        ("ruby", &[], "service.name"),
-        ("ruby", &[("service.name", "   ")], "service.name"),
-        ("objectivec", &[], "classPrefix"),
-        ("swift", &[("classPrefix", "")], "classPrefix"),
-        ("android", &[], "groupId"),
+        (
+            "java",
+            &[("javaPackageName", "com.pets")],
+            &["service.name"][..],
+        ),
+        ("ruby", &[], &["service.name"][..]),
+        ("ruby", &[("service.name", "   ")], &["service.name"][..]),
+        ("objectivec", &[], &["classPrefix"][..]),
+        ("swift", &[("classPrefix", "")], &["classPrefix"][..]),
+        (
+            "android",
+            &[],
+            &["groupId", "artifactId", "artifactVersion", "invokerPackage"][..],
+        ),
         (
             "android",
             &[
@@ -780,11 +794,11 @@ async fn a_generator_missing_a_required_parameter_is_the_modelled_bad_request() 
                 ("artifactId", "petstore-android"),
                 ("artifactVersion", "2.1.0"),
             ],
-            "invokerPackage",
+            &["invokerPackage"][..],
         ),
     ];
-    for (sdk_type, parameters, property) in missing {
-        let case = format!("GetSdk({sdk_type}, without {property})");
+    for (sdk_type, parameters, properties) in missing {
+        let case = format!("GetSdk({sdk_type}, without {properties:?})");
         let answer = get_sdk(&gateway, &api, STAGE, sdk_type, parameters).await;
         assert_eq!(
             (answer.status, answer.error.as_deref()),
@@ -792,10 +806,20 @@ async fn a_generator_missing_a_required_parameter_is_the_modelled_bad_request() 
             "case {case}: expected the modelled refusal, got {:?}",
             String::from_utf8_lossy(&answer.body)
         );
+        // Fixed text, then the missing property names bracketed and comma-separated; the
+        // sdkType itself is not named.
         assert_eq!(
             answer.message(),
-            format!("A parameter named {property} is required for sdkType of {sdk_type}"),
-            "case {case}: expected the refusal to name {property}, got {:?}",
+            format!(
+                "Required SDK properties are missing: [{}]",
+                properties.join(", ")
+            ),
+            "case {case}: expected the refusal to name {properties:?}, got {:?}",
+            answer.message()
+        );
+        assert!(
+            !answer.message().contains("sdkType"),
+            "case {case}: the refusal must not name the sdkType, got {:?}",
             answer.message()
         );
     }
@@ -807,6 +831,76 @@ async fn a_generator_missing_a_required_parameter_is_the_modelled_bad_request() 
         "case GetSdk(javascript, no parameters): expected 200, got {} with {:?}",
         generated.status,
         String::from_utf8_lossy(&generated.body)
+    );
+}
+
+#[tokio::test]
+async fn the_stage_is_resolved_before_the_requests_own_sdk_type_and_parameters() {
+    let gateway = Gateway::new();
+    let (api, _, _) = deployed_api(&gateway).await;
+
+    // A request whose URI names no stored stage is refused for the STAGE whether or not its
+    // sdkType and its parameters would also have been rejected: the resources the path names
+    // are resolved before the request's own contents. The rows differ along which half of
+    // the pair is unresolvable and along what else about the request is wrong.
+    let rows: &[PrecedenceRow<'_>] = &[
+        ("a stage the api does not hold", api.as_str(), "ruby", &[]),
+        (
+            "a stage the api does not hold, with a configured generator",
+            api.as_str(),
+            "java",
+            &[("service.name", "Pet Store")],
+        ),
+        (
+            "a stage the api does not hold, with a generator this service has none of",
+            api.as_str(),
+            "cobol",
+            &[],
+        ),
+        ("an api no record answers to", "zzzzzzzzzz", "ruby", &[]),
+        (
+            "an api no record answers to, with a generator this service has none of",
+            "zzzzzzzzzz",
+            "objective-c",
+            &[],
+        ),
+    ];
+    for (case, api_id, sdk_type, parameters) in rows {
+        let answer = get_sdk(&gateway, api_id, "nosuchstage", sdk_type, parameters).await;
+        assert_eq!(
+            (answer.status, answer.error.as_deref()),
+            (404, Some("NotFoundException")),
+            "case {case}: expected the stage refusal, got {:?}",
+            String::from_utf8_lossy(&answer.body)
+        );
+        assert_eq!(
+            answer.message(),
+            "Invalid stage identifier specified",
+            "case {case}: expected the stage refusal, got {:?}",
+            answer.message()
+        );
+    }
+
+    // The same requests against the stage the api DOES hold are refused for what they carry,
+    // so the order above is a precedence and not a swallowed check.
+    let parameters = get_sdk(&gateway, &api, STAGE, "ruby", &[]).await;
+    assert_eq!(
+        (parameters.status, parameters.message()),
+        (
+            400,
+            "Required SDK properties are missing: [service.name]".to_string()
+        ),
+        "case a resolvable stage without the required properties: expected the parameter \
+         refusal, got {:?}",
+        String::from_utf8_lossy(&parameters.body)
+    );
+    let generator = get_sdk(&gateway, &api, STAGE, "cobol", &[]).await;
+    assert_eq!(
+        (generator.status, generator.message()),
+        (400, "No SDK generator for type 'cobol'".to_string()),
+        "case a resolvable stage naming a generator this service has none of: expected the \
+         generator refusal, got {:?}",
+        String::from_utf8_lossy(&generator.body)
     );
 }
 

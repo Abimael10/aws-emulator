@@ -77,14 +77,13 @@ use crate::state::{
 /// remaining quota of a usage plan associated with a specified API key" (`UpdateUsage`'s own
 /// documentation).
 ///
-/// Published for the two ops that SET a single-valued member, as every other resource of
-/// this service publishes such a member: the remaining quota is a count the period always
-/// has, so it can be set but not removed.
-const PATCH_PATHS: SupportedPatchPaths = SupportedPatchPaths {
-    add: &["/remaining"],
-    remove: &[],
-    replace: &["/remaining"],
-};
+/// Published for `replace` ALONE, as a recorded refusal of this record shows: a path refused
+/// under a `replace` is answered with this one-entry list, while one refused under an `add`
+/// is told to choose a supported operation instead — the sentence a resource that publishes
+/// no path for that op answers ([`SupportedPatchPaths::replace_only`]). The remaining quota
+/// is a count the period always has, and which ops the member itself admits is applied where
+/// it is patched ([`apply_patch`]) rather than by this table.
+const PATCH_PATHS: SupportedPatchPaths = SupportedPatchPaths::replace_only(&["/remaining"]);
 
 /// How this operation words a refusal of a patch `path` it cannot apply: the path quoted,
 /// the `op` that named it and the paths this resource publishes for that op — the wording

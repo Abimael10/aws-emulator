@@ -29,7 +29,7 @@
 //!   carrying the query string, header and body parameters the method's `requestParameters`
 //!   and `requestModels` declare;
 //! * the stage and the address this emulator ANNOUNCES for it become the invoke endpoint
-//!   the client is bound to — the SAME endpoint the exported definition names
+//!   the client is bound to — the SAME endpoint a 2.0 exported definition names as its host
 //!   (`crate::service::invoke::announced_invoke_address`) and the one this emulator's data
 //!   plane answers —
 //!   and a method whose `apiKeyRequired` is set sends the api key the client was constructed
@@ -277,9 +277,9 @@ impl Generator {
     /// The generator `sdk_type` names, or the refusal for a language no generator of this
     /// service writes a client in.
     ///
-    /// Resolved before anything of the caller's is read, so a request naming a language
-    /// API Gateway generates no SDK for is refused the same way whether or not the api
-    /// exists.
+    /// Asked AFTER the stage the request addressed has been resolved: what the request ASKS
+    /// FOR is read only once the resources its URI names exist (see this operation's
+    /// `handle`).
     fn parse(sdk_type: &str) -> Result<Self, GetSdkError> {
         match sdk_type {
             SDK_TYPE_JAVA => Ok(Self::Java),
@@ -443,6 +443,7 @@ fn read_configuration(
     parameters: Option<&HashMap<String, String>>,
 ) -> Result<Configuration, String> {
     let mut configuration = Configuration::new();
+    let mut missing: Vec<String> = Vec::new();
     for (name, required) in generator.properties() {
         let value = parameters
             .and_then(|parameters| {
@@ -456,26 +457,27 @@ fn read_configuration(
             Some(value) => {
                 configuration.insert(name, value.to_string());
             }
-            None if required => return Err(missing_property(generator, &name)),
+            None if required => missing.push(name),
             None => {}
         }
+    }
+    if !missing.is_empty() {
+        return Err(missing_properties(&missing));
     }
     Ok(configuration)
 }
 
-/// The `BadRequestException` message a request missing a required configuration property is
-/// refused with: the property the generator cannot be run without, named as it is published,
-/// and the generator that requires it.
+/// The `BadRequestException` message a request missing required configuration properties is
+/// refused with: the fixed text, then EVERY property the generator cannot be run without
+/// that the request left unset, each named as the generator publishes it, comma-separated
+/// inside brackets.
 ///
-/// Both variable parts come from the request itself — the sdkType it named, and that
-/// generator's own property — and the sentence is the form the model states the requirement
-/// in ("For sdkType of java, parameters named serviceName and javaPackageName are
-/// required").
-fn missing_property(generator: Generator, name: &str) -> String {
-    format!(
-        "A parameter named {name} is required for sdkType of {}",
-        generator.id()
-    )
+/// The only variable part is that list of property names, which comes from the requirement
+/// set of the generator the request asked for ([`Generator::properties`]) matched against
+/// the request's own `parameters`; the sdkType itself is not named. One sentence for the
+/// whole request, so a client told what to supply is told all of it at once.
+fn missing_properties(names: &[String]) -> String {
+    format!("Required SDK properties are missing: [{}]", names.join(", "))
 }
 
 /// The camelCase spelling of a published property name: the segments of the dotted,
@@ -2557,12 +2559,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into()
         };
 
-        // What the request asks for is resolved before the store is read, so a request
-        // naming a generator this service publishes none of, or configuring one with what
-        // it cannot be run on, is refused the same way whether or not the api exists.
-        let generator = Generator::parse(&input.sdk_type)?;
-        let configuration =
-            read_configuration(generator, input.parameters.as_ref()).map_err(bad_request)?;
         let region = crate::state::request_region(ctx.parts());
 
         let store = state.lock();
@@ -2584,6 +2580,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some(crate::state::NO_SUCH_DEPLOYMENT.to_string()),
             })
         })?;
+
+        // The resources the URI names exist, so what the request ASKS FOR is read now: a
+        // generator this service writes no client in, and then the configuration that
+        // generator cannot be run without. A request whose stage does not exist is refused
+        // for the stage whether or not its sdkType and its parameters would also have been
+        // rejected — the path's resources are resolved before the request's own contents.
+        let generator = Generator::parse(&input.sdk_type)?;
+        let configuration =
+            read_configuration(generator, input.parameters.as_ref()).map_err(bad_request)?;
 
         // The endpoint the generated client is bound to is the stage's own invoke URL — the
         // endpoint the exported definition names, and the one this emulator's data plane

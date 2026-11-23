@@ -64,6 +64,26 @@ pub(crate) async fn update_usage(
         .await
 }
 
+/// The sentence `UpdateUsage` refuses a patch path this record cannot be addressed by with,
+/// under an op this record DOES publish a path for: the fixed text (API Gateway's own doubled
+/// space after `path` included), the path and the op exactly as the request spelled them, and
+/// then the paths that op may name on the record.
+fn invalid_usage_patch_path(path: &str, op: &str) -> String {
+    format!(
+        "Invalid patch path  '{path}' specified for op '{op}'. Must be one of: [/remaining]"
+    )
+}
+
+/// The sentence the same refusal carries under an op this record publishes NO path for: the
+/// same opening, and then the fixed instruction to choose a supported operation in place of a
+/// list there is nothing to fill.
+fn unsupported_usage_patch_op(path: &str, op: &str) -> String {
+    format!(
+        "Invalid patch path  '{path}' specified for op '{op}'. Please choose supported \
+         operations"
+    )
+}
+
 /// One `patchOperations` entry naming the remaining quota of the metering period; shared
 /// with the sibling suite like [`update_usage`].
 pub(crate) fn remaining_patch(op: &str, value: i64) -> Value {
@@ -438,14 +458,46 @@ async fn an_unresolvable_pair_an_unapplicable_patch_or_a_plan_with_no_quota_is_r
     }
 
     // The patch itself: a pointer the record publishes no member for, an op it publishes no
-    // pointer for, and a value that is no count of requests.
+    // pointer for, and a value that is no count of requests. The rows of the first kind span
+    // the FORMS an unapplicable pointer takes — a member of the plan rather than of the usage
+    // record, a member no shape declares, a pointer reaching into one, and a path that is no
+    // JSON Pointer — and the OP that named it: an op this record publishes a pointer for is
+    // offered that pointer, and an op it publishes none for is sent to one it supports.
     for (case, patches, message) in [
         (
-            "a pointer naming no member of the record",
+            "a pointer naming a member of the plan rather than of the usage record",
             json!([{ "op": "replace", "path": "/limit", "value": "5" }]),
-            "Invalid patch path  '/limit' specified for op 'replace'. Must be one of: \
-             [/remaining]"
-                .to_string(),
+            invalid_usage_patch_path("/limit", "replace"),
+        ),
+        (
+            "a pointer naming no member any shape declares",
+            json!([{ "op": "replace", "path": "/sim2realNoSuchField", "value": "1" }]),
+            invalid_usage_patch_path("/sim2realNoSuchField", "replace"),
+        ),
+        (
+            "the same pointer under an op the record publishes none for",
+            json!([{ "op": "add", "path": "/sim2realNoSuchField", "value": "1" }]),
+            unsupported_usage_patch_op("/sim2realNoSuchField", "add"),
+        ),
+        (
+            "a pointer reaching into the one member the record has",
+            json!([{ "op": "replace", "path": "/remaining/today", "value": "5" }]),
+            invalid_usage_patch_path("/remaining/today", "replace"),
+        ),
+        (
+            "a path that is no JSON Pointer",
+            json!([{ "op": "replace", "path": "remaining", "value": "5" }]),
+            invalid_usage_patch_path("remaining", "replace"),
+        ),
+        (
+            "a path that is no JSON Pointer, under an op the record publishes none for",
+            json!([{ "op": "add", "path": "", "value": "5" }]),
+            unsupported_usage_patch_op("", "add"),
+        ),
+        (
+            "a remove of the remaining quota",
+            json!([{ "op": "remove", "path": "/remaining" }]),
+            INVALID_PATCH_OPERATION.to_string(),
         ),
         (
             "a remove of the remaining quota",
