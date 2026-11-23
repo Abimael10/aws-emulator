@@ -284,8 +284,9 @@ struct ToggleCase {
 /// then carries, and leaves that value for any later reader — and the token
 /// moves exactly when the stored value did.
 ///
-/// The rows are the two settings this service serves a modify operation for, each
-/// driven from both starting values through the whole value set of a boolean.
+/// The rows are the three settings this service serves a modify operation for,
+/// each driven from both starting values through the whole value set of a
+/// boolean.
 #[tokio::test]
 async fn a_protection_setting_is_stored_and_read_back() {
     let harness = Harness::new();
@@ -316,13 +317,25 @@ async fn a_protection_setting_is_stored_and_read_back() {
             firewall: "subnet-guard-off-fw",
             created_with: false,
         },
+        ToggleCase {
+            operation: "UpdateFirewallPolicyChangeProtection",
+            member: "FirewallPolicyChangeProtection",
+            firewall: "policy-guard-on-fw",
+            created_with: true,
+        },
+        ToggleCase {
+            operation: "UpdateFirewallPolicyChangeProtection",
+            member: "FirewallPolicyChangeProtection",
+            firewall: "policy-guard-off-fw",
+            created_with: false,
+        },
     ];
 
     for case in &cases {
         let protections = Protections {
             delete: case.member == "DeleteProtection" && case.created_with,
             subnet_change: case.member == "SubnetChangeProtection" && case.created_with,
-            policy_change: false,
+            policy_change: case.member == "FirewallPolicyChangeProtection" && case.created_with,
         };
         create_firewall(
             &harness,
@@ -573,6 +586,10 @@ async fn a_call_on_a_gone_firewall_is_refused_as_not_found() {
         ("DescribeFirewall", json!({})),
         ("UpdateFirewallDeleteProtection", json!({ "DeleteProtection": false })),
         ("UpdateSubnetChangeProtection", json!({ "SubnetChangeProtection": false })),
+        (
+            "UpdateFirewallPolicyChangeProtection",
+            json!({ "FirewallPolicyChangeProtection": false }),
+        ),
         ("UpdateFirewallDescription", json!({ "Description": "no such firewall" })),
         (
             "AssociateSubnets",
@@ -624,6 +641,11 @@ async fn a_stale_token_cannot_change_a_protection_setting() {
             "UpdateSubnetChangeProtection",
             "SubnetChangeProtection",
             "token-subnet-fw",
+        ),
+        (
+            "UpdateFirewallPolicyChangeProtection",
+            "FirewallPolicyChangeProtection",
+            "token-policy-fw",
         ),
     ];
 
@@ -701,4 +723,136 @@ async fn a_stale_token_cannot_change_a_protection_setting() {
              accepted value"
         );
     }
+}
+
+/// RULE: the stored `FirewallPolicyChangeProtection` governs
+/// `AssociateFirewallPolicy` — while the setting is on the association is refused
+/// and the firewall keeps the policy it had, once the operation that modifies the
+/// setting has turned it off the identical call associates the new policy, and
+/// turning it back on refuses the call again.
+///
+/// Turning the setting over also moves the firewall's `UpdateToken`, so a token
+/// read before the toggle is stale for a conditional association issued after it.
+#[tokio::test]
+async fn the_stored_policy_change_setting_governs_the_association() {
+    let harness = Harness::new();
+    let policy_arn = harness.shared_policy("flip-policy").await;
+    let next_policy_arn = harness.shared_policy("flip-policy-next").await;
+    let last_policy_arn = harness.shared_policy("flip-policy-last").await;
+
+    create_firewall(
+        &harness,
+        "flip-policy-fw",
+        &policy_arn,
+        &["subnet-h01"],
+        Protections {
+            policy_change: true,
+            ..Protections::default()
+        },
+    )
+    .await;
+
+    let associate_next = json!({
+        "FirewallName": "flip-policy-fw",
+        "FirewallPolicyArn": next_policy_arn.clone(),
+    });
+
+    let (status, body) = harness
+        .call("AssociateFirewallPolicy", &associate_next)
+        .await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (400, "InvalidOperationException"),
+        "case protected: expected the policy change to be refused, got {status} {body:?}"
+    );
+    assert_eq!(
+        described_state(&harness, "flip-policy-fw").await.2,
+        policy_arn,
+        "case protected: expected the firewall to keep the policy it was created with"
+    );
+
+    // The token a caller read before the toggle marks the state the firewall was
+    // in then, so once the toggle has moved that state the token is stale.
+    let stale_token = described_state(&harness, "flip-policy-fw").await.0;
+    harness
+        .ok(
+            "UpdateFirewallPolicyChangeProtection",
+            &json!({
+                "FirewallName": "flip-policy-fw",
+                "FirewallPolicyChangeProtection": false,
+            }),
+        )
+        .await;
+    let (status, body) = harness
+        .call(
+            "AssociateFirewallPolicy",
+            &json!({
+                "FirewallName": "flip-policy-fw",
+                "FirewallPolicyArn": next_policy_arn.clone(),
+                "UpdateToken": stale_token,
+            }),
+        )
+        .await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (400, "InvalidTokenException"),
+        "case token read before the toggle: expected the conditional association to be refused, \
+         got {status} {body:?}"
+    );
+    assert_eq!(
+        described_state(&harness, "flip-policy-fw").await.2,
+        policy_arn,
+        "case token read before the toggle: expected the refusal to leave the association as it \
+         was"
+    );
+
+    // Unprotected, the identical call that was refused goes through.
+    let associated = harness.ok("AssociateFirewallPolicy", &associate_next).await;
+    assert_eq!(
+        string_at(&associated, &["FirewallPolicyArn"]),
+        next_policy_arn,
+        "case unprotected: expected the identical call to associate the policy, got \
+         {associated:?}"
+    );
+    assert_eq!(
+        described_state(&harness, "flip-policy-fw").await.2,
+        next_policy_arn,
+        "case unprotected: expected a later reader to see the new association"
+    );
+
+    // Protected again: the same call is refused once more, naming the call and
+    // the setting that refused it.
+    harness
+        .ok(
+            "UpdateFirewallPolicyChangeProtection",
+            &json!({
+                "FirewallArn": firewall_arn("flip-policy-fw"),
+                "FirewallPolicyChangeProtection": true,
+            }),
+        )
+        .await;
+    let (status, body) = harness
+        .call(
+            "AssociateFirewallPolicy",
+            &json!({
+                "FirewallName": "flip-policy-fw",
+                "FirewallPolicyArn": last_policy_arn,
+            }),
+        )
+        .await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (400, "InvalidOperationException"),
+        "case protected again: expected the policy change to be refused, got {status} {body:?}"
+    );
+    assert_eq!(
+        error_message(&body),
+        "Cannot AssociateFirewallPolicy because FirewallPolicyChangeProtection is on",
+        "case protected again: expected the refusal to name the call and the setting, got {body:?}"
+    );
+    assert_eq!(
+        described_state(&harness, "flip-policy-fw").await.2,
+        next_policy_arn,
+        "case protected again: expected the refusal to leave the association as it was"
+    );
 }
