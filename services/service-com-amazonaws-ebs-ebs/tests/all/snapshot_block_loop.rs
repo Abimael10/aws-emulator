@@ -4,8 +4,9 @@
 //!
 //! Every test drives real HTTP through the same `MultiServiceRouter` the production
 //! router uses, so the assertions are about the wire behaviour: status codes, headers,
-//! payload bytes and JSON bodies. Nothing reaches into the state struct directly —
-//! a write is only ever proven by reading it back through another operation.
+//! payload bytes and JSON bodies. A write is only ever proven by reading it back through
+//! another operation; the one thing the state struct is reached for is PASSING TIME, which
+//! no request can do (`Timeout` is in minutes, and its modelled minimum is 10).
 //!
 //! The rules under test, each asserted over a TABLE of inputs rather than one case:
 //!
@@ -26,6 +27,11 @@
 //! 7. A snapshot started from a `ParentSnapshotId` has that parent's ENCRYPTION, whole:
 //!    the SSE type and the key reference that type names are inherited together, unless
 //!    the request names a `KmsKeyArn` of its own.
+//! 8. A pending snapshot's automatic cancellation falls due `Timeout` minutes after the
+//!    last thing that happened to it — the call that started it, or the last block
+//!    written into it — so a producer still writing keeps the whole window to write its
+//!    next block or complete the snapshot, and a window that passes with neither cancels
+//!    it.
 //!
 //! The harness below (`router`, `Reply`, the per-operation request helpers) is
 //! `pub(crate)` so the sibling suites in `tests/all/` drive the same wire path instead of
@@ -37,7 +43,7 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use smithy_server_runtime::MultiServiceRouter;
 
-use service_com_amazonaws_ebs_ebs::EmulatedService;
+use service_com_amazonaws_ebs_ebs::{state::service_state, EmulatedService};
 
 // The refusal of an out-of-extent `BlockIndex`, the extent arithmetic it is computed from
 // and the wording of a rejected `VolumeSize` are stated once, by the suite that owns the
@@ -46,6 +52,9 @@ use service_com_amazonaws_ebs_ebs::EmulatedService;
 use crate::declared_block_inputs::{
     assert_validation, beyond_extent_message, extent_limit, invalid_volume_size_message,
 };
+// The refusal a snapshot the read path cannot resolve answers with, owned by the suite
+// whose rule that is: a snapshot its `Timeout` cancelled is one of them.
+use crate::read_path_requires_a_completed_snapshot::assert_not_found;
 
 /// The only block size the EBS direct APIs support: `PutSnapshotBlockRequest$DataLength`
 /// documents "Currently, the only supported size is `524288` bytes. Valid values:
@@ -2010,6 +2019,316 @@ async fn a_snapshot_started_from_a_parent_reports_the_parents_encryption() {
             "case {case:?}: a grandchild asking for nothing must report the encryption its \
              parent has, got {}",
             grandchild_reply.json()
+        );
+    }
+}
+
+/// One row of the deadline table: the `Timeout` the `StartSnapshot` request carries (`None`
+/// for a request that names none) and the window, in minutes, that request gives the
+/// snapshot.
+struct DeadlineCase {
+    case: &'static str,
+    timeout: Option<i32>,
+    minutes: u32,
+}
+
+/// Rows differ along where the window comes from: the modelled minimum, a value inside the
+/// range, the default a request naming no `Timeout` takes, and the modelled maximum.
+///
+/// The bounds are `StartSnapshotRequest$Timeout`'s `range` 10..4320 minutes
+/// (`smithy_query(query="shape",shape="com.amazonaws.ebs#StartSnapshotRequest")`) and the
+/// default is the one its documentation states: "If no value is specified, the timeout
+/// defaults to `60` minutes."
+const DEADLINE_CASES: &[DeadlineCase] = &[
+    DeadlineCase {
+        case: "the modelled minimum Timeout",
+        timeout: Some(10),
+        minutes: 10,
+    },
+    DeadlineCase {
+        case: "a Timeout inside the modelled range",
+        timeout: Some(90),
+        minutes: 90,
+    },
+    DeadlineCase {
+        case: "the documented default Timeout, which no request names",
+        timeout: None,
+        minutes: 60,
+    },
+    DeadlineCase {
+        case: "the modelled maximum Timeout",
+        timeout: Some(4320),
+        minutes: 4320,
+    },
+];
+
+/// Move every instant stored on `snapshot_id` `elapsed` into the past, so the next request
+/// observes `elapsed` of clock having passed since the snapshot was last touched.
+///
+/// This is how the suite passes time, and the only way it can: `Timeout` is in MINUTES and
+/// its modelled minimum is 10, so no request can reach a deadline inside a test and no test
+/// may wait for one. The store's schedule is recomputed afterwards, exactly as a handler
+/// does after moving a deadline, so the next call sees the clock this rewind created.
+fn elapse(
+    engine: &engine::InMemoryEngine,
+    case: &str,
+    snapshot_id: &str,
+    elapsed: std::time::Duration,
+) {
+    let state = service_state(engine)
+        .unwrap_or_else(|| panic!("case {case:?}: this service's store must be reachable"));
+    let mut store = state.lock();
+    let snapshot = store
+        .snapshots
+        .get_mut(snapshot_id)
+        .unwrap_or_else(|| panic!("case {case:?}: {snapshot_id} must be stored"));
+    snapshot.start_time -= elapsed;
+    snapshot.expiry_time -= elapsed;
+    snapshot.completed_at = snapshot.completed_at.map(|stamped| stamped - elapsed);
+    store.refresh_transition_schedule();
+}
+
+/// An epoch-seconds timestamp member of a response body (`StartTime`, `ExpiryTime`), which
+/// is how restJson1 puts a `timestamp` on the wire, or `None` when the body carries none.
+fn timestamp_member(reply: &Reply, name: &str) -> Option<f64> {
+    reply.json().get(name).and_then(serde_json::Value::as_f64)
+}
+
+/// Write the block `seed` fills at `block_index`, asserting the write was accepted.
+async fn accepted_block(
+    router: &MultiServiceRouter,
+    case: &str,
+    snapshot_id: &str,
+    block_index: i32,
+    seed: u8,
+) {
+    let data = block_bytes(seed);
+    let expected = checksum(&data);
+    let reply = put_block(router, snapshot_id, block_index, data, BLOCK_SIZE, &expected).await;
+    assert_eq!(
+        reply.status, 201,
+        "case {case:?}: PutSnapshotBlock at index {block_index} must answer 201, got {} with \
+         body {}",
+        reply.status,
+        String::from_utf8_lossy(&reply.body)
+    );
+}
+
+/// RULE 8: a pending snapshot's automatic cancellation falls due `Timeout` minutes after
+/// the LAST thing that happened to it — the call that started it while nothing has been
+/// written, and the last accepted block write once something has. `Timeout` is documented
+/// as the time after which the snapshot is cancelled if "No blocks are written to the
+/// snapshot" OR "The snapshot is not completed after writing the last block of data", so a
+/// producer that keeps writing keeps the whole window to write its next block or complete
+/// the snapshot, and the deadline it then reports is the one its last write anchored.
+#[tokio::test]
+async fn a_block_write_re_anchors_the_snapshots_timeout() {
+    for DeadlineCase {
+        case,
+        timeout,
+        minutes,
+    } in DEADLINE_CASES
+    {
+        let (router, engine) = router_with_engine();
+        let request = match timeout {
+            Some(value) => serde_json::json!({ "VolumeSize": 1, "Timeout": value }),
+            None => serde_json::json!({ "VolumeSize": 1 }),
+        };
+        let started = start_snapshot(&router, &request).await;
+        assert_eq!(
+            started.status, 201,
+            "case {case:?}: StartSnapshot must answer 201, got {} with body {}",
+            started.status,
+            String::from_utf8_lossy(&started.body)
+        );
+        let snapshot_id = member(&started, "SnapshotId");
+        let start_time = timestamp_member(&started, "StartTime").unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: StartSnapshot must report a StartTime, got {}",
+                started.json()
+            )
+        });
+        let window = std::time::Duration::from_secs(u64::from(*minutes) * 60);
+        let one_minute = std::time::Duration::from_secs(60);
+
+        // Nearly the whole window passes with nothing written: the snapshot is still
+        // pending, so this write is accepted — and it re-anchors the deadline to its own
+        // instant.
+        elapse(&engine, case, &snapshot_id, window - one_minute);
+        accepted_block(&router, case, &snapshot_id, 0, 61).await;
+
+        // Now the snapshot is a minute PAST the instant a start-anchored deadline fell at,
+        // and two minutes after its last write — inside the window that write opened, so
+        // the next block is accepted too.
+        elapse(&engine, case, &snapshot_id, one_minute + one_minute);
+        accepted_block(&router, case, &snapshot_id, 1, 62).await;
+
+        // The window reopens on EVERY write, not only on the first.
+        elapse(&engine, case, &snapshot_id, window - one_minute);
+        accepted_block(&router, case, &snapshot_id, 2, 63).await;
+
+        // The snapshot is still completable, and completing it seals the content: every
+        // block the writes put into it is there, so nothing released the bytes along the
+        // way.
+        let sealed = complete_snapshot(&router, &snapshot_id, 3).await;
+        assert_eq!(
+            sealed.status, 202,
+            "case {case:?}: CompleteSnapshot must answer 202, got {} with body {}",
+            sealed.status,
+            String::from_utf8_lossy(&sealed.body)
+        );
+        let listed = list_blocks(&router, &snapshot_id, "").await;
+        assert_eq!(
+            listed.status, 200,
+            "case {case:?}: the completed snapshot must be readable, got {} with body {}",
+            listed.status,
+            String::from_utf8_lossy(&listed.body)
+        );
+        let reported: Vec<i32> = listed_blocks(&listed)
+            .iter()
+            .map(|(index, _)| *index)
+            .collect();
+        assert_eq!(
+            reported,
+            vec![0, 1, 2],
+            "case {case:?}: every block written inside the window it reopened must still be \
+             held, got {reported:?}"
+        );
+        for (block_index, token) in listed_blocks(&listed) {
+            let seed = 61 + u8::try_from(block_index).expect("a small block index");
+            let fetched = get_block(&router, &snapshot_id, block_index, &token).await;
+            assert_eq!(
+                fetched.status, 200,
+                "case {case:?}: block {block_index} must be fetchable, got {} with body {}",
+                fetched.status,
+                String::from_utf8_lossy(&fetched.body)
+            );
+            assert_eq!(
+                checksum(&fetched.body),
+                checksum(&block_bytes(seed)),
+                "case {case:?}: block {block_index} must hold the bytes it was written with, \
+                 got {} byte(s)",
+                fetched.body.len()
+            );
+        }
+
+        // And the deadline the snapshot REPORTS is the one its last write anchored: the
+        // block tokens expire a window after that write, which is later than a window after
+        // the start the rewinds above moved into the past.
+        let expiry = timestamp_member(&listed, "ExpiryTime").unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: ListSnapshotBlocks must report an ExpiryTime, got {}",
+                listed.json()
+            )
+        });
+        let anchored_at_the_start = start_time + f64::from(*minutes) * 60.0;
+        assert!(
+            expiry > anchored_at_the_start - 60.0,
+            "case {case:?}: expected the reported ExpiryTime to be a window after the last \
+             write (at least {anchored_at_the_start} in epoch seconds, less a minute of \
+             slack), got {expiry}"
+        );
+    }
+}
+
+/// One row of the cancellation table: the `Timeout` the request carries, the window it
+/// gives, and the `(block index, byte seed)` pairs written into the snapshot before the
+/// window passes with nothing more happening to it.
+struct CancellationCase {
+    case: &'static str,
+    timeout: Option<i32>,
+    minutes: u32,
+    blocks: &'static [(i32, u8)],
+}
+
+/// Rows differ along which of the two documented triggers fires — no block written at all,
+/// or a last block written and no completion following — and along the window they wait out.
+const CANCELLATION_CASES: &[CancellationCase] = &[
+    CancellationCase {
+        case: "a snapshot nothing was ever written to",
+        timeout: Some(10),
+        minutes: 10,
+        blocks: &[],
+    },
+    CancellationCase {
+        case: "a snapshot whose last block was written and never completed",
+        timeout: Some(10),
+        minutes: 10,
+        blocks: &[(0, 71)],
+    },
+    CancellationCase {
+        case: "a snapshot left alone for the default window after several writes",
+        timeout: None,
+        minutes: 60,
+        blocks: &[(0, 72), (1, 73)],
+    },
+];
+
+/// RULE 8, the other half: the deadline a write re-anchors is still a real deadline. A
+/// window that passes with nothing written and no completion cancels the snapshot — the
+/// status the modelled `Status` enum calls `error` — so no further block is accepted, it can
+/// no longer be completed, and the read path resolves it nowhere.
+#[tokio::test]
+async fn a_window_that_passes_with_no_write_cancels_the_snapshot() {
+    for CancellationCase {
+        case,
+        timeout,
+        minutes,
+        blocks,
+    } in CANCELLATION_CASES
+    {
+        let (router, engine) = router_with_engine();
+        let request = match timeout {
+            Some(value) => serde_json::json!({ "VolumeSize": 1, "Timeout": value }),
+            None => serde_json::json!({ "VolumeSize": 1 }),
+        };
+        let started = start_snapshot(&router, &request).await;
+        assert_eq!(
+            started.status, 201,
+            "case {case:?}: StartSnapshot must answer 201, got {} with body {}",
+            started.status,
+            String::from_utf8_lossy(&started.body)
+        );
+        let snapshot_id = member(&started, "SnapshotId");
+
+        for (block_index, seed) in *blocks {
+            accepted_block(&router, case, &snapshot_id, *block_index, *seed).await;
+        }
+
+        // The whole window passes after the last thing that happened to the snapshot.
+        elapse(
+            &engine,
+            case,
+            &snapshot_id,
+            std::time::Duration::from_secs(u64::from(*minutes) * 60),
+        );
+
+        let data = block_bytes(99);
+        let expected = checksum(&data);
+        let refused = put_block(&router, &snapshot_id, 9, data, BLOCK_SIZE, &expected).await;
+        assert_validation(
+            &format!("{case}: PutSnapshotBlock after the window"),
+            &refused,
+            "INVALID_SNAPSHOT_ID",
+            &format!(
+                "snapshot {snapshot_id} is error; blocks can only be written to a pending \
+                 snapshot"
+            ),
+        );
+
+        let completion = complete_snapshot(&router, &snapshot_id, 1).await;
+        assert_validation(
+            &format!("{case}: CompleteSnapshot after the window"),
+            &completion,
+            "INVALID_SNAPSHOT_ID",
+            &format!("snapshot {snapshot_id} was cancelled and can no longer be completed"),
+        );
+
+        let listed = list_blocks(&router, &snapshot_id, "").await;
+        assert_not_found(
+            &format!("{case}: ListSnapshotBlocks after the window"),
+            &listed,
+            &snapshot_id,
         );
     }
 }

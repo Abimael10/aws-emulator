@@ -378,17 +378,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the snapshot inherited, whose block this write replaces.
             written: true,
         };
-        let Some(snapshot) = store.snapshots.get_mut(&input.snapshot_id) else {
-            return Err(not_found(snapshot_not_found_message(&input.snapshot_id)));
-        };
-        snapshot.blocks.insert(input.block_index, entry);
+        // Storing the block is also what re-anchors the snapshot's `Timeout`:
+        // `StartSnapshotRequest$Timeout` is the time after which the snapshot is
+        // automatically cancelled if "No blocks are written to the snapshot" or "The
+        // snapshot is not completed after writing the last block of data", so an accepted
+        // write moves the deadline to `Timeout` minutes after THIS write and the producer
+        // keeps that whole window to write the next block or complete the snapshot.
+        let stored = store
+            .write_block(&input.snapshot_id, input.block_index, entry, now)
+            .ok_or_else(|| not_found(snapshot_not_found_message(&input.snapshot_id)))?;
 
         // Answer from the stored block, so the checksum on the wire is the one computed
         // over the persisted bytes rather than the one the request carried.
-        let stored = snapshot
-            .blocks
-            .get(&input.block_index)
-            .ok_or_else(|| no_state_message("the block was not persisted".to_string()))?;
         Ok(PutSnapshotBlockOutput {
             checksum: Some(stored.checksum.clone()),
             checksum_algorithm: Some(stored.checksum_algorithm.clone()),

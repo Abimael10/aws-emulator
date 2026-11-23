@@ -431,6 +431,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "The new snapshot enters the pending state after the request completes": no
             // seal has been applied yet, so there is no completion instant to report.
             completed_at: None,
+            // The FIRST anchor of the `Timeout`: "No blocks are written to the snapshot"
+            // is the trigger measured from the start, and each accepted
+            // `PutSnapshotBlock` re-anchors it to its own instant
+            // (`Snapshot::reanchor_timeout`).
             expiry_time: expiry_from_timeout(now, timeout_minutes),
             description: input.description.clone(),
             tags: input

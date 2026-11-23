@@ -280,6 +280,12 @@ pub struct Snapshot {
     /// When the snapshot's `Timeout` elapses: also the instant the block tokens it
     /// hands out stop being valid, which is what `ListSnapshotBlocks$ExpiryTime`
     /// reports ("The time when the `BlockToken` expires").
+    ///
+    /// Anchored at the LAST thing that happened to the snapshot — the call that started
+    /// it, or the last block written into it ([`Self::reanchor_timeout`]) — because
+    /// `StartSnapshotRequest$Timeout` is the time after which the snapshot is cancelled
+    /// if "No blocks are written to the snapshot" OR "The snapshot is not completed after
+    /// writing the last block of data".
     pub expiry_time: SystemTime,
     pub description: Option<String>,
     pub tags: Vec<StoredTag>,
@@ -407,6 +413,23 @@ impl Snapshot {
         self.status == SnapshotStatus::Completed
     }
 
+    /// Re-anchor the instant this snapshot's `Timeout` falls due to `timeout_minutes`
+    /// after `now`, the instant a block was just written into it.
+    ///
+    /// `StartSnapshotRequest$Timeout` documents TWO triggers for the automatic
+    /// cancellation — the snapshot has no blocks written to it, and the snapshot "is not
+    /// completed after writing the last block of data" — so the deadline is `Timeout`
+    /// after whichever came last, the start or the last accepted write. A producer that
+    /// keeps writing is therefore never cancelled while it is making progress, and the
+    /// window a snapshot has to be completed in reopens on every write.
+    ///
+    /// The caller refreshes the transition schedule
+    /// ([`ComAmazonawsEbsEbsState::refresh_transition_schedule`]) once the record is
+    /// stored, because the moved deadline may be the earliest one outstanding.
+    pub fn reanchor_timeout(&mut self, now: SystemTime) {
+        self.expiry_time = expiry_from_timeout(now, self.timeout_minutes);
+    }
+
     /// Whether this snapshot holds NO block, at any index: there is no content in it to
     /// read or to compare.
     ///
@@ -486,11 +509,13 @@ impl ComAmazonawsEbsEbsState {
 
     /// Materialise every status change the CLOCK has already made due.
     ///
-    /// One is owed, at an instant stored when the call that started it ran, so it was
-    /// owed whether or not anybody called again: a `Timeout`.
+    /// One is owed, at an instant stored by the last call that touched the snapshot — the
+    /// one that started it, or the one that last wrote a block into it — so it was owed
+    /// whether or not anybody called again: a `Timeout`.
     /// `StartSnapshotRequest$Timeout` documents that a snapshot is "automatically
-    /// cancelled" when it is not completed within that many minutes; a cancelled
-    /// snapshot is what the modeled `Status` enum calls `error`.
+    /// cancelled" that many minutes after it was started with no block written to it, or
+    /// after the last block of data was written to it without a completion following; a
+    /// cancelled snapshot is what the modeled `Status` enum calls `error`.
     ///
     /// Every handler applies this before reading, and it never moves a status the clock
     /// did not already owe. A sealed snapshot has nothing left to cancel, so only a
@@ -518,7 +543,7 @@ impl ComAmazonawsEbsEbsState {
     }
 
     /// Recompute the earliest transition still outstanding. Call after storing a
-    /// snapshot or sealing one.
+    /// snapshot, writing a block into one or sealing one.
     pub fn refresh_transition_schedule(&mut self) {
         self.next_transition_due = self
             .snapshots
@@ -526,6 +551,33 @@ impl ComAmazonawsEbsEbsState {
             .filter(|snapshot| snapshot.status == SnapshotStatus::Pending)
             .map(|snapshot| snapshot.expiry_time)
             .min();
+    }
+
+    /// Store `entry` at `block_index` of the snapshot `snapshot_id` names, as of `now`,
+    /// and answer the entry as it is now stored (`None` for an id this store holds no
+    /// snapshot under).
+    ///
+    /// Writing a block is also what re-anchors that snapshot's `Timeout`
+    /// ([`Snapshot::reanchor_timeout`]): the two belong to one call, because the deadline
+    /// the store enforces is measured from the last block written, so a write that moved
+    /// the content without moving the deadline would cancel an upload that is still
+    /// making progress and release the blocks it had already accepted. Only a pending
+    /// snapshot ever gets here — "The target snapshot must be in the pending state"
+    /// (`PutSnapshotBlock`), which its handler enforces before it stores anything — so the
+    /// deadline this moves is always one that is still outstanding.
+    pub fn write_block(
+        &mut self,
+        snapshot_id: &str,
+        block_index: i32,
+        entry: BlockEntry,
+        now: SystemTime,
+    ) -> Option<&BlockEntry> {
+        let snapshot = self.snapshots.get_mut(snapshot_id)?;
+        snapshot.blocks.insert(block_index, entry);
+        snapshot.reanchor_timeout(now);
+        // The moved deadline may be the earliest one outstanding, or may have been it.
+        self.refresh_transition_schedule();
+        self.snapshots.get(snapshot_id)?.blocks.get(&block_index)
     }
 
     /// Remove the snapshot `snapshot_id` names, and everything stored only with it.
@@ -855,11 +907,14 @@ pub fn fingerprint_hex_sha256(data: &[u8]) -> String {
     hex::encode(Sha256::digest(data))
 }
 
-/// The expiry instant of a snapshot started at `start_time` with a `Timeout` of
-/// `timeout_minutes`.
-pub fn expiry_from_timeout(start_time: SystemTime, timeout_minutes: i32) -> SystemTime {
+/// The instant a `Timeout` of `timeout_minutes` anchored at `anchor` falls due.
+///
+/// `anchor` is the last thing that happened to the snapshot: the call that started it
+/// while no block has been written to it, and the last accepted write once one has
+/// ([`Snapshot::reanchor_timeout`]).
+pub fn expiry_from_timeout(anchor: SystemTime, timeout_minutes: i32) -> SystemTime {
     let minutes = u64::try_from(timeout_minutes).unwrap_or(0);
-    start_time + Duration::from_secs(minutes.saturating_mul(60))
+    anchor + Duration::from_secs(minutes.saturating_mul(60))
 }
 
 /// Encode the opaque `NextToken` that resumes a `ListSnapshotBlocks` page at
