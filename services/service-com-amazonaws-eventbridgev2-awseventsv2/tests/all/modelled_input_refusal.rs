@@ -69,7 +69,7 @@ const ACCOUNT: &str = "000000000000";
 pub(crate) const INVALID_INPUT_EXCEPTION: &str = "InvalidInputException";
 
 /// The error shape a read of a resource that is not there answers with.
-const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
+pub(crate) const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
 
 /// The synthetic shape the framework would otherwise refuse a request with, which this
 /// service's model does not declare: no answer below may name it.
@@ -278,6 +278,40 @@ impl Wire {
             assert!(
                 Instant::now() < deadline,
                 "case {case:?}: the bus {arn} never reported ACTIVE, last reported {reported:?}"
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    /// Look again until the bus at `arn` no longer RESOLVES: the read of it is
+    /// refused `ResourceNotFoundException` (404), which is the condition that says
+    /// an asynchronous deletion has finished.
+    ///
+    /// The complement of [`Self::await_active`], and polled the same way: the
+    /// CONDITION under a generous deadline rather than a fixed wait.
+    pub(crate) async fn await_bus_gone(&self, case: &str, arn: &str) {
+        let deadline = Instant::now() + POLL_DEADLINE;
+        loop {
+            let (status, body) = self
+                .call::<DescribeEventBus<InMemoryEngine>>(&DescribeEventBusInput {
+                    event_bus_arn: arn.to_string(),
+                })
+                .await;
+            if status != 200 {
+                let (code, _) = refusal(case, &body);
+                assert_eq!(
+                    (status, code.as_str()),
+                    (404, RESOURCE_NOT_FOUND_EXCEPTION),
+                    "case {case:?}: a bus that has finished disappearing must read as \
+                     ResourceNotFoundException (404), got {status} with {code:?}"
+                );
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "case {case:?}: the bus {arn} never finished disappearing, the last read answered \
+                 {status} with {:?}",
+                rendered(&body)
             );
             tokio::time::sleep(POLL_INTERVAL).await;
         }
