@@ -35,8 +35,8 @@ use service_com_amazonaws_connectcases_amazonconnectcases::state::{
 };
 
 use crate::harness::{
-    domain, field_of_type, fields_of_every_type, get_case_fields, is_minted_id, listed_fields,
-    read_field, string_at, template, Emulator,
+    batch_get_fields, domain, field_of_type, fields_of_every_type, get_case_fields, is_minted_id,
+    listed_fields, read_field, string_at, template, Emulator,
 };
 
 /// The reserved id whose value every row below leaves unwritten, so a read can
@@ -1401,5 +1401,215 @@ async fn a_batch_reads_per_item_message_is_the_services_fixed_sentence() {
                 );
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn the_last_accepted_update_is_what_every_later_batch_read_reports() {
+    // An accepted write of a field's properties is durable STATE, not an
+    // answer: every later read of that field reports what the last accepted
+    // write stored — the read immediately after it, a read that asks for other
+    // ids in the same batch, and a read later in the session with other calls
+    // in between — and a read stores nothing of its own, so the record it
+    // reports is the same one every time.
+    let emulator = Emulator::new();
+    let domain_id = domain(&emulator, "field-update-durability").await;
+
+    // Ids the domain holds no record for, mixed into one of the reads below: a
+    // batch read answers each of them in its own `errors` entry under the
+    // service's fixed sentence and still reports every field it resolved.
+    let unresolvable = [
+        "no-field-of-this-id".to_string(),
+        "00000000-0000-4000-8000-000000000001".to_string(),
+    ];
+
+    // One row per chain of accepted writes, each applied to a field of its
+    // own: rows differ along how many updates the chain holds, which member
+    // each update carries and the form of the description it stores. The last
+    // entry of a chain is what every read below must report.
+    let row = |case: &'static str, created_with: &str, updates: Vec<Value>, expected: &str| {
+        (
+            case,
+            created_with.to_string(),
+            updates,
+            expected.to_string(),
+        )
+    };
+    let rows: Vec<(&str, String, Vec<Value>, String)> = vec![
+        row(
+            "one update to a new description",
+            "the description at create",
+            vec![json!({ "description": "the description after one update" })],
+            "the description after one update",
+        ),
+        row(
+            "two updates, where the last one is what the field holds",
+            "the description at create",
+            vec![
+                json!({ "description": "the description after the first update" }),
+                json!({ "description": "the description after the second update" }),
+            ],
+            "the description after the second update",
+        ),
+        row(
+            "a description change followed by a rename that names no description",
+            "the description at create",
+            vec![
+                json!({ "description": "the description a rename must not revert" }),
+                json!({ "name": "renamed-after-its-description-changed" }),
+            ],
+            "the description a rename must not revert",
+        ),
+        row(
+            "a description emptied and then set again",
+            "the description at create",
+            vec![
+                json!({ "description": "" }),
+                json!({ "description": "the description set after it was emptied" }),
+            ],
+            "the description set after it was emptied",
+        ),
+        row(
+            "an update re-sending the description the field already holds",
+            "the description at create",
+            vec![json!({ "description": "the description at create" })],
+            "the description at create",
+        ),
+        row(
+            "a description outside ascii",
+            "the description at create",
+            vec![json!({ "description": "descripción del campo" })],
+            "descripción del campo",
+        ),
+        row(
+            // `FieldDescription` is `@length ..255`
+            // (`smithy_query(query="shape",shape="FieldDescription")`).
+            "a description at the modelled FieldDescription maximum of 255",
+            "the description at create",
+            vec![json!({ "description": "d".repeat(255) })],
+            &"d".repeat(255),
+        ),
+    ];
+
+    for (index, (case, created_with, updates, expected)) in rows.iter().enumerate() {
+        let created = emulator
+            .ok(
+                case,
+                "POST",
+                &format!("/domains/{domain_id}/fields"),
+                json!({
+                    "name": format!("field-of-the-durability-row-{index}"),
+                    "type": "Text",
+                    "description": created_with,
+                }),
+            )
+            .await;
+        let field_id = string_at(&created, "fieldId", case);
+
+        for update in updates {
+            let answer = emulator
+                .ok(
+                    case,
+                    "PUT",
+                    &format!("/domains/{domain_id}/fields/{field_id}"),
+                    update.clone(),
+                )
+                .await;
+            // `UpdateFieldResponse` declares no members, so the documented
+            // success carries the empty structure and nothing else.
+            assert_eq!(
+                answer,
+                json!({}),
+                "case {case:?}: UpdateField answers the empty structure, got {answer:?}"
+            );
+        }
+
+        // The read IMMEDIATELY after the chain.
+        let first = read_field(&emulator, case, &domain_id, &field_id).await;
+        assert_eq!(
+            &string_at(&first, "description", case),
+            expected,
+            "case {case:?}: the first read after the update must report what it stored, \
+             got {first:?}"
+        );
+
+        // The same read, mixed with ids the domain cannot resolve: the
+        // resolved field carries the same stored record, and one unresolvable
+        // id neither fails the call nor hides the rest.
+        let mixed = vec![
+            unresolvable[0].clone(),
+            field_id.clone(),
+            unresolvable[1].clone(),
+        ];
+        let (resolved, errors) = batch_get_fields(&emulator, case, &domain_id, &mixed).await;
+        assert_eq!(
+            resolved,
+            vec![first.clone()],
+            "case {case:?}: a mixed batch must report the stored record, got {resolved:?}"
+        );
+        assert_eq!(
+            errors.len(),
+            unresolvable.len(),
+            "case {case:?}: expected one error entry per unresolvable id, got {errors:?}"
+        );
+        for id in &unresolvable {
+            let entry = errors
+                .iter()
+                .find(|entry| entry.get("id").and_then(Value::as_str) == Some(id.as_str()))
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: no errors entry for {id:?} in {errors:?}")
+                });
+            assert_eq!(
+                string_at(entry, "errorCode", case),
+                BATCH_ITEM_NOT_FOUND_CODE,
+                "case {case:?}: expected the per-item code, got {entry:?}"
+            );
+            let message = string_at(entry, "message", case);
+            assert_eq!(
+                message, BATCH_ITEM_NOT_FOUND_MESSAGE,
+                "case {case:?}: expected the service's fixed sentence, got {message:?}"
+            );
+            assert!(
+                !message.contains(id.as_str()) && !message.contains(domain_id.as_str()),
+                "case {case:?}: the sentence interpolates nothing, got {message:?}"
+            );
+        }
+
+        // A LATER read, with other calls of the same session in between:
+        // another field's create and a listing of the domain leave the record
+        // the chain stored alone, and the field asked for twice in one batch
+        // is answered once per occurrence with that same record.
+        emulator
+            .ok(
+                case,
+                "POST",
+                &format!("/domains/{domain_id}/fields"),
+                json!({
+                    "name": format!("unrelated-field-of-the-durability-row-{index}"),
+                    "type": "Text",
+                    "description": "the description of another field entirely",
+                }),
+            )
+            .await;
+        let listed = listed_fields(&emulator, case, &domain_id).await;
+        assert!(
+            listed
+                .iter()
+                .any(|entry| entry.get("fieldId").and_then(Value::as_str)
+                    == Some(field_id.as_str())),
+            "case {case:?}: the updated field must still be listed, got {listed:?}"
+        );
+        let twice = vec![field_id.clone(), field_id.clone()];
+        let (later, later_errors) = batch_get_fields(&emulator, case, &domain_id, &twice).await;
+        assert!(
+            later_errors.is_empty(),
+            "case {case:?}: a resolvable id reports no error, got {later_errors:?}"
+        );
+        assert_eq!(
+            later,
+            vec![first.clone(), first.clone()],
+            "case {case:?}: every later read must report the record the last accepted update \
+             stored, got {later:?}"
+        );
     }
 }
