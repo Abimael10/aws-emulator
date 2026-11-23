@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPrincipalPolicies
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPrincipalPolicies`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPrincipalPolicies::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The policies of one principal, read out of the policy-attachment relation this
+//! service's state keeps (`crate::state::policy_attachments`) — the same relation
+//! `AttachPrincipalPolicy` records into and `ListAttachedPolicies`, the spelling that
+//! replaces this one, reads with a `recursive` scope this one has no member for.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +153,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPrincipalPolicies` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPrincipalPoliciesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Every ARN this listing reports was minted when its resource was created, so
+        // the read needs no request metadata of its own.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListPrincipalPoliciesErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `pageSize` is modelled `range 1..250` and documents no default, so a request
+        // that names none gets the largest page the model admits. The clamp is defensive
+        // rather than load-bearing: it keeps the page inside the modelled range without
+        // depending on a validation performed outside this module.
+        let page_size = input
+            .page_size
+            .map_or(crate::state::MAX_LIST_PAGE_SIZE, |page_size| {
+                page_size.clamp(1, crate::state::MAX_LIST_PAGE_SIZE)
+            }) as usize;
+
+        // A pure read of the policy-attachment relation: "Lists the policies attached to
+        // the specified principal", so nothing here writes.
+        let store = state.lock();
+
+        // The principal is resolved against this account's state, so the listing is only
+        // ever about a resource that exists: a principal of no supported form is the
+        // modelled `InvalidRequestException` (HTTP 400), and a well-formed one naming a
+        // resource this account does not hold the modelled `ResourceNotFoundException`
+        // (HTTP 404) — never an empty list standing in for "no such principal". The same
+        // resolver `ListAttachedPolicies` reads its `target` with, because the deprecated
+        // spelling addresses the same relation.
+        let resolved = match store.resolve_policy_target(&input.principal) {
+            Ok(resolved) => resolved,
+            Err(crate::state::PolicyTargetRefusal::Invalid(message)) => {
+                return Err(ListPrincipalPoliciesErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+            Err(crate::state::PolicyTargetRefusal::NotFound(message)) => {
+                return Err(ListPrincipalPoliciesErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        };
+
+        // One row per policy attached to the principal ITSELF: this spelling models no
+        // `recursive` member, so the inherited attachments of a thing group's ancestors —
+        // which `ListAttachedPolicies$recursive` asks for — are no part of this listing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPrincipalPolicies"))
+        // The listing's order is WHEN the attachment was recorded — `ascendingOrder` is
+        // "Specifies the order for results. If true, results are returned in ascending
+        // creation order", so the attachment's creation is the ordering key and the flag
+        // is its direction — as the rows the shared pager walks
+        // ([`crate::state::attachment_listing_rows`]).
+        let attachments = store.policy_attachments.attachments_of(&resolved.key);
+        let rows = crate::state::attachment_listing_rows(&attachments, input.ascending_order);
+
+        // One page of that order, resumed after the position the caller's own marker
+        // names ([`crate::state::page_of`]) — the same paging every other `@paginated`
+        // listing of this service uses, so a token is read one way. The scope carries the
+        // principal and the direction, because those together decide which rows the
+        // listing walks: a marker issued by one is refused by another rather than
+        // resuming a position computed over a different row set. A marker this listing
+        // never issued is the modelled `InvalidRequestException` (HTTP 400).
+        let scope = format!(
+            "principal-policies/{key}/{direction}",
+            key = resolved.key,
+            direction = if input.ascending_order { "a" } else { "d" }
+        );
+        let resume_after = match input.marker.as_deref() {
+            None => None,
+            Some(marker) => {
+                let Some(resume_after) = crate::state::decode_page_marker(marker, &scope) else {
+                    return Err(ListPrincipalPoliciesErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: Some(
+                                "marker is not a continuation token of this listing".to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                };
+                Some(resume_after)
+            }
+        };
+        let (page, next_marker) =
+            crate::state::page_of(rows, &scope, resume_after.as_deref(), page_size);
+
+        // One `Policy` per row, built from the policy registry's OWN record, so the name
+        // and the ARN this listing reports and the ones `GetPolicy` reports are one value —
+        // never a half-populated entry assembled from the attachment alone. Every attached
+        // policy is in the registry: an attach is only recorded for a policy that exists
+        // and a `DeletePolicy` is refused while any target holds it, so the filter drops
+        // nothing in practice and cannot invent an entry if that ever stops holding.
+        let policies: Vec<Policy> = page
+            .iter()
+            .filter_map(|row| crate::state::attachment_listing_row_policy_name(row))
+            .filter_map(|policy_name| store.policies.get(policy_name))
+            .map(|policy| Policy {
+                policy_name: Some(policy.policy_name.clone()),
+                policy_arn: Some(policy.policy_arn.clone()),
+            })
+            .collect();
+
+        Ok(ListPrincipalPoliciesOutput {
+            // `Policies` carries no length constraint, so a principal with no attachment
+            // answers with an EMPTY list rather than an absent member: "nothing is
+            // attached" is an answer, not a missing one.
+            policies: Some(policies),
+            // "The marker for the next set of results, or null if there are no additional
+            // results."
+            next_marker,
+        })
     }
 }

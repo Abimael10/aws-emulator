@@ -279,26 +279,16 @@ impl RegisteredCertificate {
 /// page size of 25".
 pub const DEFAULT_CERTIFICATE_PAGE_SIZE: i32 = 25;
 
-/// The character that separates a listing row's ORDERING POSITION from the certificate
-/// id it names. Neither part can contain it: the position is decimal digits and a
-/// `certificateId` is modelled `^(0x)?[a-fA-F0-9]+$`.
-const LISTING_ROW_SEPARATOR: char = '/';
-
-/// How wide a row's ordering position is rendered: enough decimal digits for every
-/// `u64`, so positions compare as strings exactly as they compare as numbers.
-const LISTING_POSITION_WIDTH: usize = 20;
-
 /// Where `certificate` sits in a certificate listing ordered by creation date, as a row
 /// that sorts ASCENDING in that listing's own order whichever direction it runs.
 ///
 /// `ListCertificates$ascendingOrder` is "Specifies the order for results. If True, the
 /// results are returned in ascending order, based on the creation date", so the creation
-/// date is the ordering key and the flag is its direction; a descending listing is the
-/// same key counted down from the end of the range, which keeps every row comparable
-/// with `<` and lets one pager serve both directions. The certificate id only makes the
-/// order total — it breaks a tie between two certificates created in the same
-/// microsecond, the same way in both directions — so a page boundary names exactly one
-/// position.
+/// date is the ordering key and the flag is its direction; the row is that key as the one
+/// position encoding every position-ordered listing of this service shares
+/// ([`super::position_listing_row`]). The certificate id only makes the order total — it
+/// breaks a tie between two certificates created in the same microsecond, the same way in
+/// both directions — so a page boundary names exactly one position.
 pub fn certificate_listing_row(
     certificate: &RegisteredCertificate,
     ascending_order: bool,
@@ -309,16 +299,7 @@ pub fn certificate_listing_row(
         .map_or(0, |since_epoch| {
             u64::try_from(since_epoch.as_micros()).unwrap_or(u64::MAX)
         });
-    let position = if ascending_order {
-        created_at
-    } else {
-        u64::MAX.saturating_sub(created_at)
-    };
-    format!(
-        "{position:0width$}{LISTING_ROW_SEPARATOR}{id}",
-        width = LISTING_POSITION_WIDTH,
-        id = certificate.certificate_id
-    )
+    super::position_listing_row(created_at, ascending_order, &certificate.certificate_id)
 }
 
 /// The rows `certificates` occupy in a listing of that direction, in the listing's order
@@ -338,8 +319,7 @@ pub fn certificate_listing_rows<'a>(
 /// The `certificateId` a listing row names, or `None` for a string that is not one
 /// [`certificate_listing_row`] built.
 pub fn certificate_listing_row_id(row: &str) -> Option<&str> {
-    row.split_once(LISTING_ROW_SEPARATOR)
-        .map(|(_position, certificate_id)| certificate_id)
+    super::position_listing_row_name(row)
 }
 
 /// A freshly minted key pair and the certificate issued for it: the record to persist,

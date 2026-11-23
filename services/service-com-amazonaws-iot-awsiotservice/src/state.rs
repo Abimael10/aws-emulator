@@ -3314,10 +3314,11 @@ pub use ca_certificates::{
 // `crate::state::<name>`.
 pub mod policy_attachments;
 pub use policy_attachments::{
+    attachment_listing_row, attachment_listing_row_policy_name, attachment_listing_rows,
     decode_page_marker, encode_page_marker, invalid_cognito_identity_pool_id_message,
     missing_attached_policy_message, missing_certificate_target_message, missing_policy_message,
     names_an_arn, page_of, parse_policy_target,
-    PolicyAttachmentLimit, PolicyAttachments, PolicyTarget, PolicyTargetRefusal,
+    PolicyAttachment, PolicyAttachmentLimit, PolicyAttachments, PolicyTarget, PolicyTargetRefusal,
     ResolvedPolicyTarget, MAX_ATTACHED_TARGETS, MAX_LIST_PAGE_SIZE, MAX_POLICIES_PER_TARGET,
 };
 
@@ -3327,6 +3328,14 @@ pub use policy_attachments::{
 // re-exported here so a handler reaches them as `crate::state::<name>`.
 pub mod name_listing;
 pub use name_listing::{name_listing_row, name_listing_row_name, name_listing_rows};
+
+// WHERE a resource ORDERED BY A POSITION — a creation date, a creation rank — sits in a
+// listing running in the direction that listing's `ascendingOrder` asks for: the one
+// position encoding every such listing of this service shares, so two orderings cannot
+// drift. Lives in `state/position_listing.rs`, beside the pager above; its names are
+// re-exported here so a handler reaches them as `crate::state::<name>`.
+pub mod position_listing;
+pub use position_listing::{position_listing_row, position_listing_row_name};
 
 // HOW an authorization question is DECIDED out of that relation — which policies are in
 // effect for a principal, and what their statements say about one action on one resource —

@@ -23,7 +23,7 @@
 //! identity is resolved no further than its form — identity pools live in another
 //! service, and this one holds no record of them.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 /// How many policies may be attached to ONE target.
 ///
@@ -272,6 +272,16 @@ pub struct PolicyAttachments {
     /// One entry per target that holds at least one attachment, keyed by
     /// [`PolicyTarget::key`].
     targets: BTreeMap<String, AttachedTarget>,
+    /// The ordinal the NEXT attachment recorded anywhere in the relation is given.
+    ///
+    /// `ListPrincipalPolicies$ascendingOrder` is "Specifies the order for results. If
+    /// true, results are returned in ascending creation order"
+    /// (`smithy_query(query="doc",shape="com.amazonaws.iot#ListPrincipalPoliciesRequest",member="ascendingOrder")`),
+    /// so WHEN an attachment was recorded is part of the relation rather than something
+    /// a reader can reconstruct from the names. A monotonic counter, not a clock: two
+    /// attachments recorded in the same microsecond still have an order, so the listing's
+    /// order is total and a page boundary names exactly one position.
+    next_attachment_ordinal: u64,
 }
 
 /// One target of the relation: how it is reported, and which policies it holds.
@@ -280,8 +290,19 @@ struct AttachedTarget {
     /// The target as `ListTargetsForPolicy` reports it
     /// ([`ResolvedPolicyTarget::reported`]).
     reported: String,
-    /// The names of the policies attached to it.
-    policies: BTreeSet<String>,
+    /// The policies attached to it, keyed by name and carrying the ordinal the
+    /// attachment was recorded under ([`PolicyAttachments::next_attachment_ordinal`]).
+    policies: BTreeMap<String, u64>,
+}
+
+/// One recorded attachment of a target, as a reader that reports attachments in the order
+/// they were CREATED needs it ([`attachment_listing_rows`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyAttachment {
+    /// The name of the attached policy.
+    pub policy_name: String,
+    /// Which attachment of the relation this is: a smaller ordinal was recorded earlier.
+    pub created_ordinal: u64,
 }
 
 /// Why an attachment was not recorded: a ceiling of the relation, with the message the
@@ -316,7 +337,7 @@ impl PolicyAttachments {
     ) -> Option<PolicyAttachmentLimit> {
         match self.targets.get(&target.key) {
             Some(attached) => {
-                if attached.policies.contains(policy_name) {
+                if attached.policies.contains_key(policy_name) {
                     return None;
                 }
                 (attached.policies.len() >= MAX_POLICIES_PER_TARGET).then(|| {
@@ -352,19 +373,32 @@ impl PolicyAttachments {
         if let Some(limit) = self.refusal_for(target, policy_name) {
             return Err(limit);
         }
-        match self.targets.get_mut(&target.key) {
+        // The ordinal is both WRITTEN and spent only when the pair is actually NEW, so a
+        // repeated attach keeps the position the first one recorded — the attachment was
+        // created once — and no two attachments ever share a position.
+        let ordinal = self.next_attachment_ordinal;
+        let recorded = match self.targets.get_mut(&target.key) {
             Some(attached) => {
-                attached.policies.insert(policy_name.to_string());
+                let is_new = !attached.policies.contains_key(policy_name);
+                attached
+                    .policies
+                    .entry(policy_name.to_string())
+                    .or_insert(ordinal);
+                is_new
             }
             None => {
                 self.targets.insert(
                     target.key.clone(),
                     AttachedTarget {
                         reported: target.reported.clone(),
-                        policies: BTreeSet::from([policy_name.to_string()]),
+                        policies: BTreeMap::from([(policy_name.to_string(), ordinal)]),
                     },
                 );
+                true
             }
+        };
+        if recorded {
+            self.next_attachment_ordinal = ordinal.saturating_add(1);
         }
         Ok(())
     }
@@ -376,18 +410,38 @@ impl PolicyAttachments {
         let Some(attached) = self.targets.get_mut(key) else {
             return false;
         };
-        let removed = attached.policies.remove(policy_name);
+        let removed = attached.policies.remove(policy_name).is_some();
         if attached.policies.is_empty() {
             self.targets.remove(key);
         }
         removed
     }
 
-    /// The names of the policies attached to the target recorded under `key`, in order.
+    /// The names of the policies attached to the target recorded under `key`, in name
+    /// order.
     pub fn policies_of(&self, key: &str) -> Vec<String> {
         self.targets
             .get(key)
-            .map(|attached| attached.policies.iter().cloned().collect())
+            .map(|attached| attached.policies.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Every attachment of the target recorded under `key`, each with the ordinal it was
+    /// recorded under — what a reader ordering its rows by CREATION rather than by name
+    /// needs ([`attachment_listing_rows`]).
+    pub fn attachments_of(&self, key: &str) -> Vec<PolicyAttachment> {
+        self.targets
+            .get(key)
+            .map(|attached| {
+                attached
+                    .policies
+                    .iter()
+                    .map(|(policy_name, created_ordinal)| PolicyAttachment {
+                        policy_name: policy_name.clone(),
+                        created_ordinal: *created_ordinal,
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -395,14 +449,14 @@ impl PolicyAttachments {
     pub fn is_attached(&self, key: &str, policy_name: &str) -> bool {
         self.targets
             .get(key)
-            .is_some_and(|attached| attached.policies.contains(policy_name))
+            .is_some_and(|attached| attached.policies.contains_key(policy_name))
     }
 
     /// Every target `policy_name` is attached to, as the listings report them, in order.
     pub fn targets_of(&self, policy_name: &str) -> Vec<String> {
         self.targets
             .values()
-            .filter(|attached| attached.policies.contains(policy_name))
+            .filter(|attached| attached.policies.contains_key(policy_name))
             .map(|attached| attached.reported.clone())
             .collect()
     }
@@ -476,6 +530,44 @@ impl super::ComAmazonawsIotAwsiotserviceState {
             _ => vec![target.key.clone()],
         }
     }
+}
+
+/// Where `attachment` sits in a listing of one target's attachments ordered by when they
+/// were created, as a row that sorts ASCENDING in that listing's own order whichever
+/// direction it runs.
+///
+/// `ListPrincipalPolicies$ascendingOrder` is "Specifies the order for results. If true,
+/// results are returned in ascending creation order", so the attachment's creation is the
+/// ordering key and the flag is its direction; the row is that key as the one position
+/// encoding every position-ordered listing of this service shares
+/// ([`super::position_listing_row`]), so one pager ([`page_of`]) serves both directions.
+pub fn attachment_listing_row(attachment: &PolicyAttachment, ascending_order: bool) -> String {
+    super::position_listing_row(
+        attachment.created_ordinal,
+        ascending_order,
+        &attachment.policy_name,
+    )
+}
+
+/// The rows `attachments` occupy in a listing of that direction, in the listing's order —
+/// the total order [`attachment_listing_row`] defines, which is what makes a page
+/// boundary meaningful.
+pub fn attachment_listing_rows(
+    attachments: &[PolicyAttachment],
+    ascending_order: bool,
+) -> Vec<String> {
+    let mut rows: Vec<String> = attachments
+        .iter()
+        .map(|attachment| attachment_listing_row(attachment, ascending_order))
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// The `policyName` an attachment listing row names, or `None` for a string that is not
+/// one [`attachment_listing_row`] built.
+pub fn attachment_listing_row_policy_name(row: &str) -> Option<&str> {
+    super::position_listing_row_name(row)
 }
 
 /// The character that separates a page marker's LISTING from the position it resumes
