@@ -1523,6 +1523,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-efs"
+version = "1.126.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a004917991f77326ef3d8831a9572c70bd5de98632f285b212d57b085968de00"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.1",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.2.0",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-eks"
 version = "1.163.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13430,6 +13455,7 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sdk-efs",
  "aws-sdk-iam",
  "aws-sdk-s3",
  "aws-smithy-runtime-api",
@@ -13440,6 +13466,7 @@ dependencies = [
  "http",
  "percent-encoding",
  "serde_json",
+ "service-com-amazonaws-efs-magnolioapiservice-v20150201",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-s3-amazons3",
  "service-common",

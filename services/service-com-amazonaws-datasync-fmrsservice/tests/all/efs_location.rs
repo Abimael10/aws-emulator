@@ -6,6 +6,11 @@
 //! `X-Amz-Target: FmrsService.<Operation>` and an `awsJson1_1` body, dispatched by the
 //! multi-service router. Nothing reaches into the state struct, so a response that is
 //! not computed from persisted state cannot pass.
+//!
+//! The cases at the end of this suite cover what DataSync proves about the FILE SYSTEM
+//! before it stores such a location, against a router that mounts this emulator's own
+//! Amazon EFS beside this service on ONE engine — so every file system they name is one
+//! that service really minted, through its own API.
 
 use std::sync::Arc;
 
@@ -661,4 +666,344 @@ async fn efs_locations_can_be_both_ends_of_a_task() {
         "case {case:?}: expected the Amazon EFS destination the task was created with, \
          got {described}"
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// What DataSync proves about the FILE SYSTEM before it stores an Amazon EFS location.
+// ---------------------------------------------------------------------------------------
+
+/// A second Region, so the rule is exercised where the file system does NOT live in the
+/// Region the call was signed for: the ARN names the Region holding it.
+const OTHER_REGION: &str = "eu-west-1";
+
+/// An account that is not this emulator's, for a reference no Amazon EFS of this emulator
+/// is asked about.
+const FOREIGN_ACCOUNT: &str = "123456789012";
+
+/// The class discriminator both code members of a refused file system reference carry.
+const EFS_FILESYSTEM_INVALID: &str = "EfsFilesystemInvalid";
+
+/// This service and this emulator's own Amazon EFS — the owner of file systems — mounted on
+/// ONE engine, with the in-process callback the DataSync handler resolves a reference over.
+struct WithAmazonEfs {
+    router: MultiServiceRouter,
+}
+
+impl WithAmazonEfs {
+    fn new() -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.set_request_authentication(false);
+        router.register_service(
+            service_com_amazonaws_datasync_fmrsservice::EmulatedService::new(Arc::clone(&engine)),
+        );
+        router.register_service(
+            service_com_amazonaws_efs_magnolioapiservice_v20150201::EmulatedService::new(
+                Arc::clone(&engine),
+            ),
+        );
+        Self { router }
+    }
+
+    /// An Amazon EFS client for `region` over the router's own in-process callback — the very
+    /// seam the DataSync handler resolves a file system through. No socket is opened: the
+    /// endpoint URL is only the address that transport routes by.
+    fn efs(&self, region: &str) -> ::aws_sdk_efs::Client {
+        let callback =
+            smithy_server_runtime::EmbeddedEmulator::from_router(self.router.clone());
+        let config = ::aws_sdk_efs::Config::builder()
+            .behavior_version(::aws_sdk_efs::config::BehaviorVersion::latest())
+            .http_client(callback.http_client())
+            .credentials_provider(callback.aws_credentials_provider())
+            .region(::aws_sdk_efs::config::Region::new(region.to_string()))
+            .endpoint_url(format!("https://elasticfilesystem.{region}.amazonaws.com"))
+            .retry_config(::aws_sdk_efs::config::retry::RetryConfig::disabled())
+            .timeout_config(::aws_sdk_efs::config::timeout::TimeoutConfig::disabled())
+            .identity_cache(::aws_sdk_efs::config::IdentityCache::no_cache())
+            .stalled_stream_protection(
+                ::aws_sdk_efs::config::StalledStreamProtectionConfig::disabled(),
+            )
+            .build();
+        ::aws_sdk_efs::Client::from_conf(config)
+    }
+
+    /// One file system Amazon EFS mints in `region`, reported as the two values that service
+    /// answered with: its ARN and its id. Nothing here derives either.
+    async fn create_file_system(&self, region: &str, token: &str) -> (String, String) {
+        let created = self
+            .efs(region)
+            .create_file_system()
+            .creation_token(token)
+            .send()
+            .await
+            .unwrap_or_else(|error| {
+                panic!("Amazon EFS must create the file system {token}: {error:?}")
+            });
+        (
+            created
+                .file_system_arn()
+                .unwrap_or_else(|| panic!("Amazon EFS must report the ARN of {token}"))
+                .to_string(),
+            created.file_system_id().to_string(),
+        )
+    }
+
+    /// Remove a file system from Amazon EFS again.
+    async fn delete_file_system(&self, region: &str, file_system_id: &str) {
+        self.efs(region)
+            .delete_file_system()
+            .file_system_id(file_system_id)
+            .send()
+            .await
+            .unwrap_or_else(|error| {
+                panic!("Amazon EFS must remove the file system {file_system_id}: {error:?}")
+            });
+    }
+
+    /// Whether Amazon EFS still reports the file system `file_system_id` in `region`.
+    async fn holds_file_system(&self, region: &str, file_system_id: &str) -> bool {
+        self.efs(region)
+            .describe_file_systems()
+            .file_system_id(file_system_id)
+            .send()
+            .await
+            .is_ok()
+    }
+
+    /// The location ARNs DataSync now holds, in creation order.
+    async fn held_locations(&self, case: &str) -> Vec<String> {
+        let listed = ok(&self.router, "ListLocations", serde_json::json!({}), case).await;
+        listed["Locations"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|entry| entry["LocationArn"].as_str().map(ToString::to_string))
+            .collect()
+    }
+}
+
+/// The `CreateLocationEfs` body for `arn`, with the required `Ec2Config` every case carries
+/// unchanged — so the only thing a row varies is the file system reference.
+fn create_request(arn: &str) -> serde_json::Value {
+    serde_json::json!({
+        "EfsFilesystemArn": arn,
+        "Ec2Config": {
+            "SubnetArn": subnet_arn(SIGNED_REGION, "subnet-0123456789abcdef0"),
+            "SecurityGroupArns": security_group_arns(SIGNED_REGION, &["sg-0123456789abcdef1"]),
+        },
+    })
+}
+
+/// An `EfsFilesystemArn` of `account` in `region` for `file_system_id`, for the references
+/// no file system was ever created under. The form is the member's own `@pattern`
+/// (`^arn:(aws|aws-cn|…):elasticfilesystem:[a-z\-0-9]+:[0-9]{12}:file-system/fs-[0-9a-f]{8,40}$`).
+fn filesystem_arn_of(region: &str, account: &str, file_system_id: &str) -> String {
+    format!("arn:aws:elasticfilesystem:{region}:{account}:file-system/{file_system_id}")
+}
+
+/// How DataSync words a refusal of a file system reference Amazon EFS does not hold.
+fn absent_file_system_message(arn: &str) -> String {
+    format!("Invalid EFS filesystem, ARN: {arn}, reason: EFS filesystem doesn't exist")
+}
+
+/// What the service must answer one `CreateLocationEfs` request.
+enum Expected {
+    /// The request is accepted and a location is stored.
+    Accepted,
+    /// The request is refused, storing nothing.
+    Refused,
+}
+
+/// RULE: an Amazon EFS location is a transfer endpoint on a file system of Amazon EFS, so
+/// `CreateLocationEfs` resolves the file system its `EfsFilesystemArn` names against that
+/// service — in the Region the ARN itself names — and refuses the request with
+/// `InvalidRequestException` (400), storing nothing, when Amazon EFS answers that this
+/// account holds no such file system. The refusal carries `EfsFilesystemInvalid` in BOTH
+/// `errorCode` and `datasyncErrorCode` and the sentence "Invalid EFS filesystem, ARN: <arn>,
+/// reason: EFS filesystem doesn't exist". A reference Amazon EFS was not asked about is not
+/// refused on these grounds.
+///
+/// The rows differ along what the rule generalises over: two different file systems Amazon
+/// EFS holds, so the rule is not keyed to one id; a file system held in a Region other than
+/// the signed one; id widths at both ends of the modelled `fs-[0-9a-f]{8,40}` for references
+/// nothing was created under, in either Region; a file system that was created and then
+/// deleted; and a file system of another account, which is not this emulator's to hold.
+#[tokio::test]
+async fn create_location_efs_resolves_the_file_system_in_amazon_efs() {
+    let aws = WithAmazonEfs::new();
+
+    let (held_arn, held_id) = aws.create_file_system(SIGNED_REGION, "preflight-held").await;
+    let (second_held_arn, _) = aws
+        .create_file_system(SIGNED_REGION, "preflight-second")
+        .await;
+    let (other_region_arn, _) = aws
+        .create_file_system(OTHER_REGION, "preflight-other-region")
+        .await;
+    let (deleted_arn, deleted_id) = aws
+        .create_file_system(SIGNED_REGION, "preflight-deleted")
+        .await;
+
+    assert!(
+        aws.holds_file_system(SIGNED_REGION, &held_id).await,
+        "setup: Amazon EFS must report the file system it just minted, {held_id}"
+    );
+    aws.delete_file_system(SIGNED_REGION, &deleted_id).await;
+    assert!(
+        !aws.holds_file_system(SIGNED_REGION, &deleted_id).await,
+        "setup: Amazon EFS must stop reporting the deleted file system {deleted_id}"
+    );
+
+    let account = engine::emulator_account_id();
+    let rows: Vec<(&str, String, Expected)> = vec![
+        (
+            "a file system Amazon EFS holds",
+            held_arn,
+            Expected::Accepted,
+        ),
+        (
+            "a second file system Amazon EFS holds",
+            second_held_arn,
+            Expected::Accepted,
+        ),
+        (
+            "a file system held in a Region other than the signed one",
+            other_region_arn,
+            Expected::Accepted,
+        ),
+        (
+            "the shortest id nothing was created under",
+            filesystem_arn_of(SIGNED_REGION, account, "fs-0b52a0f5"),
+            Expected::Refused,
+        ),
+        (
+            "a 17-character id nothing was created under",
+            filesystem_arn_of(SIGNED_REGION, account, "fs-0b52a0f59862d10c7"),
+            Expected::Refused,
+        ),
+        (
+            "the longest id nothing was created under",
+            filesystem_arn_of(
+                SIGNED_REGION,
+                account,
+                "fs-abcdef0123456789abcdef0123456789abcdef01",
+            ),
+            Expected::Refused,
+        ),
+        (
+            "an id nothing was created under, in another Region",
+            filesystem_arn_of(OTHER_REGION, account, "fs-00ff11ee"),
+            Expected::Refused,
+        ),
+        (
+            "a file system that was created and then deleted",
+            deleted_arn,
+            Expected::Refused,
+        ),
+        (
+            // Another account's Amazon EFS is not this emulator's to ask, so nothing is
+            // established about the file system and nothing is refused.
+            "a file system of another account",
+            filesystem_arn_of(SIGNED_REGION, FOREIGN_ACCOUNT, "fs-0b52a0f5"),
+            Expected::Accepted,
+        ),
+    ];
+
+    let mut accepted: Vec<String> = Vec::new();
+    for (case, arn, expected) in rows {
+        match expected {
+            Expected::Accepted => {
+                let created = ok(&aws.router, "CreateLocationEfs", create_request(&arn), case).await;
+                let location_arn = string(&created, "LocationArn", case);
+                assert_location_arn(&location_arn, case);
+                accepted.push(location_arn);
+            }
+            Expected::Refused => {
+                let (status, parsed) =
+                    call(&aws.router, "CreateLocationEfs", create_request(&arn)).await;
+                assert_eq!(
+                    status, 400,
+                    "case {case:?}: expected CreateLocationEfs to answer 400, got {status} \
+                     with {parsed}"
+                );
+                let wire_type = parsed["__type"].as_str().unwrap_or_default();
+                assert!(
+                    wire_type.contains("InvalidRequestException"),
+                    "case {case:?}: expected an InvalidRequestException, got {parsed}"
+                );
+                for member in ["errorCode", "datasyncErrorCode"] {
+                    assert_eq!(
+                        parsed[member].as_str(),
+                        Some(EFS_FILESYSTEM_INVALID),
+                        "case {case:?}: expected {member} to carry {EFS_FILESYSTEM_INVALID:?}, \
+                         got {parsed}"
+                    );
+                }
+                let expected_message = absent_file_system_message(&arn);
+                assert_eq!(
+                    parsed["message"].as_str(),
+                    Some(expected_message.as_str()),
+                    "case {case:?}: expected the refusal to say {expected_message:?}, \
+                     got {parsed}"
+                );
+            }
+        }
+    }
+
+    // Every refused create stored nothing: the listing holds exactly the accepted locations.
+    let held = aws.held_locations("listing").await;
+    assert_eq!(
+        held, accepted,
+        "case \"listing\": expected only the accepted locations, got {held:?}"
+    );
+}
+
+/// RULE: an accepted reference is the one the location KEEPS, so a location created on a
+/// file system Amazon EFS holds reads back through `DescribeLocationEfs` reporting that very
+/// file system.
+#[tokio::test]
+async fn an_accepted_file_system_is_what_the_stored_location_reports() {
+    let case = "round trip";
+    let aws = WithAmazonEfs::new();
+    let (arn, file_system_id) = aws
+        .create_file_system(SIGNED_REGION, "preflight-roundtrip")
+        .await;
+
+    let created = ok(&aws.router, "CreateLocationEfs", create_request(&arn), case).await;
+    let location_arn = string(&created, "LocationArn", case);
+
+    let described = ok(
+        &aws.router,
+        "DescribeLocationEfs",
+        serde_json::json!({ "LocationArn": location_arn }),
+        case,
+    )
+    .await;
+    let expected_uri = format!("efs://{SIGNED_REGION}.{file_system_id}/");
+    assert_eq!(
+        string(&described, "LocationUri", case),
+        expected_uri,
+        "case {case:?}: expected the file system the request named, got {described}"
+    );
+}
+
+/// RULE: a refusal has to be grounded in what the OWNER of the resource answered, so an
+/// emulator with no Amazon EFS mounted refuses nothing — the very references the cases above
+/// are refused for are accepted here, because nothing was asked about them.
+#[tokio::test]
+async fn nothing_is_refused_when_amazon_efs_cannot_be_asked() {
+    let router = service();
+    let account = engine::emulator_account_id();
+
+    // One reference per id width the rows above refuse, in both Regions.
+    let arns = [
+        filesystem_arn_of(SIGNED_REGION, account, "fs-0b52a0f5"),
+        filesystem_arn_of(SIGNED_REGION, account, "fs-0b52a0f59862d10c7"),
+        filesystem_arn_of(OTHER_REGION, account, "fs-00ff11ee"),
+    ];
+    for arn in arns {
+        let case = format!("no Amazon EFS mounted, {arn}");
+        let created = ok(&router, "CreateLocationEfs", create_request(&arn), &case).await;
+        assert_location_arn(&string(&created, "LocationArn", &case), &case);
+    }
 }

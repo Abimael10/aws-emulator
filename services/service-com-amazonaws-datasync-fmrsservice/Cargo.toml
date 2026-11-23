@@ -36,6 +36,12 @@ aws-sdk-s3 = { version = "1", default-features = false }
 # Percent-encodes the `x-amz-tagging` a transfer writes a destination object's tag set
 # in: that header's value is URL-encoded query parameters (`state::transfer`).
 percent-encoding = "2"
+# The AWS SDK for Amazon EFS, driven over the same in-process callback: the file system an
+# Amazon EFS location references is a resource of THAT service, so the create resolves it
+# with `DescribeFileSystems` before it stores the location (`state::efs_file_system`). Only
+# the generated client is needed — the emulator supplies the transport, so the SDK's own
+# HTTPS stack and runtime are left out.
+aws-sdk-efs = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -52,6 +58,10 @@ service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # The AWS SDK for IAM, driven over the same in-process callback: that suite creates the
 # bucket access role and changes its inline policy through IAM's own API.
 aws-sdk-iam = { version = "1", default-features = false }
+# The file system an Amazon EFS location references is a resource of Amazon EFS, so the
+# suite that drives the create's file-system resolution mounts that service beside this one
+# on ONE engine: every file system a case names is one Amazon EFS really minted.
+service-com-amazonaws-efs-magnolioapiservice-v20150201 = { workspace = true }
 
 [lints]
 workspace = true

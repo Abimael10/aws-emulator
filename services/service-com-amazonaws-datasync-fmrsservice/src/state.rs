@@ -20,6 +20,9 @@
 //! * whether this service can assume a bucket access role a request names
 //!   ([`bucket_access_role`]), which every operation that takes one resolves before it
 //!   writes anything.
+//! * whether the Amazon EFS file system a location names is one that service HOLDS
+//!   ([`efs_file_system`]), resolved before an Amazon EFS location is stored, so a
+//!   location is never minted on a reference no transfer could reach.
 //! * the modelled defaults ([`default_options`]) and the per-execution overlay
 //!   ([`overlay_options`]) that `CreateTask`, `StartTaskExecution` and the two
 //!   `Describe*` operations must agree on.
@@ -38,6 +41,7 @@
 
 pub mod agents;
 pub mod bucket_access_role;
+pub mod efs_file_system;
 pub mod listing;
 pub mod tagging;
 pub mod transfer;

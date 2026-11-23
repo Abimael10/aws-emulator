@@ -6,7 +6,9 @@
 //! [`crate::state`], so `DescribeLocationEfs` and `CreateTask` can resolve it again.
 //! Nothing is echoed back: the response carries only the newly minted ARN, and each call
 //! mints its own — two requests carrying the same file system address two independent
-//! locations.
+//! locations. The file system the request references is resolved against Amazon EFS first
+//! ([`crate::state::efs_file_system`]): a reference that service reports it does not hold is
+//! refused and nothing is stored.
 //!
 //! ## Shape of an operation
 //!
@@ -193,6 +195,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
+
+        // The pre-flight DataSync performs before it stores the location: the file system the
+        // request references is a resource of Amazon EFS, so a reference that service reports
+        // it does not hold is one no transfer could ever mount, and the create is refused
+        // before anything is stored. Amazon EFS answers the question
+        // ([`crate::state::efs_file_system::file_system_is_absent`]) and an answer it did not
+        // give establishes nothing.
+        if crate::state::efs_file_system::file_system_is_absent(
+            ctx.callback(),
+            &region,
+            &input.efs_filesystem_arn,
+        )
+        .await
+        {
+            return Err(CreateLocationEfsErrorModeled::InvalidRequestException(
+                crate::state::efs_file_system::absent_file_system_refusal(
+                    &input.efs_filesystem_arn,
+                ),
+            )
+            .into());
+        }
 
         let location_uri = crate::state::LocationKind::Efs.location_uri(
             &efs_global_id(&input.efs_filesystem_arn),
