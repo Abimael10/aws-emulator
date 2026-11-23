@@ -460,15 +460,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // are `InvalidParameterCombination` — never with a 501.
         if let Some(port) = input.port {
             // "Constraints: This value must be 1150-65535".
-            if !crate::state::PORT_RANGE.contains(&port) {
-                return Err(
-                    RestoreDBClusterFromSnapshotError::invalid_parameter_value(format!(
-                        "invalid value {port} for Port: must be a value from {} to {}",
-                        crate::state::PORT_RANGE.start(),
-                        crate::state::PORT_RANGE.end()
-                    )),
-                );
-            }
+            crate::state::check_endpoint_port(port, &crate::state::PORT_RANGE)
+                .map_err(RestoreDBClusterFromSnapshotError::invalid_parameter_value)?;
         }
         if let Some(period) = input.backup_retention_period {
             // "Must be a value from 1 to 35."

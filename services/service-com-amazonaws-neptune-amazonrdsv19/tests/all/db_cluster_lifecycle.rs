@@ -1685,3 +1685,206 @@ async fn a_delete_that_needs_a_final_snapshot_answers_501_and_keeps_the_resource
         still_there.body
     );
 }
+
+// ---------------------------------------------------------------------------
+// A delete of a cluster that still holds member DB instances
+// ---------------------------------------------------------------------------
+
+/// One row of the busy-cluster table: the cluster's identifier, how many members hold it, and
+/// whether the delete is sent once the cluster has reached `available` or while it is still
+/// coming up.
+struct BusyCluster {
+    case: &'static str,
+    cluster: &'static str,
+    members: usize,
+    settled: bool,
+}
+
+/// The rows the refusal is asserted over: the membership counts that make a cluster busy —
+/// one member and more than one — crossed with both statuses a cluster can be in when the
+/// delete arrives, because the predicate is the MEMBERSHIP and nothing else.
+const BUSY_CLUSTERS: &[BusyCluster] = &[
+    BusyCluster {
+        case: "an available cluster with one member",
+        cluster: "busy-graph-one",
+        members: 1,
+        settled: true,
+    },
+    BusyCluster {
+        case: "an available cluster with two members",
+        cluster: "busy-graph-two",
+        members: 2,
+        settled: true,
+    },
+    BusyCluster {
+        case: "a cluster still coming up, with one member",
+        cluster: "busy-graph-creating",
+        members: 1,
+        settled: false,
+    },
+];
+
+#[tokio::test]
+async fn a_cluster_that_still_holds_members_is_refused_the_delete_with_one_fixed_sentence() {
+    let neptune = Neptune::new();
+
+    for row in BUSY_CLUSTERS {
+        let created = neptune
+            .call(
+                "CreateDBCluster",
+                &[("DBClusterIdentifier", row.cluster), ("Engine", "neptune")],
+            )
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {:?}: seeding the cluster must succeed, body {}",
+            row.case, created.body
+        );
+        if row.settled {
+            await_cluster_available(&neptune, row.case, row.cluster).await;
+        }
+
+        let members: Vec<String> = (0..row.members)
+            .map(|member| format!("{}-{member}", row.cluster))
+            .collect();
+        for member in &members {
+            let joined = neptune
+                .call(
+                    "CreateDBInstance",
+                    &[
+                        ("DBInstanceIdentifier", member.as_str()),
+                        ("DBInstanceClass", "db.r5.large"),
+                        ("Engine", "neptune"),
+                        ("DBClusterIdentifier", row.cluster),
+                    ],
+                )
+                .await;
+            assert_eq!(
+                joined.status, 200,
+                "case {:?}: seeding the member {member} must succeed, body {}",
+                row.case, joined.body
+            );
+        }
+        let before = cluster_status(&neptune, row.cluster).await;
+
+        // The delete carries the final-snapshot members a teardown sends: the cluster's own
+        // state is answered first, so what comes back is the state fault and not the snapshot
+        // path's answer.
+        let refused = neptune
+            .call(
+                "DeleteDBCluster",
+                &[
+                    ("DBClusterIdentifier", row.cluster),
+                    ("SkipFinalSnapshot", "false"),
+                    (
+                        "FinalDBSnapshotIdentifier",
+                        &format!("{}-final", row.cluster),
+                    ),
+                ],
+            )
+            .await;
+        assert_eq!(
+            (refused.status, refused.error_code().as_str()),
+            (400, "InvalidDBClusterStateFault"),
+            "case {:?}: expected the modelled state fault, got body {}",
+            row.case,
+            refused.body
+        );
+        let message = refused.error_message();
+        assert_eq!(
+            message,
+            service_com_amazonaws_neptune_amazonrdsv19::state::CLUSTER_STILL_HAS_MEMBERS_MESSAGE,
+            "case {:?}: expected the fixed sentence for a cluster that still holds members, \
+             got {message:?}",
+            row.case
+        );
+        for member in &members {
+            assert!(
+                !message.contains(member.as_str()) && !message.contains(row.cluster),
+                "case {:?}: the refusal must disclose neither the cluster nor the member \
+                 {member}, got {message:?}",
+                row.case
+            );
+        }
+
+        // The refused delete left the cluster as it was, and took no snapshot of it.
+        let after = cluster_status(&neptune, row.cluster).await;
+        assert_eq!(
+            after, before,
+            "case {:?}: expected the refused delete to leave the status at {before:?}, got \
+             {after:?}",
+            row.case
+        );
+
+        // Deleting the members is what releases the cluster, which is the order the API
+        // documents: the same cluster is then deleted.
+        for member in &members {
+            let gone = neptune
+                .call(
+                    "DeleteDBInstance",
+                    &[
+                        ("DBInstanceIdentifier", member.as_str()),
+                        ("SkipFinalSnapshot", "true"),
+                    ],
+                )
+                .await;
+            assert_eq!(
+                gone.status, 200,
+                "case {:?}: deleting the member {member} must succeed, body {}",
+                row.case, gone.body
+            );
+        }
+        let deleted = neptune
+            .call(
+                "DeleteDBCluster",
+                &[
+                    ("DBClusterIdentifier", row.cluster),
+                    ("SkipFinalSnapshot", "true"),
+                ],
+            )
+            .await;
+        assert_eq!(
+            deleted.status, 200,
+            "case {:?}: the cluster must be deletable once its members are gone, body {}",
+            row.case, deleted.body
+        );
+    }
+}
+
+/// The `Status` the cluster `identifier` reports.
+async fn cluster_status(neptune: &Neptune, identifier: &str) -> String {
+    let described = neptune
+        .call("DescribeDBClusters", &[("DBClusterIdentifier", identifier)])
+        .await;
+    assert_eq!(
+        described.status, 200,
+        "{identifier}: the cluster must be reported, body {}",
+        described.body
+    );
+    described.field(&[
+        "DescribeDBClustersResult",
+        "DBClusters",
+        "DBCluster",
+        "Status",
+    ])
+}
+
+/// Read `identifier` until it reports `available`: the CONDITION the clock owes is waited
+/// for, never a fixed span.
+async fn await_cluster_available(neptune: &Neptune, case: &str, identifier: &str) {
+    // Far longer than the span the transition becomes due after, so a loaded machine cannot
+    // fail the suite, and far shorter than a client's patience.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let status = cluster_status(neptune, identifier).await;
+        if status == "available" {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: the clock owed {identifier} the available state, last status was \
+             {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}

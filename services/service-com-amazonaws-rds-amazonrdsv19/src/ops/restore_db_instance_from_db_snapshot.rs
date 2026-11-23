@@ -432,15 +432,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
         if let Some(port) = input.port {
-            if !crate::state::PORT_RANGE.contains(&port) {
-                return Err(
-                    RestoreDBInstanceFromDBSnapshotError::invalid_parameter_value(format!(
-                        "invalid value {port} for Port: must be a value from {} to {}",
-                        crate::state::PORT_RANGE.start(),
-                        crate::state::PORT_RANGE.end()
-                    )),
-                );
-            }
+            crate::state::check_endpoint_port(port, &crate::state::PORT_RANGE)
+                .map_err(RestoreDBInstanceFromDBSnapshotError::invalid_parameter_value)?;
         }
         if let Some(period) = input.backup_retention_period {
             crate::state::check_backup_retention_period(

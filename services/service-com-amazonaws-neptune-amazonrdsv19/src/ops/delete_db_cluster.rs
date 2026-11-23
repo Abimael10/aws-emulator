@@ -202,9 +202,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !cluster.members.is_empty() {
                 return Err(DeleteDBClusterErrorModeled::InvalidDBClusterStateFault(
                     InvalidDBClusterStateFault {
-                        message: Some(format!(
-                            "Cluster {key} cannot be deleted, it still contains DB instances in non-deleting state."
-                        )),
+                        // FIXED text: the refusal states the precondition and discloses
+                        // neither the cluster nor the members holding it
+                        // (`st::CLUSTER_STILL_HAS_MEMBERS_MESSAGE`).
+                        message: Some(st::CLUSTER_STILL_HAS_MEMBERS_MESSAGE.to_string()),
                     },
                 )
                 .into());

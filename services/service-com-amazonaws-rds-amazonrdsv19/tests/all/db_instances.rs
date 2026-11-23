@@ -1280,14 +1280,14 @@ async fn documented_constraints_are_refused_at_their_bounds() {
             identifier: "emu-bad-port-lo",
             extra: params!["Port" => 1149].to_vec(),
             code: "InvalidParameterValue",
-            says: "Port",
+            says: "Invalid endpoint port 1149. Valid range is: 1150-65535 ",
         },
         RefusedCase {
             case: "one above the highest Port",
             identifier: "emu-bad-port-hi",
             extra: params!["Port" => 65536].to_vec(),
             code: "InvalidParameterValue",
-            says: "Port",
+            says: "Invalid endpoint port 65536. Valid range is: 1150-65535 ",
         },
         RefusedCase {
             case: "one below the lowest BackupRetentionPeriod",

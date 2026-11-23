@@ -798,7 +798,7 @@ async fn a_failover_refused_for_the_clusters_state_names_the_cluster_and_the_sta
 /// The FIXED sentence a delete of a cluster that still holds members is refused with: it
 /// states the precondition and discloses neither the cluster nor its member instances.
 const CLUSTER_STILL_HAS_MEMBERS_SENTENCE: &str =
-    "Cluster cannot be deleted, it still contains DB instances in non-deleting state.";
+    "Cluster can't be deleted. It still contains DB instances in a non-deleting state.";
 
 #[tokio::test]
 async fn a_cluster_that_still_holds_members_is_refused_with_one_fixed_sentence() {

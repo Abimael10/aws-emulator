@@ -378,13 +378,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(ModifyDBInstanceError::invalid_parameter_value)?;
         }
         if let Some(port) = input.db_port_number {
-            if !crate::state::PORT_RANGE.contains(&port) {
-                return Err(ModifyDBInstanceError::invalid_parameter_value(format!(
-                    "invalid value {port} for DBPortNumber: must be a value from {} to {}",
-                    crate::state::PORT_RANGE.start(),
-                    crate::state::PORT_RANGE.end()
-                )));
-            }
+            crate::state::check_endpoint_port(port, &crate::state::PORT_RANGE)
+                .map_err(ModifyDBInstanceError::invalid_parameter_value)?;
         }
 
         if let Some(period) = input.performance_insights_retention_period {

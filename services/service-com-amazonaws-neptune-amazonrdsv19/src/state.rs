@@ -147,6 +147,17 @@ pub const MAX_MEMBERS_PER_CLUSTER: usize = 16;
 /// service's own.
 pub const DB_CLUSTER_ALREADY_EXISTS_MESSAGE: &str = "DB Cluster already exists";
 
+/// The sentence the `InvalidDBClusterStateFault` carries when a delete is asked for a cluster
+/// that still holds member DB instances.
+///
+/// The whole message is FIXED text, in two sentences — that the cluster cannot be deleted, and
+/// the precondition that blocks it: the cluster still contains DB instances that are not
+/// themselves on their way out, which is the predicate the refusal is decided by. It names
+/// neither the cluster the request addressed nor the members holding it, so it is a constant
+/// rather than a `format!` over the request and the store.
+pub const CLUSTER_STILL_HAS_MEMBERS_MESSAGE: &str =
+    "Cluster can't be deleted. It still contains DB instances in a non-deleting state.";
+
 /// Status of an IAM role association the service is still putting in place.
 /// Source: `DBClusterRole$Status` — "PENDING - the IAM role ARN is being associated with the
 /// DB cluster."

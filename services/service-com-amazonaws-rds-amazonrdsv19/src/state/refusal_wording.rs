@@ -324,16 +324,17 @@ pub const DELETION_PROTECTED_GLOBAL_CLUSTER: &str = "Global Cluster";
 ///
 /// An Aurora DB cluster's DB instances are deleted one by one (`DeleteDBInstance`) before
 /// the cluster can go, so a delete that would leave members behind is refused. Amazon RDS
-/// states only the precondition — the cluster still contains DB instances that are not
-/// themselves being deleted, which is the predicate the refusal is decided by — and names
-/// NEITHER the cluster nor the instances that block it, so this is a constant rather than a
-/// `format!` over the request and the store: the member identifiers are not disclosed, and a
-/// caller matching the sentence reads what it has to do.
+/// words it as two sentences — that the cluster cannot be deleted, and the precondition that
+/// blocks it: the cluster still contains DB instances that are not themselves being deleted,
+/// which is the predicate the refusal is decided by. It names NEITHER the cluster nor the
+/// instances that block it, so this is a constant rather than a `format!` over the request
+/// and the store: the member identifiers are not disclosed, and a caller matching the
+/// sentence reads what it has to do.
 ///
 /// One wording for every front door of this model that deletes a cluster, so none of them
 /// can drift from the others.
 pub const CLUSTER_STILL_HAS_MEMBERS_MESSAGE: &str =
-    "Cluster cannot be deleted, it still contains DB instances in non-deleting state.";
+    "Cluster can't be deleted. It still contains DB instances in a non-deleting state.";
 
 /// What a delete that names BOTH of its final-snapshot members is refused with.
 ///
@@ -423,6 +424,33 @@ pub fn check_backup_retention_period(
     Err(format!(
         "Invalid backup retention period: {period}. Retention period must be between {} and \
          {}.",
+        accepted.start(),
+        accepted.end()
+    ))
+}
+
+/// Refuse an endpoint PORT outside the range the engine accepts, whichever member of
+/// whichever operation named it: a DB cluster's `Port`, a DB instance's `Port` and the
+/// `DBPortNumber` a modification moves an instance to all configure the port the engine
+/// answers on, so the creates, the modifications and the restores hold ONE rule and none of
+/// them can drift from the others. `Err` carries the sentence; `accepted` is the range the
+/// engine publishes for an endpoint port ([`PORT_RANGE`], "Valid Values: 1150-65535").
+///
+/// Amazon RDS words it as the port it would not accept and then the range an endpoint port
+/// has to fall in, written `<floor>-<ceiling>` and closed by a trailing space. The sentence
+/// names no member — its subject is the ENDPOINT port, which is what each of those members
+/// configures — so the value comes from the request and the bounds from the range the engine
+/// publishes, and nothing else of the request or the store is in it.
+pub fn check_endpoint_port(
+    port: i32,
+    accepted: &std::ops::RangeInclusive<i32>,
+) -> Result<(), String> {
+    if accepted.contains(&port) {
+        return Ok(());
+    }
+    // The trailing space closes the sentence this service answers; it is not a separator.
+    Err(format!(
+        "Invalid endpoint port {port}. Valid range is: {}-{} ",
         accepted.start(),
         accepted.end()
     ))

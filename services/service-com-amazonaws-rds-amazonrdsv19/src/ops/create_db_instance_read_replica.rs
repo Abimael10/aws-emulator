@@ -414,15 +414,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (None, Some(named)) => NamedSource::Cluster(named.clone()),
         };
         if let Some(port) = input.port {
-            if !crate::state::PORT_RANGE.contains(&port) {
-                return Err(
-                    CreateDBInstanceReadReplicaError::invalid_parameter_value(format!(
-                        "invalid value {port} for Port: must be a value from {} to {}",
-                        crate::state::PORT_RANGE.start(),
-                        crate::state::PORT_RANGE.end()
-                    )),
-                );
-            }
+            crate::state::check_endpoint_port(port, &crate::state::PORT_RANGE)
+                .map_err(CreateDBInstanceReadReplicaError::invalid_parameter_value)?;
         }
         if input.multi_az == Some(true) && input.availability_zone.is_some() {
             return Err(
