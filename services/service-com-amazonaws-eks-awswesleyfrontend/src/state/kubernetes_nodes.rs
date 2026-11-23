@@ -256,7 +256,7 @@ fn node_uid(instance_id: &str) -> String {
 /// the form an Amazon EKS node publishes it, built from the version the cluster
 /// record carries so a node and `DescribeCluster` cannot disagree about which
 /// Kubernetes the cluster runs.
-fn kubelet_version(cluster: &ClusterRecord) -> String {
+pub(super) fn kubelet_version(cluster: &ClusterRecord) -> String {
     let version = cluster
         .version
         .clone()
@@ -444,6 +444,11 @@ pub struct ClusterNode {
     /// ([`node_taints`]) — what the scheduler holds a pod's tolerations against
     /// before it places the pod here.
     pub taints: Vec<NodeTaint>,
+    /// Whether this node runs exactly ONE pod, the pod it was provisioned for:
+    /// the AWS Fargate capacity of one pod is such a node
+    /// ([`super::kubernetes_fargate`]), and the scheduler places no other pod on
+    /// it. False for a node group's instance, which takes every pod it admits.
+    pub dedicated: bool,
 }
 
 impl ClusterNode {
@@ -466,7 +471,9 @@ impl ClusterNode {
 
 impl ComAmazonawsEksAwswesleyfrontendState {
     /// Every node of the cluster `cluster_name` in `region`, in node-name order:
-    /// the instances of each of its node groups that has come up.
+    /// the instances of each of its node groups that has come up, and the AWS
+    /// Fargate capacity it has provisioned for the pods its profiles select
+    /// ([`super::kubernetes_fargate`]).
     ///
     /// A node group that is still being created has not registered its nodes with
     /// the cluster yet, and one that is being deleted is taking them away, so
@@ -496,13 +503,22 @@ impl ComAmazonawsEksAwswesleyfrontendState {
                 ));
             }
         }
+        // The Fargate nodes the cluster has provisioned for the pods its profiles
+        // select, which a client reads as nodes of the cluster like any other
+        // ([`super::kubernetes_fargate`]).
+        if let Some(plane) = self.kubernetes_api.get(&(region.to_string(), cluster_name.to_string()))
+        {
+            for node in plane.objects.fargate_nodes.values() {
+                nodes.push((node.name.clone(), node.to_json(cluster, region)));
+            }
+        }
         nodes.sort_by(|left, right| left.0.cmp(&right.0));
         nodes.into_iter().map(|(_, document)| document).collect()
     }
 
     /// The nodes of that cluster a pod can be scheduled onto, in the order
     /// [`Self::cluster_nodes`] reports them: empty for a cluster whose node groups
-    /// have registered none.
+    /// have registered none and that has provisioned no Fargate capacity.
     ///
     /// Reads the node group records directly rather than the rendered documents:
     /// this runs on every request to the cluster's API server, and rendering every
@@ -530,9 +546,20 @@ impl ComAmazonawsEksAwswesleyfrontendState {
                     // The taints the node group applies to its nodes, which is
                     // what the scheduler holds a pod's tolerations against.
                     taints: node_taints(nodegroup),
+                    // A node group's instance runs every pod the scheduler
+                    // places on it.
+                    dedicated: false,
                 })
             })
             .collect();
+        // The Fargate capacity this cluster has already provisioned is registered
+        // with it as a node too ([`super::kubernetes_fargate`]), so the pod each
+        // one runs stays placed on it and its kubelet's image pull is made as the
+        // profile's Pod execution role.
+        if let Some(plane) = self.kubernetes_api.get(&(region.to_string(), cluster_name.to_string()))
+        {
+            nodes.extend(plane.objects.fargate_cluster_nodes());
+        }
         nodes.sort_by(|left, right| left.name.cmp(&right.name));
         nodes
     }

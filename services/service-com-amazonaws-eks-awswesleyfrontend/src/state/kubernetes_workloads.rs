@@ -36,7 +36,7 @@ use ::std::time::SystemTime;
 
 use super::kubernetes_lists::{listed, ListRequest};
 use super::kubernetes_metadata::ObjectMetadata;
-use super::kubernetes_nodes::ClusterNode;
+use super::kubernetes_fargate::ClusterCapacity;
 use super::kubernetes_objects::{
     generated_name_suffix, manifest_name, new_object_uid, ApiRefusal, ClusterObjects,
     DEFAULT_SERVICE_ACCOUNT,
@@ -395,7 +395,7 @@ impl ClusterObjects {
         namespace: &str,
         manifest: &::serde_json::Value,
         now: SystemTime,
-        nodes: &[ClusterNode],
+        capacity: &ClusterCapacity,
     ) -> Result<::serde_json::Value, ApiRefusal> {
         let name = manifest_name(manifest, resource.kind())?;
         self.namespace(namespace)?;
@@ -433,8 +433,8 @@ impl ClusterObjects {
                 managed_by: None,
             },
         );
-        self.run_workload_replicas(resource, namespace, &name, now, nodes);
-        self.workload_json(resource, namespace, &name, nodes)
+        self.run_workload_replicas(resource, namespace, &name, now, capacity);
+        self.workload_json(resource, namespace, &name, capacity)
     }
 
     /// `GET /apis/apps/v1/namespaces/{namespace}/{resource}/{name}`.
@@ -443,7 +443,7 @@ impl ClusterObjects {
         resource: WorkloadResource,
         namespace: &str,
         name: &str,
-        nodes: &[ClusterNode],
+        capacity: &ClusterCapacity,
     ) -> Result<::serde_json::Value, ApiRefusal> {
         let held = self.namespace(namespace)?;
         let workload = held
@@ -459,7 +459,7 @@ impl ClusterObjects {
             .filter_map(|pod| held.pods.get(pod))
             .collect();
         let ready = running.iter().filter(|pod| pod.is_ready()).count();
-        let desired = workload.desired_replicas(resource, nodes.len());
+        let desired = workload.desired_replicas(resource, capacity.shared_node_count());
         Ok(::serde_json::json!({
             "kind": resource.kind(),
             "apiVersion": APPS_API_VERSION,
@@ -483,7 +483,7 @@ impl ClusterObjects {
         resource: WorkloadResource,
         namespace: &str,
         request: &ListRequest,
-        nodes: &[ClusterNode],
+        capacity: &ClusterCapacity,
     ) -> Result<::serde_json::Value, ApiRefusal> {
         let names: Vec<String> = self
             .namespace(namespace)?
@@ -493,7 +493,7 @@ impl ClusterObjects {
             .map(|(_, name)| name.clone())
             .collect();
         Ok(listed(resource.list_kind(), &names, request, |name| {
-            self.workload_json(resource, namespace, name, nodes).ok()
+            self.workload_json(resource, namespace, name, capacity).ok()
         }))
     }
 
@@ -505,9 +505,9 @@ impl ClusterObjects {
         resource: WorkloadResource,
         namespace: &str,
         name: &str,
-        nodes: &[ClusterNode],
+        capacity: &ClusterCapacity,
     ) -> Result<::serde_json::Value, ApiRefusal> {
-        let deleted = self.workload_json(resource, namespace, name, nodes)?;
+        let deleted = self.workload_json(resource, namespace, name, capacity)?;
         self.remove_workload(resource, namespace, name);
         Ok(deleted)
     }
@@ -530,7 +530,7 @@ impl ClusterObjects {
         name: &str,
         manifest: &::serde_json::Value,
         now: SystemTime,
-        nodes: &[ClusterNode],
+        capacity: &ClusterCapacity,
     ) -> Result<::serde_json::Value, ApiRefusal> {
         let spec = admitted_workload_spec(resource, name, manifest)?;
         let metadata = ObjectMetadata::from_manifest(resource.kind(), name, manifest)?;
@@ -560,23 +560,25 @@ impl ClusterObjects {
         if rolled {
             self.retire_workload_pods(resource, namespace, name);
         }
-        self.run_workload_replicas(resource, namespace, name, now, nodes);
-        self.workload_json(resource, namespace, name, nodes)
+        self.run_workload_replicas(resource, namespace, name, now, capacity);
+        self.workload_json(resource, namespace, name, capacity)
     }
 
     /// Bring the pods one workload runs up to the number it is to run: create the
     /// replicas it is short of, and remove the ones it no longer runs.
     ///
-    /// A DaemonSet is converged against the NODES — one pod per node the cluster
-    /// holds, so a pod on a node the cluster no longer holds is removed and a node
-    /// with no pod of it gets one — and a Deployment against its replica count.
+    /// A DaemonSet is converged against the NODES a pod can be placed on — one pod
+    /// per shared node the cluster holds, so a pod on a node the cluster no longer
+    /// holds is removed and a node with no pod of it gets one — and a Deployment
+    /// against its replica count. The Fargate capacity of one pod is no node a
+    /// daemon runs a copy on ([`super::kubernetes_fargate`]): it runs that one pod.
     fn run_workload_replicas(
         &mut self,
         resource: WorkloadResource,
         namespace: &str,
         name: &str,
         now: SystemTime,
-        nodes: &[ClusterNode],
+        capacity: &ClusterCapacity,
     ) {
         let key = (resource, name.to_string());
         let Some(held) = self.namespaces.get(namespace) else {
@@ -600,7 +602,7 @@ impl ClusterObjects {
         let mut create: Vec<(String, Option<String>)> = Vec::new();
         let mut remove: Vec<String> = Vec::new();
         if resource.runs_on_every_node() {
-            for node in nodes {
+            for node in capacity.shared_nodes() {
                 if !running
                     .iter()
                     .any(|(_, on)| on.as_deref() == Some(node.name.as_str()))
@@ -617,13 +619,13 @@ impl ClusterObjects {
                 .iter()
                 .filter(|(_, on)| {
                     on.as_deref()
-                        .is_none_or(|on| !nodes.iter().any(|node| node.name == on))
+                        .is_none_or(|on| !capacity.shared_nodes().any(|node| node.name == on))
                 })
                 .map(|(pod, _)| pod.clone())
                 .collect();
             remove.extend(gone);
         } else {
-            let desired = workload.desired_replicas(resource, nodes.len());
+            let desired = workload.desired_replicas(resource, capacity.shared_node_count());
             for _ in running.len()..desired {
                 create.push((format!("{name}-{hash}-{}", generated_name_suffix()), None));
             }
@@ -639,7 +641,7 @@ impl ClusterObjects {
             // A replica the namespace cannot take — its service account is gone,
             // the namespace is full — is not created, and the workload reports the
             // replicas it does run rather than a count nothing backs.
-            if self.create_pod(namespace, &manifest, now, nodes).is_err() {
+            if self.create_pod(namespace, &manifest, now, capacity).is_err() {
                 continue;
             }
             if let Some(workload) = self
@@ -705,7 +707,7 @@ impl ClusterObjects {
     /// loses the copy of a node that is gone, whether or not anybody called — so it
     /// runs before any workload is reported and leaves every caller reading the
     /// same cluster.
-    pub fn reconcile_workloads(&mut self, now: SystemTime, nodes: &[ClusterNode]) {
+    pub fn reconcile_workloads(&mut self, now: SystemTime, capacity: &ClusterCapacity) {
         let held: Vec<(String, WorkloadResource, String)> = self
             .namespaces
             .iter()
@@ -716,7 +718,7 @@ impl ClusterObjects {
             })
             .collect();
         for (namespace, resource, name) in held {
-            self.run_workload_replicas(resource, &namespace, &name, now, nodes);
+            self.run_workload_replicas(resource, &namespace, &name, now, capacity);
         }
     }
 

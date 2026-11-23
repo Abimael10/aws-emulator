@@ -4874,6 +4874,7 @@ pub mod kubernetes_authentication;
 pub mod kubernetes_aws_auth;
 pub mod kubernetes_config_maps;
 pub mod kubernetes_events;
+pub mod kubernetes_fargate;
 pub mod kubernetes_image_pull;
 pub mod kubernetes_lists;
 pub mod kubernetes_metadata;
@@ -4921,6 +4922,7 @@ pub use kubernetes_api::KubernetesApiPlane;
 // module that owns it.
 pub use kubernetes_aws_auth::*;
 pub use kubernetes_config_maps::{ConfigMapObject, MAX_CONFIG_MAPS_PER_NAMESPACE};
+pub use kubernetes_fargate::{ClusterCapacity, FargateNode};
 pub use kubernetes_metadata::ObjectMetadata;
 pub use kubernetes_nodes::NodeInstance;
 pub use nodegroup_ami_releases::*;

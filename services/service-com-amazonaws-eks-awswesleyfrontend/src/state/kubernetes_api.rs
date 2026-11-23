@@ -1061,11 +1061,11 @@ fn route(
 
     let mut store = state.lock();
 
-    // The nodes of this cluster a pod can run on: the pod the request creates is
-    // scheduled onto one, and so is any pod that was admitted while the cluster
-    // had none. They are read from the control plane's own records before the
-    // objects are borrowed to write them.
-    let nodes = settled(&mut store, key, now)?;
+    // Everywhere this cluster can run a pod: the pod the request creates is placed
+    // on it, and so is any pod that was admitted while the cluster had nowhere to
+    // run it. It is read from the control plane's own records before the objects
+    // are borrowed to write them.
+    let capacity = settled(&mut store, key, now)?;
 
     let objects = &mut plane_mut(&mut store, key)?.objects;
     // The chunk a list asks for, read once: every collection below answers one
@@ -1087,7 +1087,7 @@ fn route(
         }
         (method, ["namespaces", namespace, "pods"]) if method == ::http::Method::POST.as_str() => {
             let document = read_manifest(content_type, body)?;
-            Ok((201, objects.create_pod(namespace, &document, now, &nodes)?))
+            Ok((201, objects.create_pod(namespace, &document, now, &capacity)?))
         }
         (method, ["namespaces", namespace, "pods"]) if method == ::http::Method::GET.as_str() => {
             Ok((
@@ -1185,11 +1185,11 @@ fn route(
 }
 
 /// Settle everything this cluster is owed before any of its objects is reported,
-/// and hand back the nodes a pod of it can run on.
+/// and hand back everywhere a pod of it can run.
 ///
 /// Two kinds of work are owed here, and both were owed at this instant whether or
 /// not anybody called: the clock-owed moves of the cluster's own objects (a pending
-/// pod bound to a node that has appeared, a pod whose containers were owed their
+/// pod placed on capacity that has appeared, a pod whose containers were owed their
 /// start), and the workloads its installed add-ons own
 /// ([`super::kubernetes_workloads::managed_workloads`]) — one per add-on the
 /// control plane reports as installed, converged against the nodes the cluster
@@ -1199,14 +1199,16 @@ fn settled(
     store: &mut ServiceStore,
     key: &(String, String),
     now: SystemTime,
-) -> Result<Vec<super::kubernetes_nodes::ClusterNode>, ApiRefusal> {
-    let nodes = store.scheduler_nodes(&key.0, &key.1);
+) -> Result<super::kubernetes_fargate::ClusterCapacity, ApiRefusal> {
+    let capacity = store.cluster_capacity(&key.0, &key.1);
     let managed = workloads::managed_workloads(store, &key.0, &key.1, now);
     let objects = &mut plane_mut(store, key)?.objects;
-    objects.materialize_due_transitions(now, &nodes);
+    objects.materialize_due_transitions(now, &capacity);
     objects.materialize_managed_workloads(&managed, now);
-    objects.reconcile_workloads(now, &nodes);
-    Ok(nodes)
+    objects.reconcile_workloads(now, &capacity);
+    // The capacity is re-read: placing the cluster's pods may have provisioned
+    // Fargate capacity for them, which is capacity the cluster now holds.
+    Ok(store.cluster_capacity(&key.0, &key.1))
 }
 
 /// Route one request to `apps/v1`: the workload resources the group serves, each of
@@ -1242,7 +1244,7 @@ fn route_apps(
         return Err(ApiRefusal::no_such_path(path));
     }
     let mut store = state.lock();
-    let nodes = settled(&mut store, key, now)?;
+    let capacity = settled(&mut store, key, now)?;
     let list_request = ListRequest::from_query(request.query);
     let objects = &mut plane_mut(&mut store, key)?.objects;
     match (method, name) {
@@ -1250,7 +1252,7 @@ fn route_apps(
             let manifest = read_manifest(request.content_type, body)?;
             Ok((
                 201,
-                objects.create_workload(resource, namespace, &manifest, now, &nodes)?,
+                objects.create_workload(resource, namespace, &manifest, now, &capacity)?,
             ))
         }
         (method, None) if method == ::http::Method::GET.as_str() => Ok((
@@ -1259,22 +1261,24 @@ fn route_apps(
                 resource,
                 namespace,
                 &selected(list_request?, &NAMESPACED_FIELD_SELECTORS)?,
-                &nodes,
+                &capacity,
             )?,
         )),
-        (method, Some(name)) if method == ::http::Method::GET.as_str() => {
-            Ok((200, objects.workload_json(resource, namespace, name, &nodes)?))
-        }
+        (method, Some(name)) if method == ::http::Method::GET.as_str() => Ok((
+            200,
+            objects.workload_json(resource, namespace, name, &capacity)?,
+        )),
         (method, Some(name)) if method == ::http::Method::PUT.as_str() => {
             let manifest = read_manifest(request.content_type, body)?;
             Ok((
                 200,
-                objects.replace_workload(resource, namespace, name, &manifest, now, &nodes)?,
+                objects.replace_workload(resource, namespace, name, &manifest, now, &capacity)?,
             ))
         }
-        (method, Some(name)) if method == ::http::Method::DELETE.as_str() => {
-            Ok((200, objects.delete_workload(resource, namespace, name, &nodes)?))
-        }
+        (method, Some(name)) if method == ::http::Method::DELETE.as_str() => Ok((
+            200,
+            objects.delete_workload(resource, namespace, name, &capacity)?,
+        )),
         (method, _) => Err(ApiRefusal::method_not_allowed(method, path)),
     }
 }

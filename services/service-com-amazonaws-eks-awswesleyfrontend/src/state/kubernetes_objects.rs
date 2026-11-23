@@ -28,6 +28,7 @@ use super::kubernetes_events::{
     EventObject, RecordedEvent, EVENT_SOURCE_SCHEDULER, EVENT_TYPE_NORMAL, EVENT_TYPE_WARNING,
     INVOLVED_KIND_POD,
 };
+use super::kubernetes_fargate::{fargate_node_for, ClusterCapacity, FargateNode};
 use super::kubernetes_image_pull::{
     back_off_message, ImagePullRecord, WAITING_REASON_IMAGE_PULL_BACK_OFF,
 };
@@ -114,6 +115,12 @@ pub struct ClusterObjects {
     /// ([`super::kubernetes_rbac`]). Bounded by
     /// [`super::kubernetes_rbac::MAX_RBAC_OBJECTS_PER_SCOPE`] per resource.
     pub cluster_rbac: RbacScope,
+    /// The AWS Fargate capacity this cluster has provisioned, by the name each
+    /// node registered under: one node per pod a Fargate profile selected
+    /// ([`super::kubernetes_fargate`]), released again once the cluster holds no
+    /// pod for it. Bounded by the pods the cluster holds, which
+    /// [`MAX_PODS_PER_NAMESPACE`] and [`MAX_NAMESPACES_PER_CLUSTER`] bound.
+    pub fargate_nodes: BTreeMap<String, FargateNode>,
     /// The revision every write of these objects is stamped with, and which each
     /// object reports as its `metadata.resourceVersion`
     /// ([`super::kubernetes_resource_versions`]). One counter per cluster, so no
@@ -595,44 +602,57 @@ impl ClusterObjects {
     /// node can take being bound to one, the pods whose node is gone being
     /// unbound, and the pods whose containers were owed their start.
     ///
-    /// `nodes` are the nodes of the cluster a pod can run on. A pod that was
-    /// admitted while the cluster had none is bound as soon as one is there — the
-    /// cluster's scheduler binds a pending pod the moment capacity appears,
-    /// whether or not anybody called — and its containers are then owed their
-    /// start like any other pod's. A pod whose node the cluster NO LONGER holds
-    /// (its node group deleted, its instances released) is unbound again: it is a
-    /// pod waiting for capacity rather than a workload on capacity that is gone.
-    /// Every instant comes from stored state, so every caller reads the same
-    /// binding and the same start time.
-    pub fn materialize_due_transitions(
-        &mut self,
-        now: SystemTime,
-        nodes: &[super::kubernetes_nodes::ClusterNode],
-    ) {
-        // The events the scheduler recorded for the pods it bound here, recorded
-        // once the namespaces are no longer borrowed for the walk.
+    /// `capacity` is everywhere the cluster can run a pod: the nodes its node
+    /// groups registered, and the Fargate capacity its ACTIVE profiles provide
+    /// ([`super::kubernetes_fargate`]). A pod that was admitted while the cluster
+    /// had nowhere to run it is placed as soon as there is — the cluster's
+    /// scheduler places a pending pod the moment capacity appears, whether or not
+    /// anybody called — and its containers are then owed their start like any
+    /// other pod's. A pod whose node the cluster NO LONGER holds (its node group
+    /// deleted, its instances released, the Fargate profile that selected it gone)
+    /// is unbound again: it is a pod waiting for capacity rather than a workload on
+    /// capacity that is gone. Every instant comes from stored state, so every
+    /// caller reads the same binding and the same start time.
+    pub fn materialize_due_transitions(&mut self, now: SystemTime, capacity: &ClusterCapacity) {
+        // The Fargate capacity this cluster no longer has a pod for, released
+        // before anything is placed: a pod still bound to one of those nodes is a
+        // pod waiting for capacity again.
+        let released = self.release_spent_fargate_capacity(capacity);
+        // The events the scheduler recorded for the pods it placed here, and the
+        // Fargate capacity it provisioned for them — both recorded once the
+        // namespaces are no longer borrowed for the walk.
         let mut scheduled: Vec<(String, EventObject)> = Vec::new();
+        let mut provisioned: Vec<FargateNode> = Vec::new();
         for (namespace, held) in &mut self.namespaces {
             for (pod_name, pod) in &mut held.pods {
                 let was_bound = pod.node_name.is_some();
                 match pod
                     .node_name
                     .as_deref()
-                    .map(|bound| nodes.iter().any(|node| node.name == bound))
+                    .map(|bound| capacity.holds_node(bound) && !released.contains(bound))
                 {
                     // Bound to a node the cluster still holds: nothing to do.
                     Some(true) => {}
                     // Bound to a node that is gone.
                     Some(false) => pod.unbind(),
-                    // Not bound at all: bound now, if there is a node for it. The
-                    // pod's tolerations are read once and asked of each node.
+                    // Not bound at all: placed now, if there is capacity for it.
+                    // Fargate first, because a pod a profile SELECTS runs on
+                    // Fargate — that is what a profile says about it — and only a
+                    // pod no profile selects is placed on a node group's node,
+                    // whose taints the pod's tolerations are asked of.
                     None => {
-                        let tolerations =
-                            super::kubernetes_nodes::PodTolerations::of(&pod.spec);
-                        if let Some(node) =
-                            nodes.iter().find(|node| node.admits(&tolerations))
-                        {
-                            pod.bind_to(node);
+                        match fargate_node_for(namespace, pod_name, pod, capacity) {
+                            Some(node) => {
+                                pod.place_on_fargate(&node);
+                                provisioned.push(node);
+                            }
+                            None => {
+                                let tolerations =
+                                    super::kubernetes_nodes::PodTolerations::of(&pod.spec);
+                                if let Some(node) = capacity.node_for(None, &tolerations) {
+                                    pod.bind_to(node);
+                                }
+                            }
                         }
                     }
                 }
@@ -644,6 +664,9 @@ impl ClusterObjects {
                 }
                 pod.materialize_due_transitions(now);
             }
+        }
+        for node in provisioned {
+            self.fargate_nodes.insert(node.name.clone(), node);
         }
         for (namespace, event) in scheduled {
             self.record_event(&namespace, event);
@@ -670,6 +693,7 @@ impl ClusterObjects {
         Self {
             namespaces,
             cluster_rbac: BTreeMap::new(),
+            fargate_nodes: BTreeMap::new(),
             versions,
         }
     }
@@ -825,16 +849,16 @@ impl ClusterObjects {
     /// manifest names and answer it with the `metadata.uid` this create minted —
     /// the uid a `TokenRequest`'s `boundObjectRef` names.
     ///
-    /// `node` is the node the cluster schedules the pod onto — one of the nodes
-    /// its node groups registered ([`super::kubernetes_nodes`]) — and `None` when
-    /// the cluster has none, in which case the pod is admitted and stays
-    /// unscheduled, as a pod no node can take does.
+    /// `capacity` is everywhere the cluster can run the pod — the nodes its node
+    /// groups registered and the Fargate capacity its profiles provide
+    /// ([`super::kubernetes_fargate`]) — and a cluster with neither admits the pod
+    /// and leaves it unscheduled, as a pod nothing can take stays.
     pub fn create_pod(
         &mut self,
         namespace: &str,
         manifest: &::serde_json::Value,
         now: SystemTime,
-        nodes: &[super::kubernetes_nodes::ClusterNode],
+        capacity: &ClusterCapacity,
     ) -> Result<::serde_json::Value, ApiRefusal> {
         let name = manifest_name(manifest, "Pod")?;
         let service_account_name = requested_service_account(manifest);
@@ -885,37 +909,56 @@ impl ClusterObjects {
                 pull: None,
             },
         );
-        // Scheduling: the pod is bound to a node of this CLUSTER, which is what
+        // Scheduling: the pod is placed on capacity of this CLUSTER, which is what
         // puts `spec.nodeName` on it and starts the clock its containers are owed
-        // their start on. A pod that NAMES a node is bound to that one — naming
-        // one is how a client bypasses the scheduler — but only when the cluster
-        // holds it: a name no node of the cluster carries is nothing to bind to,
-        // so the pod stays unscheduled, as it does on a cluster with no node at
-        // all. A node whose taints the pod does not tolerate takes no pod either
-        // ([`super::kubernetes_nodes::ClusterNode::admits`]), which is what a
-        // taint does to the scheduler's choice. Either way an unbound pod is bound
-        // by the first call after a node it can run on is there.
+        // their start on. A pod a Fargate profile SELECTS runs on the Fargate
+        // capacity that profile provides, provisioned for this pod alone
+        // ([`super::kubernetes_fargate`]) — that is what a profile says about the
+        // pods it selects, so it is asked first. Otherwise the pod goes to a node:
+        // a pod that NAMES one is bound to that one — naming one is how a client
+        // bypasses the scheduler — but only when the cluster holds it, since a name
+        // no node of the cluster carries is nothing to bind to; and a node whose
+        // taints the pod does not tolerate takes no pod either
+        // ([`super::kubernetes_nodes::ClusterNode::admits`]), which is what a taint
+        // does to the scheduler's choice. Either way a pod nothing could take is
+        // placed by the first call after capacity for it is there.
         let requested_node = manifest
             .get("spec")
             .and_then(|requested| requested.get("nodeName"))
             .and_then(::serde_json::Value::as_str)
-            .filter(|requested| !requested.is_empty());
-        let bound = match requested_node {
-            Some(named) => nodes.iter().find(|node| node.name == named),
-            None => held.pods.get(&name).and_then(|pod| {
+            .filter(|requested| !requested.is_empty())
+            .map(str::to_string);
+        // The Fargate capacity provisioned for this pod, recorded on the cluster
+        // once the namespace is no longer borrowed to place the pod on it.
+        let mut provisioned: Option<FargateNode> = None;
+        if requested_node.is_none() {
+            provisioned = held
+                .pods
+                .get(&name)
+                .and_then(|pod| fargate_node_for(namespace, &name, pod, capacity));
+            if let (Some(node), Some(pod)) = (provisioned.as_ref(), held.pods.get_mut(&name)) {
+                pod.place_on_fargate(node);
+            }
+        }
+        if provisioned.is_none() {
+            let bound = held.pods.get(&name).and_then(|pod| {
                 let tolerations = super::kubernetes_nodes::PodTolerations::of(&pod.spec);
-                nodes.iter().find(|node| node.admits(&tolerations))
-            }),
-        };
-        if let (Some(node), Some(pod)) = (bound, held.pods.get_mut(&name)) {
-            pod.bind_to(node);
+                capacity.node_for(requested_node.as_deref(), &tolerations)
+            });
+            if let (Some(node), Some(pod)) = (bound, held.pods.get_mut(&name)) {
+                pod.bind_to(node);
+            }
+        }
+        if let Some(node) = provisioned {
+            self.fargate_nodes.insert(node.name.clone(), node);
         }
         // What the scheduler DID with the pod, as the scheduler records it: the
         // node it assigned the pod to, or the reason a pod it could place nowhere
         // stays unscheduled ([`super::kubernetes_events`]).
-        let scheduling = held
-            .pods
-            .get(&name)
+        let scheduling = self
+            .namespaces
+            .get(namespace)
+            .and_then(|held| held.pods.get(&name))
             .map(|pod| scheduling_event(namespace, &name, pod, now));
         if let Some(event) = scheduling {
             self.record_event(namespace, event);
