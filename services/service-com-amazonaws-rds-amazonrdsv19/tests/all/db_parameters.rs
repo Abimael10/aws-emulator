@@ -389,6 +389,10 @@ async fn a_modified_parameter_is_reported_from_persisted_state() {
 // The value rule, over the published catalogs
 // ---------------------------------------------------------------------------
 
+/// The value a parameter the engine publishes NO `AllowedValues` for is driven with: a value
+/// of the kind such a parameter carries, since nothing published bounds it.
+const UNBOUNDED_VALUE: &str = "UTC";
+
 /// A value the parameter admits, and one it does not, derived from the parameter's OWN
 /// published `AllowedValues`: an enumeration is split, a range is taken at each published
 /// bound and one step past it, and a single published value is matched exactly.
@@ -396,6 +400,15 @@ async fn a_modified_parameter_is_reported_from_persisted_state() {
 /// The range halves come from `ClusterParameterSpec::range`, the same reader the service
 /// itself admits a value with, so a published bound is read here exactly as it is there.
 fn admitted_and_refused(spec: &ClusterParameterSpec) -> (Vec<String>, Vec<String>) {
+    if spec.allowed_values.is_empty() {
+        // The engine publishes no domain for this parameter at all — a path the managed
+        // service owns (`basedir`), a setting whose values are a whole table of the
+        // engine's own (`time_zone`) — so there is nothing for the DOMAIN to refuse: a
+        // value of the parameter's own type is admitted. A parameter the engine does not
+        // let a caller modify is still refused, by the branch that reads `IsModifiable`,
+        // whatever value it is given.
+        return (vec![UNBOUNDED_VALUE.to_string()], Vec::new());
+    }
     if spec.allowed_values.contains(',') {
         let admitted: Vec<String> = spec
             .allowed_values

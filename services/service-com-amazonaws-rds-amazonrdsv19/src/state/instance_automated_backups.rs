@@ -391,6 +391,76 @@ pub fn instance_automated_backups_arn(region: &str, dbi_resource_id: &str) -> St
     )
 }
 
+/// Whether `value` is an ARN that names an automated backup AT ALL, which is what
+/// `DBInstanceAutomatedBackupsArn` — "the Amazon Resource Name (ARN) of the automated
+/// backups" — has to carry: the whole form the member publishes
+/// (`arn:aws:rds:us-east-1:123456789012:auto-backup:ab-L2IJCEXJP7XQ7HOJ4SIEXAMPLE`), which
+/// is an ARN of this service ([`parse_rds_resource_arn`]) naming a REGION and an ACCOUNT —
+/// an automated backup belongs to one of each — whose resource is this resource type, and
+/// whose id reads back as a source instance's resource id
+/// ([`dbi_resource_id_in_automated_backups_arn`], the inverse of the function above).
+///
+/// `Err` carries the sentence a member whose value is no ARN of the resource it names is
+/// refused with ([`invalid_arn_for_parameter_message`]), so a handler lifts it into its own
+/// `InvalidParameterValue` channel before any lookup: a value of another form names no
+/// automated backup of any Region or account, which is a bad REQUEST rather than a backup
+/// that happens to be missing. Whether the backup EXISTS is the lookup's question, and a
+/// well-formed ARN naming none is the not-found fault.
+pub fn check_automated_backups_arn(value: &str) -> Result<(), String> {
+    match names_an_automated_backup(value) {
+        true => Ok(()),
+        false => Err(invalid_arn_for_parameter_message(
+            value,
+            AUTOMATED_BACKUPS_ARN_PARAMETER,
+        )),
+    }
+}
+
+/// Whether `value` is of the published form above; see [`check_automated_backups_arn`].
+fn names_an_automated_backup(value: &str) -> bool {
+    // An ARN of this service at all, by the one shared reading of that form.
+    if check_arn_parameter(AUTOMATED_BACKUPS_ARN_PARAMETER, value).is_err() {
+        return false;
+    }
+    // The Region and the account the backup belongs to. An ARN of a partition-global or
+    // account-less resource is well formed for the resources that have no Region or no
+    // owner; an automated backup has both, so a value naming neither names none. The
+    // account is an account id — this front door's one reading of that width
+    // ([`ACCOUNT_ID_DIGITS`]).
+    let Some(fields) = ::service_common::arn::parse(value) else {
+        return false;
+    };
+    let owned_by_an_account = fields.account.len() == ACCOUNT_ID_DIGITS
+        && fields.account.bytes().all(|digit| digit.is_ascii_digit());
+    if fields.region.is_empty() || !owned_by_an_account {
+        return false;
+    }
+    // The resource it names: this type, with a source instance's resource id behind the
+    // `ab-` prefix — and an id of the FORM such an id is written in, which is what the
+    // member's own documented example carries
+    // (`ab-L2IJCEXJP7XQ7HOJ4SIEXAMPLE`): the digits-and-uppercase token of the width this
+    // service mints a regional resource id in ([`RESOURCE_ID_TOKEN_LEN`]). A value carrying
+    // anything else behind the prefix names no automated backup of any account.
+    let names_this_type = parse_rds_resource_arn(value)
+        .is_some_and(|arn| arn.resource_type.eq_ignore_ascii_case(AUTOMATED_BACKUP_RESOURCE));
+    names_this_type
+        && dbi_resource_id_in_automated_backups_arn(value)
+            .is_some_and(|resource_id| is_a_dbi_resource_id(&resource_id))
+}
+
+/// Whether `value` is written in the form a `DbiResourceId` is: the `db-` prefix and the
+/// digits-and-uppercase token of the width this service mints one in
+/// ([`mint_dbi_resource_id`], "`db-` plus 26 uppercase characters").
+fn is_a_dbi_resource_id(value: &str) -> bool {
+    let Some(token) = value.strip_prefix(DBI_RESOURCE_ID_PREFIX) else {
+        return false;
+    };
+    token.len() == RESOURCE_ID_TOKEN_LEN
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte.is_ascii_uppercase())
+}
+
 /// The `db-` an instance's resource id begins with, which the automated backup's own
 /// `ab-` id is read against ([`instance_automated_backups_arn`]).
 const DBI_RESOURCE_ID_PREFIX: &str = "db-";

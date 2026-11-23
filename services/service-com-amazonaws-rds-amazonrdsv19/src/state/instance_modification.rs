@@ -197,10 +197,16 @@ impl DeferredModification {
             held.enable.truncate(MAX_CLUSTER_LIST_ENTRIES);
             held.disable.truncate(MAX_CLUSTER_LIST_ENTRIES);
         }
-        // The instant the settings are owed is the one the LATER request asked for: a
-        // modification that asks for them as soon as possible carries what an earlier one
-        // staged with it, which is what `ApplyImmediately` states.
-        replace(&mut self.apply_at, apply_at);
+        // WHEN the staged settings are owed is the LAST request's answer, not an earlier
+        // one's: `ApplyImmediately` "specifies whether the modifications in this request AND
+        // ANY PENDING MODIFICATIONS are asynchronously applied as soon as possible,
+        // regardless of the PreferredMaintenanceWindow setting", so a request that asks for
+        // them at once pulls what an earlier one staged forward with it, and a request that
+        // does NOT leaves the whole staged record for the maintenance window — which is what
+        // `ApplyImmediately` disabled asks for. Keeping an earlier request's instant here
+        // would apply a deferred modification at once because an immediate one came before
+        // it, and the instance would report nothing pending the moment it was staged.
+        self.apply_at = apply_at;
     }
 
     /// Write every staged setting onto `record`, which is what applying the modification

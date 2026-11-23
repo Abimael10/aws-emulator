@@ -178,6 +178,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(DescribeDBInstanceAutomatedBackupsError::invalid_parameter_value)?;
         crate::state::check_filter_terms(&filters)
             .map_err(DescribeDBInstanceAutomatedBackupsError::invalid_parameter_value)?;
+        // `DBInstanceAutomatedBackupsArn` is "the Amazon Resource Name (ARN) of the
+        // replicated automated backups", so its value has a GRAMMAR: a value that is no ARN
+        // naming an automated backup names none of any Region or account, which is a bad
+        // request answered before any lookup rather than a report that found none — the same
+        // reading the delete of a backup holds the member to
+        // ([`crate::state::check_automated_backups_arn`]).
+        if let Some(arn) = &input.db_instance_automated_backups_arn {
+            crate::state::check_automated_backups_arn(arn)
+                .map_err(DescribeDBInstanceAutomatedBackupsError::invalid_parameter_value)?;
+        }
 
         // No store means this service was mounted on an engine it has no state in, so it
         // cannot serve the operation at all. Unreachable with the engine the router builds;

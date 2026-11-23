@@ -14,9 +14,9 @@
 //! automated backups, set this value to 0", and which a member of a DB cluster never has
 //! one of, because the cluster holds the data. That backup is reported `active` while the
 //! instance is still there ("automated backups for current instances"), it OUTLIVES the
-//! instance as `retained` ("automated backups for deleted instances") when the delete asked
-//! to keep it (`DeleteAutomatedBackups` false), and it goes with the instance when the
-//! delete did not — the documented default. A retained backup is found by every reference
+//! instance as `retained` ("automated backups for deleted instances") unless the delete
+//! asked to remove it (`DeleteAutomatedBackups` true), which is the only way it goes with
+//! the instance. A retained backup is found by every reference
 //! the report accepts (`DbiResourceId`, `DBInstanceIdentifier`, the backups' own ARN, the
 //! `status` / `db-instance-id` / `dbi-resource-id` filters), `DeleteDBInstanceAutomatedBackup`
 //! removes it and nothing reports it afterwards, the backup of a LIVE instance refuses that
@@ -78,7 +78,10 @@ fn expected_not_found(dbi_resource_id: &str) -> String {
 }
 
 /// `CreateDBInstance` for one row, and the `DbiResourceId` the created instance reports.
-async fn available_instance(
+///
+/// `pub(crate)` so the sibling suites of this one test target reach an available instance
+/// through this loop rather than growing a second copy of it.
+pub(crate) async fn available_instance(
     router: &MultiServiceRouter,
     case: &str,
     identifier: &str,
@@ -111,7 +114,9 @@ async fn available_instance(
 }
 
 /// `DescribeDBInstances` for one instance — the REPORTING call the polls above make.
-async fn describe_instance(router: &MultiServiceRouter, identifier: &str) -> (u16, String) {
+///
+/// `pub(crate)` for the same reason [`available_instance`] is.
+pub(crate) async fn describe_instance(router: &MultiServiceRouter, identifier: &str) -> (u16, String) {
     call(
         router,
         "DescribeDBInstances",
@@ -162,8 +167,8 @@ enum DeleteSetting {
     Keep,
     /// `DeleteAutomatedBackups=true`.
     Drop,
-    /// The member is not sent at all: "the default is to remove automated backups
-    /// immediately after the DB instance is deleted".
+    /// The member is not sent at all, which keeps the backups: the service removes them
+    /// only where the request asked it to.
     Default,
 }
 
@@ -250,13 +255,13 @@ async fn an_instance_keeps_an_automated_backup_while_it_lives_and_after_a_delete
             expects_retained_backup: false,
         },
         Case {
-            case: "a delete that named no setting, which removes them",
+            case: "a delete that named no setting, which keeps them",
             identifier: "emu-iab-default",
             engine: "mysql",
             retention: Some(2),
             delete_setting: DeleteSetting::Default,
             expects_active_backup: true,
-            expects_retained_backup: false,
+            expects_retained_backup: true,
         },
     ];
 
@@ -893,7 +898,7 @@ async fn the_requests_the_automated_backup_calls_refuse() {
             "DeleteDBInstanceAutomatedBackup",
             &params![
                 "DbiResourceId" => &resource_id,
-                "DBInstanceAutomatedBackupsArn" => backups_arn("db-SOMEOTHERINSTANCESIDENTIFIER"),
+                "DBInstanceAutomatedBackupsArn" => backups_arn("db-ANOTHERINSTANCESRESOURCEID"),
             ],
         )
         .await,
@@ -913,7 +918,7 @@ async fn the_requests_the_automated_backup_calls_refuse() {
     // so is an automated-backups ARN naming one — each refusal naming the backup by the
     // source instance's resource id, which is read back out of the ARN where that is the
     // member the request carried.
-    let unknown = "db-NOTHINGWASEVERCREATEDUNDERTHIS";
+    let unknown = "db-NOTHINGWASEVERCREATEDUNDER";
     for operation in [
         "DescribeDBInstanceAutomatedBackups",
         "DeleteDBInstanceAutomatedBackup",

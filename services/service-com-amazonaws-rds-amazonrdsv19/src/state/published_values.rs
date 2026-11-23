@@ -132,9 +132,10 @@ pub fn reboot_db_instance_state_message(identifier: &str, status: &str) -> Strin
 
 /// The sentence `ModifyDBInstance` answers an `InvalidDBInstanceStateFault` with when the
 /// instance is in a TRANSIENT status a modification cannot be taken in — one the instance
-/// will leave on its own (coming up, going down, stopped, starting). A status it can never
-/// leave is worded by [`crate::state::modify_db_instance_invalid_state_message`], which
-/// picks between the two.
+/// will leave on its own (coming up, going down, starting, taking a modification). A status
+/// it stays in until a caller acts (`stopped`) and one it can never leave are worded by
+/// [`crate::state::modify_db_instance_invalid_state_message`], which picks between the
+/// three.
 ///
 /// It has NO variable part: Amazon RDS interpolates neither the identifier the request
 /// carried nor the status the instance is in — it states only the state a modification

@@ -304,10 +304,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `SourceDBSnapshotIdentifier`: "If the source snapshot is in the same Amazon Web
         // Services Region as the copy, specify a valid DB snapshot identifier" — otherwise
-        // its ARN. A value that names no stored snapshot is the modelled 404, whichever form
-        // it took, in the one wording this service answers "no such snapshot" with.
+        // its ARN. So WHICH Region the source is looked for in follows the FORM the request
+        // named it in, through this crate's one reading of that question
+        // ([`crate::state::snapshot_copy_source_region`], which the refusal below words the
+        // Region from as well): an ARN carries its own Region, and only an unqualified
+        // identifier means the Region the request was signed for. A copy whose source lives
+        // in another Region is exactly what this operation exists for.
         let requested = input.source_db_snapshot_identifier.clone();
-        let Some(source_key) = store.resolve_db_snapshot_key(&region, &requested) else {
+        let source_region =
+            crate::state::snapshot_copy_source_region(&requested, &region).to_string();
+        // The source Region's own clock is settled too, so a snapshot that became available
+        // there is found and one whose delete has run its course is not.
+        if source_region != region {
+            store.settle_due_transitions(&source_region);
+        }
+        let Some(source_key) = store.resolve_db_snapshot_key(&source_region, &requested) else {
             return Err(source_not_found(&requested, &region));
         };
 
@@ -350,7 +361,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // only disagree if the record is not where the resolve said it was, which answers
         // the same modelled 404 as a source that was never there: a disagreement is a
         // "not found", never a panic that would take the whole emulator down with it.
-        let Some(source) = store.db_snapshots.get(&(region.clone(), source_key)) else {
+        let Some(source) = store.db_snapshots.get(&(source_region.clone(), source_key)) else {
             return Err(source_not_found(&requested, &region));
         };
         // A snapshot still being taken or copied holds no data to copy yet, which is the

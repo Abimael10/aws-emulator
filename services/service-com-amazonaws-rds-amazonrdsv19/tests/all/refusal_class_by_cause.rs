@@ -91,6 +91,11 @@ const SUBNET_IDS_REQUIRED: &str = "Subnet IDs are required.";
 /// `ModifyDBInstance` on an instance in a status it will LEAVE.
 const MODIFICATION_NEEDS_AVAILABLE: &str = "Database instance is not in available state.";
 
+/// `ModifyDBInstance` on an instance in the status only a CALLER brings it out of: the
+/// sentence states the instruction rather than the state the call needs.
+const MODIFICATION_OF_A_STOPPED_INSTANCE: &str =
+    "You can't modify a stopped DB instance. Start the DB instance, and then modify it.";
+
 /// `ModifyDBInstance` on an instance in the one status it never leaves, which the sentence
 /// names together with the fact that it is terminal.
 const MODIFICATION_IN_A_TERMINAL_STATE: &str = "The specified database instance is currently \
@@ -706,9 +711,9 @@ async fn the_state_refusal_says_whether_the_status_can_be_waited_out() {
     );
     assert_eq!(
         text(&body, "Message"),
-        MODIFICATION_NEEDS_AVAILABLE,
-        "a stopped instance is one a start brings back, so the sentence is the same, got \
-         {body}"
+        MODIFICATION_OF_A_STOPPED_INSTANCE,
+        "a stopped instance leaves that status for no clock, so the sentence states what the \
+         caller must do about it, got {body}"
     );
 
     // And the one status an instance never comes back from: the refusal names that status,

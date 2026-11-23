@@ -47,11 +47,12 @@
 use service_com_amazonaws_rds_amazonrdsv19::state::{
     create_db_snapshot_instance_state_message, failover_needs_two_instances_message,
     invalid_marker_message, invalid_parameter_marker_message,
+    modify_db_instance_state_message,
     parameter_has_pending_changes_message,
     reboot_db_instance_state_message, start_db_instance_state_message,
     stop_db_instance_state_message, DB_INSTANCE_STATUS_STARTING, DB_INSTANCE_STATUS_STOPPED,
     DB_INSTANCE_STATUS_STOPPING, MIN_FAILOVER_DB_CLUSTER_INSTANCES,
-    MISSING_DB_PROXY_TARGET_IDENTIFIER_MESSAGE, MODIFY_DB_INSTANCE_INVALID_STATE_MESSAGE,
+    MISSING_DB_PROXY_TARGET_IDENTIFIER_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -156,7 +157,7 @@ fn extra_members(action: &str, identifier: &str) -> Vec<(String, String)> {
 /// The sentence `action` must answer for `identifier` while it reports `status`.
 fn expected_sentence(action: &str, identifier: &str, status: &str) -> String {
     match action {
-        "ModifyDBInstance" => MODIFY_DB_INSTANCE_INVALID_STATE_MESSAGE.to_string(),
+        "ModifyDBInstance" => modify_db_instance_state_message(status),
         "StopDBInstance" => stop_db_instance_state_message(identifier),
         "StartDBInstance" => start_db_instance_state_message(identifier),
         "CreateDBSnapshot" => create_db_snapshot_instance_state_message(identifier),

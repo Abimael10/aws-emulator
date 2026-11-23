@@ -502,16 +502,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An instance that is still coming up, or is on its way out, cannot take a
         // modification — the state the clock has yet to settle is real. One that is
         // already `modifying` can: RDS accepts a further change while it applies the
-        // last one. The sentence is the one the service words for the status the instance
-        // is in: a status it will LEAVE states the state a modification needs, and one it
+        // last one. The sentence is the one this operation words for the status the
+        // instance is in: a status it will LEAVE states the state a modification needs, a
+        // status only a CALLER brings it out of states what to do about it, and one it
         // cannot leave names that status and that it is terminal, so a caller polling on
-        // the first reads that the second is futile
-        // ([`crate::state::modify_db_instance_invalid_state_message`]).
+        // the first reads that the third is futile
+        // ([`crate::state::modify_db_instance_state_message`]).
         let current_status = store.db_instances[&key].status.clone();
         if current_status != "available" && current_status != "modifying" {
             return Err(ModifyDBInstanceErrorModeled::InvalidDBInstanceStateFault(
                 InvalidDBInstanceStateFault {
-                    message: Some(crate::state::modify_db_instance_invalid_state_message(
+                    message: Some(crate::state::modify_db_instance_state_message(
                         &current_status,
                     )),
                 },

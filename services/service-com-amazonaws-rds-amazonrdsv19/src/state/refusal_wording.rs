@@ -240,14 +240,29 @@ pub fn is_terminal_db_instance_status(status: &str) -> bool {
     TERMINAL_DB_INSTANCE_STATUSES.contains(&status)
 }
 
-/// The sentence `ModifyDBInstance` answers an `InvalidDBInstanceStateFault` with for an
-/// instance in `status`.
+/// The sentence `ModifyDBInstance` answers an `InvalidDBInstanceStateFault` with when the
+/// instance is STOPPED.
+///
+/// A stopped instance is not waiting for anything: it stays stopped until a caller starts
+/// it, so Amazon RDS words this refusal as the INSTRUCTION out of it — start the instance,
+/// then modify it — rather than as the state a modification needs, which is what it says for
+/// a status the instance leaves on its own
+/// ([`MODIFY_DB_INSTANCE_INVALID_STATE_MESSAGE`]). It interpolates neither the identifier
+/// the request carried nor the status, so it is a constant rather than a `format!` over the
+/// request, and a caller that reads the message learns what to do next.
+pub const MODIFY_STOPPED_DB_INSTANCE_MESSAGE: &str =
+    "You can't modify a stopped DB instance. Start the DB instance, and then modify it.";
+/// What a request that CHANGES a DB instance's configuration answers an
+/// `InvalidDBInstanceStateFault` with for an instance in `status`.
 ///
 /// Amazon RDS words the refusal by whether the status is one the instance will LEAVE or one
 /// it cannot: for a transient status it states the state a modification needs
 /// ([`MODIFY_DB_INSTANCE_INVALID_STATE_MESSAGE`]), which is what a caller polls on, and for
 /// a terminal one ([`TERMINAL_DB_INSTANCE_STATUSES`]) it names the state the instance is in
 /// — taken from the instance's own record — and that waiting for it to change is futile.
+///
+/// `ModifyDBInstance` itself words one status of its own beside these
+/// ([`modify_db_instance_state_message`]).
 pub fn modify_db_instance_invalid_state_message(status: &str) -> String {
     if is_terminal_db_instance_status(status) {
         return format!(
@@ -256,6 +271,22 @@ pub fn modify_db_instance_invalid_state_message(status: &str) -> String {
         );
     }
     MODIFY_DB_INSTANCE_INVALID_STATE_MESSAGE.to_string()
+}
+
+/// The sentence `ModifyDBInstance` answers an `InvalidDBInstanceStateFault` with for an
+/// instance in `status`.
+///
+/// `ModifyDBInstance` words the refusal by WHAT the blocking status IS, which is what tells
+/// a caller whether to wait, to act, or to give up: a status the instance leaves on its own
+/// states the state a modification needs, a status the instance stays in until a CALLER acts
+/// states the instruction out of it ([`MODIFY_STOPPED_DB_INSTANCE_MESSAGE`]), and a terminal
+/// status names the state itself ([`modify_db_instance_invalid_state_message`], which words
+/// the other two for every request that changes an instance's configuration).
+pub fn modify_db_instance_state_message(status: &str) -> String {
+    if status == DB_INSTANCE_STATUS_STOPPED {
+        return MODIFY_STOPPED_DB_INSTANCE_MESSAGE.to_string();
+    }
+    modify_db_instance_invalid_state_message(status)
 }
 
 /// What a delete is refused with when the resource it names has deletion protection
@@ -614,4 +645,80 @@ pub fn check_serverless_v2_scaling(
         }
     }
     Ok(())
+}
+
+/// How this service words the refusal of a member whose value has to be an ARN and is not
+/// one: `arn` is the value exactly as the request submitted it and `parameter` the member it
+/// arrived in, as Amazon RDS names that member in this sentence.
+///
+/// A member documented as "the Amazon Resource Name (ARN) of …" carries a value with a
+/// GRAMMAR, so a value outside it names no resource of any Region or account and is a bad
+/// REQUEST — the Query API's `InvalidParameterValue`, answered before any lookup — rather
+/// than a resource that happens to be missing. The distinction is client-visible: a
+/// validation refusal is permanent and caller-side, a not-found is neither.
+///
+/// One wording for every such member of this front door, so no two operations can drift on
+/// it.
+pub fn invalid_arn_for_parameter_message(arn: &str, parameter: &str) -> String {
+    format!("The provided ARN ({arn}) is invalid for this parameter ({parameter}).")
+}
+
+/// Whether `value` is an ARN of THIS service at all, which is what a member documented as
+/// one has to carry: the fields an Amazon Resource Name of this service is written in — this
+/// front door's one reading of that form ([`parse_rds_resource_arn`]).
+///
+/// `Err` carries the sentence the refusal answers with
+/// ([`invalid_arn_for_parameter_message`]), so a handler lifts it into its own
+/// `InvalidParameterValue` channel and nothing re-words it. Whether the resource the ARN
+/// names EXISTS is the lookup's question, not this one's: a well-formed ARN of this service
+/// that names no stored resource is that operation's not-found fault.
+///
+/// A member whose value must name ONE KIND of resource is checked against that kind too, by
+/// the reading that owns the ARN form in question
+/// ([`check_automated_backups_arn`]).
+pub fn check_arn_parameter(parameter: &str, value: &str) -> Result<(), String> {
+    match parse_rds_resource_arn(value) {
+        Some(_) => Ok(()),
+        None => Err(invalid_arn_for_parameter_message(value, parameter)),
+    }
+}
+
+/// How Amazon RDS names the `DBInstanceAutomatedBackupsArn` member in the sentence above.
+///
+/// The modelled member is spelled `DBInstanceAutomatedBackupsArn`; the service's own
+/// validation names it `DbInstanceAutomatedBackupsArn`, and a caller matching the message
+/// reads what the service sends rather than the model's spelling of the same member.
+pub const AUTOMATED_BACKUPS_ARN_PARAMETER: &str = "DbInstanceAutomatedBackupsArn";
+
+/// Whether an `Engine` a RESTORE asks for may run the data of a snapshot taken of `source`.
+///
+/// The restores that take an `Engine` state the one constraint on it — "Must be compatible
+/// with the engine of the source. For example, you can restore a MariaDB 10.1 DB instance
+/// from a MySQL 5.6 snapshot" — so what the member admits is the source's own engine and the
+/// engines that ARE that engine with different management around them: the MySQL-compatible
+/// engines are one such family and the PostgreSQL-compatible ones another, which is this
+/// front door's one reading of "the same engine"
+/// (`crate::ops::describe_engine_default_parameters::engines_of_one_family`, the reading its
+/// published parameter vocabularies are grouped by).
+///
+/// Every other pair is a different database: its storage format, its catalogs and its wire
+/// are another engine's, so the restored instance could not serve the snapshot's data at all
+/// — which is why the constraint is checked BEFORE anything is created
+/// ([`restore_engine_incompatible_message`]).
+pub fn restore_engine_is_compatible(engine: &str, source: &str) -> bool {
+    engine.eq_ignore_ascii_case(source)
+        || crate::ops::describe_engine_default_parameters::engines_of_one_family(engine, source)
+}
+
+/// How this service words the refusal of a restore whose requested `engine` cannot run the
+/// data of a snapshot taken of `source`; see [`restore_engine_is_compatible`].
+///
+/// The sentence states the constraint the member documents and names both engines — the one
+/// the request asked for and the one the snapshot was taken of, read from the stored snapshot
+/// — because those are the two values the caller has to reconcile.
+pub fn restore_engine_incompatible_message(engine: &str, source: &str) -> String {
+    format!(
+        "The engine {engine} isn't compatible with the engine of the source DB snapshot \
+         ({source})."
+    )
 }

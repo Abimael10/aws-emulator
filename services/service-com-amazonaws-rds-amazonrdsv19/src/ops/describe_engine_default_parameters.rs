@@ -1561,6 +1561,26 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "How many threads the server caches for reuse.",
     ),
     parameter(
+        // The server's own time-zone setting, which is what a client changes through its
+        // parameter group to move the instant every session reads: `dynamic`, so a changed
+        // value is in force for the sessions opened after it without a reboot. Its default
+        // is the time zone an Amazon RDS for MySQL instance runs in unless the parameter
+        // sets another ("the time zone for an RDS for MySQL DB instance is Universal Time
+        // Coordinated (UTC)"), which is the value a session on such an instance reads back
+        // (`crate::state::data_plane::wire_session`). The values it admits are the engine's
+        // whole time-zone name table rather than an enumeration this sample carries, so that
+        // column publishes nothing — as `basedir`'s does.
+        "time_zone",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "string",
+        "",
+        "UTC",
+        true,
+        "",
+        "The time zone the server runs in, which the sessions it serves read their local \
+         time from.",
+    ),
+    parameter(
         "tmp_table_size",
         crate::state::APPLY_TYPE_DYNAMIC,
         "integer",

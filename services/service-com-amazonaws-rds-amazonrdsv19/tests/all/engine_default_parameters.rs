@@ -66,9 +66,11 @@ const AUTOSIZED: [&str; 3] = ["back_log", "basedir", "host_cache_size"];
 
 /// The parameters the engine bounds by NOTHING it publishes, and which therefore report no
 /// `AllowedValues` at all: `basedir` is a path the managed service owns, so there is no
-/// enumeration and no range for the report to carry. Every other published parameter must
-/// report the values it admits; this is the NAMED exception.
-const UNBOUNDED: [&str; 1] = ["basedir"];
+/// enumeration and no range for the report to carry, and `time_zone` admits the engine's
+/// whole time-zone name table rather than an enumeration its published list carries. Every
+/// other published parameter must report the values it admits; these are the NAMED
+/// exceptions.
+const UNBOUNDED: [&str; 2] = ["basedir", "time_zone"];
 
 /// One reported `<Parameter>`.
 ///

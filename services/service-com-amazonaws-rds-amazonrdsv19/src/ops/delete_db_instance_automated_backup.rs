@@ -164,6 +164,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             dbi_resource_id: input.dbi_resource_id.clone(),
             automated_backups_arn: input.db_instance_automated_backups_arn.clone(),
         };
+        // `DBInstanceAutomatedBackupsArn` is "the Amazon Resource Name (ARN) of the automated
+        // backups", so its value has a GRAMMAR: a value that is no ARN naming an automated
+        // backup names none of any Region or account, which is a bad request answered before
+        // any lookup rather than a backup that happens to be missing
+        // ([`crate::state::check_automated_backups_arn`]).
+        if let Some(arn) = &reference.automated_backups_arn {
+            crate::state::check_automated_backups_arn(arn)
+                .map_err(DeleteDBInstanceAutomatedBackupError::invalid_parameter_value)?;
+        }
         match (
             &reference.dbi_resource_id,
             &reference.automated_backups_arn,

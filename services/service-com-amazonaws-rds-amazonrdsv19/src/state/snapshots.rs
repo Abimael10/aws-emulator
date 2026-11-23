@@ -474,23 +474,40 @@ pub fn inherited_snapshot_tags(
     }
 }
 
+/// The REGION a snapshot copy resolves its SOURCE in: the Region the FORM of the reference
+/// names.
+///
+/// "If the source snapshot is in the same Amazon Web Services Region as the copy, specify a
+/// valid DB snapshot identifier … If the source snapshot is in a different Amazon Web
+/// Services Region than the copy, specify a valid DB snapshot ARN" — so an ARN is looked for
+/// in the Region written in it, whether or not that is the Region the request was signed
+/// for, and an unqualified identifier (and a region-less ARN, whose Region segment is empty)
+/// means `request_region`, the Region the request was signed for.
+///
+/// The ONE reading for both copies, the DB snapshot's and the DB cluster snapshot's, and for
+/// the refusal they word ([`snapshot_copy_source_not_found_message`]): the Region a source is
+/// looked for in and the Region a refusal names are the same question, so they cannot drift
+/// apart.
+pub fn snapshot_copy_source_region<'a>(requested: &'a str, request_region: &'a str) -> &'a str {
+    arn_region(requested)
+        .filter(|region| !region.is_empty())
+        .unwrap_or(request_region)
+}
+
 /// How Amazon RDS words the not-found fault for the SOURCE of a snapshot copy, looked for
 /// from a request signed for `request_region`.
 ///
-/// A copy names its source either by identifier, in the region the request was signed for,
-/// or by ARN, in the region that ARN names — a copy whose source lives in another region is
-/// exactly what the copy operations exist for — so the refusal names BOTH the snapshot that
-/// was asked for and the region it was looked for in. `requested` is carried in the
-/// request's own spelling, and a region-less ARN (whose region segment is empty) was looked
-/// for in the request's own region.
+/// A copy names its source either by identifier or by ARN, and the Region it is looked for in
+/// follows that form ([`snapshot_copy_source_region`]) — a copy whose source lives in another
+/// region is exactly what the copy operations exist for — so the refusal names BOTH the
+/// snapshot that was asked for and the region it was looked for in. `requested` is carried in
+/// the request's own spelling.
 ///
 /// The one wording for both copies, the DB snapshot's and the DB cluster snapshot's: the
 /// sentence names the resource it could not find rather than the operation, through the one
 /// region-qualified template this crate has (`cross_region_source_not_found_message`).
 pub fn snapshot_copy_source_not_found_message(requested: &str, request_region: &str) -> String {
-    let source_region = arn_region(requested)
-        .filter(|region| !region.is_empty())
-        .unwrap_or(request_region);
+    let source_region = snapshot_copy_source_region(requested, request_region);
     cross_region_source_not_found_message(&format!("snapshot {requested}"), source_region)
 }
 

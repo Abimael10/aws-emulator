@@ -511,6 +511,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .engine
                 .clone()
                 .unwrap_or_else(|| source.engine.clone());
+            // "Constraint: Must be compatible with the engine of the source": a snapshot
+            // holds the data of the engine it was taken of, so an engine that is not that
+            // engine could not serve it and the restore is refused BEFORE any instance is
+            // created — the Query API's `InvalidParameterCombination`, since it is the two
+            // members together (the engine asked for and the snapshot named) that cannot
+            // hold ([`crate::state::restore_engine_is_compatible`]).
+            if !crate::state::restore_engine_is_compatible(&engine, &source.engine) {
+                return Err(
+                    RestoreDBInstanceFromDBSnapshotError::invalid_parameter_combination(
+                        crate::state::restore_engine_incompatible_message(
+                            &engine,
+                            &source.engine,
+                        ),
+                    ),
+                );
+            }
             let version_hint = if engine.eq_ignore_ascii_case(&source.engine) {
                 source.engine_version.clone()
             } else {
