@@ -381,6 +381,12 @@ pub struct ContainerHttpClient {
     address: String,
     /// The records the servers of this task's containers are published in.
     addresses: ServedAddresses,
+    /// Where the bytes this client's requests move are accounted for
+    /// ([`super::container_consumption`]) — the accounting of the container's RUN, which the
+    /// collections that report its network traffic sample. A client given none counts into a
+    /// reading of its own, which nothing samples: the probes the agent runs in a container are
+    /// the agent's requests rather than the container's program's.
+    accounting: ::std::sync::Arc<super::container_consumption::ContainerConsumption>,
 }
 
 impl ContainerHttpClient {
@@ -388,7 +394,24 @@ impl ContainerHttpClient {
     /// published in `addresses`.
     #[must_use]
     pub fn new(address: String, addresses: ServedAddresses) -> Self {
-        Self { address, addresses }
+        Self {
+            address,
+            addresses,
+            accounting: ::std::sync::Arc::new(
+                super::container_consumption::ContainerConsumption::new(),
+            ),
+        }
+    }
+
+    /// This client accounting the bytes its requests move into `accounting` — the accounting of
+    /// the container's run ([`super::container_consumption`]).
+    #[must_use]
+    pub fn accounting_into(
+        mut self,
+        accounting: ::std::sync::Arc<super::container_consumption::ContainerConsumption>,
+    ) -> Self {
+        self.accounting = accounting;
+        self
     }
 
     /// What one invocation of `program` answers — `None` for an invocation this client performs
@@ -401,12 +424,17 @@ impl ContainerHttpClient {
     /// standard output.
     ///
     /// A READ: asking a server for a document moves nothing of the container, of the task or of
-    /// the records the server is published in.
+    /// the records the server is published in. What it does move is BYTES, which are counted
+    /// into the container's run as they are sent and received
+    /// ([`super::container_consumption`]).
     #[must_use]
     pub fn fetch(&self, program: &str, arguments: &[String]) -> Option<FetchedDocument> {
         let downloader = program == HTTP_DOWNLOADER;
         let request = read_request(program, arguments)?;
         let (port, path) = self.addressed(&request.url)?;
+        // The request line this client puts on the connection, which is what it sends.
+        self.accounting
+            .record_network_sent(request.method.len().saturating_add(path.len()));
         let Some(answered) = self
             .addresses
             .serve(&self.address, port, &request.method, &path)
@@ -423,6 +451,8 @@ impl ContainerHttpClient {
                 save_to: None,
             });
         };
+        // The bytes the server really answered with, whatever the client then does with them.
+        self.accounting.record_network_received(answered.body.len());
         if answered.body.len() > MAX_FETCHED_BYTES {
             return Some(FetchedDocument {
                 status: if downloader {

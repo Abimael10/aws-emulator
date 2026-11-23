@@ -784,7 +784,10 @@ pub fn settle_container_runtime<Eng: Send + Sync + 'static>(
             .address
             .clone()
             .zip(addresses.clone())
-            .map(|(address, addresses)| ContainerServing::new(address, addresses));
+            .map(|(address, addresses)| {
+                ContainerServing::new(address, addresses)
+                    .accounting_into(Arc::clone(&launch.consumption))
+            });
         // And the client its program reaches those same servers THROUGH, for a task reached at
         // an address of its own: a container's program routinely asks its own server for a
         // document ([`super::container_http_client`]).
@@ -792,7 +795,10 @@ pub fn settle_container_runtime<Eng: Send + Sync + 'static>(
             .address
             .clone()
             .zip(addresses.clone())
-            .map(|(address, addresses)| ContainerHttpClient::new(address, addresses));
+            .map(|(address, addresses)| {
+                ContainerHttpClient::new(address, addresses)
+                    .accounting_into(Arc::clone(&launch.consumption))
+            });
         // The volumes the container's `mountPoints` mount, resolved with NO guard of this
         // store held: the files of an `efsVolumeConfiguration` volume are the Amazon EFS
         // service's own, so resolving one reads that service's store
@@ -815,6 +821,11 @@ pub fn settle_container_runtime<Eng: Send + Sync + 'static>(
                 filesystem
             },
         );
+        // Where the bytes this filesystem reads and writes for the container are counted
+        // ([`super::container_consumption`]) — attached AFTER the image's own files are in
+        // place, because what the image ships is not something the container's program read
+        // or wrote.
+        let filesystem = filesystem.accounting_into(Arc::clone(&launch.consumption));
         let handle = runtime.spawn(async move {
             run_container(
                 run_state,
@@ -906,11 +917,14 @@ async fn run_container<Eng: Send + Sync + 'static>(
     )
     // The AWS CLI this container's program reaches the account's services through, signing
     // as the task role ([`super::container_aws_cli`]).
-    .with_aws_cli(ContainerAwsCli::new(
-        callback.clone(),
-        &launch.region,
-        launch.credential.clone(),
-    ))
+    .with_aws_cli(
+        ContainerAwsCli::new(
+            callback.clone(),
+            &launch.region,
+            launch.credential.clone(),
+        )
+        .accounting_into(Arc::clone(&launch.consumption)),
+    )
     // What the process this session IS runs as, which is what the utilities that report a
     // process's own session answer ([`super::container_process`]).
     .with_process(launch.process.clone())

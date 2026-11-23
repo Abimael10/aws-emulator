@@ -20,31 +20,38 @@
 //! # What is published, and what is NOT
 //!
 //! Every datapoint is read off this store's own records, at the instant it is taken — the
-//! COUNTS off the records themselves, and the UTILIZATION off the runs this emulator
-//! performs for the containers of those records ([`super::container_usage`]):
+//! COUNTS off the records themselves, and the UTILIZATION, the TRAFFIC and the STORAGE off the
+//! runs this emulator performs for the containers of those records
+//! ([`super::container_usage`]):
 //!
 //! * per cluster ([`CLUSTER_DIMENSION`]): how many of its tasks are running
 //!   ([`METRIC_TASK_COUNT`]), how many services it holds ([`METRIC_SERVICE_COUNT`]) and how
 //!   many container instances are registered into it
 //!   ([`METRIC_CONTAINER_INSTANCE_COUNT`]), beside the CPU and memory its running tasks are
 //!   using and reserving ([`METRIC_CPU_UTILIZED`], [`METRIC_CPU_RESERVED`],
-//!   [`METRIC_MEMORY_UTILIZED`], [`METRIC_MEMORY_RESERVED`]);
+//!   [`METRIC_MEMORY_UTILIZED`], [`METRIC_MEMORY_RESERVED`]), the bytes those tasks moved over
+//!   a network and through a filesystem ([`METRIC_NETWORK_RX_BYTES`],
+//!   [`METRIC_NETWORK_TX_BYTES`], [`METRIC_STORAGE_READ_BYTES`],
+//!   [`METRIC_STORAGE_WRITE_BYTES`]) and the ephemeral storage their placements gave them
+//!   beside what their layers hold ([`METRIC_EPHEMERAL_STORAGE_RESERVED`],
+//!   [`METRIC_EPHEMERAL_STORAGE_UTILIZED`]);
 //! * per service of that cluster ([`SERVICE_DIMENSION`] beside the cluster's): the
 //!   running, pending and desired task counts of that service
 //!   ([`METRIC_RUNNING_TASK_COUNT`], [`METRIC_PENDING_TASK_COUNT`],
 //!   [`METRIC_DESIRED_TASK_COUNT`]), the deployments it holds
 //!   ([`METRIC_DEPLOYMENT_COUNT`]), the task sets in it ([`METRIC_TASK_SET_COUNT`]) and the
-//!   same four utilization figures for its own tasks.
+//!   same utilization, traffic and storage figures for its own tasks;
+//! * per TASK DEFINITION FAMILY whose tasks run in that cluster ([`FAMILY_DIMENSION`] beside
+//!   the cluster's): those same figures for the tasks of that family, whatever placed them —
+//!   the dimension pair a dashboard or an alarm over one workload selects.
 //!
-//! The utilization is a MEASUREMENT of the containers of those tasks: what this emulator
+//! Each of those figures is a MEASUREMENT of the containers of those tasks: what this emulator
 //! performs for a container is its program in this process, so the CPU figure is the CPU
-//! units the programs of those containers have occupied and the memory figure the MiB their
-//! sessions hold — never a number for work nothing performed. The NETWORK and STORAGE
-//! Container Insights also publishes for a cluster are NOT published: nothing here moves a
-//! byte over a network or onto a disk for a container, so a number under one of those names
-//! would be an observation of traffic nothing observed. A count of records this store holds
-//! is not that either: it is read off the very records `DescribeClusters` and
-//! `DescribeServices` report.
+//! units the programs of those containers have occupied, the memory figure the MiB their
+//! sessions hold, the network figures the bytes their clients and their own servers really
+//! carried and the storage figures the bytes their filesystem really read and wrote — never a
+//! number for work nothing performed, and never a count of records this store merely holds.
+//! Where each of them is measured is stated in [`super::container_consumption`].
 //!
 //! # The clock the series is published on
 //!
@@ -54,6 +61,13 @@
 //! ([`super::settle_container_insights`]), and each cluster's series is published at most
 //! once per [`PUBLISH_SPACING`]. Nothing here is on a read path, and nothing it publishes
 //! depends on who called: what is written is the count the records already held.
+//!
+//! # The performance log events beside the series
+//!
+//! One collection also writes the PERFORMANCE LOG EVENTS of that cluster
+//! ([`super::container_insights_logs`]), which is the other half of what a cluster Container
+//! Insights is on for produces: the documents a consumer of the cluster's performance log
+//! group reads, carrying the very figures this collection published.
 
 use ::std::collections::BTreeMap;
 
@@ -72,6 +86,11 @@ pub const CLUSTER_DIMENSION: &str = "ClusterName";
 /// The dimension a SERVICE-level metric carries beside the cluster's: the service's own
 /// name.
 pub const SERVICE_DIMENSION: &str = "ServiceName";
+
+/// The dimension a TASK-level metric carries beside the cluster's: the family of the task
+/// definition its tasks run (`TaskDefinition$family`), which is how a dashboard or an alarm
+/// selects the tasks of one workload whatever placed them.
+pub const FAMILY_DIMENSION: &str = "TaskDefinitionFamily";
 
 /// The cluster-level metrics this module publishes, by the names Container Insights
 /// publishes them under.
@@ -94,6 +113,21 @@ pub const METRIC_CPU_RESERVED: &str = "CpuReserved";
 pub const METRIC_MEMORY_UTILIZED: &str = "MemoryUtilized";
 pub const METRIC_MEMORY_RESERVED: &str = "MemoryReserved";
 
+/// The TRAFFIC metrics it publishes at both levels: the bytes those tasks' containers
+/// received and sent over a network over the interval the datapoint closes
+/// ([`super::container_usage`]).
+pub const METRIC_NETWORK_RX_BYTES: &str = "NetworkRxBytes";
+pub const METRIC_NETWORK_TX_BYTES: &str = "NetworkTxBytes";
+
+/// The STORAGE metrics it publishes at both levels: the bytes they read from and wrote to a
+/// filesystem over that same interval, and the ephemeral storage their placements gave them
+/// beside what their own writable layers hold — the last two in the gigabytes that storage is
+/// sized in ([`STORAGE_SIZE_UNIT`]).
+pub const METRIC_STORAGE_READ_BYTES: &str = "StorageReadBytes";
+pub const METRIC_STORAGE_WRITE_BYTES: &str = "StorageWriteBytes";
+pub const METRIC_EPHEMERAL_STORAGE_RESERVED: &str = "EphemeralStorageReserved";
+pub const METRIC_EPHEMERAL_STORAGE_UTILIZED: &str = "EphemeralStorageUtilized";
+
 /// The `StandardUnit` a number of CPU UNITS is published in: a CPU unit is not one of the
 /// units the enumerated type names, so these two carry the value it has for a measurement
 /// with no unit of its own ([`cloudwatch::UNIT_NONE`]).
@@ -105,6 +139,15 @@ const MEMORY_UNIT: &str = "Megabytes";
 
 /// The `StandardUnit` a count of resources is published in.
 const COUNT_UNIT: &str = "Count";
+
+/// The `StandardUnit` a quantity of BYTES is published in — the unit the traffic and the
+/// storage counters above are measured in.
+const BYTES_UNIT: &str = "Bytes";
+
+/// The `StandardUnit` an amount of EPHEMERAL STORAGE is published in: that storage is sized in
+/// gibibytes (`TaskEphemeralStorage$sizeInGiB`), so both of its figures carry the unit of a
+/// storage size rather than the one the byte counters beside them carry.
+const STORAGE_SIZE_UNIT: &str = "Gigabytes";
 
 /// The `StorageResolution` these datapoints are stored at, in seconds: the standard
 /// resolution every metric a service publishes for itself takes ("standard resolution, with
@@ -145,7 +188,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     fn due_container_insights(
         &mut self,
         now: SystemTime,
-    ) -> Vec<(cloudwatch::MetricKey, cloudwatch::StoredDatum)> {
+    ) -> DueInsights {
         // A series of a cluster or a service this store no longer holds reports nothing more,
         // so what it last reported is forgotten with it ([`super::container_usage`]).
         self.prune_insights_baselines();
@@ -163,27 +206,48 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             .map(|cluster| cluster.name.clone())
             .collect();
         let mut published = Vec::new();
+        let mut collected: Vec<ClusterPerformance> = Vec::new();
         for cluster_name in cluster_names {
             let tally = self.tally(&cluster_name);
             let instances = self.registered_container_instances(&cluster_name);
             let mut counts: Vec<(BTreeMap<String, String>, &str, f64, &str)> = Vec::new();
+            // The cluster's OWN telemetry stream, which its cluster-level document and the
+            // service-level ones beside it travel ([`super::container_insights_logs`]).
+            let mut cluster_telemetry: Vec<(i64, String)> = Vec::new();
+            let mut streams: Vec<PerformanceStream> = Vec::new();
+            let stamped_at = super::container_insights_logs::epoch_millis(now);
             let cluster_dimensions: BTreeMap<String, String> =
                 [(CLUSTER_DIMENSION.to_string(), cluster_name.clone())]
                     .into_iter()
                     .collect();
-            for (metric_name, count) in [
+            let mut cluster_figures: Vec<(&str, f64, &str)> = [
                 (METRIC_TASK_COUNT, tally.running as f64),
                 (METRIC_SERVICE_COUNT, tally.active_services as f64),
                 (METRIC_CONTAINER_INSTANCE_COUNT, instances as f64),
-            ] {
-                counts.push((cluster_dimensions.clone(), metric_name, count, COUNT_UNIT));
-            }
-            // What every running task of the cluster is consuming, read off the accounting
-            // the runs of their containers keep ([`super::container_usage`]).
-            for (metric_name, measured, unit) in
-                insights_figures(&self.cluster_insights_utilization(&cluster_name, now))
-            {
-                counts.push((cluster_dimensions.clone(), metric_name, measured, unit));
+            ]
+            .into_iter()
+            .map(|(metric_name, count)| (metric_name, count, COUNT_UNIT))
+            .collect();
+            // What every running task of the cluster is consuming, moving and holding, read
+            // off the accounting the runs of their containers keep
+            // ([`super::container_usage`]).
+            cluster_figures.extend(insights_figures(
+                &self.cluster_insights_utilization(&cluster_name, now),
+            ));
+            // The same figures the series carries are what the cluster's own performance log
+            // event carries ([`super::container_insights_logs`]).
+            cluster_telemetry.push((
+                stamped_at,
+                performance_document(
+                    CLUSTER_DOCUMENT_TYPE,
+                    &cluster_dimensions,
+                    &cluster_figures,
+                    &[&[CLUSTER_DIMENSION]],
+                    now,
+                ),
+            ));
+            for (metric_name, figure, unit) in cluster_figures {
+                counts.push((cluster_dimensions.clone(), metric_name, figure, unit));
             }
             let services: Vec<(String, i32, usize)> = self
                 .services
@@ -214,21 +278,111 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 ]
                 .into_iter()
                 .collect();
-                for (metric_name, count) in [
+                let mut service_figures: Vec<(&str, f64, &str)> = [
                     (METRIC_RUNNING_TASK_COUNT, f64::from(tally.running)),
                     (METRIC_PENDING_TASK_COUNT, f64::from(tally.pending)),
                     (METRIC_DESIRED_TASK_COUNT, f64::from(desired)),
                     (METRIC_DEPLOYMENT_COUNT, deployments as f64),
                     (METRIC_TASK_SET_COUNT, task_sets as f64),
-                ] {
-                    counts.push((dimensions.clone(), metric_name, count, COUNT_UNIT));
-                }
+                ]
+                .into_iter()
+                .map(|(metric_name, count)| (metric_name, count, COUNT_UNIT))
+                .collect();
                 // And what that service's own running tasks are consuming, on the dimension
                 // pair a per-service alarm and dashboard select.
-                for (metric_name, measured, unit) in insights_figures(
-                    &self.service_insights_utilization(&cluster_name, &service_name, now),
-                ) {
-                    counts.push((dimensions.clone(), metric_name, measured, unit));
+                service_figures.extend(insights_figures(&self.service_insights_utilization(
+                    &cluster_name,
+                    &service_name,
+                    now,
+                )));
+                cluster_telemetry.push((
+                    stamped_at,
+                    performance_document(
+                        SERVICE_DOCUMENT_TYPE,
+                        &dimensions,
+                        &service_figures,
+                        &[&[CLUSTER_DIMENSION, SERVICE_DIMENSION]],
+                        now,
+                    ),
+                ));
+                for (metric_name, figure, unit) in service_figures {
+                    counts.push((dimensions.clone(), metric_name, figure, unit));
+                }
+            }
+            // And the TASK-level collection, on the dimension pair a dashboard over one
+            // workload selects ([`FAMILY_DIMENSION`]): the same figures for the tasks of each
+            // task definition family running in the cluster.
+            for family in self.running_task_families(&cluster_name) {
+                let dimensions: BTreeMap<String, String> = [
+                    (CLUSTER_DIMENSION.to_string(), cluster_name.clone()),
+                    (FAMILY_DIMENSION.to_string(), family.clone()),
+                ]
+                .into_iter()
+                .collect();
+                let family_figures =
+                    insights_figures(&self.family_insights_utilization(&cluster_name, &family, now));
+                for (metric_name, figure, unit) in family_figures {
+                    counts.push((dimensions.clone(), metric_name, figure, unit));
+                }
+            }
+            // One task's own telemetry is its own document, in the stream of that task: what
+            // the containers of THAT task are using, moving and holding, which is the finest
+            // thing this collection measures ([`super::container_insights_logs`]).
+            for task in self.running_cluster_tasks(&cluster_name) {
+                let mut identity: BTreeMap<String, String> = [
+                    (CLUSTER_DIMENSION.to_string(), cluster_name.clone()),
+                    (FAMILY_DIMENSION.to_string(), task.family.clone()),
+                    (REVISION_MEMBER.to_string(), task.revision.clone()),
+                    (TASK_ID_MEMBER.to_string(), task.id.clone()),
+                    (KNOWN_STATUS_MEMBER.to_string(), task.known_status.clone()),
+                ]
+                .into_iter()
+                .collect();
+                // What the task carries only where its placement resolved one: the service
+                // that placed it, and the launch type it was placed under.
+                if let Some(service_name) = task.service_name.clone() {
+                    identity.insert(SERVICE_DIMENSION.to_string(), service_name);
+                }
+                if let Some(launch_type) = task.launch_type.clone() {
+                    identity.insert(LAUNCH_TYPE_MEMBER.to_string(), launch_type);
+                }
+                let task_figures =
+                    insights_figures(&self.task_insights_utilization(&cluster_name, &task.arn, now));
+                // The dimension sets a task's figures are published under: the cluster's own
+                // series, the service's where a service placed the task, and the task
+                // definition family's — the three a task's measurement feeds.
+                let mut dimension_sets: Vec<&[&str]> = vec![
+                    &[CLUSTER_DIMENSION],
+                    &[CLUSTER_DIMENSION, FAMILY_DIMENSION],
+                ];
+                if task.service_name.is_some() {
+                    dimension_sets.push(&[CLUSTER_DIMENSION, SERVICE_DIMENSION]);
+                }
+                let document = (
+                    stamped_at,
+                    performance_document(
+                        TASK_DOCUMENT_TYPE,
+                        &identity,
+                        &task_figures,
+                        &dimension_sets,
+                        now,
+                    ),
+                );
+                match task.container_instance_id {
+                    // The stream the agent of the container instance this task runs on writes.
+                    Some(instance_id) => streams.push(PerformanceStream {
+                        log_stream: instance_id,
+                        documents: vec![document],
+                    }),
+                    // A task Fargate runs holds no container instance of its own, so its
+                    // telemetry travels a stream of the task.
+                    None if task.fargate => streams.push(PerformanceStream {
+                        log_stream: fargate_telemetry_stream(&task.id),
+                        documents: vec![document],
+                    }),
+                    // A task this store holds no host for travels with the cluster's own
+                    // collection rather than through a stream named after nothing.
+                    None => cluster_telemetry.push(document),
                 }
             }
             if let Some(cluster) = self.clusters.get_mut(&cluster_name) {
@@ -256,8 +410,19 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     },
                 ));
             }
+            streams.push(PerformanceStream {
+                log_stream: cluster_telemetry_stream(&cluster_name),
+                documents: cluster_telemetry,
+            });
+            collected.push(ClusterPerformance {
+                cluster_name,
+                streams,
+            });
         }
-        published
+        DueInsights {
+            datapoints: published,
+            collected,
+        }
     }
 
     /// The counts a collection of `cluster_name`'s CLUSTER-level metrics carries: its running
@@ -299,10 +464,14 @@ pub(super) fn epoch_seconds(at: SystemTime) -> f64 {
 }
 
 /// The utilization datapoints one reading carries, each with the unit it is published in: the
-/// CPU units and the MiB the tasks are using, and the ones their task definitions reserve.
+/// CPU units and the MiB the tasks are using, the ones their task definitions reserve, the
+/// bytes those tasks moved over a network and through a filesystem, and the ephemeral storage
+/// they were given beside what their layers hold.
 ///
 /// A figure the reading has none of is not published at all — there is no quantity of CPU to
-/// report for tasks that were given none ([`super::container_usage`]).
+/// report for tasks that were given none, and no usage of an ephemeral storage no placement
+/// gave them ([`super::container_usage`]). A byte COUNTER is published whatever it stands at:
+/// zero bytes moved is a measurement of the traffic those containers had.
 fn insights_figures(
     utilization: &InsightsUtilization,
 ) -> Vec<(&'static str, f64, &'static str)> {
@@ -319,29 +488,94 @@ fn insights_figures(
             utilization.memory_reserved,
             MEMORY_UNIT,
         ),
+        (
+            METRIC_NETWORK_RX_BYTES,
+            Some(utilization.network_received_bytes),
+            BYTES_UNIT,
+        ),
+        (
+            METRIC_NETWORK_TX_BYTES,
+            Some(utilization.network_sent_bytes),
+            BYTES_UNIT,
+        ),
+        (
+            METRIC_STORAGE_READ_BYTES,
+            Some(utilization.storage_read_bytes),
+            BYTES_UNIT,
+        ),
+        (
+            METRIC_STORAGE_WRITE_BYTES,
+            Some(utilization.storage_written_bytes),
+            BYTES_UNIT,
+        ),
+        (
+            METRIC_EPHEMERAL_STORAGE_RESERVED,
+            utilization.ephemeral_storage_reserved,
+            STORAGE_SIZE_UNIT,
+        ),
+        (
+            METRIC_EPHEMERAL_STORAGE_UTILIZED,
+            utilization.ephemeral_storage_utilized,
+            STORAGE_SIZE_UNIT,
+        ),
     ]
     .into_iter()
     .filter_map(|(metric_name, figure, unit)| figure.map(|figure| (metric_name, figure, unit)))
     .collect()
 }
 
-/// Publish the Container Insights datapoints the clock owes the clusters this store holds —
-/// the ONE call a door that wrote a task's status, or the clock pump, makes for it.
+/// What one collection pass OWES: the datapoints to publish into the metric store, and the
+/// performance log events to write beside them, per cluster collected for
+/// ([`super::container_insights_logs`]).
+///
+/// Both come out of ONE reading of this store's records, so a cluster's series and its
+/// performance log event cannot report different figures for the same instant.
+#[derive(Debug, Default)]
+pub struct DueInsights {
+    /// The datapoints, each with the series it belongs to.
+    pub datapoints: Vec<(cloudwatch::MetricKey, cloudwatch::StoredDatum)>,
+    /// What each cluster's performance log group is owed.
+    pub collected: Vec<ClusterPerformance>,
+}
+
+/// Publish the Container Insights datapoints and performance log events the clock owes the
+/// clusters this store holds — the ONE call the clock pump makes for it.
 ///
 /// Called with NO guard of this store held: it takes this store's lock to read what is due
 /// (and to stamp the clusters it read), releases it, and only then writes the CloudWatch
-/// store — the one-directional, guard-free discipline every other cross-store access in this
-/// crate follows, which is what keeps a cycle between the stores unreachable.
+/// store and the log group — the one-directional, guard-free discipline every other
+/// cross-store access in this crate follows, which is what keeps a cycle between the stores
+/// unreachable.
 ///
 /// Nothing is published on an engine that holds no metric store to reach: a datapoint has
 /// one home, and this path never makes a second one.
-pub fn settle_container_insights<Eng: Send + Sync + 'static>(engine: &Eng) {
+pub async fn settle_container_insights<Eng: Send + Sync + 'static>(
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+    engine: &Eng,
+    region: &str,
+) {
     let Some(state) = service_state(engine) else {
         return;
     };
     // The guard this statement takes is a TEMPORARY: it is released at the end of the
     // statement, so nothing below holds it.
-    let published = state.lock().due_container_insights(SystemTime::now());
+    let due = state.lock().due_container_insights(SystemTime::now());
+    if due.datapoints.is_empty() && due.collected.is_empty() {
+        return;
+    }    publish_insights_datapoints(engine, due.datapoints);
+    // The other half of what a collection produces: the documents a consumer of the cluster's
+    // performance log group reads ([`super::container_insights_logs`]). Written with no guard
+    // of either store held, because the write goes through CloudWatch Logs' own ingest path.
+    super::container_insights_logs::deliver_performance_logs(callback, region, &due.collected)
+        .await;
+}
+
+/// Append `published` to the CloudWatch metric store the shared engine holds, and make the
+/// alarms over those series due.
+fn publish_insights_datapoints<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    published: Vec<(cloudwatch::MetricKey, cloudwatch::StoredDatum)>,
+) {
     if published.is_empty() {
         return;
     }

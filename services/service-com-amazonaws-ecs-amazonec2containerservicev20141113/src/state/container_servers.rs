@@ -470,6 +470,10 @@ pub struct ContainerServing {
     /// The records of the shared engine, where the server is published for the services that
     /// send this task traffic.
     addresses: ServedAddresses,
+    /// Where the bytes the servers it starts move are accounted for
+    /// ([`super::container_consumption`]) — the accounting of the container's RUN, which the
+    /// collections that report its network traffic sample.
+    accounting: ::std::sync::Arc<super::container_consumption::ContainerConsumption>,
 }
 
 impl ContainerServing {
@@ -477,7 +481,24 @@ impl ContainerServing {
     /// `addresses`.
     #[must_use]
     pub fn new(address: String, addresses: ServedAddresses) -> Self {
-        Self { address, addresses }
+        Self {
+            address,
+            addresses,
+            accounting: ::std::sync::Arc::new(
+                super::container_consumption::ContainerConsumption::new(),
+            ),
+        }
+    }
+
+    /// This serving accounting the bytes its servers move into `accounting` — the accounting of
+    /// the container's run ([`super::container_consumption`]).
+    #[must_use]
+    pub fn accounting_into(
+        mut self,
+        accounting: ::std::sync::Arc<super::container_consumption::ContainerConsumption>,
+    ) -> Self {
+        self.accounting = accounting;
+        self
     }
 
     /// Start `server` over `files`: the server is reachable at the task's address on its own
@@ -492,7 +513,11 @@ impl ContainerServing {
         self.addresses.publish(
             &self.address,
             port,
-            ::std::sync::Arc::new(ContainerStaticServer { server, files }),
+            ::std::sync::Arc::new(ContainerStaticServer {
+                server,
+                files,
+                accounting: ::std::sync::Arc::clone(&self.accounting),
+            }),
         )
     }
 }
@@ -505,13 +530,23 @@ struct ContainerStaticServer {
     /// The documents of that directory, as they stood when the server started (see this
     /// module's header).
     files: BTreeMap<String, String>,
+    /// Where the bytes it receives and answers with are accounted for
+    /// ([`super::container_consumption`]).
+    accounting: ::std::sync::Arc<super::container_consumption::ContainerConsumption>,
 }
 
 impl ServesHttp for ContainerStaticServer {
     /// What this server answers, through the ONE reading of what a static server answers for a
     /// request (see this module's header).
+    ///
+    /// The bytes of the request it took and of the answer it gave are COUNTED into the
+    /// container's run as it answers ([`super::container_consumption`]), which is the traffic
+    /// its network series then reports.
     fn serve(&self, method: &str, path: &str) -> Option<AddressAnswer> {
+        self.accounting
+            .record_network_received(method.len().saturating_add(path.len()));
         let answered = served_by(&self.server, &self.files, method, path);
+        self.accounting.record_network_sent(answered.body.len());
         Some(AddressAnswer {
             status: answered.status,
             content_type: answered.content_type,

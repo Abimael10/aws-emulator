@@ -338,6 +338,11 @@ mod cluster_settings;
 mod container_insights;
 pub use container_insights::*;
 
+/// The PERFORMANCE LOG EVENTS that same cluster publishes beside those metrics, into the
+/// CloudWatch Logs log group Container Insights keeps for it.
+mod container_insights_logs;
+pub use container_insights_logs::*;
+
 /// What one container's run CONSUMES — how long its program has spent executing and how many
 /// bytes it is occupying — measured on the session this emulator performs it in.
 mod container_consumption;

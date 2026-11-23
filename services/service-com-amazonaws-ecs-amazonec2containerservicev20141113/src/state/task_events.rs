@@ -863,11 +863,11 @@ fn spawn_task_clock_pump<Eng: Send + Sync + 'static>(
             // that wrote a status settles, owed here for the statuses NO door wrote
             // ([`super::settle_load_balancer_targets`]).
             super::settle_load_balancer_targets(&*engine);
-            // The Container Insights series each cluster the setting is ON for owes, which
-            // the collection interval makes due whether or not anybody called
-            // ([`super::settle_container_insights`]) — taken off the very records the pass
-            // above has just moved, with no guard of this store held.
-            super::settle_container_insights(&*engine);
+            // The Container Insights series each cluster the setting is ON for owes, and the
+            // performance log events beside them, which the collection interval makes due
+            // whether or not anybody called ([`super::settle_container_insights`]) — taken off
+            // the very records the pass above has just moved, with no guard of this store held.
+            super::settle_container_insights(&callback, &*engine, &region).await;
             // The `AWS/ECS` utilization series each service holding a running task owes, which
             // the publish cadence makes due whether or not anybody called
             // ([`super::settle_service_utilization`]) — read off the same records the pass

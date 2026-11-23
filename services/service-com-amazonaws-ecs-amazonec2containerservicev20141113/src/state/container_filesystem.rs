@@ -45,6 +45,16 @@
 //! as the failure it is ([`FileError::NoSpace`]), so a container's program cannot grow this
 //! process without a stated ceiling. No host path is opened, created or read: every entry is
 //! one this process holds in memory.
+//!
+//! # What is accounted for
+//!
+//! Every read and write this filesystem performs for the container is COUNTED into that
+//! container's run ([`super::container_consumption`]): the bytes a read answered and the bytes
+//! a write stored, as they are performed, so the storage series over a cluster's tasks reports
+//! the bytes their programs really moved through a filesystem
+//! ([`super::container_usage`]). A filesystem given no accounting — the one a health-check
+//! probe runs over, whose work is the agent's rather than the container's — counts into a
+//! reading of its own that nothing samples.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -53,6 +63,8 @@ use ::service_common::posix_shell_files::{FileEntry, FileRefusal, ShellFiles};
 use ::service_common::posix_shell_volume::{
     parent_path, resolved_path, ShellVolume, VolumeLimits, ROOT,
 };
+
+use super::container_consumption::ContainerConsumption;
 
 /// How much ONE container's own writable layer holds. Every field is the EMULATOR'S number,
 /// not a modelled quota (a task's `ephemeralStorage` is sized in gibibytes): the layer is this
@@ -305,6 +317,10 @@ pub struct ContainerFilesystem {
     mounts: Vec<ContainerMount>,
     /// `ContainerDefinition$workingDirectory`, which a relative path is resolved against.
     working_directory: String,
+    /// Where the bytes this filesystem reads and writes for the container are accounted for
+    /// ([`super::container_consumption`]) — the accounting of the container's RUN, which the
+    /// collections that report its storage sample.
+    accounting: Arc<ContainerConsumption>,
 }
 
 impl Default for ContainerFilesystem {
@@ -359,7 +375,16 @@ impl ContainerFilesystem {
             layer,
             mounts,
             working_directory,
+            accounting: Arc::new(ContainerConsumption::new()),
         }
+    }
+
+    /// This filesystem accounting the bytes it reads and writes into `accounting` — the
+    /// accounting of the container's run ([`super::container_consumption`]).
+    #[must_use]
+    pub fn accounting_into(mut self, accounting: Arc<ContainerConsumption>) -> Self {
+        self.accounting = accounting;
+        self
     }
 
     /// `ContainerDefinition$workingDirectory`, "the working directory to run commands inside
@@ -474,9 +499,13 @@ impl ShellFiles for ContainerFilesystem {
         if self.is_directory(path) {
             return Err(FileRefusal::IsADirectory);
         }
-        self.in_tree(path, |files, path| files.read(path))
+        let read = self
+            .in_tree(path, |files, path| files.read(path))
             .flatten()
-            .ok_or(FileRefusal::NotFound)
+            .ok_or(FileRefusal::NotFound)?;
+        // The bytes a read really answered, counted into the container's run.
+        self.accounting.record_storage_read(read.len());
+        Ok(read)
     }
 
     /// Write `text` at `path`, replacing what is there or APPENDING to it — the two forms an
@@ -515,6 +544,9 @@ impl ShellFiles for ContainerFilesystem {
         }
         let wrote = self.in_writable_tree(path, |files, path| files.write(path, text, append))?;
         if wrote {
+            // The bytes a write really stored, counted into the container's run; a write that
+            // did not happen moved none.
+            self.accounting.record_storage_write(text.len());
             Ok(())
         } else {
             Err(FileRefusal::NoSpace)

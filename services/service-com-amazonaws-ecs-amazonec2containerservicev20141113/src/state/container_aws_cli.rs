@@ -135,6 +135,10 @@ pub struct ContainerAwsCli {
     region: String,
     /// What every call presents ([`super::task_role_credentials`]).
     credential: TaskRoleCredential,
+    /// Where the bytes its transfers move are accounted for
+    /// ([`super::container_consumption`]) — the accounting of the container's RUN, which the
+    /// collections that report its network traffic sample.
+    accounting: ::std::sync::Arc<super::container_consumption::ContainerConsumption>,
 }
 
 /// Prints the Region this CLI is addressed to and NOTHING of the credential it signs with: the
@@ -160,7 +164,21 @@ impl ContainerAwsCli {
             callback,
             region: region.to_string(),
             credential,
+            accounting: ::std::sync::Arc::new(
+                super::container_consumption::ContainerConsumption::new(),
+            ),
         }
+    }
+
+    /// This CLI accounting the bytes its transfers move into `accounting` — the accounting of
+    /// the container's run ([`super::container_consumption`]).
+    #[must_use]
+    pub fn accounting_into(
+        mut self,
+        accounting: ::std::sync::Arc<super::container_consumption::ContainerConsumption>,
+    ) -> Self {
+        self.accounting = accounting;
+        self
     }
 
     /// What this container's `aws` command answers for `arguments` — the words after the
@@ -397,16 +415,25 @@ impl ContainerAwsCli {
     }
 
     /// The object's own text, bounded by [`MAX_TRANSFERRED_BYTES`].
+    ///
+    /// The bytes it really carried back are counted into the container's run as RECEIVED over
+    /// the network ([`super::container_consumption`]).
     async fn get(&self, address: &ObjectAddress) -> Result<String, String> {
-        self.made(cli::get_object_text(
-            &self.client(&self.region)?,
-            address,
-            MAX_TRANSFERRED_BYTES,
-        ))
-        .await
+        let fetched = self
+            .made(cli::get_object_text(
+                &self.client(&self.region)?,
+                address,
+                MAX_TRANSFERRED_BYTES,
+            ))
+            .await?;
+        self.accounting.record_network_received(fetched.len());
+        Ok(fetched)
     }
 
     /// Write `contents` as the object at `address`, up to the same bound.
+    ///
+    /// The bytes it really carried are counted into the container's run as SENT over the
+    /// network, under [`Self::get`]'s rule.
     async fn put(&self, address: &ObjectAddress, contents: &str) -> Result<(), String> {
         self.made(cli::put_object_text(
             &self.client(&self.region)?,
@@ -414,7 +441,9 @@ impl ContainerAwsCli {
             contents,
             MAX_TRANSFERRED_BYTES,
         ))
-        .await
+        .await?;
+        self.accounting.record_network_sent(contents.len());
+        Ok(())
     }
 
     /// Make ONE call, inside [`CALL_BUDGET`].

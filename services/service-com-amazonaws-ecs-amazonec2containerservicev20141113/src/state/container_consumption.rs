@@ -14,15 +14,28 @@
 //! ([`super::container_shell`]), on one in-process performer per container, over an in-memory
 //! filesystem and an in-memory session store.
 //!
-//! Two quantities of that run are therefore observable, and this module is where the session
-//! records them as it goes:
+//! Four kinds of quantity of that run are therefore observable, and this module is where the
+//! session records them as it goes:
 //!
 //! * how long the container's program has spent EXECUTING — the time it held its performer,
 //!   as against the time it spent waiting (a `sleep`, a wait for the stop signal, a server
 //!   held in the foreground), which is time it used nothing in;
 //! * how many BYTES the container is occupying — what its session holds (the variables it
 //!   has set and the output line it is assembling) beside what its own writable layer holds
-//!   ([`super::container_filesystem`]).
+//!   ([`super::container_filesystem`]);
+//! * how many bytes its program has READ from and WRITTEN to a filesystem — every read and
+//!   write the container's own layer and the volumes mounted into it perform for it, counted
+//!   where that filesystem performs them ([`super::container_filesystem`]);
+//! * how many bytes it has RECEIVED from and SENT over a network — the requests its clients
+//!   make to the servers of its task and the answers they get back
+//!   ([`super::container_http_client`]), the requests its own servers answer
+//!   ([`super::container_servers`]) and the objects its AWS CLI transfers
+//!   ([`super::container_aws_cli`]).
+//!
+//! The last two are CUMULATIVE COUNTERS of bytes that really moved, so a series over them
+//! reports the bytes moved over the interval it closes and reports ZERO for a container that
+//! moved none — which is a measurement, and the one a container whose program neither reads a
+//! file nor opens a connection takes.
 //!
 //! Both are the container's own, so they are held per RUN ([`super::container_runtime`]) and
 //! shared with whatever samples them: nothing here publishes anything, and nothing here
@@ -48,6 +61,11 @@ use super::*;
 /// reservation in (`TaskDefinition$memory`, `ContainerDefinition$memory`).
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 
+/// How many bytes one gibibyte is, which is the unit a task's ephemeral storage is sized in
+/// (`TaskEphemeralStorage$sizeInGiB`, "the total amount, in GiB, of the ephemeral storage to
+/// set for the task").
+const BYTES_PER_GIB: u64 = 1024 * BYTES_PER_MIB;
+
 /// What ONE container's run has consumed so far: written by the session performing it and read
 /// by the collections that sample it, so both see one accounting of one container.
 #[derive(Debug, Default)]
@@ -58,6 +76,14 @@ pub struct ContainerConsumption {
     /// How many bytes the container's SESSION is holding right now — zero once that session
     /// is over, because a session that has ended holds nothing.
     held_bytes: AtomicU64,
+    /// How many bytes its program has read from a filesystem, cumulatively over the run.
+    storage_read_bytes: AtomicU64,
+    /// How many it has written to one, under the same rule.
+    storage_written_bytes: AtomicU64,
+    /// How many bytes it has received over a network, cumulatively over the run.
+    network_received_bytes: AtomicU64,
+    /// How many it has sent over one, under the same rule.
+    network_sent_bytes: AtomicU64,
 }
 
 impl ContainerConsumption {
@@ -77,21 +103,52 @@ impl ContainerConsumption {
         self.held_bytes.load(Ordering::Acquire)
     }
 
+    /// How many bytes this container's program has read from a filesystem.
+    pub fn storage_read_bytes(&self) -> u64 {
+        self.storage_read_bytes.load(Ordering::Acquire)
+    }
+
+    /// How many it has written to one.
+    pub fn storage_written_bytes(&self) -> u64 {
+        self.storage_written_bytes.load(Ordering::Acquire)
+    }
+
+    /// How many bytes it has received over a network.
+    pub fn network_received_bytes(&self) -> u64 {
+        self.network_received_bytes.load(Ordering::Acquire)
+    }
+
+    /// How many it has sent over one.
+    pub fn network_sent_bytes(&self) -> u64 {
+        self.network_sent_bytes.load(Ordering::Acquire)
+    }
+
     /// Account `span` to the time this container's program has spent executing.
     ///
     /// Saturating, so an accounting of an absurd span cannot wrap the total back to a small
     /// one: a measurement is never reported as less work than was done.
     pub fn record_execution(&self, span: Duration) {
-        let nanos = u64::try_from(span.as_nanos()).unwrap_or(u64::MAX);
-        let mut held = self.executing_nanos.load(Ordering::Acquire);
-        while let Err(current) = self.executing_nanos.compare_exchange_weak(
-            held,
-            held.saturating_add(nanos),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            held = current;
-        }
+        add_bytes(&self.executing_nanos, u64::try_from(span.as_nanos()).unwrap_or(u64::MAX));
+    }
+
+    /// Account `bytes` to what this container's program has READ from a filesystem.
+    pub fn record_storage_read(&self, bytes: usize) {
+        add_bytes(&self.storage_read_bytes, counted(bytes));
+    }
+
+    /// Account `bytes` to what it has WRITTEN to one.
+    pub fn record_storage_write(&self, bytes: usize) {
+        add_bytes(&self.storage_written_bytes, counted(bytes));
+    }
+
+    /// Account `bytes` to what it has RECEIVED over a network.
+    pub fn record_network_received(&self, bytes: usize) {
+        add_bytes(&self.network_received_bytes, counted(bytes));
+    }
+
+    /// Account `bytes` to what it has SENT over one.
+    pub fn record_network_sent(&self, bytes: usize) {
+        add_bytes(&self.network_sent_bytes, counted(bytes));
     }
 
     /// Record that the container's session is holding `bytes` right now.
@@ -107,6 +164,27 @@ impl ContainerConsumption {
     /// container are the ones it really still holds.
     pub fn release(&self) {
         self.held_bytes.store(0, Ordering::Release);
+    }
+}
+
+/// `bytes` as the number one of these counters carries.
+fn counted(bytes: usize) -> u64 {
+    u64::try_from(bytes).unwrap_or(u64::MAX)
+}
+
+/// Add `bytes` to `counter`, saturating at its ceiling.
+///
+/// Saturating, so an accounting of an absurd quantity cannot wrap a total back to a small one:
+/// a measurement is never reported as less than what really happened.
+fn add_bytes(counter: &AtomicU64, bytes: u64) {
+    let mut held = counter.load(Ordering::Acquire);
+    while let Err(current) = counter.compare_exchange_weak(
+        held,
+        held.saturating_add(bytes),
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        held = current;
     }
 }
 
@@ -133,6 +211,23 @@ pub(super) struct ServiceConsumption {
     /// none of them states a reservation at all — what the share of its performers a program
     /// held stands for as a quantity of CPU ([`super::container_usage`]).
     pub(super) reserved_cpu_units: u128,
+    /// How many bytes those containers' own writable LAYERS hold at this instant: the files
+    /// their programs wrote, which is the storage of the task they occupy
+    /// ([`super::container_filesystem`]).
+    pub(super) layer_bytes: u128,
+    /// How many bytes of EPHEMERAL STORAGE the placements of those tasks gave them, and zero
+    /// for tasks whose placement gave them none to report — the storage a task's containers
+    /// write on ([`super::resolved_ephemeral_storage_gib`]).
+    pub(super) reserved_storage_bytes: u128,
+    /// How many bytes those containers' programs have READ from a filesystem, cumulatively
+    /// since each run began.
+    pub(super) storage_read_bytes: u128,
+    /// How many they have WRITTEN to one, under the same rule.
+    pub(super) storage_written_bytes: u128,
+    /// How many bytes they have RECEIVED over a network, under the same rule.
+    pub(super) network_received_bytes: u128,
+    /// How many they have SENT over one, under the same rule.
+    pub(super) network_sent_bytes: u128,
 }
 
 impl ServiceConsumption {
@@ -214,6 +309,15 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             reading.reserved_cpu_units = reading
                 .reserved_cpu_units
                 .saturating_add(u128::from(task_reserved_cpu_units(task)));
+            // The ephemeral storage this task's placement gave it, which is the storage its
+            // containers write on ([`super::container_process`]) — and nothing at all for a
+            // placement that gave it none to report.
+            if let Some(gib) = task.ephemeral_storage_gib.filter(|gib| *gib > 0) {
+                reading.reserved_storage_bytes = reading.reserved_storage_bytes.saturating_add(
+                    u128::from(u64::try_from(gib).unwrap_or_default())
+                        .saturating_mul(u128::from(BYTES_PER_GIB)),
+                );
+            }
             for container in &task.containers {
                 let Some(run) = self.container_runs.get(&container.container_arn) else {
                     continue;
@@ -225,6 +329,21 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 reading.held_bytes = reading.held_bytes.saturating_add(u128::from(
                     consumption.held_bytes().saturating_add(run.layer_bytes()),
                 ));
+                reading.layer_bytes = reading
+                    .layer_bytes
+                    .saturating_add(u128::from(run.layer_bytes()));
+                reading.storage_read_bytes = reading
+                    .storage_read_bytes
+                    .saturating_add(u128::from(consumption.storage_read_bytes()));
+                reading.storage_written_bytes = reading
+                    .storage_written_bytes
+                    .saturating_add(u128::from(consumption.storage_written_bytes()));
+                reading.network_received_bytes = reading
+                    .network_received_bytes
+                    .saturating_add(u128::from(consumption.network_received_bytes()));
+                reading.network_sent_bytes = reading
+                    .network_sent_bytes
+                    .saturating_add(u128::from(consumption.network_sent_bytes()));
                 if run.is_performing_a_program() {
                     reading.performers = reading.performers.saturating_add(1);
                 }
