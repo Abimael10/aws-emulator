@@ -617,13 +617,23 @@ async fn the_schema_a_client_reads_is_the_schema_the_install_is_held_to() {
     let kubernetes_version = default_cluster_version(&router).await;
     active_cluster(&router, "discovered", &kubernetes_version).await;
 
-    // Walk the discovery path a client walks, for EVERY add-on the catalog
-    // publishes: the default cluster version, the build published for it, then
-    // that build's schema — and install with a document built out of the keys
-    // that schema declares, one value per JSON type. Every key the published
-    // schema declares is therefore a key the install accepts: the schema a
-    // client reads cannot claim a configuration surface the create refuses.
-    let published = addon_names(&whole_catalog(&router).await);
+    // Walk the discovery path a client walks, for every add-on the catalog
+    // publishes FOR the default cluster version — an add-on whose published build
+    // line stops at an older Kubernetes version is offered to this cluster under
+    // no name at all — then the build published for it, then that build's
+    // schema — and install with a document built out of the keys that schema
+    // declares, one value per JSON type. Every key the published schema declares
+    // is therefore a key the install accepts: the schema a client reads cannot
+    // claim a configuration surface the create refuses.
+    let listing = describe_addon_versions(
+        &router,
+        &format!(
+            "kubernetesVersion={}&maxResults=100",
+            encode_label(&kubernetes_version)
+        ),
+    )
+    .await;
+    let published = addon_names(&listing);
     for addon_name in &published {
         let addon_name = addon_name.as_str();
         let addon_version = newest_build(&router, addon_name, &kubernetes_version).await;

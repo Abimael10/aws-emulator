@@ -289,37 +289,35 @@ async fn every_service_account_an_addon_runs_as_is_published_with_its_policies()
     }
 }
 
-/// One service account an add-on runs as, with the add-on release it is published
-/// from: the minimum build of that add-on which can be given a pod identity for
-/// that component.
-type SupportedFrom = (&'static str, (u32, u32, u32));
-
-/// The add-on whose published build line reaches back before the releases its
-/// components gained EKS Pod Identity support in.
+/// The add-on whose published build line reaches back before the release in
+/// which it gained EKS Pod Identity support.
 ///
-/// SOURCE: the minimum add-on version the Amazon EKS User Guide publishes for each
-/// component of that add-on that supports EKS Pod Identity — the EFS CSI driver's
-/// controller Deployment from the driver's 2.0.7 release and its node DaemonSet
-/// from the 2.1 line — which is the external authority this expectation is taken
-/// from, not the catalog under test. A build older than both publishes nothing at
-/// all: pod identity is not something that build can be installed with.
+/// SOURCE: the minimum add-on version the Amazon EKS User Guide publishes for the
+/// add-on — the EFS CSI driver's 2.0.7 release — which is the external authority
+/// this expectation is taken from, not the catalog under test. The guide publishes
+/// ONE minimum version PER ADD-ON, so a build at or above it publishes an entry
+/// for every service account the add-on runs as, and a build older than it
+/// publishes nothing at all: pod identity is not something that build can be
+/// installed with.
 const POD_IDENTITY_ADDON: &str = "aws-efs-csi-driver";
 
-/// The releases that add-on's service accounts are published from, in the order
-/// the catalog publishes the accounts. See [`POD_IDENTITY_ADDON`].
-const POD_IDENTITY_FROM: &[SupportedFrom] = &[
-    ("efs-csi-controller-sa", (2, 0, 7)),
-    ("efs-csi-node-sa", (2, 1, 0)),
-];
+/// The release that add-on's pod-identity configuration is published from. See
+/// [`POD_IDENTITY_ADDON`].
+const POD_IDENTITY_FROM: (u32, u32, u32) = (2, 0, 7);
+
+/// The service accounts that add-on runs as, in the order the catalog publishes
+/// them — both of the driver's components call Amazon EFS. See
+/// [`POD_IDENTITY_ADDON`].
+const POD_IDENTITY_ACCOUNTS: &[&str] = &["efs-csi-controller-sa", "efs-csi-node-sa"];
 
 #[tokio::test]
 async fn a_build_publishes_the_service_accounts_it_supports_pod_identity_for() {
     let router = emulator();
-    let (addon, supported) = (POD_IDENTITY_ADDON, POD_IDENTITY_FROM);
+    let addon = POD_IDENTITY_ADDON;
 
-    // Every build of the published line is a row, so the rows span every side of
-    // those releases and both published bounds — the oldest build the add-on has
-    // and its newest.
+    // Every build of the published line is a row, so the rows span both sides of
+    // that release and both published bounds — the oldest build the add-on has and
+    // its newest.
     let builds = published_builds(&router, addon).await;
     assert!(
         builds.len() > 1,
@@ -338,23 +336,24 @@ async fn a_build_publishes_the_service_accounts_it_supports_pod_identity_for() {
             .iter()
             .map(|(account, _)| account.as_str())
             .collect();
-        let expected: Vec<&str> = supported
-            .iter()
-            .filter(|(_, first_build)| release_of(build) >= *first_build)
-            .map(|(account, _)| *account)
-            .collect();
+        let expected: Vec<&str> = if release_of(build) >= POD_IDENTITY_FROM {
+            POD_IDENTITY_ACCOUNTS.to_vec()
+        } else {
+            Vec::new()
+        };
         published.insert(expected.len());
         assert_eq!(
             accounts, expected,
-            "case {case}: a build publishes the service accounts it supports pod \
-             identity for, got {accounts:?}"
+            "case {case}: a build at or above {POD_IDENTITY_FROM:?} publishes every service \
+             account the add-on runs as and an older one publishes none, got {accounts:?}"
         );
     }
     assert_eq!(
         published,
-        (0..=supported.len()).collect::<BTreeSet<usize>>(),
-        "setup: the published line must cross every release {supported:?} an account is \
-         published from, so some of its builds publish none, some all"
+        BTreeSet::from([0, POD_IDENTITY_ACCOUNTS.len()]),
+        "setup: the published line must cross the release {POD_IDENTITY_FROM:?} the add-on's \
+         pod-identity configuration is published from, so some of its builds publish none and \
+         some all"
     );
 }
 

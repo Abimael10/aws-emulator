@@ -81,3 +81,51 @@ Smithy model consulted: services/service-com-amazonaws-eks-awswesleyfrontend/smi
    - GET /cluster-versions and compare the whole list against the published EKS version table (clusterVersion, defaultPlatformVersion, kubernetesPatchVersion, defaultVersion, releaseDate / endOfStandardSupportDate / endOfExtendedSupportDate, versionStatus, controlPlaneScalingTiers and controlPlaneComponentConfig bounds): no index matches.
    - GET /addons/configuration-schemas?addonName=aws-efs-csi-driver&addonVersion=<the recorded version> and diff configurationSchema against the add-on's published schema, and check podIdentityConfiguration has one entry per service account the add-on uses (the second entry is missing).
    - GET /addons/configuration-schemas?addonName=vpc-cni&addonVersion=<the recorded version> and diff configurationSchema against the published draft-06 VpcCni document.
+
+## Fix note
+
+An add-on's published builds are now the ADD-ON's own history rather than a function of the
+Kubernetes version calendar, in two parts (`src/state/addon_catalog.rs`):
+
+- `ADDON_PUBLISHED_BUILDS` carries the published build table of an add-on whose table this
+  catalog can cite — the version of each build and the newest Kubernetes version it was
+  published for — so such an add-on publishes exactly those builds, one build may be the only
+  one published across several Kubernetes versions, and an add-on whose publisher has stopped
+  publishing has NO build for a Kubernetes version released since its last one. It is still
+  listed, with the builds it has, and drops out of a listing filtered to a newer version (and
+  out of an install on a cluster running one). The KubeArmor listing is cited that way: one
+  published build, offered for the versions that were in support when it was published.
+- every build, cited or derived, is offered for the Kubernetes versions Amazon EKS still
+  OFFERED when the build was published (`build_compatibilities`), so a build names no version
+  whose extended support had ended by then. The window now moves along the calendar with the
+  add-on's line instead of reaching back to the add-on's first row for ever.
+
+`DescribeAddonConfiguration`'s `podIdentityConfiguration` is published from ONE minimum build
+per add-on (`ADDON_POD_IDENTITY_FIRST_BUILD`), which is how the minimum version is published:
+a build at or above it publishes an entry for EVERY service account the add-on runs as — the
+second entry that used to be withheld from the builds between two invented per-component
+minimums — and an older build publishes none.
+
+Cause 1 is closed: the representative step's `addons[0]` now matches, built out of the add-on's
+published build table, its published compatibility window and its listing's cited product id
+and product page.
+
+What remains, and why it is not guessed at here:
+
+- Cause 2 (the published release history of the REST of the catalogue): the mechanism is in
+  place — a row in `ADDON_PUBLISHED_BUILDS` is all a cited build table needs — but the
+  published tables of the other catalogued add-ons cannot be cited from inside this emulator
+  (the replay answers "recorded values withheld" on every divergence), so their builds are
+  still derived along their own release lines. Adding a row per add-on as its table becomes
+  citable is the remaining work.
+- Causes 4 and 5 (the configuration SCHEMA documents): the EFS CSI driver's `node` definition
+  gained the `replicaCount` key its published document declares, and the pod-identity half of
+  cause 4 is closed; the published JSON-Schema DOCUMENTS of those two add-ons are third-party
+  artifacts this catalogue cannot cite from here, so the documents are still built from the
+  key set the catalogue carries per add-on.
+- Cause 3 (the cluster-version rows): the calendar itself, and every row member derived from
+  it, is the published one; the row's remaining divergence is inside `controlPlaneComponentConfig`,
+  whose published bounds are owned by the open issue
+  20261114T191058Z-eks-catalog-reads-publish-synthesised-control-plane-constraints.md (it cites
+  them), and inside `controlPlaneScalingTiers`, whose published per-tier capability table cannot
+  be cited from here. Nothing here invents a tier capability or a constraint bound.

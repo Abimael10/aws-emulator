@@ -100,12 +100,33 @@ fn alphanumeric(value: &str) -> String {
         .collect()
 }
 
-/// Whether `product_id` is the form an AWS Marketplace product identifier takes:
-/// `prod-` and thirteen lower-case alphanumerics.
+/// Whether `product_id` is a form an AWS Marketplace product identifier takes:
+/// the UUID the Marketplace catalog publishes a product id as, or the
+/// `prod-<id>` form of thirteen lower-case alphanumerics.
 ///
-/// Source: the product identifiers the AWS Marketplace APIs publish, whose
-/// `prod-<id>` form every listing's product id takes.
+/// Source: the product identifiers the AWS Marketplace catalog publishes for its
+/// listings, which is what `MarketplaceInformation$productId` carries — per
+/// listing, so a listing whose identifier is published as a UUID reports that
+/// UUID.
 pub(crate) fn is_marketplace_product_id(product_id: &str) -> bool {
+    is_product_uuid(product_id) || is_product_entity_id(product_id)
+}
+
+/// The lower-case 8-4-4-4-12 hex form a Marketplace product id is published in.
+fn is_product_uuid(product_id: &str) -> bool {
+    let groups: Vec<&str> = product_id.split('-').collect();
+    groups.len() == 5
+        && groups.iter().map(|group| group.len()).eq([8, 4, 4, 4, 12])
+        && groups.iter().all(|group| {
+            group
+                .chars()
+                .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
+        })
+}
+
+/// The `prod-` and thirteen lower-case alphanumerics form the same identifier
+/// also takes.
+fn is_product_entity_id(product_id: &str) -> bool {
     let Some(identifier) = product_id.strip_prefix("prod-") else {
         return false;
     };

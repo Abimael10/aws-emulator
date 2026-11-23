@@ -20,7 +20,7 @@
 //! named. The Kubernetes versions each case uses are read from the published
 //! calendar, so the suites keep asserting the rule as the published tables grow.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use service_com_amazonaws_eks_awswesleyfrontend::state::{
@@ -132,6 +132,41 @@ async fn active_cluster(router: &MultiServiceRouter, case: &str, name: &str) {
     }
 }
 
+/// One published calendar row's days: when Amazon EKS released that Kubernetes
+/// version, and when its extended support ends.
+#[derive(Debug, Clone, Copy)]
+struct SupportWindow {
+    /// `ClusterVersionInformation$releaseDate`, in epoch seconds as reported.
+    released: f64,
+    /// `ClusterVersionInformation$endOfExtendedSupportDate`, likewise.
+    end_of_extended_support: f64,
+}
+
+/// Every published calendar row's days, by Kubernetes minor version — read out of
+/// `DescribeClusterVersions`, so the window a build is published over is checked
+/// against the published calendar rather than against dates written here.
+async fn published_support_window(router: &MultiServiceRouter) -> BTreeMap<String, SupportWindow> {
+    published_calendar_rows(router)
+        .await
+        .iter()
+        .map(|row| {
+            let minor = string_member(row, "clusterVersion");
+            let day = |member: &str| {
+                row[member].as_f64().unwrap_or_else(|| {
+                    panic!("setup {minor}: expected a {member}, got {row:?}")
+                })
+            };
+            (
+                minor.clone(),
+                SupportWindow {
+                    released: day("releaseDate"),
+                    end_of_extended_support: day("endOfExtendedSupportDate"),
+                },
+            )
+        })
+        .collect()
+}
+
 /// The `computeTypes` one reported build names.
 fn compute_types_of(build: &serde_json::Value) -> Vec<String> {
     build["computeTypes"]
@@ -237,25 +272,29 @@ async fn every_published_build_reports_the_addons_own_compute_types() {
 
 // ---------------------------------------------------------------------------
 // RULE: a build's `compatibilities` carry ONE entry per Kubernetes minor version
-// that build supports, newest first — the unbroken run of published calendar
-// rows from the oldest version the add-on is offered for up to the version the
-// build was published alongside.
+// that build supports, newest first — the unbroken run of published calendar rows
+// ending at the version the build was published alongside and reaching back over
+// the versions Amazon EKS still OFFERED then, never past the oldest version the
+// add-on is offered for.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn a_builds_compatibilities_are_one_entry_per_supported_minor_newest_first() {
     let router = emulator();
     let calendar = published_calendar_minors(&router).await;
+    let support = published_support_window(&router).await;
     let catalog = addons(&whole_catalog(&router).await);
 
     for addon in &catalog {
         let addon_name = string_member(addon, "addonName");
         let builds = versions_of(addon);
-        let newest = supported_minors(&builds[0]);
-        let oldest_offered = newest
-            .last()
-            .unwrap_or_else(|| panic!("case {addon_name:?}: a build names a compatible version"))
-            .clone();
+        // The oldest Kubernetes version this add-on is offered for at all: the
+        // floor every one of its builds' windows stops at.
+        let oldest_offered = builds
+            .iter()
+            .flat_map(supported_minors)
+            .min_by_key(|minor| version_key(minor))
+            .unwrap_or_else(|| panic!("case {addon_name:?}: a build names a compatible version"));
         for build in &builds {
             let case = format!("{addon_name}/{}", string_member(build, "addonVersion"));
             let reported = supported_minors(build);
@@ -286,32 +325,32 @@ async fn a_builds_compatibilities_are_one_entry_per_supported_minor_newest_first
                 reported.len(),
                 "case {case}: a Kubernetes version is named once, got {reported:?}"
             );
-            // One entry per minor in the run: the calendar's own rows between the
-            // oldest version this add-on is offered for and the newest this build
-            // supports, with none of them missing.
+            // The window itself: the build was published alongside the newest
+            // version it supports, so it is published for that row and for every
+            // older row the add-on is offered for whose support had not ended by
+            // the day that version was released — one unbroken run of calendar
+            // rows, with none of them missing and none past the add-on's floor.
             let newest_supported = &reported[0];
+            let published_at = support
+                .get(newest_supported)
+                .map(|row| row.released)
+                .unwrap_or_else(|| panic!("case {case}: the calendar publishes {newest_supported}"));
             let expected: Vec<String> = calendar
                 .iter()
                 .skip_while(|minor| *minor != newest_supported)
-                .take_while(|minor| **minor != oldest_offered)
+                .take_while(|minor| {
+                    version_key(minor) >= version_key(oldest_offered.as_str())
+                        && support
+                            .get(*minor)
+                            .is_some_and(|row| row.end_of_extended_support > published_at)
+                })
                 .cloned()
-                .chain(std::iter::once(oldest_offered.clone()))
                 .collect();
             assert_eq!(
                 reported, expected,
-                "case {case}: expected one entry per published minor from {oldest_offered} up to \
-                 {newest_supported}, got {reported:?}"
+                "case {case}: expected the published versions still offered when the build was \
+                 published, down to {oldest_offered}, got {reported:?}"
             );
-            // The newest build is the one compatible with the add-on's whole
-            // published window, so no older build names a version it does not.
-            let covered: BTreeSet<&String> = newest.iter().collect();
-            for minor in &reported {
-                assert!(
-                    covered.contains(minor),
-                    "case {case}: the newest build must support every version an older build \
-                     does, got {minor:?} outside {newest:?}"
-                );
-            }
         }
     }
 }
@@ -319,8 +358,8 @@ async fn a_builds_compatibilities_are_one_entry_per_supported_minor_newest_first
 // ---------------------------------------------------------------------------
 // RULE: `defaultVersion` marks the build Amazon EKS installs for a Kubernetes
 // version when the caller names none — the NEWEST published build that supports
-// it — so a superseded build is the default for no version, and the install
-// resolves the same build the catalog marks.
+// it — so a build is the default exactly for the versions no newer build of the
+// same add-on supports, and the install resolves the build the catalog marks.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -330,16 +369,29 @@ async fn the_newest_published_build_is_the_default_for_every_version_it_supports
 
     for addon in &catalog {
         let addon_name = string_member(addon, "addonName");
-        for (position, build) in versions_of(addon).iter().enumerate() {
-            let case = format!("{addon_name}/{}", string_member(build, "addonVersion"));
-            let expected = position == 0;
-            let flags = default_flags(build);
-            assert!(
-                flags.iter().all(|flag| *flag == expected),
-                "case {case}: expected defaultVersion {expected} for every version {} \
-                 build supports, got {flags:?}",
-                if expected { "the newest" } else { "a superseded" }
-            );
+        let builds = versions_of(addon);
+        // The newest build that supports each version the add-on is offered for:
+        // the builds are reported newest first, so the first one to claim a
+        // version is that version's default.
+        let mut default_for: BTreeMap<String, String> = BTreeMap::new();
+        for build in &builds {
+            let version = string_member(build, "addonVersion");
+            for minor in supported_minors(build) {
+                default_for.entry(minor).or_insert_with(|| version.clone());
+            }
+        }
+        for build in &builds {
+            let version = string_member(build, "addonVersion");
+            let case = format!("{addon_name}/{version}");
+            for (minor, flag) in supported_minors(build).iter().zip(default_flags(build)) {
+                let expected = default_for.get(minor) == Some(&version);
+                assert_eq!(
+                    flag, expected,
+                    "case {case} on {minor}: expected defaultVersion {expected} — the newest build \
+                     supporting {minor} is {:?}",
+                    default_for.get(minor)
+                );
+            }
         }
     }
 
@@ -375,7 +427,7 @@ async fn the_newest_published_build_is_the_default_for_every_version_it_supports
     // catalog marks for the cluster's Kubernetes version, and reads back at it.
     let version = default_cluster_version(&router).await;
     active_cluster(&router, "default build", "catalog-default").await;
-    for addon_name in ["vpc-cni", "accuknox_kubearmor"] {
+    for addon_name in ["vpc-cni", "datadog_operator"] {
         let answer =
             describe_addon_versions(&router, &format!("addonName={addon_name}&kubernetesVersion={version}"))
                 .await;

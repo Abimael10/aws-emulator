@@ -170,8 +170,11 @@ async fn an_unsubscribed_marketplace_addon_is_installed_in_create_failed() {
             extra: serde_json::json!({ "tags": { "team": "platform" } }),
         },
         Case {
+            // A vendor product whose published build line still reaches this
+            // cluster's Kubernetes version: a listing whose line has ended is
+            // offered to it under no name at all, so it is no row for an install.
             case: "a vendor product that is no rebuild, with a namespace override",
-            addon: "accuknox_kubearmor",
+            addon: "kubecost_kubecost",
             extra: serde_json::json!({ "namespaceConfig": { "namespace": "vendor-system" } }),
         },
         Case {

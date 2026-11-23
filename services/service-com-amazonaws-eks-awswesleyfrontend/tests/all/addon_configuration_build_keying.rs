@@ -76,16 +76,20 @@ const MOVED: MovedKey = MovedKey {
     moved_in: (2, 0, 0),
 };
 
-/// The releases from which the EFS CSI driver's builds publish a pod-identity
-/// recommendation for each of the service accounts it runs as.
+/// The release from which the EFS CSI driver's builds publish a pod-identity
+/// recommendation, and how many service accounts the driver runs as.
 ///
-/// SOURCE: the minimum add-on version the Amazon EKS User Guide publishes for each
-/// component of that add-on that supports EKS Pod Identity — the external authority
-/// this expectation is taken from, not the catalog under test.
+/// SOURCE: the minimum add-on version the Amazon EKS User Guide publishes for the
+/// add-on — ONE per add-on, so a build at or above it publishes an entry for every
+/// service account the add-on runs as and an older build publishes none — the
+/// external authority this expectation is taken from, not the catalog under test.
 /// `addon_pod_identity_catalog.rs` asserts WHICH accounts each build publishes;
-/// here how many of them it publishes is one half of what makes two builds' answers
-/// differ.
-const POD_IDENTITY_FROM: &[(u32, u32, u32)] = &[(2, 0, 7), (2, 1, 0)];
+/// here how many of them it publishes is one half of what makes two builds'
+/// answers differ.
+const POD_IDENTITY_FROM: (u32, u32, u32) = (2, 0, 7);
+
+/// See [`POD_IDENTITY_FROM`]: both of the driver's components call Amazon EFS.
+const POD_IDENTITY_ACCOUNTS: usize = 2;
 
 /// The `(major, minor, patch)` release a `vX.Y.Z-eksbuild.N` add-on version names,
 /// which is what orders one add-on's builds.
@@ -251,10 +255,11 @@ fn published_surface(addon_name: &str, addon_version: &str) -> PublishedSurface 
         return (None, 0);
     }
     let release = release_of(addon_version);
-    let accounts = POD_IDENTITY_FROM
-        .iter()
-        .filter(|first_build| release >= **first_build)
-        .count();
+    let accounts = if release >= POD_IDENTITY_FROM {
+        POD_IDENTITY_ACCOUNTS
+    } else {
+        0
+    };
     (MOVED.declared_in(release), accounts)
 }
 

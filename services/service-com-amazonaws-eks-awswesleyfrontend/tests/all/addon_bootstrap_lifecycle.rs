@@ -45,7 +45,7 @@ use service_com_amazonaws_eks_awswesleyfrontend::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::addon_deletion::delete_addon;
-use crate::addon_lifecycle::{create_addon, describe_addon};
+use crate::addon_lifecycle::{create_addon, default_cluster_version, describe_addon};
 use crate::addon_versions::describe_addon_versions;
 use crate::wire::{call, emulator, encode_label, error_code, Answer};
 
@@ -150,12 +150,26 @@ fn health_issues(addon: &serde_json::Value) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Every add-on name the catalog publishes with the given owner, read out of the
-/// catalog itself (`DescribeAddonVersions$owners`) rather than written here.
-async fn published_with_owner(router: &MultiServiceRouter, owner: &str) -> Vec<String> {
+/// Every add-on name the catalog publishes with the given owner FOR one
+/// Kubernetes version, read out of the catalog itself
+/// (`DescribeAddonVersions$owners` and `$kubernetesVersion`) rather than written
+/// here.
+///
+/// Both filters are asked for because every row below installs the add-on on a
+/// cluster of that version: an add-on whose published build line stops at an
+/// older Kubernetes version is offered to such a cluster under no name at all.
+async fn published_with_owner(
+    router: &MultiServiceRouter,
+    owner: &str,
+    kubernetes_version: &str,
+) -> Vec<String> {
     let answer = describe_addon_versions(
         router,
-        &format!("owners={}&maxResults=100", encode_label(owner)),
+        &format!(
+            "owners={}&kubernetesVersion={}&maxResults=100",
+            encode_label(owner),
+            encode_label(kubernetes_version)
+        ),
     )
     .await;
     assert_eq!(
@@ -464,7 +478,8 @@ async fn a_configuration_document_is_read_in_either_format_and_held_to_the_schem
 
     // Every row installs a DIFFERENT add-on, because one name installs at most
     // once per cluster and an accepted row writes a record.
-    let published = published_with_owner(&router, "aws").await;
+    let published =
+        published_with_owner(&router, "aws", &default_cluster_version(&router).await).await;
     assert!(
         published.len() >= rows.len(),
         "setup: the catalog must publish at least {} Amazon EKS add-ons, got {}",
@@ -596,7 +611,12 @@ async fn a_marketplace_addon_settles_create_failed_for_want_of_a_subscription() 
     // The rows are EVERY add-on the catalog publishes as owned by the Marketplace
     // (`DescribeAddonVersions$owners`), so the rule is asserted over the whole
     // class rather than over one listing.
-    let marketplace = published_with_owner(&router, ADDON_OWNER_MARKETPLACE).await;
+    let marketplace = published_with_owner(
+        &router,
+        ADDON_OWNER_MARKETPLACE,
+        &default_cluster_version(&router).await,
+    )
+    .await;
     assert!(
         !marketplace.is_empty(),
         "setup: the catalog must publish at least one Marketplace add-on"

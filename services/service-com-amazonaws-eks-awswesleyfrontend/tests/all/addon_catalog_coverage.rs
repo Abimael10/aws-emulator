@@ -38,7 +38,7 @@ use crate::addon_catalog_publication::PUBLISHED_ADDONS;
 use crate::addon_lifecycle::{create_addon, describe_addon};
 use crate::addon_versions::{
     active_cluster, addons, compatibilities_of, describe_addon_versions, string_member,
-    versions_of, whole_catalog,
+    versions_of,
 };
 use crate::cluster_lifecycle::REGION;
 use crate::cluster_versions::version_key;
@@ -128,12 +128,22 @@ async fn standard_support_versions(router: &MultiServiceRouter) -> BTreeSet<Stri
     versions
 }
 
-/// The newest Kubernetes version in standard support that EVERY published add-on
-/// supports — the version a client picks when one cluster must take several
-/// add-ons.
-async fn version_every_addon_supports(router: &MultiServiceRouter) -> String {
+/// The newest Kubernetes version in standard support that every one of the
+/// `addon_names` supports — the version a client picks when one cluster must take
+/// several add-ons.
+///
+/// It is asked of the named add-ons rather than of the whole catalog because an
+/// add-on is offered only on the Kubernetes versions its publisher has published a
+/// build for: an add-on whose published line stops at an older version supports no
+/// version in standard support at all, so no version could satisfy the whole
+/// publication.
+async fn version_every_addon_supports(
+    router: &MultiServiceRouter,
+    addon_names: &[&str],
+) -> String {
     let mut shared = standard_support_versions(router).await;
-    for addon in addons(&whole_catalog(router).await) {
+    for addon_name in addon_names {
+        let addon = published_addon(router, addon_name, None).await;
         shared = shared
             .intersection(&supported_cluster_versions(&addon))
             .cloned()
@@ -142,7 +152,7 @@ async fn version_every_addon_supports(router: &MultiServiceRouter) -> String {
     let mut candidates: Vec<String> = shared.into_iter().collect();
     candidates.sort_by_key(|version| version_key(version));
     candidates.pop().unwrap_or_else(|| {
-        panic!("no Kubernetes version in standard support is supported by the whole catalog")
+        panic!("no Kubernetes version in standard support is supported by {addon_names:?}")
     })
 }
 
@@ -248,9 +258,6 @@ async fn every_published_addon_names_one_default_build_per_cluster_version() {
 #[tokio::test]
 async fn a_published_addon_installs_at_the_catalog_default_for_the_cluster_version() {
     let router = emulator();
-    let cluster_version = version_every_addon_supports(&router).await;
-    active_cluster(&router, "catalog-install", &cluster_version).await;
-
     let cases = [
         "cert-manager",
         "amazon-sagemaker-hyperpod-training-operator",
@@ -259,6 +266,9 @@ async fn a_published_addon_installs_at_the_catalog_default_for_the_cluster_versi
         "prometheus-node-exporter",
         "vpc-cni",
     ];
+    let cluster_version = version_every_addon_supports(&router, &cases).await;
+    active_cluster(&router, "catalog-install", &cluster_version).await;
+
     for addon_name in cases {
         let (_, default_namespace, _) = PUBLISHED_ADDONS
             .iter()
@@ -324,14 +334,16 @@ async fn a_published_addon_installs_at_the_catalog_default_for_the_cluster_versi
 #[tokio::test]
 async fn a_requested_namespace_overrides_the_catalog_default() {
     let router = emulator();
-    let cluster_version = version_every_addon_supports(&router).await;
-    active_cluster(&router, "namespace-override", &cluster_version).await;
-
-    for (addon_name, requested) in [
+    let cases = [
         ("cert-manager", "certs"),
         ("vpc-cni", "networking"),
         ("amazon-sagemaker-hyperpod-training-operator", "training"),
-    ] {
+    ];
+    let named: Vec<&str> = cases.iter().map(|(addon_name, _)| *addon_name).collect();
+    let cluster_version = version_every_addon_supports(&router, &named).await;
+    active_cluster(&router, "namespace-override", &cluster_version).await;
+
+    for (addon_name, requested) in cases {
         let created = create_addon(
             &router,
             "namespace-override",

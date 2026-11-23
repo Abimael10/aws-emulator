@@ -874,18 +874,43 @@ pub(crate) async fn published_calendar_rows(
         .clone()
 }
 
-/// Every add-on name the catalog publishes, in the order it publishes them — the
-/// names `CreateAddon` installs, read out of the catalog itself so a suite that
-/// needs several distinct add-ons names no constant.
+/// Every add-on name the catalog publishes, in the order it publishes them — read
+/// out of the catalog itself so a suite that needs several distinct add-ons names
+/// no constant.
+///
+/// The WHOLE publication, including an add-on whose published build line stops at
+/// an older Kubernetes version; [`installable_addon_names`] is the subset a
+/// cluster of one version can install.
 pub(crate) async fn published_addon_names(router: &MultiServiceRouter) -> Vec<String> {
-    let answer = call(
+    addon_names_listed(router, "/addons/supported-versions?maxResults=100").await
+}
+
+/// Every add-on name the catalog publishes FOR one Kubernetes version — the names
+/// `CreateAddon` installs on a cluster running it ("The name must match one of the
+/// names returned by `DescribeAddonVersions`").
+///
+/// The listing is filtered to that version because an add-on is installable only
+/// where its publisher has published a build: an add-on whose published line stops
+/// at an older Kubernetes version is still published, with the builds it has, and
+/// is not one a cluster on a newer version can install.
+pub(crate) async fn installable_addon_names(
+    router: &MultiServiceRouter,
+    kubernetes_version: &str,
+) -> Vec<String> {
+    addon_names_listed(
         router,
-        REGION,
-        "GET",
-        "/addons/supported-versions?maxResults=100",
-        "",
+        &format!(
+            "/addons/supported-versions?maxResults=100&kubernetesVersion={}",
+            encode_label(kubernetes_version)
+        ),
     )
-    .await;
+    .await
+}
+
+/// The add-on names one `DescribeAddonVersions` listing reports, in the order it
+/// reports them.
+async fn addon_names_listed(router: &MultiServiceRouter, path: &str) -> Vec<String> {
+    let answer = call(router, REGION, "GET", path, "").await;
     assert_eq!(
         answer.status, 200,
         "setup DescribeAddonVersions: got {answer:?}"
@@ -1049,8 +1074,9 @@ async fn a_retry_with_the_same_idempotency_token_is_absorbed() {
         .collect();
 
     // One add-on name installs at most once per cluster, so each row drives a
-    // DIFFERENT add-on of the published catalog.
-    let published = published_addon_names(&router).await;
+    // DIFFERENT add-on of the catalog's publication for this cluster's version.
+    let published =
+        installable_addon_names(&router, &default_cluster_version(&router).await).await;
     assert!(
         published.len() >= expanded.len(),
         "setup: the catalog must publish at least {} add-ons, got {}",
@@ -1292,7 +1318,8 @@ async fn a_cluster_holds_exactly_the_addons_the_catalog_publishes_for_it() {
     // What bounds this part of the store: the catalog, which is a fixed table, so
     // one cluster can hold no more add-ons than it publishes — well inside the
     // ceiling `CreateAddon` keeps as its backstop.
-    let published = published_addon_names(&router).await;
+    let published =
+        installable_addon_names(&router, &default_cluster_version(&router).await).await;
     assert!(
         !published.is_empty() && published.len() <= MAX_ADDONS_PER_CLUSTER,
         "setup: the catalog must publish between one and {MAX_ADDONS_PER_CLUSTER} add-ons, \

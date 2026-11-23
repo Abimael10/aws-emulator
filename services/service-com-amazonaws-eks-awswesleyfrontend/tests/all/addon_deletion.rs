@@ -25,7 +25,8 @@ use service_com_amazonaws_eks_awswesleyfrontend::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::addon_lifecycle::{
-    create_addon, describe_addon, describe_association, published_addon_names,
+    create_addon, default_cluster_version, describe_addon, describe_association,
+    installable_addon_names,
 };
 use crate::cluster_lifecycle::{create as create_cluster, minimal_request, REGION};
 use crate::wire::{call, emulator, encode_label, error_code, Answer};
@@ -343,8 +344,9 @@ async fn preserve_decides_whether_the_associations_the_addon_owns_go_with_it() {
     ];
 
     // One add-on name installs at most once per cluster, so each row drives a
-    // DIFFERENT add-on of the published catalog.
-    let published = published_addon_names(&router).await;
+    // DIFFERENT add-on of the catalog's publication for this cluster's version.
+    let published =
+        installable_addon_names(&router, &default_cluster_version(&router).await).await;
     assert!(
         published.len() >= preserve_cases.len() * 2,
         "setup: the catalog must publish at least {} add-ons, got {}",
