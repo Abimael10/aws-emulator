@@ -2222,7 +2222,11 @@ pub fn budget_body_invalid(findings: &[BudgetFinding]) -> crate::ops::types::Val
     }
 }
 
-/// One page of a sorted key list, plus the token the next page starts at.
+/// One page of a key list, plus the token the next page starts at.
+///
+/// The list is in whatever order its caller reports its resources in — sorted, or the order
+/// the resource itself is stored in — and only has to be the SAME order on every call, which
+/// is what makes a token name one place in it.
 ///
 /// `next_token` is the key the page starts at (the token a previous page handed back);
 /// an unknown token is a client error, so this answers `Err(message)` for it.

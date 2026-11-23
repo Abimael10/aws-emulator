@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSteps
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSteps`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSteps::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the steps a job holds — the work its template declared — a page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +152,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSteps` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListStepsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSteps"))
+        // A report: the only writes it makes are the status moves the clock already made
+        // due on the job whose steps it reports (see `crate::state::Job::settle`).
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListStepsErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // A step is reached only through its own job, its queue and its farm, so each level
+        // this store does not hold is reported as that level.
+        if store.farm(&input.farm_id).is_none() {
+            return Err(ListStepsErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+            )
+            .into());
+        }
+        if store.queue(&input.farm_id, &input.queue_id).is_none() {
+            return Err(ListStepsErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_QUEUE, &input.queue_id),
+            )
+            .into());
+        }
+        let Some(job) = store.settled_job(&input.farm_id, &input.queue_id, &input.job_id) else {
+            return Err(ListStepsErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_JOB, &input.job_id),
+            )
+            .into());
+        };
+
+        // Declared order: the steps are stored in the order the job's template declared
+        // them, so paging over the list is stable and a page is the slice a token names.
+        let ids: Vec<String> = job.steps.iter().map(|step| step.step_id.clone()).collect();
+        let (page, next_token) =
+            crate::state::page_keys(&ids, input.next_token.as_deref(), input.max_results).map_err(
+                |message| {
+                    ListStepsError::from(ListStepsErrorModeled::ValidationException(
+                        crate::state::field_validation_failed("nextToken", &message),
+                    ))
+                },
+            )?;
+
+        let mut steps = Vec::with_capacity(page.len());
+        for step_id in &page {
+            let Some(step) = job.steps.iter().find(|step| &step.step_id == step_id) else {
+                continue;
+            };
+            steps.push(StepSummary {
+                step_id: step.step_id.clone(),
+                name: step.name.clone(),
+                lifecycle_status: step.lifecycle_status.clone(),
+                // Nothing moves a step's lifecycle once its job has been assembled, so
+                // there is no move for a message to describe.
+                lifecycle_status_message: None,
+                // The run this step's own tasks are in, and the counts of what they carry.
+                task_run_status: step.run_status(&job.task_run_status),
+                task_run_status_counts: step.task_run_status_counts(),
+                task_failure_retry_count: step.task_failure_retry_count(),
+                // A step carries no target of its own: what the service is working its
+                // tasks towards is the job's target, reported only while the job's
+                // lifecycle says that work is in progress — the rule `get_job` and
+                // `list_jobs` report it by.
+                target_task_run_status: job.reported_target_task_run_status(),
+                // The steps are minted when the job is created, by the call that created
+                // it, so that call is what created them.
+                created_at: crate::state::timestamp(job.created_at),
+                created_by: job.created_by.clone(),
+                updated_at: step.updated_at().map(crate::state::timestamp),
+                // When a step last changed is known; which principal changed it is not.
+                // Nothing in this store records one: a worker's report of what it did with
+                // a task carries no principal, and no call updates a step itself.
+                updated_by: None,
+                started_at: step.started_at().map(crate::state::timestamp),
+                ended_at: step.ended_at().map(crate::state::timestamp),
+                // Nothing in this store holds a dependency between steps, so there is no
+                // resolved or unresolved count to report.
+                dependency_counts: None,
+            });
+        }
+
+        Ok(ListStepsOutput { steps, next_token })
     }
 }

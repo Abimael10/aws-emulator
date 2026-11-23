@@ -122,6 +122,66 @@ pub struct Step {
     pub tasks: Vec<Task>,
 }
 
+impl Step {
+    /// The run status this step reports: what its own tasks have settled to.
+    ///
+    /// A step aggregates exactly as a job does — the same rule over a narrower set of tasks
+    /// (see [`aggregate_run_status`]) — but carries no failure budget of its own: the budget
+    /// `maxFailedTasksCount` states is the JOB's, so only the job applies it.
+    ///
+    /// `job_run_status` is what the job itself has settled to, which is what a step this
+    /// emulator read no task out of the template for reports: such a step has nothing to
+    /// aggregate, and the modeled member is required.
+    pub fn run_status(&self, job_run_status: &str) -> String {
+        let tasks: Vec<&Task> = self.tasks.iter().collect();
+        aggregate_run_status(&tasks).unwrap_or_else(|| job_run_status.to_string())
+    }
+
+    /// How many of this step's tasks carry each run status, empty for a step that holds no
+    /// task.
+    pub fn task_run_status_counts(&self) -> HashMap<String, i32> {
+        let mut counts: HashMap<String, i32> = HashMap::new();
+        for task in &self.tasks {
+            *counts.entry(task.run_status.clone()).or_default() += 1;
+        }
+        counts
+    }
+
+    /// How many times a run of one of this step's tasks has failed and been re-queued.
+    ///
+    /// Absent for a step that holds no task, which has no run to count retries of — the
+    /// same rule [`Job::task_failure_retry_count`] applies to a job that holds no step.
+    pub fn task_failure_retry_count(&self) -> Option<i32> {
+        (!self.tasks.is_empty()).then(|| {
+            self.tasks
+                .iter()
+                .map(|task| task.failure_retry_count)
+                .fold(0, i32::saturating_add)
+        })
+    }
+
+    /// When the first of this step's tasks started running, or `None` while none has: the
+    /// step's run started when its earliest task's did.
+    pub fn started_at(&self) -> Option<SystemTime> {
+        self.tasks.iter().filter_map(|task| task.started_at).min()
+    }
+
+    /// When this step's run ended: the last of its tasks to finish, reported only once
+    /// every one of them has, since a step with a task still to run has not ended.
+    pub fn ended_at(&self) -> Option<SystemTime> {
+        if !self.tasks.iter().all(Task::terminal) {
+            return None;
+        }
+        self.tasks.iter().filter_map(|task| task.ended_at).max()
+    }
+
+    /// When something last changed one of this step's tasks, which is when the step itself
+    /// last changed.
+    pub fn updated_at(&self) -> Option<SystemTime> {
+        self.tasks.iter().filter_map(|task| task.updated_at).max()
+    }
+}
+
 /// What one task costs the budgets that bound this store's work, beside its parameters: a
 /// flat figure for its id and its record, so a task that carries no parameter costs
 /// something too.
