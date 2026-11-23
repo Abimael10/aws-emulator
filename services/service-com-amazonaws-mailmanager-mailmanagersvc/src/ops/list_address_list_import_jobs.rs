@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAddressListImportJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAddressListImportJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAddressListImportJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the import jobs stored against one address list, in pages: the jobs are walked
+//! in one stable order, at most `PageSize` of them are reported and a `NextToken` is
+//! issued only while a further page exists. The parent is resolved FIRST, so an
+//! `AddressListId` naming no stored list is refused with the modelled
+//! `ResourceNotFoundException`, worded by `crate::state::address_list_not_found_message`
+//! at `crate::state::ADDRESS_LIST_LOOKUP_STATUS`, exactly as every other address-list
+//! lookup miss of this service is — including a list `DeleteAddressList` has removed,
+//! whose jobs stay stored under their own `JobId` and are reachable through no listing.
 //!
 //! ## Shape of an operation
 //!
@@ -116,6 +116,49 @@ impl From<ListAddressListImportJobsErrorModeled> for ListAddressListImportJobsEr
     }
 }
 
+/// The page size `ListAddressListImportJobs` uses when the caller names none: the maximum
+/// the model's `PageSize` range allows
+/// (`smithy_query(query="operation",operation="ListAddressListImportJobs")` reports
+/// `range {min: 1, max: 50}`), which is how every paginated read of this service answers a
+/// request that states no size.
+const MAX_PAGE_SIZE: i32 = 50;
+
+/// The walk a continuation token of this listing belongs to: the address list whose import
+/// jobs are being walked, ahead of the position itself.
+///
+/// A token continues ONE walk, so the position it carries travels with the walk it was
+/// issued for: a token this store minted for another address list's jobs, or for another
+/// listing of the same list (`ListMembersOfAddressList` walks its members), names no
+/// position here. The leading marker is what separates those walks, and `AddressListId` is
+/// `@pattern ^[a-zA-Z0-9-]+$` — no id can carry the `:` the marker ends with or the `\u{1f}`
+/// that closes the scope, so the boundary between the scope and the position is
+/// unambiguous.
+fn page_scope(address_list_id: &str) -> String {
+    format!("import-jobs:{address_list_id}\u{1f}")
+}
+
+/// The `ImportJob` summary a listing reports for one stored job: every member read off the
+/// record, so a job reported here carries the same values `GetAddressListImportJob` reads
+/// back for it.
+fn import_job_summary(record: &crate::state::ImportJobRecord) -> ImportJob {
+    ImportJob {
+        job_id: record.job_id.clone(),
+        name: record.name.clone(),
+        status: record.status.clone(),
+        pre_signed_url: record.pre_signed_url.clone(),
+        imported_items_count: record.imported_items_count,
+        failed_items_count: record.failed_items_count,
+        import_data_format: ImportDataFormat {
+            import_data_type: record.import_data_type.clone(),
+        },
+        address_list_id: record.address_list_id.clone(),
+        created_timestamp: crate::state::timestamp(record.created_at_millis),
+        start_timestamp: record.started_at_millis.map(crate::state::timestamp),
+        completed_timestamp: record.completed_at_millis.map(crate::state::timestamp),
+        error: record.error.clone(),
+    }
+}
+
 /// The `ListAddressListImportJobs` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -152,18 +195,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAddressListImportJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAddressListImportJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAddressListImportJobs"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in this emulator: the service is always mounted on the shared
+            // `InMemoryEngine`. Answered with a modelled retryable error rather than a
+            // 501, which would claim the operation is unwritten.
+            return Err(ListAddressListImportJobsErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `PageSize` is modelled `range(1..50)`, so the boundary validator is the
+        // enforcement point and has already refused anything outside it; the modelled
+        // maximum stands in when the caller names none. The clamp is belt-and-braces for
+        // that unreachable case, so a page can never be zero-sized (an empty page carrying
+        // a `NextToken` would make a paging caller loop forever).
+        let requested = input
+            .page_size
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+        let page_size = usize::try_from(requested).unwrap_or(1);
+
+        // `@readonly`: this handler only reports what is stored. An import job advances
+        // when an import runs, not when it is listed, so there is no transition the clock
+        // owes one here.
+        let store = state.lock();
+
+        // The jobs belong to the address list they were created for, so the parent is
+        // resolved first: a list that is not stored — never created, or removed by
+        // `DeleteAddressList` — has no listing to report, and the modelled
+        // `ResourceNotFoundException` says so in the wording and at the status every
+        // address-list lookup miss of this service carries.
+        if !store.address_lists.contains_key(&input.address_list_id) {
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                ListAddressListImportJobsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::address_list_not_found_message(
+                            &input.address_list_id,
+                        )),
+                    },
+                ),
+                crate::state::ADDRESS_LIST_LOOKUP_STATUS,
+            ));
+        }
+
+        let scope = page_scope(&input.address_list_id);
+
+        // A `NextToken` is this operation's own output, so only a value THIS store minted
+        // for THIS walk names a position in it. Anything else — a token from another
+        // emulator run, one issued for another walk, one a caller built — is refused with
+        // the modelled `ValidationException` rather than answered with a plausible page the
+        // caller never asked for.
+        let resume_from = match input.next_token.as_deref() {
+            None => String::new(),
+            Some(token) => {
+                let Some(resume) = crate::state::decode_page_token(&store.page_token_key, token)
+                    .and_then(|cursor| cursor.strip_prefix(&scope).map(str::to_string))
+                else {
+                    return Err(ListAddressListImportJobsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some("NextToken is not a valid pagination token.".to_string()),
+                        },
+                    )
+                    .into());
+                };
+                resume
+            }
+        };
+
+        // The import jobs are keyed by `JobId` in a `BTreeMap`, so this walk is in one
+        // stable order and the position a token carries is simply the id to resume at — the
+        // range starts directly at that key rather than rescanning from the front. One
+        // extra job is taken to decide whether a further page exists, and is not reported.
+        // A list on which no import job has been created yields an EMPTY list, which is what
+        // a listing of zero items is: a success, and `ImportJobs` is a required member.
+        let mut page: Vec<&crate::state::ImportJobRecord> = store
+            .import_jobs
+            .range(resume_from..)
+            .map(|(_, job)| job)
+            .filter(|job| job.address_list_id == input.address_list_id)
+            .take(page_size.saturating_add(1))
+            .collect();
+
+        let next_token = page.get(page_size).map(|job| {
+            crate::state::encode_page_token(&store.page_token_key, &format!("{scope}{}", job.job_id))
+        });
+        page.truncate(page_size);
+
+        Ok(ListAddressListImportJobsOutput {
+            import_jobs: page.into_iter().map(import_job_summary).collect(),
+            next_token,
+        })
     }
 }
