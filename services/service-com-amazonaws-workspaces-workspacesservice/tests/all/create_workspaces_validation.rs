@@ -241,14 +241,14 @@ async fn every_batch_element_is_judged_on_its_own_against_persisted_state() {
         ),
         (
             // Neither resolves: the entry has two failures to report and one
-            // `ErrorCode`, so it reports the first of them in the model's own member
-            // order (`WorkspaceRequest` declares `DirectoryId` before `BundleId`).
+            // `ErrorCode`, and the bundle is resolved in preference to the directory, so
+            // it is reported against the bundle.
             json!({
                 "DirectoryId": "wsd-unregistered1",
                 "UserName": "dan",
                 "BundleId": "wsb-00000000",
             }),
-            Expected::Refused("ResourceNotFound.Directory"),
+            Expected::Refused("ResourceNotFound.Bundle"),
         ),
         (
             // The same directory user as the first row (the model's `UserName` doc says

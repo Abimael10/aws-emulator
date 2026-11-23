@@ -21,10 +21,10 @@
 //! 2. A per-element refusal names the resource that actually failed to resolve:
 //!    `ResourceNotFound.Bundle` for a `BundleId` the store does not hold and
 //!    `ResourceNotFound.Directory` for a `DirectoryId` no `RegisterWorkspaceDirectory`
-//!    registered, each beside the fixed sentence AWS answers for that class. An element
-//!    with BOTH unresolvable has two failures and one `ErrorCode`, and reports the first
-//!    in the model's own member order (`WorkspaceRequest` declares `DirectoryId` before
-//!    `BundleId`).
+//!    registered, each beside the fixed sentence AWS answers for that class. The bundle is
+//!    resolved in PREFERENCE to the directory, so an element whose `BundleId` names no
+//!    stored bundle is reported against the BUNDLE whatever its `DirectoryId` resolves to,
+//!    and the directory class is reported only for an element whose bundle resolved.
 //!
 //! The property values the rows carry come from the model: the `RunningMode` values from
 //! `RUNNING_MODE_VALUES` (the `RunningMode` enum), the compute names from
@@ -402,11 +402,18 @@ async fn a_refusal_names_the_resource_that_failed_to_resolve() {
             Some("ResourceNotFound.Directory"),
         ),
         (
-            // Two failures, one `ErrorCode`: the first in the model's member order.
+            // Two failures to report and one `ErrorCode`: the bundle is resolved in
+            // preference to the directory, so the element is reported against the bundle.
             "neither resolves",
             UNREGISTERED_DIRECTORY,
             &shortest_unheld,
-            Some("ResourceNotFound.Directory"),
+            Some("ResourceNotFound.Bundle"),
+        ),
+        (
+            "neither resolves, longest unheld bundle id",
+            UNREGISTERED_DIRECTORY,
+            &longest_unheld,
+            Some("ResourceNotFound.Bundle"),
         ),
     ];
 
