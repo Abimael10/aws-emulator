@@ -1775,6 +1775,12 @@ pub mod name_conflicts;
 /// exactly as it does for the record it is about.
 pub mod ec2_vpc_placement;
 mod harnesses;
+/// The tags a resource of this service carries: where the tag plane reads and
+/// writes them — the `tags` map on the resource's own record — and the
+/// resolution of the ARN a tag request addresses a resource by. Re-exported, so
+/// a handler names `crate::state::…` for it exactly as it does for the records
+/// themselves.
+pub mod tags;
 pub use ec2_vpc_placement::*;
 pub use harnesses::*;
 pub use name_conflicts::*;
@@ -1804,6 +1810,7 @@ pub use policies::*;
 pub use registry_entitlement::*;
 pub use resource_policies::*;
 pub use runtime_logs::*;
+pub use tags::*;
 
 /// The AgentCore Runtime environment a harness runs in, for a harness whose id
 /// is `harness_id` in `region`.

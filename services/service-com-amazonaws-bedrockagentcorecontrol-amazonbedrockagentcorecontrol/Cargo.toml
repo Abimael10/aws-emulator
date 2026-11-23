@@ -93,6 +93,9 @@ service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 # Generates the credential-provider names the API-key-credential-provider deletion
 # suite drives its idempotence property over, from a seed it reports.
 rand = "0.9"
+# Percent-encodes the ARN a tag suite carries in the `@httpLabel` of `/tags/{resourceArn}`
+# and the keys it carries on `UntagResource`'s query string.
+percent-encoding = "2"
 
 [lints]
 workspace = true
