@@ -91,8 +91,8 @@ struct MergeCase {
 /// RULE: `TagUser` merges its tags into the user's stored set — a held key is
 /// overwritten, a new key is added — and `GetUser` reports exactly that merged set.
 /// One row per thing the rule generalises over: the held tag count, the number of
-/// calls, new versus held keys, the case of a key, a key repeated inside one
-/// request, the user's path, and the published length bounds of `tagKeyType` and
+/// calls, new versus held keys, the case of a key, a key named again by a later
+/// call, the user's path, and the published length bounds of `tagKeyType` and
 /// `tagValueType`.
 #[tokio::test]
 async fn tag_user_merges_its_tags_into_the_stored_set() {

@@ -36,7 +36,8 @@ use service_com_amazonaws_iam_awsidentitymanagementv20100508::state;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::open_id_connect_providers::{
-    client_ids, expected_arn, issuer_of, list_members, tagging_absence_message, thumbprint,
+    client_ids, expected_arn, expected_thumbprints, issuer_of, list_members,
+    tagging_absence_message, thumbprint,
 };
 use crate::role_lifecycle::{borrowed, param, reported_tags};
 use crate::saml_provider_listing::split_element;
@@ -244,7 +245,8 @@ async fn assert_reads_back(router: &MultiServiceRouter, case: &DeletionCase, arn
     );
     let reported_thumbprints = list_members(&read, "ThumbprintList");
     assert_eq!(
-        reported_thumbprints, case.thumbprints,
+        reported_thumbprints,
+        expected_thumbprints(&case.url, &case.thumbprints),
         "case {:?}: deleting another provider must leave the held thumbprints alone, got \
          {reported_thumbprints:?}",
         case.url

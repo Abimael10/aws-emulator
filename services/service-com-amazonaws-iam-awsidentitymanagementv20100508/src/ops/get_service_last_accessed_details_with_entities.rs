@@ -425,7 +425,9 @@ fn associated_entities(
         if store
             .role_attached_policies
             .get(role_key)
-            .is_some_and(|attached| attached.contains(arn))
+            // Which policy an attachment names is the one question every reader of a
+            // `PolicyArn` asks (`crate::state::holds_policy_arn`).
+            .is_some_and(|attached| crate::state::holds_policy_arn(attached, arn))
         {
             found.insert(
                 crate::state::entity_page_key(crate::state::ENTITY_KEY_TAG_ROLE, role_key),
@@ -437,12 +439,12 @@ fn associated_entities(
         let attached = store
             .user_attached_policies
             .get(user_key)
-            .is_some_and(|attached| attached.contains(arn));
+            .is_some_and(|attached| crate::state::holds_policy_arn(attached, arn));
         let through_group = store.group_keys_held_by(user_key).any(|group_key| {
             store
                 .group_attached_policies
                 .get(group_key)
-                .is_some_and(|attached| attached.contains(arn))
+                .is_some_and(|attached| crate::state::holds_policy_arn(attached, arn))
         });
         if attached || through_group {
             collect_user(&mut found, store, user_key);

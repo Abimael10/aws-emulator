@@ -313,9 +313,11 @@ async fn the_policy_is_addressed_by_its_own_arn() {
         );
     }
 
-    // An ARN in the account's own namespace that names no held policy: another name,
-    // the held name under another path, and the held name in another case — a policy's
-    // ARN is the identifier, so a different spelling of it names a different policy.
+    // An ARN in the account's own namespace that names no held policy: another name, and
+    // the held name under another path — a policy's ARN is the identifier, so a different
+    // PATH names a different policy. The held name in another CASE is not among them: IAM
+    // entity names "are not distinguished by case", so it names the held policy (asserted
+    // in `tests/all/policy_arn_name_case_resolution.rs`).
     for (case, arn) in [
         ("another name at the root", account_policy_arn("/", "absent")),
         ("the held name at the root", account_policy_arn("/", "held")),
@@ -324,7 +326,6 @@ async fn the_policy_is_addressed_by_its_own_arn() {
             account_policy_arn("/elsewhere/", "held"),
         ),
         ("a name under a nested path", account_policy_arn("/a/b/c/", "absent")),
-        ("the held ARN in another case", account_policy_arn("/held/", "HELD")),
     ] {
         let (status, body) = tag_policy(&router, &arn, &tags(&[("env", "prod")])).await;
         assert_eq!(

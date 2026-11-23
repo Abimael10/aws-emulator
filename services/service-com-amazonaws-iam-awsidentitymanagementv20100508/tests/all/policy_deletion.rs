@@ -174,9 +174,10 @@ async fn deleting_a_policy_releases_that_policy_and_leaves_the_others() {
 /// same resolution a read of that ARN performs.
 ///
 /// The rows are managed-policy ARNs the account does not hold: an unrelated name, a
-/// near-miss of a held name, the held name under another path, the held name in
-/// another account, and the held name in another case (an ARN is matched exactly,
-/// unlike the entity name a request names directly).
+/// near-miss of a held name, the held name under another path, and the held name in
+/// another account. The held name in another CASE is not among them: IAM entity names
+/// "are not distinguished by case", so such an ARN names the held policy (asserted in
+/// `tests/all/policy_arn_name_case_resolution.rs`).
 #[tokio::test]
 async fn deleting_an_arn_the_account_holds_no_policy_under_is_not_found() {
     let router = router();
@@ -193,7 +194,6 @@ async fn deleting_an_arn_the_account_holds_no_policy_under_is_not_found() {
         customer_policy_arn("/", "helds"),
         customer_policy_arn("/eng/", "held"),
         "arn:aws:iam::210987654321:policy/held".to_string(),
-        customer_policy_arn("/", "HELD"),
     ];
     for candidate in absent {
         // The code and the status are IAM's for this error class whichever operation

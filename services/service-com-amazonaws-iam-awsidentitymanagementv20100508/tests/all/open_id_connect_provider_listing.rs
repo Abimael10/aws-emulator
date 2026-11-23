@@ -27,7 +27,9 @@ use service_com_amazonaws_iam_awsidentitymanagementv20100508::state;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::identity_policy_enforcement::{principal, statement};
-use crate::open_id_connect_providers::{client_ids, expected_arn, issuer_of, list_members, thumbprint};
+use crate::open_id_connect_providers::{
+    client_ids, expected_arn, expected_thumbprints, issuer_of, list_members, thumbprint,
+};
 use crate::role_lifecycle::{borrowed, param};
 use crate::saml_provider_listing::split_element;
 use crate::user_lifecycle::{
@@ -366,7 +368,7 @@ async fn listing_changes_nothing_a_later_caller_sees() {
         );
         assert_eq!(
             list_members(&read, "ThumbprintList"),
-            case.thumbprints,
+            expected_thumbprints(&case.url, &case.thumbprints),
             "case {:?}: a listing must leave the held thumbprints alone, got {read}",
             case.url
         );

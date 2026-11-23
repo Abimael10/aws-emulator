@@ -169,6 +169,26 @@ pub(crate) fn issuer_of(url: &str) -> &str {
         .expect("every fixture URL carries the scheme the model requires")
 }
 
+/// The `ThumbprintList` a provider created for `url` with `requested` must REPORT.
+///
+/// "This parameter is optional. If it is not included, IAM will retrieve and use the top
+/// intermediate certificate authority (CA) thumbprint of the OpenID Connect identity
+/// provider server certificate" (`CreateOpenIDConnectProvider$ThumbprintList`), so a create
+/// naming no thumbprint leaves the provider pinned to the one derived for its issuer, and
+/// a create naming some leaves exactly those. Shared by every suite that round-trips a
+/// provider; the derived value's own FORM and stability are the subject of
+/// `tests/all/open_id_connect_thumbprint_derivation.rs`.
+pub(crate) fn expected_thumbprints(url: &str, requested: &[String]) -> Vec<String> {
+    if requested.is_empty() {
+        return vec![
+            service_com_amazonaws_iam_awsidentitymanagementv20100508::state::derived_open_id_connect_thumbprint(
+                issuer_of(url),
+            ),
+        ];
+    }
+    requested.to_vec()
+}
+
 /// The `<member>` elements of ONE list member of the response.
 ///
 /// `ClientIDList` and `ThumbprintList` both serialize their entries as `<member>`, so a
@@ -270,7 +290,8 @@ async fn a_created_oidc_provider_round_trips_through_get_open_id_connect_provide
         );
         let reported_thumbprints = list_members(&read, "ThumbprintList");
         assert_eq!(
-            reported_thumbprints, case.thumbprints,
+            reported_thumbprints,
+            expected_thumbprints(case.url, &case.thumbprints),
             "case {:?}: the read must report the stored thumbprints in order, got \
              {reported_thumbprints:?}",
             case.url
@@ -420,7 +441,7 @@ async fn a_second_create_for_a_held_url_is_refused_and_changes_nothing() {
         );
         assert_eq!(
             list_members(&read, "ThumbprintList"),
-            case.thumbprints,
+            expected_thumbprints(case.url, &case.thumbprints),
             "case {:?}: a refused create must leave the held thumbprints alone, got {read}",
             case.url
         );
@@ -531,8 +552,9 @@ async fn a_request_past_a_published_per_provider_bound_is_refused() {
             );
             assert_eq!(
                 list_members(&read, "ThumbprintList").len(),
-                thumbprint_count,
-                "case {name:?}: the read must report every stored thumbprint, got {read}"
+                thumbprint_count.max(1),
+                "case {name:?}: the read must report every stored thumbprint \u{2014} the one \
+                 IAM derives when the request named none \u{2014} got {read}"
             );
         } else {
             assert_eq!(

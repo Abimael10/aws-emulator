@@ -24,11 +24,13 @@ use super::*;
 
 /// What IAM answers a request whose tag list names one key more than once with.
 ///
-/// Entirely fixed text: the sentence states the class of malformed list and quotes neither
-/// the repeated key nor either of the values back, so a client matching it reads the same
-/// sentence whichever operation it supplied the list to. The comparison this service makes
-/// keys by is stated on [`has_duplicate_tag_key`].
-pub const DUPLICATE_TAG_KEY_MESSAGE: &str = "Duplicate tag keys found.";
+/// Entirely fixed text, as the recorded refusal carries it: the sentence states the class of
+/// malformed list, follows it with the note AWS adds about how it reads a tag key, and
+/// quotes neither the repeated key nor either of the values back — so a client matching it
+/// reads the same sentence whichever operation it supplied the list to. The comparison this
+/// service makes keys by is stated on [`has_duplicate_tag_key`].
+pub const DUPLICATE_TAG_KEY_MESSAGE: &str =
+    "Duplicate tag keys found. Please note that Tag keys are case insensitive.";
 
 /// What IAM answers a tag call that would carry a resource past the per-resource tag quota
 /// with — the `LimitExceededException` of every `Tag*` operation.
@@ -52,7 +54,12 @@ pub const TAG_LIMIT_EXCEEDED_MESSAGE: &str = "The number of tags has reached the
 ///
 /// A predicate rather than a lookup, for the reason [`super::has_reserved_tag_key`] is one:
 /// the refusal is the one fixed sentence [`DUPLICATE_TAG_KEY_MESSAGE`], which carries nothing
-/// of the request.
+/// of the request. That sentence closes with AWS's own note about reading a tag key, which
+/// is reproduced because it is the text AWS answers with and not because it states the
+/// comparison made here: what two spellings of one word are is settled by the stored tags,
+/// where "tag keys and values are case sensitive" makes them two tags ([`super::merge_tags`]
+/// overwrites by the same comparison, and every tag suite of this crate pins that), so the
+/// list is read by it too.
 pub fn has_duplicate_tag_key<'a, I: IntoIterator<Item = &'a str>>(keys: I) -> bool {
     let mut seen: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
     keys.into_iter().any(|key| !seen.insert(key))

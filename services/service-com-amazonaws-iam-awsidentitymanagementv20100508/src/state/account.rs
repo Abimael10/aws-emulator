@@ -1702,27 +1702,37 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// Every modelled read of a managed policy addresses it by ARN while the map
     /// is keyed by the name (the identity IAM enforces uniqueness on), so the ARN
     /// is parsed ([`parse_policy_arn`]) for the name to look up, and the held
-    /// policy answers only when its own ARN is the one asked for — so an ARN that
-    /// carries another path, another account or another casing of the name names no
-    /// policy.
+    /// policy answers only when the ARN asked for names IT ([`same_policy_arn`]) —
+    /// so an ARN carrying another path or another account names no policy, while one
+    /// spelling the held name in another case names the policy the account holds,
+    /// because IAM entity names are not distinguished by case.
     pub fn policy_by_arn(&self, arn: &str) -> Option<&ManagedPolicy> {
         let parsed = parse_policy_arn(arn)?;
         let held = self.policies.get(&name_key(&parsed.policy_name))?;
-        (held.policy.arn.as_deref() == Some(arn)).then_some(held)
+        held.policy
+            .arn
+            .as_deref()
+            .is_some_and(|held_arn| same_policy_arn(held_arn, arn))
+            .then_some(held)
     }
 
     /// The managed policy `arn` names, if the account holds it, for a caller that
     /// is going to CHANGE it.
     ///
     /// The same lookup and the same identity test as
-    /// [`policy_by_arn`](Self::policy_by_arn) — an ARN carrying another path,
-    /// another account or another casing of the name names no policy — so a write
-    /// addressed by ARN reaches exactly the record a read of that ARN reports, and
-    /// the account's policies are never found under two different rules.
+    /// [`policy_by_arn`](Self::policy_by_arn) — an ARN carrying another path or
+    /// another account names no policy, one spelling the held name in another case
+    /// names the held policy — so a write addressed by ARN reaches exactly the record
+    /// a read of that ARN reports, and the account's policies are never found under
+    /// two different rules.
     pub fn policy_by_arn_mut(&mut self, arn: &str) -> Option<&mut ManagedPolicy> {
         let parsed = parse_policy_arn(arn)?;
         let held = self.policies.get_mut(&name_key(&parsed.policy_name))?;
-        (held.policy.arn.as_deref() == Some(arn)).then_some(held)
+        held.policy
+            .arn
+            .as_deref()
+            .is_some_and(|held_arn| same_policy_arn(held_arn, arn))
+            .then_some(held)
     }
 
     /// How many entities the managed policy `arn` names is attached to —
@@ -1746,7 +1756,15 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             .values()
             .chain(self.user_attached_policies.values())
             .chain(self.group_attached_policies.values())
-            .filter(|attached| attached.contains(arn))
+            .filter(|attached| {
+                // An attachment is held under the ARN the attach named, and an ARN
+                // spelling the policy's name in another case names the same policy
+                // ([`same_policy_arn`]), so the count is over the attachments of THIS
+                // policy however they were spelled.
+                attached
+                    .iter()
+                    .any(|attached_arn| same_policy_arn(attached_arn, arn))
+            })
             .count();
         i32::try_from(attachments).unwrap_or(i32::MAX)
     }
@@ -1765,7 +1783,9 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
         // compares against, so the count and the listing cannot disagree about
         // which entities a boundary policy relates to.
         let boundary_is = |boundary: Option<&crate::ops::types::AttachedPermissionsBoundary>| {
-            permissions_boundary_arn(boundary) == Some(arn)
+            // Compared as the attachment counts are: an ARN spelling the policy's name
+            // in another case names the same policy ([`same_policy_arn`]).
+            permissions_boundary_arn(boundary).is_some_and(|held| same_policy_arn(held, arn))
         };
         let roles = self
             .roles

@@ -372,13 +372,13 @@ async fn a_user_boundary_naming_a_policy_the_account_does_not_hold_is_refused() 
     create_user(&router, user, "/").await;
     create_policy(&router, "held-user-boundary", "/").await;
 
-    // Rows: a name never created, a held name under another path, a held name in
-    // another case (policy names are not distinguished by case, but the ARN carries
-    // the minted spelling), and a nested path nothing was created under.
+    // Rows: a name never created, a held name under another path, and a nested path
+    // nothing was created under. A held name in another CASE is not among them: IAM
+    // entity names "are not distinguished by case", so such an ARN names the policy the
+    // account holds (asserted in `tests/all/policy_arn_name_case_resolution.rs`).
     let absent = [
         customer_policy_arn("/", "never-created-at-all"),
         customer_policy_arn("/elsewhere/", "held-user-boundary"),
-        customer_policy_arn("/", "HELD-USER-BOUNDARY"),
         customer_policy_arn("/a/b/c/", "absent"),
     ];
     for boundary in &absent {

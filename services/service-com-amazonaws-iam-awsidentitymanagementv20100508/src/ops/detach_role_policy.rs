@@ -291,7 +291,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let detached = store
             .role_attached_policies
             .get_mut(&role_key)
-            .is_some_and(|attached| attached.remove(&input.policy_arn));
+            .is_some_and(|attached| {
+                // The attachment is held under the ARN the attach named, so what goes is
+                // the one the set holds for the policy this request names
+                // (`crate::state::attached_policy_arn`): two spellings of one ARN are one
+                // attachment, the same reading the attach makes.
+                let held = crate::state::attached_policy_arn(attached, &input.policy_arn)
+                    .cloned();
+                held.is_some_and(|held| attached.remove(&held))
+            });
         if !detached {
             return Err(DetachRolePolicyErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {

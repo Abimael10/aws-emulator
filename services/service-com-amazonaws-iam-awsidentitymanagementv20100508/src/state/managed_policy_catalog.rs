@@ -1750,8 +1750,9 @@ pub const AWS_MANAGED_POLICIES: &[AwsManagedPolicy] = &[
 /// The ARN is read through the one grammar this crate holds
 /// ([`parse_policy_arn`]), so a value that is not a managed-policy ARN at all names
 /// nothing here either; the account segment is what says the ARN is in AWS's
-/// namespace rather than an account's, and the entry answers only when its own ARN
-/// is exactly the one asked for — the same identity test
+/// namespace rather than an account's, and the entry answers only when the ARN asked
+/// for names IT ([`same_policy_arn`]: the path as published, the name whatever case it
+/// is spelled in) — the same identity test
 /// [`ComAmazonawsIamAwsidentitymanagementv20100508State::policy_by_arn`] applies to
 /// the account's policies.
 pub fn aws_managed_policy(arn: &str) -> Option<&'static AwsManagedPolicy> {
@@ -1761,8 +1762,11 @@ pub fn aws_managed_policy(arn: &str) -> Option<&'static AwsManagedPolicy> {
     }
     AWS_MANAGED_POLICIES
         .iter()
-        .find(|entry| entry.path == parsed.path && entry.policy_name == parsed.policy_name)
-        .filter(|entry| entry.arn() == arn)
+        .find(|entry| {
+            entry.path == parsed.path
+                && entry.policy_name.eq_ignore_ascii_case(&parsed.policy_name)
+        })
+        .filter(|entry| same_policy_arn(&entry.arn(), arn))
 }
 
 /// Whether `arn` is an ARN in AWS's own managed-policy namespace — well formed and
@@ -1828,7 +1832,7 @@ pub fn is_published_aws_managed_policy_arn(arn: &str) -> bool {
         return false;
     }
     match aws_managed_policy_named(&parsed.policy_name) {
-        Some(entry) => entry.arn() == arn,
+        Some(entry) => same_policy_arn(&entry.arn(), arn),
         None => true,
     }
 }

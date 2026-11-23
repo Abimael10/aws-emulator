@@ -477,12 +477,6 @@ async fn an_arn_naming_no_account_policy_is_refused_by_its_kind() {
             code: "NoSuchEntity",
         },
         MissCase {
-            name: "a held policy's name in another case",
-            arn: customer_policy_arn("/eng/", "heldpolicy"),
-            status: 404,
-            code: "NoSuchEntity",
-        },
-        MissCase {
             name: "an AWS-managed policy the catalog carries",
             arn: state::AWS_MANAGED_POLICIES[0].arn(),
             status: 400,

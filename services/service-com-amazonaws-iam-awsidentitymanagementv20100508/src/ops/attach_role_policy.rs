@@ -318,8 +318,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let attached = store.role_attached_policies.entry(role_key).or_default();
         // A policy is either attached to a role or it is not, so attaching one that
         // is already attached leaves the role exactly as it is — and in particular
-        // does not consume a second slot of the role's quota.
-        if !attached.contains(&input.policy_arn) {
+        // does not consume a second slot of the role's quota. Which policy the set
+        // already carries is the one question every reader of a `PolicyArn` asks
+        // (`crate::state::holds_policy_arn`), so two spellings of one ARN are one
+        // attachment.
+        if !crate::state::holds_policy_arn(attached, &input.policy_arn) {
             // A role carries a bounded number of managed policies, so a caller
             // cannot grow a role's permission policy without limit.
             if attached.len() >= crate::state::MAX_MANAGED_POLICIES_PER_ROLE {

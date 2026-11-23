@@ -291,8 +291,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let attached = store.group_attached_policies.entry(group_key).or_default();
         // A policy is either attached to a group or it is not, so attaching one that
         // is already attached leaves the group exactly as it is — and in particular
-        // does not consume a second slot of the group's quota.
-        if !attached.contains(&input.policy_arn) {
+        // does not consume a second slot of the group's quota. Which policy the set
+        // already carries is the one question every reader of a `PolicyArn` asks
+        // (`crate::state::holds_policy_arn`), so two spellings of one ARN are one
+        // attachment.
+        if !crate::state::holds_policy_arn(attached, &input.policy_arn) {
             // A group carries a bounded number of managed policies, so a caller
             // cannot grow the permissions its members inherit without limit.
             if attached.len() >= crate::state::MAX_MANAGED_POLICIES_PER_GROUP {

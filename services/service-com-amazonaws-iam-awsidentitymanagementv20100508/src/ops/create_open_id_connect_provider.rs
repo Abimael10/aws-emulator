@@ -216,31 +216,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The URL must begin with https:// and should correspond to the iss claim in the
         // provider's OpenID Connect ID tokens. Per the OIDC standard, path components are
         // allowed but query parameters are not" (`$Url`). A value failing either is "an
-        // invalid … value … supplied for an input parameter", so the refusal names the
-        // member and the constraint it broke.
+        // invalid … value … supplied for an input parameter".
+        //
+        // The refusal of a Url outside that published form carries NO `Message` member:
+        // recorded behaviour for this class, where IAM answers the code alone. A sentence
+        // written here instead would be text AWS never emits, which a client comparing the
+        // refusal against AWS's reads as a different refusal — so the three readings of the
+        // form below all answer the bare code
+        // (`crate::state::OPEN_ID_CONNECT_URL_FORM_REFUSAL`).
         let Some(host_and_path) = input
             .url
             .strip_prefix(crate::state::OPEN_ID_CONNECT_URL_SCHEME)
         else {
             return Err(CreateOpenIDConnectProviderErrorModeled::InvalidInputException(
-                InvalidInputException {
-                    message: Some(format!(
-                        "Invalid Url {}: the URL must begin with {}",
-                        input.url,
-                        crate::state::OPEN_ID_CONNECT_URL_SCHEME
-                    )),
-                },
+                crate::state::OPEN_ID_CONNECT_URL_FORM_REFUSAL,
             )
             .into());
         };
         if host_and_path.contains('?') {
             return Err(CreateOpenIDConnectProviderErrorModeled::InvalidInputException(
-                InvalidInputException {
-                    message: Some(format!(
-                        "Invalid Url {}: the URL must carry no query parameters",
-                        input.url
-                    )),
-                },
+                crate::state::OPEN_ID_CONNECT_URL_FORM_REFUSAL,
             )
             .into());
         }
@@ -249,12 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is no provider for it to identify.
         if host_and_path.split('/').next().unwrap_or_default().is_empty() {
             return Err(CreateOpenIDConnectProviderErrorModeled::InvalidInputException(
-                InvalidInputException {
-                    message: Some(format!(
-                        "Invalid Url {}: the URL must name a host",
-                        input.url
-                    )),
-                },
+                crate::state::OPEN_ID_CONNECT_URL_FORM_REFUSAL,
             )
             .into());
         }
@@ -311,11 +301,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // "This parameter is optional. If it is not included, IAM will retrieve and use the
         // top intermediate certificate authority (CA) thumbprint of the OpenID Connect
-        // identity provider server certificate" (`$ThumbprintList`). This emulator makes no
-        // outbound connection to an IdP, so a create naming no thumbprint registers a
-        // provider carrying none rather than one carrying a thumbprint nothing fetched.
-        let thumbprint_list = input.thumbprint_list.unwrap_or_default();
-        if thumbprint_list.len() > crate::state::MAX_THUMBPRINTS_PER_OPEN_ID_CONNECT_PROVIDER {
+        // identity provider server certificate" (`$ThumbprintList`), so a provider is never
+        // registered unpinned: a create naming no thumbprint is stored with the one derived
+        // for its issuer, through the shared rule every write registering a provider follows
+        // (`crate::state::stored_open_id_connect_thumbprints`). The quota is taken on the
+        // list the REQUEST carried, since the derived thumbprint is a single entry and is
+        // what IAM supplies rather than what the caller asked for.
+        let supplied_thumbprints = input.thumbprint_list.unwrap_or_default();
+        if supplied_thumbprints.len() > crate::state::MAX_THUMBPRINTS_PER_OPEN_ID_CONNECT_PROVIDER {
             return Err(CreateOpenIDConnectProviderErrorModeled::LimitExceededException(
                 LimitExceededException {
                     message: Some(format!(
@@ -326,6 +319,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        let thumbprint_list =
+            crate::state::stored_open_id_connect_thumbprints(&url, supplied_thumbprints);
 
         // "If any one of the tags is invalid or if you exceed the allowed maximum number of
         // tags, then the entire request fails and the resource is not created" (`$Tags`), so

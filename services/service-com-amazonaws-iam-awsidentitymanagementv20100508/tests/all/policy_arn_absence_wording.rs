@@ -37,9 +37,9 @@
 //!
 //! The rows differ along what the rule generalises over — which operation of which family
 //! is called, and the form of the ARN that resolves to nothing (a name nothing was created
-//! under, the held policy's name at another path, at the account root, in another casing,
-//! in another account, in another partition, a deeply nested path, a name spelling the
-//! punctuation the name alphabet admits) — so no single request is the specification.
+//! under, the held policy's name at another path, at the account root, in another account,
+//! in another partition, a deeply nested path, a name spelling the punctuation the name
+//! alphabet admits) — so no single request is the specification.
 
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -259,6 +259,10 @@ async fn policy_arn_call(
 
 /// Every well-formed managed-policy ARN this account still holds no policy under:
 /// `(what the row is, the ARN)`.
+///
+/// The held ARN spelled in another CASE is not among them: IAM entity names "are not
+/// distinguished by case", so such an ARN names the policy the account holds (asserted in
+/// `tests/all/policy_arn_name_case_resolution.rs`) rather than nothing.
 fn arns_the_account_holds_nothing_under(account: &str) -> Vec<(&'static str, String)> {
     vec![
         (
@@ -272,17 +276,6 @@ fn arns_the_account_holds_nothing_under(account: &str) -> Vec<(&'static str, Str
         (
             "the held name at the account root",
             format!("arn:aws:iam::{account}:policy/{HELD_NAME}"),
-        ),
-        (
-            // A managed policy's identity carries the case its name was created with,
-            // so the same spelling in another case names no policy — and the refusal
-            // must echo the case the REQUEST used.
-            "the held ARN in another casing",
-            format!(
-                "arn:aws:iam::{account}:policy{}{}",
-                HELD_PATH.to_ascii_lowercase(),
-                HELD_NAME.to_ascii_lowercase()
-            ),
         ),
         (
             "the held name in another account",

@@ -88,6 +88,63 @@ pub fn saml_provider_valid_until(
     })
 }
 
+/// The refusal of an OIDC provider `Url` that is not of the published form — one that does
+/// not begin with the scheme `Url` requires, that carries query parameters, or that names no
+/// host.
+///
+/// "An invalid or out-of-range value was supplied for an input parameter"
+/// (`InvalidInputException`), answered as the CODE ALONE: recorded behaviour for this class
+/// is a refusal carrying no `Message` member at all, so there is nothing to word here. A
+/// sentence written in its place would be text AWS never emits, which is a divergence a
+/// client comparing refusals sees — and one shared constant is what keeps every reading of
+/// the `Url`'s form answering the same way.
+pub const OPEN_ID_CONNECT_URL_FORM_REFUSAL: crate::ops::types::InvalidInputException =
+    crate::ops::types::InvalidInputException { message: None };
+
+/// The server-certificate thumbprint an OIDC provider registered for `issuer` is PINNED
+/// with when the request named none.
+///
+/// "This parameter is optional. If it is not included, IAM will retrieve and use the top
+/// intermediate certificate authority (CA) thumbprint of the OpenID Connect identity
+/// provider server certificate" (`CreateOpenIDConnectProvider$ThumbprintList`), so a
+/// provider is never registered unpinned: the thumbprint belongs to the provider, which is
+/// why one read of it is every read of it. Its FORM is published too — "the hex-encoded
+/// SHA-1 hash value of the X.509 certificate" (`thumbprintType`), exactly 40 characters —
+/// and that is what this derives: the SHA-1 of the endpoint the certificate would be
+/// presented for, hex, since this emulator opens no connection to the IdP and so has no
+/// fetched chain to hash. `issuer` is the provider's URL as the record holds it (its host
+/// and path, without the scheme), so the thumbprint is a property of the provider named
+/// rather than of the request or the moment, and two providers never share one.
+///
+/// The hex is [`data_encoding`]'s HEXLOWER, the one coding this crate spells a digest with
+/// ([`key_identifier`]).
+///
+/// What it is NOT: a claim about a certificate the IdP presented. No chain is fetched here —
+/// this emulator opens no outbound connection, and a provider URL it cannot reach has no
+/// chain to read — so what the provider is pinned to is the identifier THIS service derives
+/// for the endpoint, of the published form and stable for it. A caller that needs the
+/// thumbprint of a particular certificate supplies it on the request, which is stored as
+/// written ([`stored_open_id_connect_thumbprints`]).
+pub fn derived_open_id_connect_thumbprint(issuer: &str) -> String {
+    let mut hasher = <::sha1::Sha1 as ::sha1::Digest>::new();
+    ::sha1::Digest::update(&mut hasher, issuer.as_bytes());
+    ::data_encoding::HEXLOWER.encode(&::sha1::Digest::finalize(hasher))
+}
+
+/// The thumbprint list a provider registered for `issuer` is STORED with when the request
+/// carried `supplied`.
+///
+/// ONE rule for every write that registers a provider: the thumbprints the request named,
+/// or — for a request that named none — the single derived one
+/// ([`derived_open_id_connect_thumbprint`]), because IAM pins a certificate for the provider
+/// either way.
+pub fn stored_open_id_connect_thumbprints(issuer: &str, supplied: Vec<String>) -> Vec<String> {
+    if supplied.is_empty() {
+        return vec![derived_open_id_connect_thumbprint(issuer)];
+    }
+    supplied
+}
+
 /// The hashes of the signing keys `metadata` publishes, paired with the issuer it names.
 ///
 /// A reader of a provider's metadata checks a message from that provider against the

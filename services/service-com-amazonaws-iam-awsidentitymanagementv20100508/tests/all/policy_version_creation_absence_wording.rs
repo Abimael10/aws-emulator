@@ -23,9 +23,9 @@
 //!
 //! The rows differ along what the rule generalises over — the form of the ARN that
 //! resolves to nothing (one whose policy was just deleted, a name nothing was created
-//! under, the held name at another path, at the account root, in another casing, in
-//! another account, in another partition, a deeply nested path, a name spelling the
-//! punctuation the name alphabet admits) and, for the create, the document sent and
+//! under, the held name at another path, at the account root, in another account, in
+//! another partition, a deeply nested path, a name spelling the punctuation the name
+//! alphabet admits) and, for the create, the document sent and
 //! whether `SetAsDefault` is absent, false or true — so no single request is the
 //! specification. The whole `PolicyArn`-addressed surface is held to the same rule at
 //! once by `tests/all/policy_arn_absence_wording.rs`.
@@ -196,17 +196,6 @@ fn unresolvable_arns(account: &str, released: &str) -> Vec<(&'static str, String
         (
             "the held name at the account root",
             format!("arn:aws:iam::{account}:policy/{HELD_NAME}"),
-        ),
-        (
-            // A managed policy's identity carries the case its name was created with, so
-            // the same spelling in another case names no policy — and the refusal must
-            // echo the case the REQUEST used.
-            "the held ARN in another casing",
-            format!(
-                "arn:aws:iam::{account}:policy{}{}",
-                HELD_PATH.to_ascii_lowercase(),
-                HELD_NAME.to_ascii_lowercase()
-            ),
         ),
         (
             "the held name in another account",

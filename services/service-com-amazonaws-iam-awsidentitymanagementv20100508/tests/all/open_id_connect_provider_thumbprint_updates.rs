@@ -33,7 +33,8 @@ use service_com_amazonaws_iam_awsidentitymanagementv20100508::state::MAX_THUMBPR
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::open_id_connect_providers::{
-    absence_message, client_ids, expected_arn, issuer_of, list_members, thumbprint,
+    absence_message, client_ids, expected_arn, expected_thumbprints, issuer_of, list_members,
+    thumbprint,
 };
 use crate::role_lifecycle::{borrowed, param};
 use crate::user_lifecycle::{account_id, call, element, error_code, router};
@@ -213,9 +214,10 @@ async fn a_replacement_is_the_whole_list_the_request_carried() {
     {
         let arn = create_provider(&router, case, url, &held).await;
         let before = reported(&router, case, &arn).await;
+        let held_after_create = expected_thumbprints(url, &held);
         assert_eq!(
-            before.thumbprints, held,
-            "case {case:?}: the fixture must hold {held:?}, got {:?}",
+            before.thumbprints, held_after_create,
+            "case {case:?}: the fixture must hold {held_after_create:?}, got {:?}",
             before.thumbprints
         );
 

@@ -423,17 +423,6 @@ async fn a_request_naming_no_held_policy_or_version_is_refused_by_its_kind() {
             )),
         },
         MissCase {
-            name: "the held policy's name in another case",
-            arn: customer_policy_arn("/eng/", "heldpolicy"),
-            version_id: "v2".to_string(),
-            status: 404,
-            code: "NoSuchEntity",
-            message: Some(format!(
-                "Policy {} was not found.",
-                customer_policy_arn("/eng/", "heldpolicy")
-            )),
-        },
-        MissCase {
             name: "an AWS-managed policy the catalog carries",
             arn: aws_catalogued.clone(),
             version_id: "v1".to_string(),

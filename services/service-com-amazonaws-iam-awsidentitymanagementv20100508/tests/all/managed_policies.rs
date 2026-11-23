@@ -817,16 +817,15 @@ async fn a_created_policy_is_attachable_and_an_unheld_one_is_not() {
         "the role must report exactly the created policies that were attached, got {listed}"
     );
 
-    // An ARN of the same form the account does not hold refers to no entity.
+    // An ARN of the same form the account does not hold refers to no entity. A held name
+    // in another CASE is not such an ARN: IAM entity names "are not distinguished by
+    // case", so it names the held policy (asserted in
+    // `tests/all/policy_arn_name_case_resolution.rs`).
     for (case, arn) in [
         ("another name at the root", expected_policy_arn("/", "never-created")),
         (
             "a held name under another path",
             expected_policy_arn("/elsewhere/", "attachable-0"),
-        ),
-        (
-            "a held name in another case",
-            expected_policy_arn("/", "ATTACHABLE-0"),
         ),
     ] {
         let (status, body) = call(

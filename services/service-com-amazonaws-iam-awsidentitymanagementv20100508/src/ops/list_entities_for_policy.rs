@@ -329,7 +329,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let attached = store
                     .group_attached_policies
                     .get(group_key)
-                    .is_some_and(|attached| attached.contains(&input.policy_arn));
+                    // Which policy an attachment names is the one question every reader
+                    // of a `PolicyArn` asks (`crate::state::holds_policy_arn`), so this
+                    // listing and the attachment count a reader of the policy reports
+                    // relate the same entities to it.
+                    .is_some_and(|attached| {
+                        crate::state::holds_policy_arn(attached, &input.policy_arn)
+                    });
                 if !attached || !group.path.starts_with(&path_prefix) {
                     continue;
                 }
@@ -349,10 +355,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     && store
                         .role_attached_policies
                         .get(role_key)
-                        .is_some_and(|attached| attached.contains(&input.policy_arn));
+                        .is_some_and(|attached| {
+                            crate::state::holds_policy_arn(attached, &input.policy_arn)
+                        });
                 let bounded = want_permissions_boundary
                     && crate::state::permissions_boundary_arn(role.permissions_boundary.as_ref())
-                        == Some(input.policy_arn.as_str());
+                        .is_some_and(|held| {
+                            crate::state::same_policy_arn(held, &input.policy_arn)
+                        });
                 if !(attached || bounded) || !role.path.starts_with(&path_prefix) {
                     continue;
                 }
@@ -372,10 +382,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     && store
                         .user_attached_policies
                         .get(user_key)
-                        .is_some_and(|attached| attached.contains(&input.policy_arn));
+                        .is_some_and(|attached| {
+                            crate::state::holds_policy_arn(attached, &input.policy_arn)
+                        });
                 let bounded = want_permissions_boundary
                     && crate::state::permissions_boundary_arn(user.permissions_boundary.as_ref())
-                        == Some(input.policy_arn.as_str());
+                        .is_some_and(|held| {
+                            crate::state::same_policy_arn(held, &input.policy_arn)
+                        });
                 if !(attached || bounded) || !user.path.starts_with(&path_prefix) {
                     continue;
                 }
