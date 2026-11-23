@@ -213,28 +213,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // The run is projected by the store's own projection, the one the batch read
+        // (`crate::ops::batch_get_data_quality_ruleset_evaluation_run`) reports element for
+        // element, so the two reads report the same run at the same instant.
+        let projected = run.to_evaluation_run();
         Ok(GetDataQualityRulesetEvaluationRunOutput {
-            run_id: Some(run.id.clone()),
-            data_source: Some(run.data_source.clone()),
-            additional_data_sources: run.additional_data_sources.clone(),
-            role: Some(run.role.clone()),
-            number_of_workers: Some(run.number_of_workers),
-            timeout: Some(run.timeout),
-            additional_run_options: run.additional_run_options.clone(),
-            status: Some(run.status.clone()),
-            error_string: run.error_string.clone(),
-            started_on: Some(crate::state::to_date_time(run.started_on)),
-            last_modified_on: Some(crate::state::to_date_time(run.last_modified_on)),
-            completed_on: run.completed_on.map(crate::state::to_date_time),
-            execution_time: run.execution_time_seconds(),
-            ruleset_names: Some(run.ruleset_names.clone()),
-            // `ResultIds` is `length 1..10`, so a run that has minted none reports the member
-            // as absent rather than as an empty list the model does not admit.
-            result_ids: if run.result_ids.is_empty() {
-                None
-            } else {
-                Some(run.result_ids.clone())
-            },
+            run_id: projected.run_id,
+            data_source: projected.data_source,
+            additional_data_sources: projected.additional_data_sources,
+            role: projected.role,
+            number_of_workers: projected.number_of_workers,
+            timeout: projected.timeout,
+            additional_run_options: projected.additional_run_options,
+            status: projected.status,
+            error_string: projected.error_string,
+            started_on: projected.started_on,
+            last_modified_on: projected.last_modified_on,
+            completed_on: projected.completed_on,
+            execution_time: projected.execution_time,
+            ruleset_names: projected.ruleset_names,
+            result_ids: projected.result_ids,
         })
     }
 }

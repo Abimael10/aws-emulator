@@ -1169,6 +1169,39 @@ impl DataQualityRulesetEvaluationRunEntry {
         }
     }
 
+    /// Rebuild the modelled `DataQualityRulesetEvaluationRun` from what is stored: every
+    /// member a read of one run reports, projected in ONE place so the single-run read and
+    /// the batch read report the same run at the same instant.
+    pub fn to_evaluation_run(&self) -> DataQualityRulesetEvaluationRun {
+        DataQualityRulesetEvaluationRun {
+            run_id: Some(self.id.clone()),
+            data_source: Some(self.data_source.clone()),
+            additional_data_sources: self.additional_data_sources.clone(),
+            role: Some(self.role.clone()),
+            number_of_workers: Some(self.number_of_workers),
+            timeout: Some(self.timeout),
+            additional_run_options: self.additional_run_options.clone(),
+            status: Some(self.status.clone()),
+            error_string: self.error_string.clone(),
+            started_on: Some(to_date_time(self.started_on)),
+            last_modified_on: Some(to_date_time(self.last_modified_on)),
+            completed_on: self.completed_on.map(to_date_time),
+            execution_time: self.execution_time_seconds(),
+            ruleset_names: Some(self.ruleset_names.clone()),
+            result_ids: self.reported_result_ids(),
+        }
+    }
+
+    /// `ResultIds` as a read reports them: `length 1..10`, so a run that has minted none
+    /// reports the member as ABSENT rather than as an empty list the model does not admit.
+    pub fn reported_result_ids(&self) -> Option<Vec<String>> {
+        if self.result_ids.is_empty() {
+            None
+        } else {
+            Some(self.result_ids.clone())
+        }
+    }
+
     /// Move this run into the status the clock owed it: it was due to leave
     /// [`DATA_QUALITY_RUN_STATE_STARTING`] at [`Self::settles_at`] whether or not anybody
     /// called.

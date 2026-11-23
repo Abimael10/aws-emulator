@@ -654,9 +654,9 @@ async fn the_login_url_never_names_a_zone_aws_publishes_its_own_endpoints_in() {
 
 /// The Regions the table below holds repositories in: two commercial Regions and one of a
 /// partition with a DNS suffix of its own, none of them the Region this suite's other rows
-/// are signed for. The Region keys the stored record and names its ARN, so a published
-/// address taken from the record rather than from the endpoint the call arrived on shows up
-/// here.
+/// are signed for. The Region keys the stored record, names its ARN and is the Region label of
+/// the authority the repository is published at, so a published address that took the Region
+/// from the endpoint the call arrived on rather than from the record shows up here.
 const HOLDING_REGIONS: [&str; 3] = ["us-west-2", "eu-west-1", "cn-north-1"];
 
 /// The label run every Amazon ECR registry host carries between the owning account's id and

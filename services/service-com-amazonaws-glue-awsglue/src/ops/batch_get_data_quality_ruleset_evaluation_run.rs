@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetDataQualityRulesetEvaluationRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetDataQualityRulesetEvaluationRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetDataQualityRulesetEvaluationRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads several data quality ruleset evaluation runs by id in one call. A batch READ: the
+//! only write it makes is materialising the statuses the CLOCK had already made due
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::settle_due_data_quality_ruleset_evaluation_runs`]),
+//! which were owed at that same instant whether or not anybody called — so this batch and
+//! the single-run read ([`crate::ops::get_data_quality_ruleset_evaluation_run`]) agree about
+//! a run's state.
+//!
+//! Each id the request lists is answered on its own, in the order it was sent and with its
+//! repeats kept, because the answer reports "the details of multiple evaluation runs" rather
+//! than a set: an id this account holds a run under contributes that run's own projection —
+//! the one the single-run read serves
+//! ([`crate::state::DataQualityRulesetEvaluationRunEntry::to_evaluation_run`]) — and an id it
+//! holds no run under contributes that id to `RunsNotFound`. A miss is therefore an absence
+//! this answer REPORTS, not a failure of the whole batch, which is what distinguishes this
+//! read from the single-run one that answers `EntityNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +149,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetDataQualityRulesetEvaluationRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetDataQualityRulesetEvaluationRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetDataQualityRulesetEvaluationRun"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no store fault that fits an unreachable store, so it is
+            // reported as its timeout error — the wording the single-run read uses.
+            return Err(
+                BatchGetDataQualityRulesetEvaluationRunErrorModeled::OperationTimeoutException(
+                    OperationTimeoutException {
+                        message: Some("the Glue Data Catalog store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `RunIds` is `@required` with `length 1..100`, and each of its elements
+        // `length 1..255` with a pattern, so a batch too large to serve and an id too long
+        // or too short to address a run are both refused at the request boundary: reaching
+        // here, the only question per id is whether this account holds a run under it. The
+        // walk keeps the request's order and its repeats — one answer per REQUESTED id, not
+        // per distinct id — in a critical section scoped to the lookups alone, bounded above
+        // by that modelled list length, with the guard dropped before the answer is built.
+        let (runs, runs_not_found) = {
+            let now = ::std::time::SystemTime::now();
+            let mut store = state.lock();
+            // The one write this read performs: the statuses the clock had already made due.
+            store.settle_due_data_quality_ruleset_evaluation_runs(now);
+            let mut runs = Vec::new();
+            let mut runs_not_found = Vec::new();
+            for run_id in &input.run_ids {
+                match store.data_quality_ruleset_evaluation_run(run_id) {
+                    Some(run) => runs.push(run.to_evaluation_run()),
+                    None => runs_not_found.push(run_id.clone()),
+                }
+            }
+            (runs, runs_not_found)
+        };
+
+        ::tracing::info!(
+            operation = "BatchGetDataQualityRulesetEvaluationRun",
+            requested = input.run_ids.len(),
+            found = runs.len(),
+            not_found = runs_not_found.len(),
+            "read Glue data quality ruleset evaluation runs in a batch"
+        );
+
+        // Both lists are reported, empty included: a caller reads `RunsNotFound` to learn
+        // which of its ids missed, so an omitted list would make "none missed"
+        // indistinguishable from "not answered".
+        Ok(BatchGetDataQualityRulesetEvaluationRunOutput {
+            runs: Some(runs),
+            runs_not_found: Some(runs_not_found),
+        })
     }
 }
