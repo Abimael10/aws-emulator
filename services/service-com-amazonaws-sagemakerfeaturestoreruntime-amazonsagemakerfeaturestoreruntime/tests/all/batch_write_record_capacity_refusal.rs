@@ -158,6 +158,7 @@ impl Aws {
                     ),
                 }),
                 default_ttl_seconds: None,
+                creation_failed: false,
             });
     }
 

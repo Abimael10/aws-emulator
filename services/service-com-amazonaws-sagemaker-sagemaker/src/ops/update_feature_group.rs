@@ -219,6 +219,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // transition it materialised travels with it rather than on a second line taken
         // while the guard is still held.
         group.settle_status(now);
+        // A group whose CREATION FAILED holds no provisioned schema, store or throughput for
+        // an update to change — "The FeatureGroup could not be created in the OfflineStore"
+        // (`DescribeFeatureGroup$FailureReason`) — so the update is refused and the group is
+        // left exactly as it is; a client resolves that state by deleting the group and
+        // creating it again. 400 `ValidationException`, the class this service refuses a
+        // request it understood and will not accept with, worded as the delete words the same
+        // fact about a status that stands in the way.
+        if group.creation_failed() {
+            let status = group.status.clone();
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::feature_group_not_updatable(&name, &status),
+            ));
+        }
 
         // Each applier validates the whole update BEFORE it writes anything, so a refused
         // update leaves the group exactly as it was — and only one of the three can be

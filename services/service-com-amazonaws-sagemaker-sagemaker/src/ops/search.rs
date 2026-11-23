@@ -1086,8 +1086,11 @@ fn feature_group_entity(group: &crate::state::FeatureGroup) -> FeatureGroup {
             }),
         description: group.description.clone(),
         tags: tag_list(&group.tags),
-        // An update status, which only an update produces, and a failure reason, which
-        // only a failed create or delete produces.
+        // "The reason that the FeatureGroup failed to be replicated in the OfflineStore":
+        // reported from the group's own record, exactly as `DescribeFeatureGroup` reports it,
+        // so a failed group reads the same here as there.
+        failure_reason: group.reported_failure_reason(),
+        // An update status, which only an update produces.
         ..Default::default()
     }
 }

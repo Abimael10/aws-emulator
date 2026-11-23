@@ -128,6 +128,7 @@ impl Emulator {
                 // Online-only feature groups: no offline store to replicate into.
                 offline_store: None,
                 default_ttl_seconds: None,
+                creation_failed: false,
             });
     }
 

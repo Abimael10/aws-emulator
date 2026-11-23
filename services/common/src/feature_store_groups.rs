@@ -79,6 +79,17 @@ pub struct FeatureGroupRecord {
     /// expiry derived from its own event time — which is why the data plane cannot update
     /// such a record without being told an `EventTime`.
     pub default_ttl_seconds: Option<f64>,
+    /// Whether the group's CREATION FAILED, i.e. the control plane could not create the
+    /// offline store the group was asked for and the group settles the modelled
+    /// `FeatureGroupStatus` `CreateFailed` carrying a `FailureReason` ("The reason that the
+    /// FeatureGroup failed to be replicated in the OfflineStore. This is failure can occur
+    /// because: The FeatureGroup could not be created in the OfflineStore",
+    /// `DescribeFeatureGroup$FailureReason`).
+    ///
+    /// Recorded here because such a group holds NO provisioned store for this data plane to
+    /// serve: its records can be neither written nor read, which is the one fact about a
+    /// group's status the runtime API carries nothing about and so could not otherwise know.
+    pub creation_failed: bool,
 }
 
 /// `value` of the `TtlDurationUnit` `unit`, in seconds, or `None` when `unit` is not one
@@ -195,6 +206,7 @@ mod tests {
             online_store_enabled: true,
             offline_store: None,
             default_ttl_seconds: None,
+            creation_failed: false,
         }
     }
 

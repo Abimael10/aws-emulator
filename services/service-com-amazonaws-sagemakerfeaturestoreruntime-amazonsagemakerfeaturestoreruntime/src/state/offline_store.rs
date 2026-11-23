@@ -409,6 +409,7 @@ mod tests {
             online_store_enabled: true,
             offline_store: None,
             default_ttl_seconds: None,
+            creation_failed: false,
         }
     }
 

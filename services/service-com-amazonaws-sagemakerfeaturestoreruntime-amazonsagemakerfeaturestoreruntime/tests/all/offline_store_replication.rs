@@ -563,17 +563,25 @@ async fn an_ingested_record_is_replicated_into_the_offline_store_its_role_may_wr
         aws.create_bucket(row.bucket).await;
         let role_name = format!("{}-role", row.group);
         let role_arn = aws.create_role(case, &role_name).await;
-        if let Some(resource) = row.grant {
-            aws.grant_write(case, &role_name, resource).await;
-        }
-        let described = aws
-            .create_feature_group(
-                case,
-                row.group,
-                row.online,
-                row.s3_uri.map(|s3_uri| (s3_uri, role_arn.as_str())),
-            )
+        // The control plane settles the offline-store write BEFORE it creates the group — a
+        // store the group's role may not write is refused there — so every group here is
+        // created with that write permitted, and the grant the REPLICATION is judged by (the
+        // row's own, or none at all) is put in force afterwards. That is how a client reaches
+        // a blocked offline store: a permission revoked or narrowed after the create.
+        aws.grant_write(case, &role_name, &format!("arn:aws:s3:::{}/*", row.bucket))
             .await;
+        aws.create_feature_group(
+            case,
+            row.group,
+            row.online,
+            row.s3_uri.map(|s3_uri| (s3_uri, role_arn.as_str())),
+        )
+        .await;
+        match row.grant {
+            Some(resource) => aws.grant_write(case, &role_name, resource).await,
+            None => aws.revoke_write(case, &role_name).await,
+        }
+        let described = aws.describe_feature_group(case, row.group).await;
 
         // The status the group reports, and the reason a blocked one is reported with.
         let (status, reason) = offline_status(&described);
@@ -1485,10 +1493,12 @@ async fn an_accepted_update_is_replicated_into_every_store_the_request_targets()
         aws.create_bucket(update.bucket).await;
         let role_name = format!("{}-role", update.group);
         let role_arn = aws.create_role(case, &role_name).await;
-        if update.granted {
-            aws.grant_write(case, &role_name, &format!("arn:aws:s3:::{}/*", update.bucket))
-                .await;
-        }
+        // The control plane settles the offline-store write before it creates the group, so
+        // the create itself is made with that write permitted; a row whose REPLICATION is to
+        // be withheld has the grant taken away again right after, which is how a client
+        // reaches a blocked offline store.
+        aws.grant_write(case, &role_name, &format!("arn:aws:s3:::{}/*", update.bucket))
+            .await;
         let described = aws
             .create_feature_group(
                 case,
@@ -1500,6 +1510,9 @@ async fn an_accepted_update_is_replicated_into_every_store_the_request_targets()
                 )),
             )
             .await;
+        if !update.granted {
+            aws.revoke_write(case, &role_name).await;
+        }
         let resolved = resolved_key(&described);
 
         // The record the update is made against, ingested first: the update is PARTIAL, so

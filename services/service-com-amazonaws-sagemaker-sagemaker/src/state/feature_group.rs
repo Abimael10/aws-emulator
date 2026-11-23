@@ -39,14 +39,18 @@ pub const FEATURE_GROUP_RELEASED_AFTER: Duration = FEATURE_GROUP_CREATED_AFTER;
 pub const FEATURE_GROUP_QUOTA: usize = 1_000;
 
 /// `FeatureGroupStatus`'s members this emulator moves a feature group through (the
-/// modelled enum also carries `CreateFailed` and `DeleteFailed`, which this slice does
-/// not reach: nothing here fails a feature group). Named once here so no handler compares
+/// modelled enum also carries `DeleteFailed`, which this slice does not reach: nothing here
+/// fails a group's DELETION). Named once here so no handler compares
 /// a bare string literal. Deliberately separate from [`STATUS_CREATING`] even though the
 /// two spell the same value today: they are members of two different modelled enums, and
 /// either may be re-spelled without the other.
 pub const FEATURE_GROUP_STATUS_CREATING: &str = "Creating";
 /// See [`FEATURE_GROUP_STATUS_CREATING`].
 pub const FEATURE_GROUP_STATUS_CREATED: &str = "Created";
+/// See [`FEATURE_GROUP_STATUS_CREATING`]. What a group whose offline store could not be set
+/// up settles in: "The `FeatureGroup` could not be created in the `OfflineStore`"
+/// ([`FeatureGroup::failure_reason`]).
+pub const FEATURE_GROUP_STATUS_CREATE_FAILED: &str = "CreateFailed";
 /// See [`FEATURE_GROUP_STATUS_CREATING`]. What a group reports from the
 /// `DeleteFeatureGroup` that asked for its deletion until the clock completes it.
 pub const FEATURE_GROUP_STATUS_DELETING: &str = "Deleting";
@@ -125,6 +129,85 @@ pub async fn offline_store_status(
     Some(active)
 }
 
+/// How SageMaker words the reason a feature group's creation FAILED because its offline store
+/// could not be set up: the fact the model documents — "The `FeatureGroup` could not be created
+/// in the `OfflineStore`" (`DescribeFeatureGroup$FailureReason`) — then the three facts a client
+/// repairs it with: the role the store is written as, the permission it is missing and the
+/// location it is missing it on.
+///
+/// Every variable part is taken from the REQUEST that created the group: the `RoleArn` it
+/// supplied and the `S3Uri` it named, as the caller spelled them, which is how every other
+/// report of an Amazon S3 location this service could not reach words it
+/// ([`could_not_access_model_data`]). The action is the one an object write is authorized under
+/// (`::service_common::feature_store_offline_store::WRITE_ACTION`), so the sentence names the
+/// permission a client actually grants.
+#[must_use]
+pub fn offline_store_creation_failure(role_arn: &str, s3_uri: &str) -> String {
+    format!(
+        "The FeatureGroup could not be created in the OfflineStore: the IAM role {role_arn} \
+         does not have permission to perform {} on the OfflineStore location {s3_uri}.",
+        ::service_common::feature_store_offline_store::WRITE_ACTION
+    )
+}
+
+/// Why the offline store an `OfflineStoreConfig` asks for could NOT be created — the
+/// `FailureReason` the group then carries, and the reason its `FeatureGroupStatus` settles
+/// `CreateFailed` — or `None` when nothing establishes that.
+///
+/// "The Amazon Resource Name (ARN) of the IAM execution role used to persist data into the
+/// OfflineStore if an OfflineStoreConfig is provided" (`RoleArn`): the store is set up and
+/// written AS that role, so a location that role may not write backs no offline store, and the
+/// group it was asked for FAILS rather than coming up healthy — which is the modelled outcome,
+/// since `DescribeFeatureGroup$FailureReason` is documented as "the reason that the
+/// `FeatureGroup` failed to be replicated in the `OfflineStore`. This is failure can occur
+/// because: the `FeatureGroup` could not be created in the `OfflineStore`", and
+/// `FeatureGroupStatus` carries `CreateFailed` for it. The call itself is ACCEPTED: recorded
+/// SageMaker answers the create and reports the failure on the resource. A create that names no
+/// offline store asks for no replication and fails for nothing here.
+///
+/// The question is the shared one for this store
+/// ([`::service_common::feature_store_offline_store::write_is_withheld`]) — the one the group's
+/// `OfflineStoreStatus` is reported from ([`offline_store_status`]) and the one the data plane
+/// makes each record write under — so the reason a group failed, the status it reports and the
+/// objects its store holds cannot disagree.
+///
+/// Only what IAM and Amazon S3 ESTABLISHED fails a group: a role this emulator's IAM holds
+/// nothing under, and a bucket carrying no policy, establish nothing, so such a group is created
+/// healthy.
+///
+/// Nothing is written and no store guard is held: the questions are awaited.
+pub async fn offline_store_creation_failure_reason(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    offline_store_config: Option<&crate::ops::types::OfflineStoreConfig>,
+    role_arn: Option<&str>,
+) -> Option<String> {
+    let config = offline_store_config?;
+    let role_arn = role_arn?;
+    let storage = &config.s3_storage_config;
+    // The resolved output path is what the records are written under, so it is the location
+    // the permission is asked about; a create whose `S3Uri` resolved none falls back to that
+    // `S3Uri`, which is then the only location the group has.
+    let resolved = storage
+        .resolved_output_s3_uri
+        .as_deref()
+        .unwrap_or(storage.s3_uri.as_str());
+    let location =
+        ::service_common::feature_store_offline_store::OfflineStoreLocation::parse(resolved)?;
+    // The key every record object of this group is written under, which is the key the group's
+    // own status is decided for as well.
+    let key = ::service_common::feature_store_offline_store::status_key(&location);
+    ::service_common::feature_store_offline_store::write_is_withheld(
+        ctx.callback(),
+        region,
+        role_arn,
+        &location,
+        &key,
+    )
+    .await
+    .then(|| offline_store_creation_failure(role_arn, &storage.s3_uri))
+}
+
 /// The `ThroughputMode` a feature group runs under when its create stated no
 /// `ThroughputConfig`: the mode that bills per read and write and needs no stated
 /// capacity ("With on-demand mode, you are charged for data reads and writes that your
@@ -171,6 +254,22 @@ pub fn feature_group_not_deletable(name: &str, status: &str) -> String {
     )
 }
 
+/// How SageMaker words a refusal to update a feature group that is not provisioned: the
+/// `Validation Error:` prefix, the group's name, and the status that stands in the way —
+/// reported in the upper case this message spells a `FeatureGroupStatus` in, exactly as
+/// [`feature_group_not_deletable`] words the same fact for a delete.
+///
+/// A group whose creation FAILED carries no provisioned schema or store for an update to
+/// change, so there is nothing for this call to apply to; the remedy is to delete it and
+/// create it again.
+pub fn feature_group_not_updatable(name: &str, status: &str) -> String {
+    format!(
+        "Validation Error: FeatureGroup with name {name} cannot be updated, because \
+         FeatureGroupStatus is '{}'.",
+        status.to_uppercase()
+    )
+}
+
 /// The feature names a `FeatureGroup` may not declare, from `FeatureDefinitions`' own
 /// doc: "FeatureNames cannot be any of the following: is_deleted, write_time,
 /// api_invocation_time" — Feature Store writes those three columns itself.
@@ -196,6 +295,12 @@ pub struct FeatureGroup {
     pub description: Option<String>,
     pub tags: Vec<Tag>,
     pub status: String,
+    /// Why this group's offline store could not be created, recorded by the create that
+    /// resolved it ([`offline_store_creation_failure_reason`]); `None` for a group whose
+    /// store nothing failed. It is what the group's `FailureReason` reports and what makes
+    /// its status settle `CreateFailed` rather than `Created`
+    /// ([`FeatureGroup::settle_status`]).
+    pub failure_reason: Option<String>,
     pub creation_time: SystemTime,
     pub last_modified_time: SystemTime,
     /// WHEN the `Created` status falls due, not when the group was created — that is
@@ -210,7 +315,9 @@ pub struct FeatureGroup {
 }
 
 impl FeatureGroup {
-    /// Materialise the `Creating` -> `Created` transition the clock already owes.
+    /// Materialise the `Creating` -> `Created` transition the clock already owes — or the
+    /// `Creating` -> `CreateFailed` one, for a group whose offline store could not be
+    /// created ([`Self::failure_reason`]).
     ///
     /// The one write a reporting operation may make, for the reason spelled out on
     /// [`Endpoint::settle_status`]: the transition was due at `created_due_at` whether or
@@ -219,11 +326,36 @@ impl FeatureGroup {
     /// Answers whether the transition happened on this call, so the caller can record it.
     pub fn settle_status(&mut self, now: SystemTime) -> bool {
         if self.status == FEATURE_GROUP_STATUS_CREATING && now >= self.created_due_at {
-            self.status = FEATURE_GROUP_STATUS_CREATED.to_string();
+            self.status = if self.failure_reason.is_some() {
+                FEATURE_GROUP_STATUS_CREATE_FAILED.to_string()
+            } else {
+                FEATURE_GROUP_STATUS_CREATED.to_string()
+            };
             self.last_modified_time = self.created_due_at;
             return true;
         }
         false
+    }
+
+    /// This group's `FailureReason` as a reader reports it: the reason its offline store
+    /// could not be created, once the clock has SETTLED the group into
+    /// [`FEATURE_GROUP_STATUS_CREATE_FAILED`].
+    ///
+    /// "The reason that the `FeatureGroup` failed to be replicated in the `OfflineStore`"
+    /// (`DescribeFeatureGroup$FailureReason`) is a fact about a failure that has HAPPENED, so
+    /// a group still being created reports none even where the create already resolved what
+    /// will fail it.
+    pub fn reported_failure_reason(&self) -> Option<String> {
+        (self.status == FEATURE_GROUP_STATUS_CREATE_FAILED)
+            .then(|| self.failure_reason.clone())
+            .flatten()
+    }
+
+    /// Whether this group's creation FAILED, so it holds no provisioned store or schema: the
+    /// state every mutation of a group refuses ([`feature_group_not_updatable`]) and the one
+    /// a client resolves by deleting the group.
+    pub fn creation_failed(&self) -> bool {
+        self.status == FEATURE_GROUP_STATUS_CREATE_FAILED
     }
 
     /// Start the deletion `DeleteFeatureGroup` asked for: the group reports `Deleting`,

@@ -69,6 +69,9 @@ impl Emulator {
                 // Online-only feature groups: no offline store to replicate into.
                 offline_store: None,
                 default_ttl_seconds,
+                // A group this harness registers is one the control plane created
+                // successfully.
+                creation_failed: false,
             });
     }
 

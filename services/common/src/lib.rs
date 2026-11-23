@@ -714,6 +714,10 @@ pub mod ssm_client;
 /// The ONE read of an Amazon S3 object a service was pointed at, and the ONE reading of
 /// what the object store's answer about it established, over that same hop.
 pub mod s3_object_read;
+/// The ONE reading of whether the permissions in force allow an Amazon S3 call a service makes
+/// UNDER a caller-supplied role: the destination bucket's own policy and the role's
+/// identity-based policies, weighed the way IAM weighs the two within one account.
+pub mod s3_object_authorization;
 /// The ONE delivery of a recorded management call into the bucket of each trail that logs
 /// it — the gzipped log file an audit pipeline reads — so the layout and the framing are
 /// stated once rather than per service.

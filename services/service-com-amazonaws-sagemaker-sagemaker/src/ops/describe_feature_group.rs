@@ -271,9 +271,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "A value indicating whether the update made to the feature group was
             // successful": absent until an update has been made to this group.
             last_update_status: None,
-            // Only set when the group failed to be created in, or deleted from, the
-            // OfflineStore; neither happens to a group this emulator holds.
-            failure_reason: None,
+            // "The reason that the FeatureGroup failed to be replicated in the
+            // OfflineStore. This is failure can occur because: The FeatureGroup could not be
+            // created in the OfflineStore": reported once the clock has settled a group whose
+            // offline store could not be created into `CreateFailed`
+            // (`crate::state::FeatureGroup::reported_failure_reason`), and absent for every
+            // group nothing failed.
+            failure_reason: group.reported_failure_reason(),
             description: group.description.clone(),
             // "A token to resume pagination of the list of Features": a FeatureGroup
             // holds at most the modelled 2,500 `FeatureDefinitions`, which is also the

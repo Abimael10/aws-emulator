@@ -90,6 +90,7 @@ impl Emulator {
                 online_store_enabled,
                 offline_store: None,
                 default_ttl_seconds: None,
+                creation_failed: false,
             });
     }
 

@@ -1013,6 +1013,11 @@ pub enum Unresolved {
 /// OfflineStore where it has one ([`offline_store`]), so a write leaves the online store
 /// alone and answers success — exactly as a write whose `TargetStores` names only the
 /// OfflineStore does.
+///
+/// A group whose CREATION FAILED is refused here for every operation, read and write alike
+/// ([`feature_group_creation_failed`]): the control plane could not create the store it was
+/// asked for, so the group holds nothing this data plane could serve and nothing it could
+/// persist to.
 pub fn resolve_group<Eng: Send + Sync + 'static>(
     engine: &Eng,
     region: &str,
@@ -1023,11 +1028,31 @@ pub fn resolve_group<Eng: Send + Sync + 'static>(
     };
     let held = directory.lock().get(name_or_arn).cloned();
     match held {
+        Some(group) if group.creation_failed => Err(Unresolved::Refused(
+            feature_group_creation_failed(&group.name),
+        )),
         Some(group) => Ok(group),
         None => Err(Unresolved::Refused(no_such_feature_group(
             &feature_group_arn(region, name_or_arn),
         ))),
     }
+}
+
+/// How this data plane refuses a call on a feature group whose CREATION FAILED: the group
+/// is named as the request named it, then the status that stands in the way — reported in
+/// the upper case a `FeatureGroupStatus` is spelled in here, the same shape
+/// [`no_online_store`] gives the other fact about a group that cannot serve a call.
+///
+/// A group in that status holds no provisioned store: "The FeatureGroup could not be
+/// created in the OfflineStore" (`DescribeFeatureGroup$FailureReason`), so neither a record
+/// write nor a record read can be served, and the remedy is to delete the group and create
+/// it again. Stated once, for every operation of this service, and carried in the modelled
+/// `ValidationError` (HTTP 400) the way every other request-level refusal here is.
+pub fn feature_group_creation_failed(group: &str) -> String {
+    format!(
+        "Validation Error: FeatureGroup {group} cannot be used, because FeatureGroupStatus \
+         is 'CREATE_FAILED'."
+    )
 }
 
 /// How this data plane states a `FeatureGroupName` that denotes no feature group: the

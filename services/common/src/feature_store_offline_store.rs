@@ -255,17 +255,40 @@ fn calendar(at: SystemTime) -> Option<::chrono::DateTime<::chrono::Utc>> {
     ::chrono::DateTime::from_timestamp(seconds, 0)
 }
 
-/// Whether IAM ANSWERED that the role `role_arn` may NOT write the object `key` of
-/// `location`.
+/// The service principal a feature group's offline store is written by, from
+/// `CreateFeatureGroup$RoleArn`'s own doc ("the IAM execution role used to persist data into
+/// the OfflineStore"): SageMaker makes the write, so a bucket policy written to open a bucket
+/// to the service names this principal.
+const SERVICE_PRINCIPAL: &str = "sagemaker.amazonaws.com";
+
+/// Whether the permissions in force do NOT allow the role `role_arn` to write the object
+/// `key` of `location`.
 ///
 /// The write is made UNDER the feature group's own role — "the IAM execution role used to
-/// persist data into the OfflineStore" — so it is that role's permissions that decide it,
-/// not the calling client's. The question is put to IAM itself, through the tree's one
-/// route to that answer ([`crate::iam_role::role_withholds_action_through`]), which is why
-/// everything that is not such an answer (a value naming no role of this account, a role
-/// this emulator's IAM holds nothing under, no IAM to ask at all) withholds nothing: an
-/// execution role is routinely provisioned out of band, so its absence here is evidence
-/// about this store and not about the role's permissions.
+/// persist data into the OfflineStore" — so it is that role's permissions that decide it, not
+/// the calling client's, and TWO documents are in force on it: that role's identity-based
+/// policies and the destination bucket's own policy. Within one account IAM weighs them
+/// together — an explicit `Deny` from either side refuses, an `Allow` from EITHER grants, and
+/// a write neither allows falls to the implicit deny ([`crate::iam_authorization::is_allowed`])
+/// — so a bucket whose policy grants the role takes the write even where the role's own
+/// policies say nothing about it, and a bucket that denies it takes nothing however much the
+/// role allows.
+///
+/// What the ROLE's documents say is put to IAM itself, and what the destination BUCKET's own
+/// policy says is decided by this crate's one evaluation of a policy document — both through
+/// the one shared reading of an Amazon S3 call made under a caller-supplied role
+/// ([`crate::s3_object_authorization`]), so this module states only WHICH action, WHICH location
+/// and WHICH principal spellings the offline store's write is decided for. Everything that is
+/// not an answer (a value naming no role of this account, a role this emulator's IAM holds
+/// nothing under, a bucket with no policy, no IAM to ask at all) establishes nothing: an
+/// execution role is routinely provisioned out of band, so its absence here is evidence about
+/// this store and not about the role's permissions.
+///
+/// ONE question for every plane that asks it: the control plane decides from it whether a
+/// feature group's offline store could be SET UP at all (and so whether the group's creation
+/// fails) and reports the group's `OfflineStoreStatus` from it, and the data plane makes each
+/// record write under it — so the status a group reports, the reason its creation failed and
+/// the objects the store holds cannot disagree.
 pub async fn write_is_withheld(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     region: &str,
@@ -273,16 +296,33 @@ pub async fn write_is_withheld(
     location: &OfflineStoreLocation,
     key: &str,
 ) -> bool {
-    let partition = crate::arn::parse(role_arn).map_or(DEFAULT_PARTITION, |parsed| parsed.partition);
+    let partition = partition_of(role_arn);
     let object_arn = location.object_arn(partition, key);
-    crate::iam_role::role_withholds_action_through(
+    let document = crate::s3_object_authorization::bucket_policy_document(
+        callback,
+        region,
+        &location.bucket,
+    )
+    .await;
+    crate::s3_object_authorization::call_decision(
         callback,
         region,
         role_arn,
+        // The spelling a bucket policy written to open a bucket to the SERVICE names the
+        // writer by, beside the role's own ARN.
+        &[SERVICE_PRINCIPAL.to_string()],
+        document.as_deref(),
         WRITE_ACTION,
         &object_arn,
     )
     .await
+    .is_some_and(|said| said != crate::iam_authorization::Decision::Allowed)
+}
+
+/// The partition an Amazon S3 ARN of this store carries: the one the role's own ARN names, and
+/// [`DEFAULT_PARTITION`] for a value this emulator cannot read one out of.
+fn partition_of(role_arn: &str) -> &str {
+    crate::arn::parse(role_arn).map_or(DEFAULT_PARTITION, |parsed| parsed.partition)
 }
 
 /// The key the STATUS of an offline store is decided for: every object a record ingestion
