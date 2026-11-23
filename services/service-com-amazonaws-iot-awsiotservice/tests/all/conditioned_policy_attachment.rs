@@ -16,19 +16,20 @@
 //! resource; the document is then reported verbatim by every reader of it (`GetPolicy`, and
 //! `GetEffectivePolicies` for the principal the pair was recorded for), and its conditions
 //! decide every authorization question asked about that principal: a clause over a key the
-//! question carries no value for does not hold, so an `Allow` so conditioned grants nothing
-//! and the key is reported under `missingContextValues`, while the same `Allow` carrying no
-//! condition, a negated clause, or one spelled to hold in the key's absence, grants it. A
-//! pair is still only ever recorded for resources that exist, so the IoT error classes
-//! refuse an unknown policy name and an unknown target.
+//! simulated connection's authorizer does not answer for cannot be decided, so an `Allow`
+//! so conditioned grants nothing and the key is reported under `missingContextValues`,
+//! while the same `Allow` carrying no condition, or one over a key the authorizer does
+//! answer for and whose value satisfies it, grants it. A pair is still only ever recorded
+//! for resources that exist, so the IoT error classes refuse an unknown policy name and an
+//! unknown target.
 //!
 //! The tables span the class the rule generalises over rather than one recorded request:
 //! the condition operators the policy language groups by family (string equality, string
 //! wildcard, string negation, the absence-tolerant spelling, address and ARN comparison and
 //! the boolean), the global condition keys those clauses are written over, values that name
 //! a resource of another service in each of its published id forms, each target form the
-//! modelled member documents, and a key the question DOES carry a value for, both matching
-//! and not.
+//! modelled member documents, and a key the authorizer DOES answer for, both matching and
+//! not.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -604,10 +605,10 @@ struct Question {
 }
 
 /// The conditions of an attached policy DECIDE every question asked about the principal it
-/// is attached to: a clause over a key the question carries no value for does not hold, so
-/// the `Allow` grants nothing and the key is named under `missingContextValues`; a clause
-/// over a key the question DOES carry is decided against that value and names no missing
-/// key; and an unconditioned, negated or absence-tolerant clause grants the question.
+/// is attached to: a clause over a key the authorizer does not answer for the simulated
+/// connection cannot be decided at all, so the `Allow` grants nothing and the key is named
+/// under `missingContextValues`; a clause over a key it DOES answer for is decided against
+/// that value and names no missing key; and an unconditioned statement grants the question.
 #[tokio::test]
 async fn the_conditions_of_an_attached_policy_decide_every_question() {
     // The key a `TestAuthorization` question carries a value for is the MQTT client id
@@ -644,14 +645,18 @@ async fn the_conditions_of_an_attached_policy_decide_every_question() {
             decision: "IMPLICIT_DENY",
             missing: vec!["aws:SourceVpce"],
         },
+        // A key the authorizer does not answer for is undecidable whatever the operator's
+        // polarity or spelling: a negated comparison over it is no more decidable than the
+        // positive one, and neither is the absence-tolerant spelling, because the
+        // authorizer cannot say the key is absent — only that it has no answer for it.
         Question {
             label: "string negation over the source VPC endpoint",
             condition: Some(json!({
                 "StringNotEquals": { "aws:SourceVpce": "vpce-0a1b2c3d4e5f67890" },
             })),
             client_id: None,
-            decision: "ALLOWED",
-            missing: Vec::new(),
+            decision: "IMPLICIT_DENY",
+            missing: vec!["aws:SourceVpce"],
         },
         Question {
             label: "the absence-tolerant spelling over the source VPC endpoint",
@@ -659,8 +664,8 @@ async fn the_conditions_of_an_attached_policy_decide_every_question() {
                 "StringEqualsIfExists": { "aws:SourceVpce": "vpce-0a1b2c3d4e5f67890" },
             })),
             client_id: None,
-            decision: "ALLOWED",
-            missing: Vec::new(),
+            decision: "IMPLICIT_DENY",
+            missing: vec!["aws:SourceVpce"],
         },
         Question {
             label: "string equality over the source VPC",
@@ -671,12 +676,15 @@ async fn the_conditions_of_an_attached_policy_decide_every_question() {
             decision: "IMPLICIT_DENY",
             missing: vec!["aws:SourceVpc"],
         },
+        // The address the request was made from IS answered for, so an address clause is
+        // compared against it: a range the question is outside of is a plain non-match and
+        // names no missing key.
         Question {
             label: "address comparison over the source address range",
             condition: Some(json!({ "IpAddress": { "aws:SourceIp": "203.0.113.0/24" } })),
             client_id: None,
             decision: "IMPLICIT_DENY",
-            missing: vec!["aws:SourceIp"],
+            missing: Vec::new(),
         },
         Question {
             label: "ARN comparison over another service's resource",

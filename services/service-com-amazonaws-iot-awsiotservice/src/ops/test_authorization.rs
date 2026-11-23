@@ -10,8 +10,11 @@
 //!
 //! One `authInfo` is one question — an `actionType` and the resources the principal is
 //! being authorized for — and one `AuthResult` is its answer, in the order the request
-//! asked them, so a caller reads `authResults[i]` as the answer to `authInfos[i]`. Each
-//! question is decided against the policies in EFFECT for the principal:
+//! asked them, so a caller reads `authResults[i]` as the answer to `authInfos[i]`. The
+//! answers stop at the first question that cannot be DECIDED — one whose statements are
+//! conditioned on a key the authorizer does not answer for the simulated connection — so
+//! every entry a caller reads is a question this evaluation reached. Each question is
+//! decided against the policies in EFFECT for the principal:
 //!
 //! * `principal` — a certificate ARN, a thing group ARN or a Cognito identity, resolved
 //!   against this account's state the way every other reader of a policy target resolves
@@ -33,9 +36,10 @@
 //! [`crate::state::policy_evaluation`]): a statement is about the question only when it
 //! names the action and matches the resource, an explicit `Deny` among those overrides
 //! every `Allow`, and a question the documents state nothing about is an implicit deny.
-//! What is IoT's own — which policy action each `ActionType` asks about, and why the
-//! `topicfilter/` and `topic/` resource namespaces then decide a question on their own —
-//! is [`crate::state::policy_evaluation`]'s to say.
+//! What is IoT's own — which policy action each `ActionType` asks about, why the
+//! `topicfilter/` and `topic/` resource namespaces then decide a question on their own, and
+//! which condition keys the authorizer answers for the connection being simulated — is
+//! [`crate::state::policy_evaluation`]'s to say.
 //!
 //! ---
 //!
@@ -159,9 +163,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // Every policy a decision names carries the ARN minted when it was created, and
-        // nothing here is minted, so the answer needs no request metadata of its own.
-        let _ = ctx;
-
+        // nothing here is minted, so the only request metadata a decision needs is the
+        // CONNECTION the question is simulated over, read off `ctx.parts()` below.
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             TestAuthorizationErrorModeled::InternalFailureException(InternalFailureException {
                 message: Some("the IoT emulator has no state store attached".to_string()),
@@ -271,49 +274,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store.policies_in_effect(&scope, &treat_as_attached, &treat_as_detached)
         };
 
-        // The context the connection being authorized is simulated with: `clientId` is
-        // "The MQTT client ID", the value a policy variable and a condition name the
-        // connecting client by. It is the WHOLE context of the simulated connection — a key
-        // it does not carry is one the question carries no value for, which is what a
-        // statement conditioned on that key is decided, and reported as missing, from.
-        let context: Vec<(String, String)> = input
-            .client_id
-            .as_deref()
-            .map(|client_id| {
-                vec![(
-                    crate::state::CLIENT_ID_CONTEXT_KEY.to_string(),
-                    client_id.to_string(),
-                )]
-            })
-            .unwrap_or_default();
+        // The context the connection being authorized is simulated with: the keys the
+        // device gateway's authorizer answers for that connection — the MQTT client ID the
+        // request names and the address the request was made from. A key it does not answer
+        // for is one no statement conditioned on it can be decided from, which is what such
+        // a statement decides nothing from and what the decision reports as missing
+        // ([`crate::state::SimulatedConnection`]).
+        let connection =
+            crate::state::SimulatedConnection::of(input.client_id.as_deref(), ctx.parts());
 
-        let auth_results = input
-            .auth_infos
-            .iter()
-            .zip(questions)
-            .map(|(auth_info, action)| {
-                let decided = crate::state::evaluate_authorization(
-                    &policies,
-                    action,
-                    &auth_info.resources,
-                    &context,
-                );
-                AuthResult {
-                    // "Authorization information": the question this result answers, so a
-                    // caller reading one result knows what it decided.
-                    auth_info: Some(auth_info.clone()),
-                    // "A list of policies that allowed the authentication" — present
-                    // whatever the decision, and empty unless the decision IS allowed:
-                    // nothing allowed an authorization that was denied.
-                    allowed: Some(Allowed {
-                        policies: Some(reported_policies(decided.allowed.clone())),
-                    }),
-                    denied: Some(denied(&decided)),
-                    auth_decision: Some(decided.decision.to_string()),
-                    missing_context_values: Some(decided.missing_context_values),
-                }
-            })
-            .collect();
+        // One question is one `AuthResult`, in the order the request asked them — up to the
+        // first question that cannot be DECIDED. A question whose policies are conditioned
+        // on a key the authorizer does not answer for has no verdict to report, and the
+        // batch stops there rather than answering the questions behind it: what a caller
+        // reads then is the one undecidable answer and the key it must supply, and never a
+        // verdict for a question this evaluation never reached.
+        let mut auth_results: Vec<AuthResult> = Vec::with_capacity(input.auth_infos.len());
+        for (auth_info, action) in input.auth_infos.iter().zip(questions) {
+            let decided = crate::state::evaluate_authorization(
+                &policies,
+                action,
+                &auth_info.resources,
+                &connection,
+            );
+            let undecidable = !decided.missing_context_values.is_empty();
+            auth_results.push(AuthResult {
+                // "Authorization information": the question this result answers, so a
+                // caller reading one result knows what it decided.
+                auth_info: Some(auth_info.clone()),
+                // "A list of policies that allowed the authentication" — present
+                // whatever the decision, and empty unless the decision IS allowed:
+                // nothing allowed an authorization that was denied.
+                allowed: Some(Allowed {
+                    policies: Some(reported_policies(decided.allowed.clone())),
+                }),
+                denied: Some(denied(&decided)),
+                auth_decision: Some(decided.decision.to_string()),
+                missing_context_values: Some(decided.missing_context_values),
+            });
+            if undecidable {
+                break;
+            }
+        }
 
         Ok(TestAuthorizationOutput {
             auth_results: Some(auth_results),

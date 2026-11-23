@@ -3378,8 +3378,9 @@ pub use name_listing::{name_listing_row, name_listing_row_name, name_listing_row
 pub mod policy_evaluation;
 pub use policy_evaluation::{
     evaluate_authorization, iot_action_for_action_type, AuthorizationDecision, PolicyInEffect,
-    PolicyReference, AUTH_DECISION_ALLOWED, AUTH_DECISION_EXPLICIT_DENY,
+    PolicyReference, SimulatedConnection, AUTH_DECISION_ALLOWED, AUTH_DECISION_EXPLICIT_DENY,
     AUTH_DECISION_IMPLICIT_DENY, CLIENT_ID_CONTEXT_KEY, MAX_AUTHORIZED_RESOURCES,
+    SOURCE_IP_CONTEXT_KEY,
 };
 
 // WHICH resource of this account a caller-supplied `resourceArn` names, and WHERE that
