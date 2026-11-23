@@ -12,7 +12,8 @@
 //! "specif[ies] whether to rollback the documentation importation (true) or not (false)
 //! WHEN A WARNING IS ENCOUNTERED". What a documentation import warns about is what the
 //! OpenAPI document it reads does not hold together — a `$ref` naming a model the document
-//! does not declare — so for such a body the flag decides between the modelled 400 stating
+//! does not declare, and every media type whose model that reference was to name — so for
+//! such a body the flag decides between the modelled 400 stating
 //! every warning (with the API's documentation set left exactly as it was) and an import
 //! carried out that REPORTS them; for a body that earns none it decides nothing, the import
 //! being carried out and leaving the same documentation set whichever way the flag and the
@@ -235,11 +236,10 @@ async fn fail_on_warnings_decides_nothing_for_a_body_that_warns_about_nothing() 
 async fn a_model_reference_the_document_does_not_resolve_is_what_fail_on_warnings_refuses() {
     // The documentation set travels in an OpenAPI document ("to import from an OpenAPI
     // file, this is a JSON object"), so what the import warns about is what that DOCUMENT
-    // does not hold together: a `$ref` naming a model it does not declare names no model.
-    // What such a reference costs a DEFINITION import besides the model — the format a
-    // method would have read that media type under — is not reported here, because this
-    // import creates no methods; the reference reader itself is the definition importer's,
-    // so one document earns one set of reference warnings whichever import reads it. The
+    // does not hold together: a `$ref` naming a model it does not declare names no model,
+    // and every media type whose model it was to name is left with no format the method
+    // could read it under. The reader is the definition importer's, so one document earns
+    // one set of warnings — in one order — whichever import reads it. The
     // rows differ along the spelling of the reference (OpenAPI 3's `content` map and
     // Swagger 2.0's bare `schema`), along where it sits (a response and a request body),
     // along the media type and the verb it is declared for, and along a reference that
@@ -275,6 +275,7 @@ async fn a_model_reference_the_document_does_not_resolve_is_what_fail_on_warning
             warnings: &[
                 "Reference to model 'DoesNotExist' not found. Ignoring.",
                 "Reference to model 'DoesNotExist' not found. Ignoring.",
+                "Invalid format for model application/json for method GET",
             ],
             documents: vec![entry(
                 json!({ "type": "RESPONSE", "path": "/", "method": "GET", "statusCode": "200" }),
@@ -296,6 +297,7 @@ async fn a_model_reference_the_document_does_not_resolve_is_what_fail_on_warning
             warnings: &[
                 "Reference to model 'Absent' not found. Ignoring.",
                 "Reference to model 'Absent' not found. Ignoring.",
+                "Invalid format for model application/xml for method POST",
             ],
             documents: vec![entry(
                 json!({ "type": "RESPONSE", "path": "/orders", "method": "POST", "statusCode": "201" }),
@@ -313,7 +315,10 @@ async fn a_model_reference_the_document_does_not_resolve_is_what_fail_on_warning
                     "schema": { "$ref": "#/definitions/Gone" },
                 } } } } },
             }),
-            warnings: &["Reference to model 'Gone' not found. Ignoring."],
+            warnings: &[
+                "Reference to model 'Gone' not found. Ignoring.",
+                "Invalid format for model application/json for method GET",
+            ],
             documents: vec![entry(
                 json!({ "type": "RESPONSE", "path": "/", "method": "GET", "statusCode": "200" }),
                 "ok",
@@ -329,7 +334,10 @@ async fn a_model_reference_the_document_does_not_resolve_is_what_fail_on_warning
                     "schema": { "$ref": "shared.json#/definitions/Thing" },
                 } } } } },
             }),
-            warnings: &["Reference to model 'Thing' not found. Ignoring."],
+            warnings: &[
+                "Reference to model 'Thing' not found. Ignoring.",
+                "Invalid format for model application/json for method GET",
+            ],
             documents: vec![entry(
                 json!({ "type": "RESPONSE", "path": "/", "method": "GET", "statusCode": "200" }),
                 "ok",

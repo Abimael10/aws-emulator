@@ -1186,23 +1186,13 @@ fn read_definition(document: &Node, scope: &ImportScope) -> Result<ImportedDefin
     definition.gateway_responses =
         imported_gateway_responses(document, scope, &mut definition.warnings);
 
-    // The references the document does not resolve. A `$ref` names the model a part of
-    // the document stands for, and one whose target the document does not declare — or
-    // whose target is outside the document altogether — names no model an import could
-    // carry over, so it is reported rather than silently dropped.
-    for warning in model_reference_warnings(document) {
+    // What the DOCUMENT itself does not hold together ([`document_warnings`]): a `$ref`
+    // whose target the document does not declare — or whose target is outside the document
+    // altogether — names no model an import could carry over, so it is reported rather
+    // than silently dropped, and so is the format each method is left without once that
+    // model resolved to nothing. The same reader every import of this document uses.
+    for warning in document_warnings(document) {
         warn(&mut definition.warnings, warning);
-    }
-    // And what THIS import loses with it: a method's body is read under the model the
-    // schema reference names, so a reference that resolves to nothing leaves the method
-    // with no format for that media type. Reported here rather than beside the reference
-    // above, because it is about the METHODS this import creates — which a documentation
-    // import, reading the same document through the same reader, creates none of.
-    for (media_type, verb) in unreadable_body_formats(document) {
-        warn(
-            &mut definition.warnings,
-            format!("Invalid format for model {media_type} for method {verb}"),
-        );
     }
 
     // The security schemes the document declares. API Gateway carries one over as an
@@ -1524,6 +1514,30 @@ pub fn warnings_refusal(warnings: &[String]) -> String {
     message
 }
 
+/// Every diagnostic the DOCUMENT itself earns, in the order an import reports them: one
+/// line per PLACE an unresolvable model reference is resolved
+/// ([`model_reference_warnings`]), then one line per media type and method the reference
+/// left with no readable format ([`unreadable_body_formats`]).
+///
+/// What an import warns about is what the document it read does not hold together, and a
+/// document is read the same way whichever import reads it: `PutRestApi`, `ImportRestApi`
+/// and `ImportDocumentationParts` all take "a JSON object" of the one OpenAPI shape, so one
+/// document earns one set of warnings — in one order — whichever of them reads it, and
+/// `failOnWarnings` states that same set.
+///
+/// Bounded exactly as each reader is: a document cannot earn more warnings than a response
+/// carries ([`crate::state::MAX_COLLECTION_ENTRIES`]).
+pub fn document_warnings(document: &Node) -> Vec<String> {
+    let mut warnings = model_reference_warnings(document);
+    for (media_type, verb) in unreadable_body_formats(document) {
+        warn(
+            &mut warnings,
+            format!("Invalid format for model {media_type} for method {verb}"),
+        );
+    }
+    warnings
+}
+
 /// The warnings a document earns for the MODEL REFERENCES it does not itself resolve, in
 /// document order and one per PLACE the import resolves each of them.
 ///
@@ -1538,13 +1552,11 @@ pub fn warnings_refusal(warnings: &[String]) -> String {
 /// type that declares its model by it ([`media_type_bindings`]), which is why a document
 /// declaring one unresolvable schema under a media type earns the sentence twice.
 ///
-/// `pub` because `ImportDocumentationParts` reads the same OpenAPI document — its `body`
-/// is "a JSON object" of the same shape, carrying the documentation set in an extension of
-/// it — and reports the same condition, so neither importer can word it differently. What
-/// is NOT here is what an import loses BESIDE the model ([`unreadable_body_formats`]):
-/// that is about the methods a definition import creates, which a documentation import
-/// creates none of.
-pub fn model_reference_warnings(document: &Node) -> Vec<String> {
+/// This is HALF of what a document earns for such a reference: what the import loses
+/// BESIDE the model ([`unreadable_body_formats`]) follows it. Every caller reads the two
+/// together through [`document_warnings`], which is why this reader is private to this
+/// module.
+fn model_reference_warnings(document: &Node) -> Vec<String> {
     // Counted ONCE for the whole document rather than per reference, so reporting costs
     // the document once however many references it carries.
     let bindings = media_type_bindings(document);

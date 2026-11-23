@@ -15,10 +15,11 @@
 //! The import is ALL-OR-NOTHING: an entry this service cannot store refuses the whole
 //! body with the modelled 400 and leaves the API's documentation set exactly as it was.
 //! What it WARNS about is what the document it read does not hold together — a `$ref`
-//! naming a model the document does not declare — read and worded by the definition
-//! importer's own reader ([`import_warnings`]), so one document earns one set of warnings
-//! whichever import reads it. `failOnWarnings` turns that set into the modelled 400 before
-//! anything is stored, and an import carried out reports it in `warnings` instead.
+//! naming a model the document does not declare, and every media type whose model that
+//! reference was to name — read and worded by the definition importer's own reader
+//! ([`import_warnings`]), so one document earns one set of warnings whichever import reads
+//! it. `failOnWarnings` turns that set into the modelled 400 before anything is stored, and
+//! an import carried out reports it in `warnings` instead.
 //!
 //! ## Shape of an operation
 //!
@@ -107,7 +108,7 @@ use crate::state::DocumentationPartEntry;
 
 use super::create_documentation_part::{location_key, validated_location, validated_properties};
 use super::put_rest_api::{
-    model_reference_warnings, put_mode, warnings_refusal, Node, PutModeKind, OPERATION_KEYS,
+    document_warnings, put_mode, warnings_refusal, Node, PutModeKind, OPERATION_KEYS,
 };
 
 /// The OpenAPI extension API Gateway carries a documentation set in, and the member of
@@ -789,10 +790,11 @@ fn import_errors(problem: &str) -> String {
 /// The body is an OpenAPI document ("To import from an OpenAPI file, this is a JSON
 /// object", `ImportDocumentationParts$body`) carrying the documentation set in an
 /// extension of it, so what an import warns about is what that DOCUMENT does not hold
-/// together: a `$ref` naming a model the document does not declare names no model, and the
-/// part of the document carrying it is passed over. The reader and the wording are the
-/// definition importer's ([`model_reference_warnings`]), so the same document earns the
-/// same warnings whichever import reads it.
+/// together: a `$ref` naming a model the document does not declare names no model, and
+/// every media type whose model it was to name is then left with no format the method
+/// could read it under. The reader and the wording are the definition importer's
+/// ([`document_warnings`]), so the same document earns the same warnings — in the same
+/// order — whichever import reads it.
 ///
 /// The document is read again as a definition NODE rather than from the value the
 /// documentation set was read out of: the reference walk is bounded and shared with that
@@ -801,7 +803,7 @@ fn import_errors(problem: &str) -> String {
 /// can otherwise perform.
 fn import_warnings(body: &[u8]) -> Vec<String> {
     match ::serde_json::from_slice::<Node>(body) {
-        Ok(document) => model_reference_warnings(&document),
+        Ok(document) => document_warnings(&document),
         Err(_) => Vec::new(),
     }
 }
