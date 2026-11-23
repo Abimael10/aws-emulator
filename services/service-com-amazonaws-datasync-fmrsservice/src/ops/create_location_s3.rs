@@ -213,13 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .await
         {
             return Err(CreateLocationS3ErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    message: Some(format!(
-                        "Datasync bucket access test failed: no such bucket {bucket} exists."
-                    )),
-                    error_code: None,
-                    datasync_error_code: None,
-                },
+                crate::state::transfer::bucket_absent_refusal(&bucket),
             )
             .into());
         }
@@ -239,16 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .await
         {
             return Err(CreateLocationS3ErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    message: Some(format!(
-                        "DataSync location access test failed: could not perform \
-                         s3:ListObjectsV2 on bucket {bucket}. Access denied. Ensure bucket \
-                         access role has {action} permission.",
-                        action = crate::state::transfer::BUCKET_LIST_ACTION,
-                    )),
-                    error_code: None,
-                    datasync_error_code: None,
-                },
+                crate::state::transfer::bucket_listing_denied_refusal(&bucket),
             )
             .into());
         }

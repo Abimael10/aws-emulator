@@ -44,7 +44,7 @@ use ::smithy_server_runtime::EmbeddedEmulator;
 use super::{
     ComAmazonawsDatasyncFmrsserviceState, ExecutionCounters, PhaseStatus, DEFAULT_REGION,
 };
-use crate::ops::types::{FilterRule, Options};
+use crate::ops::types::{FilterRule, InvalidRequestException, Options};
 
 /// The phase that resolves the locations and sizes up the work.
 const PREPARE_PHASE: u8 = 0;
@@ -211,6 +211,59 @@ pub async fn bucket_is_absent(
         Err(error) => error.as_service_error().is_some_and(
             ::aws_sdk_s3::operation::head_bucket::HeadBucketError::is_not_found,
         ),
+    }
+}
+
+/// The class discriminator DataSync reports when its bucket access test could not reach
+/// the bucket at all: the object store answered the probe that the bucket does not exist.
+///
+/// A refusal that reports what ANOTHER service answered carries that answer as its class,
+/// in the `<namespace><answer>` spelling this service names such a failure by — exactly as
+/// the assume-role gate before it carries the STS call it could not make
+/// ([`super::bucket_access_role::STS_ASSUME_ROLE_CODE`]). So a caller reads which side it
+/// has to fix — the bucket here, the role's trust policy there — off the one member every
+/// client failure of this service is classified by.
+const BUCKET_ABSENT_CODE: &str = "S3NoSuchBucket";
+
+/// The class discriminator for the other half of the bucket access test: the bucket is
+/// there, and the object store refused the listing DataSync acted under the bucket access
+/// role to make.
+///
+/// The same rule as [`BUCKET_ABSENT_CODE`] over the other answer the probe can get — a
+/// listing Amazon S3 will not serve this role is answered `AccessDenied`.
+const BUCKET_LISTING_DENIED_CODE: &str = "S3AccessDenied";
+
+/// The refusal a request that would store a location on a bucket the object store reports
+/// is not there earns: the bucket access test names the bucket it could not find.
+pub fn bucket_absent_refusal(bucket: &str) -> InvalidRequestException {
+    bucket_access_test_refusal(
+        BUCKET_ABSENT_CODE,
+        format!("Datasync bucket access test failed: no such bucket {bucket} exists."),
+    )
+}
+
+/// The refusal a request naming a bucket access role that is not allowed to list the
+/// bucket earns: the access test names the listing it could not perform and the permission
+/// the role is missing.
+pub fn bucket_listing_denied_refusal(bucket: &str) -> InvalidRequestException {
+    bucket_access_test_refusal(
+        BUCKET_LISTING_DENIED_CODE,
+        format!(
+            "DataSync location access test failed: could not perform s3:ListObjectsV2 on \
+             bucket {bucket}. Access denied. Ensure bucket access role has \
+             {BUCKET_LIST_ACTION} permission."
+        ),
+    )
+}
+
+/// One bucket access test refusal: the message of the test that failed, under the class
+/// discriminator BOTH code members of the modelled client error carry.
+fn bucket_access_test_refusal(code: &str, message: String) -> InvalidRequestException {
+    let code = Some(code.to_string());
+    InvalidRequestException {
+        message: Some(message),
+        error_code: code.clone(),
+        datasync_error_code: code,
     }
 }
 
