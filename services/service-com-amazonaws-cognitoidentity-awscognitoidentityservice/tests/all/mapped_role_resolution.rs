@@ -50,6 +50,11 @@ const OTHER_CLIENT_ID: &str = "otherclient22";
 /// A public login provider the fixture pool accepts, identified by its NAME alone.
 pub(crate) const PUBLIC_PROVIDER: &str = "graph.facebook.com";
 
+/// A SECOND public login provider the fixture pool accepts, so a mapping the pool stores can
+/// be keyed by a provider no login below is made under — a mapping is storable only for a
+/// provider the pool is configured with.
+pub(crate) const OTHER_PUBLIC_PROVIDER: &str = "accounts.google.com";
+
 /// One role of the fixture, by the two things a row needs: the ARN a mapping rule names it
 /// by and the NAME the assumed-role ARN of a session of it carries.
 pub(crate) struct Role {
@@ -110,8 +115,8 @@ fn trust_policy(audience: &str) -> Value {
 }
 
 /// A pool fronted by the user pool the rows present — through both of that user pool's app
-/// clients, so a mapping keyed by either is one the pool stores — accepting the public
-/// provider too and allowing unauthenticated identities, so every flow below is one it
+/// clients, so a mapping keyed by either is one the pool stores — accepting both public
+/// providers too and allowing unauthenticated identities, so every flow below is one it
 /// serves. Answers its minted `IdentityPoolId`.
 pub(crate) async fn pool(emulator: &Emulator, name: &str) -> String {
     let created = emulator
@@ -124,7 +129,10 @@ pub(crate) async fn pool(emulator: &Emulator, name: &str) -> String {
                     {"ProviderName": USER_POOL_PROVIDER, "ClientId": CLIENT_ID},
                     {"ProviderName": USER_POOL_PROVIDER, "ClientId": OTHER_CLIENT_ID},
                 ],
-                "SupportedLoginProviders": {PUBLIC_PROVIDER: "0123456789"},
+                "SupportedLoginProviders": {
+                    PUBLIC_PROVIDER: "0123456789",
+                    OTHER_PUBLIC_PROVIDER: "9876543210",
+                },
             }),
         )
         .await;
@@ -497,9 +505,11 @@ async fn the_mapping_that_decides_is_the_one_keyed_by_the_presented_login_s_prov
     }));
 
     // The rows differ along the KEY the one mapping is held under (the provider with the
-    // client the token names, with another client the pool stores, with one it does not, the
-    // provider name alone, another provider), the provider the login is made under, and
-    // whether the exchange presents a login at all.
+    // client the token names, with another client the pool stores, the provider name alone,
+    // another provider), the provider the login is made under, and whether the exchange
+    // presents a login at all. Every key is one the pool is CONFIGURED with: a mapping for a
+    // provider or app client the pool does not carry is refused rather than stored, which is
+    // `provider_configured_role_mappings`'s rule.
     let rows: Vec<(&str, String, Value, &Role)> = vec![
         (
             "keyed by the provider and the client the token names",
@@ -512,12 +522,6 @@ async fn the_mapping_that_decides_is_the_one_keyed_by_the_presented_login_s_prov
             USER_POOL_PROVIDER.to_string(),
             json!({USER_POOL_PROVIDER: &user_pool_token}),
             mapped,
-        ),
-        (
-            "keyed by the provider and a client the pool does not store",
-            format!("{USER_POOL_PROVIDER}:anotherclient"),
-            json!({USER_POOL_PROVIDER: &user_pool_token}),
-            authenticated,
         ),
         (
             "keyed by the provider and the pool's OTHER app client",
@@ -533,7 +537,7 @@ async fn the_mapping_that_decides_is_the_one_keyed_by_the_presented_login_s_prov
         ),
         (
             "keyed by a provider the login was not made under",
-            "accounts.google.com".to_string(),
+            OTHER_PUBLIC_PROVIDER.to_string(),
             json!({USER_POOL_PROVIDER: &user_pool_token}),
             authenticated,
         ),

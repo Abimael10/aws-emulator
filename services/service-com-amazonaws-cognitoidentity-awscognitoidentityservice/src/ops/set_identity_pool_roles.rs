@@ -10,9 +10,10 @@
 //! has to be a role of the caller's own account: a value naming another account's role, or
 //! naming no role at all, is refused `NotAuthorizedException` (HTTP 403) — the pass is
 //! decided about the value as the role of an account that is not this one rather than
-//! parsed as a parameter ([`crate::state::names_an_assumable_role`]). A role MAPPING that
-//! does not carry what the model documents as required for its `Type` is a bad input
-//! parameter, `InvalidParameterException` (HTTP 400). A `Roles` KEY outside the constraints
+//! parsed as a parameter ([`crate::state::names_an_assumable_role`]). A role MAPPING keyed
+//! by a provider the pool is not configured with, and one that does not carry what the model
+//! documents as required for its `Type`, are each a bad input parameter,
+//! `InvalidParameterException` (HTTP 400). A `Roles` KEY outside the constraints
 //! the model states for it is a third refusal: the protocol's own `ValidationException`
 //! (HTTP 400), as for any value the model bounds.
 //!
@@ -355,7 +356,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> SetIdentityPoolRo
         };
 
         let mut store = state.lock();
-        if !store.identity_pools.contains_key(&input.identity_pool_id) {
+        let Some(pool) = store.identity_pools.get(&input.identity_pool_id) else {
             return Err(SetIdentityPoolRolesErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(format!(
@@ -365,13 +366,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> SetIdentityPoolRo
                 },
             )
             .into());
-        }
+        };
 
         // Every refusal below is decided BEFORE anything is written, so a rejected call
         // leaves the pool's previous configuration exactly as it was.
         let roles = validated_roles(&input.roles)?;
+        // The mappings are decided against the pool AS IT STANDS: which providers it is
+        // configured with is what says whether a mapping names a provider of it at all.
         let role_mappings = match &input.role_mappings {
-            Some(role_mappings) => Some(validated_role_mappings(role_mappings)?),
+            Some(role_mappings) => Some(validated_role_mappings(pool, role_mappings)?),
             None => None,
         };
 
@@ -429,14 +432,28 @@ fn validated_roles(
 }
 
 /// The `RoleMappings` map as it will be stored, or the modelled refusal for the first
-/// mapping that is not complete for its `Type`.
+/// mapping that is not complete for its `Type`, or one keyed by a provider the pool is not
+/// configured with.
+///
+/// Each entry is decided KEY first: a mapping keyed by a provider this pool's own
+/// configuration does not declare
+/// ([`crate::state::IdentityPool::names_role_mapping_provider`]) maps the claims of a
+/// provider that will never present a login here, so it is refused as the bad input
+/// parameter it is before anything the mapping carries is looked at. A pool therefore cannot
+/// be left resolving roles from a provider it is not fronted by.
 fn validated_role_mappings(
+    pool: &crate::state::IdentityPool,
     role_mappings: &::std::collections::HashMap<String, RoleMapping>,
 ) -> Result<::std::collections::BTreeMap<String, RoleMapping>, SetIdentityPoolRolesError> {
     let mut validated = ::std::collections::BTreeMap::new();
     let mut entries: Vec<(&String, &RoleMapping)> = role_mappings.iter().collect();
     entries.sort_by_key(|(provider, _)| *provider);
     for (provider, mapping) in entries {
+        if !pool.names_role_mapping_provider(provider) {
+            return Err(invalid_parameter(
+                crate::state::role_mapping_provider_not_configured_message(provider),
+            ));
+        }
         if !ROLE_MAPPING_TYPE_VALUES.contains(&mapping.r#type.as_str()) {
             return Err(invalid_parameter(format!(
                 "RoleMappings['{provider}'].Type '{}' is not valid: the type must be one of {}.",

@@ -303,13 +303,17 @@ const ROWS: &[Row] = &[
         case: "a complete mapping beside a Rules mapping with no rules configuration",
         region: "us-west-2",
         role_mappings: Some(|provider| {
+            // The second mapping is keyed by the SAME user pool named WITHOUT its app client
+            // — a provider the pool is configured with as well — so the row is refused for
+            // what that mapping is missing rather than for the provider it is keyed by.
+            let provider_name = provider.rsplit_once(':').map_or(provider, |(name, _)| name);
             json!({
                 "userpool": {
                     "IdentityProvider": provider,
                     "Type": "Token",
                     "AmbiguousRoleResolution": "AuthenticatedRole",
                 },
-                "graph.facebook.com": {
+                provider_name: {
                     "Type": "Rules",
                     "AmbiguousRoleResolution": "Deny",
                 },

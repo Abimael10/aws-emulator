@@ -22,6 +22,10 @@ use serde_json::{json, Value};
 use crate::identity_pool_flow::{error_code, member, non_empty, Emulator};
 use crate::identity_pool_roles::role_arn;
 
+/// The providers the pools below DECLARE, so a `RoleMappings` entry the table carries is
+/// keyed by a provider its pool is configured with — which is what makes it storable.
+const MAPPED_PROVIDERS: [&str; 2] = ["graph.facebook.com", "accounts.google.com"];
+
 /// One role mapping, complete for its `Type` as the model documents it.
 fn token_mapping() -> Value {
     json!({
@@ -106,7 +110,9 @@ async fn get_identity_pool_roles_carries_only_the_members_the_pool_holds_entries
 
     for (case, configured) in configurations() {
         // A fresh pool per row, so the row that stores nothing really has nothing stored.
-        let pool_id = emulator.pool("roles-presence", true).await;
+        let pool_id = emulator
+            .pool_with_providers("roles-presence", true, &MAPPED_PROVIDERS)
+            .await;
         if let Some((roles, role_mappings)) = &configured {
             emulator
                 .ok(
@@ -155,7 +161,9 @@ async fn repeated_reads_report_the_same_members() {
     let emulator = Emulator::new();
 
     for (case, configured) in configurations() {
-        let pool_id = emulator.pool("roles-presence-reread", true).await;
+        let pool_id = emulator
+            .pool_with_providers("roles-presence-reread", true, &MAPPED_PROVIDERS)
+            .await;
         if let Some((roles, role_mappings)) = &configured {
             emulator
                 .ok(
@@ -184,7 +192,9 @@ async fn repeated_reads_report_the_same_members() {
 #[tokio::test]
 async fn a_replacement_that_stores_no_entry_leaves_the_member_out() {
     let emulator = Emulator::new();
-    let pool_id = emulator.pool("roles-presence-replaced", true).await;
+    let pool_id = emulator
+        .pool_with_providers("roles-presence-replaced", true, &MAPPED_PROVIDERS)
+        .await;
 
     let roles = json!({
         "authenticated": role_arn("Cognito_poolAuth_Role"),
@@ -278,7 +288,9 @@ async fn a_refused_set_leaves_the_pool_with_no_configuration() {
     ];
 
     for (case, roles, role_mappings) in refusals {
-        let pool_id = emulator.pool("roles-presence-refused", true).await;
+        let pool_id = emulator
+            .pool_with_providers("roles-presence-refused", true, &MAPPED_PROVIDERS)
+            .await;
         let (status, body) = emulator
             .call(
                 "SetIdentityPoolRoles",

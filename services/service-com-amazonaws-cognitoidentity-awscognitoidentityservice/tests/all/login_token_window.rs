@@ -275,7 +275,8 @@ impl Emulator {
             authenticated_by,
             issued_at,
             expiration,
-        );
+        )
+        .expect("this service signs the token it mints");
         let state = cognito::state::service_state(&*self.engine)
             .expect("this service's store is on this engine");
         state.lock().open_id_tokens.insert(

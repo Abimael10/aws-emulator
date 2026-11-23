@@ -185,14 +185,19 @@ impl Emulator {
     /// Create a pool that DECLARES `providers` in its federated-provider configuration, and
     /// return its minted `IdentityPoolId`.
     ///
-    /// A call that writes a provider's principal-tag attribute map is served only for a
-    /// provider the pool's own configuration declares, so a suite that writes one needs the
-    /// pool to declare the provider it writes for. Each name is declared under the member
-    /// that names a provider of its kind: an Amazon Cognito user pool
+    /// A call that writes a provider's principal-tag attribute map, and one that maps a
+    /// provider's claims onto a role, are each served only for a provider the pool's own
+    /// configuration declares, so a suite that writes one needs the pool to declare the
+    /// provider it writes for. Each name is declared under the member that names a provider
+    /// of its kind: an Amazon Cognito user pool
     /// (`cognito-idp.<region>.amazonaws.com/<UserPoolId>`) under `CognitoIdentityProviders`,
     /// an ARN under `SamlProviderARNs`, and any other provider name under
     /// `SupportedLoginProviders` — which is modelled `length 0..10`, so past that a name is
     /// declared as the OpenID Connect provider of that issuer instead.
+    ///
+    /// A user pool may be given with the APP CLIENT the role-mapping spelling appends
+    /// (`cognito-idp.<region>.amazonaws.com/<UserPoolId>:<app client id>`), in which case the
+    /// entry is declared with that client id.
     pub(crate) async fn pool_with_providers(
         &self,
         name: &str,
@@ -211,7 +216,11 @@ impl Emulator {
         let mut oidc: Vec<Value> = Vec::new();
         for provider in providers {
             if provider.starts_with("cognito-idp.") {
-                user_pools.push(json!({"ProviderName": provider, "ClientId": "declaredclient"}));
+                let (provider_name, client_id) = provider
+                    .rsplit_once(':')
+                    .unwrap_or((provider, "declaredclient"));
+                user_pools
+                    .push(json!({"ProviderName": provider_name, "ClientId": client_id}));
             } else if provider.starts_with("arn:") {
                 saml.push(json!(provider));
             } else if public.len() < 10 {

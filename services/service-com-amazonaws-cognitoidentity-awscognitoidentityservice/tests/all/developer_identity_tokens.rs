@@ -55,6 +55,12 @@ const ISSUER: &str = "https://cognito-identity.amazonaws.com";
 /// authentication methods.
 const PRINCIPAL: &str = "cognito-identity.amazonaws.com";
 
+/// The JWS algorithm this service signs the tokens it vends under — RSASSA-PKCS1-v1_5 using
+/// SHA-256 (RFC 7518 §3.3) — spelled out here so the wire-visible value is pinned by the
+/// test rather than by the code under test. `pub(crate)` so a sibling suite asserting the
+/// same header names it once.
+pub(crate) const SIGNING_ALGORITHM: &str = "RS256";
+
 /// What `TokenDuration`'s own documentation gives a token that does not name one: "If you
 /// don't provide an expiration time, the token is valid for 15 minutes."
 const DEFAULT_TOKEN_SECONDS: i64 = 900;
@@ -129,22 +135,12 @@ pub(crate) fn token_request(
     Value::Object(request)
 }
 
-/// A base64url segment's bytes, decoded with the codec the wire serializer uses
-/// (`aws_smithy_types::base64`): the two alphabet substitutions and the padding RFC 7515
-/// §2 strips are restored first.
-fn decode_base64url(case: &str, segment: &str) -> Vec<u8> {
-    let mut standard = segment.replace('-', "+").replace('_', "/");
-    while !standard.len().is_multiple_of(4) {
-        standard.push('=');
-    }
-    aws_smithy_types::base64::decode(&standard)
-        .unwrap_or_else(|error| panic!("case {case:?}: {segment:?} must be base64url ({error})"))
-}
-
-/// The header and the claims of a token in JWS compact serialization, with the form of the
-/// serialization itself asserted: three segments, the third one EMPTY, as RFC 7515 §6
-/// defines for a JWS that carries no signature. `pub(crate)` so every suite in this target
-/// reads an issued token the same way.
+/// The header and the claims of a token in JWS compact serialization, with the form AND the
+/// SIGNATURE of the token itself asserted: three segments, a non-empty signature, and a
+/// signature that checks out against the key the header names in the key set this issuer
+/// publishes — the RFC 7515 §5.2 check every consumer of such a token makes
+/// (`::service_common::jwt::verify`). `pub(crate)` so every suite in this target reads an
+/// issued token the same way.
 pub(crate) fn jws_header_and_claims(case: &str, token: &str) -> (Value, Value) {
     let segments: Vec<&str> = token.split('.').collect();
     assert_eq!(
@@ -153,15 +149,41 @@ pub(crate) fn jws_header_and_claims(case: &str, token: &str) -> (Value, Value) {
         "case {case:?}: a compact JWS has three segments, got {token:?}"
     );
     assert!(
-        segments[2].is_empty(),
-        "case {case:?}: an unsecured JWS carries an empty signature segment, got {:?}",
-        segments[2]
+        !segments[2].is_empty(),
+        "case {case:?}: a signed JWS carries a signature segment, got {token:?}"
     );
-    let header: Value = serde_json::from_slice(&decode_base64url(case, segments[0]))
-        .unwrap_or_else(|error| panic!("case {case:?}: the header must be JSON ({error})"));
-    let claims: Value = serde_json::from_slice(&decode_base64url(case, segments[1]))
-        .unwrap_or_else(|error| panic!("case {case:?}: the claims must be JSON ({error})"));
-    (header, claims)
+    let verified = ::service_common::jwt::verify(
+        token,
+        &service_com_amazonaws_cognitoidentity_awscognitoidentityservice::state::token_signing::token_key_set(),
+    )
+    .unwrap_or_else(|defect| {
+        panic!("case {case:?}: the issued token does not verify: {defect}")
+    });
+    (
+        Value::Object(verified.header),
+        Value::Object(verified.claims),
+    )
+}
+
+/// Assert `header` is the JOSE header of a token this service SIGNED: the algorithm it signs
+/// under, the token type, and the `kid` naming the key a verifier finds in the published key
+/// set. The `kid` is the key's own thumbprint, so the assertion is that one is named rather
+/// than which. `pub(crate)` for the same reason as [`jws_header_and_claims`].
+pub(crate) fn assert_signed_header(case: &str, header: &Value) {
+    assert_eq!(
+        header["alg"],
+        json!(SIGNING_ALGORITHM),
+        "case {case:?}: expected a token signed under {SIGNING_ALGORITHM}, got {header}"
+    );
+    assert_eq!(
+        header["typ"],
+        json!("JWT"),
+        "case {case:?}: expected the JWT type, got {header}"
+    );
+    assert!(
+        header["kid"].as_str().is_some_and(|kid| !kid.is_empty()),
+        "case {case:?}: expected the header to name the signing key, got {header}"
+    );
 }
 
 /// The `Logins` provider names `ListIdentities` reports for one identity of a pool.
@@ -314,11 +336,7 @@ async fn a_developer_login_resolves_one_identity_and_mints_a_token_per_call() {
         );
 
         let (header, claims) = jws_header_and_claims(case, &token);
-        assert_eq!(
-            header,
-            json!({"alg": "none", "typ": "JWT"}),
-            "case {case:?}: expected the unsecured-JWS header, got {header}"
-        );
+        assert_signed_header(case, &header);
         assert_eq!(
             claims["iss"],
             json!(ISSUER),
@@ -839,6 +857,45 @@ const ROLE_MAPPINGS_REFUSAL: &str = "Invalid identity pool configuration. When a
                                      configured for RoleMappings, \
                                      GetOpenIdTokenForDeveloperIdentity may not be used.";
 
+/// The identity providers the role-mapping rows below key a mapping by: a user pool with the
+/// app client a role attachment names it with, and two public providers. The pools those rows
+/// drive DECLARE them, because a mapping is storable only for a provider its pool is
+/// configured with.
+const MAPPED_PROVIDERS: [&str; 3] = [
+    "cognito-idp.us-east-1.amazonaws.com/us-east-1_AbCdEfGhI:1h57kf5cpq17m0eml12eu9m8ll",
+    "graph.facebook.com",
+    "accounts.google.com",
+];
+
+/// A pool carrying `developer_provider` AND fronted by every provider in
+/// [`MAPPED_PROVIDERS`], so a row can put its role configuration in the mapped state.
+async fn mappable_pool(emulator: &Emulator, name: &str, developer_provider: &str) -> String {
+    let user_pool = MAPPED_PROVIDERS[0]
+        .rsplit_once(':')
+        .expect("the user pool is named with its app client id");
+    let created = emulator
+        .ok(
+            "CreateIdentityPool",
+            &json!({
+                "IdentityPoolName": name,
+                "AllowUnauthenticatedIdentities": true,
+                "DeveloperProviderName": developer_provider,
+                "CognitoIdentityProviders": [
+                    {"ProviderName": user_pool.0, "ClientId": user_pool.1},
+                ],
+                "SupportedLoginProviders": {
+                    MAPPED_PROVIDERS[1]: "declared-app-id",
+                    MAPPED_PROVIDERS[2]: "declared-app-id",
+                },
+            }),
+        )
+        .await;
+    created["IdentityPoolId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("CreateIdentityPool answers an IdentityPoolId: {created}"))
+        .to_string()
+}
+
 /// Configure `pool_id`'s roles: the pool's `authenticated` role always, and the
 /// `RoleMappings` member only when the row carries one (so a row with `None` exercises its
 /// ABSENCE). `SetIdentityPoolRoles` replaces the whole configuration, so one call puts the
@@ -967,8 +1024,7 @@ async fn a_pool_configured_for_role_mappings_does_not_mint_developer_tokens() {
 
     for (index, (case, first, later, refused)) in rows.iter().enumerate() {
         let name = format!("developer-mint-mapping-{index}");
-        let pool_id =
-            pool_with_developer_provider(&emulator, &name, Some(developer_provider)).await;
+        let pool_id = mappable_pool(&emulator, &name, developer_provider).await;
         // The first row configures NO roles at all; every other row configures them, with the
         // mappings it carries.
         if index > 0 {
@@ -1059,7 +1115,7 @@ async fn a_mapped_pool_refuses_every_developer_mint_until_the_mapping_is_dropped
     let emulator = Emulator::new();
     let developer_provider = "login.example.app";
     let name = "developer-mint-mapped-requests";
-    let pool_id = pool_with_developer_provider(&emulator, name, Some(developer_provider)).await;
+    let pool_id = mappable_pool(&emulator, name, developer_provider).await;
 
     // An identifier the pool registers BEFORE the mapping is configured, so the rows below
     // cover the idempotent-resolution path as well as a fresh mint.

@@ -161,7 +161,9 @@ fn role_arn(name: &str) -> String {
 #[tokio::test]
 async fn a_clause_about_an_enumerated_type_states_its_values_in_the_order_its_table_is_walked() {
     let emulator = Emulator::new();
-    let pool_id = emulator.pool("stated-order-enums", true).await;
+    let pool_id = emulator
+        .pool_with_providers("stated-order-enums", true, &["graph.facebook.com"])
+        .await;
     let provider = "graph.facebook.com";
     let mapped = role_arn("Cognito_statedOrderMapped_Role");
 
@@ -284,7 +286,17 @@ async fn a_clause_about_an_enumerated_type_states_its_values_in_the_order_its_ta
 #[tokio::test]
 async fn a_mapping_with_no_ambiguous_role_resolution_names_the_type_that_requires_it() {
     let emulator = Emulator::new();
-    let pool_id = emulator.pool("stated-order-ambiguous", true).await;
+    let pool_id = emulator
+        .pool_with_providers(
+            "stated-order-ambiguous",
+            true,
+            &[
+                "graph.facebook.com",
+                "accounts.google.com",
+                "cognito-idp.us-east-1.amazonaws.com/us-east-1_stated1:statedclient",
+            ],
+        )
+        .await;
     let mapped = role_arn("Cognito_statedOrderMapped_Role");
 
     // The rows span both values of `RoleMappingType` — the model's
@@ -727,7 +739,14 @@ async fn a_pools_role_configuration_reports_its_maps_in_one_order_on_every_read(
 
     for (index, (case, authenticated_first, mappings)) in rows.into_iter().enumerate() {
         let name = format!("map-order-roles-{index}");
-        let pool_id = emulator.pool(&name, true).await;
+        // Every provider a mapping below is keyed by is DECLARED by the pool: a mapping is
+        // storable only for a provider its pool is configured with.
+        let declared: Vec<String> = mapping_entries(mappings)
+            .into_iter()
+            .map(|(provider, _)| provider)
+            .collect();
+        let declared: Vec<&str> = declared.iter().map(String::as_str).collect();
+        let pool_id = emulator.pool_with_providers(&name, true, &declared).await;
 
         let roles = role_entries(&name, authenticated_first);
         let mappings = mapping_entries(mappings);

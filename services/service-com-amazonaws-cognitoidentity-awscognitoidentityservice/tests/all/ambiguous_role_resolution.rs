@@ -39,7 +39,7 @@ use serde_json::{json, Value};
 
 use crate::mapped_role_resolution::{
     identity_token, pool, rule, seeded_roles, set_roles, user_pool_claims, vended_session_arn,
-    Role, CLIENT_ID, PUBLIC_PROVIDER, USER_POOL_PROVIDER,
+    Role, CLIENT_ID, OTHER_PUBLIC_PROVIDER, PUBLIC_PROVIDER, USER_POOL_PROVIDER,
 };
 use crate::vended_role_session::{expected_session_arn, Emulator};
 
@@ -282,7 +282,7 @@ async fn a_rules_mapping_matching_nothing_is_decided_by_its_ambiguous_role_resol
         ),
         (
             "a mapping keyed by a provider the login was not made under, under Deny",
-            "accounts.google.com".to_string(),
+            OTHER_PUBLIC_PROVIDER.to_string(),
             DENY,
             vec![rule("custom:dept", "Equals", "engineering", mapped)],
             &engineering,

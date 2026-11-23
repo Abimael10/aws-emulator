@@ -34,7 +34,12 @@ use crate::vended_role_session::{
 #[tokio::test]
 async fn a_vended_credential_is_recorded_as_a_session_of_its_role() {
     let emulator = Emulator::new();
-    let pool_id = emulator.pool("vended-identity-record").await;
+    let pool_id = emulator
+        .pool_with_providers(
+            "vended-identity-record",
+            &["accounts.google.com", "graph.facebook.com"],
+        )
+        .await;
     let authenticated = emulator.seed_role("record-auth", Some(trust_policy(&pool_id)));
     let unauthenticated = emulator.seed_role("record-unauth", Some(trust_policy(&pool_id)));
     let mapped = emulator.seed_role("record-mapped", Some(trust_policy(&pool_id)));

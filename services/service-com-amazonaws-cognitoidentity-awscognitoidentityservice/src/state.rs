@@ -34,6 +34,10 @@ pub mod pool_configuration;
 /// that request publishes to the assumed role's trust policy.
 pub mod session_tags;
 
+/// The key this service signs the OpenID Connect tokens it mints with, and the key set it
+/// publishes for them.
+pub mod token_signing;
+
 use crate::ops::types::{CognitoIdentityProvider, MappingRule, RoleMapping};
 use emulator_server::CredentialStore;
 /// What an integrated Amazon Cognito user pool says about a token presented as the login of
@@ -313,6 +317,49 @@ impl IdentityPool {
                 .iter()
                 .flatten()
                 .any(|arn| arn == provider_name)
+    }
+
+    /// Whether this pool's configuration declares the identity provider a `RoleMappings`
+    /// KEY names.
+    ///
+    /// A role mapping maps the claims of a token ONE identity provider issued onto the role
+    /// an identity of this pool assumes, so the provider the mapping is keyed by has to be a
+    /// provider the pool is configured with ([`Self::names_federated_provider`]) — the same
+    /// set a `Logins` entry can be keyed by, since the claims a mapping reads come from the
+    /// login that provider presents.
+    ///
+    /// One spelling is this map's own: an Amazon Cognito user pool is named with the APP
+    /// CLIENT the token was issued to appended, "for example, graph.facebook.com or
+    /// cognito-idp.us-east-1.amazonaws.com/us-east-1_abcdefghi:app_client_id"
+    /// (`SetIdentityPoolRolesInput$RoleMappings`, this service's model). Such a name is one
+    /// of this pool's providers when the pool carries that user pool WITH that app client id
+    /// ([`Self::names_user_pool_app_client`]): the app client is part of which provider the
+    /// mapping is for, so one the pool was never configured with names no provider of it.
+    pub fn names_role_mapping_provider(&self, provider_name: &str) -> bool {
+        self.names_federated_provider(provider_name)
+            || provider_name
+                .rsplit_once(APP_CLIENT_ID_SEPARATOR)
+                .is_some_and(|(provider, client_id)| {
+                    self.names_user_pool_app_client(provider, client_id)
+                })
+    }
+
+    /// Whether one of this pool's `CognitoIdentityProviders` names the user pool
+    /// `provider_name` and, on that same entry, the app client `client_id` — the pair a role
+    /// mapping of a user pool is keyed by.
+    ///
+    /// The provider names are compared as issuers ([`login_provider_issuer`]), exactly as
+    /// every other reading of this member compares them, so either spelling of the user pool
+    /// resolves.
+    fn names_user_pool_app_client(&self, provider_name: &str, client_id: &str) -> bool {
+        let issuer = login_provider_issuer(provider_name);
+        self.cognito_identity_providers
+            .iter()
+            .flatten()
+            .filter(|provider| {
+                provider.provider_name.as_deref().map(login_provider_issuer) == Some(issuer)
+            })
+            .any(|provider| provider.client_id.as_deref() == Some(client_id))
     }
 
     /// Whether this pool's stored configuration names NO identity provider at all: none of
@@ -1037,6 +1084,25 @@ pub fn forbidden_identity_message(identity_id: &str) -> String {
 /// sent itself; the rest is fixed text, naming none of the providers the pool really holds.
 pub fn provider_not_configured_message(identity_provider_name: &str) -> String {
     format!("Provider {identity_provider_name} not configured for Identity Pool")
+}
+
+/// What separates an Amazon Cognito user pool's provider name from the APP CLIENT ID a
+/// `RoleMappings` key names it with — "cognito-idp.us-east-1.amazonaws.com/
+/// us-east-1_abcdefghi:app_client_id" (`SetIdentityPoolRolesInput$RoleMappings`, this
+/// service's model).
+const APP_CLIENT_ID_SEPARATOR: char = ':';
+
+/// How AWS words the refusal of a `RoleMappings` entry keyed by a provider the identity pool
+/// is not configured with ([`IdentityPool::names_role_mapping_provider`]).
+///
+/// The one part taken from the request is the key the mapping was filed under, which the
+/// caller sent itself; the rest is fixed text, naming none of the providers the pool really
+/// holds.
+pub fn role_mapping_provider_not_configured_message(provider_name: &str) -> String {
+    format!(
+        "({provider_name}) is not a valid RoleMapping ProviderName or is not a configured \
+         provider."
+    )
 }
 
 /// How AWS words the refusal of a `Logins` map that names no PUBLIC provider at all — one
@@ -3344,13 +3410,17 @@ pub fn decode_pagination_token(scope: &str, token: &str) -> Option<String> {
 /// identity as the subject, the validity window, the `amr` authentication-methods
 /// reference ([`authentication_methods`]) and a `jti` that makes every issued token
 /// distinct, so two calls in the same second never produce one token.
+///
+/// `None` when the claim set could not be SIGNED ([`token_signing::signed_token`]), so a
+/// token is either signed or not issued at all and the caller answers its own server error
+/// rather than handing out a value no issuer signed.
 pub fn open_id_token(
     identity_pool_id: &str,
     identity_id: &str,
     authenticated_by: &[String],
     issued_at: SystemTime,
     expiration: SystemTime,
-) -> String {
+) -> Option<String> {
     let amr: Vec<::serde_json::Value> = authentication_methods(authenticated_by)
         .iter()
         .map(|method| ::serde_json::Value::from(method.as_str()))
@@ -3364,27 +3434,12 @@ pub fn open_id_token(
         "exp": unix_seconds(expiration),
         "jti": guid(),
     });
-    unsecured_jws(&claims)
-}
-
-/// `claims` as an UNSECURED JWS in compact serialization (RFC 7515 §6, "Using the
-/// Algorithm none"): `base64url(header) '.' base64url(claims) '.'`, with an empty
-/// signature segment.
-///
-/// Amazon Cognito Identity signs its OIDC tokens with a key pair whose public half it
-/// publishes. This emulator holds no such key pair, so it issues the form RFC 7515
-/// defines for a JWS that carries no signature rather than filling the third segment with
-/// bytes that would only look like one. The token is still this emulator's own: its claims
-/// come from stored state and every token issued is recorded in
-/// [`ComAmazonawsCognitoidentityAwscognitoidentityserviceState::open_id_tokens`], so the
-/// service can say which identity a token it handed out names.
-fn unsecured_jws(claims: &::serde_json::Value) -> String {
-    let header = ::serde_json::json!({ "alg": "none", "typ": "JWT" });
-    format!(
-        "{}.{}.",
-        base64_url(header.to_string().as_bytes()),
-        base64_url(claims.to_string().as_bytes())
-    )
+    // Amazon Cognito Identity signs the tokens it vends with a key pair whose public half it
+    // publishes, and this service does the same ([`token_signing`]): the signed token is this
+    // emulator's own — its claims come from stored state and every issuance is recorded in
+    // [`ComAmazonawsCognitoidentityAwscognitoidentityserviceState::open_id_tokens`], so the
+    // service can still say which identity a token it handed out names.
+    token_signing::signed_token(&claims)
 }
 
 /// `bytes` in base64url without padding, as a JWS segment is encoded (RFC 7515 §2): the
@@ -3400,16 +3455,15 @@ pub fn base64_url(bytes: &[u8]) -> String {
 }
 
 /// The claim set a token this service minted carries, read back out of the token itself:
-/// the payload segment of the unsecured JWS [`open_id_token`] produced. `None` for a value
+/// the payload segment of the compact JWS [`open_id_token`] produced. `None` for a value
 /// that is not one of this service's tokens — one that is no compact JWS, one whose payload
 /// is not a JSON claim set, or one naming another issuer.
 ///
 /// The reading is [`::service_common::jwt`], the tree's ONE bounded reading of a compact
-/// JWS, through the reader a service that MINTED the token it is reading calls: the tokens
-/// [`unsecured_jws`] produces carry no signature, which is the form that reader admits.
-/// Nothing is VERIFIED here and nothing is granted on what it reads — an unsecured token is
-/// one nothing signed, so the claim set is only ever read to REFUSE a token the service's
-/// own issuance registry also refuses.
+/// JWS, through the reader that leaves the signature judgement out: a value PRESENTING
+/// itself as one of this service's tokens is read whether or not anything signed it, because
+/// what is read is only ever used to REFUSE a value the service's own issuance registry
+/// refuses too. Nothing is granted on it.
 fn minted_token_claims(token: &str) -> Option<::serde_json::Map<String, ::serde_json::Value>> {
     let read = ::service_common::jwt::read_unsecured(token).ok()?;
     (read.claim_str(ISSUER_CLAIM) == Some(OIDC_TOKEN_ISSUER)).then_some(read.claims)

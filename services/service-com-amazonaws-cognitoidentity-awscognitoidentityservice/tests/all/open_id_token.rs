@@ -29,7 +29,9 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Map, Value};
 
-use crate::developer_identity_tokens::{jws_header_and_claims, listed_logins};
+use crate::developer_identity_tokens::{
+    assert_signed_header, jws_header_and_claims, listed_logins,
+};
 use crate::identity_pool_flow::{cognito_trust_policy, error_code, seeded_role_arn, Emulator};
 use crate::mapped_role_resolution::identity_token;
 
@@ -266,11 +268,7 @@ async fn a_token_is_minted_from_the_stored_identity_it_names() {
         );
 
         let (header, claims) = jws_header_and_claims(case, &token);
-        assert_eq!(
-            header,
-            json!({"alg": "none", "typ": "JWT"}),
-            "case {case:?}: expected the unsecured-JWS header, got {header}"
-        );
+        assert_signed_header(case, &header);
         assert_eq!(
             claims["iss"],
             json!(ISSUER),

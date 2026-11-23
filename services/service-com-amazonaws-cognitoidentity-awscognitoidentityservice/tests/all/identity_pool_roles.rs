@@ -32,6 +32,19 @@ pub(crate) fn role_arn(name: &str) -> String {
     format!("arn:aws:iam::{}:role/{name}", engine::emulator_account_id())
 }
 
+/// The providers the pools below DECLARE, so every `RoleMappings` key the tables carry
+/// names a provider its pool is configured with — which is what makes the mapping storable
+/// at all. The user pool is declared with the app client the role-mapping spelling appends
+/// to it (`SetIdentityPoolRolesInput$RoleMappings`: "for example, graph.facebook.com or
+/// cognito-idp.us-east-1.amazonaws.com/us-east-1_abcdefghi:app_client_id").
+const MAPPED_PROVIDERS: [&str; 5] = [
+    "graph.facebook.com",
+    "accounts.google.com",
+    "appleid.apple.com",
+    "www.amazon.com",
+    "cognito-idp.us-east-1.amazonaws.com/us-east-1_abcdefghi:client",
+];
+
 /// `MappingRuleMatchType`'s values, from
 /// `smithy_query(query="shape",shape="MappingRuleMatchType")`.
 const MATCH_TYPES: [&str; 4] = ["Contains", "Equals", "NotEqual", "StartsWith"];
@@ -152,7 +165,9 @@ fn configurations() -> Vec<(&'static str, Value, Option<Value>)> {
 #[tokio::test]
 async fn get_identity_pool_roles_reports_what_the_last_set_stored() {
     let emulator = Emulator::new();
-    let pool_id = emulator.pool("roles-round-trip", true).await;
+    let pool_id = emulator
+        .pool_with_providers("roles-round-trip", true, &MAPPED_PROVIDERS)
+        .await;
 
     for (case, roles, role_mappings) in configurations() {
         let answered = emulator
@@ -344,7 +359,9 @@ type RefusedConfiguration = (&'static str, Value, Option<Value>, (u16, &'static 
 #[tokio::test]
 async fn an_incomplete_or_non_role_configuration_is_refused_and_changes_nothing() {
     let emulator = Emulator::new();
-    let pool_id = emulator.pool("roles-refusals", true).await;
+    let pool_id = emulator
+        .pool_with_providers("roles-refusals", true, &MAPPED_PROVIDERS)
+        .await;
 
     // The configuration every refusal below must leave untouched.
     let stored = json!({"authenticated": role_arn("Cognito_poolAuth_Role")});
@@ -544,7 +561,9 @@ async fn a_roles_key_that_is_not_a_role_kind_is_refused() {
 #[tokio::test]
 async fn a_custom_role_arn_is_resolved_against_the_pools_stored_roles() {
     let emulator = Emulator::new();
-    let pool_id = emulator.pool("roles-custom", true).await;
+    let pool_id = emulator
+        .pool_with_providers("roles-custom", true, &MAPPED_PROVIDERS)
+        .await;
     // Naming a `CustomRoleArn` is something only an exchange whose provider offered several
     // roles may do, so the identity below is reached through the provider the pool holds a
     // role mapping for, and every vend presents that login.

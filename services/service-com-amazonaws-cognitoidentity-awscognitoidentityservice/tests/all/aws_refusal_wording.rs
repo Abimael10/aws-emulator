@@ -204,7 +204,21 @@ async fn a_developer_identity_the_caller_may_not_resolve_is_one_fixed_sentence()
 #[tokio::test]
 async fn a_rules_mapping_with_no_rules_configuration_is_one_fixed_sentence() {
     let emulator = Emulator::new();
-    let pool_id = pool(&emulator, "wording-role-mappings").await;
+    // The pool DECLARES every provider the incomplete mappings below are keyed by: a mapping
+    // for a provider the pool is not configured with is refused on its key instead, which is
+    // `provider_configured_role_mappings`'s rule.
+    let pool_id = emulator
+        .pool_with_providers(
+            "wording-role-mappings",
+            true,
+            &[
+                "graph.facebook.com",
+                "accounts.google.com",
+                "www.amazon.com",
+                "cognito-idp.us-east-1.amazonaws.com/us-east-1_wording1:wordingclient",
+            ],
+        )
+        .await;
     let role_arn = format!(
         "arn:aws:iam::{}:role/wording-authenticated",
         engine::emulator_account_id()

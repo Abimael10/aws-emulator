@@ -54,8 +54,14 @@ const STACK_TYPE: &str = "AWS::CloudFormation::Stack";
 /// refused for the ROLE MAPPING it states rather than for the roles beside it.
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/superseded-failure-auth";
 
-/// The provider a role mapping is keyed by.
+/// The provider a role mapping is keyed by, which the pool below DECLARES: a mapping is
+/// storable only for a provider its pool is configured with, so declaring it is what leaves
+/// the attachment failing for the mapping's own missing member rather than for its key.
 const PROVIDER: &str = "graph.facebook.com";
+
+/// The app id the pool declares [`PROVIDER`] with — `SupportedLoginProviders` is a map from
+/// the provider's name to the app id registered with it.
+const PROVIDER_APP_ID: &str = "declared-app-id";
 
 /// A template whose identity pool is fine and whose role attachment cannot be applied: a
 /// `RoleMapping` of type `Rules` states no `RulesConfiguration`, which the owning service
@@ -68,7 +74,8 @@ fn template_with_an_invalid_role_mapping(pool_name: &str) -> String {
                 "Type": "AWS::Cognito::IdentityPool",
                 "Properties": {
                     "IdentityPoolName": pool_name,
-                    "AllowUnauthenticatedIdentities": true
+                    "AllowUnauthenticatedIdentities": true,
+                    "SupportedLoginProviders": {PROVIDER: PROVIDER_APP_ID}
                 }
             },
             FAILING: {
@@ -95,7 +102,8 @@ fn template_with_a_valid_role_mapping(pool_name: &str) -> String {
                 "Type": "AWS::Cognito::IdentityPool",
                 "Properties": {
                     "IdentityPoolName": pool_name,
-                    "AllowUnauthenticatedIdentities": true
+                    "AllowUnauthenticatedIdentities": true,
+                    "SupportedLoginProviders": {PROVIDER: PROVIDER_APP_ID}
                 }
             },
             FAILING: {

@@ -116,11 +116,27 @@ impl Emulator {
     ///
     /// `pub(crate)` so a sibling suite on this harness asks for a pool the same way.
     pub(crate) async fn pool(&self, name: &str) -> String {
-        self.ok(
-            "CreateIdentityPool",
-            &json!({"IdentityPoolName": name, "AllowUnauthenticatedIdentities": true}),
-        )
-        .await["IdentityPoolId"]
+        self.pool_with_providers(name, &[]).await
+    }
+
+    /// Create a pool that DECLARES `providers` as its public login providers, and answer its
+    /// minted `IdentityPoolId`.
+    ///
+    /// A role mapping is storable only for a provider the pool's own configuration declares,
+    /// so a suite that maps a provider's claims onto a role needs the pool to be fronted by
+    /// that provider.
+    pub(crate) async fn pool_with_providers(&self, name: &str, providers: &[&str]) -> String {
+        let mut request =
+            json!({"IdentityPoolName": name, "AllowUnauthenticatedIdentities": true});
+        if !providers.is_empty() {
+            request["SupportedLoginProviders"] = Value::Object(
+                providers
+                    .iter()
+                    .map(|provider| ((*provider).to_string(), json!("declared-app-id")))
+                    .collect(),
+            );
+        }
+        self.ok("CreateIdentityPool", &request).await["IdentityPoolId"]
             .as_str()
             .expect("CreateIdentityPool answers an IdentityPoolId")
             .to_string()
@@ -303,7 +319,12 @@ pub(crate) fn vended(response: &Value) -> (&str, &str) {
 #[tokio::test]
 async fn a_vend_is_a_session_of_the_role_the_pool_resolves() {
     let emulator = Emulator::new();
-    let pool_id = emulator.pool("vended-role").await;
+    let pool_id = emulator
+        .pool_with_providers(
+            "vended-role",
+            &["accounts.google.com", "graph.facebook.com", "appleid.apple.com"],
+        )
+        .await;
     let authenticated = emulator.seed_role("vend-auth", Some(trust_policy(&pool_id)));
     let unauthenticated = emulator.seed_role("vend-unauth", Some(trust_policy(&pool_id)));
     let mapped = emulator.seed_role("vend-mapped", Some(trust_policy(&pool_id)));

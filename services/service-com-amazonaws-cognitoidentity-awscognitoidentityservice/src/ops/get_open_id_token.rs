@@ -421,13 +421,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetOpenIdToken<En
         }
 
         let expiration = now + TOKEN_VALIDITY;
-        let token = crate::state::open_id_token(
+        // A token is either SIGNED or not issued: a claim set nothing could sign is a server
+        // failure of this service, not a token.
+        let Some(token) = crate::state::open_id_token(
             &identity_pool_id,
             &input.identity_id,
             &providers,
             now,
             expiration,
-        );
+        ) else {
+            return Err(GetOpenIdTokenErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the OpenID Connect token could not be signed".to_string()),
+                },
+            )
+            .into());
+        };
 
         // What the clock has already expired is forgotten here, and the store is kept
         // inside this emulator's own ceiling on outstanding tokens; then this issuance is

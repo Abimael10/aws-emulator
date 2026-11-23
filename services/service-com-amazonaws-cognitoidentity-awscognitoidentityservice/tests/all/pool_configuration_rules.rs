@@ -596,7 +596,9 @@ async fn a_configuration_past_the_user_pool_provider_quota_is_refused() {
 #[tokio::test]
 async fn a_role_the_account_does_not_own_is_refused_as_a_pass_role() {
     let emulator = Emulator::new();
-    let identity_pool_id = emulator.pool("pass-role-pool", false).await;
+    let identity_pool_id = emulator
+        .pool_with_providers("pass-role-pool", false, &["accounts.google.com"])
+        .await;
     let own = |name: &str| format!("arn:aws:iam::{}:role/{name}", engine::emulator_account_id());
 
     // (case, the role value, admitted?)
