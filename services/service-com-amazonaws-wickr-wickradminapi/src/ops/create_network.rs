@@ -206,12 +206,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        let network_arn = ::engine::emulator_arn("wickr", &region, &format!("network/{network_id}"));
         let record = crate::state::NetworkRecord {
-            network_arn: ::engine::emulator_arn(
-                "wickr",
-                &region,
-                &format!("network/{network_id}"),
-            ),
             network_id: network_id.clone(),
             network_name: input.network_name,
             access_level: input.access_level,
@@ -223,8 +219,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .enable_premium_free_trial
                 .unwrap_or(false)
                 .then(|| crate::state::free_trial_expiration(created_at)),
-            migration_state: crate::state::MIGRATION_STATE_NOT_STARTED,
+            migration_state: crate::state::MIGRATION_STATE_COMPLETED,
             encryption_key_arn: input.encryption_key_arn,
+            // The tag set the service puts on the network it just minted, built
+            // from that network's own ARN.
+            tags: crate::state::service_set_network_tags(&network_arn),
+            network_arn,
         };
 
         // Every network starts with its default security group, and with no users.

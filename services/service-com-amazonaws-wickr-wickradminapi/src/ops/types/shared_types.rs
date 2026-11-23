@@ -26,6 +26,30 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-wickr-wickradminapi.jso
 /// absolute form cannot be concatenated there — keep the two spellings in step.
 pub const RECORDED_NAMESPACE: &str = "com.amazonaws.wickr.recorded";
 
+/// The namespace this service's own modelled shapes and members sit in, which a hand-written
+/// shape takes for every member the model DOES declare.
+pub const SERVICE_NAMESPACE: &str = "com.amazonaws.wickr";
+
+/// One member's schema, as the vendored codegen emits it: the member's shape id, its shape
+/// type, its wire name and its index in the member list.
+///
+/// Shared by every hand-written shape in this crate's `types/` modules, so the three of them
+/// cannot spell a member schema differently.
+pub const fn member_schema(
+    shape_id: &'static str,
+    namespace: &'static str,
+    name: &'static str,
+    shape_type: ::aws_smithy_schema::ShapeType,
+    index: usize,
+) -> ::aws_smithy_schema::Schema {
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(shape_id, namespace, name),
+        shape_type,
+        name,
+        index,
+    )
+}
+
 #[smithy_macros::smithy(shape = "com.amazonaws.wickr#User")]
 #[derive(Debug, Clone, Default)]
 pub struct User {

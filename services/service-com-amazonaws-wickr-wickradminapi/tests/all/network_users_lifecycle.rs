@@ -264,7 +264,9 @@ async fn the_network_and_user_lifecycle_round_trips_through_stored_state() {
             )),
         ),
         ("encryptionKeyArn", json!(key_arn)),
-        ("migrationState", json!(0)),
+        // The SSO redirect URI migration state of a network this API created, which the
+        // recorded wire reports as completed — the member's documented value 2.
+        ("migrationState", json!(2)),
     ] {
         assert_eq!(
             fetched[member], expected,

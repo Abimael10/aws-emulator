@@ -27,17 +27,8 @@ pub struct ListNetworksOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.wickr#Network")]
-#[derive(Debug, Clone, Default)]
-pub struct Network {
-    pub network_id: String,
-    pub network_name: String,
-    pub access_level: String,
-    pub aws_account_id: String,
-    pub network_arn: String,
-    pub standing: Option<i32>,
-    pub free_trial_expiration: Option<String>,
-    pub migration_state: Option<i32>,
-    pub encryption_key_arn: Option<String>,
-}
+// `Network` is NOT declared here: a listed network carries members the model does not
+// declare, and members this shape serializes as an explicit null where the network holds
+// no value, so its schema and codec are written out in
+// [`super::network_record_wire`] rather than derived.
 

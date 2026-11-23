@@ -48,6 +48,9 @@ pub mod list_networks_types;
 pub mod list_security_group_users_types;
 pub mod list_security_groups_types;
 pub mod list_users_types;
+/// The two network-record shapes a read answers with, whose schemas and codecs are written
+/// out rather than derived because the wire carries members the model does not declare.
+pub mod network_record_wire;
 pub mod register_oidc_config_test_types;
 pub mod register_oidc_config_types;
 pub mod register_opentdf_config_types;
@@ -128,6 +131,8 @@ pub use list_security_group_users_types::*;
 pub use list_security_groups_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use list_users_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use network_record_wire::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use register_oidc_config_test_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

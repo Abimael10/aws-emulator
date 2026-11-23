@@ -49,59 +49,43 @@ pub struct CreateNetworkOutput {
 
 #[allow(non_upper_case_globals)]
 impl CreateNetworkOutput {
-    const NAMESPACE: &'static str = "com.amazonaws.wickr";
-
-    pub const M_NETWORK_ID: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
-        ::aws_smithy_schema::ShapeId::from_static(
-            "com.amazonaws.wickr#CreateNetworkResponse$networkId",
-            Self::NAMESPACE,
-            "networkId",
-        ),
-        ::aws_smithy_schema::ShapeType::String,
+    pub const M_NETWORK_ID: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.wickr#CreateNetworkResponse$networkId",
+        SERVICE_NAMESPACE,
         "networkId",
+        ::aws_smithy_schema::ShapeType::String,
         0,
     );
 
-    pub const M_NETWORK_NAME: ::aws_smithy_schema::Schema =
-        ::aws_smithy_schema::Schema::new_member(
-            ::aws_smithy_schema::ShapeId::from_static(
-                "com.amazonaws.wickr#CreateNetworkResponse$networkName",
-                Self::NAMESPACE,
-                "networkName",
-            ),
-            ::aws_smithy_schema::ShapeType::String,
-            "networkName",
-            1,
-        );
+    pub const M_NETWORK_NAME: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.wickr#CreateNetworkResponse$networkName",
+        SERVICE_NAMESPACE,
+        "networkName",
+        ::aws_smithy_schema::ShapeType::String,
+        1,
+    );
 
-    pub const M_ENCRYPTION_KEY_ARN: ::aws_smithy_schema::Schema =
-        ::aws_smithy_schema::Schema::new_member(
-            ::aws_smithy_schema::ShapeId::from_static(
-                "com.amazonaws.wickr#CreateNetworkResponse$encryptionKeyArn",
-                Self::NAMESPACE,
-                "encryptionKeyArn",
-            ),
-            ::aws_smithy_schema::ShapeType::String,
-            "encryptionKeyArn",
-            2,
-        );
+    pub const M_ENCRYPTION_KEY_ARN: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.wickr#CreateNetworkResponse$encryptionKeyArn",
+        SERVICE_NAMESPACE,
+        "encryptionKeyArn",
+        ::aws_smithy_schema::ShapeType::String,
+        2,
+    );
 
     /// The member the on-disk model does not declare; see [`RECORDED_NAMESPACE`].
-    pub const M_MESSAGE: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
-        ::aws_smithy_schema::ShapeId::from_static(
-            "com.amazonaws.wickr.recorded#CreateNetworkResponse$message",
-            RECORDED_NAMESPACE,
-            "message",
-        ),
-        ::aws_smithy_schema::ShapeType::String,
+    pub const M_MESSAGE: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.wickr.recorded#CreateNetworkResponse$message",
+        RECORDED_NAMESPACE,
         "message",
+        ::aws_smithy_schema::ShapeType::String,
         3,
     );
 
     pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
         ::aws_smithy_schema::ShapeId::from_static(
             "com.amazonaws.wickr#CreateNetworkResponse",
-            Self::NAMESPACE,
+            SERVICE_NAMESPACE,
             "CreateNetworkResponse",
         ),
         ::aws_smithy_schema::ShapeType::Structure,

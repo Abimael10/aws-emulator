@@ -41,35 +41,27 @@ pub struct DeleteNetworkOutput {
 
 #[allow(non_upper_case_globals)]
 impl DeleteNetworkOutput {
-    const NAMESPACE: &'static str = "com.amazonaws.wickr";
-
-    pub const M_MESSAGE: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
-        ::aws_smithy_schema::ShapeId::from_static(
-            "com.amazonaws.wickr#DeleteNetworkResponse$message",
-            Self::NAMESPACE,
-            "message",
-        ),
-        ::aws_smithy_schema::ShapeType::String,
+    pub const M_MESSAGE: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.wickr#DeleteNetworkResponse$message",
+        SERVICE_NAMESPACE,
         "message",
+        ::aws_smithy_schema::ShapeType::String,
         0,
     );
 
     /// The member the on-disk model does not declare; see [`RECORDED_NAMESPACE`].
-    pub const M_NETWORK_ID: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
-        ::aws_smithy_schema::ShapeId::from_static(
-            "com.amazonaws.wickr.recorded#DeleteNetworkResponse$networkId",
-            RECORDED_NAMESPACE,
-            "networkId",
-        ),
-        ::aws_smithy_schema::ShapeType::String,
+    pub const M_NETWORK_ID: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.wickr.recorded#DeleteNetworkResponse$networkId",
+        RECORDED_NAMESPACE,
         "networkId",
+        ::aws_smithy_schema::ShapeType::String,
         1,
     );
 
     pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
         ::aws_smithy_schema::ShapeId::from_static(
             "com.amazonaws.wickr#DeleteNetworkResponse",
-            Self::NAMESPACE,
+            SERVICE_NAMESPACE,
             "DeleteNetworkResponse",
         ),
         ::aws_smithy_schema::ShapeType::Structure,

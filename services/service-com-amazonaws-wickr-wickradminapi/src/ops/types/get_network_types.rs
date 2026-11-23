@@ -17,17 +17,7 @@ pub struct GetNetworkInput {
     pub network_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.wickr#GetNetworkResponse")]
-#[derive(Debug, Clone, Default)]
-pub struct GetNetworkOutput {
-    pub network_id: String,
-    pub network_name: String,
-    pub access_level: String,
-    pub aws_account_id: String,
-    pub network_arn: String,
-    pub standing: Option<i32>,
-    pub free_trial_expiration: Option<String>,
-    pub migration_state: Option<i32>,
-    pub encryption_key_arn: Option<String>,
-}
+// `GetNetworkOutput` is NOT declared here: the answer carries a member the model does not
+// declare, so its schema and codec are written out in
+// [`super::network_record_wire`] rather than derived.
 

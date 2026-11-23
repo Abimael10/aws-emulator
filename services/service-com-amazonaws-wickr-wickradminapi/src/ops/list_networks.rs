@@ -232,7 +232,12 @@ fn refused(field: &str, reason: String) -> ListNetworksError {
         .into()
 }
 
-/// One stored network as the modelled `Network` shape.
+/// One stored network as a listing reports it.
+///
+/// Beside the modelled members, a listed network carries its tag set and the two
+/// translation members the model declares nowhere; the members this shape serializes
+/// unconditionally are written as an explicit null where the network holds no value for
+/// them (see [`crate::ops::types::network_record_wire`]).
 fn network_view(record: &crate::state::NetworkRecord) -> Network {
     Network {
         network_id: record.network_id.clone(),
@@ -244,5 +249,11 @@ fn network_view(record: &crate::state::NetworkRecord) -> Network {
         free_trial_expiration: record.free_trial_expiration.clone(),
         migration_state: Some(record.migration_state),
         encryption_key_arn: record.encryption_key_arn.clone(),
+        tags: record.tags.clone(),
+        // Nothing in this API configures message translation for a network, so a listed
+        // network reports neither value — as the explicit null this shape writes for a
+        // member it carries and the network has no value for.
+        translation_status: None,
+        translation_iam_role_arn: None,
     }
 }

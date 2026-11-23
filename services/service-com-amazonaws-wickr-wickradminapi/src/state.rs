@@ -146,18 +146,51 @@ pub const MAX_BATCH_USERS: usize = 100;
 /// can make a listing serialize the whole store.
 pub const MAX_PAGE_SIZE: usize = 100;
 
-/// `Network$migrationState` 0: the model documents "0 (not started), 1 (in
-/// progress), or 2 (completed)" for the SSO redirect URI migration wizard, and a
-/// network nobody has run the wizard on has not started it.
-pub const MIGRATION_STATE_NOT_STARTED: i32 = 0;
+/// `Network$migrationState` for a network the service reports the SSO redirect
+/// URI migration as finished for.
+///
+/// The model documents the value set — "0 (not started), 1 (in progress), or 2
+/// (completed)" — and RECORDED behaviour decides which of the three a network
+/// this API created carries: the wire reports the completed state for a network
+/// that has just been created, the migration wizard having nothing left to do on
+/// a network whose SSO redirect URI is the one it was created with. Nothing in
+/// this service runs that wizard, so no other value is reachable and a read
+/// reports this one for every live network.
+pub const MIGRATION_STATE_COMPLETED: i32 = 2;
 
 /// `Network$standing` for a network that exists and is usable.
 ///
 /// The model documents `standing` as "the current standing or status of the
-/// network" without enumerating values, so this emulator reports ONE stable
-/// value for every live network rather than inventing transitions it cannot
-/// ground.
-pub const NETWORK_STANDING_GOOD: i32 = 1;
+/// network" without enumerating values, so this is RECORDED behaviour: the wire
+/// reports this value for a freshly created, usable network. This emulator
+/// reports ONE stable value for every live network rather than inventing
+/// transitions it cannot ground.
+pub const NETWORK_STANDING_GOOD: i32 = 2;
+
+/// The tag key the service itself sets on every network, holding the network's
+/// own ARN.
+///
+/// RECORDED behaviour: this API models no tagging operation at all
+/// (`smithy_query(query="list_operations")` lists none), and the recorded read of
+/// a network carries a tag set with this one service-set entry in it, whose value
+/// is the same ARN the record reports as `networkArn`. The KEY is fixed; the
+/// value is the network's own ARN, never a literal.
+pub const NETWORK_TAG_RESOURCE_ARN: &str = "resourceArn";
+
+/// The tag set a network comes into being with: the one entry the service sets
+/// itself, naming the network's own ARN.
+///
+/// Built from the record's ARN, so the tag and `networkArn` cannot disagree, and
+/// stored on the record rather than derived per read, so a later tagging
+/// operation has one place to add to.
+pub fn service_set_network_tags(network_arn: &str) -> BTreeMap<String, String> {
+    [(
+        NETWORK_TAG_RESOURCE_ARN.to_string(),
+        network_arn.to_string(),
+    )]
+    .into_iter()
+    .collect()
+}
 
 /// Length of the premium free trial, in days.
 ///
@@ -209,9 +242,9 @@ pub enum NetworkAccess<'a> {
     Unplaceable,
 }
 
-/// One stored network — every member of the modelled `Network` shape, so
-/// `GetNetwork` and `ListNetworks` read the same record rather than each
-/// recomputing half of it.
+/// One stored network — every member of the modelled `Network` shape plus the
+/// tag set a read of one reports, so `GetNetwork` and `ListNetworks` read the
+/// same record rather than each recomputing half of it.
 #[derive(Debug, Clone)]
 pub struct NetworkRecord {
     pub network_id: String,
@@ -223,6 +256,10 @@ pub struct NetworkRecord {
     pub free_trial_expiration: Option<String>,
     pub migration_state: i32,
     pub encryption_key_arn: Option<String>,
+    /// The network's tags, by key. Holds the service-set entry every network
+    /// carries ([`service_set_network_tags`]); this API models no operation that
+    /// adds another, so today that is the whole set.
+    pub tags: BTreeMap<String, String>,
 }
 
 /// One stored user of one network.

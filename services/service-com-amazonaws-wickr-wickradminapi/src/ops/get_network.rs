@@ -3,6 +3,10 @@
 //! @op GetNetwork
 //! Reports one stored network by id. Reporting only: it never writes.
 //!
+//! Beside the members the model declares, the answer carries the network's TAG SET, which
+//! the model declares on neither `GetNetworkResponse` nor `Network`; its schema and codec
+//! are written out in [`crate::ops::types::network_record_wire`].
+//!
 //! ## How this operation refuses
 //!
 //! This API resolves ownership of the `networkId` path label before it validates the
@@ -226,6 +230,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             free_trial_expiration: network.free_trial_expiration.clone(),
             migration_state: Some(network.migration_state),
             encryption_key_arn: network.encryption_key_arn.clone(),
+            // The network's own tag set, as the store holds it.
+            tags: network.tags.clone(),
         })
     }
 }
