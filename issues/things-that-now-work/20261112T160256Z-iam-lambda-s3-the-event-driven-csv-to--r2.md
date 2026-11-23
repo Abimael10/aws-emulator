@@ -47,3 +47,48 @@ Per-run values (bucket name, function and role names carrying the run token, obj
 6. PutObject a NEW key raw/probe-<n>.csv and poll ListObjectsV2/GetObject under converted/ for the derived <stem>.xlsx. Expected: the workbook appears (and parses as an OPC package whose sheet cells equal the CSV rows) with no further API call. Observed: it never appears, and the check is cut off at the 60 s harness cap having completed no phase.
 7. PutObject a key the filter rejects (e.g. raw/ignored.txt) and confirm no output object appears — unreachable today because step 6 never succeeds.
 8. Re-replay iam__lambda__s3.e2e-csv-to-xlsx-pipeline-lifecycle to confirm the fix.
+
+## Fix status
+
+Cause 1 (an ObjectCreated notification naming a function never resulting in that function
+being invoked, so nothing is converted): FIXED as to the root cause that could be identified
+and demonstrated, which is the one the report's own Fix sentence names second — "the function
+runtime that must actually execute the handler and let its PutObject land in the bucket".
+
+The AWS SDK the managed `python3.x` runtime bundles refused the handler's own `PutObject`
+whenever its `Body` was the file-like object the SDK documents ("bytes or seekable file-like
+object"), which is the form a handler that builds a binary artefact in memory naturally uses:
+`services/service-com-amazonaws-lambda-awsgirapiservice/src/state/execution/aws_sdk_guest.rs`
+encoded a blob in two places (`Client._sent` for the per-service blob input members, and
+`_encoded` for a blob wherever a call's own document carries one) and neither knew that form,
+and the four managed transfers the SDK adds to the Amazon S3 client (`upload_fileobj`,
+`download_fileobj`, `upload_file`, `download_file`) were not on the client at all. Because an
+S3 notification invokes the function ASYNCHRONOUSLY, that refusal reached no client: the
+delivery was made, the handler faulted inside it, and the only symptom was a derived object
+that never appeared — exactly what this report describes. Both encoders now read the three
+documented forms through one reader, so every blob input member of every service this SDK
+speaks takes all three, and the transfers resolve on the Amazon S3 client and on no other.
+Pinned by `tests/all/handler_sdk_blob_values.rs` in that crate.
+
+The dispatch half of the cause — "an S3 bucket notification whose
+LambdaFunctionConfigurations name a function never results in that function being invoked for
+a matching ObjectCreated event" — could not be reproduced: it is implemented and served. The
+report's own call sequence, driven against the started emulator binary over TLS with verified
+credentials (CreateBucket, seeded `raw/*.csv`, iam CreateRole/AttachRolePolicy/PutRolePolicy,
+lambda CreateFunction from a real .zip, GetFunction polled to Active, AddPermission,
+PutBucketNotificationConfiguration filtered to prefix `raw/` and suffix `.csv`, the backfill
+Invoke, then a NEW `raw/probe-1.csv`), converted the new key with no further API call, in
+under five seconds. It is pinned by `tests/all/handler_workbook_pipeline.rs` in that same
+crate (its EVENT table drives the converting handler from an armed `s3:ObjectCreated:*`
+notification, one row per key the filter admits and per key it rejects), by
+`core/router/tests/all/s3_notification_pipeline_lifecycle.rs` (the whole life of the pipeline,
+including the filter-rejected non-effect and the teardown) and by
+`core/router/tests/all/s3_notification_converts_on_a_started_emulator.rs`.
+
+Still unresolved, and NOT a behaviour a service crate can change: the replay key
+`iam__lambda__s3.e2e-csv-to-xlsx-pipeline-lifecycle|_watch_absent#9|Timeout|return found`.
+The check is abandoned at the harness's 60 s wall ceiling with no assertion reached, in the
+leg that WATCHES, and the sibling filing
+`issues/things-that-do-not-work/20261117T134237Z-lambda-s3-the-armed-s3-objectcreated-notification-csv-conversion-scenario.md`
+carries the identical `_watch_absent|Timeout|return found` shape for a second, independent
+notification check. Nothing in the emulator's own answers to that sequence spends that budget.

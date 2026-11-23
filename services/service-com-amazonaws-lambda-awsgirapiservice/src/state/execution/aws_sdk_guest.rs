@@ -763,6 +763,20 @@ _host = __import__("_lambda_host")
 # rather than to every client, because the token is a database login's, not an API call's.
 _DB_AUTH_TOKEN_SERVICES = ("rds",)
 
+# The MANAGED-TRANSFER methods the SDK adds to the Amazon S3 client and to no other, by the
+# name a handler calls each of them under: "upload_fileobj", "download_fileobj",
+# "upload_file" and "download_file" are documented on that client beside its operations, so
+# a handler that moves an object through a buffer or through the function's own ephemeral
+# storage calls them rather than an operation. They are the client's and not the service's:
+# each is one `PutObject` or `GetObject` made through this same client.
+_S3_TRANSFER_SERVICES = ("s3",)
+_S3_TRANSFER_METHODS = (
+    "upload_fileobj",
+    "download_fileobj",
+    "upload_file",
+    "download_file",
+)
+
 # The input members a call carries BYTES in, by service, keyed by the service's token with
 # its hyphens dropped — the one spelling both of a two-word token's forms compact to, so a
 # client built with either reaches the same entry. Every protocol this SDK speaks carries a
@@ -851,14 +865,72 @@ def _epoch_seconds(value):
     return int((value - datetime.datetime(1970, 1, 1)).total_seconds())
 
 
+def _file_like_bytes(value):
+    """The bytes a FILE-LIKE value carries, read from where it stands, or `None`.
+
+    An SDK takes a blob input member as "bytes or seekable file-like object" (Amazon S3
+    `PutObject$Body` is documented in exactly those words), so a buffer a handler built in
+    memory and a file it opened are both values a call carries. It is read from the position
+    the caller left it at, which is what the SDK reads one from: a buffer written and then
+    rewound carries all of it, and one that was not carries what is left of it. Text a
+    file-like value in text mode hands back is encoded as UTF-8, the way a text body is.
+
+    `None` for a value that is not file-like at all, which leaves the refusal to the caller.
+    A value that IS file-like and whose `read` hands back neither text nor bytes answers
+    `None` too, with that read already spent: there is no way to put back what a stream
+    yielded, so such a value is unrecoverable and the caller's refusal reports the value
+    rather than its contents.
+    """
+    read = getattr(value, "read", None)
+    if not callable(read):
+        return None
+    carried = read()
+    if isinstance(carried, str):
+        return carried.encode("utf-8")
+    if isinstance(carried, (bytes, bytearray)):
+        return bytes(carried)
+    return None
+
+
+def _blob_bytes(value):
+    """The bytes a blob input member carries, in each of the forms an SDK call takes one.
+
+    The three the SDK documents: the `bytes` themselves, text (encoded as UTF-8, which is
+    what a client does with a text body), and a file-like object ([`_file_like_bytes`]).
+    `None` for anything else — the value the caller then refuses ([`_blob_type_report`]).
+    """
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    if isinstance(value, str):
+        return value.encode("utf-8")
+    return _file_like_bytes(value)
+
+
+def _blob_type_report(member, value):
+    """The report a blob member given a value no call carries is refused with.
+
+    The SDK validates the parameter before it builds the request and names the member, what
+    it was given and the forms it takes. The value is rendered AS IT STANDS, the way the
+    SDK's own report renders it: `BotoCoreError` substitutes this report into its own
+    sentence with `str.format`, which parses only the sentence's own braces and emits a
+    substituted value verbatim, so a value whose rendering carries braces reads exactly as
+    the value does.
+    """
+    return (
+        "Invalid type for parameter %s, value: %s, type: %s, valid types: "
+        "<class 'bytes'>, <class 'bytearray'>, file-like object" % (member, value, type(value))
+    )
+
+
 def _encoded(value):
     """A value `json` does not write by itself.
 
     Every protocol this SDK speaks carries a blob as base64 text, so the `bytes` a handler
-    passes are encoded to it, and a timestamp as the seconds since the epoch, so a
-    `datetime` a handler passes for a timestamp member is converted to them
-    ([`_epoch_seconds`]) rather than refused: a native date-time is what an SDK takes for
-    such a member. Anything else is a value this SDK cannot send, and says so.
+    passes are encoded to it — as are the bytes a SEEKABLE file-like value carries, which is
+    the form an SDK takes a blob in ([`_file_like_bytes`]) — and a timestamp as the seconds
+    since the epoch, so a `datetime` a handler passes for a timestamp member is converted to
+    them ([`_epoch_seconds`]) rather than refused: a native date-time is what an SDK takes
+    for such a member. Anything else is a value this SDK cannot send, and says so.
     """
     import datetime
 
@@ -866,6 +938,14 @@ def _encoded(value):
         return base64.b64encode(bytes(value)).decode("ascii")
     if isinstance(value, datetime.datetime):
         return _epoch_seconds(value)
+    # A blob input member takes "a seekable file-like object", so the arm offered here is
+    # narrowed to one: this hook sees EVERY value a call's document carries, not only the
+    # members a model types as a blob, and a value that merely happens to carry a `read` is
+    # not one of them.
+    if callable(getattr(value, "read", None)) and callable(getattr(value, "seek", None)):
+        carried = _file_like_bytes(value)
+        if carried is not None:
+            return base64.b64encode(carried).decode("ascii")
     raise TypeError("%r is not a value an AWS SDK call can carry" % (value,))
 
 
@@ -1114,6 +1194,14 @@ class Client:
                     "'%s' object has no attribute '%s'" % (self._service_name, name)
                 )
             return self._db_auth_token
+        # The managed transfers the SDK adds to the Amazon S3 client, and to no other client
+        # ([`_S3_TRANSFER_METHODS`]).
+        if name in _S3_TRANSFER_METHODS:
+            if self._service_name not in _S3_TRANSFER_SERVICES:
+                raise AttributeError(
+                    "'%s' object has no attribute '%s'" % (self._service_name, name)
+                )
+            return getattr(self, "_transfer_" + name)
         operation_name = _operation_name(name)
 
         def method(**parameters):
@@ -1193,6 +1281,95 @@ class Client:
         )
 
     def close(self):
+        return None
+
+    def _transfer_upload_fileobj(
+        self, Fileobj, Bucket, Key, ExtraArgs=None, Callback=None, Config=None
+    ):
+        """`upload_fileobj`: "Upload a file-like object to S3."
+
+        The object is read from where it stands ([`_file_like_bytes`]) and written with one
+        `PutObject`, carrying every member `ExtraArgs` names ("Extra arguments that may be
+        passed to the client operation") — which is how a transfer states the object's
+        `ContentType`, its metadata or its encryption. `Callback` is told how many bytes were
+        transferred, as a transfer's progress callback is.
+
+        "The file-like object must be in binary mode": the transfer itself checks that the
+        value it was handed is one it can read, before it reads anything, and says which
+        method it must carry.
+        """
+        if not callable(getattr(Fileobj, "read", None)):
+            raise ValueError("Fileobj must implement read")
+        carried = _file_like_bytes(Fileobj)
+        if carried is None:
+            raise ParamValidationError(report=_blob_type_report("Fileobj", Fileobj))
+        parameters = dict(ExtraArgs or {})
+        parameters.update(Bucket=Bucket, Key=Key, Body=carried)
+        self._call("PutObject", parameters)
+        if Callback is not None:
+            Callback(len(carried))
+        return None
+
+    def _transfer_download_fileobj(
+        self, Bucket, Key, Fileobj, ExtraArgs=None, Callback=None, Config=None
+    ):
+        """`download_fileobj`: "Download an object from S3 to a file-like object."
+
+        One `GetObject`, whose body is written to the object the caller handed in — which is
+        where a handler that reads an object it then parses in memory puts it. The value is
+        checked for the method it has to carry first, as the upload above is.
+        """
+        if not callable(getattr(Fileobj, "write", None)):
+            raise ValueError("Fileobj must implement write")
+        parameters = dict(ExtraArgs or {})
+        parameters.update(Bucket=Bucket, Key=Key)
+        answered = self._call("GetObject", parameters)
+        # The answer side hands a blob over as a stream or as its own bytes ([`_blob_bytes`]
+        # reads either), so a `Body` that is neither is no object this transfer can write:
+        # writing nothing and reporting success would be indistinguishable from an empty
+        # object, which is a different answer.
+        carried = _blob_bytes(answered.get("Body"))
+        if carried is None:
+            raise SdkCallNotMade(
+                detail="GetObject answered a Body this SDK cannot read as bytes"
+            )
+        Fileobj.write(carried)
+        if Callback is not None:
+            Callback(len(carried))
+        return None
+
+    def _transfer_upload_file(
+        self, Filename, Bucket, Key, ExtraArgs=None, Callback=None, Config=None
+    ):
+        """`upload_file`: "Upload a file to an S3 object", named by its path.
+
+        The path is the function's own — the ephemeral storage a handler writes its working
+        files to — and the upload is the one above over the file's own bytes. WHICH paths a
+        run can open at all is the runtime's own file layer's to decide, not this transfer's:
+        `open` dispatches there, so a path that layer does not serve is refused by it.
+        """
+        with open(Filename, "rb") as held:
+            return self._transfer_upload_fileobj(
+                held, Bucket, Key, ExtraArgs=ExtraArgs, Callback=Callback, Config=Config
+            )
+
+    def _transfer_download_file(
+        self, Bucket, Key, Filename, ExtraArgs=None, Callback=None, Config=None
+    ):
+        """`download_file`: "Download an S3 object to a file", named by its path.
+
+        The object is fetched BEFORE the path is opened, so a download the service refused
+        leaves whatever stood at that path untouched rather than truncated — the ordering a
+        transfer that stages its download has.
+        """
+        import io
+
+        buffered = io.BytesIO()
+        self._transfer_download_fileobj(
+            Bucket, Key, buffered, ExtraArgs=ExtraArgs, Callback=Callback, Config=Config
+        )
+        with open(Filename, "wb") as held:
+            held.write(buffered.getvalue())
         return None
 
     def generate_presigned_url(
@@ -1316,15 +1493,12 @@ class Client:
         for member in members:
             if member not in sent:
                 continue
-            value = sent[member]
-            if isinstance(value, str):
-                value = value.encode("utf-8")
-            if not isinstance(value, (bytes, bytearray)):
+            carried = _blob_bytes(sent[member])
+            if carried is None:
                 raise ParamValidationError(
-                    report="Invalid type for parameter %s: this SDK carries it as bytes "
-                    "or as a string" % (member,)
+                    report=_blob_type_report(member, sent[member])
                 )
-            sent[member] = base64.b64encode(bytes(value)).decode("ascii")
+            sent[member] = base64.b64encode(carried).decode("ascii")
         return sent
 
     def _raise_refusal(self, refused, answered, operation_name):
