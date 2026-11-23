@@ -780,10 +780,15 @@ async fn a_create_that_cannot_be_served_is_refused_and_leaves_nothing_behind() {
 
     // A second create of one identifier is the modelled already-exists fault, and the
     // endpoint the FIRST create stored is untouched.
-    expect_ok(
+    // A second create of one identifier is the modelled already-exists fault — naming the
+    // identifier that collided and the ADDRESS the endpoint already holding it publishes, so
+    // a client creating several endpoints in one flow can tell WHICH one it collided with —
+    // and the endpoint the FIRST create stored is untouched.
+    let first = expect_ok(
         "the first create",
         create_endpoint(&router, "emu-ce-taken", CLUSTER, "ANY", &[]).await,
     );
+    let holder_address = text(&first, "Endpoint");
     for case in ["a second create of one identifier", "a third one"] {
         let refused = expect_error(
             case,
@@ -793,8 +798,11 @@ async fn a_create_that_cannot_be_served_is_refused_and_leaves_nothing_behind() {
         );
         assert_eq!(
             text(&refused, "Message"),
-            "The specified custom endpoint can't be created because it already exists.",
-            "case {case:?}: expected the fixed already-exists sentence, got {refused}"
+            format!(
+                "An endpoint with the identifier emu-ce-taken already exists: {holder_address}"
+            ),
+            "case {case:?}: expected the already-exists sentence naming the identifier and the \
+             endpoint holding it, got {refused}"
         );
     }
     let kept = poll_endpoint_until(&router, "the stored endpoint", "emu-ce-taken", AVAILABLE).await;

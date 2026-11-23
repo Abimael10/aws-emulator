@@ -24,6 +24,11 @@
 //! An instance with automated backups OFF keeps none — "setting this parameter to 0 disables
 //! automated backups" — which is the case `PointInTimeRestoreNotEnabledFault` is answered
 //! for.
+//!
+//! The hook both wires call when a session commits lives here
+//! ([`record_committed_state`]) and dispatches on the resource the endpoint belongs to: a DB
+//! CLUSTER keeps the consistent points of its backtrack window instead
+//! ([`super::cluster_backtrack`]), for the same reason and under the same bounds.
 
 use std::sync::Arc;
 
@@ -178,9 +183,39 @@ pub async fn record_initial_state(record: &mut DbInstanceRecord, endpoint: Optio
     }
 }
 
-/// Record what the DB instance `target` names has just COMMITTED as a recovery point of its
-/// continuous backup. Does nothing for an endpoint of any other resource, and for an
-/// instance that keeps no automated backups.
+/// Record what the resource the endpoint `target` belongs to has just COMMITTED as the
+/// consistent point its own recovery keeps: a recovery point of a DB INSTANCE's continuous
+/// backup, and a point of a DB CLUSTER's backtrack window
+/// ([`super::cluster_backtrack`]) — one hook, so the two wires cannot drift on which
+/// resource records what.
+///
+/// Does nothing for an endpoint of a resource that keeps neither: a DB instance with no
+/// automated backups, a DB cluster with no backtrack window, and a DB PROXY's endpoint,
+/// whose commits are recorded for the database the proxy pools connections TO when that
+/// database's own endpoint records them.
+pub async fn record_committed_state(
+    state: &::engine::ServiceState<ComAmazonawsRdsAmazonrdsv19State>,
+    target: &SessionTarget,
+    storage: &Arc<InstanceDatabase>,
+) {
+    match target {
+        SessionTarget::DbInstance {
+            region,
+            resource_id,
+        } => record_instance_committed_state(state, region, resource_id, storage).await,
+        SessionTarget::DbCluster {
+            region,
+            resource_id,
+        } => {
+            super::cluster_backtrack::record_committed_state(state, region, resource_id, storage)
+                .await;
+        }
+        SessionTarget::DbProxy { .. } => {}
+    }
+}
+
+/// Record what the DB instance `region`/`resource_id` has just COMMITTED as a recovery point
+/// of its continuous backup. Does nothing for an instance that keeps no automated backups.
 ///
 /// The store's guard is taken only to read whether the instance keeps backups and, at the
 /// end, to record the point; the COPY itself is engine work, so it runs on a blocking task
@@ -188,18 +223,12 @@ pub async fn record_initial_state(record: &mut DbInstanceRecord, endpoint: Optio
 /// takes does. Nothing of the client's statement depends on its outcome: a copy the engine
 /// could not take leaves the instance with the points it already had, and is recorded in this
 /// service's own tracing.
-pub async fn record_committed_state(
+async fn record_instance_committed_state(
     state: &::engine::ServiceState<ComAmazonawsRdsAmazonrdsv19State>,
-    target: &SessionTarget,
+    region: &str,
+    resource_id: &str,
     storage: &Arc<InstanceDatabase>,
 ) {
-    let SessionTarget::DbInstance {
-        region,
-        resource_id,
-    } = target
-    else {
-        return;
-    };
     let keeps_backups = state
         .lock()
         .instance_by_resource_id(region, resource_id)

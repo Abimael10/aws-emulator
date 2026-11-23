@@ -79,6 +79,9 @@ use super::snapshot_data_bytes;
 /// What each statement a session ran COST this engine, recorded as the session activity the
 /// monitoring services report on.
 pub mod activity_samples;
+// The CONSISTENT POINTS a DB CLUSTER keeps of what its sessions committed, which
+// `BacktrackDBCluster` rewinds it to.
+pub mod cluster_backtrack;
 pub mod cluster_endpoint;
 pub mod constraint_names;
 // The CONTINUOUS BACKUP of a DB instance: the recovery points `RestoreDBInstanceToPointInTime`
@@ -146,6 +149,17 @@ pub enum EndpointRole {
     /// currently writes through, so a `FailoverDBCluster` that moves the writer moves it
     /// under the live sessions of both.
     ClusterMember(String),
+    /// A CUSTOM endpoint created in front of a DB cluster, named by its
+    /// `DBClusterEndpointIdentifier`: "a custom endpoint for an Aurora cluster represents a
+    /// set of DB instances that you choose", so which member a session on it reaches — and
+    /// therefore whether it serves writes — follows the endpoint's own type and membership
+    /// as they stand NOW, which `ModifyDBClusterEndpoint` changes under the live sessions of
+    /// that endpoint ([`ComAmazonawsRdsAmazonrdsv19State::cluster_endpoint_member`]).
+    ///
+    /// The endpoint is named rather than the member it selects, because the membership is
+    /// the endpoint's and moves; the identifier itself is fixed for the endpoint's whole
+    /// life, since no operation renames a custom endpoint.
+    CustomEndpoint(String),
 }
 
 /// Which native wire an engine speaks.

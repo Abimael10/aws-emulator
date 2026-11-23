@@ -143,15 +143,23 @@ pub fn check_custom_endpoint_type(value: &str) -> Result<String, String> {
     }
 }
 
-/// The sentence a `DBClusterEndpointAlreadyExistsFault` carries: the one the model
-/// publishes for the error class — "The specified custom endpoint can't be created because
-/// it already exists."
+/// The message a `DBClusterEndpointAlreadyExistsFault` carries: Amazon RDS reports WHICH
+/// identifier was already taken and WHICH endpoint holds it, as
+/// `An endpoint with the identifier <identifier> already exists: <endpoint address>`.
 ///
-/// It has NO variable part: the fault reports that the identifier the request named is
-/// taken, and neither the identifier nor the cluster is interpolated into it, so this is a
-/// constant rather than a `format!` over the request.
-pub const DB_CLUSTER_ENDPOINT_ALREADY_EXISTS_MESSAGE: &str =
-    "The specified custom endpoint can't be created because it already exists.";
+/// The error shape's own documentation ("The specified custom endpoint can't be created
+/// because it already exists.") describes the error CLASS and is not what goes on the wire,
+/// so the sentence is formatted here — the same reason
+/// [`db_cluster_endpoint_not_found_message`] is formatted rather than taken from the model.
+///
+/// `named` is the value the REQUEST carried, so a caller matching the message against the
+/// identifier it sent finds it there, and `endpoint` is the ADDRESS the stored endpoint
+/// already holding that identifier publishes ([`DbClusterEndpointRecord::to_wire`]'s
+/// `Endpoint`), read out of this store — which is what tells a client creating several
+/// endpoints in one flow which one it collided with.
+pub fn db_cluster_endpoint_already_exists_message(named: &str, endpoint: &str) -> String {
+    format!("An endpoint with the identifier {named} already exists: {endpoint}")
+}
 
 /// The sentence a `DBClusterEndpointQuotaExceededFault` carries, as the model publishes it
 /// for the error class: "The cluster already has the maximum number of custom endpoints."
@@ -300,6 +308,19 @@ pub struct DbClusterEndpointRecord {
     /// `ExcludedMembers`: "list of DB instance identifiers that aren't part of the custom
     /// endpoint group", resolved the same way.
     pub excluded_members: Vec<String>,
+    /// The address of the LISTENER this endpoint's own sessions arrive on, for a cluster
+    /// whose engine wire this emulator serves.
+    ///
+    /// A custom endpoint is one DNS name in front of a chosen set of the cluster's members,
+    /// so it is an address a client CONNECTS to with its ordinary driver: it gets a listener
+    /// of its own ([`data_plane::cluster_endpoint`]) and publishes that listener's
+    /// address, because a name this machine does not resolve would be no endpoint at all,
+    /// and an address shared with another of the cluster's endpoints could not route to the
+    /// members this endpoint selects.
+    ///
+    /// `None` for a cluster this emulator serves no wire for, which keeps the DNS-form name
+    /// ([`Self::to_wire`]) and gets no listener.
+    pub served_endpoint: Option<ServedEndpoint>,
     /// The tags the create assigned to the endpoint.
     ///
     /// Stored because `Tags` is "the tags to be assigned to the Amazon RDS resource", so a
@@ -347,6 +368,52 @@ impl DbClusterEndpointRecord {
         self.status == DB_CLUSTER_ENDPOINT_STATUS_AVAILABLE && self.pending_status.is_none()
     }
 
+    /// Whether the member `identifier` is in this endpoint's GROUP, by the two membership
+    /// lists: `StaticMembers` is the "list of DB instance identifiers that are part of the
+    /// custom endpoint group", and where it is empty `ExcludedMembers` lists the ones that
+    /// are not while "all other eligible instances are reachable through the custom
+    /// endpoint" — which is why the exclusions are read only for an endpoint with no static
+    /// list, exactly as `ExcludedMembers` documents ("relevant only if the list of static
+    /// members is empty").
+    ///
+    /// A DB instance identifier "isn't case-sensitive" wherever this front door resolves
+    /// one, so the comparison disregards case.
+    pub fn admits_member(&self, identifier: &str) -> bool {
+        if !self.static_members.is_empty() {
+            return self
+                .static_members
+                .iter()
+                .any(|member| member.eq_ignore_ascii_case(identifier));
+        }
+        !self
+            .excluded_members
+            .iter()
+            .any(|member| member.eq_ignore_ascii_case(identifier))
+    }
+
+    /// Whether a member in the cluster's WRITING role (`is_writer`) is one this endpoint's
+    /// TYPE routes to: `CustomEndpointType` is "the type associated with a custom endpoint.
+    /// One of: READER, WRITER, ANY", so a READER endpoint routes to the cluster's read-only
+    /// members, a WRITER endpoint to the one it writes through, and an ANY endpoint to
+    /// either.
+    pub fn admits_writer_role(&self, is_writer: bool) -> bool {
+        match self.custom_endpoint_type.to_ascii_uppercase().as_str() {
+            DB_CLUSTER_ENDPOINT_TYPE_READER => !is_writer,
+            DB_CLUSTER_ENDPOINT_TYPE_WRITER => is_writer,
+            // "ANY" — the third value the member publishes, and the only one left.
+            _ => true,
+        }
+    }
+
+    /// Whether a session on this endpoint may WRITE at all: a READER endpoint never writes,
+    /// whichever member it reaches, and the other two types write exactly while the member
+    /// they reached is the one the cluster writes through — which is what the caller decides
+    /// from the member ([`ComAmazonawsRdsAmazonrdsv19State::cluster_endpoint_member`]).
+    pub fn serves_reads_only(&self) -> bool {
+        self.custom_endpoint_type
+            .eq_ignore_ascii_case(DB_CLUSTER_ENDPOINT_TYPE_READER)
+    }
+
     /// Accept a modification: the endpoint reports [`DB_CLUSTER_ENDPOINT_STATUS_MODIFYING`]
     /// from now on and the clock owes it [`DB_CLUSTER_ENDPOINT_STATUS_AVAILABLE`]
     /// [`STATUS_TRANSITION_DELAY`] from now. Nothing sleeps: the due instant is stored and
@@ -380,7 +447,7 @@ impl DbClusterEndpointRecord {
             db_cluster_endpoint_identifier: Some(self.identifier.clone()),
             db_cluster_identifier: Some(self.db_cluster_identifier.clone()),
             db_cluster_endpoint_resource_identifier: Some(self.resource_id.clone()),
-            endpoint: cluster.map(|cluster| self.address_on(cluster)),
+            endpoint: Some(self.address(cluster)).filter(|address| !address.is_empty()),
             status: Some(self.status.clone()),
             // "One of: READER, WRITER, CUSTOM": an endpoint a caller created is a CUSTOM
             // one, and the type the request asked for is the `CustomEndpointType` beside it.
@@ -409,6 +476,30 @@ impl DbClusterEndpointRecord {
     /// to with the cluster's `Port`.
     fn address_on(&self, cluster: &DbClusterRecord) -> String {
         cluster.custom_endpoint_host(&self.identifier)
+    }
+
+    /// `Endpoint` as this endpoint publishes it: the address of its OWN listener where this
+    /// emulator opened one ([`Self::served_endpoint`]), and the DNS name above for a cluster
+    /// it serves no wire for.
+    ///
+    /// The served form carries the PORT the core assigned that listener
+    /// (`service_common::data_plane_addressing::host_port_authority`), because the modelled
+    /// `DBClusterEndpoint` shape has no port member of its own and the core owns the port
+    /// range — so a client that reads this string has the whole address it needs, exactly as
+    /// a DB proxy's `Endpoint` carries one ([`DbProxyRecord::endpoint`]).
+    ///
+    /// An endpoint whose cluster this store no longer holds and that has no listener of its
+    /// own has no address at all: the empty value is what the caller leaves the member out
+    /// for, rather than an invented name. A cluster's custom endpoints leave the store with
+    /// the cluster, so that is a state no read reaches.
+    fn address(&self, cluster: Option<&DbClusterRecord>) -> String {
+        if let Some(served) = &self.served_endpoint {
+            return ::service_common::data_plane_addressing::host_port_authority(
+                &served.host,
+                u16::try_from(served.port).unwrap_or_default(),
+            );
+        }
+        cluster.map(|cluster| self.address_on(cluster)).unwrap_or_default()
     }
 }
 
@@ -513,6 +604,38 @@ impl ComAmazonawsRdsAmazonrdsv19State {
     ) -> Option<&DbClusterEndpointRecord> {
         self.db_cluster_endpoints
             .get(&(region.to_string(), db_cluster_endpoint_key(named)))
+    }
+
+    /// The MEMBER DB instance a session arriving on the custom endpoint `record` is routed
+    /// to: the first of the cluster's members, in the order the cluster reports them (the
+    /// writer first), that this endpoint's TYPE and its membership lists both admit
+    /// ([`DbClusterEndpointRecord::admits_writer_role`],
+    /// [`DbClusterEndpointRecord::admits_member`]) and that is not on its way out.
+    ///
+    /// That is what a custom endpoint IS: "a custom endpoint for an Aurora cluster
+    /// represents a set of DB instances that you choose", so a session on it reaches one of
+    /// the chosen members and never one the endpoint leaves out — which is the difference
+    /// between this address and the cluster's own two.
+    ///
+    /// `None` when the endpoint selects no member at all: a cluster this store no longer
+    /// holds, one with no member instance yet, and a membership that admits none of the
+    /// members the cluster has. Such a session is served against the CLUSTER itself, in the
+    /// role this endpoint's type gives it, exactly as the cluster's own endpoints are.
+    pub fn cluster_endpoint_member(
+        &self,
+        record: &DbClusterEndpointRecord,
+    ) -> Option<&DbInstanceRecord> {
+        let cluster = self.resolve_db_cluster(&record.region, &record.db_cluster_identifier)?;
+        let members = self.cluster_members(cluster);
+        let writes = members
+            .first()
+            .map(|member| member.identifier.clone())
+            .unwrap_or_default();
+        members.into_iter().find(|member| {
+            !member.is_deleting()
+                && record.admits_writer_role(writes.eq_ignore_ascii_case(&member.identifier))
+                && record.admits_member(&member.identifier)
+        })
     }
 
     /// Project a stored custom endpoint onto the modelled `DBClusterEndpoint` shape, with

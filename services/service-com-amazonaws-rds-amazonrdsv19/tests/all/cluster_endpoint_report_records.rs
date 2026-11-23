@@ -265,8 +265,9 @@ async fn the_report_lists_the_custom_endpoints_of_a_cluster_before_its_own_two()
 #[derive(Debug, PartialEq, Eq)]
 enum Published {
     /// A cluster whose own engine LISTENER serves its data plane: the writer entry publishes
-    /// the address that listener answers on, and the reader and the custom endpoint the names
-    /// the cluster mints for them.
+    /// the address that listener answers on, the custom endpoint the address of the listener
+    /// OPENED FOR IT — a client dials the members that endpoint selects there — and the
+    /// reader the name the cluster mints for it.
     ListenerThenNames,
     /// A cluster whose data plane is an AWS API this emulator serves at its OWN endpoint:
     /// every endpoint of such a cluster is reached at that one address, because its plane
@@ -399,13 +400,46 @@ async fn every_endpoint_of_a_cluster_publishes_the_address_of_its_own_kind() {
                     );
                 }
                 // Each minted name carries the label its kind is published under, in front of
-                // the resource it belongs to.
-                assert!(
-                    custom.starts_with(&format!("{}.cluster-custom-", row.endpoint_identifier)),
-                    "case {:?}: expected a custom endpoint of the form \
-                     <identifier>.cluster-custom-<label>…, got {custom:?}",
-                    row.case
-                );
+                // the resource it belongs to — for the endpoints that publish a NAME. A custom
+                // endpoint of a cluster this emulator serves the wire of publishes its OWN
+                // listener's address instead, which is what routes a session to the members
+                // that endpoint selects, and which carries that listener's port because the
+                // modelled endpoint shape has no port member of its own.
+                match row.expected {
+                    Published::ListenerThenNames => {
+                        let (host, port) = custom.rsplit_once(':').unwrap_or_else(|| {
+                            panic!(
+                                "case {:?}: expected the custom endpoint's own listener address \
+                                 <host>:<port>, got {custom:?}",
+                                row.case
+                            )
+                        });
+                        assert!(
+                            host.trim_matches(['[', ']']).parse::<std::net::IpAddr>().is_ok(),
+                            "case {:?}: expected the address the custom endpoint's own listener \
+                             answers on, got the name {host:?}",
+                            row.case
+                        );
+                        let port = port.parse::<u16>().unwrap_or_else(|error| {
+                            panic!(
+                                "case {:?}: expected the port that listener was assigned, got \
+                                 {port:?}: {error}",
+                                row.case
+                            )
+                        });
+                        assert!(
+                            port > 0,
+                            "case {:?}: expected a port a client can dial, got {port}",
+                            row.case
+                        );
+                    }
+                    _ => assert!(
+                        custom.starts_with(&format!("{}.cluster-custom-", row.endpoint_identifier)),
+                        "case {:?}: expected a custom endpoint of the form \
+                         <identifier>.cluster-custom-<label>…, got {custom:?}",
+                        row.case
+                    ),
+                }
                 assert!(
                     reader.starts_with(&format!("{}.cluster-ro-", row.cluster)),
                     "case {:?}: expected a reader endpoint of the form \
@@ -430,9 +464,15 @@ async fn every_endpoint_of_a_cluster_publishes_the_address_of_its_own_kind() {
                 }
             }
         }
-        // Every entry publishes a bare HOST: the cluster has one `Port` member for all of
-        // its endpoints, so no entry carries a port or a scheme of its own.
-        for (which, address) in [(CUSTOM, &custom), (WRITER, &writer), (READER, &reader)] {
+        // Every entry that publishes a NAME publishes a bare HOST: the cluster has one
+        // `Port` member for all of its endpoints, so no such entry carries a port or a scheme
+        // of its own. The one address that does carry a port is a custom endpoint's own
+        // listener (asserted above), which the cluster's `Port` does not answer on.
+        let bare: Vec<(&str, &String)> = match row.expected {
+            Published::ListenerThenNames => vec![(WRITER, &writer), (READER, &reader)],
+            _ => vec![(CUSTOM, &custom), (WRITER, &writer), (READER, &reader)],
+        };
+        for (which, address) in bare {
             assert!(
                 !address.is_empty() && !address.contains(':') && !address.contains('/'),
                 "case {:?}: the {which} entry publishes a bare host, got {address:?}",

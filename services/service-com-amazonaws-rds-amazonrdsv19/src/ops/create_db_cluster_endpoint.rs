@@ -215,138 +215,241 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
         };
+        let key = (region.clone(), identifier.clone());
+        // Everything this create is REFUSED for, decided under one guard — which is then
+        // released, because the endpoint's own listener is bound asynchronously and the
+        // store cannot be held across that. NOTHING is written in this scope.
+        let (record, volume) = {
+            let mut store = state.lock();
+            store.settle_due_transitions(&region);
+
+            // "Creates a new custom endpoint and associates it with an Amazon Aurora DB
+            // cluster": the endpoint hangs off a cluster, so a `DBClusterIdentifier` that
+            // resolves to no cluster in this region, one this call does not apply to, or one
+            // in a state no endpoint can be added to is the refusal that cause carries
+            // ([`admits_the_cluster`]) rather than an endpoint pointing at nothing. RDS is
+            // regional, so only the region the request was signed for is in scope.
+            let db_cluster_identifier =
+                admits_the_cluster(&store, &region, &input.db_cluster_identifier, Self::NAME)?;
+
+            // "List of DB instance identifiers that are part of the custom endpoint group" and
+            // the list that is not: each names a DB instance, so an identifier that resolves to
+            // none is the modelled `DBInstanceNotFoundFault` and one naming an instance on its
+            // way out is the modelled `InvalidDBInstanceStateFault` — the two faults this
+            // operation declares for a membership — rather than a membership naming nothing.
+            let static_members = store
+                .resolve_cluster_endpoint_members(&region, &static_members)
+                .map_err(member_refusal)?;
+            let excluded_members = store
+                .resolve_cluster_endpoint_members(&region, &excluded_members)
+                .map_err(member_refusal)?;
+
+            admits_another_endpoint(&store, &key, &named, &db_cluster_identifier)?;
+
+            let mint = store.next_mint();
+            // WHAT the endpoint's own listener is opened onto: the cluster's VOLUME, on the
+            // wire its engine speaks — the same storage every other endpoint of that cluster
+            // addresses, since "each Aurora DB cluster hosts copies of its data" on one
+            // volume. `None` for a cluster this emulator serves no wire for, which gets no
+            // listener and keeps the DNS-form name.
+            let volume = store.cluster_volume_of(&region, &db_cluster_identifier);
+            let record = crate::state::DbClusterEndpointRecord {
+                identifier,
+                region: region.clone(),
+                db_cluster_identifier,
+                resource_id: crate::state::mint_db_cluster_endpoint_resource_id(mint),
+                custom_endpoint_type,
+                // The create is accepted and the endpoint is still being provisioned: it
+                // reports `creating` until the transition the clock owes it comes due, which
+                // the next call materialises. Nothing sleeps.
+                status: crate::state::DB_CLUSTER_ENDPOINT_STATUS_CREATING.to_string(),
+                pending_status: Some(crate::state::PendingStatus::in_a_moment(
+                    crate::state::DB_CLUSTER_ENDPOINT_STATUS_AVAILABLE,
+                )),
+                static_members,
+                excluded_members,
+                served_endpoint: None,
+                tags,
+            };
+            (record, volume)
+        };
+
+        // The endpoint's OWN LISTENER, opened with the state lock released: binding is
+        // asynchronous and the core owns the socket, the bind interface and the port. It is
+        // opened AFTER every refusal above has been answered — so nothing binds for a create
+        // that was going to fail — and before the record is admitted to the store, so an
+        // endpoint this service holds is one whose address is already listening. The endpoint
+        // still reports `creating` until the clock makes `available` due.
+        //
+        // A listener of its OWN, rather than a second publication of one of the cluster's two
+        // addresses: a session on this address is routed to the members THIS endpoint selects
+        // ([`crate::state::EndpointRole::CustomEndpoint`]), which an address shared with
+        // another endpoint could not do.
+        let mut record = record;
+        let plane = match volume {
+            Some((wire, cluster_resource_id, storage)) => Some(
+                crate::state::open_engine_endpoint(
+                    &*self.engine,
+                    &state,
+                    crate::state::EngineEndpointPlan {
+                        target: crate::state::SessionTarget::DbCluster {
+                            region: region.clone(),
+                            resource_id: cluster_resource_id,
+                        },
+                        wire,
+                        role: crate::state::EndpointRole::CustomEndpoint(
+                            record.identifier.clone(),
+                        ),
+                        // ONE address per custom endpoint: the modelled shape carries a
+                        // single `Endpoint`.
+                        reader: false,
+                        storage: Some(storage),
+                        callback: ctx.callback().clone(),
+                    },
+                )
+                .await
+                .map_err(CreateDBClusterEndpointError::internal_failure)?,
+            ),
+            None => None,
+        };
+        record.served_endpoint = plane.as_ref().map(|plane| plane.endpoint.clone());
+
         let mut store = state.lock();
         store.settle_due_transitions(&region);
+        // Every refusal about the STORE is decided AGAIN here, because the lock was released
+        // for the bind and the store may have moved under it: another request may have stored
+        // an endpoint under this identifier (the loser of two simultaneous creates reads the
+        // same already-exists sentence whichever scope caught it), carried the cluster to its
+        // allowance, or taken the CLUSTER away or out of a state it can take an endpoint in —
+        // which would otherwise leave an endpoint, and a listener, hanging off a cluster this
+        // store no longer holds. The listener this call opened is dropped with the plane it
+        // was going to publish, which closes its port.
+        admits_the_cluster(&store, &region, &input.db_cluster_identifier, Self::NAME)?;
+        admits_another_endpoint(&store, &key, &named, &record.db_cluster_identifier)?;
+        let created = store.cluster_endpoint_to_wire(&record);
+        store.db_cluster_endpoints.insert(key.clone(), record);
+        // The listener is held in the store, which is what keeps its port open: it is dropped
+        // with the endpoint when the clock takes the endpoint away, and with the cluster.
+        if let Some(plane) = plane {
+            store.db_cluster_endpoint_planes.insert(key, plane);
+        }
+        Ok(created)
+    }
+}
 
-        // "Creates a new custom endpoint and associates it with an Amazon Aurora DB
-        // cluster": the endpoint hangs off a cluster, so a `DBClusterIdentifier` that
-        // resolves to no cluster in this region is the modelled not-found fault rather than
-        // an endpoint pointing at nothing. RDS is regional, so only the region the request
-        // was signed for is in scope.
-        let Some(cluster) = store.resolve_db_cluster(&region, &input.db_cluster_identifier) else {
-            return Err(CreateDBClusterEndpointErrorModeled::DBClusterNotFoundFault(
-                DBClusterNotFoundFault {
-                    // The cluster is named here as the SOURCE the new endpoint hangs off, the
-                    // role RDS words this fault for across the custom-endpoint API
-                    // ([`crate::state::db_cluster_cannot_be_accessed_message`]).
-                    message: Some(crate::state::db_cluster_cannot_be_accessed_message(
-                        &input.db_cluster_identifier,
+/// Whether the CLUSTER `named` still admits a custom endpoint, and the identifier it is
+/// stored under where it does — or the refusal that cause carries: the modelled not-found
+/// fault for a cluster this store does not hold, the parameter refusal for one this call does
+/// not apply to ("this action applies only to Aurora DB clusters"), and the modelled
+/// cluster-state fault for one in a state no endpoint can be added to
+/// ([`crate::state::CLUSTER_ENDPOINT_CLUSTER_STATUSES`] — a cluster that is stopped,
+/// stopping, starting, rebooting, failing over, taking a modification or on its way out).
+///
+/// Decided under BOTH of this handler's critical sections, for the same reason
+/// [`admits_another_endpoint`] is: the endpoint's listener is opened with the state lock
+/// released, so a delete, a stop or a modification of the cluster can land in between, and an
+/// endpoint stored for such a cluster would publish an address for a cluster that is gone. One
+/// reading, so the two scopes cannot refuse the same request differently.
+fn admits_the_cluster(
+    store: &crate::state::ComAmazonawsRdsAmazonrdsv19State,
+    region: &str,
+    named: &str,
+    operation: &str,
+) -> Result<String, CreateDBClusterEndpointError> {
+    let Some(cluster) = store.resolve_db_cluster(region, named) else {
+        return Err(CreateDBClusterEndpointErrorModeled::DBClusterNotFoundFault(
+            DBClusterNotFoundFault {
+                // The cluster is named here as the SOURCE the new endpoint hangs off, the role
+                // RDS words this fault for across the custom-endpoint API
+                // ([`crate::state::db_cluster_cannot_be_accessed_message`]).
+                message: Some(crate::state::db_cluster_cannot_be_accessed_message(named)),
+            },
+        )
+        .into());
+    };
+    if !crate::state::ClusterKind::Aurora.holds_for(&cluster.engine) {
+        return Err(CreateDBClusterEndpointError::invalid_parameter_value(
+            crate::state::cluster_kind_unsupported_message(
+                operation,
+                &cluster.identifier,
+                &cluster.engine,
+                crate::state::ClusterKind::Aurora,
+            ),
+        ));
+    }
+    if cluster.is_deleting()
+        || !crate::state::CLUSTER_ENDPOINT_CLUSTER_STATUSES.contains(&cluster.status.as_str())
+    {
+        return Err(
+            CreateDBClusterEndpointErrorModeled::InvalidDBClusterStateFault(
+                InvalidDBClusterStateFault {
+                    message: Some(crate::state::cluster_state_message(
+                        &cluster.identifier,
+                        &cluster.status,
+                        &crate::state::CLUSTER_ENDPOINT_CLUSTER_STATUSES.join(", "),
                     )),
                 },
             )
-            .into());
-        };
-        let db_cluster_identifier = cluster.identifier.clone();
-        let cluster_engine = cluster.engine.clone();
-        let cluster_status = cluster.status.clone();
-        let cluster_is_deleting = cluster.is_deleting();
-
-        // "This action applies only to Aurora DB clusters": a `DBClusterIdentifier` naming
-        // a Multi-AZ DB cluster names one this call cannot serve at all, which is a value
-        // the parameter does not accept rather than a state the cluster is in — the
-        // `InvalidParameterValue` this front door answers such a value with.
-        if !crate::state::ClusterKind::Aurora.holds_for(&cluster_engine) {
-            return Err(CreateDBClusterEndpointError::invalid_parameter_value(
-                crate::state::cluster_kind_unsupported_message(
-                    Self::NAME,
-                    &db_cluster_identifier,
-                    &cluster_engine,
-                    crate::state::ClusterKind::Aurora,
-                ),
-            ));
-        }
-        // A custom endpoint is added TO the cluster, so there has to be a cluster to add it
-        // to: only one that is up, or one still being created that the endpoint comes up
-        // with, can take it ([`crate::state::CLUSTER_ENDPOINT_CLUSTER_STATUSES`]). Every
-        // other status — stopped, stopping, rebooting, failing over, taking a modification,
-        // or on its way out — is the modelled `InvalidDBClusterStateFault`, and nothing is
-        // stored for it.
-        if cluster_is_deleting
-            || !crate::state::CLUSTER_ENDPOINT_CLUSTER_STATUSES.contains(&cluster_status.as_str())
-        {
-            return Err(
-                CreateDBClusterEndpointErrorModeled::InvalidDBClusterStateFault(
-                    InvalidDBClusterStateFault {
-                        message: Some(crate::state::cluster_state_message(
-                            &db_cluster_identifier,
-                            &cluster_status,
-                            &crate::state::CLUSTER_ENDPOINT_CLUSTER_STATUSES.join(", "),
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
-
-        // "List of DB instance identifiers that are part of the custom endpoint group" and
-        // the list that is not: each names a DB instance, so an identifier that resolves to
-        // none is the modelled `DBInstanceNotFoundFault` and one naming an instance on its
-        // way out is the modelled `InvalidDBInstanceStateFault` — the two faults this
-        // operation declares for a membership — rather than a membership naming nothing.
-        let static_members = store
-            .resolve_cluster_endpoint_members(&region, &static_members)
-            .map_err(member_refusal)?;
-        let excluded_members = store
-            .resolve_cluster_endpoint_members(&region, &excluded_members)
-            .map_err(member_refusal)?;
-
-        // The identifier names ONE endpoint in the region: a second create under it is the
-        // modelled already-exists fault rather than a silent overwrite of the first, which
-        // is what makes two concurrent creates of one identifier settle as one success and
-        // one refusal — this store's lock serialises them.
-        let key = (region.clone(), identifier.clone());
-        if store.db_cluster_endpoints.contains_key(&key) {
-            return Err(
-                CreateDBClusterEndpointErrorModeled::DBClusterEndpointAlreadyExistsFault(
-                    DBClusterEndpointAlreadyExistsFault {
-                        message: Some(
-                            crate::state::DB_CLUSTER_ENDPOINT_ALREADY_EXISTS_MESSAGE.to_string(),
-                        ),
-                    },
-                )
-                .into(),
-            );
-        }
-        // The cluster's custom endpoint allowance: "the cluster already has the maximum
-        // number of custom endpoints" is what the modelled fault reports, and the bound is
-        // the one Amazon Aurora publishes per DB cluster.
-        if store
-            .cluster_endpoints_of(&region, &db_cluster_identifier)
-            .len()
-            >= crate::state::DB_CLUSTER_ENDPOINT_QUOTA_PER_CLUSTER
-        {
-            return Err(
-                CreateDBClusterEndpointErrorModeled::DBClusterEndpointQuotaExceededFault(
-                    DBClusterEndpointQuotaExceededFault {
-                        message: Some(crate::state::DB_CLUSTER_ENDPOINT_QUOTA_MESSAGE.to_string()),
-                    },
-                )
-                .into(),
-            );
-        }
-
-        let mint = store.next_mint();
-        let record = crate::state::DbClusterEndpointRecord {
-            identifier,
-            region: region.clone(),
-            db_cluster_identifier,
-            resource_id: crate::state::mint_db_cluster_endpoint_resource_id(mint),
-            custom_endpoint_type,
-            // The create is accepted and the endpoint is still being provisioned: it
-            // reports `creating` until the transition the clock owes it comes due, which
-            // the next call materialises. Nothing sleeps.
-            status: crate::state::DB_CLUSTER_ENDPOINT_STATUS_CREATING.to_string(),
-            pending_status: Some(crate::state::PendingStatus::in_a_moment(
-                crate::state::DB_CLUSTER_ENDPOINT_STATUS_AVAILABLE,
-            )),
-            static_members,
-            excluded_members,
-            tags,
-        };
-        let created = store.cluster_endpoint_to_wire(&record);
-        store.db_cluster_endpoints.insert(key, record);
-        Ok(created)
+            .into(),
+        );
     }
+    Ok(cluster.identifier.clone())
+}
+
+/// Whether the store admits another custom endpoint under `key` for the cluster
+/// `db_cluster_identifier`, or the refusal it answers one with.
+///
+/// Decided under BOTH of this handler's critical sections, because the endpoint's listener is
+/// opened with the state lock released and another request may store an endpoint in between:
+/// one reading, so the interleaving cannot admit two endpoints under one identifier or carry
+/// a cluster past the number of custom endpoints it may have.
+///
+/// * The identifier names ONE endpoint in the region: a second create under it is the
+///   modelled `DBClusterEndpointAlreadyExistsFault`, naming the identifier that collided and
+///   the ADDRESS the endpoint already holding it publishes
+///   ([`crate::state::db_cluster_endpoint_already_exists_message`]) — which is what tells a
+///   client creating several endpoints in one flow which one it collided with — rather than a
+///   silent overwrite of the first.
+/// * "The cluster already has the maximum number of custom endpoints" is what the modelled
+///   `DBClusterEndpointQuotaExceededFault` reports, over the bound Amazon Aurora publishes per
+///   DB cluster.
+///
+/// `named` is the identifier the REQUEST carried, which is the one the refusal names.
+fn admits_another_endpoint(
+    store: &crate::state::ComAmazonawsRdsAmazonrdsv19State,
+    key: &crate::state::RegionalKey,
+    named: &str,
+    db_cluster_identifier: &str,
+) -> Result<(), CreateDBClusterEndpointError> {
+    if let Some(holder) = store.db_cluster_endpoints.get(key) {
+        let address = store
+            .cluster_endpoint_to_wire(holder)
+            .endpoint
+            .unwrap_or_default();
+        return Err(
+            CreateDBClusterEndpointErrorModeled::DBClusterEndpointAlreadyExistsFault(
+                DBClusterEndpointAlreadyExistsFault {
+                    message: Some(crate::state::db_cluster_endpoint_already_exists_message(
+                        named, &address,
+                    )),
+                },
+            )
+            .into(),
+        );
+    }
+    if store.cluster_endpoints_of(&key.0, db_cluster_identifier).len()
+        >= crate::state::DB_CLUSTER_ENDPOINT_QUOTA_PER_CLUSTER
+    {
+        return Err(
+            CreateDBClusterEndpointErrorModeled::DBClusterEndpointQuotaExceededFault(
+                DBClusterEndpointQuotaExceededFault {
+                    message: Some(crate::state::DB_CLUSTER_ENDPOINT_QUOTA_MESSAGE.to_string()),
+                },
+            )
+            .into(),
+        );
+    }
+    Ok(())
 }
 
 /// The modelled fault a membership entry this service cannot put in the endpoint group is

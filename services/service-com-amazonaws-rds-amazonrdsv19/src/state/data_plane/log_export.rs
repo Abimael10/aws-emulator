@@ -431,6 +431,17 @@ fn stream_of(
     if let EndpointRole::ClusterMember(identifier) = role {
         return identifier.clone();
     }
+    // A CUSTOM endpoint names the member it ROUTES to, which is the instance whose engine
+    // served the session ([`ComAmazonawsRdsAmazonrdsv19State::cluster_endpoint_member`]); an
+    // endpoint that selects none falls through to the cluster's own reading below.
+    if let EndpointRole::CustomEndpoint(identifier) = role {
+        if let Some(member) = store
+            .resolve_db_cluster_endpoint(&cluster.region, identifier)
+            .and_then(|custom| store.cluster_endpoint_member(custom))
+        {
+            return member.identifier.clone();
+        }
+    }
     let members = store.cluster_members(cluster);
     let served = match role {
         EndpointRole::Reader => members.get(1).or_else(|| members.first()),

@@ -86,6 +86,21 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             .find(|record| record.resource_id == resource_id)
     }
 
+    /// The same cluster, held MUTABLY: what a session writes through when the engine behind
+    /// one of the cluster's endpoints records something on the cluster it belongs to — a
+    /// consistent point of its backtrack window ([`super::cluster_backtrack`]).
+    pub fn cluster_by_resource_id_mut(
+        &mut self,
+        region: &str,
+        resource_id: &str,
+    ) -> Option<&mut DbClusterRecord> {
+        self.db_clusters
+            .range_mut((region.to_string(), String::new())..)
+            .take_while(|((stored, _), _)| stored == region)
+            .map(|(_, record)| record)
+            .find(|record| record.resource_id == resource_id)
+    }
+
     /// The engine endpoint of the DB cluster `key` names, for the clusters that have one.
     #[must_use]
     pub fn cluster_engine_endpoint(
@@ -190,14 +205,29 @@ pub(super) fn cluster_facts(
     // published at, while everything a login is checked against — the master user, the
     // engine version, the database — is the CLUSTER's, which is where an Aurora member's
     // credential lives ("the password is managed by the DB cluster").
-    let member = match &role {
-        EndpointRole::ClusterMember(identifier) => {
+    //
+    // A CUSTOM endpoint names no member of its own: it selects one, out of the set its type
+    // and its membership admit as they stand now
+    // ([`ComAmazonawsRdsAmazonrdsv19State::cluster_endpoint_member`]), so a session that
+    // arrives on it is served by the member it routes to — and by the cluster itself where
+    // it selects none.
+    let custom = match &role {
+        EndpointRole::CustomEndpoint(identifier) => {
+            Some(store.resolve_db_cluster_endpoint(region, identifier)?)
+        }
+        EndpointRole::Writer | EndpointRole::Reader | EndpointRole::ClusterMember(_) => None,
+    };
+    let member = match (&role, custom) {
+        (EndpointRole::ClusterMember(identifier), _) => {
             Some(store.db_instances.get(&(
                 record.region.clone(),
                 identifier.to_ascii_lowercase(),
             ))?)
         }
-        EndpointRole::Writer | EndpointRole::Reader => None,
+        (EndpointRole::CustomEndpoint(_), Some(custom)) => {
+            store.cluster_endpoint_member(custom)
+        }
+        _ => None,
     };
     // The address of the endpoint the client DIALLED, which is the one an authentication
     // token has to have been generated for and the one a refusal names.
@@ -207,6 +237,9 @@ pub(super) fn cluster_facts(
         EndpointRole::ClusterMember(_) => {
             member.and_then(|member| member.served_endpoint.as_ref())
         }
+        // A custom endpoint's own listener, not the member's: that is the address this
+        // session arrived on and the one the control plane published for it.
+        EndpointRole::CustomEndpoint(_) => custom.and_then(|custom| custom.served_endpoint.as_ref()),
     };
     Some(facts_of(
         RecordFacts {
@@ -278,11 +311,42 @@ pub(super) fn serves_reads_only(
     match role {
         EndpointRole::Writer => false,
         EndpointRole::Reader => true,
-        EndpointRole::ClusterMember(identifier) => store
-            .cluster_members(record)
-            .first()
-            .is_none_or(|writer| !writer.identifier.eq_ignore_ascii_case(identifier)),
+        EndpointRole::ClusterMember(identifier) => !writes_through(store, record, identifier),
+        // A CUSTOM endpoint of type READER serves no writes at all, whichever member it
+        // reaches; one of the other two types writes exactly while the member it routes to
+        // is the one the cluster writes through, which is the same rule a member's own
+        // endpoint follows. An endpoint that selects no member reaches the cluster itself,
+        // which a WRITER or ANY endpoint writes through.
+        EndpointRole::CustomEndpoint(identifier) => {
+            let Some(custom) = store.resolve_db_cluster_endpoint(&record.region, identifier)
+            else {
+                return true;
+            };
+            if custom.serves_reads_only() {
+                return true;
+            }
+            match store.cluster_endpoint_member(custom) {
+                Some(member) => !writes_through(store, record, &member.identifier),
+                None => false,
+            }
+        }
     }
+}
+
+/// Whether the member `identifier` is the one the cluster `record` WRITES THROUGH — the
+/// member `DBClusterMembers` reports `IsClusterWriter` for, which `FailoverDBCluster` moves.
+///
+/// One reading for every endpoint whose writing follows a member: a member's own endpoint and
+/// a custom endpoint that routes to one.
+fn writes_through(
+    store: &ComAmazonawsRdsAmazonrdsv19State,
+    record: &DbClusterRecord,
+    identifier: &str,
+) -> bool {
+    store
+        .cluster_members(record)
+        .first()
+        .is_some_and(|writer| writer.identifier.eq_ignore_ascii_case(identifier))
 }
 
 /// The engine runtime of the cluster `record`, read under the state lock the caller holds.

@@ -247,8 +247,12 @@ pub struct DbClusterRecord {
     /// to a point it kept the data of — "If the specified time isn't a consistent time for
     /// the DB cluster, Aurora automatically chooses the nearest possible consistent time for
     /// the DB cluster", and these are this service's consistent times. A point is recorded
-    /// when the cluster's storage is opened with backtracking enabled and after each
-    /// backtrack; points older than [`Self::backtrack_window`] are dropped, because a
+    /// when the cluster's storage is opened with backtracking enabled, at each instant a
+    /// session on one of the cluster's endpoints COMMITS a change
+    /// ([`data_plane::cluster_backtrack`]) and after each backtrack — the commits are what
+    /// makes a rewind restore the contents as of the time asked for rather than the contents
+    /// the cluster came up with; points older than [`Self::backtrack_window`] are dropped,
+    /// because a
     /// cluster "can't be backtracked" beyond its window, and the cluster keeps at most
     /// [`MAX_BACKTRACK_POINTS_PER_CLUSTER`] of them, because each one holds a copy of the
     /// data.
@@ -281,14 +285,17 @@ pub const MAX_BACKTRACKS_PER_CLUSTER: usize = 100;
 /// Emulator resource guard, NOT an AWS quota: how many CONSISTENT POINTS one DB cluster
 /// keeps ([`DbClusterRecord::backtrack_points`]).
 ///
-/// How many points fall inside a cluster's backtrack window is driven by how often a caller
-/// asks for a backtrack, and each point holds a COPY of the cluster's data, so the count has
-/// to be capped as well as the age: without it a caller could make the store hold a copy per
-/// request. Once it is full the OLDEST point is dropped, so what the cluster keeps is the
-/// most recent times it can be rewound to, and the `EarliestBacktrackTime` the cluster
-/// reports moves up with them. Generous beside the points one cluster accumulates in normal
-/// use — one when its storage opens and one per backtrack performed on it.
-pub const MAX_BACKTRACK_POINTS_PER_CLUSTER: usize = 16;
+/// How many points fall inside a cluster's backtrack window is driven by how often a CLIENT
+/// COMMITS — a point is kept per committed change ([`data_plane::cluster_backtrack`]) — and
+/// each point holds a full COPY of the cluster's data in this process, so the count is what
+/// bounds what the store may hold for one cluster: without it a client could make the store
+/// hold a copy per statement. Once it is full the OLDEST point is dropped, so what the
+/// cluster keeps is the most recent times it can be rewound to, and the
+/// `EarliestBacktrackTime` the cluster reports moves up with them.
+///
+/// Eight, which is the ring a client that undoes its last few changes needs — the data of the
+/// instant its storage opened plus the last several commits — at a bounded cost per cluster.
+pub const MAX_BACKTRACK_POINTS_PER_CLUSTER: usize = 8;
 
 /// One backtrack PERFORMED on a DB cluster, as `DBClusterBacktrack` reports it.
 #[derive(Debug, Clone)]
@@ -419,12 +426,35 @@ impl DbClusterRecord {
         &mut self,
         storage: ::std::sync::Arc<data_plane::sql_engine::InstanceDatabase>,
     ) {
+        self.record_backtrack_point_at(now_as_wire_timestamp(), storage);
+    }
+
+    /// The same, for a point the cluster held at an instant the caller already has in hand:
+    /// the instant a session COMMITTED the change this copy was taken of
+    /// ([`data_plane::cluster_backtrack`]).
+    ///
+    /// The copy is taken off the runtime's worker threads, so the instant the data reached
+    /// this state is read where the commit happened rather than where the record is written
+    /// — otherwise a point would be dated after a backtrack to it could name it. Two sessions
+    /// that commit at once therefore reach this in either order, so the point is inserted in
+    /// INSTANT order rather than appended: every reader of the list — the earliest time the
+    /// cluster reports, the window and count trims, and the point a backtrack picks — reads
+    /// it oldest first ([`Self::backtrack_points`]).
+    pub fn record_backtrack_point_at(
+        &mut self,
+        at: ::aws_smithy_types::DateTime,
+        storage: ::std::sync::Arc<data_plane::sql_engine::InstanceDatabase>,
+    ) {
         if !self.backtracking_enabled() {
             self.backtrack_points.clear();
             return;
         }
-        let now = now_as_wire_timestamp();
-        self.backtrack_points.push(BacktrackPoint { at: now, storage });
+        let now = at;
+        let position = self
+            .backtrack_points
+            .partition_point(|point| point.at.as_secs_f64() <= now.as_secs_f64());
+        self.backtrack_points
+            .insert(position, BacktrackPoint { at: now, storage });
         // "The target backtrack window, in seconds": a point older than the window is one
         // the cluster can no longer be backtracked to, so it is dropped rather than kept
         // and offered. The oldest point is kept while it is the ONLY one, because a cluster
