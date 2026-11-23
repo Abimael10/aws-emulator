@@ -56,6 +56,9 @@ pub mod api_version;
 /// The plane that SERVES a load balancer's own traffic: how a request addressed to the name
 /// a load balancer published is recognised, and which registered instance it is sent to.
 pub mod data_plane;
+/// The connection [`data_plane`] makes to the registered instance it selected, and what the
+/// server behind that instance answers.
+pub mod instance_connection;
 /// The SOCKET that address is answered on — the transport under [`data_plane`].
 pub mod listener_socket;
 /// The session stickiness a listener's policies give a client: the `AWSELB` cookie.

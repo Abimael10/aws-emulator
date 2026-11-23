@@ -60,13 +60,18 @@
 //! that, this module writes NOTHING: serving traffic moves no status, consumes no quota and
 //! bumps no counter.
 //!
-//! What it does NOT do is invent the instance's own answer. A registered instance is an EC2
-//! instance id, and this plane does not read what the server behind such an instance serves,
-//! so the connection the load balancer makes to the instance it selected is reported as one
-//! that could not be established — which is a condition Elastic Load Balancing itself words a
-//! status for ([`INSTANCE_UNREACHABLE_STATUS`]), as is having no instance to send the request
-//! to at all ([`NO_IN_SERVICE_INSTANCE_STATUS`]). Neither a body nor a status is invented for
-//! a backend that never answered.
+//! The answer itself is the SELECTED INSTANCE'S OWN. The listener states where the connection
+//! to it goes — `Listener$InstancePort`, "the port on which the instance is listening" — and
+//! what answers there is the server that instance runs ([`super::instance_connection`]), so
+//! the client is handed that server's status, media type and bytes, a status the backend itself
+//! denies the request with included. Nothing of the answer is this plane's.
+//!
+//! The two statuses this plane answers ITSELF are the two Elastic Load Balancing words for
+//! having no backend answer to relay at all: having no instance to send the request to
+//! ([`NO_IN_SERVICE_INSTANCE_STATUS`]) and having selected one whose connection cannot be
+//! established ([`INSTANCE_UNREACHABLE_STATUS`]) — nothing of this emulator listening on the
+//! port the listener forwards traffic to. Neither a body nor a status is invented for a
+//! backend that never answered.
 
 use ::std::time::SystemTime;
 
@@ -124,10 +129,11 @@ pub const NO_IN_SERVICE_INSTANCE_STATUS: u16 = 503;
 ///
 /// From the Classic Load Balancer's own troubleshooting documentation for `HTTP 504: Gateway
 /// Timeout`: the load balancer failed to establish a connection to the registered instance.
-/// Every backend this emulator holds is a registration — an EC2 instance id — with no server
-/// of this emulator's listening on the instance port, so this is what a request the load
-/// balancer did select an instance for is answered with, rather than a body invented for a
-/// backend that never ran.
+/// So it is what a request is answered with when nothing of this emulator is listening on the
+/// port the listener forwards traffic to — the instance runs no server there, its guest is not
+/// up, or the account holds no such instance — rather than a body invented for a backend that
+/// never answered. A backend that DID answer is relayed, whatever it answered
+/// ([`super::instance_connection`]).
 pub const INSTANCE_UNREACHABLE_STATUS: u16 = 504;
 
 /// The status a request this plane resolved no load balancer for is answered with. The
@@ -135,13 +141,16 @@ pub const INSTANCE_UNREACHABLE_STATUS: u16 = 504;
 /// a load balancer deleted between the claim and the answer.
 const NOT_SERVED_STATUS: u16 = 404;
 
-/// What a request RESOLVES to: the load balancer it addresses, and the port the client
-/// addressed — which is what decides the listener it reached.
+/// What a request RESOLVES to: the load balancer it addresses, the port the client addressed —
+/// which is what decides the listener it reached — and the path it asks a backend for.
 #[derive(Debug)]
 struct Resolved {
     region: String,
     load_balancer_name: String,
     addressed_port: Option<i32>,
+    /// The request path AS THE BACKEND IS ASKED FOR IT: the client's own path, which under the
+    /// prefixed addressing is what follows the segments naming this plane.
+    path: String,
 }
 
 /// What a data-plane request ADDRESSES, as the wire carries it: the host it was sent to, its
@@ -265,12 +274,13 @@ fn resolve<Eng: Send + Sync + 'static>(
     // part of it, and the load balancer is resolved in that region alone: a Classic load
     // balancer's name is unique per region, so a lookup by name across regions could answer
     // a request out of a same-named load balancer the client never addressed.
-    if let Some((region, named, _path)) = prefixed_addressing(addressed.path) {
+    if let Some((region, named, path)) = prefixed_addressing(addressed.path) {
         let record = store.load_balancers_in(region)?.get(named)?;
         return Some(Resolved {
             region: region.to_string(),
             load_balancer_name: record.name.clone(),
             addressed_port: addressed_port(addressed.host),
+            path: path.to_string(),
         });
     }
     // A path under the reserved namespace that did NOT name this plane names another one,
@@ -294,6 +304,7 @@ fn resolve<Eng: Send + Sync + 'static>(
         region,
         load_balancer_name,
         addressed_port: addressed_port(Some(host)),
+        path: addressed.path.to_string(),
     })
 }
 
@@ -385,11 +396,21 @@ fn eligible_instances(
 /// selected for it, and the stickiness cookie the answer hands the client back.
 #[derive(Debug)]
 struct Answered {
-    /// The instance the load balancer selected, or `None` when it had none to select.
-    instance_id: Option<String>,
+    /// The instance the load balancer selected and where the connection to it goes, or `None`
+    /// when it had none to select.
+    selected: Option<Selected>,
     /// The `Set-Cookie` field pinning the client to that instance, where the listener's
     /// policies mint one for this request.
     set_cookie: Option<String>,
+}
+
+/// The instance one request is SENT to: which one, and the port the listener that took the
+/// request forwards traffic to on it — `Listener$InstancePort`, "the port on which the
+/// instance is listening".
+#[derive(Debug)]
+struct Selected {
+    instance_id: String,
+    instance_port: i32,
 }
 
 /// Which instance the load balancer selects for `request_cookie`, and the cookie the answer
@@ -405,7 +426,7 @@ fn answered(
     // listening for the request at all, so there is no instance to send it to.
     let Some(listener) = listener else {
         return Answered {
-            instance_id: None,
+            selected: None,
             set_cookie: None,
         };
     };
@@ -436,15 +457,16 @@ fn answered(
     });
     let Some(instance_id) = selected else {
         return Answered {
-            instance_id: None,
+            selected: None,
             set_cookie: None,
         };
     };
     // The cookie the answer hands back names the instance this request was SELECTED for,
     // which is what the policy governs. A client that carried a pin already holds it, and an
     // application-controlled policy mints one only on "a new application cookie" in the
-    // application's own response, which a load balancer with no reachable backend server
-    // receives none of.
+    // application's own response, which is a cookie field the server behind a registered
+    // instance answers none of: what such a server serves is a document of the instance's own
+    // storage ([`super::instance_connection`]).
     let set_cookie = match &stickiness {
         Stickiness::Duration {
             expiration_period_seconds,
@@ -455,7 +477,10 @@ fn answered(
         _ => None,
     };
     Answered {
-        instance_id: Some(instance_id),
+        selected: Some(Selected {
+            instance_id,
+            instance_port: listener.instance_port,
+        }),
         set_cookie,
     }
 }
@@ -528,33 +553,84 @@ async fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtR
         )
     };
 
+    // The connection the load balancer makes to the instance it selected, on the port that
+    // listener forwards traffic to: made with NO guard of this store held, and answered by the
+    // server the instance itself runs there ([`super::instance_connection`]).
+    let served = answer.selected.as_ref().and_then(|selected| {
+        super::instance_connection::answered(
+            engine,
+            &selected.instance_id,
+            selected.instance_port,
+            req.method(),
+            &resolved.path,
+        )
+    });
+
     // The record of one request this address answered, as a load balancer's own access log
     // carries it. Reported through the emulator's own logging facility, so a client can see
     // which plane claimed a request it believed went elsewhere.
-    let status = match &answer.instance_id {
-        Some(_) => INSTANCE_UNREACHABLE_STATUS,
-        None => NO_IN_SERVICE_INSTANCE_STATUS,
+    let status = match (&answer.selected, &served) {
+        // The backend's OWN status, whatever it is: a load balancer relays what the instance
+        // it selected answered.
+        (_, Some(served)) => served.status,
+        // An instance was selected and nothing of this emulator is listening on the port the
+        // listener forwards traffic to, so the connection to it could not be established.
+        (Some(_), None) => INSTANCE_UNREACHABLE_STATUS,
+        (None, None) => NO_IN_SERVICE_INSTANCE_STATUS,
     };
     ::tracing::info!(
         load_balancer = %resolved.load_balancer_name,
         region = %resolved.region,
         method = %req.method(),
         path = %uri.path(),
-        instance = answer.instance_id.as_deref().unwrap_or("none"),
+        instance = answer
+            .selected
+            .as_ref()
+            .map_or("none", |selected| selected.instance_id.as_str()),
         status,
         "the load balancer answered a request on the name it published"
     );
-    rendered(status, answer.set_cookie.as_deref())
+    match served {
+        Some(served) => relayed(served, answer.set_cookie.as_deref()),
+        None => rendered(status, answer.set_cookie.as_deref()),
+    }
 }
 
-/// One rendered answer: the status the load balancer itself produced, and the stickiness
-/// cookie it hands back with it.
+/// One answer the LOAD BALANCER itself produced: a status it words for having no backend
+/// answer to relay, carrying no document, and the stickiness cookie it hands back with it.
 fn rendered(status: u16, set_cookie: Option<&str>) -> RtResponse {
+    written(status, None, Vec::new(), set_cookie)
+}
+
+/// One answer the selected INSTANCE produced, relayed to the client: its own status, the media
+/// type of the document it served and that document's bytes, beside the stickiness cookie the
+/// load balancer minted for this request.
+fn relayed(
+    served: super::instance_connection::BackendAnswer,
+    set_cookie: Option<&str>,
+) -> RtResponse {
+    written(
+        served.status,
+        served.content_type.as_deref(),
+        served.body,
+        set_cookie,
+    )
+}
+
+/// The ONE writer of an answer on this plane: the status, the document where one was served,
+/// and the cookie.
+fn written(
+    status: u16,
+    content_type: Option<&str>,
+    body: Vec<u8>,
+    set_cookie: Option<&str>,
+) -> RtResponse {
+    let length = body.len();
     let mut response = RtResponse::new(
         StatusCode::try_from(status).unwrap_or_else(|_| {
             StatusCode::try_from(NO_IN_SERVICE_INSTANCE_STATUS).expect("503 is a status")
         }),
-        SdkBody::empty(),
+        SdkBody::from(body),
     );
     if let Some(field) = set_cookie {
         if let Err(refused) = response
@@ -567,7 +643,14 @@ fn rendered(status: u16, set_cookie: Option<&str>) -> RtResponse {
             );
         }
     }
-    let _ = response.headers_mut().try_insert("content-length", "0");
+    if let Some(media_type) = content_type {
+        let _ = response
+            .headers_mut()
+            .try_insert("content-type", media_type.to_string());
+    }
+    let _ = response
+        .headers_mut()
+        .try_insert("content-length", length.to_string());
     response
 }
 
