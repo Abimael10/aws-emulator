@@ -83,6 +83,19 @@ static PARSE_PERMITS: ::std::sync::LazyLock<::std::sync::Arc<::tokio::sync::Sema
 /// reports: a line break, so the document reads as the pages read.
 const PAGE_SEPARATOR: &str = "\n";
 
+/// What separates one reconstructed line of a page from the next: a line break, so a page
+/// reads as its lines read.
+const LINE_SEPARATOR: &str = "\n";
+
+/// What follows every WORD the extraction read out of a line — a single space.
+///
+/// It is emitted after each word, the LAST word of a line included, because the extracted text
+/// is the concatenation of each segment with the separator that follows it: the separator
+/// belongs to the segment it trails, so it is never trimmed off the end of the concatenation.
+/// A consumer that slices this text by offsets taken from the sibling blocks, hashes it or
+/// appends the next extraction to it depends on exactly that.
+const WORD_SEPARATOR: &str = " ";
+
 /// How long the settle of one job waits for its document to be parsed.
 ///
 /// This module's OWN bound, and it bounds the WAIT: a blocking task cannot be aborted, so past
@@ -272,19 +285,26 @@ fn extracted_text(pages: &[String]) -> String {
     text
 }
 
-/// One extracted page's text as the DOCUMENT's text: each line trimmed, the runs of
-/// whitespace inside it collapsed to one space, and the empty lines dropped.
+/// One extracted page's text as the DOCUMENT's text: every word of every line followed by its
+/// own [`WORD_SEPARATOR`], the lines joined by [`LINE_SEPARATOR`], and the lines that hold no
+/// word at all dropped.
 ///
 /// A PDF carries no lines and no words — it positions glyphs — so an extractor reconstructs
 /// them from those positions and the padding it emits for the gaps between them is an
 /// artefact of the layout rather than text the document says. What the page SAYS is its
-/// words, in reading order, one line per line, which is what this reports.
+/// words, in reading order, one line per line, which is what this reports — each word carrying
+/// the separator that follows it, so the concatenation keeps the separator of its last segment
+/// too ([`WORD_SEPARATOR`]).
 fn document_text(page: &str) -> String {
     page.lines()
-        .map(|line| line.split_whitespace().collect::<Vec<&str>>().join(" "))
+        .map(|line| {
+            line.split_whitespace()
+                .flat_map(|word| [word, WORD_SEPARATOR])
+                .collect::<String>()
+        })
         .filter(|line| !line.is_empty())
         .collect::<Vec<String>>()
-        .join("\n")
+        .join(LINE_SEPARATOR)
 }
 
 /// `text`, cut to at most `room` bytes on a character boundary so what is kept stays valid

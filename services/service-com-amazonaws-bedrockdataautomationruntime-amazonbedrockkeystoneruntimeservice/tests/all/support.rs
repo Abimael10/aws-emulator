@@ -223,6 +223,64 @@ pub async fn tag_keys(router: &MultiServiceRouter, arn: &str) -> Vec<String> {
     keys
 }
 
+/// A PDF document of `pages`, each page showing its own lines in the Base-14 Helvetica face
+/// every PDF reader carries (nothing is embedded, so the document stands alone).
+///
+/// Written by the `pdf-writer` crate, so the asset a job reads is a document a PDF parser
+/// opens rather than bytes shaped like one. Shared by the suites whose subject is what a job
+/// EXTRACTS out of such an asset, so one document builder serves them all.
+pub fn pdf_document(pages: &[&[&str]]) -> Vec<u8> {
+    use pdf_writer::{Content, Finish, Name, Pdf, Rect, Ref, Str};
+
+    /// The ISO 216 A4 page box in PDF points (1/72 inch).
+    const A4: [f32; 4] = [0.0, 0.0, 595.28, 841.89];
+    /// Point size of the body text, and the baseline-to-baseline distance with it.
+    const FONT_SIZE: f32 = 12.0;
+    /// See [`FONT_SIZE`].
+    const LEADING: f32 = 16.0;
+
+    let catalog_id = Ref::new(1);
+    let page_tree_id = Ref::new(2);
+    let font_id = Ref::new(3);
+    let font_name = Name(b"F1");
+
+    let mut pdf = Pdf::new();
+    pdf.catalog(catalog_id).pages(page_tree_id);
+    // Two object ids per page: the page and its content stream, after the three above.
+    let page_ids: Vec<Ref> = (0..pages.len())
+        .map(|index| Ref::new(4 + 2 * i32::try_from(index).expect("a small page count")))
+        .collect();
+    let content_ids: Vec<Ref> = (0..pages.len())
+        .map(|index| Ref::new(5 + 2 * i32::try_from(index).expect("a small page count")))
+        .collect();
+    pdf.pages(page_tree_id)
+        .kids(page_ids.iter().copied())
+        .count(i32::try_from(pages.len()).expect("a small page count"));
+    for ((lines, page_id), content_id) in pages.iter().zip(&page_ids).zip(&content_ids) {
+        let mut content = Content::new();
+        content.begin_text();
+        content.set_font(font_name, FONT_SIZE);
+        content.set_leading(LEADING);
+        content.next_line(56.0, 785.0);
+        for line in lines.iter() {
+            content.show(Str(line.as_bytes()));
+            content.next_line(0.0, -LEADING);
+        }
+        content.end_text();
+        let content = content.finish();
+
+        let mut page = pdf.page(*page_id);
+        page.parent(page_tree_id);
+        page.media_box(Rect::new(A4[0], A4[1], A4[2], A4[3]));
+        page.contents(*content_id);
+        page.resources().fonts().pair(font_name, font_id);
+        page.finish();
+        pdf.stream(*content_id, &content);
+    }
+    pdf.type1_font(font_id).base_font(Name(b"Helvetica"));
+    pdf.finish()
+}
+
 /// The refusal message a tag key outside the modelled pattern earns at input path `path`:
 /// the `ValidationException` envelope around one clause naming the member and the
 /// constraint it failed, with the offending value NOT echoed.

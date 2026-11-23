@@ -60,6 +60,9 @@ regex = "1.13"
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs`, so the single integration-test target
+# needs no hand-kept list of suites.
+automod = { workspace = true }
 hex = { workspace = true }
 # Generates the tag keys the modelled `TagKey` character class is asserted over
 # (`tests/all/tag_key_combining_mark_class.rs`), from a fixed seed so a failing case is
