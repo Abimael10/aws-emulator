@@ -48,8 +48,8 @@ const AMI: &str = "ami-0123456789abcdef0";
 const NOT_FOUND: &str = "InvalidInstanceID.NotFound";
 
 /// The code the validators that do NOT tell an unreadable id from an absent one answer for
-/// the same value — the console readers, the root-volume replacement and the suppression
-/// enable.
+/// the same value — the console readers, the root-volume replacement, the Mac modification
+/// task creates and the suppression enable.
 const MALFORMED: &str = "InvalidInstanceID.Malformed";
 
 fn p(name: &str, value: &str) -> (String, String) {
@@ -114,8 +114,8 @@ fn rows() -> Vec<Row> {
         // Creates that take the instance as their subject.
         row("CreateReplaceRootVolumeTask", MALFORMED, false),
         row("CreateInstanceExportTask", "InvalidParameter", false),
-        row("CreateMacSystemIntegrityProtectionModificationTask", NOT_FOUND, false),
-        row("CreateDelegateMacVolumeOwnershipTask", NOT_FOUND, false),
+        row("CreateMacSystemIntegrityProtectionModificationTask", MALFORMED, false),
+        row("CreateDelegateMacVolumeOwnershipTask", MALFORMED, false),
     ]
 }
 

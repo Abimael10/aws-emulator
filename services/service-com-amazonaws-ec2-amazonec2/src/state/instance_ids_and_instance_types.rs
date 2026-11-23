@@ -675,6 +675,43 @@ pub fn require_looked_up_instance_record<'store, E>(
     require_instance_record_in_form(store, region, instance_id, instance_id_is_well_formed)
 }
 
+/// The stored instance `instance_id` names, for an operation whose validator draws NO
+/// distinction between an id it cannot read and one that resolves to nothing: every value
+/// that does not name an instance of the signed Region — a value in no published form, the
+/// all-zero placeholder, a long form the service never issued, and an id another Region's
+/// instance holds — is `InvalidInstanceID.Malformed` with
+/// [`crate::scaffolded::Scaffolded::instance_id_is_malformed`]'s sentence, so the
+/// not-found half is never reached at all.
+///
+/// The reading of the operations whose recorded refusals carry that one code for an id that
+/// resolves to nothing, whatever its form: `CreateReplaceRootVolumeTask`
+/// (`ec2-instance-dependent-ops-error-paths#task#4`, a 17-hexadecimal-digit id of the issued
+/// shape) and the two Mac modification task creates ([`require_mac_instance`], whose own
+/// recorded refusals carry it for the all-zero placeholder AND for an unallocated id of the
+/// issued form). Such an operation tells only "this id names no instance I can act on" from
+/// "this instance cannot do what you asked" — the second being a refusal about the instance
+/// itself ([`instance_type_is_ineligible`], reached only for an id that DID resolve) — which
+/// is the distinction a caller branches on there.
+///
+/// WHICH reading an operation takes is a fact of that operation, recorded by its caller
+/// ([`instance_id_reads_as_one`] states the split), so this one is not generalised to the
+/// operations recorded telling an unreadable id from an absent instance
+/// ([`require_instance_record`] and the two readings beside it). The ONE statement of it, so
+/// no handler re-spells the refusal.
+///
+/// An instance of ANOTHER Region is as absent as an id the account holds no instance under,
+/// EC2 being reached through a regional endpoint, so it is answered the same way — through
+/// the crate's one reading of which Region holds an instance
+/// ([`instance_record_in_region`]).
+pub fn require_resolved_instance_record<'store, E>(
+    store: &'store ComAmazonawsEc2Amazonec2State,
+    region: &str,
+    instance_id: &str,
+) -> Result<&'store InstanceRecord, crate::scaffolded::Scaffolded<E>> {
+    instance_record_in_region(store, region, instance_id)
+        .ok_or_else(|| crate::scaffolded::Scaffolded::instance_id_is_malformed(instance_id))
+}
+
 /// The id prefix of an EC2 instance, as [`instance_id_is_well_formed`] reads one and as a
 /// refusal that names the form it expected spells it (`Expected: 'i-...'.`).
 pub const INSTANCE_ID_PREFIX: &str = "i";

@@ -720,7 +720,17 @@ async fn the_instance_a_task_names_is_resolved_first() {
         (
             "an instance id of the issued form that names nothing".to_string(),
             sip("i-0fedcba987654321f"),
-            "InvalidInstanceID.NotFound",
+            "InvalidInstanceID.Malformed",
+        ),
+        (
+            "the retired short id form, nothing launched under it".to_string(),
+            sip("i-0abc1234"),
+            "InvalidInstanceID.Malformed",
+        ),
+        (
+            "the all-zero placeholder".to_string(),
+            sip("i-00000000000000000"),
+            "InvalidInstanceID.Malformed",
         ),
         (
             format!("an instance of the {other_type} family, which runs no macOS"),
@@ -1361,7 +1371,7 @@ async fn dry_run_reports_whether_the_call_would_have_succeeded() {
                 p("DryRun", "true"),
             ],
             400,
-            "InvalidInstanceID.NotFound",
+            "InvalidInstanceID.Malformed",
         ),
         (
             "a tag specification naming another resource type".to_string(),

@@ -238,9 +238,13 @@ async fn a_long_form_id_the_mint_spent_on_another_kind_is_refused_before_any_loo
         }
     }
 
-    // The operations whose own validator WORDS a malformed instance id differently answer
-    // the same class with their own sentence, over the same two halves of the rule.
-    for (case, instance_id, code, _decoded) in &instance_rows {
+    // The operations whose own validator draws NO such distinction answer their own
+    // sentence, and one code, for every id that resolves to no instance: the Mac
+    // modification task creates discriminate on whether the id names an instance they can
+    // act on, so each row above \u2014 whatever made it unresolvable \u2014 is
+    // `InvalidInstanceID.Malformed` there.
+    for (case, instance_id, _code, _decoded) in &instance_rows {
+        let mac_code = "InvalidInstanceID.Malformed";
         let (status, body) = api(
             &router,
             "CreateMacSystemIntegrityProtectionModificationTask",
@@ -252,18 +256,16 @@ async fn a_long_form_id_the_mint_spent_on_another_kind_is_refused_before_any_loo
         .await;
         assert_eq!(
             (status, error_code(&body).as_str()),
-            (REFUSAL, *code),
-            "case {case:?} ({instance_id}) on the Mac SIP task: expected {REFUSAL} {code}, got \
-             {status} with body {body}"
+            (REFUSAL, mac_code),
+            "case {case:?} ({instance_id}) on the Mac SIP task: expected {REFUSAL} {mac_code}, \
+             got {status} with body {body}"
         );
-        if *code == "InvalidInstanceID.Malformed" {
-            assert_eq!(
-                error_message(&body),
-                format!("The instance ID '{instance_id}' is malformed"),
-                "case {case:?}: the Mac SIP task words a malformed instance id its own way, \
-                 got body {body}"
-            );
-        }
+        assert_eq!(
+            error_message(&body),
+            format!("The instance ID '{instance_id}' is malformed"),
+            "case {case:?}: the Mac SIP task words an instance id it cannot resolve its own \
+             way, got body {body}"
+        );
     }
 
     // And the ids that DO resolve still resolve: the refusals above are about the values, not

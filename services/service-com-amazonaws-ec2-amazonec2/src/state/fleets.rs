@@ -1753,22 +1753,26 @@ pub fn require_known_mac_modification_task<E>(
 /// instance on its way to `terminated` has no macOS left to configure. The ONE reading of
 /// those three refusals, so the two creates cannot disagree about which instance a task may
 /// name, and the resolved record is handed back so a handler reads the instance once.
+///
+/// An id that names NO instance of the signed Region is refused
+/// [`crate::scaffolded::Scaffolded::instance_id_is_malformed`] whatever its form, through
+/// [`require_resolved_instance_record`]: these creates discriminate on whether the id names
+/// an instance they can act on, not on whether the value reads as an id, so they never reach
+/// the not-found half — what a caller branches on here is "no such instance" against "this
+/// instance cannot do it" ([`instance_type_is_ineligible`], reached only for an id that did
+/// resolve).
 pub fn require_mac_instance<'store, E>(
     store: &'store ComAmazonawsEc2Amazonec2State,
     region: &str,
     instance_id: &str,
 ) -> Result<&'store InstanceRecord, Scaffolded<E>> {
-    // The Mac task validators word an instance id they cannot read their own way — "The
-    // instance ID '<id>' is malformed", which is what the recorded refusal of
-    // `CreateMacSystemIntegrityProtectionModificationTask` for the all-zero placeholder
-    // carries — while the RULE behind that refusal is the crate's one reading of an instance
-    // id ([`require_instance_record_worded`]).
-    let instance = require_instance_record_worded(
-        store,
-        region,
-        instance_id,
-        Scaffolded::instance_id_is_malformed,
-    )?;
+    // The Mac task validators answer ONE refusal for every instance id that names no
+    // instance they can act on — `InvalidInstanceID.Malformed`, "The instance ID '<id>' is
+    // malformed", which is what their recorded refusals carry for the all-zero placeholder
+    // AND for an unallocated id of the issued form alike — so the id is resolved through the
+    // crate's one reading of that class ([`require_resolved_instance_record`]) rather than
+    // through a reading that tells an unreadable id from an absent instance.
+    let instance = require_resolved_instance_record(store, region, instance_id)?;
     let instance_family = instance_family_of(&instance.instance_type);
     if !is_mac_instance_family(instance_family) {
         return Err(instance_type_is_ineligible());

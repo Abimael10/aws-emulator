@@ -496,9 +496,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// `InvalidInstanceID.Malformed`, "The instance ID '<id>' is malformed", while
 /// `CreateInstanceExportTask` answers the SAME id "does not exist" (recorded in
 /// `issues/.../20261023T102725Z-ec2-answers-parameter-rejections-with-generic-validationerror-and.md`).
-/// So the choice belongs to the OPERATION rather than to the id, which is why this lives
-/// here and not in [`crate::state::require_known_instance`] — the shared helper that other
-/// operations, which do draw the malformed/not-found distinction, keep using.
+/// So the choice belongs to the OPERATION rather than to the id, which is why the reading
+/// is [`crate::state::require_resolved_instance_record`] — the crate's ONE statement of that
+/// class, shared with the Mac modification task creates, whose recorded refusals carry the
+/// same code for the same condition — and not
+/// [`crate::state::require_known_instance`], the helper the operations that DO draw the
+/// malformed/not-found distinction keep using.
 ///
 /// The refusal itself is [`crate::scaffolded::Scaffolded::instance_id_is_malformed`], a
 /// named constructor beside the syntax-only one, so both wordings of this code live in
@@ -512,10 +515,5 @@ fn require_replaceable_instance<'a, E>(
     region: &str,
     instance_id: &str,
 ) -> Result<&'a crate::state::InstanceRecord, crate::scaffolded::Scaffolded<E>> {
-    // An instance of ANOTHER Region is as absent as an id the account holds no instance
-    // under, EC2 being reached through a regional endpoint, so it is answered the same
-    // sentence — through the crate's one reading of which Region holds an instance
-    // ([`crate::state::instance_record_in_region`]).
-    crate::state::instance_record_in_region(store, region, instance_id)
-        .ok_or_else(|| crate::scaffolded::Scaffolded::instance_id_is_malformed(instance_id))
+    crate::state::require_resolved_instance_record(store, region, instance_id)
 }

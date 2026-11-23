@@ -53,9 +53,9 @@ pub fn require_console_instance<'store, E>(
     }
     // An instance of ANOTHER Region is as absent as an id the account holds no instance
     // under, EC2 being reached through a regional endpoint, so it is answered the same
-    // sentence this reading words an absent instance with.
-    super::instance_record_in_region(store, region, instance_id)
-        .ok_or_else(|| crate::scaffolded::Scaffolded::instance_id_is_malformed(instance_id))
+    // sentence this reading words an absent instance with — through the crate's one statement
+    // of resolve-or-malformed ([`super::require_resolved_instance_record`]).
+    super::require_resolved_instance_record(store, region, instance_id)
 }
 
 /// The lines of text one instance's console shows: what that instance's GUEST wrote to its
