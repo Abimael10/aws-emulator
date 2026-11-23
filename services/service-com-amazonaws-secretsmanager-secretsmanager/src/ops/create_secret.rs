@@ -758,9 +758,7 @@ fn missing_client_request_token() -> CreateSecretError {
 /// ([`token_in_use`]).
 fn already_exists(name: &str) -> CreateSecretError {
     CreateSecretErrorModeled::ResourceExistsException(ResourceExistsException {
-        message: Some(format!(
-            "The operation failed because the secret {name} already exists."
-        )),
+        message: Some(crate::state::secret_already_exists_message(name)),
     })
     .into()
 }

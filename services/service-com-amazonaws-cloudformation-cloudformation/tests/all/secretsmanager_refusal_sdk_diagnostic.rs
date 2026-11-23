@@ -198,7 +198,12 @@ fn template(secret: &str, declared: Value, blocks_public_policies: bool) -> Stri
 
 /// Create one secret through Secrets Manager's OWN wire, so the attach the stack makes
 /// addresses a secret that service really holds.
-async fn seed_a_secret(router: &MultiServiceRouter, case: &str, secret: &str) {
+///
+/// `pub(crate)`: a sibling suite that holds the OTHER resource types of this service to the
+/// same diagnostic seeds the secret they address the same way, so it reads this call rather
+/// than carrying a second copy of it
+/// ([`crate::secretsmanager_type_refusal_diagnostics`]).
+pub(crate) async fn seed_a_secret(router: &MultiServiceRouter, case: &str, secret: &str) {
     let (status_code, answered) = secretsmanager(
         router,
         "CreateSecret",
@@ -237,7 +242,16 @@ async fn attached_policy(
 /// sentence, then the service as its SDK names it, the status that service answered and the id
 /// of the call — each present, and each of the FORM the call answers rather than one recorded
 /// value.
-fn assert_diagnostic(case: &str, quoted: &str, expected_sentence: &str, expected_status: u16) {
+///
+/// `pub(crate)`: the diagnostic is the SERVICE's, not one type's, so the sibling suite that
+/// holds the other resource types of this service to it reads THIS assertion rather than
+/// carrying a second copy of it ([`crate::secretsmanager_type_refusal_diagnostics`]).
+pub(crate) fn assert_diagnostic(
+    case: &str,
+    quoted: &str,
+    expected_sentence: &str,
+    expected_status: u16,
+) {
     let diagnostic = quoted
         .strip_prefix(expected_sentence)
         .map(str::trim_start)

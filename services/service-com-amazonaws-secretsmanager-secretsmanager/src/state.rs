@@ -451,6 +451,19 @@ pub fn token_in_use_message(token: &str, arn: &str) -> String {
     )
 }
 
+/// The `ResourceExistsException` message for a NAME this service already holds a
+/// secret under.
+///
+/// The name is the one the request asked to create, which is what identifies which
+/// create collided; the rest of the sentence is fixed. Published because the name
+/// collision is reported outside this service too — a CloudFormation stack that
+/// declares a secret under a name the account already holds fails that resource with
+/// this sentence inside the exception its provider's SDK raised — so there is one
+/// wording rather than a copy per reader.
+pub fn secret_already_exists_message(name: &str) -> String {
+    format!("The operation failed because the secret {name} already exists.")
+}
+
 /// The `LimitExceededException` message for a write that would leave a secret
 /// holding more versions than this store keeps for one secret (see
 /// [`VERSIONS_PER_SECRET`]).
