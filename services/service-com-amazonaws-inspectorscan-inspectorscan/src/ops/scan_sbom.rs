@@ -16,6 +16,13 @@
 //! and every `affects[].ref` is a `bom-ref` this scan assigned to a component
 //! of the report.
 //!
+//! The report ADDS to the submitted document rather than restating it, so a
+//! member it is built from that carries a JSON type CycloneDX does not allow
+//! there is refused with the same `ValidationException` a mistyped `components`
+//! gets ([`validate_report_members`]) — a value of the wrong type cannot carry
+//! the scan's own data beside it, and a report that wrote the scan's data in its
+//! place would state the caller sent something it did not.
+//!
 //! ## Reaching this service's state
 //!
 //! The engine is held on `self` (constructor-injected), NOT passed per request.
@@ -752,6 +759,123 @@ fn nested_components(
     }
 }
 
+/// The `properties` array of a submitted object — a `components[]` entry's or
+/// the document's `metadata` — `None` when it carries none, or a refusal when
+/// the member is present and is not an array.
+///
+/// CycloneDX declares `properties` an array of name/value pairs at BOTH sites,
+/// and the report APPENDS the scan's own entries to it ([`annotate_skipped_components`]
+/// and the summary in [`cyclonedx_report`]), so one rule reads it for both: a
+/// value of another type cannot carry the scan's entries beside what the caller
+/// submitted, and left to fall through it would be REPLACED by an array holding
+/// the scan's own entries alone — a 200 response stating the caller sent
+/// something it did not.
+fn submitted_properties(
+    object: &Map<String, Value>,
+) -> Result<Option<&Vec<Value>>, ScanSbomError> {
+    match object.get("properties") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(properties)) => Ok(Some(properties)),
+        Some(_) => Err(invalid(SbomDefect::InvalidValue("properties"))),
+    }
+}
+
+/// The submitted `metadata`, `None` when the document carries none, or a
+/// refusal when the member is present and is not an object.
+///
+/// The same rule [`nested_components`] applies, at the member CycloneDX
+/// declares an object: the report is the submitted document with the scan's own
+/// data added to it, so a `metadata` of another type left to fall through would
+/// be REPLACED by the object the scan builds.
+fn submitted_metadata(
+    document: &Map<String, Value>,
+) -> Result<Option<&Map<String, Value>>, ScanSbomError> {
+    match document.get("metadata") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Object(metadata)) => Ok(Some(metadata)),
+        Some(_) => Err(invalid(SbomDefect::InvalidValue("metadata"))),
+    }
+}
+
+/// What CycloneDX allows a submitted `metadata.tools` to be: the 1.5 object
+/// form, or the array of tool objects 1.5 deprecated but still reads.
+#[derive(Debug, Clone, Copy)]
+enum SubmittedTools<'d> {
+    /// The document says nothing about the tools that produced it.
+    Absent,
+    /// The 1.5 object form, carrying `components` and `services`.
+    Object(&'d Map<String, Value>),
+    /// The deprecated 1.4 array of `{vendor, name, version}` tool objects.
+    Entries(&'d [Value]),
+}
+
+/// Which form the submitted `metadata.tools` is in, or a refusal when the
+/// member is present in neither.
+///
+/// An ENTRY of the array form is a tool object; one of another type names no
+/// tool, and [`tool_component`] reads a member off it with none to read, so it
+/// would be reported as a tool component carrying nothing the caller sent.
+fn submitted_tools(metadata: &Map<String, Value>) -> Result<SubmittedTools<'_>, ScanSbomError> {
+    match metadata.get("tools") {
+        None | Some(Value::Null) => Ok(SubmittedTools::Absent),
+        Some(Value::Object(tools)) => Ok(SubmittedTools::Object(tools)),
+        Some(Value::Array(entries)) if entries.iter().all(Value::is_object) => {
+            Ok(SubmittedTools::Entries(entries))
+        }
+        Some(_) => Err(invalid(SbomDefect::InvalidValue("tools"))),
+    }
+}
+
+/// The `services` array of a submitted 1.5 `metadata.tools`, `None` when it
+/// names none, or a refusal when the member is present and is not an array.
+///
+/// The scan appends ITSELF to this array, so the same rule as
+/// [`submitted_properties`] holds for it.
+fn submitted_services(tools: &Map<String, Value>) -> Result<Option<&Vec<Value>>, ScanSbomError> {
+    match tools.get("services") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(services)) => Ok(Some(services)),
+        Some(_) => Err(invalid(SbomDefect::InvalidValue("services"))),
+    }
+}
+
+/// The submitted `serialNumber`, `None` when the document carries none, or a
+/// refusal when the member is present and is not a string.
+///
+/// CycloneDX declares `serialNumber` a string identifying the BOM instance, and
+/// the report stamps its own only on a document that names none, so a value of
+/// another type left to fall through would be replaced by the scan's URN.
+fn submitted_serial_number(document: &Map<String, Value>) -> Result<Option<&str>, ScanSbomError> {
+    match document.get("serialNumber") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(serial)) => Ok(Some(serial.as_str())),
+        Some(_) => Err(invalid(SbomDefect::InvalidValue("serialNumber"))),
+    }
+}
+
+/// Refuse a submitted document that carries one of the members the report is
+/// built from with a JSON type CycloneDX does not allow there.
+///
+/// Every member is read through the accessor [`cyclonedx_report`] reads it
+/// with, so ONE rule decides both what is refused and what a report carries,
+/// and the check runs for every `outputFormat`: whether a submitted document is
+/// a CycloneDX 1.5 BOM is a property of the document, not of the form the
+/// answer is rendered in. A member present as `null` states no value, which is
+/// read as absent exactly as `components` already is.
+fn validate_report_members(document: &Map<String, Value>) -> Result<(), ScanSbomError> {
+    // Each accessor is called for its type check; the values themselves are
+    // read again where the report is built.
+    let _serial_number = submitted_serial_number(document)?;
+    let Some(metadata) = submitted_metadata(document)? else {
+        return Ok(());
+    };
+    let _properties = submitted_properties(metadata)?;
+    if let SubmittedTools::Object(tools) = submitted_tools(metadata)? {
+        let _services = submitted_services(tools)?;
+    }
+    Ok(())
+}
+
 /// The `bom-ref` a component submitted, `None` when it carries none, or a
 /// refusal when the one it carries is longer than [`MAX_BOM_REF_LEN`].
 ///
@@ -832,6 +956,12 @@ fn resolve_component_tree(
         if name.is_empty() {
             return Err(invalid(SbomDefect::InvalidValue("name")));
         }
+        // The array the report appends the scanner's annotation to when this
+        // component is one the scan draws no conclusion about: its type is
+        // checked for every entry, so whether a document is accepted does not
+        // depend on which of its components the advisory data happens to rule
+        // on.
+        let _properties = submitted_properties(object)?;
 
         let (package_type, package_name, version, purl_namespace) = match purl {
             Some(raw) => {
@@ -923,6 +1053,11 @@ fn parse_sbom(sbom: &Value) -> Result<ParsedSbom, ScanSbomError> {
         // Absent, or a CycloneDX revision other than the one a scan reads.
         _ => return Err(invalid(SbomDefect::InvalidValue("specVersion"))),
     }
+
+    // The document's own members the report is built from, before anything is
+    // scanned: a member CycloneDX does not allow this type at is refused here
+    // rather than rewritten when the report is rendered.
+    validate_report_members(object)?;
 
     let components = match object.get("components") {
         None | Some(Value::Null) => return Ok(ParsedSbom::default()),
@@ -1408,19 +1543,23 @@ fn tool_component(entry: &Value) -> Value {
 /// about, WHY it was skipped.
 ///
 /// The annotation is appended to the component's own `properties`, so what the
-/// caller submitted there is preserved beside it. The walk is bounded exactly
-/// as the two resolution passes are: the tree it walks came from
-/// [`resolve_component_tree`], which refuses anything deeper.
+/// caller submitted there is preserved beside it — never replaced: a
+/// `properties` of any other type was refused when the document was validated
+/// ([`submitted_properties`]), and is refused here too rather than overwritten,
+/// so the rule holds at the site that writes as well as at the site that
+/// checks. The walk is bounded exactly as the two resolution passes are: the
+/// tree it walks came from [`resolve_component_tree`], which refuses anything
+/// deeper.
 fn annotate_skipped_components(
     components: &mut Value,
     skipped: &HashMap<String, SkipReason>,
     depth: usize,
-) {
+) -> Result<(), ScanSbomError> {
     if depth > MAX_COMPONENT_NESTING {
-        return;
+        return Ok(());
     }
     let Some(entries) = components.as_array_mut() else {
-        return;
+        return Ok(());
     };
     for entry in entries {
         let Some(object) = entry.as_object_mut() else {
@@ -1438,15 +1577,19 @@ fn annotate_skipped_components(
             });
             match object.get_mut("properties") {
                 Some(Value::Array(list)) => list.push(property),
-                _ => {
+                // The component carries no `properties` at all, so the
+                // annotation is its first one.
+                None | Some(Value::Null) => {
                     object.insert("properties".to_string(), json!([property]));
                 }
+                Some(_) => return Err(invalid(SbomDefect::InvalidValue("properties"))),
             }
         }
         if let Some(children) = object.get_mut("components") {
-            annotate_skipped_components(children, skipped, depth + 1);
+            annotate_skipped_components(children, skipped, depth + 1)?;
         }
     }
+    Ok(())
 }
 
 /// What the SCAN stamps on a CycloneDX report, beside the findings: the instant
@@ -1465,6 +1608,11 @@ struct ReportStamp<'s> {
 }
 
 /// The input BOM augmented with the scan's results — the `CYCLONE_DX_1_5` form.
+///
+/// Every submitted member the report reads is read through the accessor that
+/// states the type CycloneDX allows it, so a member this form would otherwise
+/// have to replace is REFUSED (the document was already validated against the
+/// same accessors, so this is the floor under that check, not a second rule).
 fn cyclonedx_report(
     submitted: &Map<String, Value>,
     parsed: &ParsedSbom,
@@ -1472,7 +1620,7 @@ fn cyclonedx_report(
     skipped: &HashMap<String, SkipReason>,
     summary: &ScanSummary,
     stamp: ReportStamp<'_>,
-) -> Value {
+) -> Result<Value, ScanSbomError> {
     let mut report = submitted.clone();
 
     // `bomFormat`/`specVersion` are preserved: both were checked above, so they
@@ -1492,11 +1640,8 @@ fn cyclonedx_report(
     // which identifies nothing). Either way the value is a function of the
     // submitted document, so a repeat of this `@idempotent` scan answers the
     // identical report.
-    let submitted_serial = report
-        .get("serialNumber")
-        .and_then(Value::as_str)
-        .filter(|serial| !serial.is_empty())
-        .is_some();
+    let submitted_serial =
+        submitted_serial_number(&report)?.is_some_and(|serial| !serial.is_empty());
     if !submitted_serial {
         report.insert(
             "serialNumber".to_string(),
@@ -1515,13 +1660,15 @@ fn cyclonedx_report(
     // scanner's own annotation on every component it drew no conclusion about.
     if let Some(components) = &parsed.components_value {
         let mut components = components.clone();
-        annotate_skipped_components(&mut components, skipped, 0);
+        annotate_skipped_components(&mut components, skipped, 0)?;
         report.insert("components".to_string(), components);
     }
 
-    let mut metadata = match report.get("metadata") {
-        Some(Value::Object(existing)) => existing.clone(),
-        _ => Map::new(),
+    // The submitted `metadata` is the object the scan ADDS to: its own members
+    // are carried over and the scan's are written beside them.
+    let mut metadata = match submitted_metadata(&report)? {
+        Some(existing) => existing.clone(),
+        None => Map::new(),
     };
     metadata.insert(
         "timestamp".to_string(),
@@ -1531,9 +1678,10 @@ fn cyclonedx_report(
     // The scan reports WHO scanned the document: the scanning service, under
     // `metadata.tools.services`, beside whatever the submitted document already
     // said about the tools that produced it.
-    let mut tools = match metadata.remove("tools") {
-        Some(Value::Object(existing)) => existing,
-        Some(Value::Array(entries)) => {
+    let mut tools = match submitted_tools(&metadata)? {
+        SubmittedTools::Absent => Map::new(),
+        SubmittedTools::Object(existing) => existing.clone(),
+        SubmittedTools::Entries(entries) => {
             let mut object = Map::new();
             object.insert(
                 "components".to_string(),
@@ -1541,24 +1689,20 @@ fn cyclonedx_report(
             );
             object
         }
-        _ => Map::new(),
     };
-    match tools.get_mut("services") {
-        Some(Value::Array(services)) => services.push(scanner_service(stamp.scanner_version)),
-        _ => {
-            tools.insert(
-                "services".to_string(),
-                json!([scanner_service(stamp.scanner_version)]),
-            );
-        }
-    }
+    let mut services = match submitted_services(&tools)? {
+        Some(existing) => existing.clone(),
+        None => Vec::new(),
+    };
+    services.push(scanner_service(stamp.scanner_version));
+    tools.insert("services".to_string(), Value::Array(services));
     metadata.insert("tools".to_string(), Value::Object(tools));
 
     // And WHAT it found, as the namespaced scan summary, appended to the
     // document's own `metadata.properties` rather than replacing them.
-    let mut properties = match metadata.remove("properties") {
-        Some(Value::Array(existing)) => existing,
-        _ => Vec::new(),
+    let mut properties = match submitted_properties(&metadata)? {
+        Some(existing) => existing.clone(),
+        None => Vec::new(),
     };
     properties.extend(summary.cyclonedx_properties());
     metadata.insert("properties".to_string(), Value::Array(properties));
@@ -1570,7 +1714,7 @@ fn cyclonedx_report(
         Value::Array(findings.iter().map(cyclonedx_vulnerability).collect()),
     );
 
-    Value::Object(report)
+    Ok(Value::Object(report))
 }
 
 /// Which of the two Inspector-native forms a report is rendered in.
@@ -2009,7 +2153,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     timestamp: &timestamp,
                     scanner_version: &scanner_version,
                 },
-            ),
+            )?,
             OutputFormat::Inspector => inspector_report(
                 &scan_id,
                 &timestamp,

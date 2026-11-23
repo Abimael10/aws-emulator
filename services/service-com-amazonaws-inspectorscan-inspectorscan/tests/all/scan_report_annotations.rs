@@ -855,3 +855,265 @@ async fn a_request_naming_no_output_format_is_answered_the_inspector_report() {
         cyclonedx["sbom"]
     );
 }
+
+// ---------------------------------------------------------------------------
+// What the caller submitted is never replaced by what the scan found
+// ---------------------------------------------------------------------------
+//
+// The CycloneDX report is the submitted document with the scan's own data ADDED
+// to it, so at every member the scan writes, what the caller sent is still
+// there: each array member keeps its submitted entries, in order, with the
+// scan's appended after them, and the submitted `metadata` object keeps its own
+// members. (A member sent with a type CycloneDX does not allow there cannot
+// carry both, and is refused instead — `scan_sbom_refusals.rs`.)
+
+/// One row: a document carrying a submitted array at `path`, and whether the
+/// scan has anything of its own to append there.
+#[derive(Debug)]
+struct PreservedCase {
+    what: &'static str,
+    sbom: Value,
+    /// The member path, from the report root, the array lives at.
+    path: &'static [&'static str],
+    /// The entries the document submitted at that path, in submitted order.
+    submitted: Value,
+    /// Whether this scan appends anything of its own at that member.
+    appended: bool,
+}
+
+/// The report's subtree at `path`: an object member by name, an array entry by
+/// its decimal index.
+fn at_path<'r>(report: &'r Value, path: &[&str]) -> &'r Value {
+    let mut cursor = report;
+    for key in path {
+        cursor = match key.parse::<usize>() {
+            Ok(index) if cursor.is_array() => &cursor[index],
+            _ => &cursor[*key],
+        };
+    }
+    cursor
+}
+
+/// A component carrying `properties`, with the coordinate given.
+fn component_with_properties(
+    bom_ref: &str,
+    name: &str,
+    version: &str,
+    purl: &str,
+    properties: Value,
+) -> Value {
+    let mut entry = component(bom_ref, name, version, purl);
+    entry["properties"] = properties;
+    entry
+}
+
+#[tokio::test]
+async fn a_submitted_array_member_keeps_its_entries_with_the_scans_appended_after_them() {
+    // `left-pad` is a package the advisory data holds no rule for, so the scan
+    // annotates it; `lodash@4.17.20` is a release it rules on, so the scan has
+    // nothing to append on that component and the submitted array is reported
+    // exactly as it was sent.
+    let submitted_property = json!([{ "name": "internal:team", "value": "platform" }]);
+    let two_properties = json!([
+        { "name": "internal:team", "value": "platform" },
+        { "name": "internal:tier", "value": "1" },
+    ]);
+    let cases = vec![
+        PreservedCase {
+            what: "a skipped component's own property",
+            sbom: bom(vec![component_with_properties(
+                "ref-own",
+                "left-pad",
+                "1.0.0",
+                "pkg:npm/left-pad@1.0.0",
+                submitted_property.clone(),
+            )]),
+            path: &["components", "0", "properties"],
+            submitted: submitted_property.clone(),
+            appended: true,
+        },
+        PreservedCase {
+            what: "two properties on a skipped component",
+            sbom: bom(vec![component_with_properties(
+                "ref-own",
+                "left-pad",
+                "1.0.0",
+                "pkg:npm/left-pad@1.0.0",
+                two_properties.clone(),
+            )]),
+            path: &["components", "0", "properties"],
+            submitted: two_properties,
+            appended: true,
+        },
+        PreservedCase {
+            what: "a ruled-on component's own property",
+            sbom: bom(vec![component_with_properties(
+                "ref-own",
+                "lodash",
+                "4.17.20",
+                "pkg:npm/lodash@4.17.20",
+                submitted_property.clone(),
+            )]),
+            path: &["components", "0", "properties"],
+            submitted: submitted_property.clone(),
+            appended: false,
+        },
+        PreservedCase {
+            what: "a nested component's own property",
+            sbom: bom(vec![json!({
+                "type": "application",
+                "bom-ref": "ref-assembly",
+                "name": "app",
+                "version": "1.0.0",
+                "components": [component_with_properties(
+                    "ref-child",
+                    "left-pad",
+                    "1.0.0",
+                    "pkg:npm/left-pad@1.0.0",
+                    submitted_property.clone(),
+                )],
+            })]),
+            path: &["components", "0", "components", "0", "properties"],
+            submitted: submitted_property.clone(),
+            appended: true,
+        },
+        PreservedCase {
+            what: "a submitted metadata property",
+            sbom: {
+                let mut sbom = bom(vec![component(
+                    "ref-clean",
+                    "left-pad",
+                    "1.0.0",
+                    "pkg:npm/left-pad@1.0.0",
+                )]);
+                sbom["metadata"]["properties"] =
+                    json!([{ "name": "internal:build", "value": "42" }]);
+                sbom
+            },
+            path: &["metadata", "properties"],
+            submitted: json!([{ "name": "internal:build", "value": "42" }]),
+            appended: true,
+        },
+        PreservedCase {
+            what: "a service the submitted document already named",
+            sbom: {
+                let mut sbom = bom(vec![component(
+                    "ref-clean",
+                    "left-pad",
+                    "1.0.0",
+                    "pkg:npm/left-pad@1.0.0",
+                )]);
+                sbom["metadata"]["tools"]["services"] = json!([{ "name": "another-scanner" }]);
+                sbom
+            },
+            path: &["metadata", "tools", "services"],
+            submitted: json!([{ "name": "another-scanner" }]),
+            appended: true,
+        },
+    ];
+
+    let (_engine, router) = emulator();
+    for case in &cases {
+        let request = json!({ "sbom": case.sbom.clone(), "outputFormat": "CYCLONE_DX_1_5" });
+        let (status, response) = post_scan(&router, &request).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: expected HTTP 200, got {status}: {response}",
+            case.what
+        );
+        let reported = at_path(&response["sbom"], case.path);
+        let reported = reported.as_array().cloned().unwrap_or_else(|| {
+            panic!(
+                "case {:?}: expected an array at {:?}, got {reported}",
+                case.what, case.path
+            )
+        });
+        let submitted = case.submitted.as_array().cloned().unwrap_or_default();
+        assert_eq!(
+            reported.get(..submitted.len()).map(<[Value]>::to_vec),
+            Some(submitted.clone()),
+            "case {:?}: expected the submitted entries {:?} first, got {reported:?}",
+            case.what,
+            submitted
+        );
+        if case.appended {
+            assert!(
+                reported.len() > submitted.len(),
+                "case {:?}: expected the scan's own entries after the submitted ones, got \
+                 {reported:?}",
+                case.what
+            );
+        } else {
+            assert_eq!(
+                reported.len(),
+                submitted.len(),
+                "case {:?}: the scan has nothing to append here, so the member is reported as \
+                 submitted, got {reported:?}",
+                case.what
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_submitted_metadata_object_keeps_its_own_members_in_the_report() {
+    let (_engine, router) = emulator();
+    let mut submitted = bom(vec![component(
+        "ref-clean",
+        "left-pad",
+        "1.0.0",
+        "pkg:npm/left-pad@1.0.0",
+    )]);
+    // Members of `metadata` the scan writes nothing at: each must come back
+    // exactly as submitted.
+    let carried = json!({
+        "authors": [ { "name": "A. Maintainer" } ],
+        "supplier": { "name": "Example Corp" },
+        "lifecycles": [ { "phase": "build" } ],
+        "licenses": [ { "license": { "id": "CC0-1.0" } } ],
+    });
+    for (member, value) in carried.as_object().expect("the carried members") {
+        submitted["metadata"][member] = value.clone();
+    }
+    let request = json!({ "sbom": submitted.clone(), "outputFormat": "CYCLONE_DX_1_5" });
+    let (status, response) = post_scan(&router, &request).await;
+    assert_eq!(status, 200, "expected HTTP 200, got {status}: {response}");
+    let metadata = &response["sbom"]["metadata"];
+    for (member, value) in submitted["metadata"]
+        .as_object()
+        .expect("the submitted metadata")
+    {
+        // `timestamp`, `tools` and `properties` are what the scan itself
+        // reports at this member; everything else is the caller's.
+        if ["timestamp", "tools", "properties"].contains(&member.as_str()) {
+            continue;
+        }
+        assert_eq!(
+            &metadata[member], value,
+            "case {member:?}: expected the submitted metadata member to be reported as \
+             submitted, got {metadata}"
+        );
+    }
+    // And the scan's own data is there beside it.
+    assert!(
+        metadata["timestamp"].is_string(),
+        "the report stamps the scan's instant beside the submitted metadata, got {metadata}"
+    );
+    assert_eq!(
+        property(
+            &metadata["properties"],
+            &format!("{NAMESPACE}:critical_vulnerabilities")
+        )
+        .as_deref(),
+        Some("0"),
+        "the scan summary is reported beside the submitted metadata, got {metadata}"
+    );
+    assert!(
+        metadata["tools"]["services"]
+            .as_array()
+            .is_some_and(|services| services
+                .iter()
+                .any(|service| service["name"].as_str() == Some(SERVICE_NAME))),
+        "the scanning service is reported beside the submitted metadata, got {metadata}"
+    );
+}
