@@ -1,29 +1,35 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeConnectionType
-//! IMPLEMENTED: answers the full set of options of ONE connection type — the connector
-//! kinds this service serves are the values of the modelled `ConnectionType` enum, which is
-//! the key space of `ConnectionInput$ConnectionType`, so a type a connection can be created
-//! with is a type this read describes. What each one is configured with is the CATALOG
-//! ENTRY recorded for that type in [`crate::state::describe_connection_type`]: the entry's
-//! own data (the data source it reaches, which its description names, and the
+//! IMPLEMENTED: answers the full set of options of ONE connection type — a connector the
+//! service itself ships, or a CUSTOM one this account registered.
+//!
+//! The connector kinds this service serves are the values of the modelled `ConnectionType`
+//! enum, which is the key space of `ConnectionInput$ConnectionType`, so a type a connection
+//! can be created with is a type this read describes. What each one is configured with is
+//! the CATALOG ENTRY recorded for that type in [`crate::state::describe_connection_type`]:
+//! the entry's own data (the data source it reaches, which its description names, and the
 //! authentication types a connection of it takes, which its capabilities and authentication
 //! configuration report) together with the descriptors the way it reaches that source
 //! carries — the create's connection properties, the Spark script's connection options, one
 //! configuration per compute environment, and the placement every connection may state,
 //! required only where the connection is nothing but that placement.
 //!
-//! A name that is no connection type this service serves is refused with the modelled
-//! `InvalidInputException`. This read reports what the service itself ships, which is the
-//! same for every caller, so it reads no per-account record and writes nothing.
+//! A CUSTOM connection type is described from the account-level record a
+//! `RegisterConnectionType` wrote instead ([`crate::state::RegisteredConnectionTypeEntry`]),
+//! which is also the only kind of type that carries a `RestConfiguration` — "HTTP request
+//! and response configuration ... for REST based data source", which a type has only when it
+//! was REGISTERED with one.
 //!
-//! Members this handler reports nothing for: `RestConfiguration` is "HTTP request and
-//! response configuration ... for REST based data source", which a connection type carries
-//! only when it was REGISTERED with one (`RegisterConnectionType`), and the three
-//! per-compute-environment property maps (`AthenaConnectionProperties`,
-//! `PythonConnectionProperties`, `SparkConnectionProperties`) hold the properties that
-//! differ per environment, where the catalogue holds one set of properties common to them
-//! all and reports each environment's own options in `ComputeEnvironmentConfigurations`.
+//! A name that is neither is refused with the modelled `InvalidInputException`. Whichever
+//! kind answers, this read reports what was registered or what the service ships and writes
+//! nothing.
+//!
+//! Members this handler reports nothing for: the three per-compute-environment property maps
+//! (`AthenaConnectionProperties`, `PythonConnectionProperties`, `SparkConnectionProperties`)
+//! hold the properties that differ per environment, where a shipped connector's catalogue
+//! entry and a registration alike state one set of properties common to them all and report
+//! each environment's own options in `ComputeEnvironmentConfigurations`.
 //!
 //! ## Shape of an operation
 //!
@@ -185,12 +191,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The connector kinds described here are the ones the service itself ships, so
-        // there is no record of this account to read: every caller is served the same
-        // description, and reading it changes nothing. The engine this operation was
-        // constructed with therefore goes untouched.
-        let _ = &self.engine;
-        let Some(details) = crate::state::describe_connection_type(&input.connection_type) else {
+        // The connector kinds the SERVICE ships are described the same for every caller, so
+        // for those there is no record of this account to read. A CUSTOM connection type is
+        // the other kind — the account-level record a `RegisterConnectionType` wrote — and is
+        // described from that record, which is read here. Reading either changes nothing.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeConnectionTypeErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue connection type store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+        let details = crate::state::describe_connection_type(&input.connection_type).or_else(|| {
+            state
+                .lock()
+                .registered_connection_type(&input.connection_type)
+                .map(crate::state::RegisteredConnectionTypeEntry::details)
+        });
+        let Some(details) = details else {
             return Err(DescribeConnectionTypeErrorModeled::InvalidInputException(
                 InvalidInputException {
                     message: Some(
@@ -204,19 +223,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(DescribeConnectionTypeOutput {
             connection_type: Some(details.connection_type),
-            description: Some(details.description),
+            description: details.description,
             capabilities: Some(details.capabilities),
             connection_properties: Some(details.connection_properties),
             connection_options: Some(details.connection_options),
             authentication_configuration: details.authentication_configuration,
             compute_environment_configurations: Some(details.compute_environment_configurations),
             physical_connection_requirements: Some(details.physical_connection_requirements),
-            // See the module docs: the per-compute-environment property maps and the REST
-            // configuration carry what a connection type holds beyond this catalogue.
+            // See the module docs: the per-compute-environment property maps carry what a
+            // connection type holds beyond these descriptors, and the REST configuration is
+            // the one a registration stated.
             athena_connection_properties: None,
             python_connection_properties: None,
             spark_connection_properties: None,
-            rest_configuration: None,
+            rest_configuration: details.rest_configuration,
         })
     }
 }

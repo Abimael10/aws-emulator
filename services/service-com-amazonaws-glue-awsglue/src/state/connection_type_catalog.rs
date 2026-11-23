@@ -35,6 +35,7 @@ use std::collections::HashMap;
 use super::{AUTHENTICATION_TYPE_BASIC, AUTHENTICATION_TYPE_CUSTOM, AUTHENTICATION_TYPE_OAUTH2};
 use crate::ops::types::{
     AllowedValue, AuthConfiguration, Capabilities, ComputeEnvironmentConfiguration, Property,
+    RestConfiguration,
 };
 
 mod entries;
@@ -117,13 +118,16 @@ pub fn connection_type_family(connection_type: &str) -> Option<ConnectionFamily>
     connection_type_entry(connection_type).map(|entry| entry.family)
 }
 
-/// Everything `DescribeConnectionType` reports about one connection type.
+/// Everything `DescribeConnectionType` reports about one connection type — a connector the
+/// service itself ships ([`describe_connection_type`]) or one this account registered
+/// ([`RegisteredConnectionTypeEntry::details`]).
 #[derive(Debug, Clone)]
 pub struct ConnectionTypeDetails {
     /// The type described, as the request named it.
     pub connection_type: String,
-    /// What a connection of this type connects to.
-    pub description: String,
+    /// What a connection of this type connects to, or `None` where nothing states it — a
+    /// custom type whose registration carried no `Description`.
+    pub description: Option<String>,
     /// The authentication types, data operations and compute environments it supports.
     pub capabilities: Capabilities,
     /// The properties a create of this type sets in `ConnectionInput$ConnectionProperties`.
@@ -136,6 +140,10 @@ pub struct ConnectionTypeDetails {
     pub compute_environment_configurations: HashMap<String, ComputeEnvironmentConfiguration>,
     /// Where in a VPC the connection sits: the placement every connection may state.
     pub physical_connection_requirements: HashMap<String, Property>,
+    /// How the connector's requests and responses are interpreted, which a type carries
+    /// only where it was REGISTERED with one (`RegisterConnectionType`): `None` for every
+    /// connector the service itself ships.
+    pub rest_configuration: Option<RestConfiguration>,
 }
 
 /// Everything the service knows about `connection_type`, or `None` when it serves no such
@@ -150,7 +158,7 @@ pub fn describe_connection_type(connection_type: &str) -> Option<ConnectionTypeD
         family.compute_environment_configurations(&capabilities, &connection_options);
     Some(ConnectionTypeDetails {
         connection_type: entry.connection_type.to_string(),
-        description: family.describe(entry.source),
+        description: Some(family.describe(entry.source)),
         capabilities,
         connection_properties: family
             .connection_properties(takes_stored_credentials(entry.authentication_types)),
@@ -158,6 +166,9 @@ pub fn describe_connection_type(connection_type: &str) -> Option<ConnectionTypeD
         authentication_configuration: authentication_configuration(entry.authentication_types),
         compute_environment_configurations,
         physical_connection_requirements: family.physical_connection_requirements(),
+        // A connector the service ships is reached by the driver it ships with, not by a
+        // REST configuration an account registered for it.
+        rest_configuration: None,
     })
 }
 
@@ -231,7 +242,7 @@ impl ConnectionFamily {
     /// The data operations a job may run against a source of this family. A REST source is
     /// read; a store Glue has a driver for is read and written; a VPC path carries no data
     /// of its own, so neither.
-    fn supported_data_operations(self) -> Vec<String> {
+    pub fn supported_data_operations(self) -> Vec<String> {
         let operations: &[&str] = match self {
             Self::GenericJdbc
             | Self::Relational
@@ -252,7 +263,7 @@ impl ConnectionFamily {
     /// wherever Glue has a driver for the source, the Python shell where the source is
     /// reached by an API or a JDBC engine, and Athena where the source is queryable through
     /// a federated catalog.
-    fn supported_compute_environments(self) -> Vec<String> {
+    pub fn supported_compute_environments(self) -> Vec<String> {
         let environments: &[&str] = match self {
             Self::Relational | Self::AwsService | Self::Connector => &[
                 COMPUTE_ENVIRONMENT_SPARK,

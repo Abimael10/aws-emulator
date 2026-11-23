@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterConnectionType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterConnectionType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: registers a CUSTOM connection type for this account — a REST-based
+//! connector the caller configures rather than one the service ships — and answers the ARN
+//! that type is addressed by. The record written is the whole registration
+//! ([`crate::state::RegisteredConnectionTypeEntry`]): the properties a connection of the
+//! type is created with, the authentication types the connector accepts with the properties
+//! each calls for, and the REST configuration its requests and responses are interpreted by.
+//! `DescribeConnectionType` answers from that record, so a type registered here is described
+//! as it was registered.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterConnectionType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The name is the whole address of such a type — every operation over one names it by
+//! `ConnectionType` alone — so it must be the name of no type already registered, and must
+//! carry the prefix the member itself requires ("must be prefixed with "REST-""). Each
+//! refusal is the operation's modelled `InvalidInputException`, decided before anything is
+//! written. The store is resident memory and this call is reachable by any caller, so the
+//! number of registrations one process holds is bounded
+//! ([`crate::state::MAX_REGISTERED_CONNECTION_TYPES`]), past which a registration earns the
+//! operation's own modelled `ResourceNumberLimitExceededException`.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +183,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterConnectionType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterConnectionTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported as
+            // that rather than as a client error the caller could act on.
+            return Err(
+                RegisterConnectionTypeErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some("the Glue connection type store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut store = state.lock();
+        // Every refusal is decided BEFORE anything is written, so a refused registration
+        // leaves the types already registered exactly as they were.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterConnectionType"))
+        // "Must be between 1 and 255 characters and must be prefixed with "REST-" to
+        // indicate it is a REST-based connector": the length is a modelled constraint,
+        // already refused before this handler runs, and the prefix is this member's own
+        // grammar, which is refused here.
+        if !input
+            .connection_type
+            .starts_with(crate::state::CUSTOM_CONNECTION_TYPE_PREFIX)
+        {
+            return Err(RegisterConnectionTypeErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::messages::connection_type_prefix_required(
+                        crate::state::CUSTOM_CONNECTION_TYPE_PREFIX,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+        // A connection type is addressed by its name alone, so a registration under a name
+        // already registered is refused rather than replacing the stored configuration.
+        if store
+            .registered_connection_type(&input.connection_type)
+            .is_some()
+        {
+            return Err(RegisterConnectionTypeErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(
+                        crate::state::messages::CONNECTION_TYPE_ALREADY_EXISTS.to_string(),
+                    ),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+        // The store is resident memory and this registration is reachable by any caller, so
+        // the number of records one process will hold is bounded. Past the ceiling the
+        // request is refused with the operation's own modelled limit error.
+        if !store.can_register_connection_type() {
+            return Err(
+                RegisterConnectionTypeErrorModeled::ResourceNumberLimitExceededException(
+                    ResourceNumberLimitExceededException {
+                        message: Some(format!(
+                            "This account already holds the maximum of {} connection types",
+                            crate::state::MAX_REGISTERED_CONNECTION_TYPES
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Stored exactly as sent, so a read of the type answers the configuration this
+        // registration stated and nothing composed for it.
+        store.registered_connection_types.insert(
+            input.connection_type.clone(),
+            crate::state::RegisteredConnectionTypeEntry::from_register_input(&input),
+        );
+        ::tracing::info!(
+            operation = "RegisterConnectionType",
+            connection_type = %input.connection_type,
+            "registered a custom Glue connection type"
+        );
+
+        // "This unique identifier can be used to reference the connection type in other Glue
+        // operations": the ARN of the record now stored under that name.
+        Ok(RegisterConnectionTypeOutput {
+            connection_type_arn: Some(crate::state::registered_connection_type_arn(
+                &region,
+                &input.connection_type,
+            )),
+        })
     }
 }

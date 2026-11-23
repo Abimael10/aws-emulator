@@ -23,7 +23,8 @@ use super::*;
 /// `CreateTrigger$Tags`, `CreateWorkflow$Tags`, `CreateBlueprint$Tags`,
 /// `CreateRegistry$Tags`, `CreateSchema$Tags`, `CreateSession$Tags`, `CreateCatalog$Tags`,
 /// `CreateMLTransform$Tags`, `CreateUsageProfile$Tags`, `CreateCustomEntityType$Tags`,
-/// `CreateDataQualityRuleset$Tags`) and whose resource this emulator holds.
+/// `CreateDataQualityRuleset$Tags`, `RegisterConnectionType$Tags`) and whose resource this
+/// emulator holds.
 ///
 /// A Glue resource whose create models NO `Tags` map carries no tag set to report: a
 /// catalog TABLE (`CreateTable` models none), a table version, a user defined function and
@@ -41,6 +42,10 @@ pub enum TaggedResourceKind {
     Catalog,
     /// `connection/<name>`.
     Connection,
+    /// `connectionType/<name>`: a CUSTOM connection type `RegisterConnectionType`
+    /// registered, which is the only kind of connection type this store holds a record of
+    /// (the connectors the service ships are no account's resource).
+    ConnectionType,
     /// `crawler/<name>`.
     Crawler,
     /// `customEntityType/<name>`.
@@ -80,10 +85,14 @@ pub enum TaggedResourceKind {
 /// `customEntityType`, `dataQualityRuleset`). The model states only the prefix every Glue
 /// ARN shares (`GlueResourceArn`'s pattern, see [`ARN_NAMESPACE`]), so the segments are
 /// listed here once and every mint and every lookup goes through this one table.
-pub const TAGGED_RESOURCE_TYPES: [(&str, TaggedResourceKind); 15] = [
+pub const TAGGED_RESOURCE_TYPES: [(&str, TaggedResourceKind); 16] = [
     ("blueprint", TaggedResourceKind::Blueprint),
     ("catalog", TaggedResourceKind::Catalog),
     ("connection", TaggedResourceKind::Connection),
+    (
+        CONNECTION_TYPE_ARN_SEGMENT,
+        TaggedResourceKind::ConnectionType,
+    ),
     ("crawler", TaggedResourceKind::Crawler),
     ("customEntityType", TaggedResourceKind::CustomEntityType),
     ("database", TaggedResourceKind::Database),
@@ -426,6 +435,10 @@ macro_rules! tag_set_of {
                 .blueprints
                 .$get(&resource.name)
                 .map(|blueprint| $($borrow)* blueprint.tags),
+            TaggedResourceKind::ConnectionType => $store
+                .registered_connection_types
+                .$get(&resource.name)
+                .map(|connection_type| $($borrow)* connection_type.tags),
             TaggedResourceKind::Crawler => $store
                 .crawlers
                 .$get(&resource.name)
@@ -586,6 +599,15 @@ impl ComAmazonawsGlueAwsglueState {
                 region,
                 &custom_entity_type.name,
                 &custom_entity_type.tags,
+            );
+        }
+        for connection_type in self.registered_connection_types.values() {
+            push_row(
+                &mut found,
+                TaggedResourceKind::ConnectionType,
+                region,
+                &connection_type.connection_type,
+                &connection_type.tags,
             );
         }
         for ruleset in self.data_quality_rulesets.values() {

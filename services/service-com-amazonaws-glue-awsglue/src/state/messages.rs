@@ -1448,6 +1448,29 @@ pub fn connection_test_did_not_reach_the_source(connection_type: &str) -> String
 /// so a client sees the same wording whichever name it asked for.
 pub const CONNECTION_TYPE_NOT_AVAILABLE: &str = "The connection type is not available.";
 
+/// `RegisterConnectionType` whose `ConnectionType` does not carry the prefix the member
+/// itself requires ("must be prefixed with "REST-" to indicate it is a REST-based
+/// connector" — `RegisterConnectionTypeRequest$ConnectionType`).
+///
+/// NOT recorded: what is pinned is the behaviour — 400 with the operation's modelled
+/// `InvalidInputException`, and nothing registered — and the sentence states the member that
+/// was validated and the prefix it must carry, the way this crate's other grammar refusals
+/// of an identifier do. It names nothing of the
+/// request, so every rejected name is refused with the same words.
+pub fn connection_type_prefix_required(prefix: &str) -> String {
+    format!("Invalid ConnectionType format. Valid connection types begin with {prefix}")
+}
+
+/// `RegisterConnectionType` for a `ConnectionType` this account has already registered a
+/// custom connection type under.
+///
+/// NOT recorded: what is pinned is the behaviour — 400 with the operation's modelled
+/// `InvalidInputException`, the closest client error it models (it models no
+/// `AlreadyExistsException`), and the registration already stored left exactly as it was.
+/// The sentence states the resource kind and withholds the name asked for, as the recorded
+/// duplicate of a connection ([`CONNECTION_ALREADY_EXISTS`]) does for its own resource.
+pub const CONNECTION_TYPE_ALREADY_EXISTS: &str = "Connection type already exists.";
+
 /// `GetTable` for an address it cannot resolve — a table the database does not hold, or
 /// a `DatabaseName` the catalog holds no database under. Recorded constant: this read
 /// answers ONE wording whichever step of the address missed, and it names neither the

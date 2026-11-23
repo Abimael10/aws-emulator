@@ -303,6 +303,7 @@ mod ml_transforms;
 mod pagination;
 mod partition_predicate;
 mod policy_documents;
+mod registered_connection_types;
 mod schema_compatibility;
 mod schema_definition_canonical;
 mod schema_definition_json;
@@ -359,6 +360,7 @@ pub use ml_transforms::*;
 pub use pagination::*;
 pub use partition_predicate::*;
 pub use policy_documents::*;
+pub use registered_connection_types::*;
 pub use schema_compatibility::*;
 pub use schema_definition_canonical::*;
 pub use schema_definition_json::*;
@@ -1144,6 +1146,16 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// so `ListCustomEntityTypes` has one deterministic order to page over. The key is
     /// the name exactly as sent — the model documents no case fold for it.
     pub custom_entity_types: BTreeMap<String, CustomEntityTypeEntry>,
+    /// Every CUSTOM connection type `RegisterConnectionType` registered in this account,
+    /// keyed by the name it was registered under.
+    ///
+    /// Per account and beside the catalog tree, like the crawlers and the custom entity
+    /// types: `DescribeConnectionType` and `DeleteConnectionType` address a connection type
+    /// by `ConnectionType` alone, with no `CatalogId` member, so the name a registration
+    /// sends is the whole address. Ordered, so a listing has one deterministic order to page
+    /// over. The key is the name exactly as sent — the model documents no case fold for
+    /// `NameString`. See [`RegisteredConnectionTypeEntry`].
+    pub registered_connection_types: BTreeMap<String, RegisteredConnectionTypeEntry>,
     /// Every security configuration this emulator holds, keyed by its name.
     ///
     /// Per account, like crawlers and custom entity types: `GetSecurityConfiguration`,
