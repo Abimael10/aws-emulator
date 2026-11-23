@@ -44,8 +44,12 @@
 //! with. A script is performed as a SCRIPT rather than as one command line, so the session is
 //! given its own working tree ([`ShellSession::with_file_utilities`]) and with it the grammar's
 //! control flow and the file utilities a script is written in, and the file Amazon EMR
-//! publishes the node's role in ([`INSTANCE_INFO_PATH`]) is seeded into that tree. The tree is
-//! session-local memory, keyed by the path the script named and bounded by that session: no
+//! publishes the node's role in ([`INSTANCE_INFO_PATH`]) is seeded into that tree. That tree
+//! STARTS with what the node's own local disk holds and is kept beside the node afterwards
+//! ([`super::node_file_systems`]), because a node has storage that outlives the one program
+//! that wrote to it: what one action leaves there the next action, and the steps that run after
+//! the bootstrap phase, read. The tree is
+//! service-held memory, keyed by the path the script named and bounded by that module: no
 //! host file, directory or path is opened, created or read. NO host command, process or shell
 //! is started here or anywhere this calls, and a command the session provides no program for
 //! answers the status a shell gives a command it could not find.
@@ -467,9 +471,20 @@ pub async fn run_due_bootstrap_actions<Eng: Send + Sync + 'static>(
             };
             spent = spent.saturating_add(1);
             performed_any = true;
+            // What this node's local disk already holds, which is what the script finds on it:
+            // the files the actions BEFORE this one left there.
+            let disk = {
+                let store = state.lock();
+                store
+                    .clusters
+                    .get(cluster_id)
+                    .map(|cluster| cluster.node_disk(&node))
+                    .unwrap_or_default()
+            };
             let answer =
-                performed_bootstrap_action(engine, ctx, region, &plan, &credentials, claim).await;
-            let Some(answer) = answer else {
+                performed_bootstrap_action(engine, ctx, region, &plan, &credentials, claim, disk)
+                    .await;
+            let Some((answer, kept)) = answer else {
                 // Nothing answered: the run stays owed, so a later call performs it rather than
                 // this one recording an answer nothing produced.
                 continue;
@@ -478,6 +493,9 @@ pub async fn run_due_bootstrap_actions<Eng: Send + Sync + 'static>(
             {
                 let mut store = state.lock();
                 if let Some(cluster) = store.clusters.get_mut(cluster_id) {
+                    // What the script left on the node's local disk is the node's from now on,
+                    // which is what the step that runs after the bootstrap phase reads.
+                    cluster.keep_node_disk(&node, kept);
                     cluster.record_bootstrap_action_run(BootstrapActionRun {
                         position: plan.position,
                         path: plan.path.clone(),
@@ -502,8 +520,8 @@ pub async fn run_due_bootstrap_actions<Eng: Send + Sync + 'static>(
     }
 }
 
-/// Perform ONE owed bootstrap action and answer what it came to, or `None` when nothing
-/// answered for it at all.
+/// Perform ONE owed bootstrap action and answer what it came to, and what the node's local disk
+/// holds afterwards — or `None` when nothing answered for it at all.
 async fn performed_bootstrap_action<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
@@ -511,12 +529,13 @@ async fn performed_bootstrap_action<Eng: Send + Sync + 'static>(
     plan: &BootstrapActionPlan,
     credentials: &StepCredentials,
     claim: InFlight,
-) -> Option<BootstrapActionAnswer> {
+    disk: Vec<(String, String)>,
+) -> Option<(BootstrapActionAnswer, Vec<(String, String)>)> {
     let script = match read_bootstrap_script(ctx, region, &plan.path).await {
         Ok(script) => script,
         // There is nothing to run: the node could not fetch the script the action names, which
-        // is a failure of the action itself.
-        Err(detail) => return Some(BootstrapActionAnswer::Unfetched(detail)),
+        // is a failure of the action itself — and its disk is as it was, because nothing ran.
+        Err(detail) => return Some((BootstrapActionAnswer::Unfetched(detail), disk)),
     };
     // The CLI this script's environment provides, built per run so each gets its own transfer
     // budget, and presenting on every call it makes what the cluster's instances obtained from
@@ -530,7 +549,7 @@ async fn performed_bootstrap_action<Eng: Send + Sync + 'static>(
         &format!("bootstrap-{}-{}", plan.position, node.key()),
     );
     performed_on_its_own_thread(BOOTSTRAP_THREAD_NAME, TRANSFER_BUDGET, claim, move || {
-        performed_script(&script, &node, cli)
+        performed_script(&script, &node, cli, disk)
     })
     .await
 }
@@ -598,7 +617,8 @@ fn performed_script(
     script: &str,
     node: &BootstrapNode,
     cli: Option<StepObjectCli>,
-) -> BootstrapActionAnswer {
+    disk: Vec<(String, String)>,
+) -> (BootstrapActionAnswer, Vec<(String, String)>) {
     // A script is written against storage, so the session is given a working tree of its own:
     // its redirections leave files the CLI then carries, and the grammar's control flow and the
     // file utilities a script uses are commands it performs.
@@ -615,14 +635,21 @@ fn performed_script(
     };
     let mut session =
         ShellSession::with_programs(BTreeMap::new(), config, programs).with_file_utilities();
+    // What this node's local disk already holds, which the script finds on it: a node has
+    // storage, and it outlives the one program that wrote to it
+    // ([`super::node_file_systems`]).
+    seed_node_disk(&mut session, &disk);
     // The file every Amazon EMR bootstrap action reads its node's role from, published to the
     // node before its actions run.
     session.put_file(INSTANCE_INFO_PATH, &node.instance_info());
     let status = session.run(script);
+    // What the script left on that disk is the node's from now on, whatever the run came to:
+    // the writes happened.
+    let kept = kept_node_disk(&session);
     if status == config.statuses.could_not_run && session.exit_status().is_none() {
-        return BootstrapActionAnswer::NotPerformed;
+        return (BootstrapActionAnswer::NotPerformed, kept);
     }
-    BootstrapActionAnswer::Exited(status)
+    (BootstrapActionAnswer::Exited(status), kept)
 }
 
 /// The state a cluster whose shutdown is due reaches, which follows from WHY it shut down.

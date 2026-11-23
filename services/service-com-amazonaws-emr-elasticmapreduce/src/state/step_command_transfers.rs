@@ -217,6 +217,15 @@ pub fn step_object_cli<Eng: Send + Sync + 'static>(
     })
 }
 
+/// ONE object as a listing of the store reports it: its key, the bytes it holds and the instant
+/// of its last write, which is what a filesystem over the store reports for that path.
+#[derive(Debug, Clone)]
+pub(super) struct ListedObject {
+    pub(super) key: String,
+    pub(super) size: u64,
+    pub(super) modified: Option<SystemTime>,
+}
+
 /// One end of a transfer: a path of the session's tree, an object of the store, or the
 /// command's own standard input or standard output.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -612,7 +621,11 @@ impl StepObjectCli {
     }
 
     /// The object's own text, read whole and bounded by [`MAX_TRANSFERRED_BYTES`].
-    fn get_object(&self, address: &S3Object) -> Result<String, String> {
+    ///
+    /// `pub(super)` because the Hadoop filesystem CLI a step's command line also provides
+    /// ([`super::hadoop_cli`]) reads an object through the SAME program, under the same
+    /// credential and the same budget, rather than opening a second path to the store.
+    pub(super) fn get_object(&self, address: &S3Object) -> Result<String, String> {
         self.made(|| async {
             let read = self
                 .client()?
@@ -670,13 +683,56 @@ impl StepObjectCli {
         Ok(texts)
     }
 
-    /// The keys under `prefix`, in the store's own order, to `max_objects` of them.
-    fn list_objects(
+    /// What the store holds at `address` without reading its bytes — the size and the instant
+    /// of its last write — and `None` when the store answered that it holds no object there.
+    ///
+    /// A `HEAD`, so an object a command only asks ABOUT costs none of the bytes a transfer of
+    /// it would: what a filesystem over the store reports for a path
+    /// ([`super::hadoop_cli`]) is read this way.
+    pub(super) fn object_facts(
+        &self,
+        address: &S3Object,
+    ) -> Result<Option<(u64, Option<SystemTime>)>, String> {
+        self.made(|| async {
+            match self
+                .client()?
+                .head_object()
+                .bucket(&address.bucket)
+                .key(&address.key)
+                .send()
+                .await
+            {
+                Ok(head) => Ok(Some((
+                    u64::try_from(head.content_length().unwrap_or_default()).unwrap_or_default(),
+                    head.last_modified()
+                        .and_then(|written| SystemTime::try_from(*written).ok()),
+                ))),
+                Err(error) => {
+                    // The store SAYING there is nothing there is the answer `None` stands for;
+                    // every other refusal is one the command reports as its own failure.
+                    if ::service_common::s3_object_read::answered_refusal(&error)
+                        == ::service_common::s3_object_read::ObjectRead::Absent
+                    {
+                        return Ok(None);
+                    }
+                    Err(store_answered("HeadObject", &error))
+                }
+            }
+        })
+    }
+
+    /// Every object under `prefix` of `bucket` as the store reports it — the key, the bytes it
+    /// holds and the instant of its last write — in the store's own order, to `max_objects` of
+    /// them.
+    ///
+    /// What a filesystem over the store answers a LISTING and a disk-usage walk out of
+    /// ([`super::hadoop_cli`]): the listing is the store's, so no bytes of any object are read.
+    pub(super) fn listed_objects(
         &self,
         bucket: &str,
         prefix: &str,
         max_objects: usize,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<Vec<ListedObject>, String> {
         let limit = i32::try_from(max_objects).unwrap_or(i32::MAX);
         self.made(|| async {
             let listed = self
@@ -691,17 +747,42 @@ impl StepObjectCli {
             Ok(listed
                 .contents()
                 .iter()
-                .filter_map(|object| object.key().map(str::to_string))
-                // A key that ENDS in the separator is the marker a filesystem over the
-                // object store writes for a directory, not a data file.
-                .filter(|key| !key.ends_with('/'))
+                .filter_map(|object| {
+                    Some(ListedObject {
+                        key: object.key()?.to_string(),
+                        size: u64::try_from(object.size().unwrap_or_default())
+                            .unwrap_or_default(),
+                        modified: object
+                            .last_modified()
+                            .and_then(|written| SystemTime::try_from(*written).ok()),
+                    })
+                })
                 .take(max_objects)
                 .collect())
         })
     }
 
-    /// Write `contents` as the object at `address`.
-    fn put_object(&self, address: &S3Object, contents: &str) -> Result<(), String> {
+    /// The keys under `prefix`, in the store's own order, to `max_objects` of them.
+    ///
+    /// The DATA keys: the one listing path above with the directory markers a filesystem over
+    /// the store writes left out — a key ending in the separator holds no data.
+    fn list_objects(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        max_objects: usize,
+    ) -> Result<Vec<String>, String> {
+        Ok(self
+            .listed_objects(bucket, prefix, max_objects)?
+            .into_iter()
+            .filter(|object| !object.key.ends_with('/'))
+            .map(|object| object.key)
+            .collect())
+    }
+
+    /// Write `contents` as the object at `address`. `pub(super)` for the reason
+    /// [`Self::get_object`] is.
+    pub(super) fn put_object(&self, address: &S3Object, contents: &str) -> Result<(), String> {
         if contents.len() > MAX_TRANSFERRED_BYTES {
             return Err(format!(
                 "The file is past the {MAX_TRANSFERRED_BYTES} bytes one transfer carries."
@@ -722,8 +803,9 @@ impl StepObjectCli {
         })
     }
 
-    /// Copy the object at `source` to `destination`, in the store itself.
-    fn copy_object(
+    /// Copy the object at `source` to `destination`, in the store itself. `pub(super)` for the
+    /// reason [`Self::get_object`] is.
+    pub(super) fn copy_object(
         &self,
         source: &S3Object,
         destination: &S3Object,
@@ -741,8 +823,8 @@ impl StepObjectCli {
         })
     }
 
-    /// Delete the object at `address`.
-    fn delete_object(&self, address: &S3Object) -> Result<(), String> {
+    /// Delete the object at `address`. `pub(super)` for the reason [`Self::get_object`] is.
+    pub(super) fn delete_object(&self, address: &S3Object) -> Result<(), String> {
         self.made(|| async {
             self.client()?
                 .delete_object()

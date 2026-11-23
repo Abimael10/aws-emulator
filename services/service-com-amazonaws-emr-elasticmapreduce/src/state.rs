@@ -239,6 +239,27 @@ pub use step_command_status::*;
 mod step_command_transfers;
 pub use step_command_transfers::*;
 
+/// The FILESYSTEMS a cluster's nodes hold — the cluster's own HDFS and each node's local disk,
+/// both of which outlive the one program that wrote to them — split out and re-exported the
+/// same way.
+mod node_file_systems;
+pub use node_file_systems::*;
+
+/// The HADOOP a cluster's nodes run — the version its release installs and the configuration
+/// Hadoop resolves on them — split out and re-exported the same way.
+mod hadoop_configuration;
+pub use hadoop_configuration::*;
+
+/// WHAT a Hadoop path names, and what the filesystem it names does with it — split out and
+/// re-exported the same way.
+mod hadoop_paths;
+pub use hadoop_paths::*;
+
+/// The HADOOP COMMANDS a cluster's nodes provide to a step's command line — `hadoop fs`,
+/// `hdfs dfs`, `hdfs getconf` and `hadoop version` — split out and re-exported the same way.
+mod hadoop_cli;
+pub use hadoop_cli::*;
+
 /// WHEN that answer is given, and what one call may spend giving it: the queue side of the
 /// same concern, split out and re-exported the same way.
 mod command_step_run;
@@ -3047,6 +3068,14 @@ pub struct ClusterRecord {
     /// ([`ClusterInstanceRecord`]), which is what `ListInstances` reports. A cluster whose
     /// instances Amazon EC2 did not launch holds none, so nothing is reported for it.
     pub ec2_instances: Vec<ClusterInstanceRecord>,
+    /// This cluster's own HDFS: the distributed filesystem its programs read and write, which
+    /// outlives each of them, so what one step wrote the next step reads
+    /// ([`node_file_systems`]).
+    pub hdfs: ClusterHdfs,
+    /// What each NODE's local disk holds, by the key that names the node
+    /// ([`ClusterRecord::node_disk`]): the files a bootstrap action of that node and the steps
+    /// that ran on it left behind, which is what the next program of that node finds there.
+    pub node_disks: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl ClusterRecord {

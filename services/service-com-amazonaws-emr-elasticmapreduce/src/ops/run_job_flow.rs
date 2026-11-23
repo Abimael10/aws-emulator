@@ -872,6 +872,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // store's guard is released: the launch is a call into another service and
             // cannot be made while the guard is held.
             ec2_instances: Vec::new(),
+            // The cluster's own HDFS comes up with it, holding the directories a cluster's
+            // filesystem has and nothing else.
+            hdfs: crate::state::ClusterHdfs::default(),
+            // Nothing has run on this cluster's nodes yet, so their local disks hold none of
+            // the files a bootstrap action or a step leaves behind.
+            node_disks: std::collections::BTreeMap::new(),
         };
         store.clusters.insert(id.clone(), record);
         // What this cluster's collections ask Amazon EC2 for, read off the records just

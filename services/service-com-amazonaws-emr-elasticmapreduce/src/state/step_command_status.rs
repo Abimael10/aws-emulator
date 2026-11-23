@@ -22,7 +22,10 @@
 //! session with a working tree of its own provides (`printf`, `mkdir`, `touch`, `rm`, `tee`,
 //! `ls`, `test`, a nested `sh`/`bash`, `.`/`source` and `sleep`) — a step's command line runs
 //! on a cluster node, which has storage, so it is given the same tree and the same catalog a
-//! cluster's bootstrap script is ([`super::bootstrap_run`]) — beside the TWO programs the
+//! cluster's bootstrap script is ([`super::bootstrap_run`]), seeded with what that NODE's local
+//! disk already holds and left holding what the command wrote
+//! ([`super::node_file_systems`]) — beside the programs the node's installed applications
+//! provide (the Hadoop distribution: [`super::hadoop_cli`]) and the TWO programs the
 //! environment of a step's command line provides: the cluster's own SQL client
 //! ([`super::step_sql_cli`], which runs the statements it is given against the cluster's Hive
 //! metastore and the data under it) and the AWS CLI's Amazon S3 transfers
@@ -199,6 +202,43 @@ const COMMAND_OUTPUT_LIMITS: OutputLimits = OutputLimits {
     line_bytes: 4 * 1024,
 };
 
+/// The NODE a step's command line runs on, as the session that performs it is given it.
+///
+/// A step's command line runs on the cluster's primary node, which has STORAGE of its own and
+/// the programs the cluster's applications installed: both are the node's rather than the
+/// session's, so the session starts with the files that node's local disk holds and with those
+/// programs in its environment ([`super::node_file_systems`]).
+pub struct StepNode {
+    /// What NAMES the node, which is what its disk is kept under.
+    pub key: String,
+    /// The files its local disk holds, as `(path, contents)`.
+    pub disk: Vec<(String, String)>,
+    /// The programs its installed applications provide — the Hadoop distribution
+    /// ([`super::hadoop_cli`]) — and `None` for a node that has none this emulator can account
+    /// for.
+    pub programs: Option<Box<dyn EnvironmentPrograms>>,
+}
+
+/// Written by hand rather than derived: the programs a node provides carry a `Debug` of their
+/// own, and what this names is the node, not the files a caller's program left on it.
+impl ::std::fmt::Debug for StepNode {
+    fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        formatter
+            .debug_struct("StepNode")
+            .field("key", &self.key)
+            .field("files", &self.disk.len())
+            .finish()
+    }
+}
+
+/// What ONE command of a step came to: the state its step ends in, and what the node's local
+/// disk holds once the command has run — which is what the next program of that node reads.
+#[derive(Debug, Clone)]
+pub struct CommandAnswer {
+    pub outcome: StepOutcome,
+    pub disk: Vec<(String, String)>,
+}
+
 /// What this command ANSWERED, or `None` when the session answered for nothing of it.
 ///
 /// The status is the session's ([`performed_command`]), and the step's end follows from it the
@@ -216,17 +256,20 @@ const COMMAND_OUTPUT_LIMITS: OutputLimits = OutputLimits {
 /// that carries a file to or from it really carries it, and `sql` the cluster's SQL client, so
 /// a command line that runs statements really runs them. A command performed WITHOUT either —
 /// there is no runtime to make a call on — reaches no object store and no metastore, and such
-/// a command line is then one the session reports it could not run.
+/// a command line is then one the session reports it could not run. `node` is the node the
+/// command line runs ON: the files its local disk already holds, which is what the session's
+/// tree starts with, and the programs its installed applications provide.
 #[must_use]
 pub fn command_outcome(
     command: &StepCommand,
     objects: Option<StepObjectCli>,
     sql: Option<StepSqlCli>,
-) -> Option<StepOutcome> {
+    node: StepNode,
+) -> Option<CommandAnswer> {
     // Held beside the session, which takes the client itself: what the client answered about
     // a refused statement is read back out of it once the command has run.
     let driver = sql.clone();
-    let answered = performed_command(command, objects, sql)?;
+    let answered = performed_command(command, objects, sql, node)?;
     let log = StepRunLog {
         stdout: console_text(&answered.output),
         stderr: console_text(&answered.errors),
@@ -234,10 +277,13 @@ pub fn command_outcome(
     }
     .bounded();
     if answered.status == 0 {
-        return Some(StepOutcome {
-            state: step_state::COMPLETED.to_string(),
-            failure: None,
-            log: Some(log),
+        return Some(CommandAnswer {
+            outcome: StepOutcome {
+                state: step_state::COMPLETED.to_string(),
+                failure: None,
+                log: Some(log),
+            },
+            disk: answered.disk,
         });
     }
     let failure = driver
@@ -246,10 +292,13 @@ pub fn command_outcome(
             reason: COMMAND_FAILED_REASON.to_string(),
             message: command_failure_message(answered.status),
         });
-    Some(StepOutcome {
-        state: step_state::FAILED.to_string(),
-        failure: Some(failure),
-        log: Some(log),
+    Some(CommandAnswer {
+        outcome: StepOutcome {
+            state: step_state::FAILED.to_string(),
+            failure: Some(failure),
+            log: Some(log),
+        },
+        disk: answered.disk,
     })
 }
 
@@ -264,13 +313,14 @@ fn console_text(lines: &[String]) -> String {
     text
 }
 
-/// What the session answered for one command: the status it exited with and the two console
-/// streams it wrote.
+/// What the session answered for one command: the status it exited with, the two console
+/// streams it wrote, and the files it left on the node's local disk.
 #[derive(Debug, Clone)]
 struct PerformedCommand {
     status: i32,
     output: Vec<String>,
     errors: Vec<String>,
+    disk: Vec<(String, String)>,
 }
 
 /// What the session answered for `command`, or `None` when it answered for nothing of it.
@@ -290,15 +340,17 @@ fn performed_command(
     command: &StepCommand,
     objects: Option<StepObjectCli>,
     sql: Option<StepSqlCli>,
+    node: StepNode,
 ) -> Option<PerformedCommand> {
     let config = SessionConfig {
         output: Some(COMMAND_OUTPUT_LIMITS),
         ..SessionConfig::default()
     };
     // The programs the environment of a step's command line provides, asked in order: the
-    // cluster's SQL client and the AWS CLI's Amazon S3 transfers. Each answers only for its
-    // own names, so the order between them decides nothing.
-    let programs: Option<Box<dyn EnvironmentPrograms>> = match (sql, objects) {
+    // programs the NODE's own applications installed (the Hadoop distribution), the cluster's
+    // SQL client and the AWS CLI's Amazon S3 transfers. Each answers only for its own names, so
+    // the order between them decides nothing.
+    let provided: Option<Box<dyn EnvironmentPrograms>> = match (sql, objects) {
         (Some(sql), Some(objects)) => Some(layered(
             Box::new(sql) as Box<dyn EnvironmentPrograms>,
             Box::new(objects) as Box<dyn EnvironmentPrograms>,
@@ -306,6 +358,11 @@ fn performed_command(
         (Some(sql), None) => Some(Box::new(sql) as Box<dyn EnvironmentPrograms>),
         (None, Some(objects)) => Some(Box::new(objects) as Box<dyn EnvironmentPrograms>),
         (None, None) => None,
+    };
+    let programs: Option<Box<dyn EnvironmentPrograms>> = match (node.programs, provided) {
+        (Some(installed), Some(provided)) => Some(layered(installed, provided)),
+        (Some(installed), None) => Some(installed),
+        (None, provided) => provided,
     };
     let mut session = match programs {
         Some(programs) => ShellSession::with_programs(BTreeMap::new(), config, programs),
@@ -319,6 +376,10 @@ fn performed_command(
     // same cluster gets. The tree is the SESSION's own and nothing of the host's: it is
     // created with the session and dropped with it, and its ceilings are that module's.
     .with_file_utilities();
+    // The node's local disk is what the session's tree STARTS with: a step's command line runs
+    // on a node a bootstrap action and the steps before it already wrote to
+    // ([`super::node_file_systems`]).
+    seed_node_disk(&mut session, &node.disk);
     let status = session.run(&command.as_line());
     if status == config.statuses.could_not_run && session.exit_status().is_none() {
         return None;
@@ -327,5 +388,8 @@ fn performed_command(
         status,
         output: session.output().to_vec(),
         errors: session.errors().to_vec(),
+        // What the command left on that disk, which is what the next program of the node finds
+        // there.
+        disk: kept_node_disk(&session),
     })
 }

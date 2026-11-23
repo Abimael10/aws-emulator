@@ -844,6 +844,73 @@ impl ShellVolume {
         }
     }
 
+    /// Remove everything at or under `path` — the file it names, or the whole SUBTREE under
+    /// the directory it names, directories included — answering whether anything was removed.
+    ///
+    /// The sibling of [`Self::make_directories`]: that one makes a chain of directories, this
+    /// one takes a whole tree away, which is what a recursive removal does on a machine.
+    ///
+    /// What a program may NOT remove keeps itself and the directories above it: a sealed file,
+    /// a device, and anything under a read-only filesystem ([`Self::is_read_only`]) stay, and
+    /// so does every directory still holding one of them — so this never reports a removal it
+    /// did not make. The ROOT is the tree itself rather than an entry of it, and is never
+    /// removed.
+    pub fn remove_tree(&mut self, path: &str) -> bool {
+        let Some(resolved) = self.resolve(path) else {
+            return false;
+        };
+        if self.is_read_only(&resolved) {
+            return false;
+        }
+        if let Some(removed) = self.in_mount_mut(&resolved, |files, inside| {
+            files.remove_tree(inside)
+        }) {
+            return removed;
+        }
+        if resolved == ROOT {
+            return false;
+        }
+        let under = format!("{resolved}/");
+        let held: Vec<String> = self
+            .files
+            .keys()
+            .filter(|path| path.as_str() == resolved || path.starts_with(under.as_str()))
+            .cloned()
+            .collect();
+        let mut removed = false;
+        for file in held {
+            removed |= self.remove_file(&file);
+        }
+        // DEEPEST first, so a directory is weighed only once the ones under it have gone.
+        let directories: Vec<String> = self
+            .directories
+            .iter()
+            .filter(|path| path.as_str() == resolved || path.starts_with(under.as_str()))
+            .cloned()
+            .rev()
+            .collect();
+        for directory in directories {
+            if self.holds_anything_under(&directory) {
+                continue;
+            }
+            self.directories.remove(&directory);
+            self.modified.remove(&directory);
+            removed = true;
+        }
+        self.record_parent_written(&resolved);
+        removed
+    }
+
+    /// Whether anything of this tree lies under the directory `resolved`, which is what keeps
+    /// that directory from going away with the subtree around it.
+    fn holds_anything_under(&self, resolved: &str) -> bool {
+        let under = format!("{resolved}/");
+        let holds = |path: &String| path.starts_with(under.as_str());
+        self.files.keys().any(holds)
+            || self.devices.keys().any(holds)
+            || self.directories.iter().any(holds)
+    }
+
     /// What the tree holds at `path`, as a long listing of it reports that entry — and
     /// `None` for a path the tree holds nothing at.
     ///
@@ -951,7 +1018,7 @@ impl ShellVolume {
 
 #[cfg(test)]
 mod tests {
-    use super::{EntryKind, ShellVolume, VolumeLimits};
+    use super::{EntryKind, ShellVolume, VolumeLimits, ROOT};
 
     /// RULE: a path is resolved the way a machine resolves one — absolute, with empty, `.`
     /// and `..` segments resolved and `..` above the root staying at the root — and a
@@ -1180,6 +1247,74 @@ mod tests {
         assert!(
             of_a_file.is_empty(),
             "a path that is not a directory names no entries, got {of_a_file:?}"
+        );
+    }
+
+    /// RULE: a recursive removal takes the whole subtree away — the files and the directories
+    /// under it, and the directory it named — while what a program may not remove keeps itself
+    /// and every directory above it, so the answer is never a removal that did not happen.
+    ///
+    /// The rows span the shapes of a subtree: one holding only files, a nested one, one holding
+    /// a sealed file the program may not take away, the file case, the root itself and a path
+    /// the tree holds nothing at.
+    #[test]
+    fn a_recursive_removal_takes_the_subtree_away() {
+        let mut volume = ShellVolume::default();
+        volume.make_directories("/flat");
+        volume.write("/flat/one", "1", false);
+        volume.write("/flat/two", "2", false);
+        volume.make_directories("/deep/under/here");
+        volume.write("/deep/under/here/one", "1", false);
+        volume.write("/deep/one", "1", false);
+        volume.make_directories("/kept/under");
+        volume.seal_file("/kept/under/published", "by the machine");
+        volume.write("/alone", "1", false);
+
+        // (case, the path removed, whether anything was removed, what the tree must still hold)
+        let rows: [(&str, &str, bool, &[&str]); 6] = [
+            ("a directory of files", "/flat", true, &[]),
+            ("a nested directory", "/deep", true, &[]),
+            (
+                "a directory holding a file the program may not remove",
+                "/kept",
+                false,
+                &["/kept", "/kept/under", "/kept/under/published"],
+            ),
+            ("one file", "/alone", true, &[]),
+            ("the root of the tree", "/", false, &["/"]),
+            ("a path the tree holds nothing at", "/absent", false, &[]),
+        ];
+        for (case, path, expected, still_held) in rows {
+            let removed = volume.remove_tree(path);
+            assert_eq!(
+                removed, expected,
+                "case {case:?}: expected the removal to answer {expected}, got {removed}"
+            );
+            for held in still_held {
+                assert!(
+                    volume.exists(held),
+                    "case {case:?}: expected the tree to still hold {held}"
+                );
+            }
+        }
+        for gone in [
+            "/flat",
+            "/flat/one",
+            "/deep",
+            "/deep/one",
+            "/deep/under",
+            "/deep/under/here",
+            "/deep/under/here/one",
+            "/alone",
+        ] {
+            assert!(
+                !volume.exists(gone),
+                "expected {gone} to be gone with the subtree it was in"
+            );
+        }
+        assert!(
+            volume.exists(ROOT),
+            "the root is the tree itself and is never removed"
         );
     }
 }

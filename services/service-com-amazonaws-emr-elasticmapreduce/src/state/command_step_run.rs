@@ -25,6 +25,8 @@
 //! ([`super::step_command_transfers::TRANSFER_BUDGET`]), and the wait for the thread is that
 //! budget plus the grace that module gives one.
 
+use ::service_common::posix_shell_session::EnvironmentPrograms;
+
 use super::*;
 
 /// How many commands ONE call answers for, leaving the rest to the next call that reports the
@@ -183,6 +185,23 @@ pub async fn resolve_due_step_commands<Eng: Send + Sync + 'static>(
         // runs read the relations' data through that same program, so one command's reads and
         // writes share its budget and its credential.
         let sql = step_sql_cli(engine, metastore_is_the_catalog, cli.clone());
+        // The NODE the command line runs on: its local disk, which the session starts with and
+        // is left holding what the command wrote, and the programs the cluster's applications
+        // installed on it. Read under the guard, because both are the cluster's own state; the
+        // command itself is performed with the guard released.
+        let node = {
+            let store = state.lock();
+            let Some(cluster) = store.clusters.get(cluster_id) else {
+                return;
+            };
+            let key = cluster.primary_node_key(region);
+            StepNode {
+                disk: cluster.node_disk(&key),
+                key,
+                programs: cluster_hadoop_cli(cluster, cli.clone())
+                    .map(|hadoop| Box::new(hadoop) as Box<dyn EnvironmentPrograms>),
+            }
+        };
         // One command is performed at a time, so a command another call is still performing —
         // including one that call has already given up waiting for — is not performed a second
         // time: its transfers are real effects on the object store, and a `mv` or an `rm`
@@ -190,23 +209,27 @@ pub async fn resolve_due_step_commands<Eng: Send + Sync + 'static>(
         let Some(claim) = claimed(cluster_id, &plan.step_id) else {
             continue;
         };
-        let Some(outcome) = performed_command(&plan, cli, sql, claim).await else {
+        // What the node is called, kept here because the node itself is moved into the thread
+        // the command is performed on.
+        let node_key = node.key.clone();
+        let Some(outcome) = performed_command(&plan, cli, sql, node, claim).await else {
             // Nothing answered: the step stays owed an answer, so a later call performs the
             // command rather than this one reporting an outcome nothing produced.
             continue;
         };
         let mut store = state.lock();
-        if let Some(step) = store
-            .clusters
-            .get_mut(cluster_id)
-            .and_then(|cluster| cluster.step_mut(&plan.step_id))
-        {
-            // Only a step that STILL awaits an answer takes this one: in the window the guard
-            // was released another call may have answered the same command, or the caller may
-            // have cancelled the step or its cluster, and neither is overwritten by an answer
-            // computed before that happened.
-            if step.awaits_command() {
-                step.outcome = Some(outcome);
+        if let Some(cluster) = store.clusters.get_mut(cluster_id) {
+            // What the command left on the node's local disk is the node's from now on: the
+            // command really wrote it, whoever reports the step next.
+            cluster.keep_node_disk(&node_key, outcome.disk);
+            if let Some(step) = cluster.step_mut(&plan.step_id) {
+                // Only a step that STILL awaits an answer takes this one: in the window the
+                // guard was released another call may have answered the same command, or the
+                // caller may have cancelled the step or its cluster, and neither is overwritten
+                // by an answer computed before that happened.
+                if step.awaits_command() {
+                    step.outcome = Some(outcome.outcome);
+                }
             }
         }
         // The steps can now reach the state their commands answered, if their spans have
@@ -232,14 +255,20 @@ async fn performed_command(
     plan: &StepCommandPlan,
     cli: Option<StepObjectCli>,
     sql: StepSqlCli,
+    node: StepNode,
     claim: InFlight,
-) -> Option<StepOutcome> {
+) -> Option<CommandAnswer> {
     let command = plan.command.clone();
     performed_on_its_own_thread(COMMAND_THREAD_NAME, TRANSFER_BUDGET, claim, move || {
         // A command the session answered for nothing of ends the step the way every
         // unaccounted-for submission of this service ends it: in the modelled failure
-        // state saying its work was not run, never a status nothing produced.
-        command_outcome(&command, cli, Some(sql)).unwrap_or_else(not_executed)
+        // state saying its work was not run, never a status nothing produced — and leaves
+        // the node's disk as it found it, because nothing ran to change it.
+        let disk = node.disk.clone();
+        command_outcome(&command, cli, Some(sql), node).unwrap_or_else(|| CommandAnswer {
+            outcome: not_executed(),
+            disk,
+        })
     })
     .await
 }
