@@ -220,10 +220,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // it otherwise — a restore that created nothing is not partly
                     // done.
                     percent_done: Some(job.percent_done().to_string()),
-                    // The restore moved no bytes, because the backup it reads
-                    // copied none: the member reports 0 rather than a size no
-                    // restore produced.
-                    backup_size_in_bytes: Some(0),
+                    // What the restore moves is the backup it reads, whose size
+                    // the recovery point it resolved reported.
+                    backup_size_in_bytes: Some(job.backup_size_in_bytes),
                     iam_role_arn: job.iam_role_arn.clone(),
                     resource_type: job.resource_type.clone(),
                     recovery_point_creation_date: Some(crate::state::modelled_timestamp(

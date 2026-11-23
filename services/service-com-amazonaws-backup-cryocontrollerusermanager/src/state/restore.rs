@@ -135,6 +135,11 @@ pub struct RestoreJobRecord {
     pub created_resource_arn: Option<String>,
     /// `CopySourceTagsToRestoredResource`, as the request asked for it.
     pub copy_source_tags_to_restored_resource: bool,
+    /// How many bytes the backup this restore reads holds, read off the recovery
+    /// point it resolved ([`super::RecoveryPoint::backup_size_in_bytes`]): the
+    /// restore writes the contents that point captured into the resource it
+    /// creates, so what it moves is the size of that backup.
+    pub backup_size_in_bytes: i64,
     /// The `IdempotencyToken` the start carried, if any: "retrying a successful
     /// request with the same idempotency token results in a success message
     /// with no action taken" (model doc for the member), so a repeat answers
@@ -181,8 +186,9 @@ impl RestoreJobRecord {
             status: Some(self.status.clone()),
             status_message: self.status_message.clone(),
             percent_done: Some(self.percent_done().to_string()),
-            // The restore moved no bytes, because the backup it reads copied none.
-            backup_size_in_bytes: Some(0),
+            // What the restore moves is the backup it reads, whose size the point it
+            // resolved reported.
+            backup_size_in_bytes: Some(self.backup_size_in_bytes),
             iam_role_arn: self.iam_role_arn.clone(),
             created_resource_arn: self.created_resource_arn.clone(),
             resource_type: self.resource_type.clone(),

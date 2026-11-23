@@ -286,6 +286,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 source_resource_arn,
                 metadata,
                 source_tags,
+                contents,
             } => {
                 // THE RESTORE ITSELF: the resource is created in the service that
                 // owns it, over the emulator's own in-process transport, with no
@@ -310,6 +311,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     metadata,
                     source_tags,
                     copy_source_tags: input.copy_source_tags_to_restored_resource,
+                    contents,
                 };
                 match ::tokio::runtime::Handle::try_current() {
                     Ok(runtime) => {
@@ -342,6 +344,7 @@ enum Started {
         source_resource_arn: String,
         metadata: ::std::collections::BTreeMap<String, String>,
         source_tags: ::std::collections::BTreeMap<String, String>,
+        contents: crate::state::CapturedContents,
     },
 }
 
@@ -374,6 +377,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartRestoreJob<E
         // The tags "included in the backup", which the restore copies to
         // the resource it creates when the request asks it to.
         let source_tags = point.tags.clone();
+        // And the DATA the backup captured, which the restore writes into the
+        // resource it creates: a restore puts the contents of the protected
+        // resource back (`crate::state::captured_contents`).
+        let contents = point.captured_contents.clone();
+        // What that backup holds, which is what this restore moves.
+        let point_backup_size_in_bytes = point.backup_size_in_bytes;
         // "Starts a job to restore a recovery point for one of the
         // following resources" — the request may name the type, and when it
         // does not the type of the resource the point was taken of is what
@@ -442,6 +451,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartRestoreJob<E
             validation_status_message: None,
             created_resource_arn: None,
             copy_source_tags_to_restored_resource: input.copy_source_tags_to_restored_resource,
+            // The size of the backup this restore reads, as the point it resolved
+            // reports it: what the restore writes back is the contents that point
+            // captured.
+            backup_size_in_bytes: point_backup_size_in_bytes,
             idempotency_token: input.idempotency_token.clone(),
         };
         let metadata = record.metadata.clone();
@@ -459,6 +472,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartRestoreJob<E
             source_resource_arn,
             metadata,
             source_tags,
+            contents,
         })
     }
 }
@@ -475,6 +489,9 @@ struct Restoring {
     metadata: ::std::collections::BTreeMap<String, String>,
     source_tags: ::std::collections::BTreeMap<String, String>,
     copy_source_tags: bool,
+    /// The contents the recovery point captured, which the restore writes into the
+    /// resource it creates (`crate::state::captured_contents`).
+    contents: crate::state::CapturedContents,
 }
 
 impl Restoring {
@@ -485,20 +502,25 @@ impl Restoring {
     /// the modelled failure status with the reason, which is terminal, so the
     /// clock never reports it `COMPLETED` afterwards.
     ///
-    /// BOUNDED by construction: it makes at most the two in-process calls the
-    /// restore of one resource needs ([`crate::state::perform_restore`]), with
-    /// retries and timeouts disabled, and then returns — there is no loop, no
-    /// wait and no work sized by the request, and one task is started per
-    /// stored restore job, which [`crate::state::MAX_RESTORE_JOBS`] caps.
+    /// BOUNDED by construction: it makes the in-process calls the restore of one
+    /// resource needs ([`crate::state::perform_restore`]) — the two the resource
+    /// itself takes, plus one per run of captured items written back, which the
+    /// capture's own budget caps ([`crate::state::MAX_CAPTURED_CONTENT_BYTES`]) —
+    /// with retries and timeouts disabled, and then returns: there is no wait and
+    /// no work sized by the REQUEST, and one task is started per stored restore
+    /// job, which [`crate::state::MAX_RESTORE_JOBS`] caps.
     async fn perform(self) {
         let outcome = crate::state::perform_restore(
             &self.callback,
-            &self.region,
-            self.resource_type.as_deref(),
-            &self.source_resource_arn,
-            &self.metadata,
-            &self.source_tags,
-            self.copy_source_tags,
+            crate::state::RestoreRequest {
+                region: &self.region,
+                resource_type: self.resource_type.as_deref(),
+                source_resource_arn: &self.source_resource_arn,
+                metadata: &self.metadata,
+                source_tags: &self.source_tags,
+                copy_source_tags: self.copy_source_tags,
+                contents: &self.contents,
+            },
         )
         .await;
         let now = ::std::time::SystemTime::now();

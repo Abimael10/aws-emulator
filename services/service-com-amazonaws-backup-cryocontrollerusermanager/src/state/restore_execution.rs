@@ -16,12 +16,20 @@
 //!
 //! One arm per resource type whose restore this emulator can perform; the first
 //! is Amazon DynamoDB, which the restore of a table recovery point creates
-//! through `CreateTable`. The restored table's key schema is the SOURCE table's,
-//! read back from DynamoDB itself, so the table a restore creates has the shape
-//! the protected resource has. The ITEMS it held are not restored: a backup in
-//! this emulator copies no bytes ([`super::RecoveryPoint::backup_size_in_bytes`]
-//! stays 0), so there is nothing captured to put back, and capturing a protected
-//! resource's contents is the subject of the backup side's own issue.
+//! through `CreateTable`. The restored table's SHAPE is the source table's, read
+//! back from DynamoDB itself: its key schema, the attributes that schema and its
+//! indexes are declared over, its billing mode and capacity, and its secondary
+//! indexes, global and local alike — every structural member of the source's
+//! description that `CreateTable` takes, so the table a restore creates offers
+//! the query paths the protected resource offered. (A table setting AWS
+//! documents a DynamoDB restore as NOT reproducing — its stream, its
+//! time-to-live, its auto scaling and its point-in-time recovery — is left to
+//! the restored table's own defaults.)
+//!
+//! Its CONTENTS are the source's too: the items the recovery point captured when
+//! the backup was taken ([`super::CapturedContents`]) are written into the
+//! created table through the owning service's own API, so a restore puts the
+//! data back and the restored table answers reads for what was backed up.
 //!
 //! A type with no arm here, and a call the owning service refuses, both end the
 //! restore in the modelled failure status carrying the reason
@@ -54,6 +62,14 @@ const BILLING_MODE_PAY_PER_REQUEST: &str = "PAY_PER_REQUEST";
 /// a positive value for each, and this is the smallest pair that satisfies it.
 const DEFAULT_PROVISIONED_CAPACITY: i64 = 1;
 
+/// How many item writes one `BatchWriteItem` carries at most.
+///
+/// SOURCE: "A single call to BatchWriteItem can transmit up to 16MB of data over the
+/// network, consisting of up to 25 item put or delete operations" (the model's doc for
+/// `BatchWriteItem`). The write-back below sends the captured items in runs of this
+/// size, so it makes one call per 25 items rather than one per item.
+const MAX_ITEMS_PER_BATCH_WRITE: usize = 25;
+
 /// What performing a restore came to.
 #[derive(Debug, Clone)]
 pub enum RestoreOutcome {
@@ -66,32 +82,41 @@ pub enum RestoreOutcome {
     Failed(String),
 }
 
-/// Re-create the protected resource `source_resource_arn` names, as the restore
-/// metadata asks for, and answer what that came to.
+/// What performing ONE restore needs, as the stored restore job and the recovery
+/// point it reads carry it: grouped so the arms below take the restore rather
+/// than a list of its parts.
+#[derive(Debug, Clone, Copy)]
+pub struct RestoreRequest<'r> {
+    /// The Region the restore runs in, which the resource it creates is created in.
+    pub region: &'r str,
+    /// The Backup resource type being restored ([`super::resource_type_of`]), which
+    /// selects the arm that performs it.
+    pub resource_type: Option<&'r str>,
+    /// The protected resource the recovery point was taken of.
+    pub source_resource_arn: &'r str,
+    /// The restore metadata the start was given, which names what to create.
+    pub metadata: &'r BTreeMap<String, String>,
+    /// The tags the recovery point carries, copied onto the created resource when
+    /// `copy_source_tags` asks for it.
+    pub source_tags: &'r BTreeMap<String, String>,
+    pub copy_source_tags: bool,
+    /// The contents the backup captured, which the restore writes back
+    /// ([`super::CapturedContents`]).
+    pub contents: &'r super::CapturedContents,
+}
+
+/// Re-create the protected resource `restore` names, as its restore metadata asks
+/// for, holding the contents the recovery point captured, and answer what that
+/// came to.
 ///
-/// Called with NO state lock held: the hop below is an await, and this
+/// Called with NO state lock held: the hops below are awaits, and this
 /// service's store is not held across one.
 pub async fn perform_restore(
     callback: &EmbeddedEmulator,
-    region: &str,
-    resource_type: Option<&str>,
-    source_resource_arn: &str,
-    metadata: &BTreeMap<String, String>,
-    source_tags: &BTreeMap<String, String>,
-    copy_source_tags: bool,
+    restore: RestoreRequest<'_>,
 ) -> RestoreOutcome {
-    match resource_type {
-        Some(RESOURCE_TYPE_DYNAMODB) => {
-            restore_dynamodb_table(
-                callback,
-                region,
-                source_resource_arn,
-                metadata,
-                source_tags,
-                copy_source_tags,
-            )
-            .await
-        }
+    match restore.resource_type {
+        Some(RESOURCE_TYPE_DYNAMODB) => restore_dynamodb_table(callback, &restore).await,
         // A type this emulator cannot re-create has no restore to perform, so
         // the job says so rather than reporting a resource nothing created.
         Some(other) => RestoreOutcome::Failed(format!(
@@ -105,16 +130,13 @@ pub async fn perform_restore(
 }
 
 /// The DynamoDB arm: create the table the metadata names, shaped like the table
-/// the recovery point was taken of.
+/// the recovery point was taken of, and holding the items that point captured.
 async fn restore_dynamodb_table(
     callback: &EmbeddedEmulator,
-    region: &str,
-    source_resource_arn: &str,
-    metadata: &BTreeMap<String, String>,
-    source_tags: &BTreeMap<String, String>,
-    copy_source_tags: bool,
+    restore: &RestoreRequest<'_>,
 ) -> RestoreOutcome {
-    let Some(target_table_name) = metadata_value(metadata, METADATA_TARGET_TABLE_NAME) else {
+    let Some(target_table_name) = metadata_value(restore.metadata, METADATA_TARGET_TABLE_NAME)
+    else {
         // A start whose metadata names no target table is refused when it is made
         // ([`super::rejected_restore_metadata`]), so no stored job reaches here
         // without one; a restore that has no target still creates nothing rather
@@ -124,7 +146,7 @@ async fn restore_dynamodb_table(
              create"
         ));
     };
-    let Some(source_table_name) = table_name_of(source_resource_arn) else {
+    let Some(source_table_name) = table_name_of(restore.source_resource_arn) else {
         return RestoreOutcome::Failed(
             "the recovery point's resource is not a DynamoDB table, so there is no table to \
              create"
@@ -132,7 +154,7 @@ async fn restore_dynamodb_table(
         );
     };
 
-    let client = dynamodb_client(callback, region);
+    let client = dynamodb_client(callback, restore.region);
     // The shape of the table to create is the SOURCE table's, read back from
     // the service that holds it rather than guessed here.
     let source = match client
@@ -194,8 +216,8 @@ async fn restore_dynamodb_table(
     // restored resource" (model doc for
     // `StartRestoreJob$CopySourceTagsToRestoredResource`) — the tags included in
     // the backup are the ones the recovery point carries.
-    if copy_source_tags {
-        for (key, value) in source_tags {
+    if restore.copy_source_tags {
+        for (key, value) in restore.source_tags {
             create = create.tags(
                 ::aws_sdk_dynamodb::types::Tag::builder()
                     .key(key)
@@ -205,25 +227,246 @@ async fn restore_dynamodb_table(
             );
         }
     }
+    // The SECONDARY INDEXES the source table carries, global and local alike. They
+    // are part of the shape the recovery point was taken of, so the restored table
+    // has them: the index names, their own key schemas and their projections are
+    // the source's, and a global index of a provisioned table is given capacity of
+    // its own the way the table is. They are also what makes the forwarded
+    // `AttributeDefinitions` whole — DynamoDB admits a definition only when some
+    // key schema uses it, and an index-only attribute is used by no other.
+    match declared_indexes(&source, pay_per_request) {
+        Ok(declared) => {
+            let global = (!declared.global.is_empty()).then_some(declared.global);
+            let local = (!declared.local.is_empty()).then_some(declared.local);
+            create = create
+                .set_global_secondary_indexes(global)
+                .set_local_secondary_indexes(local);
+        }
+        Err(index_name) => {
+            return RestoreOutcome::Failed(format!(
+                "the table the recovery point was taken of reports no complete description of \
+                 its index {index_name}, so the table it was backed up as cannot be re-created"
+            ))
+        }
+    }
 
-    match create.send().await {
+    let created = match create.send().await {
         // The ARN reported is the one DynamoDB answered with, so the resource
         // this restore reports created is one that service holds.
-        Ok(created) => match created
-            .table_description
-            .and_then(|description| description.table_arn)
+        Ok(created) => created,
+        Err(error) => {
+            return RestoreOutcome::Failed(format!(
+                "the restored table could not be created: {}",
+                ::aws_smithy_types::error::display::DisplayErrorContext(&error)
+            ))
+        }
+    };
+    let Some(table_arn) = created
+        .table_description
+        .and_then(|description| description.table_arn)
+    else {
+        return RestoreOutcome::Failed(
+            "the restored table was created but its own service reported no ARN for it"
+                .to_string(),
+        );
+    };
+    // THE DATA: the items the recovery point captured, written into the table this
+    // restore just created, through the owning service's own API. A restore puts the
+    // protected resource's contents back, so a restore that created the table but
+    // could not write them reports the failure rather than a table that is missing
+    // them. A table created an instant ago does not serve item writes yet, so the
+    // write waits for the one it was created with to become usable.
+    if !restore.contents.is_empty() {
+        if let Err(reason) = wait_until_serving(&client, target_table_name).await {
+            return RestoreOutcome::Failed(reason);
+        }
+        if let Err(reason) =
+            write_captured_items(&client, target_table_name, restore.contents).await
         {
-            Some(table_arn) => RestoreOutcome::Created(table_arn),
-            None => RestoreOutcome::Failed(
-                "the restored table was created but its own service reported no ARN for it"
-                    .to_string(),
-            ),
-        },
-        Err(error) => RestoreOutcome::Failed(format!(
-            "the restored table could not be created: {}",
-            ::aws_smithy_types::error::display::DisplayErrorContext(&error)
-        )),
+            return RestoreOutcome::Failed(reason);
+        }
     }
+    RestoreOutcome::Created(table_arn)
+}
+
+/// Wait until the table `table_name` names SERVES item writes, so the captured
+/// contents can be written into it.
+///
+/// "You can perform read and write operations only on an ACTIVE table" (the model's
+/// doc for `CreateTable`), and a table is created in a transient status for a span:
+/// the restore of a table that holds data therefore takes at least as long as that
+/// table takes to become usable, which is why the restore job reports the
+/// non-terminal status until the data is in.
+///
+/// The wait is the owning service's OWN read: `DescribeTable` answers a poll once the
+/// creation it still owes has fallen due, so the status it reports is the one in force
+/// when it answers and nothing is waited for longer than that service takes. BOUNDED:
+/// at most [`TABLE_READY_POLLS`] reads, each one in-process call, so a table that
+/// never becomes usable ends the restore with a reason instead of waiting forever.
+async fn wait_until_serving(
+    client: &::aws_sdk_dynamodb::Client,
+    table_name: &str,
+) -> Result<(), String> {
+    for _ in 0..TABLE_READY_POLLS {
+        let described = client
+            .describe_table()
+            .table_name(table_name)
+            .send()
+            .await
+            .map_err(|error| {
+                format!(
+                    "the restored table could not be read back: {}",
+                    ::aws_smithy_types::error::display::DisplayErrorContext(&error)
+                )
+            })?;
+        let serving = described
+            .table
+            .as_ref()
+            .and_then(|table| table.table_status.as_ref())
+            .is_some_and(|status| status == &::aws_sdk_dynamodb::types::TableStatus::Active);
+        if serving {
+            return Ok(());
+        }
+        ::tokio::time::sleep(TABLE_READY_POLL_WAIT).await;
+    }
+    Err(format!(
+        "the restored table {table_name} did not become usable, so the items the recovery \
+         point captured could not be written into it"
+    ))
+}
+
+/// How many times the wait above looks, and how long it waits between looks: the read
+/// it makes already waits out the span the owning service's clock owes a new table, so
+/// these bound only a table that never becomes usable at all.
+const TABLE_READY_POLLS: usize = 20;
+const TABLE_READY_POLL_WAIT: ::std::time::Duration = ::std::time::Duration::from_millis(100);
+
+/// The secondary indexes a restored table is created with, read off the source
+/// table's description: [`DeclaredIndexes`], or the name of an index the source
+/// describes too partially to re-create.
+///
+/// `pay_per_request` is the billing mode the restored table is created in, which
+/// decides whether a global index may carry capacity at all: "Neither
+/// ReadCapacityUnits nor WriteCapacityUnits can be specified when BillingMode is
+/// PAY_PER_REQUEST" (DynamoDB's refusal for an index of such a table), while a
+/// provisioned one requires both. A local index has no capacity of its own: it
+/// shares the table's.
+fn declared_indexes(
+    source: &::aws_sdk_dynamodb::types::TableDescription,
+    pay_per_request: bool,
+) -> Result<DeclaredIndexes, String> {
+    let mut declared = DeclaredIndexes::default();
+    for index in source.global_secondary_indexes.iter().flatten() {
+        let name = index.index_name.clone().unwrap_or_default();
+        let mut builder = ::aws_sdk_dynamodb::types::GlobalSecondaryIndex::builder()
+            .set_index_name(index.index_name.clone())
+            .set_key_schema(index.key_schema.clone())
+            .set_projection(index.projection.clone());
+        if !pay_per_request {
+            builder = builder.provisioned_throughput(index_throughput(
+                index.provisioned_throughput.as_ref(),
+            ));
+        }
+        let built = builder.build().map_err(|_| name)?;
+        declared.global.push(built);
+    }
+    for index in source.local_secondary_indexes.iter().flatten() {
+        let name = index.index_name.clone().unwrap_or_default();
+        let built = ::aws_sdk_dynamodb::types::LocalSecondaryIndex::builder()
+            .set_index_name(index.index_name.clone())
+            .set_key_schema(index.key_schema.clone())
+            .set_projection(index.projection.clone())
+            .build()
+            .map_err(|_| name)?;
+        declared.local.push(built);
+    }
+    Ok(declared)
+}
+
+/// The two index lists a `CreateTable` takes, as the source table's description
+/// gave them.
+#[derive(Debug, Default)]
+struct DeclaredIndexes {
+    global: Vec<::aws_sdk_dynamodb::types::GlobalSecondaryIndex>,
+    local: Vec<::aws_sdk_dynamodb::types::LocalSecondaryIndex>,
+}
+
+/// The capacity one global secondary index of a provisioned restored table is
+/// created with: the source index's own, and the smallest DynamoDB admits for an
+/// index the source reports no positive capacity for — the same reading the
+/// table's own capacity is carried over by.
+fn index_throughput(
+    described: Option<&::aws_sdk_dynamodb::types::ProvisionedThroughputDescription>,
+) -> ::aws_sdk_dynamodb::types::ProvisionedThroughput {
+    let units = |units: Option<i64>| {
+        units
+            .filter(|units| *units > 0)
+            .unwrap_or(DEFAULT_PROVISIONED_CAPACITY)
+    };
+    ::aws_sdk_dynamodb::types::ProvisionedThroughput::builder()
+        .read_capacity_units(units(described.and_then(|described| described.read_capacity_units)))
+        .write_capacity_units(units(
+            described.and_then(|described| described.write_capacity_units),
+        ))
+        .build()
+        .expect("a provisioned throughput with both capacities set")
+}
+
+/// Write the items the recovery point captured into the table `table_name` names,
+/// or answer why they could not all be written.
+///
+/// BOUNDED by what the recovery point holds, which the capture itself bounds
+/// ([`super::MAX_CAPTURED_CONTENT_BYTES`]): the items are sent in runs of
+/// [`MAX_ITEMS_PER_BATCH_WRITE`], so the number of calls is a fixed fraction of the
+/// number of items captured and there is no retry loop. An item the owning service
+/// did not process is reported rather than dropped: a restore that reports the data
+/// put back must have put all of it back.
+async fn write_captured_items(
+    client: &::aws_sdk_dynamodb::Client,
+    table_name: &str,
+    contents: &super::CapturedContents,
+) -> Result<(), String> {
+    for batch in contents.dynamodb_items.chunks(MAX_ITEMS_PER_BATCH_WRITE) {
+        let mut writes = Vec::with_capacity(batch.len());
+        for item in batch {
+            let put = ::aws_sdk_dynamodb::types::PutRequest::builder()
+                .set_item(Some(item.clone().into_iter().collect()))
+                .build()
+                .map_err(|error| {
+                    format!("a captured item could not be written back: {error}")
+                })?;
+            writes.push(
+                ::aws_sdk_dynamodb::types::WriteRequest::builder()
+                    .put_request(put)
+                    .build(),
+            );
+        }
+        let answer = client
+            .batch_write_item()
+            .request_items(table_name.to_string(), writes)
+            .send()
+            .await
+            .map_err(|error| {
+                format!(
+                    "the items the recovery point captured could not be written into the \
+                     restored table: {}",
+                    ::aws_smithy_types::error::display::DisplayErrorContext(&error)
+                )
+            })?;
+        let unprocessed: usize = answer
+            .unprocessed_items
+            .iter()
+            .flat_map(|items| items.values())
+            .map(|writes| writes.len())
+            .sum();
+        if unprocessed > 0 {
+            return Err(format!(
+                "{unprocessed} of the items the recovery point captured were not written into \
+                 the restored table"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The value the restore metadata carries under `name`, matched

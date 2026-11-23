@@ -405,6 +405,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartCopyJob<Eng>
             )
             .into());
         }
+        // The copy duplicates the source point's CONTENTS into this store, so it is
+        // measured against the same budget every capture is
+        // (`crate::state::captured_contents`): a copy that does not fit is refused
+        // rather than stored holding part of the backup it copies.
+        if store
+            .captured_content_bytes()
+            .saturating_add(source_point.captured_contents.size_in_bytes)
+            > crate::state::MAX_CAPTURED_CONTENT_BYTES
+        {
+            return Err(StartCopyJobErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "this emulator captures at most {} bytes of resource data into its \
+                         recovery points",
+                        crate::state::MAX_CAPTURED_CONTENT_BYTES
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
 
         let copy_job_id = store.next_id(now);
         let point_id = store.next_id(now);
@@ -456,6 +477,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartCopyJob<Eng>
             // carries the configuration the source point captured rather than
             // describing nothing.
             captured_restore_metadata: source_point.captured_restore_metadata.clone(),
+            // And it holds the same DATA: a restore of the copy puts back what a
+            // restore of the source point would (`crate::state::captured_contents`).
+            captured_contents: source_point.captured_contents.clone(),
         };
         let job = crate::state::CopyJobRecord {
             copy_job_id: copy_job_id.clone(),

@@ -122,6 +122,12 @@ pub use restore::*;
 mod restore_execution;
 pub use restore_execution::*;
 
+/// The CONTENTS of the protected resource a backup captures into the recovery point it
+/// writes, which a restore of that point puts back. Re-exported for the reason given on
+/// `events`.
+mod captured_contents;
+pub use captured_contents::*;
+
 /// What a restore's `Metadata` has to carry for the type of resource it restores, which a
 /// start that carries less is refused for, and the pairs a stored recovery point reports as
 /// its own. Re-exported for the reason given on `events`.
@@ -3068,6 +3074,13 @@ pub struct RecoveryPoint {
     /// onto a COPY of this point: a copy of a backup describes the same original
     /// resource.
     pub captured_restore_metadata: BTreeMap<String, String>,
+    /// The CONTENTS of the protected resource, as the service that owns it answered
+    /// them WHEN THE BACKUP WAS TAKEN ([`captured_contents`]): the data a restore of
+    /// this point writes into the resource it creates ([`perform_restore`]), so a
+    /// restored resource answers reads for what was backed up. Empty for a point
+    /// whose resource no arm of that capture reads, and copied as it stands onto a
+    /// COPY of this point: a copy of a backup holds the same data.
+    pub captured_contents: CapturedContents,
 }
 
 impl RecoveryPoint {

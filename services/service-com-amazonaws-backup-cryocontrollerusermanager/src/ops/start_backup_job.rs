@@ -259,9 +259,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         } else {
             ::std::collections::BTreeMap::new()
         };
+        // WHAT THE BACKUP CAPTURES: the resource's own CONTENTS, read from the service
+        // that owns them at the same instant and for the same reason — a backup is a
+        // copy of the DATA, so the recovery point carries it and a restore of that point
+        // puts it back (`crate::state::captured_contents`). Asked only for a backup that
+        // will write a point at all, and with no store guard held. The ceiling the
+        // capture may allocate inside is read from the store FIRST and handed to it, so
+        // the bound precedes the allocation; the admission is decided again below, under
+        // the lock, against what the store holds by then.
+        let captured_contents = if withheld.is_none() {
+            let budget = crate::state::service_state(&*self.engine)
+                .map_or(0, |state| state.lock().captured_content_budget());
+            crate::state::captured_contents(ctx.callback(), &region, &input.resource_arn, budget)
+                .await
+        } else {
+            crate::state::CapturedContents::default()
+        };
         // Starting the job holds this store's lock; neither the questions above nor
         // the publication below does, so no lock is held across an await.
-        let output = self.started_job(input, &region, withheld, captured_restore_metadata)?;
+        let output = self.started_job(
+            input,
+            &region,
+            withheld,
+            captured_restore_metadata,
+            captured_contents,
+        )?;
         crate::state::publish_job_state_changes(ctx, &*self.engine).await;
         // The transition this job is owed falls due on the clock, not on the next
         // call: the pump publishes it when it does, so a client watching the bus
@@ -285,6 +307,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartBackupJob<En
     /// stored ON the recovery point, which is what the restore-metadata read of that
     /// point reports.
     ///
+    /// `captured_contents` is the resource's own data, as that service answered it to
+    /// the same capture; it too is stored on the recovery point, and is what a restore
+    /// of that point writes back (`crate::state::captured_contents`).
+    ///
     /// Separate from `handle` so this store's lock lives for exactly this call: the
     /// publication `handle` makes afterwards awaits, and a guard must not be held
     /// across an await. `region` is the Region of the call, which every ARN this
@@ -295,6 +321,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartBackupJob<En
         region: &str,
         withheld: Option<crate::state::BackupFailure>,
         captured_restore_metadata: ::std::collections::BTreeMap<String, String>,
+        captured_contents: crate::state::CapturedContents,
     ) -> Result<StartBackupJobOutput, StartBackupJobError> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             StartBackupJobErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
@@ -446,6 +473,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartBackupJob<En
             )
             .into());
         }
+        // The CONTENTS a recovery point holds are the other growth site of this store,
+        // and the one sized by the protected resource rather than by the request: a
+        // backup whose capture does not fit the budget left is refused with the same
+        // modelled class, so no point is ever stored holding PART of a resource while
+        // reporting a backup of all of it (`crate::state::captured_contents`).
+        if captured_contents.over_budget
+            || store
+                .captured_content_bytes()
+                .saturating_add(captured_contents.size_in_bytes)
+                > crate::state::MAX_CAPTURED_CONTENT_BYTES
+        {
+            return Err(StartBackupJobErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "this emulator captures at most {} bytes of resource data into its \
+                         recovery points, and at most {} items into one of them",
+                        crate::state::MAX_CAPTURED_CONTENT_BYTES,
+                        crate::state::MAX_CAPTURED_ITEMS
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
 
         let job_id = store.next_id(now);
         let point_id = store.next_id(now);
@@ -503,7 +554,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartBackupJob<En
             creation_date: now,
             settles_at,
             completion_date: None,
-            backup_size_in_bytes: 0,
+            // The size of a backup is the size of what it CAPTURED, so it is the
+            // figure the capture measured rather than a value chosen here; a backup
+            // of a resource whose contents no arm of the capture reads holds nothing
+            // and so is of no size.
+            backup_size_in_bytes: captured_contents.size_in_bytes,
             lifecycle: input.lifecycle.clone(),
             encryption_key_arn: point_encryption_key_arn,
             is_encrypted: true,
@@ -517,6 +572,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartBackupJob<En
             },
             created_by_job_id: job_id.clone(),
             captured_restore_metadata,
+            captured_contents,
         };
         let job = crate::state::BackupJob {
             job_id: job_id.clone(),
@@ -536,7 +592,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartBackupJob<En
             // the clock owes this job follows it (`crate::state::job_outcome`).
             failure: withheld,
             percent_done: crate::state::PERCENT_DONE_NONE.to_string(),
-            backup_size_in_bytes: 0,
+            // The job reports the size of the backup it took, which is the size of
+            // the point it wrote; the bytes it has TRANSFERRED are recorded when it
+            // settles, since a job still running has moved nothing yet.
+            backup_size_in_bytes: point.backup_size_in_bytes,
             bytes_transferred: 0,
             creation_date: now,
             settles_at,
