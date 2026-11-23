@@ -1523,22 +1523,19 @@ async fn a_configuration_change_settles_from_processing_to_active_on_the_clock()
     create_baseline(&emulator, name).await;
 
     // Straight after the create the domain is still provisioning, and so is every
-    // option the create set a setting in force for. The log-publishing configuration
-    // the baseline sends names a log type with publishing switched OFF, which is nothing
-    // for the service to apply to a cluster, so that option is `Active` from the start —
-    // the state of an option that is not being changed.
+    // option the create gave it a value for: each is a property the change in flight is
+    // applying, which is what `Processing` — "the requested change is still in progress"
+    // — says. The log-publishing configuration the baseline sends holds a log type, so it
+    // is applied with the rest; a domain that publishes nothing has no such configuration
+    // to apply and reports `Active` from the start
+    // ([`super::domain_configuration_rules`]).
     let before = emulator.describe_config(name).await;
     let before = &before.body["DomainConfig"];
     for (option, _) in baseline_options() {
-        let expected = if option == "LogPublishingOptions" {
-            "Active"
-        } else {
-            "Processing"
-        };
         assert_eq!(
             option_state(before, option, "before settling"),
-            expected,
-            "case before settling({option}): expected {expected}, got {:?}",
+            "Processing",
+            "case before settling({option}): expected Processing, got {:?}",
             before[option]["Status"]
         );
     }

@@ -152,16 +152,24 @@ pub(crate) const LEAF_PROPERTY_BLOCKS: [(&str, &[&str]); 3] = [
     ),
 ];
 
-/// The properties EVERY domain's configuration is made of, whatever the create named:
-/// the service provisions a domain with a whole configuration, filling in the blocks the
-/// request left out, so the change a create starts applies all of them — the blocks of
-/// [`LEAF_PROPERTY_BLOCKS`] property by property, every other option whole, and the tag
-/// set the create carried.
-const PROVISIONED_PROPERTIES: [&str; 40] = [
+/// The properties EVERY domain's configuration is reported as made of, whatever the
+/// create named: the service provisions a domain with a whole configuration, filling in
+/// the blocks the request left out, so the change a create starts applies all of them —
+/// the blocks of [`LEAF_PROPERTY_BLOCKS`] property by property, every other enumerated
+/// option whole, and the tag set the create carried.
+///
+/// Only the properties the service ENUMERATES: a part of the configuration it does not
+/// report as a modifiable property (the Auto-Tune settings, the Cognito authentication of
+/// the dashboards, the engine mode and the use case) is applied without a property being
+/// reported for it, and so is a part the domain holds NOTHING in (the Identity Center
+/// integration of a domain that names no instance, the access policy of a domain created
+/// without one, the log publishing of a domain that publishes no log type, the placement
+/// of a domain reached on a public endpoint) — the conditional ones are added by
+/// [`provisioned_properties`].
+const PROVISIONED_PROPERTIES: [&str; 34] = [
     "AIMLOptions.NaturalLanguageQueryGenerationOptions",
     "AIMLOptions.S3VectorsEngine",
     "AIMLOptions.ServerlessVectorAcceleration",
-    "AccessPolicies",
     "AdvancedOptions",
     "AdvancedSecurityOptions.AnonymousAuthDisableDate",
     "AdvancedSecurityOptions.AnonymousAuthEnabled",
@@ -170,7 +178,6 @@ const PROVISIONED_PROPERTIES: [&str; 40] = [
     "AdvancedSecurityOptions.JWTOptions",
     "AdvancedSecurityOptions.MasterUserOptions",
     "AdvancedSecurityOptions.SAMLOptions",
-    "AutoTuneOptions",
     "AutomatedSnapshotPauseOptions",
     "ClusterConfig.ColdStorageOptions",
     "ClusterConfig.DedicatedMasterCount",
@@ -184,20 +191,16 @@ const PROVISIONED_PROPERTIES: [&str; 40] = [
     "ClusterConfig.WarmStorage",
     "ClusterConfig.WarmType",
     "ClusterConfig.ZoneAwarenessEnabled",
-    "CognitoOptions",
-    "DeploymentStrategyOptions",
     "DomainEndpointOptions",
+    "DeploymentStrategyOptions",
     "EncryptionAtRestOptions",
-    "EngineMode",
     "EngineVersion",
     "IPAddressType",
-    "IdentityCenterOptions",
     "NodeToNodeEncryptionOptions",
     "OffPeakWindowOptions",
     "SnapshotOptions",
     "SoftwareUpdateOptions",
     "TAGS",
-    "UseCase",
 ];
 
 /// The property names setting `option` amounts to: a block the service applies property
@@ -235,9 +238,10 @@ fn property_names(properties: &[String]) -> Vec<String> {
     names
 }
 
-/// Every property the configuration a `CreateDomain` body provisions is made of: the
-/// blocks the service fills in for every domain, the log-publishing configuration every
-/// domain has, and the EBS volume, which a domain created without one does not have.
+/// Every property the configuration a `CreateDomain` body provisions is reported as made
+/// of: the blocks the service fills in for every domain, plus the three a domain only has
+/// when the create gave it one — the EBS volume, the access policy and the log types it
+/// publishes. A part of the configuration the domain holds nothing in is no property.
 fn provisioned_properties(body: &Value) -> Vec<String> {
     let mut names: Vec<String> = PROVISIONED_PROPERTIES
         .iter()
@@ -246,7 +250,15 @@ fn provisioned_properties(body: &Value) -> Vec<String> {
     if body.get("EBSOptions").is_some() {
         names.push("EBSOptions".to_string());
     }
-    names.push("LogPublishingOptions".to_string());
+    if body["AccessPolicies"].as_str().is_some_and(|policy| !policy.is_empty()) {
+        names.push("AccessPolicies".to_string());
+    }
+    if body["LogPublishingOptions"]
+        .as_object()
+        .is_some_and(|types| !types.is_empty())
+    {
+        names.push("LogPublishingOptions".to_string());
+    }
     names.sort();
     names
 }

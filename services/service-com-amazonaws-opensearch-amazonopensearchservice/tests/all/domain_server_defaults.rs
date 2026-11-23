@@ -32,7 +32,8 @@
 use serde_json::{json, Value};
 
 use super::domain_lifecycle::{
-    create_baseline, error_code, Emulator, PREFIX, RECORDED_NOT_FOUND_STATUS, SETTLE_WAIT,
+    create_baseline, error_code, settled_domain, Emulator, PREFIX, RECORDED_NOT_FOUND_STATUS,
+    SETTLE_WAIT,
 };
 
 /// The option blocks and members the service fills in for a domain created without
@@ -551,7 +552,7 @@ async fn a_change_waits_while_the_cluster_is_provisioned_and_then_applies() {
         .collect();
     for expected in [
         "AIMLOptions.S3VectorsEngine : {\"Enabled\":false}",
-        "CognitoOptions : {\"Enabled\":false}",
+        "AdvancedSecurityOptions.SAMLOptions : false",
         "IPAddressType : ipv4",
         "SnapshotOptions : {\"AutomatedSnapshotStartHour\":0}",
     ] {
@@ -595,9 +596,10 @@ async fn a_change_waits_while_the_cluster_is_provisioned_and_then_applies() {
     }
 
     // Once the cluster is up, nothing is being modified any more and a FURTHER change
-    // is applied to a running cluster rather than waiting for one.
-    tokio::time::sleep(SETTLE_WAIT).await;
-    let settled = emulator.describe(name).await.body["DomainStatus"].clone();
+    // is applied to a running cluster rather than waiting for one. Polled for — the
+    // condition a client waits on — rather than waited out, so the case does not depend on
+    // how fast the host runs.
+    let settled = settled_domain(&emulator, name).await;
     assert_eq!(
         settled["ModifyingProperties"].as_array().map(Vec::len),
         Some(0),

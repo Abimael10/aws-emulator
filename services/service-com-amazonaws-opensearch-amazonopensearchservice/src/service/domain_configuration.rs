@@ -510,20 +510,25 @@ pub fn reported_config(domain: &Domain) -> DomainConfig {
     config
 }
 
-/// Whether `domain` holds a SETTING IN FORCE for the option `option` names: a value
-/// saying something is configured, rather than an option block that is empty or one
-/// whose every setting is switched off.
+/// Whether the change in flight on `domain` is APPLYING the option `option` names, which
+/// is what decides the state that option's status reports.
 ///
-/// What an option holds decides whether a change in flight is applying anything TO it
-/// (`Domain::option_state`): a feature that is off, and a container the domain holds
-/// nothing in, has nothing for the service to apply to a cluster, so such an option is
-/// not reported as being modified — the log-publishing configuration of a domain that
-/// publishes no log type and the VPC configuration of a domain reached on a public
-/// endpoint are two of them. Read from the SAME projection of the stored record a
-/// change reports its properties from ([`option_value`]), so the two cannot disagree
-/// about what an option holds.
-pub fn option_setting_in_force(domain: &Domain, option: &str) -> bool {
-    option_value(domain, option).is_some_and(|value| setting_in_force(&value))
+/// An option is being applied when the domain holds something for the service to put on
+/// the cluster: a value for one of the properties the service reports a change by
+/// ([`ENUMERATED_PROPERTIES`]) — a feature switched OFF is still a configuration the
+/// service applies — or, for a part of the configuration it reports no property for, a
+/// setting IN FORCE. An option neither of those holds of has nothing to apply: a feature
+/// nobody configured and the service reports no property for, a container the domain holds
+/// nothing in, and the VPC configuration of a domain reached on a public endpoint are each
+/// `Active` from the moment the domain is created.
+pub fn option_being_applied(domain: &Domain, option: &str) -> bool {
+    let Some(value) = option_value(domain, option) else {
+        return false;
+    };
+    if setting_in_force(&value) {
+        return true;
+    }
+    ENUMERATED_PROPERTIES.contains(&option) && holds_a_value(&value)
 }
 
 /// Whether `value` states a setting that is in force: a number, a non-empty text or a
@@ -537,6 +542,39 @@ fn setting_in_force(value: &Value) -> bool {
         Value::Number(_) => true,
         Value::Array(elements) => elements.iter().any(setting_in_force),
         Value::Object(members) => members.values().any(setting_in_force),
+    }
+}
+
+/// The value `domain` holds for `option` as a change REPORTS it, or `None` when the
+/// change reports no property for it: an option the domain holds no value for at all,
+/// and one it holds NOTHING in — an empty document, an empty map and a blank text each
+/// say that part of the configuration is not set, so there is nothing for the service to
+/// apply to a cluster and no property to report (the log-publishing configuration of a
+/// domain that publishes no log type, the access policy of a domain created without one,
+/// and the VPC configuration of a domain reached on a public endpoint are three of
+/// them).
+///
+/// The tag set is the exception: it is the tags the request carried rather than an
+/// option container the service fills in, so it is reported whether or not the domain
+/// carries a tag.
+fn reported_option_value(domain: &Domain, option: &str) -> Option<Value> {
+    let value = option_value(domain, option)?;
+    if option == OPT_TAGS || holds_a_value(&value) {
+        return Some(value);
+    }
+    None
+}
+
+/// Whether `value` says anything at all is configured: a number, a toggle either way and
+/// a non-empty text do, while an empty text, an empty document and an empty list say that
+/// nothing is.
+fn holds_a_value(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(_) | Value::Number(_) => true,
+        Value::String(text) => !text.is_empty(),
+        Value::Array(elements) => !elements.is_empty(),
+        Value::Object(members) => !members.is_empty(),
     }
 }
 
@@ -605,7 +643,7 @@ fn reported_modifying_properties(domain: &Domain) -> Vec<ModifyingProperties> {
     let Some(change) = domain.latest_change().filter(|change| change.in_progress()) else {
         return Vec::new();
     };
-    let mut modifying: Vec<ModifyingProperties> = change_leaf_values(domain, &change.properties)
+    change_leaf_values(domain, &change.properties)
         .into_iter()
         .map(|(name, value)| {
             let pending = property_text(&value);
@@ -616,9 +654,7 @@ fn reported_modifying_properties(domain: &Domain) -> Vec<ModifyingProperties> {
                 pending_value: Some(pending),
             }
         })
-        .collect();
-    modifying.sort_by(|left, right| left.name.cmp(&right.name));
-    modifying
+        .collect()
 }
 
 /// The service software a descriptor of `domain` reports — and what
@@ -673,25 +709,71 @@ const PROPERTY_VALUE_TYPE_PLAIN_TEXT: &str = "PLAIN_TEXT";
 /// one entry per LEAF option container, naming it and the value the domain holds for
 /// it.
 ///
-/// Ordered by name, so two reads of one change report its properties in the same
-/// order.
+/// In the order the service enumerates its domain properties ([`ENUMERATED_PROPERTIES`]),
+/// so two reads of one change report its properties in the same order and a caller that
+/// indexes the list reads the same property each time.
 fn reported_properties(domain: &Domain, options: &[String]) -> Vec<String> {
-    let mut properties: Vec<String> = change_leaf_values(domain, options)
+    change_leaf_values(domain, options)
         .into_iter()
         .map(|(name, value)| format!("{name}{PROPERTY_SEPARATOR}{}", property_text(&value)))
-        .collect();
-    properties.sort();
-    properties
+        .collect()
 }
+
+/// The domain properties the service ENUMERATES when it reports a configuration change,
+/// in the order it enumerates them.
+///
+/// `DomainStatus$ModifyingProperties` is "information about the domain properties that
+/// are currently being modified", and WHICH properties a service can report as modified
+/// is the service's own enumeration rather than the shape of this emulator's record: the
+/// list is positionally stable, carries one entry per enumerated property the change in
+/// flight is applying, and carries none for a part of the configuration the service does
+/// not enumerate as a modifiable property — the Auto-Tune settings, the Cognito
+/// authentication of the dashboards, the engine mode and the use case, which the service
+/// applies without reporting a property for (recorded behaviour).
+///
+/// The names are a domain configuration's own modelled members
+/// (`smithy_query(query="shape",shape="com.amazonaws.opensearch#DomainConfig")`) plus the
+/// tag set the create carried; a member the service applies property by property stands
+/// here for its own properties ([`LEAF_PROPERTY_BLOCKS`]), which is why the blocks are
+/// named once each.
+const ENUMERATED_PROPERTIES: [&str; 20] = [
+    OPT_AIML_OPTIONS,
+    OPT_ACCESS_POLICIES,
+    OPT_ADVANCED_OPTIONS,
+    OPT_ADVANCED_SECURITY_OPTIONS,
+    OPT_CLUSTER_CONFIG,
+    OPT_DOMAIN_ENDPOINT_OPTIONS,
+    OPT_EBS_OPTIONS,
+    OPT_TAGS,
+    OPT_AUTOMATED_SNAPSHOT_PAUSE_OPTIONS,
+    OPT_DEPLOYMENT_STRATEGY_OPTIONS,
+    OPT_ENCRYPTION_AT_REST_OPTIONS,
+    OPT_ENGINE_VERSION,
+    OPT_IP_ADDRESS_TYPE,
+    OPT_IDENTITY_CENTER_OPTIONS,
+    OPT_LOG_PUBLISHING_OPTIONS,
+    OPT_NODE_TO_NODE_ENCRYPTION_OPTIONS,
+    OPT_OFF_PEAK_WINDOW_OPTIONS,
+    OPT_SNAPSHOT_OPTIONS,
+    OPT_SOFTWARE_UPDATE_OPTIONS,
+    OPT_VPC_OPTIONS,
+];
 
 /// The leaf properties the `options` of a change amount to, each with the value the
 /// domain holds for it: the ONE reading of a change's properties, so the list it
 /// reports as pending and the properties it reports as modifying cannot name different
 /// things.
+///
+/// Walked in the service's enumeration order rather than in the order the change
+/// recorded its options, and holding only the properties that enumeration names, so what
+/// a caller finds at one index is the same property on every read of every domain.
 fn change_leaf_values(domain: &Domain, options: &[String]) -> Vec<(String, Value)> {
-    options
+    ENUMERATED_PROPERTIES
         .iter()
-        .filter_map(|option| option_value(domain, option).map(|value| leaf_values(option, &value)))
+        .filter(|property| options.iter().any(|applied| applied == *property))
+        .filter_map(|property| {
+            reported_option_value(domain, property).map(|value| leaf_values(property, &value))
+        })
         .flatten()
         .collect()
 }
@@ -700,10 +782,17 @@ fn change_leaf_values(domain: &Domain, options: &[String]) -> Vec<(String, Value
 /// JSON document it is, a direct value as itself, and a property the domain holds no
 /// value for as the empty text — the same way `ActiveValue` reports a property that had
 /// no value before the change.
+///
+/// A document and a list with nothing in them hold no value either, and are reported as
+/// that same empty text rather than as the empty braces they render to: the tag set of a
+/// domain created with no tag is reported empty, not as an empty map a caller would have
+/// to parse to find nothing in.
 fn property_text(value: &Value) -> String {
     match value {
         Value::Null => String::new(),
         Value::String(text) => text.clone(),
+        Value::Array(elements) if elements.is_empty() => String::new(),
+        Value::Object(members) if members.is_empty() => String::new(),
         other => other.to_string(),
     }
 }
@@ -800,15 +889,36 @@ fn leaf_values(option: &str, value: &Value) -> Vec<(String, Value)> {
     else {
         return vec![(option.to_string(), value.clone())];
     };
+    let absent = absent_property_value(option);
     properties
         .iter()
         .map(|property| {
             (
                 format!("{option}{PROPERTY_PATH_SEPARATOR}{property}"),
-                value.get(property).cloned().unwrap_or(Value::Null),
+                value
+                    .get(property)
+                    .cloned()
+                    .unwrap_or_else(|| absent.clone()),
             )
         })
         .collect()
+}
+
+/// What a property of a block the domain holds NO value for is reported as.
+///
+/// The security block states, property by property, which of the domain's security
+/// features are configured: a feature it holds no settings for is not configured, which
+/// the block reports as the toggle being OFF rather than as an absent value — so a caller
+/// reading one of those properties to decide whether a security feature is in flight
+/// reads a concrete answer. Every other block reports a property it holds nothing for as
+/// the empty value, carried here as JSON null and reported as the empty text by
+/// [`property_text`].
+fn absent_property_value(option: &str) -> Value {
+    if option == OPT_ADVANCED_SECURITY_OPTIONS {
+        Value::Bool(false)
+    } else {
+        Value::Null
+    }
 }
 
 /// A JSON object of the members a container holds, leaving out every member it holds
@@ -968,6 +1078,11 @@ fn option_value(domain: &Domain, option: &str) -> Option<Value> {
         }
         OPT_AUTOMATED_SNAPSHOT_PAUSE_OPTIONS => {
             let options = domain.automated_snapshot_pause_options.as_ref()?;
+            // The pause CONFIGURATION — whether automated snapshots are paused and over
+            // which window — and not `State`, "the current state of the automated snapshot
+            // pause", which says where a pause has got to rather than what is being
+            // applied: a change applies a configuration, so a derived state is no part of
+            // the value a property is moving to.
             object(vec![
                 ("Enabled", Some(Value::from(options.enabled))),
                 (
@@ -978,7 +1093,6 @@ fn option_value(domain: &Domain, option: &str) -> Option<Value> {
                     "StartTime",
                     options.start_time.map(|at| Value::from(at.secs())),
                 ),
-                ("State", options.state.clone().map(Value::from)),
             ])
         }
         OPT_AUTO_TUNE_OPTIONS => {
@@ -1249,19 +1363,16 @@ fn option_value(domain: &Domain, option: &str) -> Option<Value> {
             ])
         }
         OPT_USE_CASE => Value::from(domain.use_case.clone()),
-        // The tag set is not an option container: the service applies it as the list of
-        // `Tag` the create carried, which is the document a caller reads back, so it is
-        // reported as that list — empty for a domain created with no tag.
-        OPT_TAGS => Value::Array(
+        // The tag set is not an option container: the service applies it as the tags the
+        // create carried, reported as the MAP those tags are — one member per tag, its key
+        // naming it and its value the tag's value — so a caller confirming the tags a
+        // create was given reads them by key. A domain created with no tag holds an empty
+        // map, which is the empty value [`property_text`] reports as such.
+        OPT_TAGS => Value::Object(
             domain
                 .tags
                 .iter()
-                .map(|(key, value)| {
-                    object(vec![
-                        ("Key", Some(Value::from(key.clone()))),
-                        ("Value", Some(Value::from(value.clone()))),
-                    ])
-                })
+                .map(|(key, value)| (key.clone(), Value::from(value.clone())))
                 .collect(),
         ),
         OPT_VPC_OPTIONS => {

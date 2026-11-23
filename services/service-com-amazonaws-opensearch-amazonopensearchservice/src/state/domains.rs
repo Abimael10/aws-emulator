@@ -952,18 +952,18 @@ impl Domain {
     /// The `OptionState` of one option: `Processing` while the domain is applying a
     /// change to THIS option, `Active` otherwise.
     ///
-    /// "Active" is the state of an option that is not being changed, so an option a
-    /// change in flight is not applying anything to is `Active` while the rest of the
-    /// configuration settles — which is what a caller polling every option's state
-    /// before it continues waits for. An option the domain holds no SETTING IN FORCE for
-    /// is one of those: there is nothing to apply to a cluster in a feature that is off
-    /// (its container is empty, or every setting in it is switched off), so such an
-    /// option is `Active` from the moment the domain is created
-    /// ([`crate::service::domain_configuration::option_setting_in_force`]).
+    /// `Processing` is "the requested change is still in progress" and `Active` "the
+    /// requested change is processed and deployed", so an option the change in flight is
+    /// applying nothing to is `Active` while the rest of the configuration settles —
+    /// which is what a caller polling every option's state before it continues waits
+    /// for. Which options a change is applying is stated once
+    /// ([`crate::service::domain_configuration::option_being_applied`]): the ones the
+    /// domain holds a setting in force for, and the ones the request that started the
+    /// change named.
     pub(super) fn option_state(&self, option: &str, revision: &OptionRevision) -> &'static str {
         let applying = self.processing
             && revision.updated_at == self.updated_at
-            && crate::service::domain_configuration::option_setting_in_force(self, option);
+            && crate::service::domain_configuration::option_being_applied(self, option);
         if applying {
             OPTION_STATE_PROCESSING
         } else {

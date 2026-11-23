@@ -153,13 +153,20 @@ impl ConfigChange {
             status: Some(self.status().to_string()),
             pending_properties: Some(pending),
             completed_properties: Some(completed),
-            // "The total number of stages required for the configuration change" is
-            // the number of stages the change reports, so the denominator a caller
-            // renders progress against is the list beside it — a change that deploys
-            // nothing reports no stage and the total stays at the member's own
-            // modelled default. The container is reported either way, empty rather
-            // than absent, so a caller walking the stages has a list to walk.
-            total_number_of_stages: i32::try_from(self.stages.len()).unwrap_or(i32::MAX),
+            // "The total number of stages required for the configuration change" is the
+            // number of stages the deployment applying it goes through
+            // ([`CHANGE_STAGES`]) — what it REQUIRES, not how many of them it has
+            // published yet: a change that is waiting for the cluster it will be applied
+            // to publishes no stage and still reports the count a caller renders progress
+            // against. A change that applies no configuration at all — the one a delete
+            // records — requires no stage, and the member stays at its own modelled
+            // default. The container is reported either way, empty rather than absent, so
+            // a caller walking the stages has a list to walk.
+            total_number_of_stages: if self.properties.is_empty() {
+                0
+            } else {
+                i32::try_from(STAGE_COUNT).unwrap_or(i32::MAX)
+            },
             change_progress_stages: Some(
                 self.stages.iter().map(ChangeStage::to_stage).collect(),
             ),

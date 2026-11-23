@@ -77,18 +77,30 @@ struct Stage {
 }
 
 /// The stages a `ChangeProgressStatusDetails` reports, each checked against the members
-/// the model declares for it, with `TotalNumberOfStages` checked against their count.
+/// the model declares for it, with `TotalNumberOfStages` checked against them: it is the
+/// number of stages the deployment REQUIRES, so it can never be fewer than the stages
+/// reported, and it is exactly that many once the change has published them.
 fn reported_stages(status: &Value, case: &str) -> Vec<Stage> {
     let listed = status["ChangeProgressStages"]
         .as_array()
         .unwrap_or_else(|| panic!("case {case}: expected a ChangeProgressStages list, got {status:?}"))
         .clone();
-    assert_eq!(
-        status["TotalNumberOfStages"].as_i64(),
-        Some(i64::try_from(listed.len()).unwrap_or(i64::MAX)),
-        "case {case}: the total number of stages is the number of stages reported, got \
-         {status:?}"
+    let total = status["TotalNumberOfStages"].as_i64().unwrap_or_else(|| {
+        panic!("case {case}: expected a TotalNumberOfStages count, got {status:?}")
+    });
+    let reported = i64::try_from(listed.len()).unwrap_or(i64::MAX);
+    assert!(
+        total >= reported,
+        "case {case}: the stages required cannot be fewer than the {reported} reported, got \
+         {total} in {status:?}"
     );
+    if !listed.is_empty() {
+        assert_eq!(
+            total, reported,
+            "case {case}: a change that has published its stages reports them all, got {total} \
+             against {reported} in {status:?}"
+        );
+    }
     listed
         .iter()
         .map(|entry| {

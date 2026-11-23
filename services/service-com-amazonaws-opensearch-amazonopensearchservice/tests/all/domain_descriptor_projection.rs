@@ -28,7 +28,8 @@
 //!    the domain runs.
 //! 5. `DescribeDomainConfig` reports `Active` for an option a change in flight is
 //!    applying nothing to, and the Auto-Tune settings the service fills in.
-//! 6. `ChangeProgressStatus$TotalNumberOfStages` counts the stages that change reports.
+//! 6. `ChangeProgressStatus$TotalNumberOfStages` counts the stages that change's
+//!    deployment requires, which is there before the first stage is published.
 
 /// What every descriptor of a domain reports for the options of its ENDPOINT: not which
 /// address it publishes, but the container the service provisions the domain's endpoint
@@ -306,7 +307,7 @@ async fn a_change_names_the_leaf_properties_it_applies_and_the_kind_of_each_valu
         ),
         (
             "TAGS",
-            "[{\"Key\":\"team\",\"Value\":\"search\"}]",
+            "{\"team\":\"search\"}",
             STRINGIFIED_JSON,
         ),
     ];
@@ -458,15 +459,17 @@ async fn a_domain_publishes_its_endpoint_host_and_the_software_its_engine_runs()
     }
 }
 
-/// RULE: `DescribeDomainConfig` reports every option's `OptionStatus`, `Processing` only
-/// for an option the change in flight is applying something TO and `Active` for one it is
-/// not — an option whose container is empty or whose every setting is switched off has
-/// nothing to apply — and it carries the Auto-Tune settings the service fills in.
+/// RULE: `DescribeDomainConfig` reports every option's `OptionStatus`, `Processing` for
+/// an option the change in flight reports a property for and `Active` for one it does not
+/// — a part of the configuration the service does not enumerate as a modifiable property,
+/// and one the domain holds nothing in, are both `Active` — and it carries the Auto-Tune
+/// settings the service fills in.
 ///
-/// The rows differ along what the option holds: a feature the create configured, a
-/// feature it switched off, a container it left empty, and the configuration of a domain
-/// reached on a public endpoint, which has no VPC placement at all. The stage count is
-/// asserted beside them, since it counts the stages the SAME change reports.
+/// The rows differ along what the option holds and whether the service enumerates it: a
+/// feature the create configured, a feature it switched off, a part of the configuration
+/// the service reports no property for, a container it left empty, and the configuration
+/// of a domain reached on a public endpoint, which has no VPC placement at all. The stage
+/// count is asserted beside them, since it counts the stages the SAME change reports.
 #[tokio::test]
 async fn an_option_with_nothing_to_apply_is_active_while_the_rest_of_the_change_is_applied() {
     let emulator = Emulator::new();
@@ -502,12 +505,12 @@ async fn an_option_with_nothing_to_apply_is_active_while_the_rest_of_the_change_
             "Processing",
         ),
         (
-            "a feature the create switched OFF",
+            "a feature the create switched OFF, which the change still applies",
             "EncryptionAtRestOptions",
-            "Active",
+            "Processing",
         ),
         (
-            "a feature the create said nothing about",
+            "a part of the configuration the service reports no property for",
             "CognitoOptions",
             "Active",
         ),
@@ -559,17 +562,23 @@ async fn an_option_with_nothing_to_apply_is_active_while_the_rest_of_the_change_
         config["AutoTuneOptions"]
     );
 
-    // The stage count is the number of stages the change reports: a change that publishes
-    // no stage reports none to count.
+    // A change that is still waiting for the cluster it will be applied to has published
+    // no stage, and the total beside it is the number of stages that deployment REQUIRES
+    // — the denominator a caller renders progress against, which is there before the
+    // first stage is.
     let in_flight = progress(&emulator, name).await;
     assert_eq!(
-        (
-            in_flight["ChangeProgressStages"].as_array().map(Vec::len),
-            in_flight["TotalNumberOfStages"].as_i64(),
-        ),
-        (Some(0), Some(0)),
-        "case DescribeDomainChangeProgress({name:?}): expected the stage count to be the \
-         number of stages reported, got {in_flight:?}"
+        in_flight["ChangeProgressStages"].as_array().map(Vec::len),
+        Some(0),
+        "case DescribeDomainChangeProgress({name:?}): a change waiting for its cluster has \
+         published no stage, got {in_flight:?}"
+    );
+    assert!(
+        in_flight["TotalNumberOfStages"]
+            .as_i64()
+            .is_some_and(|total| total > 0),
+        "case DescribeDomainChangeProgress({name:?}): expected the stages the deployment \
+         requires, got {in_flight:?}"
     );
 
     // Once the change has been applied every option is Active, whatever it holds.
