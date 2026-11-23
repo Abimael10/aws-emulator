@@ -282,10 +282,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(HeadBucketOutput {
             bucket_region: Some(bucket.region.clone()),
-            // The request named a bucket, not an access point alias, which is what this
-            // member reports (`AccessPointAlias`: "Indicates whether the bucket name used
-            // in the request is an access point alias").
-            access_point_alias: Some(false),
+            // Whether the name the request used was an ACCESS POINT's rather than this
+            // bucket's own, which is what this member reports (`AccessPointAlias`:
+            // "Indicates whether the bucket name used in the request is an access point
+            // alias").
+            //
+            // Read off the address the request RESOLVED — the access point it was served
+            // through, recorded where that address is resolved
+            // ([`crate::state::access_points`]) — rather than stated as a constant: an
+            // access point is "attached to [a bucket] that you can use to perform S3 object
+            // operations" (Amazon S3 User Guide, *Managing data access with Amazon S3 access
+            // points*), so a HEAD addressed by its alias, by its ARN or at its own endpoint
+            // host reaches this bucket through it, and this member is how a client learns
+            // that the name it used named the access point and not the bucket.
+            access_point_alias: Some(crate::state::access_points::addressed().is_some()),
             // "The Amazon Resource Name (ARN) of the S3 bucket" (`BucketArn`), the ARN of
             // the bucket this read looked up — built from the bucket's own recorded kind
             // and Region ([`crate::state::Bucket::arn`]), so it is the one string every

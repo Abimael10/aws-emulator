@@ -371,6 +371,37 @@ fn denial_message(principal: &str, action: &str, resource: &str, reason: &str) -
     )
 }
 
+/// The ENDPOINT AUTHORITIES a client of this emulator is configured with and dials — the
+/// loopback interface its listeners are bound on, in the spellings an endpoint URL carries it
+/// in: the address with the port it is served on, the address alone, a name under the loopback
+/// zone RFC 6761 reserves for that interface, and the IPv6 literal.
+///
+/// They matter to THIS rule because an AWS SDK handed an access point ARN in the `Bucket`
+/// field rewrites it into `<access-point-name>-<account-id>.<the endpoint authority it was
+/// configured with>` before it sends the request — so against this emulator these, and not a
+/// published AWS hostname, are the hosts an access-point-addressed call arrives on. Which
+/// address and which port is a per-run value and no part of the rule; what the rows pin is
+/// that the access point resolves, and its network origin decides the request, on every one of
+/// them.
+const ANNOUNCED_AUTHORITIES: [(&str, &str); 4] = [
+    (
+        "its own endpoint host over the announced loopback endpoint",
+        "127.0.0.1:9297",
+    ),
+    (
+        "its own endpoint host over the loopback address alone",
+        "127.0.0.1",
+    ),
+    (
+        "its own endpoint host over a name in the loopback zone",
+        "emulator.localhost:9297",
+    ),
+    (
+        "its own endpoint host over the IPv6 loopback literal",
+        "[::1]:9297",
+    ),
+];
+
 /// One ADDRESS an access point is reached by: the case, the host the request is sent to, the
 /// path of a request about one key, and the path of a listing of the access point itself.
 struct Address {
@@ -387,7 +418,7 @@ fn addresses(access_point: &AccessPoint) -> Vec<Address> {
     let encoded_arn = form_encode(&access_point.arn);
     let alias = access_point.alias.clone();
     let label = access_point.endpoint_label();
-    vec![
+    let mut rows = vec![
         Address {
             case: "the access point ARN as the path's bucket label",
             host: path_style_host(),
@@ -418,7 +449,27 @@ fn addresses(access_point: &AccessPoint) -> Vec<Address> {
             path: Box::new(|key| format!("/{key}")),
             listing: "/?list-type=2".to_string(),
         },
-    ]
+    ];
+    // And the same first label in front of each authority a client of THIS emulator is given
+    // ([`ANNOUNCED_AUTHORITIES`]), which is what an SDK sends an access point ARN to here.
+    for (case, authority) in ANNOUNCED_AUTHORITIES {
+        rows.push(Address {
+            case,
+            host: format!("{label}.{authority}"),
+            path: Box::new(|key| format!("/{key}")),
+            listing: "/?list-type=2".to_string(),
+        });
+    }
+    // The ALIAS is bucket-shaped and addresses the access point "for any access point data
+    // plane operation", so a client that was handed it and addresses buckets in the host
+    // reaches the access point there too.
+    rows.push(Address {
+        case: "its alias as the host label of the announced endpoint",
+        host: format!("{alias}.{}", ANNOUNCED_AUTHORITIES[0].1),
+        path: Box::new(|key| format!("/{key}")),
+        listing: "/?list-type=2".to_string(),
+    });
+    rows
 }
 
 /// Rule, first half: a VPC-confined access point refuses the internet-borne request through

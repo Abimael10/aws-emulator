@@ -933,3 +933,106 @@ async fn a_grant_for_the_access_point_path_does_not_grant_the_bucket_path() {
         );
     }
 }
+
+/// The authorities a client of THIS emulator is configured with and dials: the loopback
+/// interface its listeners are bound on, with and without the port it is served on. An AWS SDK
+/// handed an access point ARN rewrites it into `<name>-<account-id>.<the authority it was
+/// configured with>`, so these — and not a published AWS hostname — are the hosts an
+/// access-point-addressed call arrives on here. Which address and which port is a per-run
+/// value and no part of the rule.
+const ANNOUNCED_AUTHORITIES: [&str; 2] = ["127.0.0.1:9297", "127.0.0.1"];
+
+/// Rule, applied to what a read REPORTS about the address it resolved: a HEAD of the bucket
+/// reports whether the name the request used was an access point's
+/// (`HeadBucketOutput$AccessPointAlias`: "Indicates whether the bucket name used in the
+/// request is an access point alias"), so every address that reaches the bucket THROUGH the
+/// access point reports that it was, and the bucket's own name reports that it was not.
+///
+/// The rows differ along the address form — the ARN, the alias and the endpoint host label as
+/// the path's bucket label, the access point's own endpoint host as a published AWS hostname,
+/// and that same host label in front of each authority this emulator is reached at
+/// ([`ANNOUNCED_AUTHORITIES`]) — plus the bucket's own name in the path and in the host, which
+/// is the negative control.
+#[tokio::test]
+async fn a_head_reports_whether_the_name_the_request_used_was_an_access_points() {
+    let emulator = Emulator::new();
+    let bucket = "access-point-reported-address-bucket";
+    emulator.create_bucket(bucket).await;
+    let route = emulator.create_access_point("reporting-ap", bucket);
+    let path_style_host = format!("s3.{REGION}.amazonaws.com");
+    let label = route.endpoint_label();
+
+    // (case, the host the HEAD is addressed to, its path, whether the name it used was the
+    // access point's)
+    let mut rows: Vec<(String, String, String, bool)> = vec![
+        (
+            "the access point ARN as the path's bucket label".to_string(),
+            path_style_host.clone(),
+            format!("/{}", form_encode(&route.arn)),
+            true,
+        ),
+        (
+            "the access point alias as the path's bucket label".to_string(),
+            path_style_host.clone(),
+            format!("/{}", route.alias),
+            true,
+        ),
+        (
+            "the endpoint host label as the path's bucket label".to_string(),
+            path_style_host.clone(),
+            format!("/{label}"),
+            true,
+        ),
+        (
+            "the access point's own endpoint host".to_string(),
+            format!("{label}.s3.{REGION}.amazonaws.com"),
+            "/".to_string(),
+            true,
+        ),
+        (
+            "the bucket's own name in the path".to_string(),
+            path_style_host.clone(),
+            format!("/{bucket}"),
+            false,
+        ),
+        (
+            "the bucket's own name as the host label".to_string(),
+            format!("{bucket}.s3.{REGION}.amazonaws.com"),
+            "/".to_string(),
+            false,
+        ),
+    ];
+    for authority in ANNOUNCED_AUTHORITIES {
+        rows.push((
+            format!("the access point's own endpoint host at {authority}"),
+            format!("{label}.{authority}"),
+            "/".to_string(),
+            true,
+        ));
+        rows.push((
+            format!("the bucket's own name as the host label at {authority}"),
+            format!("{bucket}.{authority}"),
+            "/".to_string(),
+            false,
+        ));
+    }
+
+    for (case, host, path, through_access_point) in rows {
+        let head = emulator.s3_at(ACCOUNT_KEY, &host, "HEAD", &path, b"").await;
+        assert_eq!(
+            head.status,
+            200,
+            "case {case:?}: the HEAD must be answered about the bucket, got {} with {}",
+            head.status,
+            body_text(&head)
+        );
+        let expected = through_access_point.to_string();
+        let reported = head.header("x-amz-access-point-alias");
+        assert_eq!(
+            reported.as_deref(),
+            Some(expected.as_str()),
+            "case {case:?}: expected the HEAD to report an access point alias of \
+             {expected:?}, got {reported:?}"
+        );
+    }
+}

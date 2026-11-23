@@ -59,3 +59,34 @@ Replay the behavioral suite against the emulator and re-run the check in trace_i
 5. s3 GetObject(Bucket=<AccessPointArn>, Key="private.txt") from outside that VPC, through the endpoint the emulator announces. Expect HTTP 403 / AccessDenied with message `User: <caller arn> is not authorized to perform: s3:GetObject on resource: "<AccessPointArn>/object/private.txt" with an explicit deny in a resource-based policy`. Observed: NoSuchBucket.
 6. s3control PutAccessPointPolicy(AccountId, Name=<vpc-ap>, Policy={Allow, Principal {"AWS":"*"}, Action s3:GetObject, Resource "<AccessPointArn>/object/*"}) and repeat step 5 — the refusal must be unchanged.
 7. Positive control: s3control CreateAccessPoint(AccountId, Name=<net-ap>, Bucket=<same bucket>) with no VpcConfiguration, then s3 GetObject(Bucket=<that AccessPointArn>, Key="private.txt") — expect 200 and the bytes b"vpc-only".
+
+## Resolution
+
+The access-point data path now resolves, and refuses, over EVERY address a client of this
+emulator is given — including the one an SDK derives from an access point ARN against the
+endpoint the emulator announces, `<access-point-name>-<account-id>.<that authority>`, whatever
+authority that is (the loopback address with the port the data plane is served on, the address
+alone, a name in the loopback zone, the IPv6 literal). `core/router/tests/all/s3_access_point_vpc_network_origin.rs`
+drives all three of its tests over those authorities beside the ARN, the alias, the endpoint
+host label and the published AWS host: the VPC-confined access point refuses the read, the HEAD
+and the listing 403 `AccessDenied` over `<ap-arn>/object/<key>`, none of four access point policy
+documents lifts it, the anonymous caller is refused alike, and the Internet-origin access point
+over the same bucket serves the bytes.
+
+What the resolution still answered by a constant was `HeadBucketOutput$AccessPointAlias`
+("Indicates whether the bucket name used in the request is an access point alias"), which
+reported `false` for every request: `services/service-com-amazonaws-s3-amazons3/src/ops/head_bucket.rs`
+now reads it off the access point the request was SERVED through, so a HEAD addressed by an
+access point's ARN, its alias or its endpoint host label — at any authority — reports that the
+name it used was the access point's, and the bucket's own name still reports that it was not
+(`tests/all/access_point_data_plane.rs`).
+
+The recorded check `s3control.access-point-vpc-origin-denies-internet-read-rejected` still does
+not reach this behaviour, and no longer for anything on the data path: its FIRST s3control call
+never leaves the runner. botocore applies the modelled `@endpoint(hostPrefix: "{AccountId}.")`
+that every account-scoped s3control operation carries, so `create_access_point` is addressed to
+`<account-id>.<endpoint authority>` and the run — which may dial only the endpoint host — refuses
+it (`EgressRefused: ... '000000000000.127.0.0.1' is not the endpoint under test (127.0.0.1)`).
+The access point under test is therefore never created, and that refusal is one of the keys of
+the open issue `20261116T222947Z-s3control-the-account-id-host-prefix-every-operation.md`, which
+owns it.
