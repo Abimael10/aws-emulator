@@ -41,6 +41,9 @@
 //! * what a request SAYS is judged where it always was: the walk refuses a member outside
 //!   its constraint, and a handler refuses what the model cannot state, for an absent
 //!   target exactly as for a stored one;
+//! * the ORDER of those two: the front door is decided on the target ARN alone and stated
+//!   first, so a request addressing an ARN the caller is not entitled to earns its refusal
+//!   whatever else about the request those layers would refuse, and writes nothing;
 //! * an ARN a request carries in its BODY (`ListConfigurations`) is an argument the operation
 //!   resolves rather than a target the front door decides, so it is the modelled 404 whatever
 //!   account it names, and a label that is no ARN at all (`GetConfiguration`'s configuration
@@ -779,33 +782,37 @@ async fn an_arn_of_another_regions_endpoint_earns_the_modelled_not_found() {
     );
 }
 
-/// What a request SAYS is judged where it always was, for an absent target exactly as for
-/// a stored one: the modelled constraint walk refuses a member outside its constraint, and
-/// a handler refuses what the model cannot state — so the only thing an absent target
-/// changes is which resource could not be found.
-#[tokio::test]
-async fn the_requests_own_input_is_judged_as_it_is_for_a_stored_resource() {
-    let router = emulator();
-    let case = "a live manager";
-    let live = create_manager(&router, case, "ordering").await;
-    let id = definition_id(&router, case, &live).await;
-    let unserved = UNSERVED_ARNS[0].1;
+/// One request this service judges BEHIND the front door, on a route that labels its target
+/// with a resource ARN: malformed in a way the modelled constraint walk or a handler refuses,
+/// or naming something no handler can resolve, with the status and shape it earns for an ARN
+/// naming no resource and for the stored manager — both of them ARNs the caller IS entitled
+/// to, which is where these refusals are stated.
+///
+/// One table, taken by the two tests that drive these rows in the two directions the rule
+/// splits on, so the rows cannot drift apart:
+/// [`the_requests_own_input_is_judged_as_it_is_for_a_stored_resource`] pairs the two entitled
+/// targets, and [`the_front_door_is_stated_before_the_request_is_judged`] pairs an entitled
+/// target with the targets the caller may not address, which the front door refuses ahead of
+/// every judgement here.
+struct JudgedRequest {
+    case: &'static str,
+    method: &'static str,
+    /// Built from the target ARN and a definition id of the stored manager.
+    path: fn(&str, &str) -> String,
+    body: Option<Value>,
+    unserved_status: u16,
+    unserved_code: &'static str,
+    served_status: u16,
+    served_code: &'static str,
+}
 
-    /// One request, with the status and code it earns against an ARN naming no resource
-    /// and against the stored manager.
-    struct Row {
-        case: &'static str,
-        method: &'static str,
-        /// Built from the manager ARN and its first definition id.
-        path: fn(&str, &str) -> String,
-        body: Option<Value>,
-        unserved_status: u16,
-        unserved_code: &'static str,
-        served_status: u16,
-        served_code: &'static str,
-    }
-    let rows = vec![
-        Row {
+/// The rows, spanning where behind the front door a request is judged: a body member outside
+/// its modelled `@pattern`, a `@required` body member left out, a value this service refuses
+/// carried in a body and the same one carried in a query, a path label outside its own modelled
+/// pattern, and a label naming nothing a handler can resolve.
+fn judged_requests() -> Vec<JudgedRequest> {
+    vec![
+        JudgedRequest {
             // The manager's own route, with a `Name` outside its modelled pattern: the
             // walk refuses it before any handler runs, whichever manager it names.
             case: "UpdateConfigurationManager with a Name outside its modelled pattern",
@@ -817,7 +824,7 @@ async fn the_requests_own_input_is_judged_as_it_is_for_a_stored_resource() {
             served_status: 400,
             served_code: "ValidationException",
         },
-        Row {
+        JudgedRequest {
             // `TagsMap` is `@required`, so a body without it is refused by the walk.
             case: "TagResource with no Tags member at all",
             method: "PUT",
@@ -828,7 +835,7 @@ async fn the_requests_own_input_is_judged_as_it_is_for_a_stored_resource() {
             served_status: 400,
             served_code: "ValidationException",
         },
-        Row {
+        JudgedRequest {
             // A tag key under the AWS-reserved prefix is the service's own refusal of the
             // request's input, stated before the resource it names is resolved.
             case: "TagResource with a reserved tag key",
@@ -840,7 +847,9 @@ async fn the_requests_own_input_is_judged_as_it_is_for_a_stored_resource() {
             served_status: 400,
             served_code: "ValidationException",
         },
-        Row {
+        JudgedRequest {
+            // The same refusal with the offending value in the QUERY `tagKeys` binds,
+            // rather than in a body.
             case: "UntagResource with a reserved tag key",
             method: "DELETE",
             path: |arn, _| format!("/tags/{}?tagKeys=aws:reserved", label(arn)),
@@ -850,7 +859,7 @@ async fn the_requests_own_input_is_judged_as_it_is_for_a_stored_resource() {
             served_status: 400,
             served_code: "ValidationException",
         },
-        Row {
+        JudgedRequest {
             // The definition id is a label of its own, resolved against the manager the
             // same request named: so an absent manager is the not-found of the MANAGER,
             // and a stored one with no such definition the not-found of the DEFINITION.
@@ -869,7 +878,7 @@ async fn the_requests_own_input_is_judged_as_it_is_for_a_stored_resource() {
             served_status: 404,
             served_code: "ResourceNotFoundException",
         },
-        Row {
+        JudgedRequest {
             // A `TypeVersion` outside its modelled pattern is the walk's refusal.
             case: "UpdateConfigurationDefinition with a TypeVersion outside its pattern",
             method: "PUT",
@@ -880,9 +889,42 @@ async fn the_requests_own_input_is_judged_as_it_is_for_a_stored_resource() {
             served_status: 400,
             served_code: "ValidationException",
         },
-    ];
+        JudgedRequest {
+            // The route's OTHER label: `Id` is modelled `^[a-z0-9-]{1,20}$`
+            // (`smithy_query(query="operation",operation="UpdateConfigurationDefinition")`),
+            // which an upper-case id is outside — a path label refused by the walk, beside
+            // the ARN label the front door decides on.
+            case: "UpdateConfigurationDefinition with an Id outside its modelled pattern",
+            method: "PUT",
+            path: |arn, _| {
+                format!(
+                    "/configurationDefinition/{}/{}",
+                    label(arn),
+                    label("NOT-AN-ID")
+                )
+            },
+            body: Some(json!({ "TypeVersion": "LATEST" })),
+            unserved_status: 400,
+            unserved_code: "ValidationException",
+            served_status: 400,
+            served_code: "ValidationException",
+        },
+    ]
+}
 
-    for row in &rows {
+/// What a request SAYS is judged where it always was, for an absent target exactly as for
+/// a stored one: the modelled constraint walk refuses a member outside its constraint, and
+/// a handler refuses what the model cannot state — so the only thing an absent target
+/// changes is which resource could not be found.
+#[tokio::test]
+async fn the_requests_own_input_is_judged_as_it_is_for_a_stored_resource() {
+    let router = emulator();
+    let case = "a live manager";
+    let live = create_manager(&router, case, "ordering").await;
+    let id = definition_id(&router, case, &live).await;
+    let unserved = UNSERVED_ARNS[0].1;
+
+    for row in &judged_requests() {
         let (status, answer) = call(
             &router,
             row.method,
@@ -1081,5 +1123,156 @@ async fn entitlement_is_decided_on_the_arn_alone_whatever_the_store_holds() {
     assert_eq!(
         status, 200,
         "the stored manager must be readable, got {status} / {answer:?}"
+    );
+}
+
+/// The ORDER the front door's refusal is stated in: it is decided on the request's target ARN
+/// alone, before anything the request SAYS is judged, so a request addressing an ARN the caller
+/// is not entitled to earns HTTP 401 / `UnauthorizedException` / the one fixed sentence whatever
+/// ELSE about it the layers behind the front door would refuse — a second path label outside its
+/// modelled pattern, a body member outside its, a `@required` body member left out, or a tag key
+/// this service refuses — and nothing of the request is judged, nothing resolved, nothing
+/// written.
+///
+/// Every row of [`judged_requests`] — the same table the test above takes in the entitled
+/// direction — is sent to an ARN the caller IS entitled to, where those layers do judge it and
+/// answer their own refusal, and then to every target it is not: the pair is what pins the
+/// order rather than only the two answers.
+#[tokio::test]
+async fn the_front_door_is_stated_before_the_request_is_judged() {
+    let router = emulator();
+    let case = "a live manager";
+    let live = create_manager(&router, case, "ordering-front-door").await;
+    let id = definition_id(&router, case, &live).await;
+    // An ARN of this account that names no resource: the entitled side of every row, so what
+    // that side is refused for is the row's own malformed input.
+    let unserved = UNSERVED_ARNS[0].1;
+
+    // One tag of the stored manager's own, so an unintended write through any row below — a
+    // tag added by a refused `TagResource`, or one taken away by a refused `UntagResource` —
+    // is observable as a changed tag set rather than invisible against an empty one.
+    const LIVE_TAG_KEY: &str = "Owner";
+    const LIVE_TAG_VALUE: &str = "ordering";
+    let (status, answer) = call(
+        &router,
+        "PUT",
+        &format!("/tags/{}", label(&live)),
+        Some(&json!({ "Tags": { LIVE_TAG_KEY: LIVE_TAG_VALUE } })),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "tagging the stored manager must succeed, got {status} / {answer:?}"
+    );
+
+    for row in &judged_requests() {
+        // The entitled side: the request reaches the layers that judge what it says, and is
+        // refused by them.
+        let (status, answer) = call(
+            &router,
+            row.method,
+            &(row.path)(unserved, &id),
+            row.body.as_ref(),
+        )
+        .await;
+        let entitled_case = format!("{} on an ARN of this account", row.case);
+        assert_not_refused_by_the_front_door(&entitled_case, status, &answer);
+        assert_eq!(
+            status, row.unserved_status,
+            "case {entitled_case:?}: expected {}, got {status} / {answer:?}",
+            row.unserved_status
+        );
+        let code = error_code(&answer);
+        assert_eq!(
+            code, row.unserved_code,
+            "case {entitled_case:?}: expected {}, got {code:?} in {answer:?}",
+            row.unserved_code
+        );
+
+        // The unentitled side: the very same request, to every target the caller may not
+        // address, earns the front door's refusal instead — so the refusal precedes the
+        // judgement above rather than following it.
+        for (target_case, target) in FOREIGN_TARGETS {
+            let refused_case = format!("{} on {target_case}", row.case);
+            let (status, answer) = call(
+                &router,
+                row.method,
+                &(row.path)(target, &id),
+                row.body.as_ref(),
+            )
+            .await;
+            assert_unauthorized(&refused_case, status, &answer);
+        }
+
+        // And to the twins of the manager this endpoint DOES serve, so no row is answered for
+        // its ARN naming nothing either.
+        for account in OTHER_ACCOUNTS {
+            let twin = in_account(&live, account);
+            let refused_case = format!("{} on the {account} twin of the stored manager", row.case);
+            let (status, answer) = call(
+                &router,
+                row.method,
+                &(row.path)(&twin, &id),
+                row.body.as_ref(),
+            )
+            .await;
+            assert_unauthorized(&refused_case, status, &answer);
+        }
+    }
+
+    // Nothing the refusals above carried was written: the stored manager still answers under
+    // the name it was created with, still holds the definition the create gave it, and carries
+    // exactly the one tag it was given above — the tag plane's two mutations were among the
+    // refused rows, so an unintended write would show as a tag added or taken away.
+    let (status, answer) = call(
+        &router,
+        "GET",
+        &format!("/configurationManager/{}", label(&live)),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the stored manager must still be readable, got {status} / {answer:?}"
+    );
+    assert_eq!(
+        answer.get("Name").and_then(Value::as_str),
+        Some("ordering-front-door"),
+        "the refused rows must not have renamed the manager, got {answer:?}"
+    );
+    assert_eq!(
+        answer["ConfigurationDefinitions"]
+            .as_array()
+            .and_then(|definitions| definitions.first())
+            .and_then(|definition| definition.get("Id"))
+            .and_then(Value::as_str),
+        Some(id.as_str()),
+        "the refused rows must not have touched the stored definition, got {answer:?}"
+    );
+
+    let (status, answer) = call(&router, "GET", &format!("/tags/{}", label(&live)), None).await;
+    assert_eq!(
+        status, 200,
+        "the stored manager's tags must still be readable, got {status} / {answer:?}"
+    );
+    let tags: Vec<(String, String)> = answer
+        .get("Tags")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry["Key"].as_str().unwrap_or_default().to_string(),
+                        entry["Value"].as_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        tags,
+        vec![(LIVE_TAG_KEY.to_string(), LIVE_TAG_VALUE.to_string())],
+        "the refused rows must have neither added a tag nor taken one away, got {tags:?}"
     );
 }
