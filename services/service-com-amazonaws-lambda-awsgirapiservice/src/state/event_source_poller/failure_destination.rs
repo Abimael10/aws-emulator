@@ -11,21 +11,27 @@
 //! the other half of it, the only thing a client can still learn about the records that were
 //! dropped:
 //!
-//! * WHAT IS RECORDED IS THE BATCH, NOT ITS PAYLOADS. The destination gets one record per
+//! * WHAT EVERY DESTINATION IS TOLD IS THE BATCH. The destination gets one record per
 //!   discarded batch ([`batch_record`]) naming the function, what ended the batch, how many
 //!   attempts it had and what the last of them answered, beside the batch itself: the stream
 //!   it was read from, the shard, the sequence numbers it starts and ends at, when its first
 //!   and last record arrived and how many records it held. That window is what a client
-//!   replays the dropped records from, which a copy of the payloads would not give it — the
-//!   records are still in the shard for its retention period.
+//!   replays the dropped records from — the records are still in the shard for its retention
+//!   period.
+//! * A BUCKET IS ALSO TOLD THE EVENT. An object has no message-size limit to drop a payload
+//!   against, so for a bucket destination alone the record carries, beside that pointer, the
+//!   WHOLE event the invocation was made with ([`object_record`]) — the records as the
+//!   function was handed them — which is what lets a client replay the batch out of the
+//!   object itself rather than out of the stream. A queue and a topic are told the pointer
+//!   and nothing more.
 //! * WHERE IT GOES IS WHAT THE MAPPING NAMES. `DestinationConfig$OnFailure` is "the
 //!   destination configuration for failed invocations", whose `Destination` is "the Amazon
 //!   Resource Name (ARN) of the destination resource", and a mapping naming none has nowhere
 //!   to record a discarded batch, so nothing is written for it. HOW it goes there is the
 //!   destination service's own write ([`deliver`]): a message of the record for a queue or a
 //!   topic, and one OBJECT holding it for a bucket — under the prefix that destination names,
-//!   at a key of the batch's own coordinates ([`record_object_key_suffix`]), so one discarded
-//!   batch is one object and a reader lists them under that prefix.
+//!   at the key such an object takes ([`record_object_key_suffix`]), so one discarded batch is
+//!   one object and a reader lists them under that prefix.
 //! * A HEALTHY BATCH RECORDS NOTHING. The record exists for the batch Lambda gave up on, so
 //!   a batch that was processed — or one that is still being attempted — writes nothing to
 //!   the destination at all.
@@ -58,6 +64,10 @@ pub const KINESIS_BATCH_INFO: &str = "KinesisBatchInfo";
 
 /// The member the batch of an Amazon DynamoDB table's stream is described under.
 pub const DYNAMODB_STREAM_BATCH_INFO: &str = "DDBStreamBatchInfo";
+
+/// The member the EVENT the invocation was made with is carried under, for the one
+/// destination kind that is told it ([`object_record`]).
+pub const RECORD_PAYLOAD: &str = "payload";
 
 /// The destination a mapping's `DestinationConfig$OnFailure` names, or `None` when it names
 /// none.
@@ -94,6 +104,10 @@ pub(super) struct FailedBatch<'batch> {
     /// What the LAST attempt's invocation answered, and `None` when that attempt could not
     /// invoke the function at all.
     pub(super) answered: Option<&'batch Answered>,
+    /// The EVENT the function was invoked with for this batch — "Lambda reads items from the
+    /// event source and invokes the function" — which a BUCKET destination's object carries
+    /// whole ([`object_record`]).
+    pub(super) event: &'batch Value,
 }
 
 /// Write the record of the batch `batch` names to the destination its mapping configures, and
@@ -129,7 +143,7 @@ pub(super) async fn discard_batch(
     }
     let at = SystemTime::now();
     let record = batch_record(batch, at);
-    let delivered = deliver(callback, clients, destination, &record.to_string(), batch, at).await;
+    let delivered = deliver(callback, clients, destination, &record, batch, at).await;
     if let Err(detail) = delivered {
         // The write is not part of what any caller was told — no client asked for this batch
         // to be read — so a failure is reported here and nothing is retried.
@@ -278,20 +292,21 @@ fn stamped(record: &ShardRecord) -> Option<String> {
         .map(crate::state::iso8601)
 }
 
-/// Write `body` to the destination `destination` names, and report whether that destination
+/// Write `record` to the destination `destination` names, and report whether that destination
 /// ACCEPTED it.
 ///
 /// Which call is made follows from the SERVICE the destination's ARN names, because a
 /// destination is a resource Lambda writes to with that service's own write. The kinds
 /// `OnFailure$Destination` enumerates for a shard source are "an Amazon SNS topic, Amazon SQS
 /// queue, or Amazon S3 bucket" — a message of the record for the first two, and ONE OBJECT
-/// holding it for the third ([`put_record_object`]) — and a destination of any other kind is
-/// reported as a record that was not written rather than counted as written.
+/// holding it for the third ([`put_record_object`]), which is the one kind told the event
+/// itself as well ([`object_record`]) — and a destination of any other kind is reported as a
+/// record that was not written rather than counted as written.
 async fn deliver(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     clients: &mut Clients,
     destination: &str,
-    body: &str,
+    record: &Value,
     batch: &FailedBatch<'_>,
     at: SystemTime,
 ) -> Result<(), String> {
@@ -317,8 +332,19 @@ async fn deliver(
         stated
     };
     match parsed.vendor {
-        "sqs" => send_to_queue(callback, clients, region, parsed.resource, body).await,
-        "sns" => publish_to_topic(callback, clients, region, destination, body).await,
+        "sqs" => {
+            send_to_queue(
+                callback,
+                clients,
+                region,
+                parsed.resource,
+                &record.to_string(),
+            )
+            .await
+        }
+        "sns" => {
+            publish_to_topic(callback, clients, region, destination, &record.to_string()).await
+        }
         "s3" => {
             put_record_object(
                 callback,
@@ -326,7 +352,7 @@ async fn deliver(
                 region,
                 parsed.resource,
                 &record_object_key_suffix(batch, at),
-                body,
+                &object_record(record, batch).to_string(),
             )
             .await
         }
@@ -393,29 +419,47 @@ fn bucket_and_prefix(resource: &str) -> (&str, String) {
     (bucket, prefix)
 }
 
+/// The fixed path the key of every such object begins with, below the prefix the destination
+/// itself names: the records a bucket destination holds are Lambda's own, so they sit in a
+/// place of Lambda's own naming rather than loose among the caller's objects.
+const RECORD_KEY_ROOT: &str = "aws/lambda";
+
 /// What the key of the object recording ONE discarded batch carries BELOW the prefix its
 /// destination names ([`bucket_and_prefix`]).
 ///
-/// A bucket destination takes one object per discarded batch, so the key below the prefix has
-/// to tell two discarded batches apart, and everything that does so is already known about
-/// the batch: the instant the record was made, written as the date path a prefix is read in
-/// so a reader can ask for a day or an hour of records alone; then the mapping that gave up
-/// on the batch, the shard the batch was read from, and the window of sequence numbers it
-/// covered — the same window the record itself reports ([`batch_info`]). Nothing of it is
-/// drawn: the key of an object says WHICH batch it is about, so the same batch recorded again
-/// within that hour is the same object rather than a second one.
+/// AWS's own naming convention for these objects, which is what a client reading them lists
+/// by: `aws/lambda/<ESM-UUID>/<shardID>/YYYY/MM/DD/YYYY-MM-DDTHH.MM.SS-<uuid>`. Everything
+/// that varies in it is known about the batch — the mapping that gave up on it, the shard it
+/// was read from, and the instant the record was made, written once as the date path a reader
+/// asks a day of records for and once as the second the record was made at — and the last
+/// segment ends in an id of this object's own, so one key belongs to one write and two batches
+/// discarded in the same second of the same shard are two objects rather than one overwriting
+/// the other.
 fn record_object_key_suffix(batch: &FailedBatch<'_>, at: SystemTime) -> String {
-    let partition = ::chrono::DateTime::<::chrono::Utc>::from(at).format("%Y/%m/%d/%H");
-    let sequence_number = |record: Option<&ShardRecord>| {
-        record.map_or_else(String::new, |record| record.sequence_number.clone())
-    };
+    let at = ::chrono::DateTime::<::chrono::Utc>::from(at);
     format!(
-        "{partition}/{uuid}/{shard}/{start}-{end}",
+        "{RECORD_KEY_ROOT}/{uuid}/{shard}/{date}/{second}-{distinct}",
         uuid = batch.uuid,
         shard = batch.shard,
-        start = sequence_number(batch.records.first()),
-        end = sequence_number(batch.records.last()),
+        date = at.format("%Y/%m/%d"),
+        second = at.format("%Y-%m-%dT%H.%M.%S"),
+        distinct = ::uuid::Uuid::new_v4(),
     )
+}
+
+/// The record the OBJECT of a bucket destination holds: the pointer to the batch every
+/// destination is told ([`batch_record`]), plus the whole event the invocation was made with.
+///
+/// An object is the one destination kind with no message-size limit to drop a payload against,
+/// so the record written there carries the event itself beside the pointer: the records as the
+/// function was handed them, which is what lets a client replay the discarded batch out of the
+/// object alone. A queue or a topic is told the pointer and nothing more.
+fn object_record(record: &Value, batch: &FailedBatch<'_>) -> Value {
+    let mut object = record.clone();
+    if let Some(members) = object.as_object_mut() {
+        members.insert(RECORD_PAYLOAD.to_string(), batch.event.clone());
+    }
+    object
 }
 
 /// The media type the record of a discarded batch is stored under, which is what a later read
@@ -606,6 +650,7 @@ mod tests {
                 last,
             } = row;
             let run = run(source);
+            let event = json!({ "Records": [] });
             let batch = FailedBatch {
                 uuid: MAPPING_UUID,
                 run: &run,
@@ -613,6 +658,7 @@ mod tests {
                 records: &records,
                 attempts,
                 answered: last.as_ref(),
+                event: &event,
             };
             let written = batch_record(&batch, arrived_at + Duration::from_secs(10));
             let member = match source {
@@ -672,10 +718,12 @@ mod tests {
                 "case {case:?}: an arrival instant is reported exactly where the source \
                  stamped one, got {written}"
             );
-            // The record describes the batch and carries no payload of it.
+            // The pointer every destination is told describes the batch and carries no event
+            // of it; the event is the bucket destination's own addition
+            // ([`a_bucket_destinations_record_carries_the_event_whole`]).
             let rendered = written.to_string();
             assert!(
-                !rendered.contains("Records") && !rendered.contains("payload"),
+                !rendered.contains("Records") && !rendered.contains(RECORD_PAYLOAD),
                 "case {case:?}: the record must carry no record payload, got {rendered}"
             );
             match last.as_ref() {
@@ -767,89 +815,178 @@ mod tests {
         }
     }
 
-    /// RULE: a bucket destination takes ONE OBJECT per discarded batch, keyed below the
-    /// destination's prefix by the batch's own coordinates — the hour the record was made, the
-    /// mapping, the shard and the sequence-number window — so two discarded batches are two
-    /// objects and the same batch is the same object.
+    /// RULE: the key of the object a bucket destination takes for ONE discarded batch follows
+    /// the published naming convention for these records —
+    /// `aws/lambda/<ESM-UUID>/<shardID>/YYYY/MM/DD/YYYY-MM-DDTHH.MM.SS-<uuid>` below whatever
+    /// prefix the destination itself states — so a reader lists one mapping's records under
+    /// `aws/lambda/<UUID>/`, one shard's below that and one day's below the date path, and no
+    /// two writes land on one key.
+    ///
+    /// The rows differ along what the rule generalises over: which shard the batch was read
+    /// from, how many records it held and the instant the record was made at.
     #[test]
-    fn each_discarded_batch_takes_its_own_key_under_the_prefix() {
+    fn the_key_of_a_recorded_batch_follows_the_published_naming_convention() {
+        let run = run(ShardSource::Kinesis);
+        let first = record("49590338271490256608559692538361571095921575989136588898", None);
+        let second = record("49590338271490256608559692538361571095921575989136588899", None);
+        let one = [first.clone()];
+        let both = [first.clone(), second.clone()];
+        let event = json!({ "Records": [] });
+        // (case, the batch, the instant the record was made, the date path and the second the
+        // key carries for it)
+        let rows: [(&str, FailedBatch<'_>, &str, &str, &str); 4] = [
+            (
+                "a-batch-of-one-record",
+                discarded(&run, "shardId-000000000000", &one, &event),
+                "2026-10-26T07:44:05Z",
+                "2026/10/26",
+                "2026-10-26T07.44.05",
+            ),
+            (
+                "a-batch-spanning-a-window",
+                discarded(&run, "shardId-000000000000", &both, &event),
+                "2026-10-26T07:44:05Z",
+                "2026/10/26",
+                "2026-10-26T07.44.05",
+            ),
+            (
+                "another-shard-of-the-same-mapping",
+                discarded(&run, "shardId-000000000001", &one, &event),
+                "2026-10-26T07:44:05Z",
+                "2026/10/26",
+                "2026-10-26T07.44.05",
+            ),
+            (
+                "a-record-made-on-another-day",
+                discarded(&run, "shardId-000000000000", &one, &event),
+                "2027-01-01T23:59:59Z",
+                "2027/01/01",
+                "2027-01-01T23.59.59",
+            ),
+        ];
+        let mut keys: Vec<String> = Vec::new();
+        for (case, batch, instant, date, second) in rows {
+            let at: SystemTime = ::chrono::DateTime::parse_from_rfc3339(instant)
+                .expect("the fixture instant is a well-formed timestamp")
+                .into();
+            let expected = format!(
+                "{RECORD_KEY_ROOT}/{MAPPING_UUID}/{}/{date}/{second}-",
+                batch.shard
+            );
+            let key = record_object_key_suffix(&batch, at);
+            assert!(
+                key.starts_with(&expected),
+                "case {case:?}: expected a key under {expected:?}, got {key:?}"
+            );
+            let distinct = key.strip_prefix(&expected).unwrap_or_default();
+            assert!(
+                ::uuid::Uuid::parse_str(distinct).is_ok(),
+                "case {case:?}: the key must end in an id of the object's own, got {distinct:?} \
+                 in {key:?}"
+            );
+            // One key belongs to one write: the same batch recorded twice takes two objects
+            // rather than one overwriting the other.
+            let again = record_object_key_suffix(&batch, at);
+            assert_ne!(
+                again, key,
+                "case {case:?}: two writes must not share a key, got {again:?} twice"
+            );
+            for written in [key, again] {
+                assert!(
+                    !keys.contains(&written),
+                    "case {case:?}: every write must take its own key, but {written:?} is \
+                     already taken among {keys:?}"
+                );
+                keys.push(written);
+            }
+        }
+    }
+
+    /// RULE: the record written to a BUCKET destination carries the WHOLE event the invocation
+    /// was made with, beside the pointer to the batch every destination is told; the record a
+    /// queue or a topic is sent carries that pointer alone.
+    ///
+    /// The rows differ along what the rule generalises over: the shape of the event the
+    /// invocation was made with.
+    #[test]
+    fn a_bucket_destinations_record_carries_the_event_whole() {
         let at: SystemTime = ::chrono::DateTime::parse_from_rfc3339("2026-10-26T07:44:05Z")
             .expect("the fixture instant is a well-formed timestamp")
             .into();
         let run = run(ShardSource::Kinesis);
-        let first = record("49590338271490256608559692538361571095921575989136588898", None);
-        let second = record("49590338271490256608559692538361571095921575989136588899", None);
-
-        // The hour the instant above falls in, as the date path the key carries.
-        let partition = "2026/10/26/07";
-        let one = [first.clone()];
-        let both = [first.clone(), second.clone()];
-        let last = [second.clone()];
-        // (case, the batch, the key below the destination's prefix)
-        let rows: [(&str, FailedBatch<'_>, String); 4] = [
+        let records = [record(
+            "49590338271490256608559692538361571095921575989136588898",
+            Some(at),
+        )];
+        // (case, the event the invocation was made with)
+        let rows: [(&str, Value); 3] = [
             (
-                "a-batch-of-one-record",
-                discarded(&run, "shardId-000000000000", &one),
-                format!(
-                    "{partition}/{MAPPING_UUID}/shardId-000000000000/{}-{}",
-                    first.sequence_number, first.sequence_number
-                ),
+                "an-event-of-one-record",
+                json!({
+                    "Records": [{
+                        "eventSource": "aws:kinesis",
+                        "kinesis": {
+                            "sequenceNumber": records[0].sequence_number,
+                            "data": "b3JkZXI=",
+                        },
+                    }],
+                }),
             ),
             (
-                "a-batch-spanning-a-window",
-                discarded(&run, "shardId-000000000000", &both),
-                format!(
-                    "{partition}/{MAPPING_UUID}/shardId-000000000000/{}-{}",
-                    first.sequence_number, second.sequence_number
-                ),
+                "an-event-of-several-records",
+                json!({
+                    "Records": [
+                        { "kinesis": { "sequenceNumber": "1", "data": "b25l" } },
+                        { "kinesis": { "sequenceNumber": "2", "data": "dHdv" } },
+                    ],
+                }),
             ),
             (
-                "the-next-batch-of-the-same-shard",
-                discarded(&run, "shardId-000000000000", &last),
-                format!(
-                    "{partition}/{MAPPING_UUID}/shardId-000000000000/{}-{}",
-                    second.sequence_number, second.sequence_number
-                ),
-            ),
-            (
-                "the-same-window-of-another-shard",
-                discarded(&run, "shardId-000000000001", &one),
-                format!(
-                    "{partition}/{MAPPING_UUID}/shardId-000000000001/{}-{}",
-                    first.sequence_number, first.sequence_number
-                ),
+                "an-event-carrying-a-tumbling-window-beside-its-records",
+                json!({
+                    "Records": [{ "kinesis": { "sequenceNumber": "1", "data": "b25l" } }],
+                    "window": { "start": "2026-10-26T07:44:00Z" },
+                    "isFinalInvokeForWindow": false,
+                }),
             ),
         ];
-        let mut keys: Vec<String> = Vec::new();
-        for (case, batch, expected) in rows {
-            let key = record_object_key_suffix(&batch, at);
+        for (case, event) in rows {
+            let batch = discarded(&run, "shardId-000000000000", &records, &event);
+            let pointer = batch_record(&batch, at);
+            let object = object_record(&pointer, &batch);
             assert_eq!(
-                key, expected,
-                "case {case:?}: expected the key {expected:?}, got {key:?}"
+                object[RECORD_PAYLOAD], event,
+                "case {case:?}: the object must carry the event whole, got {object}"
             );
-            // The same batch recorded again is the same object, and no other batch shares it.
-            let again = record_object_key_suffix(&batch, at);
+            for member in [
+                "version",
+                "timestamp",
+                "requestContext",
+                KINESIS_BATCH_INFO,
+            ] {
+                assert_eq!(
+                    object[member], pointer[member],
+                    "case {case:?}: the object must still say what every destination is told \
+                     about {member}, got {object}"
+                );
+            }
             assert_eq!(
-                again, key,
-                "case {case:?}: the key of one batch must not change between writes, got \
-                 {again:?} after {key:?}"
+                pointer.get(RECORD_PAYLOAD),
+                None,
+                "case {case:?}: the record a queue or a topic is sent carries no event, got \
+                 {pointer}"
             );
-            assert!(
-                !keys.contains(&key),
-                "case {case:?}: every discarded batch must take its own key, but {key:?} is \
-                 already taken among {keys:?}"
-            );
-            keys.push(key);
         }
     }
 
     /// One batch the mapping `run` names gave up on: the `records` it handed over, read from
-    /// `shard`, with the attempts and the answer left at one row's worth — the key of its
-    /// object is decided by the mapping, the shard and the records alone.
+    /// `shard`, with `event` as what the invocation was made with and the attempts and the
+    /// answer left at one row's worth.
     fn discarded<'batch>(
         run: &'batch ShardSourcedMapping,
         shard: &'batch str,
         records: &'batch [ShardRecord],
+        event: &'batch Value,
     ) -> FailedBatch<'batch> {
         FailedBatch {
             uuid: MAPPING_UUID,
@@ -858,6 +995,7 @@ mod tests {
             records,
             attempts: 1,
             answered: None,
+            event,
         }
     }
 

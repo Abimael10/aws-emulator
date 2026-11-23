@@ -15,11 +15,13 @@
 //! write, so a destination that is a BUCKET takes one OBJECT per discarded batch: an S3
 //! bucket's ARN names the bucket in its resource field and anything after a `/` is a key
 //! prefix inside it, so the object appears under exactly that prefix, keyed below it by the
-//! batch's own coordinates, and its payload is the same record every other destination kind
-//! gets — the function, what ended the batch, how many attempts it had and what the last
-//! answered, beside the stream it was read from, the shard, the sequence-number window it
-//! covers, when its first and last record arrived and how many records it held, and never the
-//! record payloads.
+//! published layout for these records —
+//! `aws/lambda/<ESM-UUID>/<shardID>/YYYY/MM/DD/YYYY-MM-DDTHH.MM.SS-<uuid>` — and its body is
+//! the record every other destination kind gets (the function, what ended the batch, how many
+//! attempts it had and what the last answered, beside the stream it was read from, the shard,
+//! the sequence-number window it covers, when its first and last record arrived and how many
+//! records it held) with, for a bucket alone, the WHOLE event the invocation was made with
+//! beside it.
 //!
 //! The rows differ along what the rule generalises over: which shard source the records sit in
 //! (a Kinesis data stream, a DynamoDB table's stream), how the destination ARN states the
@@ -60,6 +62,12 @@ const CONDITION_RETRY_ATTEMPTS_EXHAUSTED: &str = "RetryAttemptsExhausted";
 const KINESIS_BATCH_INFO: &str = "KinesisBatchInfo";
 /// See [`RECORD_SCHEMA_VERSION`].
 const DYNAMODB_STREAM_BATCH_INFO: &str = "DDBStreamBatchInfo";
+/// See [`RECORD_SCHEMA_VERSION`]: the member a BUCKET destination's record carries the event
+/// the invocation was made with under.
+const RECORD_PAYLOAD: &str = "payload";
+/// See [`RECORD_SCHEMA_VERSION`]: the fixed path the key of such an object begins with, below
+/// whatever prefix the destination's own ARN states.
+const RECORD_KEY_ROOT: &str = "aws/lambda";
 
 /// The Region every call below is made in, and the Region the stream's ARN carries.
 ///
@@ -522,20 +530,7 @@ async fn put_record(
 ) {
     match source {
         Source::Kinesis => {
-            let (status, written) = kinesis(
-                router,
-                "PutRecord",
-                &json!({
-                    "StreamName": name,
-                    "PartitionKey": data,
-                    "Data": base64::engine::general_purpose::STANDARD.encode(data.as_bytes()),
-                }),
-            )
-            .await;
-            assert_eq!(
-                status, 200,
-                "case {case:?}: PutRecord answered {status} {written}"
-            );
+            let _written = put_kinesis_record(router, case, name, data).await;
         }
         Source::TableStream => {
             let (status, written) = dynamodb(
@@ -550,6 +545,40 @@ async fn put_record(
             );
         }
     }
+}
+
+/// Put one record carrying `data` onto the Kinesis stream `name`, the way a client writes one;
+/// answers the `SequenceNumber` and the `ShardId` `PutRecord` reported for it — the two
+/// identifiers the client itself holds for that record.
+async fn put_kinesis_record(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+    data: &str,
+) -> (String, String) {
+    let (status, written) = kinesis(
+        router,
+        "PutRecord",
+        &json!({
+            "StreamName": name,
+            "PartitionKey": data,
+            "Data": base64::engine::general_purpose::STANDARD.encode(data.as_bytes()),
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: PutRecord answered {status} {written}"
+    );
+    let sequence_number = written["SequenceNumber"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: no SequenceNumber in {written}"))
+        .to_string();
+    let shard = written["ShardId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: no ShardId in {written}"))
+        .to_string();
+    (sequence_number, shard)
 }
 
 /// A function whose package RUNS [`handler_source`], waited out to `Active`.
@@ -695,6 +724,57 @@ async fn awaited_keys(
     }
 }
 
+/// Assert the key of the object recording one discarded batch is the layout AWS publishes for
+/// these records — `aws/lambda/<ESM-UUID>/<shardID>/YYYY/MM/DD/YYYY-MM-DDTHH.MM.SS-<uuid>`,
+/// below whatever prefix the destination's own ARN states.
+fn assert_key_layout(case: &str, key: &str, listed_prefix: &str, uuid: &str, shard: &str) {
+    let under = format!("{listed_prefix}{RECORD_KEY_ROOT}/{uuid}/{shard}/");
+    let below = key.strip_prefix(&under).unwrap_or_else(|| {
+        panic!("case {case:?}: expected the record of the batch under {under:?}, got {key:?}")
+    });
+    let segments: Vec<&str> = below.split('/').collect();
+    let [year, month, day, named] = segments.as_slice() else {
+        panic!(
+            "case {case:?}: expected a date path and one named object below {under:?}, got \
+             {below:?}"
+        )
+    };
+    for (segment, shape) in [(year, "####"), (month, "##"), (day, "##")] {
+        assert!(
+            matches_shape(segment, shape),
+            "case {case:?}: expected the date path {shape:?}, got {segment:?} in {key:?}"
+        );
+    }
+    // The second the record was made at, then an id of this object's own.
+    assert!(
+        matches_shape(
+            named,
+            "####-##-##T##.##.##-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+        ),
+        "case {case:?}: expected the object to be named for the second the record was made at \
+         and an id of its own, got {named:?} in {key:?}"
+    );
+    assert!(
+        named.starts_with(&format!("{year}-{month}-{day}T")),
+        "case {case:?}: the named object must carry the same day as the date path above it, got \
+         {named:?} in {key:?}"
+    );
+}
+
+/// Whether `value` has the shape `shape`, where `#` stands for a decimal digit, `x` for a
+/// lowercase hexadecimal digit and every other character for itself.
+fn matches_shape(value: &str, shape: &str) -> bool {
+    value.chars().count() == shape.chars().count()
+        && value
+            .chars()
+            .zip(shape.chars())
+            .all(|(got, want)| match want {
+                '#' => got.is_ascii_digit(),
+                'x' => got.is_ascii_hexdigit() && !got.is_ascii_uppercase(),
+                literal => got == literal,
+            })
+}
+
 /// The rows whose batch the handler refuses, so the mapping gives up on it: each shard source,
 /// each way of stating the place inside the bucket, both retry counts, and a batch of one
 /// record as well as one of several with the refused record last.
@@ -780,7 +860,8 @@ async fn wire(router: &MultiServiceRouter, row: &Row) -> Wired {
 /// RULE: once the attempts a mapping's `MaximumRetryAttempts` allows one batch are spent, the
 /// batch is discarded and the record describing it is written to the destination its
 /// `DestinationConfig$OnFailure` names — for a BUCKET destination, as exactly one object under
-/// the prefix that ARN states inside the bucket, whose payload is that record.
+/// the prefix that ARN states inside the bucket, keyed below it by the published layout for
+/// these records, whose body is that record and the whole event the invocation was made with.
 #[tokio::test]
 async fn a_batch_whose_retries_are_spent_is_recorded_as_an_object_of_the_bucket() {
     for row in discarded_rows() {
@@ -801,12 +882,6 @@ async fn a_batch_whose_retries_are_spent_is_recorded_as_an_object_of_the_bucket(
             "case {case:?}: the object must sit under the prefix the destination states \
              ({:?}), got {key:?}",
             row.listed_prefix
-        );
-        assert!(
-            key.contains(&wired.uuid),
-            "case {case:?}: the key must name the mapping that gave up on the batch ({:?}), \
-             got {key:?}",
-            wired.uuid
         );
 
         let read = s3(&router, "GET", &format!("/{bucket}/{key}"), "").await;
@@ -884,11 +959,7 @@ async fn a_batch_whose_retries_are_spent_is_recorded_as_an_object_of_the_bucket(
             shard.starts_with("shardId-"),
             "case {case:?}: the batch must name the shard it was read from, got {record}"
         );
-        assert!(
-            key.contains(&shard),
-            "case {case:?}: the key must name the shard the batch was read from ({shard:?}), \
-             got {key:?}"
-        );
+        assert_key_layout(case, &key, row.listed_prefix, &wired.uuid, &shard);
         assert_eq!(
             info["batchSize"],
             json!(row.records.len()),
@@ -900,23 +971,70 @@ async fn a_batch_whose_retries_are_spent_is_recorded_as_an_object_of_the_bucket(
             !start.is_empty() && !end.is_empty(),
             "case {case:?}: the batch must report the window it covers, got {record}"
         );
-        assert!(
-            key.ends_with(&format!("{start}-{end}")),
-            "case {case:?}: the key must name the window the batch covers, got {key:?} for \
-             {record}"
-        );
         for member in ["approximateArrivalOfFirstRecord", "approximateArrivalOfLastRecord"] {
             assert!(
                 info[member].as_str().is_some_and(|at| at.contains('T')),
                 "case {case:?}: the batch must report {member}, got {record}"
             );
         }
-        for data in row.records {
-            assert!(
-                !body.contains(data),
-                "case {case:?}: the record must describe the batch and carry no record \
-                 payload, but it holds {data:?}: {body}"
-            );
+
+        // A BUCKET destination is told the event itself as well: the records as the function
+        // was handed them, bounded by the window the pointer above reports.
+        let handed = record[RECORD_PAYLOAD]["Records"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            handed.len(),
+            row.records.len(),
+            "case {case:?}: the object must carry the whole event the invocation was made with, \
+             got {body}"
+        );
+        for (n, data) in row.records.iter().enumerate() {
+            let envelope = &handed[n];
+            let sequence_number = match row.source {
+                Source::Kinesis => {
+                    let encoded = envelope["kinesis"]["data"].as_str().unwrap_or_default();
+                    let decoded = base64::engine::general_purpose::STANDARD
+                        .decode(encoded)
+                        .ok()
+                        .and_then(|bytes| String::from_utf8(bytes).ok())
+                        .unwrap_or_default();
+                    assert_eq!(
+                        &decoded, data,
+                        "case {case:?}: record {n} of the event must carry the data that was \
+                         put, got {envelope}"
+                    );
+                    envelope["kinesis"]["sequenceNumber"]
+                        .as_str()
+                        .unwrap_or_default()
+                }
+                Source::TableStream => {
+                    assert_eq!(
+                        envelope["dynamodb"]["Keys"][KEY]["S"],
+                        json!(data),
+                        "case {case:?}: record {n} of the event must carry the item that was \
+                         written, got {envelope}"
+                    );
+                    envelope["dynamodb"]["SequenceNumber"]
+                        .as_str()
+                        .unwrap_or_default()
+                }
+            };
+            if n == 0 {
+                assert_eq!(
+                    sequence_number, start,
+                    "case {case:?}: the event must start at the record the window starts at, \
+                     got {envelope}"
+                );
+            }
+            if n + 1 == handed.len() {
+                assert_eq!(
+                    sequence_number, end,
+                    "case {case:?}: the event must end at the record the window ends at, got \
+                     {envelope}"
+                );
+            }
         }
 
         // The batch was DISCARDED, not left in place: the mapping reads on past it, which the
@@ -965,4 +1083,139 @@ async fn a_processed_batch_writes_no_object_to_the_bucket() {
         Some(RESULT_OK),
         "case {case:?}: the mapping must report the batch as processed"
     );
+}
+
+/// RULE: the object a bucket destination takes for a discarded batch is addressed and bodied by
+/// the identifiers the CLIENT holds for the records it put — the shard and the sequence number
+/// `PutRecord` answered — so a client that lists `aws/lambda/<UUID>/` finds the record of its
+/// own batch and replays it out of the event the object carries.
+///
+/// The rows differ along what the rule generalises over: the data the client put (which decides
+/// its own sequence number and what the event's payload decodes to) and whether the destination
+/// ARN states a prefix inside the bucket.
+#[tokio::test]
+async fn a_recorded_batch_is_keyed_and_bodied_by_the_identifiers_the_client_holds() {
+    // (case, the name every resource of the row carries, the record's data, what the
+    // destination ARN states after the bucket, the prefix a client lists)
+    let rows: [(&str, &str, &str, &str, &str); 2] = [
+        (
+            "a record recorded at the bucket's root",
+            "client-root",
+            "poison-at-the-root",
+            "",
+            "",
+        ),
+        (
+            "a record recorded under the prefix the destination states",
+            "client-prefixed",
+            "poison-under-a-prefix",
+            "/esm/failures",
+            "esm/failures/",
+        ),
+    ];
+    for (case, name, data, stated_prefix, listed_prefix) in rows {
+        let router = emulator();
+        let stream = format!("source-{name}");
+        let function = format!("consume-{name}");
+        let bucket = format!("sink-{name}");
+        let stream_arn = given_stream(&router, case, &stream).await;
+        given_bucket(&router, case, &bucket).await;
+        given_function(&router, case, &function).await;
+        // The record is in the stream BEFORE the mapping reads it, which is what
+        // `TRIM_HORIZON` hands over, and the client keeps what the put answered.
+        let (sequence_number, shard) = put_kinesis_record(&router, case, &stream, data).await;
+        let (uuid, function_arn) = given_mapping(
+            &router,
+            case,
+            &function,
+            &stream_arn,
+            0,
+            &format!("arn:aws:s3:::{bucket}{stated_prefix}"),
+        )
+        .await;
+
+        // A client looks where the records of ITS mapping sit.
+        let under = format!("{listed_prefix}{RECORD_KEY_ROOT}/{uuid}/");
+        let keys = awaited_keys(&router, case, &bucket, &under).await;
+        assert_eq!(
+            keys.len(),
+            1,
+            "case {case:?}: exactly one object must be written for the discarded batch, got \
+             {keys:?}"
+        );
+        let key = keys[0].clone();
+        assert_key_layout(case, &key, listed_prefix, &uuid, &shard);
+
+        let read = s3(&router, "GET", &format!("/{bucket}/{key}"), "").await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: GetObject {key:?} answered {} {}",
+            read.status, read.body
+        );
+        let body = read.body.clone();
+        let record: Value = serde_json::from_str(&body)
+            .unwrap_or_else(|_| panic!("case {case:?}: the record must be a JSON document: {body}"));
+
+        let info = &record[KINESIS_BATCH_INFO];
+        assert_eq!(
+            (
+                info["shardId"].clone(),
+                info["startSequenceNumber"].clone(),
+                info["endSequenceNumber"].clone(),
+                info["batchSize"].clone(),
+                info["streamArn"].clone(),
+            ),
+            (
+                json!(shard),
+                json!(sequence_number),
+                json!(sequence_number),
+                json!(1),
+                json!(stream_arn),
+            ),
+            "case {case:?}: the batch must be reported by the identifiers the put answered, got \
+             {record}"
+        );
+        assert_eq!(
+            (
+                record["requestContext"]["condition"].clone(),
+                record["requestContext"]["approximateInvokeCount"].clone(),
+                record["requestContext"]["functionArn"].clone(),
+                record["responseContext"]["functionError"].clone(),
+            ),
+            (
+                json!(CONDITION_RETRY_ATTEMPTS_EXHAUSTED),
+                json!(1),
+                json!(function_arn),
+                json!(UNHANDLED),
+            ),
+            "case {case:?}: the record must report what ended the batch, got {record}"
+        );
+
+        // The event the invocation was made with, which is what the batch is replayed from.
+        let handed = record[RECORD_PAYLOAD]["Records"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            handed.len(),
+            1,
+            "case {case:?}: the object must carry the whole event the invocation was made with, \
+             got {body}"
+        );
+        let envelope = &handed[0];
+        assert_eq!(
+            envelope["kinesis"]["sequenceNumber"],
+            json!(sequence_number),
+            "case {case:?}: the event must name the record the client put, got {envelope}"
+        );
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(envelope["kinesis"]["data"].as_str().unwrap_or_default())
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .unwrap_or_default();
+        assert_eq!(
+            decoded, data,
+            "case {case:?}: the event's record must carry the data the client put, got {envelope}"
+        );
+    }
 }

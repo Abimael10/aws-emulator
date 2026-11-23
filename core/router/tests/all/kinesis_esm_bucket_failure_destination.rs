@@ -14,10 +14,13 @@
 //! SNS topic, Amazon SQS queue, Amazon S3 bucket, or Kafka topic as the destination". The write
 //! is the destination service's OWN write, so a BUCKET destination takes one OBJECT per
 //! discarded batch: an S3 bucket's ARN names the bucket in its resource field and anything
-//! after a `/` is a key prefix inside it, so the object appears under exactly that prefix and
-//! its payload is the record describing the BATCH — the function, what ended it, how many
-//! attempts it had and what the last answered, beside the stream it was read from, the shard,
-//! the sequence-number window it covers, when its records arrived and how many it held.
+//! after a `/` is a key prefix inside it, so the object appears under exactly that prefix,
+//! keyed below it by the published layout for these records
+//! (`aws/lambda/<ESM-UUID>/<shardID>/YYYY/MM/DD/YYYY-MM-DDTHH.MM.SS-<uuid>`), and its body is
+//! the record describing the BATCH — the function, what ended it, how many attempts it had and
+//! what the last answered, beside the stream it was read from, the shard, the sequence-number
+//! window it covers, when its records arrived and how many it held — with, for a bucket alone,
+//! the whole event the invocation was made with beside it.
 //!
 //! Five crates have to agree for that to hold, so the suite lives here rather than in any one
 //! of them: the owning crate's own
@@ -58,6 +61,13 @@ const BUCKET: &str = "kinesis-esm-bucket-destination-records";
 
 /// The key prefix inside the bucket the mapping's destination names, as its ARN spells it.
 const PREFIX: &str = "on-failure";
+
+/// The fixed path the key of such an object carries below that prefix, and the member a BUCKET
+/// destination's record carries the event the invocation was made with under. Source: AWS's
+/// published layout and body for an on-failure record written to a bucket.
+const RECORD_KEY_ROOT: &str = "aws/lambda";
+/// See [`RECORD_KEY_ROOT`].
+const RECORD_PAYLOAD: &str = "payload";
 
 /// Where Lambda binds the two collections used below.
 const FUNCTIONS_URI: &str = "/2015-03-31/functions";
@@ -518,7 +528,8 @@ async fn awaited_keys(router: &MultiServiceRouter) -> Vec<String> {
 /// RULE: once the attempts a mapping's `MaximumRetryAttempts` allows one batch are spent, the
 /// batch is discarded and the record describing it is written to the destination its
 /// `DestinationConfig$OnFailure` names — for a BUCKET destination, as one object under the key
-/// prefix that ARN states inside the bucket, whose payload is that record.
+/// prefix that ARN states inside the bucket, keyed by the published layout for these records,
+/// whose body is that record and the whole event the invocation was made with.
 #[tokio::test]
 async fn a_discarded_kinesis_batch_is_recorded_as_an_object_of_its_bucket_destination() {
     let router = emulator();
@@ -548,10 +559,11 @@ async fn a_discarded_kinesis_batch_is_recorded_as_an_object_of_its_bucket_destin
         "exactly one object must be written per discarded batch, got {keys:?}"
     );
     let key = keys[0].clone();
+    let under = format!("{PREFIX}/{RECORD_KEY_ROOT}/{uuid}/");
     assert!(
-        key.starts_with(&format!("{PREFIX}/")) && key.contains(&uuid),
-        "the object must sit under the prefix the destination states and name the mapping \
-         {uuid:?}, got {key:?}"
+        key.starts_with(&under),
+        "the object must sit under the prefix the destination states, below the path these \
+         records are keyed in for the mapping that wrote them ({under:?}), got {key:?}"
     );
 
     let (status, body) = s3(&router, "GET", &format!("/{BUCKET}/{key}")).await;
@@ -598,14 +610,41 @@ async fn a_discarded_kinesis_batch_is_recorded_as_an_object_of_its_bucket_destin
         json!(1),
         "the batch must report how many records it held, got {record}"
     );
+    let shard = info["shardId"].as_str().unwrap_or_default().to_string();
     assert!(
-        info["shardId"]
-            .as_str()
-            .is_some_and(|shard| shard.starts_with("shardId-")),
+        shard.starts_with("shardId-"),
         "the batch must name the shard it was read from, got {record}"
     );
     assert!(
-        !body.contains(payload),
-        "the record must describe the batch and carry no record payload, got {body}"
+        key.starts_with(&format!("{under}{shard}/")),
+        "the key must name the shard the batch was read from ({shard:?}) below the mapping, got \
+         {key:?}"
+    );
+    // A BUCKET destination is told the event itself as well, which is what the discarded
+    // records are replayed from.
+    let handed = record[RECORD_PAYLOAD]["Records"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        handed.len(),
+        1,
+        "the object must carry the whole event the invocation was made with, got {body}"
+    );
+    let envelope = &handed[0];
+    assert_eq!(
+        envelope["kinesis"]["sequenceNumber"],
+        info["startSequenceNumber"],
+        "the event must name the record the window starts at, got {envelope}"
+    );
+    let decoded = ::aws_smithy_types::base64::decode(
+        envelope["kinesis"]["data"].as_str().unwrap_or_default(),
+    )
+    .ok()
+    .and_then(|bytes| String::from_utf8(bytes).ok())
+    .unwrap_or_default();
+    assert_eq!(
+        decoded, payload,
+        "the event's record must carry the data that was put, got {envelope}"
     );
 }

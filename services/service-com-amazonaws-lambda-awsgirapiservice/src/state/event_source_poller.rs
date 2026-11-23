@@ -1375,6 +1375,13 @@ async fn move_batches(
             // The batch is gone from the shard's reach, so a split it was being read in is
             // over too: the records behind it are read at the mapping's own `BatchSize`.
             work.bisected.remove(shard);
+            // What the invocation of that batch was MADE WITH, which a BUCKET destination's
+            // record carries whole beside the pointer to the batch
+            // ([`failure_destination::object_record`]): the event as the function was handed
+            // it, so nothing of it is composed a second time here.
+            let handed_over = handing
+                .first()
+                .map_or_else(|| batch_event(given_up), |(payload, _)| payload.clone());
             // The records are gone from the function's reach, so the only thing a client can
             // still learn about them is what the mapping's own failure destination says.
             failure_destination::discard_batch(
@@ -1391,6 +1398,7 @@ async fn move_batches(
                     records: given_up,
                     attempts,
                     answered: attempt.answered.as_ref(),
+                    event: &handed_over,
                 },
             )
             .await;
