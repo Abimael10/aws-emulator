@@ -106,6 +106,45 @@ impl TokenRefusal {
     }
 }
 
+/// The wire error code a listing answers a `nextToken` of its own whose documented span
+/// has elapsed with.
+///
+/// Not one of the error shapes any listing of this service declares: the `nextToken`
+/// member's own documentation states that an expired pagination token is answered with an
+/// HTTP 400 `InvalidToken` error, so that is the code a client matching on the code sees
+/// for that trigger, rather than the modelled client-input error. Every other reason a
+/// token cannot be resumed from stays on the modelled channel, where the code and the
+/// status are model-derived.
+pub const EXPIRED_TOKEN_CODE: &str = "InvalidToken";
+
+/// The HTTP status that answer carries, from the same sentence.
+pub const EXPIRED_TOKEN_STATUS: u16 = 400;
+
+/// The answer a listing gives a `nextToken` it cannot resume from, stated once so that
+/// every paginated read of this service refuses alike.
+///
+/// A token past its documented span is answered with the code that documentation names
+/// ([`EXPIRED_TOKEN_CODE`]), which no listing's model declares; a token the addressed walk
+/// never issued is answered with the operation's own modelled client-input error, which
+/// `modeled` builds from the refusal's message. The two ask the caller to fix different
+/// things — restart the walk, or correct the client — so they share neither a message nor
+/// a code.
+pub fn token_refusal<E>(
+    refusal: &TokenRefusal,
+    operation: &str,
+    modeled: impl FnOnce(String) -> E,
+) -> crate::scaffolded::Scaffolded<E> {
+    let message = refusal.message(operation);
+    match refusal {
+        TokenRefusal::Expired => crate::scaffolded::Scaffolded::unmodeled(
+            EXPIRED_TOKEN_CODE,
+            EXPIRED_TOKEN_STATUS,
+            message,
+        ),
+        TokenRefusal::Unrecognised => crate::scaffolded::Scaffolded::Modeled(modeled(message)),
+    }
+}
+
 /// Render a page cursor as the opaque `nextToken` the next request replays.
 /// `nextToken` is modelled as an opaque string, so the authenticated bytes are
 /// rendered in hex, an alphabet that survives any transport. Two things travel with

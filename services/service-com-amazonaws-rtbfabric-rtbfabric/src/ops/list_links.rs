@@ -199,8 +199,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(token) => Some(
                 crate::state::decode_next_token(&token_key, &walk, token, now).map_err(
                     |refusal| {
-                        ListLinksErrorModeled::ValidationException(ValidationException {
-                            message: refusal.message(Self::NAME),
+                        crate::state::token_refusal(&refusal, Self::NAME, |message| {
+                            ListLinksErrorModeled::ValidationException(ValidationException {
+                                message,
+                            })
                         })
                     },
                 )?,

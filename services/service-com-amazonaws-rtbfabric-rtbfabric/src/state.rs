@@ -39,8 +39,8 @@ pub use external_links::{
     CONNECTIVITY_TYPE_EXTERNAL_INBOUND, CONNECTIVITY_TYPE_PUBLIC_EGRESS,
 };
 pub use page_tokens::{
-    decode_next_token, encode_next_token, PageTokenKey, TokenRefusal, Walk, MAX_TOKEN_LENGTH,
-    TOKEN_LIFETIME,
+    decode_next_token, encode_next_token, token_refusal, PageTokenKey, TokenRefusal, Walk,
+    EXPIRED_TOKEN_CODE, EXPIRED_TOKEN_STATUS, MAX_TOKEN_LENGTH, TOKEN_LIFETIME,
 };
 pub use paging::{page_of, page_size, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE};
 pub use routing_rules::{
