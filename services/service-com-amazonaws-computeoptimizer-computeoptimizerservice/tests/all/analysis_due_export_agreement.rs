@@ -13,9 +13,11 @@
 //! What is asserted is the whole class of surfaces against the rule: one row per resource type
 //! this service both reads and exports an analysis of, each row differing in the resource type,
 //! in the member its reader reports a resource's ARN under and in the column its export file
-//! names it under. `GetECSServiceRecommendations` is not a row: an Amazon ECS service
-//! recommendation is computed from the Amazon ECS inventory and the utilization published for
-//! it, so it is not read from the analysis this gate governs.
+//! names it under. `GetECSServiceRecommendations` is not a row for a setup reason rather than a
+//! rule one: an Amazon ECS service recommendation is computed from the Amazon ECS inventory and
+//! the utilization published for it, so a row of it would need both of those stores mounted on
+//! this emulator — it obeys the same gate, and its reader and export are driven through the
+//! four phases of one enrollment in `crate::ecs_service_recommendations`.
 //!
 //! Every call goes through the front door a client uses: the Compute Optimizer calls as
 //! `POST /` with `X-Amz-Target`, the export file downloaded from its destination bucket over

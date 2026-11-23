@@ -32,8 +32,8 @@ use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::MAX_P
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    call, call_ecs, call_in_region, emulator_with_analysed_services_and_engine, error_code, opt_in,
-    seed_cloudwatch_series, ACCOUNT, REGION,
+    call, call_ecs, call_in_region, emulator_with_analysed_services_and_engine, error_code,
+    make_analysis_due, opt_in, seed_cloudwatch_series, ACCOUNT, REGION,
 };
 
 /// The two `AWS/ECS` series an ECS service recommendation is computed from.
@@ -162,10 +162,17 @@ impl Case {
     }
 }
 
-/// An emulator holding every [`cases`] service, opted in, with its utilization published.
+/// An emulator holding every [`cases`] service, opted in with the analysis its enrollment
+/// started already due, with its utilization published.
+///
+/// The analysis is made due by moving the stored enrollment instant back a span
+/// ([`make_analysis_due`]) rather than by waiting for the clock to reach it: this reader
+/// projects a recommendation only once the analysis exists, which is the gate every
+/// recommendation reader of this service applies.
 async fn emulator_with_cases() -> MultiServiceRouter {
     let (router, engine) = emulator_with_analysed_services_and_engine();
     opt_in(&router).await;
+    make_analysis_due(&engine);
     create_cluster(&router, CLUSTER, "setup").await;
     let published_at = now_secs() - 3_600;
     for case in cases() {
@@ -585,10 +592,12 @@ async fn a_request_with_no_series_to_report_is_refused_or_answered_empty() {
     );
 }
 
-/// The service analyses an account's resources only once it has opted in: an account that
-/// never opted in reads no projection at all.
+/// The service analyses an account's resources only once it has opted in AND the analysis that
+/// enrollment started is due: an account that never opted in reads no projection at all, one
+/// that has JUST opted in reads no projection yet, and once the analysis is due the projection
+/// is served.
 #[tokio::test]
-async fn the_read_waits_for_the_enrollment() {
+async fn the_read_waits_for_the_enrollment_and_the_analysis() {
     let (router, engine) = emulator_with_analysed_services_and_engine();
     let case = &cases()[0];
     create_cluster(&router, CLUSTER, "setup").await;
@@ -646,10 +655,22 @@ async fn the_read_waits_for_the_enrollment() {
     );
 
     opt_in(&router).await;
-    let response = projected_ok(&router, "once opted in", body).await;
+    let response = projected_ok(&router, "just opted in", body.clone()).await;
+    assert_eq!(
+        options_of("just opted in", &response),
+        Vec::<Value>::new(),
+        "case \"just opted in\": the analysis this enrollment started is not due, so there is \
+         nothing to project, got {response}"
+    );
+
+    // The analysis is due because its stored instant is already past ([`make_analysis_due`]),
+    // not because this test waited for the clock to reach it.
+    make_analysis_due(&engine);
+    let response = projected_ok(&router, "the analysis is due", body).await;
     assert!(
-        !options_of("once opted in", &response).is_empty(),
-        "once the account is opted in the projection is served, got {response}"
+        !options_of("the analysis is due", &response).is_empty(),
+        "case \"the analysis is due\": once the analysis exists the projection is served, got \
+         {response}"
     );
 }
 

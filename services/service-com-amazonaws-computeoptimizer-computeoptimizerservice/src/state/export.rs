@@ -1054,8 +1054,8 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     ) -> Vec<ExportRow> {
         // The Amazon ECS service recommendations the plan resolved. That analysis is computed
         // from the Amazon ECS inventory and the utilization published for it rather than
-        // recorded with this account's enrollment, so it carries the gate its READER carries
-        // (already applied when the plan resolved it) rather than the stored analysis's.
+        // recorded with this account's enrollment, so its rows come from the sweep the plan
+        // resolved \u2014 under the same visibility gate asked just below, which that sweep applied.
         if plan.resource_type == RESOURCE_TYPE_ECS_SERVICE {
             return plan
                 .analysed_ecs_services

@@ -48,7 +48,8 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::harness::{
     call, call_ecs, call_in_region, cell, create_bucket, csv_rows,
     emulator_with_analysed_services, emulator_with_analysed_services_and_engine, error_code,
-    export_destination, get_object, opt_in, seed_cloudwatch_series, summary_of, summary_set,
+    export_destination, get_object, make_analysis_due, opt_in, seed_cloudwatch_series, summary_of,
+    summary_set,
     REGION,
 };
 
@@ -72,6 +73,22 @@ const PRICE_PER_VCPU_HOUR: f64 = 0.040_48;
 const PRICE_PER_GB_HOUR: f64 = 0.004_445;
 /// Hours in a month, the factor an hourly price becomes a monthly figure by: 365 × 24 / 12.
 const HOURS_PER_MONTH: f64 = 730.0;
+
+/// The emulator every analysis suite below drives: Compute Optimizer over the Amazon ECS and
+/// CloudWatch stores of ONE engine, with the account opted in AND the analysis its enrollment
+/// started already due.
+///
+/// Both halves are the gate this reader applies: Compute Optimizer reports an analysis to an
+/// ENROLLED account only, and only once the analysis that enrollment starts has been produced.
+/// The second half is made true by moving the stored enrollment instant back a span
+/// ([`make_analysis_due`]) rather than by waiting for the clock to reach it, so the condition
+/// holds however fast or loaded the host is.
+async fn enrolled_emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    let (router, engine) = emulator_with_analysed_services_and_engine();
+    opt_in(&router).await;
+    make_analysis_due(&engine);
+    (router, engine)
+}
 
 /// One row of the analysis table: a service's persisted size, what was observed for it, and
 /// the recommendation that follows.
@@ -103,8 +120,7 @@ struct AnalysisCase {
 
 #[tokio::test]
 async fn a_recommendation_is_computed_from_the_service_and_its_observed_utilization() {
-    let (router, engine) = emulator_with_analysed_services_and_engine();
-    opt_in(&router).await;
+    let (router, engine) = enrolled_emulator().await;
     let cluster = "analysis";
     create_cluster(&router, cluster, "setup").await;
     let published_at = now_secs() - 3_600;
@@ -537,8 +553,7 @@ async fn a_recommendation_is_computed_from_the_service_and_its_observed_utilizat
 /// ones, because no Savings Plans commitment is recorded against a service's Fargate spend.
 #[tokio::test]
 async fn after_discount_savings_are_reported_only_when_the_preference_activates_them() {
-    let (router, engine) = emulator_with_analysed_services_and_engine();
-    opt_in(&router).await;
+    let (router, engine) = enrolled_emulator().await;
     let cluster = "discounts";
     create_cluster(&router, cluster, "setup").await;
     let published_at = now_secs() - 3_600;
@@ -653,8 +668,7 @@ struct ErrorCase {
 
 #[tokio::test]
 async fn a_service_with_no_analysis_input_is_absent_or_reported_as_unsupported() {
-    let (router, engine) = emulator_with_analysed_services_and_engine();
-    opt_in(&router).await;
+    let (router, engine) = enrolled_emulator().await;
     let cluster = "errors";
     create_cluster(&router, cluster, "setup").await;
 
@@ -924,10 +938,197 @@ async fn a_malformed_request_is_refused_and_an_unenrolled_account_has_no_analysi
     );
 }
 
+/// Compute Optimizer reports an analysis of an account's Amazon ECS services to an ENROLLED
+/// account only, and only once the analysis that enrollment started has been produced — so an
+/// account that has JUST opted in reads no Amazon ECS analysis yet, exactly as it reads none of
+/// any other resource type of this service.
+///
+/// One enrollment is driven through its four phases — never opted in, just opted in, the
+/// analysis due, opted back out — and in each of them every shape of request this reader takes
+/// is asked, because the gate is about the ANALYSIS and not about one request: the sweep that
+/// names nothing, a request naming a service the analysis has every input for, one naming a
+/// service Compute Optimizer does not analyse (whose `errors` entry is a statement about the
+/// analysis too), and one naming both. The summary of the same services is asked beside them,
+/// since it counts what this reader reports and the two cannot disagree about whether an
+/// analysis exists yet.
+#[tokio::test]
+async fn every_ecs_service_read_waits_for_the_enrollment_and_the_analysis() {
+    let (router, engine) = emulator_with_analysed_services_and_engine();
+    let cluster = "gated";
+    create_cluster(&router, cluster, "setup").await;
+    let family = "gatedfamily";
+    register_task_definition(&router, family, "1024", "2048", "setup").await;
+    // One Fargate service with both of its series inside the look-back window — everything the
+    // analysis needs — and one on container instances, which Compute Optimizer does not analyse.
+    let analysable =
+        create_service(&router, cluster, "fargate", family, "FARGATE", 2, "setup").await;
+    let unsupported =
+        create_service(&router, cluster, "oncontainers", family, "EC2", 1, "setup").await;
+    let published_at = now_secs() - 3_600;
+    publish(&engine, cluster, "fargate", CPU_METRIC, &[14.0, 9.0], published_at);
+    publish(
+        &engine,
+        cluster,
+        "fargate",
+        MEMORY_METRIC,
+        &[21.0, 17.0],
+        published_at,
+    );
+
+    // Every shape of request this reader takes, each of which reports an analysis.
+    let reads: [(&str, Value); 4] = [
+        ("the sweep", json!({})),
+        (
+            "the analysable service by ARN",
+            json!({ "serviceArns": [analysable.clone()] }),
+        ),
+        (
+            "an unsupported service by ARN",
+            json!({ "serviceArns": [unsupported.clone()] }),
+        ),
+        (
+            "both services by ARN",
+            json!({ "serviceArns": [analysable.clone(), unsupported.clone()] }),
+        ),
+    ];
+
+    // Phase: never opted in. The account holds no analysis at all, so every read is refused
+    // with the modelled 403 — including the summary of the same services.
+    for (row, request) in &reads {
+        let case = format!("never opted in/{row}");
+        let (status, body) =
+            call(&router, "GetECSServiceRecommendations", request.clone()).await;
+        assert_eq!(
+            status, 403,
+            "case {case:?}: an account that is not opted in reads no analysis, expected 403, \
+             got {status}: {body}"
+        );
+        assert!(
+            error_code(&body).contains("OptInRequiredException"),
+            "case {case:?}: expected OptInRequiredException, got {body}"
+        );
+    }
+
+    // Phase: just opted in. The analysis this enrollment started is not due yet, so there is
+    // nothing analysed — which is no failed request: each read is the successful empty answer,
+    // with no error entry either, because a service nothing has analysed is no error of the
+    // request.
+    opt_in(&router).await;
+    for (row, request) in &reads {
+        let case = format!("just opted in/{row}");
+        let (status, body) =
+            call(&router, "GetECSServiceRecommendations", request.clone()).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: an account with nothing analysed is not a failed request, expected \
+             200, got {status}: {body}"
+        );
+        assert_eq!(
+            list(&body, "ecsServiceRecommendations", &case),
+            Vec::<Value>::new(),
+            "case {case:?}: the analysis is not due yet, so no Amazon ECS service is reported, \
+             got {body}"
+        );
+        assert_eq!(
+            list(&body, "errors", &case),
+            Vec::<Value>::new(),
+            "case {case:?}: the analysis is not due yet, so no service of it is an error of the \
+             request, got {body}"
+        );
+        assert_eq!(
+            body["nextToken"],
+            Value::Null,
+            "case {case:?}: an empty answer continues nowhere, got {body}"
+        );
+    }
+    let answer = summary_set(&router, "just opted in/the summary", json!({})).await;
+    let summary = summary_of("just opted in/the summary", &answer, SUMMARY_RESOURCE_TYPE);
+    for entry in summary["summaries"].as_array().cloned().unwrap_or_default() {
+        assert_eq!(
+            entry["value"].as_f64(),
+            Some(0.0),
+            "case \"just opted in/the summary\": nothing is analysed yet, so every finding \
+             counts zero Amazon ECS services, got {entry}"
+        );
+    }
+
+    // Phase: the analysis is due, because its stored instant is already past
+    // ([`make_analysis_due`]) and not because this test waited for the clock to reach it. The
+    // same reads now report the analysis: the analysable service, and the unsupported one as an
+    // error of a request that names it.
+    make_analysis_due(&engine);
+    for (row, request) in &reads {
+        let case = format!("the analysis is due/{row}");
+        let (status, body) =
+            call(&router, "GetECSServiceRecommendations", request.clone()).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: once the analysis is due it is served, expected 200, got {status}: \
+             {body}"
+        );
+        let reported: Vec<String> = list(&body, "ecsServiceRecommendations", &case)
+            .iter()
+            .map(|found| found["serviceArn"].as_str().unwrap_or_default().to_string())
+            .collect();
+        let failed: Vec<String> = list(&body, "errors", &case)
+            .iter()
+            .map(|error| error["identifier"].as_str().unwrap_or_default().to_string())
+            .collect();
+        // A request naming only the unsupported service reports no recommendation; every other
+        // row reports the analysable one.
+        let expects_recommendation = *row != "an unsupported service by ARN";
+        assert_eq!(
+            reported.contains(&analysable),
+            expects_recommendation,
+            "case {case:?}: once the analysis is due the analysable service is reported exactly \
+             where the request puts it in scope, got {reported:?}"
+        );
+        // The sweep reports no error for a service it was not asked about; a request that names
+        // the unsupported service reports it.
+        let names_unsupported = *row != "the sweep" && *row != "the analysable service by ARN";
+        assert_eq!(
+            failed.contains(&unsupported),
+            names_unsupported,
+            "case {case:?}: a service Compute Optimizer does not analyse is an error only of a \
+             request that names it, got {failed:?}"
+        );
+    }
+    let analysed = assert_summary_counts_the_reader(&router, "the analysis is due/the summary").await;
+    assert_eq!(
+        analysed.len(),
+        1,
+        "case \"the analysis is due/the summary\": the one analysable service is reported and \
+         counted, got {analysed:?}"
+    );
+
+    // Phase: opted back out. The gate is the STORED enrollment, not whether the account ever
+    // enrolled, so the analysis is gone again however long ago it came due.
+    let (status, body) = call(
+        &router,
+        "UpdateEnrollmentStatus",
+        json!({ "status": "Inactive" }),
+    )
+    .await;
+    assert_eq!(status, 200, "opting out: expected 200, got {status}: {body}");
+    for (row, request) in &reads {
+        let case = format!("opted back out/{row}");
+        let (status, body) =
+            call(&router, "GetECSServiceRecommendations", request.clone()).await;
+        assert_eq!(
+            status, 403,
+            "case {case:?}: an account that opted out reads no analysis, expected 403, got \
+             {status}: {body}"
+        );
+        assert!(
+            error_code(&body).contains("OptInRequiredException"),
+            "case {case:?}: expected OptInRequiredException, got {body}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn recommendations_are_paged_in_arn_order_and_filtered_by_finding() {
-    let (router, engine) = emulator_with_analysed_services_and_engine();
-    opt_in(&router).await;
+    let (router, engine) = enrolled_emulator().await;
     let cluster = "paging";
     create_cluster(&router, cluster, "setup").await;
     let published_at = now_secs() - 3_600;
@@ -1043,8 +1244,7 @@ async fn recommendations_are_paged_in_arn_order_and_filtered_by_finding() {
 /// account can address — the rule holds for each of them, not just one.
 #[tokio::test]
 async fn only_the_services_of_the_requested_region_are_analysed() {
-    let (router, engine) = emulator_with_analysed_services_and_engine();
-    opt_in(&router).await;
+    let (router, engine) = enrolled_emulator().await;
     let cluster = "regional";
     create_cluster(&router, cluster, "setup").await;
     let family = "regionalfamily";
@@ -1139,8 +1339,7 @@ async fn only_the_services_of_the_requested_account_are_analysed() {
         "the other-account rows must not name the account this service answers for \
          ({ACCOUNT}), got {OTHER_ACCOUNTS:?}"
     );
-    let (router, engine) = emulator_with_analysed_services_and_engine();
-    opt_in(&router).await;
+    let (router, engine) = enrolled_emulator().await;
     let cluster = "ownership";
     create_cluster(&router, cluster, "setup").await;
     let family = "ownershipfamily";
@@ -1528,8 +1727,7 @@ struct SummaryCase {
 /// one has no published utilization, so neither reader counts either of them.
 #[tokio::test]
 async fn the_ecs_service_summary_counts_the_services_this_reader_reports() {
-    let (router, engine) = emulator_with_analysed_services_and_engine();
-    opt_in(&router).await;
+    let (router, engine) = enrolled_emulator().await;
     let cluster = "summaries";
     create_cluster(&router, cluster, "setup").await;
     let published_at = now_secs() - 3_600;
@@ -1993,8 +2191,7 @@ fn exported_services() -> Vec<ExportedService> {
 /// opted in — everything an export of these recommendations needs, created the way a client
 /// creates it.
 async fn export_emulator(case: &str) -> MultiServiceRouter {
-    let (router, engine) = emulator_with_analysed_services_and_engine();
-    opt_in(&router).await;
+    let (router, engine) = enrolled_emulator().await;
     create_bucket(&router, EXPORT_BUCKET).await;
     create_cluster(&router, EXPORT_CLUSTER, case).await;
     let published_at = now_secs() - 3_600;

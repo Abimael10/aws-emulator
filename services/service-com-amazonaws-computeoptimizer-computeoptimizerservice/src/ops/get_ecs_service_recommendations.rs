@@ -331,7 +331,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The enrollment gate, ahead of every read of another service's store: an account
         // that is not opted in has no analysis at all.
-        if !state.lock().enrollment.is_opted_in() {
+        //
+        // The other half of the same rule is the visibility gate every recommendation reader
+        // of this service applies ([`crate::state::Enrollment::analysis_visible`]): an account
+        // that has JUST opted in holds no analysis either, because the analysis its enrollment
+        // started is not due yet, whatever another service's inventory holds. An account with
+        // nothing analysed is no failed request, so the answer is the successful EMPTY result
+        // this reader gives an account that owns no analysed service — with an empty `errors`
+        // too, since a service the analysis has not reached is no error of the request.
+        let enrollment = state.lock().enrollment.clone();
+        if !enrollment.is_opted_in() {
             return Err(
                 GetECSServiceRecommendationsErrorModeled::OptInRequiredException(
                     OptInRequiredException {
@@ -342,6 +351,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
+        }
+        if !enrollment.analysis_visible() {
+            return Ok(GetECSServiceRecommendationsOutput {
+                next_token: None,
+                ecs_service_recommendations: Some(Vec::new()),
+                errors: Some(Vec::new()),
+            });
         }
 
         // The services in scope, in ARN order so a page boundary is stable across calls:

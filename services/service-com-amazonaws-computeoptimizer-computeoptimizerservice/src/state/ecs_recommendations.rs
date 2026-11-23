@@ -158,10 +158,12 @@ pub fn ecs_candidate_preferences(
 /// ([`analysed_ecs_service_resources`]) — so the file an export job writes, and the counts a
 /// summary states, hold exactly the recommendations a read of the same moment reports.
 ///
-/// The gate is the one the reader applies: an account that is not opted in holds no analysis at
-/// all. The analysis itself is computed from another service's inventory and the utilization
-/// published for it rather than recorded with this account's enrollment, so it is not the stored
-/// analysis [`Enrollment::analysis_visible`] governs.
+/// The gate is the one the reader applies, which is the gate every reader of this service
+/// applies ([`Enrollment::analysis_visible`]): an account that never opted in, one that opted
+/// out and one that has just opted in — whose analysis is not due yet — hold no analysis at
+/// all, whatever another service's inventory holds. That a recommendation is COMPUTED from
+/// that inventory rather than recorded with the account's enrollment decides what an analysis
+/// says, not whether it exists yet.
 ///
 /// Reads only: the ECS inventory and the CloudWatch series are another service's state, and this
 /// writes to neither, nor to this service's own store.
@@ -211,7 +213,7 @@ fn analysed_ecs_service_analyses<Eng: Send + Sync + 'static>(
     account_id: &str,
     now: f64,
 ) -> Vec<(EcsServiceCandidate, ECSServiceRecommendation)> {
-    if !store.enrollment.is_opted_in() {
+    if !store.enrollment.analysis_visible() {
         return Vec::new();
     }
     // The inventory holds the resources of the ONE account this emulator presents

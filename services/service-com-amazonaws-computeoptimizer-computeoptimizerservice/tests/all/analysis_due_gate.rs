@@ -16,6 +16,13 @@
 //! an empty list from a lister, counts of zero from the roll-up, whose entries are the
 //! resource types the service reports recommendations for and so exist as soon as the
 //! account is enrolled, and an empty list of projections from a reader of one resource.
+//!
+//! The two Amazon ECS readers obey the same rule and are driven through the same four phases
+//! in `crate::ecs_service_recommendations` and
+//! `crate::ecs_service_recommendation_projected_metrics` instead of being rows here: their
+//! analysis is computed from the Amazon ECS and CloudWatch stores, so each needs an emulator
+//! with those mounted and a service created and published for in them, which is the fixture
+//! those suites own.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -72,7 +79,8 @@ struct Reader {
 /// The listers are the ones `tests/all/timestamp_probe.rs` reads one analysis through, plus
 /// the two the findings catalog answers (`GetRDSDatabaseRecommendations` and the summary
 /// reader); the per-resource rows are the two projected-metrics readers, each naming a
-/// resource of the store's own analysis.
+/// resource of the store's own analysis. The two Amazon ECS readers are driven through the
+/// same four phases by the suites that own their fixture (see this module's header).
 fn readers(instance_arn: &str, database_arn: &str) -> Vec<Reader> {
     let lister = |operation: &'static str, items: &'static str| Reader {
         operation,

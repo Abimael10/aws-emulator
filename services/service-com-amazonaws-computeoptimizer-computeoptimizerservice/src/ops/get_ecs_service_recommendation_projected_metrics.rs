@@ -288,9 +288,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The enrollment gate, ahead of every read of another service's store: "The account
         // is not opted in to Compute Optimizer" — the service analyses an account's resources
         // only once it has opted in, so an account that never did, or that opted back out,
-        // reads no recommendation and no projection of one. The look-back period in force for
-        // the service comes from the same store, by the scope precedence every preference read
-        // of this service uses.
+        // reads no recommendation and no projection of one. An account that has JUST opted in
+        // holds no analysis either: the analysis its enrollment started is not due yet
+        // ([`crate::state::Enrollment::analysis_visible`], the gate every recommendation
+        // reader of this service applies), so a service of it is answered exactly as one this
+        // service holds no analysis for — the empty list of projections, a successful response
+        // rather than a failure. The look-back period in force for the service comes from the
+        // same store, by the scope precedence every preference read of this service uses.
         let look_back_period = {
             let preferences = state.lock();
             if !preferences.enrollment.is_opted_in() {
@@ -304,6 +308,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into(),
                 );
+            }
+            if !preferences.enrollment.analysis_visible() {
+                return Ok(no_projection());
             }
             preferences
                 .effective_preferences_for(
