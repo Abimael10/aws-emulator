@@ -3,8 +3,10 @@
 //! End-to-end tests for the application names this service serves, driven over
 //! the wire (restJson1) through the same router the emulator boots.
 //!
-//! RULE: an operation whose request carries an `app` member serves only the
-//! applications the member's own documentation lists; a name outside that set is
+//! RULE: an operation whose request carries an `app` member serves exactly the
+//! applications the SERVICE serves (`state::SUPPORTED_APPLICATIONS`), which is
+//! the member's documented snapshot of that set plus every application AppFabric
+//! serves that the snapshot does not list; a name outside the served set is
 //! refused with the modelled `ValidationException` (HTTP 400) carrying the
 //! sentence `app <app> is not supported`, naming `app` as the member at fault,
 //! before anything is written — so a refused call leaves the bundle holding
@@ -13,10 +15,10 @@
 //!
 //! The tables span the whole set rather than one recorded call: every served
 //! name, and names outside it of each form a wrong one takes (the one the
-//! recording carried, another vendor's product, a lower-case spelling of a
-//! served name, a near miss of one, a served name with a trailing space, and a
-//! name at the member's own `@length` ceiling), crossed with the two operations
-//! that carry the member (`CreateAppAuthorization` and `CreateIngestion`).
+//! recording carried, a lower-case spelling of a served name, two near misses of
+//! one, a served name with a trailing space, and a name at the member's own
+//! `@length` ceiling), crossed with the two operations that carry the member
+//! (`CreateAppAuthorization` and `CreateIngestion`).
 //!
 //! The harness (the router, `Answer`, `encode`, `arn_of`) is the one
 //! `app_bundle_ingestion_lifecycle` already builds.
@@ -25,11 +27,13 @@ use serde_json::{json, Value};
 
 use crate::app_bundle_ingestion_lifecycle::{arn_of, encode, Answer, Emulator};
 
-/// The applications the service serves, from the value set the model's own
-/// documentation of the member gives
+/// The applications the service serves (`state::SUPPORTED_APPLICATIONS`): the
+/// value set the model's own documentation of the member gives
 /// (`smithy_query(query="doc",shape="CreateAppAuthorizationRequest",member="app")`:
 /// "The name of the application. Valid values are: SLACK ASANA JIRA M365
-/// M365AUDITLOGS ZOOM ZENDESK OKTA GOOGLE DROPBOX SMARTSHEET CISCO").
+/// M365AUDITLOGS ZOOM ZENDESK OKTA GOOGLE DROPBOX SMARTSHEET CISCO"), which is a
+/// snapshot, followed by the applications AppFabric serves that the snapshot
+/// does not list.
 const SERVED_APPS: &[&str] = &[
     "SLACK",
     "ASANA",
@@ -43,6 +47,7 @@ const SERVED_APPS: &[&str] = &[
     "DROPBOX",
     "SMARTSHEET",
     "CISCO",
+    "PAGERDUTY",
 ];
 
 /// The tenant each row below authorizes, as the row's index makes it distinct.
@@ -181,9 +186,9 @@ async fn held_ingestions(emulator: &Emulator, bundle: &str) -> Vec<String> {
 fn unserved_apps() -> Vec<(&'static str, String)> {
     vec![
         ("the name the recording carried", "NOT_A_REAL_SUPPORTED_APP".to_string()),
-        ("another vendor's product", "PAGERDUTY".to_string()),
         ("a lower-case spelling of a served name", "slack".to_string()),
         ("a near miss of a served name", "M365AUDITLOG".to_string()),
+        ("a served name spelled with a separator", "PAGER_DUTY".to_string()),
         ("a served name with a trailing space", "SLACK ".to_string()),
         // The member is `String255` (@length min 1 max 255), so a name of 255
         // characters passes the wire schema and reaches the service's own set.

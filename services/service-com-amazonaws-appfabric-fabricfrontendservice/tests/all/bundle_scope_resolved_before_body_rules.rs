@@ -40,10 +40,16 @@ const BUNDLE_NOT_VALID_MESSAGE: &str = "The specified app bundle ID is not valid
 /// `smithy_query(query="doc",shape="CreateAppAuthorizationRequest",member="app")`).
 const APPS: &[&str] = &["SLACK", "M365AUDITLOGS"];
 
-/// Names OUTSIDE that set, for the rows whose fault is the application name
-/// itself: another vendor's product, a lower-case spelling of a served name and
-/// a near miss of one.
-const UNSUPPORTED_APPS: &[&str] = &["PAGERDUTY", "slack", "M365AUDITLOG"];
+/// Names OUTSIDE the set the service serves (`state::SUPPORTED_APPLICATIONS`),
+/// for the rows whose fault is the application name itself: a name no
+/// application has, a lower-case spelling of a served name and two near misses
+/// of served names.
+const UNSUPPORTED_APPS: &[&str] = &[
+    "NOT_A_REAL_SUPPORTED_APP",
+    "slack",
+    "M365AUDITLOG",
+    "PAGER_DUTY",
+];
 
 /// The sentence `CreateIngestion` refuses an (application, tenant) pair whose
 /// app bundle holds no app authorization for it with — see

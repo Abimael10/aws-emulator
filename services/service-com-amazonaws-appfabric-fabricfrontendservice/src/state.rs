@@ -151,17 +151,33 @@ pub const AUTH_TYPE_OAUTH2: &str = "oauth2";
 pub const APP_AUTHORIZATION_PERSONA_ADMIN: &str = "admin";
 
 /// The applications this service supports, which is the value set its `app`
-/// member is closed over.
+/// member is checked against.
 ///
-/// The member targets `String255`, so the MODEL constrains only its length; the
-/// set of names is stated in the member's own documentation
+/// The member targets `String255`, so the MODEL constrains only its length: the
+/// set of names is the SERVICE's, enforced by it rather than by the wire schema,
+/// and the list the member's own documentation carries
 /// (`smithy_query(query="doc",shape="CreateAppAuthorizationRequest",member="app")`:
 /// "The name of the application. Valid values are: SLACK ASANA JIRA M365
-/// M365AUDITLOGS ZOOM ZENDESK OKTA GOOGLE DROPBOX SMARTSHEET CISCO") and is
-/// enforced by the service rather than by the wire schema. The names are
-/// compared exactly: each one is a fixed upper-case token, so a different
-/// spelling of one is a different value and names no supported application.
+/// M365AUDITLOGS ZOOM ZENDESK OKTA GOOGLE DROPBOX SMARTSHEET CISCO") is a
+/// SNAPSHOT of that set, not its definition — AppFabric onboards applications
+/// without that member's documentation being regenerated, so an application is
+/// served because the service serves it, not because the snapshot happens to
+/// name it. The set below is therefore the documented snapshot PLUS every
+/// application this service is known to serve beyond it, and a name is served
+/// for every operation that carries the member, not only for the one it was
+/// first seen on.
+///
+/// The names are compared exactly: each one is a fixed upper-case token, so a
+/// different spelling of one is a different value and names no supported
+/// application.
+///
+/// A name past the snapshot is added on EVIDENCE that AppFabric serves that
+/// application under that exact token, never on a guess at how it would be
+/// spelled: a guessed token would make this emulator serve a name the service
+/// refuses. So the absence of an application AppFabric serves is a gap in the
+/// evidence, not a statement that the service refuses it.
 pub const SUPPORTED_APPLICATIONS: &[&str] = &[
+    // The applications the member's documented snapshot lists.
     "SLACK",
     "ASANA",
     "JIRA",
@@ -174,6 +190,11 @@ pub const SUPPORTED_APPLICATIONS: &[&str] = &[
     "DROPBOX",
     "SMARTSHEET",
     "CISCO",
+    // Applications the service serves that the snapshot above does not list.
+    // PagerDuty is one: an `app` of `PAGERDUTY` is authorized, ingested and
+    // reported on exactly like a listed one, so refusing it would refuse an
+    // application AppFabric serves.
+    "PAGERDUTY",
 ];
 
 /// Whether `app` names one of the applications this service supports (see

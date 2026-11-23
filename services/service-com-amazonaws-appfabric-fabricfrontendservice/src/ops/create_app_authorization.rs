@@ -23,11 +23,11 @@
 //!
 //! `app` is a third: the model types it as a plain `String255`, so the wire
 //! schema bounds its LENGTH only, while the set of applications the service
-//! serves is stated in the member's own documentation
-//! ([`crate::state::SUPPORTED_APPLICATIONS`]) and enforced by the service — an
-//! application name outside that set is refused with the modelled
-//! `ValidationException` (HTTP 400) before anything is written, so no
-//! authorization is created for it.
+//! serves is the SERVICE's own ([`crate::state::SUPPORTED_APPLICATIONS`]) —
+//! which holds every application AppFabric serves, including ones the member's
+//! documented snapshot of the set does not list. An application name outside
+//! that set is refused with the modelled `ValidationException` (HTTP 400)
+//! before anything is written, so no authorization is created for it.
 //!
 //! No rule over the request's own members is judged before
 //! `appBundleIdentifier` is resolved: the bundle the URI names is the scope this
@@ -264,8 +264,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `authType` is closed by the model (`AUTH_TYPE_VALUES`), so the
         // boundary validator has already refused anything outside it. `app` is
         // typed as an open `String255`, so the wire schema checks only its
-        // length: the set of applications the service serves is stated in the
-        // member's documentation and enforced here (see
+        // length: the set of applications the service serves is the service's
+        // own and is enforced here (see
         // [`crate::state::SUPPORTED_APPLICATIONS`]), before anything is
         // written, so a name outside it creates no authorization.
         if !crate::state::is_supported_app(&input.app) {

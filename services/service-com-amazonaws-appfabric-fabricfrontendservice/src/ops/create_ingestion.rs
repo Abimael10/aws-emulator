@@ -19,10 +19,14 @@
 //!
 //! `app` itself is a rule over the REQUEST: the model types it as a plain
 //! `String255`, so the wire schema bounds its length only, while the set of
-//! applications the service serves is stated in the member's own documentation
-//! ([`crate::state::SUPPORTED_APPLICATIONS`]) and enforced by the service — an
-//! application name outside that set is refused with the modelled
-//! `ValidationException` (HTTP 400) before anything is written.
+//! applications the service serves is the SERVICE's own
+//! ([`crate::state::SUPPORTED_APPLICATIONS`]), which holds every application
+//! AppFabric serves rather than only the ones the member's documented snapshot
+//! lists — an application name outside that set is refused with the modelled
+//! `ValidationException` (HTTP 400) before anything is written. An application
+//! the service DOES serve is never refused on its name, so what such a request
+//! is refused for is the precondition it really misses: the connected app
+//! authorization the guard further down judges.
 //!
 //! The `tags` the request carries are stored as the MAP they are (see
 //! [`crate::state::tag_set`]), so a key the list repeats is held once with the
@@ -240,13 +244,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `app` is typed as an open `String255` in the model, so the wire schema
         // bounds its LENGTH only; the set of applications the service serves is
-        // stated in the member's own documentation and enforced here (see
+        // the service's own and is enforced here (see
         // [`crate::state::SUPPORTED_APPLICATIONS`]) — the same member, the same
         // set and the same refusal as on the authorization this ingestion hangs
         // off. It is judged before anything is written, so a name outside the
-        // set creates no ingestion. What this operation requires of the
-        // (application, tenant) pair BEYOND the name is a CONNECTED app
-        // authorization, which the guard further down judges.
+        // set creates no ingestion, while a name INSIDE it passes this guard
+        // whatever the store holds for the pair: what this operation requires of
+        // the (application, tenant) pair BEYOND the name is a CONNECTED app
+        // authorization, which the guard further down judges and reports on its
+        // own.
         if !crate::state::is_supported_app(&input.app) {
             return Err(CreateIngestionErrorModeled::ValidationException(
                 crate::state::app_not_supported(&input.app),
