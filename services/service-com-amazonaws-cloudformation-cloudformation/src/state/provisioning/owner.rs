@@ -94,6 +94,10 @@ impl Owner {
             Self::IotProvisioningResource(kind) => {
                 iot_provisioning_resources::create(ctx, region, kind, resource, propagated).await
             }
+            // A THING carries no tags of its own: `AWS::IoT::Thing` publishes no `Tags`
+            // property and AWS IoT's tagging calls address no thing, so CloudFormation
+            // propagates none to it ([`iot_thing::create`]).
+            Self::IotThing => iot_thing::create(ctx, region, resource).await,
             // A topic rule IS taggable: `TagResource` addresses one by the ARN its create
             // minted, so it carries the tags CloudFormation gives the resource beside its own
             // ([`iot_topic_rule::create`]).
@@ -366,6 +370,8 @@ impl Owner {
             // A provisioning template and a role alias each EXIST from the moment their
             // create answers ([`iot_provisioning_resources::ready`]).
             Self::IotProvisioningResource(_) => Ok(iot_provisioning_resources::ready()),
+            // A thing EXISTS from the moment `CreateThing` answers ([`iot_thing::ready`]).
+            Self::IotThing => Ok(iot_thing::ready()),
             // A rule is LIVE the moment `CreateTopicRule` answers
             // ([`iot_topic_rule::ready`]).
             Self::IotTopicRule => Ok(iot_topic_rule::ready()),
@@ -557,8 +563,9 @@ impl Owner {
             // either is up.
             Self::IotProvisioningResource(_) => Ok(BTreeMap::new()),
             // A topic rule's `Arn` is the one its create read back from the service that
-            // minted it, so there is nothing left to read once the rule is up.
-            Self::IotTopicRule => Ok(BTreeMap::new()),
+            // minted it, and a thing's `Arn` and `Id` are the ones `CreateThing` answered, so
+            // there is nothing left to read once either is up.
+            Self::IotTopicRule | Self::IotThing => Ok(BTreeMap::new()),
             // A distribution's id and domain name, and an origin access control's id, are the
             // ones their own creates answered with, so there is nothing left to read once
             // either resource is up.
@@ -749,6 +756,9 @@ impl Owner {
                 efs_resources::removal(ctx, region, kind, physical_resource_id).await
             }
             Self::IotProvisioningResource(_) => Ok(iot_provisioning_resources::removal()),
+            // `DeleteThing` takes the thing's record away as it answers too
+            // ([`iot_thing::removal`]).
+            Self::IotThing => Ok(iot_thing::removal()),
             // `DeleteTopicRule` takes the rule away as it answers too
             // ([`iot_topic_rule::removal`]).
             Self::IotTopicRule => Ok(iot_topic_rule::removal()),
@@ -969,6 +979,12 @@ impl Owner {
             Self::IotProvisioningResource(kind) => {
                 iot_provisioning_resources::update(ctx, region, kind, resource, declared).await
             }
+            // `UpdateThing` writes the attribute list of the thing it addresses by name, so a
+            // changed declaration is applied in place and the thing keeps its identity, its ARN
+            // and its id ([`iot_thing::update`]).
+            Self::IotThing => iot_thing::update(ctx, region, resource, declared)
+                .await
+                .map(Some),
             // `ReplaceTopicRule` writes the WHOLE payload of the rule it addresses by name, so
             // a changed declaration is applied by replacing it and the rule keeps its identity
             // and its ARN ([`iot_topic_rule::update`]).
@@ -1203,6 +1219,9 @@ impl Owner {
             // which re-applies the declaration's whole tag set through `TagResource`
             // ([`iot_topic_rule::update`]), so nothing is asked about them here.
             Self::IotTopicRule => Ok(()),
+            // A THING is not taggable at all: the type publishes no `Tags` property and AWS
+            // IoT's tagging calls address no thing, so nothing is asked about its tags.
+            Self::IotThing => Ok(()),
             // An origin access control is not taggable at all, and the tags of a distribution
             // that already exists are reconciled by no arm here yet
             // ([`Provisioner::retag`]'s own default), so nothing is asked about them.
@@ -1380,6 +1399,11 @@ impl Owner {
             }
             // AWS IoT takes no snapshot of a topic rule on the way out either.
             Self::IotTopicRule => iot_topic_rule::delete(ctx, region, resource).await,
+            // AWS IoT takes no snapshot of a thing on the way out: there is no such call, so a
+            // `Snapshot` deletion policy on this type deletes the thing with no snapshot
+            // invented for it — and a refusal of that delete fails the resource
+            // ([`iot_thing::delete`]).
+            Self::IotThing => iot_thing::delete(ctx, region, resource).await,
             // CloudFront takes no snapshot of a distribution or an origin access control on
             // the way out: there is no such call, so a `Snapshot` deletion policy on either
             // deletes the resource with no snapshot invented for it. A distribution is
@@ -1611,6 +1635,7 @@ impl Owner {
                 iot_provisioning_resources::actual_configuration(ctx, region, kind, resource)
                     .await?
             }
+            Self::IotThing => iot_thing::actual_configuration(ctx, region, resource).await?,
             Self::IotTopicRule => {
                 iot_topic_rule::actual_configuration(ctx, region, resource).await?
             }
@@ -1776,7 +1801,7 @@ impl Owner {
             // wording is applied where the refusal is READ — at the call, which is where the
             // type whose provider made it is known ([`logs_resources::provider_exception`]) —
             // so nothing of it is added a second time here.
-            Self::LogsResource(_) | Self::IotAuthorizer | Self::IotTopicRule => {
+            Self::LogsResource(_) | Self::IotAuthorizer | Self::IotTopicRule | Self::IotThing => {
                 message.to_string()
             }
             // The two other AWS IoT providers report that service's own message as it came

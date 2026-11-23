@@ -144,6 +144,11 @@ pub(super) fn naming_rules(resource_type: &str) -> Option<NameRules> {
         crate::state::provisioning::iot_provisioning_resources::IOT_ROLE_ALIAS => {
             rules(128, Characters::AsGenerated)
         }
+        // The same service's `CreateThing.thingName`: `ThingName`,
+        // `@length(min: 1, max: 128)` with pattern `^[a-zA-Z0-9:_-]+$` (AWS IoT's own Smithy
+        // model), which a generated name is already inside — letters, digits and the hyphen
+        // are all admitted — but may be longer than.
+        crate::state::provisioning::iot_thing::IOT_THING => rules(128, Characters::AsGenerated),
         // The same service's `CreateTopicRule.ruleName`: `RuleName`,
         // `@length(min: 1, max: 128)` with pattern `^[a-zA-Z0-9_]+$` (AWS IoT's own Smithy
         // model), which admits letters, digits and the UNDERSCORE and no hyphen at all — so a

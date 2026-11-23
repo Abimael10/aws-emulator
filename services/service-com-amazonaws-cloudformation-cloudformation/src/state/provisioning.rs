@@ -326,6 +326,9 @@ pub(super) mod iot_authorizer;
 /// template a stack declares and the role alias a device assumes credentials through, each
 /// created in AWS IoT itself ([`iot_provisioning_resources`]).
 pub(super) mod iot_provisioning_resources;
+/// `AWS::IoT::Thing`: the thing a stack declares, registered in AWS IoT's own thing
+/// registry ([`iot_thing`]).
+pub(super) mod iot_thing;
 /// `AWS::IoT::TopicRule`: the topic rule a stack declares, created in AWS IoT itself
 /// ([`iot_topic_rule`]).
 pub(super) mod iot_topic_rule;
@@ -1316,6 +1319,9 @@ pub(super) enum Owner {
     /// fleet-provisioning template, and the role alias a device assumes credentials through.
     /// Which of them it is travels with the owner, so the algorithm resolves the type once.
     IotProvisioningResource(iot_provisioning_resources::Kind),
+    /// `AWS::IoT::Thing`, whose arms are [`iot_thing`]'s: the record of the AWS IoT thing
+    /// registry every later control-plane call about the device resolves by name.
+    IotThing,
     /// `AWS::IoT::TopicRule`, whose arms are [`iot_topic_rule`]'s.
     IotTopicRule,
     /// One of the Amazon EC2 VPC-network types [`ec2_vpc_network`] creates: the route table,
@@ -1482,6 +1488,9 @@ pub(super) fn owner_for(resource_type: &str) -> Option<Owner> {
     }
     if let Some(kind) = iot_provisioning_resources::kind_of(resource_type) {
         return Some(Owner::IotProvisioningResource(kind));
+    }
+    if resource_type == iot_thing::IOT_THING {
+        return Some(Owner::IotThing);
     }
     if resource_type == iot_topic_rule::IOT_TOPIC_RULE {
         return Some(Owner::IotTopicRule);
