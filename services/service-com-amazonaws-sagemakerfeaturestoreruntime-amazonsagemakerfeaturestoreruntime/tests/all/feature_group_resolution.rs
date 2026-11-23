@@ -9,9 +9,12 @@
 //! (HTTP 400) — never with `ResourceNotFound` (404), which says a RECORD is missing from
 //! a feature group that exists, and never accepted, which would report an ingestion no
 //! later read could find. A group that resolves with NO `OnlineStore` is refused the same
-//! way on the READS, which have nothing to serve from it, while a WRITE to it leaves the
-//! online store alone and succeeds: AWS replicates such a write to the OfflineStore,
-//! which this emulator does not model.
+//! way on the READS, which have nothing to serve from it, while a write that states a
+//! whole record of its own leaves the online store alone and succeeds: AWS replicates such
+//! a write to the group's OfflineStore. `UpdateRecord` is neither — it states a PARTIAL
+//! update of a record that must already exist — so in a group holding no live record under
+//! the requested identifier it answers the `ResourceNotFound` (404) its own documentation
+//! states, whatever stores that group has.
 //!
 //! The runtime API carries no feature-group definition, so the resolution goes through
 //! the shared feature-group directory `CreateFeatureGroup` writes
@@ -68,13 +71,29 @@ const EVERY_CALL: [Call; 7] = [
 impl Call {
     /// Whether this operation READS the OnlineStore (rather than writing it), which is
     /// what decides how it answers a feature group that exists with no `OnlineStore`:
-    /// there is nothing for a read to serve, while a write to such a group is the
-    /// OfflineStore's business and leaves the online store alone.
+    /// there is nothing for a read to serve, while a write of a whole record to such a
+    /// group is the OfflineStore's business and leaves the online store alone.
     fn reads(self) -> bool {
         matches!(
             self,
             Call::GetRecord | Call::ListRecords | Call::BatchGetRecord
         )
+    }
+
+    /// The status and wire error code this operation answers for a feature group that
+    /// resolves but has no `OnlineStore`.
+    ///
+    /// A read has nothing to serve from such a group, and an `UpdateRecord` has no record
+    /// to update: its documented precondition is a record that already exists, and a group
+    /// with no online store holds none — so the absence of the record is stated as the
+    /// modelled `ResourceNotFound`, exactly as it is in a group that has an online store
+    /// holding no such record.
+    fn answer_without_an_online_store(self) -> (u16, &'static str) {
+        match self {
+            _ if self.reads() => (400, "ValidationError"),
+            Call::UpdateRecord => (404, "ResourceNotFound"),
+            _ => (200, ""),
+        }
     }
 }
 
@@ -350,16 +369,15 @@ async fn every_operation_refuses_a_feature_group_name_that_resolves_to_no_featur
 
         for call in EVERY_CALL {
             // What each class of group answers. A name that resolves to NO feature group
-            // is refused everywhere. A group that resolves but has no `OnlineStore` is
-            // refused on the READS — there is no online store for this data plane to
-            // serve — while a WRITE to it is accepted and leaves the online store alone,
-            // because AWS replicates such a write to the OfflineStore and this emulator
-            // does not model that store.
-            let refused = match group {
-                Group::WithOnlineStore => false,
-                Group::Absent => true,
-                Group::WithoutOnlineStore => call.reads(),
+            // is refused everywhere, as a request defect. A group that resolves but has no
+            // `OnlineStore` answers per operation
+            // ([`Call::answer_without_an_online_store`]).
+            let (expected_status, expected_code) = match group {
+                Group::WithOnlineStore => (200, ""),
+                Group::Absent => (400, "ValidationError"),
+                Group::WithoutOnlineStore => call.answer_without_an_online_store(),
             };
+            let refused = expected_status != 200;
             let (status, body) = emulator.perform(call, &spelling).await;
             let code = error_code(&body);
             if matches!(call, Call::BatchGetRecord | Call::BatchWriteRecord) {
@@ -368,7 +386,7 @@ async fn every_operation_refuses_a_feature_group_name_that_resolves_to_no_featur
                 // classification arrives as that element's own `ErrorCode`.
                 let reported = batch_error_codes(&body);
                 let expected: Vec<String> = if refused {
-                    vec!["ValidationError".to_owned()]
+                    vec![expected_code.to_owned()]
                 } else {
                     Vec::new()
                 };
@@ -380,21 +398,12 @@ async fn every_operation_refuses_a_feature_group_name_that_resolves_to_no_featur
                 );
                 continue;
             }
-            if refused {
-                assert_eq!(
-                    (status, code.as_str()),
-                    (400, "ValidationError"),
-                    "case {case:?}/{call:?}: expected HTTP 400 ValidationError for a name \
-                     with no online store to serve, got {status} {code:?} with body {body:?}"
-                );
-            } else {
-                assert_eq!(
-                    (status, code.as_str()),
-                    (200, ""),
-                    "case {case:?}/{call:?}: expected HTTP 200, got {status} {code:?} with \
-                     body {body:?}"
-                );
-            }
+            assert_eq!(
+                (status, code.as_str()),
+                (expected_status, expected_code),
+                "case {case:?}/{call:?}: expected HTTP {expected_status} \
+                 {expected_code:?}, got {status} {code:?} with body {body:?}"
+            );
         }
     }
 }

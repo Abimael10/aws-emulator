@@ -10,7 +10,8 @@
 //! * "If you omit EventTime, the service keeps the record's existing EventTime and
 //!   applies the update."
 //! * "The record must already exist. If the record does not exist or has been
-//!   soft-deleted, the operation returns a ResourceNotFound error." (404)
+//!   soft-deleted, the operation returns a ResourceNotFound error." (404) — including in a
+//!   feature group created with no `OnlineStore`, which holds no record at all.
 //! * "If you provide an EventTime that is older than the record's current EventTime, the
 //!   service rejects the update with a ConflictException. If the EventTime is equal to or
 //!   newer than the current value, the service applies the update." (409, record
@@ -55,13 +56,13 @@ impl Emulator {
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
         let emulator = Self { engine, router };
-        emulator.create_feature_group(GROUP);
+        emulator.create_feature_group(GROUP, true);
         emulator
     }
 
-    /// Create a feature group with an OnlineStore, the way the SageMaker control plane's
-    /// `CreateFeatureGroup` does.
-    fn create_feature_group(&self, name: &str) {
+    /// Create a feature group the way the SageMaker control plane's `CreateFeatureGroup`
+    /// does, with or without an OnlineStore (`OnlineStoreConfig.EnableOnlineStore`).
+    fn create_feature_group(&self, name: &str, online_store_enabled: bool) {
         self.engine
             .state::<FeatureGroupDirectory>()
             .lock()
@@ -70,7 +71,7 @@ impl Emulator {
                 arn: format!("arn:aws:sagemaker:us-east-1:123456789012:feature-group/{name}"),
                 record_identifier_feature_name: IDENTIFIER_FEATURE.to_owned(),
                 event_time_feature_name: EVENT_TIME_FEATURE.to_owned(),
-                online_store_enabled: true,
+                online_store_enabled,
                 // The feature groups these cases write to are online-only: no offline store
                 // to replicate into.
                 offline_store: None,
@@ -160,6 +161,14 @@ fn error_code(body: &Value) -> String {
         .unwrap_or_default()
         .rsplit('#')
         .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// The `Message` an error response states.
+fn stated_message(body: &Value) -> String {
+    body.get("Message")
+        .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned()
 }
@@ -716,5 +725,204 @@ async fn an_update_aimed_only_at_the_offline_store_is_still_validated_and_resolv
             "case {case:?}: expected an offline-only update to be refused with HTTP \
              {expected_status} {expected_code:?}, got {status} {code:?} with body {body:?}"
         );
+    }
+}
+
+/// One row of the table that spans every way the feature group a resolved
+/// `FeatureGroupName` names can hold no live record under the requested identifier.
+struct StoreCase {
+    case: &'static str,
+    /// Whether the group was created with an `OnlineStore` — where this data plane holds
+    /// the records it serves.
+    online_store_enabled: bool,
+    /// Whether a `PutRecord` carrying that identifier was accepted into the group first.
+    /// Accepted is not the same as held: a group with no `OnlineStore` takes no record
+    /// here, because that write is the OfflineStore's.
+    seeded: bool,
+    /// The `TargetStores` the update names, or `None` for an update that names none.
+    target_stores: Option<&'static [&'static str]>,
+    /// The status and wire error code the update must answer.
+    status: u16,
+    code: &'static str,
+}
+
+#[tokio::test]
+async fn an_update_answers_resource_not_found_for_a_group_holding_no_live_record() {
+    // RULE: the record is this operation's precondition — "The record must already exist.
+    // If the record does not exist or has been soft-deleted, the operation returns a
+    // ResourceNotFound error. To create a record, use PutRecord." — so the answer turns on
+    // whether a LIVE record is held under the requested identifier, and on nothing about
+    // the feature group that holds it. A group created with no `OnlineStore` holds no
+    // record this data plane could ever have written (records live in the online store,
+    // which every write skips for such a group), so no identifier in it can be updated.
+    //
+    // The rows differ along what the rule generalises over: whether the group has an
+    // `OnlineStore`, whether a `PutRecord` of the same identifier was accepted first, and
+    // which stores the update targets — the three things that must NOT change the verdict.
+    let rows: [StoreCase; 9] = [
+        StoreCase {
+            case: "a group with an OnlineStore holding the record",
+            online_store_enabled: true,
+            seeded: true,
+            target_stores: None,
+            status: 200,
+            code: "",
+        },
+        StoreCase {
+            case: "a group with an OnlineStore that never took the record",
+            online_store_enabled: true,
+            seeded: false,
+            target_stores: None,
+            status: 404,
+            code: "ResourceNotFound",
+        },
+        StoreCase {
+            case: "a group with no OnlineStore and nothing ever written to it",
+            online_store_enabled: false,
+            seeded: false,
+            target_stores: None,
+            status: 404,
+            code: "ResourceNotFound",
+        },
+        StoreCase {
+            case: "a group with no OnlineStore, after an accepted PutRecord of the same \
+                   identifier",
+            online_store_enabled: false,
+            seeded: true,
+            target_stores: None,
+            status: 404,
+            code: "ResourceNotFound",
+        },
+        StoreCase {
+            case: "a group with no OnlineStore, the update naming the OfflineStore alone",
+            online_store_enabled: false,
+            seeded: true,
+            target_stores: Some(&["OfflineStore"]),
+            status: 404,
+            code: "ResourceNotFound",
+        },
+        StoreCase {
+            case: "a group with no OnlineStore, the update naming the OnlineStore alone",
+            online_store_enabled: false,
+            seeded: true,
+            target_stores: Some(&["OnlineStore"]),
+            status: 404,
+            code: "ResourceNotFound",
+        },
+        StoreCase {
+            case: "a group with no OnlineStore, the update naming both stores",
+            online_store_enabled: false,
+            seeded: true,
+            target_stores: Some(&["OnlineStore", "OfflineStore"]),
+            status: 404,
+            code: "ResourceNotFound",
+        },
+        StoreCase {
+            case: "a group with an OnlineStore holding the record, the update naming the \
+                   OfflineStore alone",
+            online_store_enabled: true,
+            seeded: true,
+            target_stores: Some(&["OfflineStore"]),
+            status: 200,
+            code: "",
+        },
+        StoreCase {
+            case: "a group with an OnlineStore that never took the record, the update \
+                   naming the OfflineStore alone",
+            online_store_enabled: true,
+            seeded: false,
+            target_stores: Some(&["OfflineStore"]),
+            status: 404,
+            code: "ResourceNotFound",
+        },
+    ];
+
+    // The identifier every row updates, and the group it is updated in — created per row
+    // with the row's own store configuration, beside the online-store group
+    // `Emulator::new` creates, so no row's verdict can come from an empty directory.
+    const IDENTIFIER: &str = "R-store-case";
+    const ROW_GROUP: &str = "storecase";
+
+    for row in rows {
+        let case = row.case;
+        let emulator = Emulator::new();
+        emulator.create_feature_group(ROW_GROUP, row.online_store_enabled);
+        if row.seeded {
+            let (status, body) = emulator
+                .send(
+                    "PUT",
+                    &format!("/FeatureGroup/{ROW_GROUP}"),
+                    Some(json!({ "Record": [
+                        feature(IDENTIFIER_FEATURE, IDENTIFIER),
+                        feature(EVENT_TIME_FEATURE, SEEDED_EVENT_TIME),
+                        feature("feature_a", "original")
+                    ] })),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the seeding PutRecord to be accepted, got {status} \
+                 with body {body:?}"
+            );
+        }
+
+        let mut request = json!({
+            "RecordIdentifierValueAsString": IDENTIFIER,
+            "Features": [feature("feature_a", "updated")]
+        });
+        if let Some(stores) = row.target_stores {
+            request["TargetStores"] = json!(stores);
+        }
+        let (status, body) = emulator
+            .send(
+                "POST",
+                &format!("/FeatureGroup/{ROW_GROUP}/Record"),
+                Some(request),
+            )
+            .await;
+        let code = error_code(&body);
+        assert_eq!(
+            (status, code.as_str()),
+            (row.status, row.code),
+            "case {case:?}: expected HTTP {} {:?}, got {status} {code:?} with body {body:?}",
+            row.status,
+            row.code
+        );
+
+        if row.status == 404 {
+            // The refusal names the record it could not find, by the identifier the
+            // request carried — the absence is the RECORD's, not the feature group's.
+            let stated = stated_message(&body);
+            let expected = format!(
+                "Record Not Found: Record not found with record identifier [{IDENTIFIER}]."
+            );
+            assert_eq!(
+                stated,
+                expected,
+                "case {case:?}: expected the refusal to state {expected:?}, got {stated:?}"
+            );
+
+            // And it created nothing: the identifier still resolves to no record. A group
+            // with an OnlineStore answers the read with no `Record` at all, and one with
+            // none answers the read's own 400 — there is no online store in it to serve
+            // from, before any record.
+            let (read_status, read_body) = emulator
+                .send(
+                    "GET",
+                    &format!(
+                        "/FeatureGroup/{ROW_GROUP}?RecordIdentifierValueAsString={IDENTIFIER}"
+                    ),
+                    None,
+                )
+                .await;
+            let served_record = read_body.get("Record").cloned().unwrap_or(Value::Null);
+            let expected_read = if row.online_store_enabled { 200 } else { 400 };
+            assert!(
+                read_status == expected_read && served_record.is_null(),
+                "case {case:?}: expected the record to still be absent (HTTP \
+                 {expected_read} carrying no Record), got {read_status} with body \
+                 {read_body:?}"
+            );
+        }
     }
 }

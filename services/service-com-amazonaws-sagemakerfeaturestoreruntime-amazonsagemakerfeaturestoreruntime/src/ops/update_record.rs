@@ -10,7 +10,10 @@
 //! The `FeatureGroupName` is resolved against the feature groups the SageMaker control
 //! plane holds ([`crate::state::resolve_group`]) and a name that resolves to none is
 //! refused with the modelled `ValidationError` (400). The record must already exist and
-//! not be soft-deleted (`ResourceNotFound`, 404); the request's `EventTime` — the value
+//! not be soft-deleted (`ResourceNotFound`, 404) — the precondition is on the record
+//! alone, so a group that holds no live record under the requested identifier is refused
+//! that way whatever stores the group has and whatever stores the request targets; the
+//! request's `EventTime` — the value
 //! of the group's own `EventTimeFeatureName`, when this request carries it — orders the
 //! update against the stored record's, and one older than it is refused with
 //! `ConflictException` (409) leaving the record untouched, while an omitted `EventTime`
@@ -45,7 +48,9 @@
 //! ([`crate::state::offline_store`]), since that store is append-only and holds the record
 //! AS UPDATED. An update naming only the OfflineStore therefore leaves the online record
 //! standing and still appends the row, and an update naming only the OnlineStore appends
-//! nothing.
+//! nothing. Both writes are made off the record that must already exist, so a feature
+//! group with no OnlineStore — where this data plane holds no record at all — has nothing
+//! to update and answers `ResourceNotFound`, not a success that lands in no store.
 //!
 //! ## Shape of an operation
 //!
@@ -376,16 +381,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // A feature group that HAS no `OnlineStore` holds no record to merge the posted
-        // feature values onto, and a PARTIAL update states no whole record of its own: the
-        // row the OfflineStore would take is the record AS UPDATED, which cannot be
-        // computed from a record this emulator does not hold. So there is nothing for this
-        // handler to do once the request itself has been found well-formed, and not a
-        // refusal, which no recording shows.
-        if !definition.online_store_enabled {
-            return Ok(UpdateRecordOutput);
-        }
-
         // ONE critical section for the whole read-merge-write: the stored record's event
         // time decides whether the update is accepted at all, so reading it under the
         // same guard that performs the write is what keeps two concurrent updates from
@@ -398,8 +393,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "The record must already exist. If the record does not exist or has been
             // soft-deleted, the operation returns a ResourceNotFound error. To create a
             // record, use PutRecord." `live_record` is exactly that: present and not
-            // soft-deleted. A feature group that resolves but has taken no record yet
-            // holds no online store here, which is the same "no such record" answer.
+            // soft-deleted. The precondition is on the RECORD alone, so every way one can
+            // be absent is answered here and answered the same: a feature group that has
+            // taken no record yet holds no store here, a group whose definition configures
+            // no `OnlineStore` holds no record this data plane can ever have written
+            // (records live in the online store, and every write of this data plane skips
+            // that store for such a group), and a record that was deleted or has expired
+            // is gone from the one it does hold. None of that is decided by the stores the
+            // request targets either: the merged record both stores take is read off the
+            // record that must already exist.
             let Some(group) = store.group_mut(&input.feature_group_name) else {
                 return Err(no_such_record(&identifier));
             };
