@@ -519,6 +519,9 @@ async fn a_refused_region_removal_is_inert_and_delete_directory_takes_the_direct
             "case {case:?}: expected the delete to report the id it was asked about, got \
              {deleted}"
         );
+        // The FIRST read after the delete, with nothing waited for: the id narrows the
+        // reporting call to an empty page, which is what a delete-and-wait client reads its own
+        // deletion off.
         assert_eq!(
             stage(&router, directory_id, case).await,
             None,
