@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteWorkflow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteWorkflow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteWorkflow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Forgets the workflow build version this service's state holds and echoes the ARN it
+//! removed.
+//!
+//! A workflow a stored image pipeline still references is not deleted: "You can't delete a
+//! workflow build version while an image pipeline references it. The request fails with
+//! ResourceDependencyException", and a pipeline reaches a build version whenever one of its
+//! workflow references MATCHES it — a reference carrying trailing `x` wildcards answers with
+//! whichever build is newest at the instant the pipeline runs, so every build it admits is
+//! still in use. An image BUILD VERSION is not a dependant: the workflows it records are a
+//! snapshot of what that build ran. An ARN nothing is stored under, and one of another
+//! Region, delete nothing — which is reported MISSING, as the not-found error this service
+//! models for a resource its request references and it does not hold, so a repeat of a delete
+//! that already succeeded is reported the same way.
 //!
 //! ## Shape of an operation
 //!
@@ -79,6 +84,8 @@
 //! * `ResourceDependencyException` (HTTP 400) — You have attempted to mutate or delete a
 //!   resource with a dependency that prohibits this action. See the error message for more
 //!   details.
+//! * `ResourceNotFoundException` (HTTP 404) — widened in through `extra_errors` (see below):
+//!   "At least one of the resources referenced by your request does not exist."
 //! * `ServiceException` (HTTP 500) — An internal server error occurred while Image Builder
 //!   processed the request. Retrying the request may succeed.
 //! * `ServiceUnavailableException` (HTTP 503) — The service is unable to process your request
@@ -98,7 +105,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-imagebuilder-imagebuild
 // here — hence the `DeleteWorkflowError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.imagebuilder#DeleteWorkflow")]
+//
+// `ResourceNotFoundException` is widened in through `extra_errors`:
+// `workflowBuildVersionArn` is an `@httpQuery` member naming a workflow that may not exist,
+// this SERVICE models that shape for exactly that case
+// (`com.amazonaws.imagebuilder#ResourceNotFoundException`, HTTP 404, "At least one of the
+// resources referenced by your request does not exist", declared in
+// `types/shared_types.rs`), and this operation's own `errors` list omits it. So an ARN
+// nothing is stored under is reported MISSING rather than dressed up as an invalid request,
+// which is a different claim a client branches on — the reading `DeleteComponent` and
+// `GetWorkflow` already follow.
+#[smithy_macros::operation_error(
+    "com.amazonaws.imagebuilder#DeleteWorkflow",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum DeleteWorkflowErrorModeled {
     CallRateLimitExceededException(CallRateLimitExceededException),
@@ -106,6 +126,7 @@ pub enum DeleteWorkflowErrorModeled {
     ForbiddenException(ForbiddenException),
     InvalidRequestException(InvalidRequestException),
     ResourceDependencyException(ResourceDependencyException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ServiceException(ServiceException),
     ServiceUnavailableException(ServiceUnavailableException),
 }
@@ -161,18 +182,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteWorkflow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteWorkflowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteWorkflow"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteWorkflowErrorModeled::ServiceException(ServiceException {
+                message: Some(crate::state::store_unavailable_message()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+
+        // The dependency check and the removal happen under ONE lock, so a pipeline cannot
+        // be created against this workflow between the two.
+        let mut store = state.lock();
+
+        // The modelled input is a BUILD version ARN — its pattern carries the build node —
+        // so exactly one stored workflow can answer it. Whether this Region holds one is
+        // asked FIRST: a workflow of another Region is out of reach rather than in use, so
+        // it is reported missing rather than as something a pipeline depends on.
+        if store
+            .workflow(&input.workflow_build_version_arn, &region)
+            .is_none()
+        {
+            return Err(missing_workflow(&input.workflow_build_version_arn));
+        }
+
+        // A workflow a stored image pipeline still runs is not removed.
+        if store
+            .pipeline_depending_on_workflow(&input.workflow_build_version_arn)
+            .is_some()
+        {
+            return Err(DeleteWorkflowErrorModeled::ResourceDependencyException(
+                ResourceDependencyException {
+                    message: Some(crate::state::resource_dependency_message(
+                        &input.workflow_build_version_arn,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The record this call took out of the store, which is what the answer names. The
+        // `else` cannot be reached — the lookup above ran under this same lock — and the
+        // report it carries is that same lookup's, so no success can ever answer with no
+        // ARN.
+        let Some(removed) = store.remove_workflow(&input.workflow_build_version_arn, &region)
+        else {
+            return Err(missing_workflow(&input.workflow_build_version_arn));
+        };
+
+        Ok(DeleteWorkflowOutput {
+            // The ARN of the record this call removed, read back from it rather than echoed
+            // from the request.
+            workflow_build_version_arn: Some(removed.arn),
+        })
     }
+}
+
+/// The report a call naming a workflow build version this Region holds nothing under
+/// answers with: the missing required resource it named, in this service's one sentence for
+/// one ([`crate::state::required_resource_not_found_message`]), so a delete of a build that
+/// was never stored and a repeat of one that already succeeded read alike.
+fn missing_workflow(arn: &str) -> DeleteWorkflowError {
+    DeleteWorkflowErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::required_resource_not_found_message(arn)),
+    })
+    .into()
 }

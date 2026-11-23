@@ -17,6 +17,7 @@
 use super::{
     ComAmazonawsImagebuilderImagebuilderState, ContainerRecipeRecord,
     DistributionConfigurationRecord, ImagePipelineRecord, InfrastructureConfigurationRecord,
+    WorkflowRecord,
 };
 
 impl ComAmazonawsImagebuilderImagebuilderState {
@@ -70,5 +71,16 @@ impl ComAmazonawsImagebuilderImagebuilderState {
         self.container_recipe(arn, request_region)?;
         self.resource_policies.remove(arn);
         self.container_recipes.remove(arn)
+    }
+
+    /// Forget the workflow BUILD VERSION `arn` names, when it belongs to `request_region`.
+    ///
+    /// One build version is one resource of this service, so a delete takes out exactly the
+    /// build the ARN names and leaves every other build of the same name and version where
+    /// it is — the same reading the component build version's own removal follows.
+    pub fn remove_workflow(&mut self, arn: &str, request_region: &str) -> Option<WorkflowRecord> {
+        self.workflow(arn, request_region)?;
+        self.resource_policies.remove(arn);
+        self.workflows.remove(arn)
     }
 }

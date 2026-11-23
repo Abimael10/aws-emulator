@@ -29,19 +29,23 @@
 //!   first" (`DeleteInfrastructureConfiguration`, which `DeleteDistributionConfiguration`
 //!   repeats). Neither configuration ARN carries a version, so a pipeline reaches one by
 //!   naming it exactly.
+//! * a WORKFLOW build version is reached by the workflow list an image pipeline holds
+//!   ([`ComAmazonawsImagebuilderImagebuilderState::pipeline_depending_on_workflow`]) — "You
+//!   can't delete a workflow build version while an image pipeline references it. The request
+//!   fails with ResourceDependencyException" (`DeleteWorkflow`).
 //!
 //! A reference reaches a resource whenever it MATCHES it, not only when it is the newest
 //! match: a pipeline holding a wildcard version builds whichever matching version is newest
 //! at the instant it runs, so every version it matches is still in use — the same rule the
 //! component dependency check follows.
 //!
-//! An image BUILD VERSION is not a dependant: a build records the recipe it was built from
-//! as a snapshot of what it ran, and that record is not a reference the recipe has to
-//! outlive.
+//! An image BUILD VERSION is not a dependant: a build records the recipe and the workflows it
+//! was built from as a snapshot of what it ran, and that record is not a reference the recipe
+//! or the workflow has to outlive.
 
 use super::{
     ComAmazonawsImagebuilderImagebuilderState, ImagePipelineRecord, ImageRecipeRecord,
-    VersionedReference, CONTAINER_RECIPE_ARN_PREFIX, IMAGE_RECIPE_ARN_PREFIX,
+    VersionedReference, WorkflowReference, CONTAINER_RECIPE_ARN_PREFIX, IMAGE_RECIPE_ARN_PREFIX,
 };
 
 impl ComAmazonawsImagebuilderImagebuilderState {
@@ -111,6 +115,35 @@ impl ComAmazonawsImagebuilderImagebuilderState {
         self.image_pipelines
             .values()
             .find(|pipeline| pipeline.distribution_configuration_arn.as_deref() == Some(arn))
+    }
+
+    /// The first stored image pipeline whose workflow list reaches the workflow build version
+    /// `arn` names, if any does.
+    ///
+    /// The reverse of the resolution a pipeline's own workflow references pass
+    /// ([`super::ComAmazonawsImagebuilderImagebuilderState::resolve_workflow`]), read through
+    /// the one reading of a workflow ARN this crate has ([`WorkflowReference`]) — so the
+    /// stage, the Region, the name and the version nodes are compared exactly as the forward
+    /// path compares them, and a reference carrying trailing `x` wildcards reaches every
+    /// build it admits rather than only the newest.
+    ///
+    /// `None` when no pipeline reaches it, and when this store holds no workflow under that
+    /// ARN at all, there being nothing for a reference to reach. The Region needs no
+    /// argument: a reference reaches a record only when the two name the same Region, so a
+    /// pipeline of another Region can reach no workflow of this one.
+    #[must_use]
+    pub fn pipeline_depending_on_workflow(&self, arn: &str) -> Option<&ImagePipelineRecord> {
+        let workflow = self.workflows.get(arn)?;
+        self.image_pipelines.values().find(|pipeline| {
+            pipeline
+                .workflows
+                .iter()
+                .flatten()
+                .filter_map(|configuration| {
+                    WorkflowReference::parse(&configuration.workflow_arn)
+                })
+                .any(|reference| reference.matches(workflow))
+        })
     }
 }
 
