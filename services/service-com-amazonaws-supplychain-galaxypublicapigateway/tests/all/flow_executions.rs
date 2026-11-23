@@ -13,7 +13,7 @@
 //!   `AccessDeniedException` (HTTP 403) carrying the gateway's authorization sentence and
 //!   NOT a not-found — whatever flow or execution id the request named;
 //! * within a live instance, a flow the instance does not hold and an `executionId` that
-//!   flow does not hold are each `ResourceNotFoundException` (HTTP 404), with the fixed
+//!   flow does not hold are each `ResourceNotFoundException` (HTTP 404), with the
 //!   sentence of the resource that is missing;
 //! * the read changes nothing a later caller sees.
 //!
@@ -45,9 +45,13 @@ const REGION: &str = "us-east-1";
 const ACCOUNT: &str = "000000000000";
 
 /// The sentences this service answers these refusals with, written out HERE rather than
-/// read from the crate: the wording is the requirement, so a drift in the constant the
-/// handler answers from fails this suite instead of travelling with it.
-const FLOW_NOT_FOUND_SENTENCE: &str = "Flow not found.";
+/// read from the crate: the wording is the requirement, so a drift in what the handler
+/// answers fails this suite instead of travelling with it. The flow's own not-found names
+/// the flow and its instance, the two `@httpLabel` members of the flow URI; the
+/// execution's is fixed.
+fn expected_flow_not_found_sentence(flow_name: &str, instance_id: &str) -> String {
+    format!("Flow {flow_name} does not exist in instance {instance_id}")
+}
 const FLOW_EXECUTION_NOT_FOUND_SENTENCE: &str = "Flow execution not found.";
 
 /// The emulator under test: one engine, one service, driven through the router.
@@ -164,6 +168,18 @@ impl Emulator {
             &format!(
                 "/api-data/data-integration/instance/{instance_id}/data-integration-flows/\
                  {flow_name}/executions/{execution_id}"
+            ),
+            None,
+        )
+        .await
+    }
+
+    /// `DeleteDataIntegrationFlow` for one (instance, flow) pair.
+    async fn delete_flow(&self, instance_id: &str, name: &str) -> (u16, Value) {
+        self.send(
+            "DELETE",
+            &format!(
+                "/api/data-integration/instance/{instance_id}/data-integration-flows/{name}"
             ),
             None,
         )
@@ -429,9 +445,8 @@ async fn an_instance_this_account_does_not_hold_is_an_authorization_failure() {
 }
 
 /// RULE: within a live instance, the missing resource is what the refusal names: a flow the
-/// instance does not hold is the flow's not-found, and an `executionId` the flow does not
-/// hold is the execution's — each a 404 carrying one fixed sentence that echoes nothing of
-/// the request.
+/// instance does not hold is the flow's not-found, naming the flow and its instance, and an
+/// `executionId` the flow does not hold is the execution's — each a 404.
 #[tokio::test]
 async fn a_missing_flow_or_execution_is_the_not_found_of_what_is_missing() {
     let emulator = Emulator::new();
@@ -455,25 +470,25 @@ async fn a_missing_flow_or_execution_is_the_not_found_of_what_is_missing() {
             "a flow that was never created",
             "never-created",
             execution_id(1),
-            FLOW_NOT_FOUND_SENTENCE,
+            expected_flow_not_found_sentence("never-created", &instance_id),
         ),
         (
             "a flow name one character off a live one",
             "orders-flo",
             execution_id(1),
-            FLOW_NOT_FOUND_SENTENCE,
+            expected_flow_not_found_sentence("orders-flo", &instance_id),
         ),
         (
             "a live flow and an execution it does not hold",
             "orders-flow",
             execution_id(2),
-            FLOW_EXECUTION_NOT_FOUND_SENTENCE,
+            FLOW_EXECUTION_NOT_FOUND_SENTENCE.to_string(),
         ),
         (
             "a live flow and the lowest execution id the shape admits",
             "orders-flow",
             "00000000-0000-0000-0000-000000000000".to_string(),
-            FLOW_EXECUTION_NOT_FOUND_SENTENCE,
+            FLOW_EXECUTION_NOT_FOUND_SENTENCE.to_string(),
         ),
     ];
 
@@ -487,11 +502,12 @@ async fn a_missing_flow_or_execution_is_the_not_found_of_what_is_missing() {
         assert_eq!(
             error_message(&body),
             sentence,
-            "case {case:?}: the refusal must carry the fixed not-found sentence, got {body}"
+            "case {case:?}: the refusal must carry the not-found sentence of the resource \
+             that is missing, got {body}"
         );
         assert!(
-            !error_message(&body).contains(flow_name) && !error_message(&body).contains(&id),
-            "case {case:?}: the sentence must echo nothing of the request, got {body}"
+            !error_message(&body).contains(&id),
+            "case {case:?}: no sentence of this family carries the execution id, got {body}"
         );
     }
 
@@ -503,4 +519,84 @@ async fn a_missing_flow_or_execution_is_the_not_found_of_what_is_missing() {
         status, 200,
         "case \"the stored run survives\": expected 200, got {status} with {body}"
     );
+}
+
+/// RULE: a run is addressed THROUGH its flow, so it does not outlive the flow whose delete
+/// removed it: after `DeleteDataIntegrationFlow` every read of one of that flow's runs is
+/// the flow's own not-found, and re-creating the name gives a flow holding none of the
+/// runs the removed one held.
+#[tokio::test]
+async fn a_run_does_not_outlive_the_flow_whose_delete_removed_it() {
+    let emulator = Emulator::new();
+    let instance_id = emulator.given_instance().await;
+
+    // Two flows of one instance, each holding runs, so the delete has a flow to leave
+    // alone as well as one to remove.
+    for flow_name in ["orders-flow", "returns-flow"] {
+        emulator.given_flow(&instance_id, flow_name).await;
+        for index in [1, 2] {
+            emulator.given_execution(DataIntegrationFlowExecutionRecord {
+                instance_id: instance_id.clone(),
+                flow_name: flow_name.to_string(),
+                execution_id: execution_id(index),
+                status: Some("SUCCEEDED".to_string()),
+                source_info: None,
+                message: None,
+                start_time: None,
+                end_time: None,
+                output_metadata: None,
+            });
+        }
+    }
+
+    let (status, body) = emulator.delete_flow(&instance_id, "orders-flow").await;
+    assert_eq!(
+        status, 200,
+        "case \"the delete\": expected 200, got {status} with {body}"
+    );
+
+    // Rows: each (flow, run) pair that existed before the delete, and what the read
+    // answers for it now.
+    for (case, flow_name, index, expected) in [
+        ("a run of the deleted flow", "orders-flow", 1, 404),
+        ("its second run", "orders-flow", 2, 404),
+        ("a run of the flow left alone", "returns-flow", 1, 200),
+        ("its second run", "returns-flow", 2, 200),
+    ] {
+        let (status, body) = emulator
+            .get_execution(&instance_id, flow_name, &execution_id(index))
+            .await;
+        assert_eq!(
+            status, expected,
+            "case {case:?}: expected {expected}, got {status} with {body}"
+        );
+        if expected == 404 {
+            assert_eq!(
+                error_message(&body),
+                expected_flow_not_found_sentence(flow_name, &instance_id),
+                "case {case:?}: the refusal must name the flow that is missing, got {body}"
+            );
+        }
+    }
+
+    // The name is free again, and the flow created under it holds none of the removed
+    // flow's runs: the read is the EXECUTION's not-found, not the flow's.
+    emulator.given_flow(&instance_id, "orders-flow").await;
+    for index in [1, 2] {
+        let (status, body) = emulator
+            .get_execution(&instance_id, "orders-flow", &execution_id(index))
+            .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (404, "ResourceNotFoundException"),
+            "case \"re-created flow, run {index}\": expected 404 ResourceNotFoundException, \
+             got {status} with {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            FLOW_EXECUTION_NOT_FOUND_SENTENCE,
+            "case \"re-created flow, run {index}\": a run of the removed flow must not come \
+             back, got {body}"
+        );
+    }
 }

@@ -12,6 +12,10 @@
 //! whose declared source/target/transformation type carries none of its configuration is
 //! a validation failure that persists nothing, an `instanceId` naming no instance is an
 //! authorization failure, and a name the instance holds no flow under is a not-found.
+//!
+//! `DeleteDataIntegrationFlow` is the other side of that pair: it TAKES the entry out of
+//! the store, so a name it has removed is a name the instance holds no flow under — every
+//! later read of it misses and the name is free to be created again.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -31,10 +35,13 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The region these tests sign for.
 const REGION: &str = "us-east-1";
 
-/// How a flow read refuses a name the addressed instance holds no flow under. Spelled out
-/// here, independently of the handler, so a change to the service's wording fails this
-/// suite instead of travelling with it.
-const FLOW_NOT_FOUND_SENTENCE: &str = "Flow not found.";
+/// How a flow call refuses a name the addressed instance holds no flow under: the fixed
+/// text with the flow name and the instance id from the request's two `@httpLabel`
+/// members. Spelled out here, independently of the handler, so a change to the service's
+/// wording fails this suite instead of travelling with it.
+fn expected_not_found_sentence(name: &str, instance_id: &str) -> String {
+    format!("Flow {name} does not exist in instance {instance_id}")
+}
 
 /// How long a poll loop waits for the condition it is about before giving up, and how long
 /// it waits between looks.
@@ -148,6 +155,12 @@ impl Emulator {
     /// `GetDataIntegrationFlow` for one (instance, name) pair.
     async fn get_flow(&self, instance_id: &str, name: &str) -> (u16, Value) {
         self.send("GET", &flow_path(instance_id, name), None).await
+    }
+
+    /// `DeleteDataIntegrationFlow` for one (instance, name) pair.
+    async fn delete_flow(&self, instance_id: &str, name: &str) -> (u16, Value) {
+        self.send("DELETE", &flow_path(instance_id, name), None)
+            .await
     }
 }
 
@@ -944,8 +957,8 @@ async fn a_flow_is_scoped_to_its_instance_and_name() {
         );
         assert_eq!(
             error_message(&body),
-            FLOW_NOT_FOUND_SENTENCE,
-            "case {case}: the refusal must carry the service's not-found sentence, got {body}"
+            expected_not_found_sentence(name, &first),
+            "case {case}: the refusal must name the flow and its instance, got {body}"
         );
     }
 }
@@ -1092,4 +1105,274 @@ async fn a_create_past_the_per_instance_cap_is_refused() {
         status, 200,
         "case neighbour: the cap is per instance, got {status} with {body}"
     );
+}
+
+/// RULE: `DeleteDataIntegrationFlow` TAKES the addressed (instance, name) entry out of the
+/// store, so a name it has removed is a name the instance holds no flow under: the delete
+/// answers 200 naming what it removed, every later read of that pair is refused
+/// `ResourceNotFoundException` (404) naming the flow and its instance, a repeat delete is
+/// that same not-found, and the name is free for a new flow.
+#[tokio::test]
+async fn a_deleted_flow_is_no_longer_readable() {
+    let emulator = Emulator::new();
+    let instance_id = emulator.create_instance("delete").await;
+
+    // Rows differ along what the rule generalises over: the shape of the name the delete
+    // addresses — both ends of the modelled `@length` 1..256 of `DataIntegrationFlowName`
+    // and a name of digits and hyphens, each inside its `^[A-Za-z0-9-]+$` — and the
+    // configuration the removed flow carried.
+    let longest_name = "z".repeat(256);
+    let rows: Vec<(&str, String, Value)> = vec![
+        (
+            "a single-character name, S3 to S3 untransformed",
+            "q".to_string(),
+            json!({
+                "sources": [s3_source("orders", "supply-landing", "orders/", None)],
+                "transformation": { "transformationType": "NONE" },
+                "target": {
+                    "targetType": "S3",
+                    "s3Target": { "bucketName": "supply-exports", "prefix": "orders/" },
+                },
+            }),
+        ),
+        (
+            "the longest name the shape admits, a dataset source",
+            longest_name.clone(),
+            json!({
+                "sources": [dataset_source(
+                    "inbound",
+                    &dataset_identifier(&instance_id, "default", "orders"),
+                    None,
+                )],
+                "transformation": {
+                    "transformationType": "SQL",
+                    "sqlTransformation": { "query": "SELECT * FROM inbound" },
+                },
+                "target": {
+                    "targetType": "S3",
+                    "s3Target": { "bucketName": "supply-exports", "prefix": "longest/" },
+                },
+            }),
+        ),
+        (
+            "a name of digits and hyphens, two sources into a dataset",
+            "2026-01-31-0".to_string(),
+            json!({
+                "sources": [
+                    s3_source("first", "supply-landing", "first/", None),
+                    s3_source("second", "supply-landing", "second/", None),
+                ],
+                "transformation": { "transformationType": "NONE" },
+                "target": {
+                    "targetType": "DATASET",
+                    "datasetTarget": {
+                        "datasetIdentifier": dataset_identifier(
+                            &instance_id,
+                            "default",
+                            "orders",
+                        ),
+                    },
+                },
+            }),
+        ),
+    ];
+
+    for (case, name, request) in rows {
+        let (status, body) = emulator
+            .create_flow(&instance_id, &name, request.clone())
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: the create expected 200, got {status} with {body}"
+        );
+        let (status, body) = emulator.get_flow(&instance_id, &name).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: the created flow must be readable, got {status} with {body}"
+        );
+
+        // The delete reports the pair it removed, from the two labels that addressed it.
+        let (status, body) = emulator.delete_flow(&instance_id, &name).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: the delete expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            string_of(case, &body, "instanceId"),
+            instance_id,
+            "case {case}: the delete must name the instance it removed from, got {body}"
+        );
+        assert_eq!(
+            string_of(case, &body, "name"),
+            name,
+            "case {case}: the delete must name the flow it removed, got {body}"
+        );
+
+        // The read misses, twice over: the entry is gone, not merely hidden from the
+        // first look.
+        for look in ["the first read after the delete", "the second read"] {
+            let (status, body) = emulator.get_flow(&instance_id, &name).await;
+            assert_eq!(
+                status, 404,
+                "case {case}, {look}: a deleted flow must not be readable, got {status} \
+                 with {body}"
+            );
+            assert!(
+                error_type(&body).contains("ResourceNotFoundException"),
+                "case {case}, {look}: expected a ResourceNotFoundException envelope, got \
+                 {body}"
+            );
+            assert_eq!(
+                error_message(&body),
+                expected_not_found_sentence(&name, &instance_id),
+                "case {case}, {look}: the refusal must name the flow and its instance, got \
+                 {body}"
+            );
+        }
+
+        // A repeat delete has nothing left to take, so it is the same not-found.
+        let (status, body) = emulator.delete_flow(&instance_id, &name).await;
+        assert_eq!(
+            status, 404,
+            "case {case}: a repeat delete expected 404, got {status} with {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            expected_not_found_sentence(&name, &instance_id),
+            "case {case}: the repeat delete must carry the not-found sentence, got {body}"
+        );
+
+        // The name is free again: nothing of the removed flow is left to conflict with a
+        // new one, and the new one is what the read answers with.
+        let (status, body) = emulator
+            .create_flow(&instance_id, &name, request.clone())
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: the name must be free after the delete, got {status} with {body}"
+        );
+        let (status, body) = emulator.get_flow(&instance_id, &name).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: the re-created flow must be readable, got {status} with {body}"
+        );
+        assert_eq!(
+            string_of(case, &flow_of(case, &body), "name"),
+            name,
+            "case {case}: the read must answer with the re-created flow, got {body}"
+        );
+    }
+}
+
+/// RULE: a flow is addressed by its whole (instance, name) pair, so a delete takes exactly
+/// that one entry: a sibling flow of the same instance and the same name under another
+/// instance are untouched, a name no flow is held under is the flow's not-found, and an
+/// `instanceId` naming no instance of this account is refused by the gateway's
+/// authorization step before any flow is looked up.
+#[tokio::test]
+async fn a_delete_takes_only_the_addressed_flow() {
+    let emulator = Emulator::new();
+    let first = emulator.create_instance("first instance").await;
+    let second = emulator.create_instance("second instance").await;
+    let request = json!({
+        "sources": [s3_source("orders", "supply-landing", "orders/", None)],
+        "transformation": { "transformationType": "NONE" },
+        "target": {
+            "targetType": "S3",
+            "s3Target": { "bucketName": "supply-exports", "prefix": "orders/" },
+        },
+    });
+
+    // The same two names in both instances, so one delete has a sibling and a namesake to
+    // leave alone.
+    for instance_id in [&first, &second] {
+        for name in ["shared-name", "sibling-name"] {
+            let (status, body) = emulator
+                .create_flow(instance_id, name, request.clone())
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {name}: the create expected 200, got {status} with {body}"
+            );
+        }
+    }
+
+    let (status, body) = emulator.delete_flow(&first, "shared-name").await;
+    assert_eq!(
+        status, 200,
+        "case delete: expected 200, got {status} with {body}"
+    );
+
+    // Rows: every (instance, name) pair of the four created, and what the read answers for
+    // it now that one of them is gone.
+    for (case, instance_id, name, expected) in [
+        ("the deleted pair", &first, "shared-name", 404),
+        ("its sibling in the same instance", &first, "sibling-name", 200),
+        ("the same name in another instance", &second, "shared-name", 200),
+        ("the sibling in another instance", &second, "sibling-name", 200),
+    ] {
+        let (status, body) = emulator.get_flow(instance_id, name).await;
+        assert_eq!(
+            status, expected,
+            "case {case}: expected {expected}, got {status} with {body}"
+        );
+    }
+
+    // Names this instance holds no flow under, differing in how close they are to one it
+    // does hold: each delete is the flow's not-found and takes nothing.
+    for (case, name) in [
+        ("a name never created", "never-created"),
+        ("one character off a stored name", "sibling-names"),
+        ("the stored name in another case", "Sibling-Name"),
+        ("a single character", "q"),
+    ] {
+        let (status, body) = emulator.delete_flow(&first, name).await;
+        assert_eq!(
+            status, 404,
+            "case {case}: expected 404, got {status} with {body}"
+        );
+        assert!(
+            error_type(&body).contains("ResourceNotFoundException"),
+            "case {case}: expected a ResourceNotFoundException envelope, got {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            expected_not_found_sentence(name, &first),
+            "case {case}: the refusal must name the flow and its instance, got {body}"
+        );
+    }
+
+    // An `instanceId` of the modelled shape that names no instance of this account is the
+    // gateway's authorization failure, whatever name the delete addresses.
+    let unknown = "00000000-0000-4000-8000-000000000000";
+    for (case, name) in [
+        ("a name held elsewhere", "sibling-name"),
+        ("a name held nowhere", "never-created"),
+    ] {
+        let (status, body) = emulator.delete_flow(unknown, name).await;
+        assert_eq!(
+            status, 403,
+            "case {case}: expected 403, got {status} with {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            expected_authorization_failure(unknown),
+            "case {case}: the refusal must carry the gateway's authorization sentence, got \
+             {body}"
+        );
+    }
+
+    // Nothing the refusals touched: the three flows that were never deleted are still
+    // readable.
+    for (case, instance_id, name) in [
+        ("sibling", &first, "sibling-name"),
+        ("namesake", &second, "shared-name"),
+        ("namesake sibling", &second, "sibling-name"),
+    ] {
+        let (status, body) = emulator.get_flow(instance_id, name).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: a refused delete must take nothing, got {status} with {body}"
+        );
+    }
 }

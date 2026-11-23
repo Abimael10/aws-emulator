@@ -55,11 +55,11 @@ pub const INSTANCE_STATE_DELETING: &str = "Deleting";
 ///
 /// Its SOURCE is the recorded wire response of such a call: the sentence is FIXED — it
 /// names the resource kind and nothing else, and in particular does not echo the
-/// `instanceId` the request asked about, as the flow read ([`FLOW_NOT_FOUND_MESSAGE`])
-/// answers too. (The namespace and dataset refusals are recorded NAMING their resource —
-/// see [`namespace_not_found_message`] — so this family is read from each recording
-/// rather than assumed uniform.) Stated once, here, so no instance-scoped handler can
-/// drift into a sentence of its own for this one refusal.
+/// `instanceId` the request asked about. (The namespace, dataset and flow refusals are
+/// recorded NAMING their resource — see [`namespace_not_found_message`] and
+/// [`flow_not_found_message`] — so this family is read from each recording rather than
+/// assumed uniform.) Stated once, here, so no instance-scoped handler can drift into a
+/// sentence of its own for this one refusal.
 pub const INSTANCE_NOT_FOUND_MESSAGE: &str = "Instance not found.";
 
 /// How this service refuses a call that asks to MUTATE an instance which is not in
@@ -690,9 +690,8 @@ impl DataIntegrationEventRecord {
 ///
 /// No recording fixes this sentence, so its FORM is this service's recorded not-found
 /// family — one fixed sentence naming the resource and echoing nothing from the request, as
-/// the instance read ([`INSTANCE_NOT_FOUND_MESSAGE`]) and the flow read
-/// ([`FLOW_NOT_FOUND_MESSAGE`]) answer. Stated once, here, and re-verified against a
-/// recording when one covers this read.
+/// the instance read ([`INSTANCE_NOT_FOUND_MESSAGE`]) answers. Stated once, here, and
+/// re-verified against a recording when one covers this read.
 pub const EVENT_NOT_FOUND_MESSAGE: &str = "Event not found.";
 
 /// The one `DataIntegrationEventType` whose event names its target dataset itself.
@@ -821,18 +820,19 @@ pub fn flow_configuration_problem(
     None
 }
 
-/// How a flow read refuses a name this instance holds no flow under
+/// How a flow operation refuses a name the addressed instance holds no flow under
 /// (`ResourceNotFoundException`, HTTP 404).
 ///
-/// No recording fixes this sentence, so its FORM is this service's recorded not-found
-/// family — one fixed sentence naming the resource and echoing nothing from the request,
-/// as the recorded instance read ("Instance not found.") answers; the flow CONFLICT
-/// sentence
-/// ([`flow_conflict_message`]) is worded by its own class, which is why it is not the
-/// model for this one. Stated once, here, so the flow operations cannot drift into
-/// several sentences for one refusal, and re-verified against a recording when one
-/// covers this read.
-pub const FLOW_NOT_FOUND_MESSAGE: &str = "Flow not found.";
+/// Its SOURCE is the recorded wire response of a flow read addressed to a name its
+/// instance holds no flow under — including the name of one a delete has already removed.
+/// The FIXED text is "Flow " and " does not exist in instance ", and the two interpolated
+/// parts are the flow name and the instance id, the two `@httpLabel` members every flow
+/// URI carries. Unlike the sibling namespace and dataset refusals, this one DOES name the
+/// instance. Stated once, here, so the flow operations cannot drift into several sentences
+/// for one refusal.
+pub fn flow_not_found_message(name: &str, instance_id: &str) -> String {
+    format!("Flow {name} does not exist in instance {instance_id}")
+}
 
 /// How a flow create refuses a `(instanceId, name)` pair that already holds one
 /// (`ConflictException`, HTTP 409).
@@ -899,9 +899,8 @@ impl DataIntegrationFlowRecord {
 ///
 /// No recording fixes this sentence, so its FORM is this service's recorded not-found
 /// family — one fixed sentence naming the resource and echoing nothing from the request,
-/// as the instance read ([`INSTANCE_NOT_FOUND_MESSAGE`]) and the flow read
-/// ([`FLOW_NOT_FOUND_MESSAGE`]) answer. Stated once, here, and re-verified against a
-/// recording when one covers this read.
+/// as the instance read ([`INSTANCE_NOT_FOUND_MESSAGE`]) answers. Stated once, here, and
+/// re-verified against a recording when one covers this read.
 pub const FLOW_EXECUTION_NOT_FOUND_MESSAGE: &str = "Flow execution not found.";
 
 /// The key one flow execution is stored under: its instance, its flow's name, then its
@@ -1352,6 +1351,25 @@ impl ComAmazonawsSupplychainGalaxypublicapigatewayState {
     /// inserted.
     pub fn flows_at_capacity(&self, instance_id: &str) -> bool {
         self.flow_count(instance_id) >= MAX_FLOWS_PER_INSTANCE
+    }
+
+    /// Take the flow `name` of `instance_id` out of this store, with the runs addressed
+    /// through it, and report whether there was one to take.
+    ///
+    /// The one place a single flow leaves the store, so a flow that is gone is gone for
+    /// every operation that reads one: a later read of the pair misses, a re-create of the
+    /// name is free to take it again, and no execution outlives the flow it belongs to
+    /// (an execution is addressed THROUGH its flow, the same cascade reason as
+    /// [`Self::drop_instance_flow_executions`]).
+    pub fn remove_flow(&mut self, instance_id: &str, name: &str) -> bool {
+        let removed = self.flows.remove(&flow_key(instance_id, name)).is_some();
+        if removed {
+            self.flow_executions
+                .retain(|(instance, flow_name, _), _| {
+                    instance != instance_id || flow_name != name
+                });
+        }
+        removed
     }
 
     /// Drop every flow of `instance_id`, for the same reason as
