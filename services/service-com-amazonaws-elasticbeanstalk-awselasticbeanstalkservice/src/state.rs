@@ -813,14 +813,19 @@ pub fn platform_version_arn(region: &str, platform_name: &str, platform_version:
 /// model publishes.
 pub const DATA_PLANE_SEGMENT: &str = "elasticbeanstalk";
 
-/// The path one environment's application is served at on the emulator's own
+/// The path one environment's application is ALSO served at on the emulator's own
 /// endpoint: `/_aws/elasticbeanstalk/<region>/<cname prefix>`, which a request
 /// path then follows.
 ///
-/// The REGION is part of the address because it is part of the name a prefix
-/// forms: an environment's CNAME sits in its own Region's zone
-/// (`<prefix>.<region>.elasticbeanstalk.com`), so the same prefix in two Regions
-/// is two names and `CheckDNSAvailability` reports on them separately.
+/// The name an environment PUBLISHES carries the Region and the prefix in its
+/// leading labels ([`environment_cname`]); this is the same addressing in a PATH,
+/// for a client that resolves nothing but the emulator's own endpoint — the
+/// shared data-plane reading of this tree, where what a host cannot carry the
+/// path carries.
+///
+/// The REGION is part of it because it is part of the name a prefix forms: an
+/// environment's CNAME sits in its own Region's zone, so the same prefix in two
+/// Regions is two names and `CheckDNSAvailability` reports on them separately.
 ///
 /// ONE place writes that addressing and one place reads it back
 /// ([`crate::service::environment_plane`]), so the address this service PUBLISHES
@@ -835,20 +840,107 @@ pub fn environment_plane_path(region: &str, cname_prefix: &str) -> String {
 /// The address an environment is reached at — `EnvironmentDescription$CNAME`,
 /// "the URL to the CNAME for this environment", and the `EndpointURL` beside it.
 ///
-/// A client READS that address and dials it, so it has to be an address this
-/// emulator answers on: a name under Elastic Beanstalk's own zone
+/// A CNAME is a DNS NAME, and its leading labels are what a client reads back
+/// out of it: the first label is the environment's CNAME prefix and the second
+/// its Region, which is how a client recovers the prefix an environment holds
+/// (`CNAME.split('.')[0]`) and re-checks it with `CheckDNSAvailability`. So the
+/// value carries no port in a label and no path at all — neither is part of a
+/// name — and the labels are followed by a DOMAIN.
+///
+/// That domain is this emulator's own, not Elastic Beanstalk's: a client READS
+/// this address and dials it, and a name under the service's public zone
 /// (`<prefix>.<region>.elasticbeanstalk.com`) resolves to nothing on the machine
 /// this emulator runs on, which would make the one address the API publishes the
-/// one address nobody can reach. So the address is `authority` — the socket the
-/// environment plane is served on
-/// ([`environment_plane_endpoint::environment_plane_authority`]) — with the
-/// environment's Region and CNAME prefix in the PATH, which is where its
-/// application is served ([`crate::service::environment_plane`]).
+/// one address nobody can reach. So the name is minted in the zone this emulator
+/// may announce in (`announced_zone_of_authority`, the workspace's one reading of
+/// that question — the loopback zone RFC 6761 reserves for the interface the core
+/// binds its listeners on, where this emulator is reached at an address), with
+/// this service's own label between the Region and that zone, exactly as every
+/// other published host of this tree is built.
 ///
-/// The CNAME PREFIX is still what identifies the name, inside its Region: it is
-/// what `CheckDNSAvailability` reports on and what at most one live environment
-/// may hold, exactly as the DNS name it forms was.
+/// The PORT of `authority` — the socket the environment plane is served on
+/// ([`environment_plane_endpoint::environment_plane_authority`]) — is kept on the
+/// authority, after the name. The member is "the URL to the CNAME for this
+/// environment", and a URL's authority is `host[:port]`: AWS leaves the port out
+/// because its environments answer on the default HTTP port, which THIS process
+/// cannot bind (it is privileged, and the core hands out ports from its own
+/// range), so a value without it would name an address nothing answers at — the
+/// defect an address no client can reach is. The name is therefore published with
+/// the port the socket really answers on, the same reading every other address
+/// this tree announces for a plane on a core listener takes. Everything the name
+/// cannot carry — WHICH environment a request is for — is in the leading labels,
+/// which [`environment_address_labels`] reads back and
+/// [`crate::service::environment_plane`] serves the request by.
+///
+/// The CNAME PREFIX is what identifies the name, inside its Region: it is what
+/// `CheckDNSAvailability` reports on and what at most one live environment may
+/// hold.
 pub fn environment_cname(authority: &str, region: &str, cname_prefix: &str) -> String {
+    let host = environment_address_host(authority, region, cname_prefix);
+    match ::service_common::data_plane_addressing::addressed_port(Some(authority))
+        .and_then(|port| u16::try_from(port).ok())
+    {
+        Some(port) => ::service_common::data_plane_addressing::host_port_authority(&host, port),
+        None => host,
+    }
+}
+
+/// The HOST of that address, without the port: `<prefix>.<region>.<service
+/// label>.<zone>`.
+///
+/// The REGION ends up in a host here, so it is taken only as a Region LABEL
+/// (`service_common::arn::region_label`, this tree's one statement of that
+/// grammar) and anything else falls back to [`DEFAULT_REGION`]: a value carrying
+/// a host or path delimiter would name an authority the caller chose. The PREFIX
+/// is already a host name label wherever it comes from — a caller-supplied one is
+/// refused unless it is ([`is_legal_cname_prefix`]), and a generated one is built
+/// from the environment's own name and id.
+fn environment_address_host(authority: &str, region: &str, cname_prefix: &str) -> String {
+    let region = ::service_common::arn::region_label(region).unwrap_or(DEFAULT_REGION);
+    let zone = ::service_common::data_plane_addressing::announced_zone_of_authority(authority);
+    format!("{cname_prefix}.{region}.{DATA_PLANE_SEGMENT}.{zone}")
+}
+
+/// The Region and the CNAME PREFIX the published host `host` names, or `None` for
+/// a host that names no environment address of this service.
+///
+/// The reading of [`environment_cname`]: the prefix label, the Region label, this
+/// service's own label, and then the domain the name sits in — which carries at
+/// least one label of its own, since a name is a name only with a domain under it.
+/// Any userinfo, the port and a trailing root dot are not part of the name and are
+/// dropped first, and the comparison of this service's label ignores case, the way
+/// DNS compares names.
+pub fn environment_address_labels(host: &str) -> Option<(&str, &str)> {
+    let named = ::service_common::data_plane_addressing::host_only(host).trim_end_matches('.');
+    let mut labels = named.split('.');
+    let cname_prefix = labels.next()?;
+    let region = labels.next()?;
+    let service = labels.next()?;
+    let domain_has_labels = labels.next().is_some_and(|label| !label.is_empty());
+    (!cname_prefix.is_empty()
+        && !region.is_empty()
+        && service.eq_ignore_ascii_case(DATA_PLANE_SEGMENT)
+        && domain_has_labels)
+        .then_some((region, cname_prefix))
+}
+
+/// The address the environment's traffic is SERVED at —
+/// `EnvironmentDescription$EndpointURL`, "for load-balanced, autoscaling
+/// environments, the URL to the LoadBalancer. For single-instance environments,
+/// the IP address of the instance".
+///
+/// A DIFFERENT value from the CNAME, and not a name at all: what this member
+/// carries is the ADDRESS of the thing answering behind the name — on AWS a load
+/// balancer's own host, or, for a single-instance environment, the instance's IP
+/// ADDRESS. Here that thing is this emulator's own socket, so the member is that
+/// socket's `host:port` with the environment's plane path on it
+/// ([`environment_plane_path`]): the address a client reaches the environment at
+/// without resolving anything.
+///
+/// It stays with its environment when a `SwapEnvironmentCNAMEs` moves the NAMES,
+/// exactly as a load balancer does: the swap exchanges which name points at which
+/// environment, not which address each environment is served at.
+pub fn environment_endpoint_url(authority: &str, region: &str, cname_prefix: &str) -> String {
     format!("{authority}{}", environment_plane_path(region, cname_prefix))
 }
 
@@ -863,12 +955,12 @@ pub const CNAME_ZONE: &str = "elasticbeanstalk.com";
 /// This is a NAME the report answers a question ABOUT, not an address the caller
 /// dials: what the caller does with it is read `Available` beside it and then
 /// create an environment under that prefix. The address an environment is
-/// actually REACHED at is a different member of a different operation, and it is
-/// this emulator's own socket ([`environment_cname`]) — a name in Elastic
-/// Beanstalk's zone resolves to nothing on the machine this emulator runs on.
+/// actually REACHED at is a different member of a different operation, minted in
+/// the zone this emulator answers in ([`environment_cname`]) — a name in Elastic
+/// Beanstalk's own zone resolves to nothing on the machine this emulator runs on.
 ///
 /// The REGION is part of the name because the same prefix in two Regions is two
-/// names, which is why [`environment_plane_path`] carries the Region too.
+/// names, which is why the published address carries the Region label too.
 pub fn fully_qualified_cname(region: &str, cname_prefix: &str) -> String {
     format!("{cname_prefix}.{region}.{CNAME_ZONE}")
 }
@@ -4326,10 +4418,12 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 //
 // A CNAME ([`environment_cname`]) is RESERVED by at most ONE live environment —
 // the one that took it when it was created and still carries it
-// ([`environment_reserving_cname`]) — and is SERVED by at most one live
+// ([`environment_reserving_cname_prefix`]) — and is SERVED by at most one live
 // environment, which is whichever one carries it now
 // ([`environment_serving_cname`]); the two differ exactly for a name a
-// `SwapEnvironmentCNAMEs` has moved. A prefix that cannot be a host name label
+// `SwapEnvironmentCNAMEs` has moved, which is also what separates the
+// environment a NAME reaches from the one its own address reaches
+// ([`environment_at_own_address`]). A prefix that cannot be a host name label
 // names no CNAME at all. All of it lives here, together, because
 // `CheckDNSAvailability` reports on the reservations and `CreateEnvironment`
 // enforces both, and the three must not disagree.
@@ -4354,31 +4448,27 @@ pub fn is_legal_cname_prefix(prefix: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
-/// The live environment in `store` that holds the RESERVATION for `cname` — the
-/// one that took that DNS name when it was created and still carries it, which
-/// is what `CheckDNSAvailability` reports a prefix as unavailable for. A
-/// terminated environment holds nothing, and neither does one whose CNAME a swap
-/// has moved: it carries a name it never reserved, and the name it reserved is
-/// now carried by the environment it swapped with. DNS names are
-/// case-insensitive, so the comparison is too.
-pub fn environment_reserving_cname<'store>(
+/// The live environment in `store` that holds the RESERVATION for the CNAME the
+/// prefix `cname_prefix` forms in `region` — the one that took that DNS name when
+/// it was created and still carries it, which is what `CheckDNSAvailability`
+/// reports a prefix as unavailable for. A terminated environment holds nothing,
+/// and neither does one whose CNAME a swap has moved: it carries a name it never
+/// reserved, and the name it reserved is now carried by the environment it
+/// swapped with.
+pub fn environment_reserving_cname_prefix<'store>(
     store: &'store ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState,
-    cname: &str,
+    region: &str,
+    cname_prefix: &str,
 ) -> Option<&'store Environment> {
-    environment_serving_cname(store, cname)
-        .filter(|environment| environment.reserved_cname.eq_ignore_ascii_case(cname))
+    environment_serving_cname_prefix(store, region, cname_prefix)
+        .filter(|environment| addresses(&environment.reserved_cname, region, cname_prefix))
 }
 
 /// The live environment in `store` whose URL IS `cname` — the one answering at
 /// that DNS name, whether it reserved the name itself or took it in a swap. Two
 /// environments cannot answer at one host name, which is what `CreateEnvironment`
-/// refuses a prefix already in use for.
-///
-/// DELIBERATELY not the same question [`environment_reserving_cname`] answers: a
-/// name a swap moved is served by the environment that received it and reserved
-/// by nobody, so `CheckDNSAvailability` reports it available (which is what the
-/// recorded answer for a swapped prefix carries) while a create still refuses it.
-/// Keep the two predicates apart.
+/// refuses a prefix already in use for. DNS names are case-insensitive, so the
+/// comparison is too.
 pub fn environment_serving_cname<'store>(
     store: &'store ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState,
     cname: &str,
@@ -4392,33 +4482,52 @@ pub fn environment_serving_cname<'store>(
 /// `cname_prefix` in `region` — the one a request to that address is served by.
 ///
 /// The PREFIX inside its Region is what identifies the address
-/// ([`environment_cname`]), and the address a request reached carries both in the
-/// path, so this is the same question [`environment_serving_cname`] answers,
-/// asked by a request rather than by a name: the environment serving the address
-/// is the one whose published CNAME ends in that prefix's plane path.
+/// ([`environment_cname`]): it is the first label of the name the environment
+/// publishes and the Region is the second, so this is the same question
+/// [`environment_serving_cname`] answers, asked by a request rather than by a
+/// whole name.
 pub fn environment_serving_cname_prefix<'store>(
     store: &'store ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState,
     region: &str,
     cname_prefix: &str,
 ) -> Option<&'store Environment> {
-    let path = environment_plane_path(region, cname_prefix);
-    store
-        .environments
-        .values()
-        .find(|environment| !environment.is_terminated() && ends_in_path(&environment.cname, &path))
+    store.environments.values().find(|environment| {
+        !environment.is_terminated() && addresses(&environment.cname, region, cname_prefix)
+    })
 }
 
-/// Whether the address `cname` ends in the plane path `path`, compared the way
-/// DNS compares names: case-insensitively, since a CNAME prefix is a host name
-/// label and `TAKEN-PREFIX` names the name `taken-prefix` names.
+/// The live environment in `store` whose OWN ADDRESS carries the CNAME prefix
+/// `cname_prefix` in `region` — the one the name that prefix forms was MINTED
+/// for, which is the environment served at that address
+/// ([`environment_endpoint_url`], "the URL to the LoadBalancer", "the IP address
+/// of the instance").
 ///
-/// `get` rather than a slice: the address is composed of stored values, but a
-/// byte offset that falls inside a multi-byte character is not a split point —
-/// it answers `false` here instead of panicking.
-fn ends_in_path(cname: &str, path: &str) -> bool {
-    cname
-        .len()
-        .checked_sub(path.len())
-        .and_then(|start| cname.get(start..))
-        .is_some_and(|tail| tail.eq_ignore_ascii_case(path))
+/// DELIBERATELY not the question [`environment_serving_cname_prefix`] answers: a
+/// `SwapEnvironmentCNAMEs` moves the NAMES between two environments and moves
+/// neither environment, so after a swap the name is answered by the environment
+/// that received it while each environment's own address goes on reaching its own
+/// application. Keep the two predicates apart.
+pub fn environment_at_own_address<'store>(
+    store: &'store ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState,
+    region: &str,
+    cname_prefix: &str,
+) -> Option<&'store Environment> {
+    store.environments.values().find(|environment| {
+        !environment.is_terminated() && addresses(&environment.reserved_cname, region, cname_prefix)
+    })
+}
+
+/// Whether the published address `cname` is the one the prefix `cname_prefix`
+/// forms in `region`: its leading labels, compared the way DNS compares names —
+/// case-insensitively, since a CNAME prefix is a host name label and
+/// `TAKEN-PREFIX` names the name `taken-prefix` names.
+///
+/// The Region is read through the same label grammar the address was built with
+/// ([`environment_address_host`]), so a request's Region and the stored name
+/// cannot disagree about which Region's zone the name sits in.
+fn addresses(cname: &str, region: &str, cname_prefix: &str) -> bool {
+    let region = ::service_common::arn::region_label(region).unwrap_or(DEFAULT_REGION);
+    environment_address_labels(cname).is_some_and(|(named_region, named_prefix)| {
+        named_region.eq_ignore_ascii_case(region) && named_prefix.eq_ignore_ascii_case(cname_prefix)
+    })
 }

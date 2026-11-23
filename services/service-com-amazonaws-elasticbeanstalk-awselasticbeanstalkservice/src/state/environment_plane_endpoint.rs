@@ -14,14 +14,18 @@
 //! So the environment plane gets a socket of the EMULATOR's own, opened through
 //! the core (`engine.listeners().tcp_plaintext(..)`, which owns the socket, the
 //! bind interface and the port range), and every environment's published address
-//! is that socket's `host:port` with the environment's Region and CNAME prefix in
-//! the PATH ([`super::environment_plane_path`]). A client dials exactly what it
-//! was told.
+//! is a NAME in the zone this emulator may announce in, with the environment's
+//! CNAME prefix and Region as its leading labels, on that socket's PORT
+//! ([`super::environment_cname`]). A client dials exactly what it was told: the
+//! name resolves to the interface the core bound (RFC 6761 reserves the loopback
+//! zone for it) and the port is the socket's own.
 //!
 //! ONE socket serves every environment of an engine: WHICH environment a request
-//! is for is in the path, so a second port would answer the same requests at
-//! another number. It is opened when the first address is needed and held on the
-//! store for the life of the engine; dropping it closes the port.
+//! is for is in the leading labels of the host it named — or in the PATH, for a
+//! client that resolves nothing but the emulator's own endpoint
+//! ([`super::environment_plane_path`]) — so a second port would answer the same
+//! requests at another number. It is opened when the first address is needed and
+//! held on the store for the life of the engine; dropping it closes the port.
 //!
 //! The socket is the ADDRESS, not the data plane: everything a request is
 //! answered BY — which environment carries the address, what its deployed
@@ -170,14 +174,20 @@ pub async fn environment_plane_authority<Eng: Send + Sync + 'static>(
 /// `callback` is the handle into the emulator this request is running within
 /// (`ctx.callback()`), which is how a request the socket accepts reaches the
 /// plane: the socket is not a second emulator, it is a second ADDRESS of this
-/// one.
+/// one. The STORE travels with it for the same reason the front door's claim
+/// reads one: which addresses this socket serves is a question about the
+/// environments this service HOLDS, never about the shape of a host a client
+/// wrote.
 async fn open_environment_plane<Eng: Send + Sync + 'static>(
     engine: &Eng,
     callback: EmbeddedEmulator,
 ) -> Option<EnvironmentPlaneEndpoint> {
     let shared = (engine as &dyn ::std::any::Any).downcast_ref::<::engine::InMemoryEngine>()?;
     let listeners = shared.listeners();
-    let handler = EnvironmentPlaneSocket { callback };
+    let handler = EnvironmentPlaneSocket {
+        callback,
+        store: shared.state::<ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState>(),
+    };
     // Opened on a task of its OWN, so a runtime that cannot bind a socket at all
     // — one built with no IO driver, which is what a host that drives this
     // emulator in process may hand a request — leaves the create without a socket
@@ -193,12 +203,16 @@ async fn open_environment_plane<Eng: Send + Sync + 'static>(
 /// Serves the environment plane's socket: it speaks HTTP/1.1 on every connection
 /// the core hands it and gives each request to this service's own front door.
 ///
-/// Cheap to clone — its one field is a handle — which is what the core's
-/// `'static` per-connection handler contract asks for.
+/// Cheap to clone — its fields are handles — which is what the core's `'static`
+/// per-connection handler contract asks for.
 #[derive(Clone)]
 struct EnvironmentPlaneSocket {
     /// The handle into the emulator this socket belongs to.
     callback: EmbeddedEmulator,
+    /// This service's own store, the SAME one its handlers read: what decides
+    /// whether an address a request named is one of this service's environments
+    /// ([`serves_the_name`]).
+    store: ::engine::ServiceState<ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState>,
 }
 
 impl NativeHandler for EnvironmentPlaneSocket {
@@ -214,8 +228,10 @@ impl EnvironmentPlaneSocket {
     async fn serve_connection(&self, conn: ListenerConn) {
         let io = ::hyper_util::rt::TokioIo::new(conn);
         let callback = self.callback.clone();
+        let store = self.store.clone();
         let service = ::hyper::service::service_fn(move |request: ::http::Request<_>| {
             let callback = callback.clone();
+            let store = store.clone();
             async move {
                 // A panic anywhere behind this address is CONTAINED here and
                 // answered as the protocol-shaped internal failure, exactly as
@@ -224,7 +240,8 @@ impl EnvironmentPlaneSocket {
                 // with it.
                 let facts = ::emulator_server::RequestFacts::from_request(&request);
                 Ok::<_, ::std::convert::Infallible>(
-                    ::emulator_server::contain_panics(facts, answer(callback, request)).await,
+                    ::emulator_server::contain_panics(facts, answer(callback, store, request))
+                        .await,
                 )
             }
         });
@@ -247,6 +264,7 @@ impl EnvironmentPlaneSocket {
 /// Answer one request this socket accepted, from this service's own front door.
 async fn answer(
     callback: EmbeddedEmulator,
+    store: ::engine::ServiceState<ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState>,
     request: ::http::Request<::hyper::body::Incoming>,
 ) -> ::http::Response<Full<Bytes>> {
     let (parts, body) = request.into_parts();
@@ -256,7 +274,7 @@ async fn answer(
         let Ok(collected) = limited.collect().await else {
             return rendered(BAD_GATEWAY);
         };
-        let Some(forwarded) = forwarded(parts, collected.to_bytes()) else {
+        let Some(forwarded) = forwarded(parts, collected.to_bytes(), &store) else {
             // A request this socket does not serve: one that addresses no
             // environment plane at all, or one that does not render as a request.
             return rendered(NOT_SERVED_STATUS);
@@ -290,37 +308,68 @@ async fn answer(
 }
 
 /// The request this service's front door is handed for one client request: the
-/// same method, path, query and body, addressed to this service's own endpoint —
-/// so the plane claims it exactly as it claims a request a client sent to the
-/// emulator's API endpoint under the same path.
+/// same method, path, query and body, addressed to the AUTHORITY the client
+/// addressed where a live environment of THIS STORE answers at that authority,
+/// and to this service's own endpoint otherwise — so the plane reads back the very
+/// addressing the client used, and a host a client invented cannot pick which
+/// service the forwarded request reaches.
 ///
-/// Only a request addressing the PLANE is handed over
-/// ([`crate::service::environment_plane::addresses_environment_plane`]): this
-/// socket serves environment traffic and nothing else, so a path that is not an
-/// environment's own is answered here rather than resolved as some other route.
-/// The client's credential and signing headers do not travel with it (see
-/// [`HEADERS_NOT_FORWARDED`]).
+/// The authority matters because the two addressings an environment publishes are
+/// different questions ([`crate::service::environment_plane`]): a NAME is answered
+/// by whatever carries it now, and an environment's own address by that
+/// environment. Rewriting a name-addressed request into the path form would
+/// collapse the two, and a client dialling a name a `SwapEnvironmentCNAMEs` had
+/// moved would be served the application of the environment that minted it.
+///
+/// Only a request addressing the PLANE is handed over: a name a live environment
+/// answers at ([`serves_the_name`], the store the front door's own claim reads),
+/// or the plane PATH
+/// ([`crate::service::environment_plane::addresses_environment_plane`]). This
+/// socket serves environment traffic and nothing else, so a request that names no
+/// environment of this service is answered here rather than resolved as some
+/// other route. The client's credential and signing headers do not travel with it
+/// (see [`HEADERS_NOT_FORWARDED`]), and neither does its own `Host`: the
+/// authority above is what the forwarded request carries.
 ///
 /// `None` when the client's own request does not address this plane, or does not
 /// render as a request at all.
-fn forwarded(parts: ::http::request::Parts, body: Bytes) -> Option<RtRequest> {
+fn forwarded(
+    parts: ::http::request::Parts,
+    body: Bytes,
+    store: &::engine::ServiceState<ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState>,
+) -> Option<RtRequest> {
     let path = parts.uri.path();
-    if !crate::service::environment_plane::addresses_environment_plane(path) {
+    let stated_host = parts
+        .headers
+        .get(::http::header::HOST)
+        .and_then(|value| value.to_str().ok());
+    // The authority the forwarded request is addressed to: the name the client
+    // stated when a live environment of this store ANSWERS at that name — which
+    // is what says WHICH environment the request is for, and the whole of the
+    // addressing for a request carrying no plane path — and this service's own
+    // endpoint for every other request, whose plane path is what names its
+    // environment.
+    let addressed_to = stated_host.filter(|host| serves_the_name(store, host));
+    if addressed_to.is_none()
+        && !crate::service::environment_plane::addresses_environment_plane(path, None)
+    {
         return None;
     }
+    let addressed_to = addressed_to.unwrap_or(SERVICE_ENDPOINT);
     let query = parts
         .uri
         .query()
         .map(|query| format!("?{query}"))
         .unwrap_or_default();
-    let uri = format!("https://{SERVICE_ENDPOINT}{path}{query}");
+    let uri = format!("https://{addressed_to}{path}{query}");
     let mut builder = ::http::Request::builder()
         .method(parts.method.clone())
         .uri(uri)
-        .header(::http::header::HOST, SERVICE_ENDPOINT);
+        .header(::http::header::HOST, addressed_to);
     for (name, value) in parts.headers.iter() {
         let name_text = name.as_str();
-        if HEADERS_NOT_FORWARDED.contains(&name_text)
+        if name == ::http::header::HOST
+            || HEADERS_NOT_FORWARDED.contains(&name_text)
             || name_text.starts_with(SIGNING_HEADER_PREFIX)
         {
             continue;
@@ -329,6 +378,27 @@ fn forwarded(parts: ::http::request::Parts, body: Bytes) -> Option<RtRequest> {
     }
     let built = builder.body(SdkBody::from(body)).ok()?;
     RtRequest::try_from(built).ok()
+}
+
+/// Whether a LIVE environment of `store` answers at the name `host` — the same
+/// question the front door's claim asks of the store
+/// (`crate::service::environment_plane`), asked here because the authority a
+/// relayed request carries must name an environment this service HOLDS and not
+/// merely a host shaped like one.
+///
+/// A termination the clock has already completed is what makes a name stop being
+/// answered, and it was due whether or not anybody dialled, so the owed
+/// transitions are settled first — the one write this reading performs.
+fn serves_the_name(
+    store: &::engine::ServiceState<ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState>,
+    host: &str,
+) -> bool {
+    let Some((region, cname_prefix)) = environment_address_labels(host) else {
+        return false;
+    };
+    let mut held = store.lock();
+    held.materialize_due_transitions();
+    environment_serving_cname_prefix(&held, region, cname_prefix).is_some()
 }
 
 /// One answer this socket renders itself, for a request it could not hand over at

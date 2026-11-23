@@ -192,7 +192,7 @@ async fn a_name_is_held_until_its_environment_is_terminated_and_can_then_be_take
         );
         assert_eq!(
             again.expect("CNAME", case),
-            emulator.environment_address(TEST_REGION, prefix),
+            emulator.published_cname(TEST_REGION, prefix),
             "case {case:?}: the re-created environment publishes the address its prefix \
              forms, got {}",
             again.body

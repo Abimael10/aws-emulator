@@ -29,11 +29,11 @@ const RELEASE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60)
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// The address `prefix` forms in `region`, as `state::environment_cname` builds
-/// it: the socket this emulator serves the environment plane on, then the plane
-/// path that prefix's environment is served at. Read off the emulator, because
-/// the port that socket answers on is the core's to choose.
+/// it: the DNS name whose first labels are that prefix and that Region, on the
+/// port the socket this emulator serves the environment plane on answers. Read
+/// off the emulator, because that port is the core's to choose.
 fn served_at(emulator: &Emulator, prefix: &str, region: &str) -> String {
-    emulator.environment_address(region, prefix)
+    emulator.published_cname(region, prefix)
 }
 
 /// The DNS name `prefix` forms in `region`, as `CheckDNSAvailability` reports it:

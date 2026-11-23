@@ -54,12 +54,12 @@ fn rows() -> Vec<Row> {
     ]
 }
 
-/// The CNAME a prefix forms, as `state::environment_cname` builds it: the socket
-/// this emulator serves the environment plane on, then the plane path that
-/// prefix's environment is served at. Read off the emulator, because the port
-/// that socket answers on is the core's to choose.
+/// The CNAME a prefix forms, as `state::environment_cname` builds it: the DNS
+/// name whose first labels are that prefix and the Region, on the port the socket
+/// this emulator serves the environment plane on answers. Read off the emulator,
+/// because that port is the core's to choose.
 fn fully_qualified(emulator: &Emulator, prefix: &str) -> String {
-    emulator.environment_address(TEST_REGION, prefix)
+    emulator.published_cname(TEST_REGION, prefix)
 }
 
 /// Create the environment `name` holding the CNAME `prefix` forms, and answer its

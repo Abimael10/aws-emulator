@@ -116,9 +116,15 @@ impl Environment {
             // environment stops carrying it.
             reserved_cname: environment_cname(plane_authority, region, &cname_prefix),
             // `EndpointURL` is "the URL to the LoadBalancer" or "the IP address
-            // of the instance" — the address the environment's traffic goes to,
-            // which is the one address this environment answers at.
-            endpoint_url: Some(environment_cname(plane_authority, region, &cname_prefix)),
+            // of the instance" — the ADDRESS the environment's traffic is served
+            // at, which is this emulator's own socket
+            // ([`environment_endpoint_url`]), rather than the NAME the CNAME
+            // carries.
+            endpoint_url: Some(environment_endpoint_url(
+                plane_authority,
+                region,
+                &cname_prefix,
+            )),
             tier,
             option_settings,
             // A launch deploys the configuration it was given, so there is no

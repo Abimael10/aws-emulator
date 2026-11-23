@@ -7,21 +7,28 @@
 //! An environment publishes the address its traffic goes to —
 //! `EnvironmentDescription$CNAME`, "the URL to the CNAME for this environment",
 //! and the `EndpointURL` beside it — and a client READS that address and dials
-//! it. That address is the emulator's own endpoint with the environment's CNAME
-//! prefix in the path ([`crate::state::environment_cname`]), which names no
-//! modelled operation of this service: the front door could resolve no operation
-//! for such a request and answered a routing failure, for the one address this
-//! service told the caller to use. So this plane claims it
-//! ([`claims_parts`], read by `Service::can_handle`) and serves it
+//! it. That address is a NAME whose first two labels are the environment's CNAME
+//! prefix and its Region ([`crate::state::environment_cname`]), on the port the
+//! environment plane's own socket answers ([`crate::state::environment_plane_endpoint`]);
+//! the same request is served under the PATH that names the same two things
+//! ([`crate::state::environment_plane_path`]), for a client that resolves nothing
+//! but the emulator's own endpoint.
+//!
+//! Neither addressing names a modelled operation of this service: the front door
+//! could resolve no operation for such a request and answered a routing failure,
+//! for the one address this service told the caller to use. So this plane claims
+//! it ([`claims_parts`], read by `Service::can_handle`) and serves it
 //! ([`EnvironmentPlane`], returned by `Service::override_operation`).
 //!
 //! What it answers is what the DEPLOYED APPLICATION answers: the version the
 //! environment reports running is RUN, in process, and the response its own
 //! request handler ends is the response — or, for a bundle that starts no server
 //! of its own, the file of that bundle the request addresses
-//! ([`crate::state::DeployedApplication`]). Nothing is invented: an environment
-//! running no application this emulator could start answers as an address with
-//! nothing behind it.
+//! ([`crate::state::DeployedApplication`]). WHICH environment answers follows
+//! from HOW the request was addressed ([`Addressing`]): a NAME is answered by the
+//! environment carrying it now, and an environment's own address by that
+//! environment. Nothing is invented: an environment running no application this
+//! emulator could start answers as an address with nothing behind it.
 //!
 //! Serving traffic moves no status, consumes no quota and bumps no counter, so a
 //! client dialling the address leaves every later caller seeing exactly what it
@@ -39,8 +46,9 @@ use smithy_server_runtime::{http, BoxFuture, ErasedOperation, OperationContext, 
 use ::service_common::data_plane_addressing::{first_segment, EMULATOR_PATH_NAMESPACE};
 
 use crate::state::{
-    environment_serving_cname_prefix, service_state, stream_instance_logs, GuestRequest,
-    GuestResponse, InstanceLogStreaming, DATA_PLANE_SEGMENT,
+    environment_at_own_address, environment_serving_cname_prefix, service_state,
+    stream_instance_logs, Environment, GuestRequest, GuestResponse, InstanceLogStreaming,
+    DATA_PLANE_SEGMENT,
 };
 
 /// What this plane answers for an address no environment serves — the prefix of
@@ -62,24 +70,94 @@ const PLAIN_TEXT: &str = "text/plain; charset=utf-8";
 /// encoding stating one would describe a body that is not there.
 const HEADERS_DESCRIBING_A_BODY: &[&str] = &["content-length", "transfer-encoding"];
 
-/// Whether `path` addresses this plane at all: the reserved namespace segment,
-/// then this service's own plane segment, then a Region and a CNAME prefix.
+/// How a request ADDRESSES an environment, which is what decides WHICH
+/// environment answers it.
 ///
-/// The SOCKET an environment's address is served on
-/// ([`crate::state::environment_plane_endpoint`]) reads it before handing a
-/// request to the front door, so that port serves environment traffic and
-/// nothing else.
-pub fn addresses_environment_plane(path: &str) -> bool {
-    addressed(path).is_some()
+/// The two addressings an environment publishes are not the same question. The
+/// `CNAME` is a NAME, and a name is answered by whatever carries it now — which
+/// is the point of `SwapEnvironmentCNAMEs`, where the names move and the
+/// environments do not. The `EndpointURL` is the ADDRESS the environment itself
+/// is served at ("the URL to the LoadBalancer", "the IP address of the
+/// instance"), which no swap moves: it goes on reaching its own environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Addressing {
+    /// The NAME the environment publishes, which the request carried in its HOST.
+    Name,
+    /// The ADDRESS it is served at, which the request carried in its PATH.
+    OwnAddress,
 }
 
-/// The CNAME prefix a request addresses, its Region, and the request path under
-/// them — or `None` when the request does not address this plane at all.
+/// What one request addresses: the CNAME prefix and the Region it names, how it
+/// named them, and the request path under them.
+#[derive(Debug, Clone, Copy)]
+struct Addressed<'r> {
+    region: &'r str,
+    cname_prefix: &'r str,
+    /// The application's own request path.
+    path: &'r str,
+    addressing: Addressing,
+}
+
+/// Whether `path` and `host` address this plane at all — the predicate the SOCKET
+/// an environment's address is served on
+/// ([`crate::state::environment_plane_endpoint`]) reads before handing a request
+/// to the front door, so that port serves environment traffic and nothing else.
 ///
-/// The addressing is the one [`crate::state::environment_plane_path`] writes:
-/// `/_aws/elasticbeanstalk/<region>/<cname prefix>` and then the application's
+/// The same reading the claim uses, minus the store: a request addressed by the
+/// plane PATH, or by the leading labels of a published NAME.
+pub fn addresses_environment_plane(path: &str, host: Option<&str>) -> bool {
+    addressed_by(path, host).is_some()
+}
+
+/// What a request addresses, or `None` when it addresses no environment of this
+/// plane at all.
+///
+/// Read from the two addressings the module docs state: the PATH
+/// [`crate::state::environment_plane_path`] writes
+/// (`/_aws/elasticbeanstalk/<region>/<cname prefix>` and then the application's
 /// own request path, so `/_aws/elasticbeanstalk/us-west-2/my-env` addresses `/`
-/// of `my-env` in `us-west-2`.
+/// of `my-env` in `us-west-2`) — the address the `EndpointURL` publishes — and
+/// otherwise the leading labels of the HOST the request named
+/// ([`crate::state::environment_address_labels`]), the NAME the `CNAME`
+/// publishes, whose whole path is then the application's own.
+fn addressed_by<'r>(path: &'r str, host: Option<&'r str>) -> Option<Addressed<'r>> {
+    if let Some((region, cname_prefix, path)) = addressed(path) {
+        return Some(Addressed {
+            region,
+            cname_prefix,
+            path,
+            addressing: Addressing::OwnAddress,
+        });
+    }
+    let (region, cname_prefix) = crate::state::environment_address_labels(host?)?;
+    Some(Addressed {
+        region,
+        cname_prefix,
+        path,
+        addressing: Addressing::Name,
+    })
+}
+
+/// The live environment that answers what `addressed` addresses: the one CARRYING
+/// that name for a request addressed by name, and the one that name was MINTED for
+/// — the environment served at that address — for a request addressed by its own
+/// address. The two differ exactly for a name a `SwapEnvironmentCNAMEs` has moved,
+/// which is what makes the swap observable in the traffic.
+fn environment_answering<'store>(
+    store: &'store crate::state::ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState,
+    addressed: &Addressed<'_>,
+) -> Option<&'store Environment> {
+    match addressed.addressing {
+        Addressing::Name => {
+            environment_serving_cname_prefix(store, addressed.region, addressed.cname_prefix)
+        }
+        Addressing::OwnAddress => {
+            environment_at_own_address(store, addressed.region, addressed.cname_prefix)
+        }
+    }
+}
+
+/// The same reading for the PATH addressing alone.
 fn addressed(path: &str) -> Option<(&str, &str, &str)> {
     let (namespace, rest) = first_segment(path)?;
     if namespace != EMULATOR_PATH_NAMESPACE {
@@ -101,19 +179,47 @@ fn addressed(path: &str) -> Option<(&str, &str, &str)> {
 /// shared store, rather than to a path shape alone, so one request keeps one
 /// claimant.
 pub fn claims_parts<Eng: Send + Sync + 'static>(engine: &Eng, parts: &http::request::Parts) -> bool {
-    claims_path(engine, parts.uri.path())
+    claims(engine, parts.uri.path(), addressed_authority_of_parts(parts))
+}
+
+/// The authority a request's PARTS ADDRESSED, which is what the name addressing is
+/// read from: the tree's one reading of "WHICH RESOURCE a request addresses"
+/// ([`::service_common::data_plane_addressing::addressed_authority_of`]) — the
+/// request target's own authority, and the `Host` header for a request that
+/// carries none. Not the host a client STATED, which for a relayed request is the
+/// host that relay's own client addressed.
+fn addressed_authority_of_parts(parts: &http::request::Parts) -> Option<&str> {
+    ::service_common::data_plane_addressing::addressed_authority_of(
+        parts.uri.authority().map(::http::uri::Authority::as_str),
+        parts
+            .headers
+            .get(::http::header::HOST)
+            .and_then(|value| value.to_str().ok()),
+    )
 }
 
 /// [`claims_parts`] for the runtime-API request the serving seams are handed,
 /// read by the same rule, so the claim and the serving cannot disagree about
 /// which requests belong to this plane.
 pub fn claims_request<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> bool {
-    claims_path(engine, ::service_common::request_path(req.uri()))
+    claims(
+        engine,
+        ::service_common::request_path(req.uri()),
+        addressed_authority_of_request(req),
+    )
+}
+
+/// The authority a runtime-API request addressed, by the same reading.
+fn addressed_authority_of_request(req: &RtRequest) -> Option<&str> {
+    ::service_common::data_plane_addressing::addressed_authority(
+        req.uri(),
+        req.headers().get(::http::header::HOST.as_str()),
+    )
 }
 
 /// The one rule both of those read.
-fn claims_path<Eng: Send + Sync + 'static>(engine: &Eng, path: &str) -> bool {
-    let Some((region, prefix, _)) = addressed(path) else {
+fn claims<Eng: Send + Sync + 'static>(engine: &Eng, path: &str, host: Option<&str>) -> bool {
+    let Some(addressed) = addressed_by(path, host) else {
         return false;
     };
     let Some(state) = service_state(engine) else {
@@ -123,7 +229,7 @@ fn claims_path<Eng: Send + Sync + 'static>(engine: &Eng, path: &str) -> bool {
     // A termination the clock has already completed is what makes an address stop
     // being served, and it was due whether or not anybody dialled.
     store.materialize_due_transitions();
-    environment_serving_cname_prefix(&store, region, prefix).is_some()
+    environment_answering(&store, &addressed).is_some()
 }
 
 /// The data plane as the ROUTER serves it: the operation
@@ -178,14 +284,14 @@ async fn serve<Eng: Send + Sync + 'static>(
     ctx: &OperationContext<'_>,
 ) -> RtResponse {
     let path = ::service_common::request_path(req.uri());
-    let Some((region, prefix, application_path)) = addressed(path) else {
+    let Some(addressed) = addressed_by(path, addressed_authority_of_request(req)) else {
         return rendered(NOT_SERVED_STATUS, PLAIN_TEXT, Vec::new());
     };
     // The query string belongs to the request the application reads off
     // `req.url`, the way Node.js hands it over.
     let application_path = match req.uri().split_once('?') {
-        Some((_, query)) => format!("{application_path}?{query}"),
-        None => application_path.to_string(),
+        Some((_, query)) => format!("{}?{query}", addressed.path),
+        None => addressed.path.to_string(),
     };
     let request = GuestRequest {
         method: req.method().to_string(),
@@ -209,14 +315,14 @@ async fn serve<Eng: Send + Sync + 'static>(
         };
         let mut store = state.lock();
         store.materialize_due_transitions();
-        let Some(environment) = environment_serving_cname_prefix(&store, region, prefix) else {
+        let Some(environment) = environment_answering(&store, &addressed) else {
             return rendered(NOT_SERVED_STATUS, PLAIN_TEXT, Vec::new());
         };
         let environment_id = environment.environment_id.clone();
         // Where this environment's instance logs go, read while the store is held
         // — the delivery itself calls another service and so happens below, with
         // no guard taken.
-        let streaming = store.instance_log_streaming(region, &environment_id);
+        let streaming = store.instance_log_streaming(addressed.region, &environment_id);
         (store.deployed_application(&environment_id), streaming)
     };
     let Some(deployed) = deployed else {

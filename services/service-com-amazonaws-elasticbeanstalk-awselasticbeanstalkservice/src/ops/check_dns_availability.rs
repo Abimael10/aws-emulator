@@ -2,11 +2,11 @@
 
 //! @op CheckDNSAvailability
 //! Implemented: reports whether the CNAME the requested prefix forms in the request's
-//! region is still free — no live environment in the store holds the RESERVATION for it
-//! ([`crate::state::environment_reserving_cname`]), and the prefix can form a DNS label
-//! at all — and the fully qualified CNAME that prefix would reserve. Reserves nothing:
-//! this is a report on the store, not a claim on the name. This is the ONLY file to
-//! touch for this operation.
+//! region is still free — no live environment in the store holds the RESERVATION for
+//! that prefix ([`crate::state::environment_reserving_cname_prefix`]), and the prefix
+//! can form a DNS label at all — and the fully qualified CNAME that prefix would
+//! reserve. Reserves nothing: this is a report on the store, not a claim on the name.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -131,13 +131,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let region = crate::state::request_region(ctx);
-        // The address a prefix forms is the address the environment holding it is
-        // SERVED at, so the report needs the socket that answers there — opened
-        // on the first call that needs it, before the store is taken, and the
-        // same address on every later call. It is this service's own socket, not
-        // a resource this caller holds: nothing a later caller sees changes.
-        let plane_authority =
-            crate::state::environment_plane_authority(&*self.engine, ctx).await;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CheckDNSAvailabilityError::internal_failure(
                 "the Elastic Beanstalk store is unavailable",
@@ -157,20 +150,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // creates an environment under that prefix. It is reported for an
         // unusable prefix too: the member says which name the prefix WOULD form,
         // and `Available` is what says it cannot be had.
-        //
-        // The RESERVATION is held against the address the environment holding
-        // that prefix is SERVED at, which is this emulator's own socket, so the
-        // lookup below is made with that address while the report carries the
-        // name.
         let fully_qualified_cname =
             crate::state::fully_qualified_cname(&region, &input.cname_prefix);
-        let served_at =
-            crate::state::environment_cname(&plane_authority, &region, &input.cname_prefix);
         // Available unless the name cannot exist at all, or a live environment
-        // holds the RESERVATION for it. Nothing is written for the answer:
-        // checking a prefix neither reserves a free one nor releases a held one.
+        // holds the RESERVATION for that prefix in this Region. Nothing is
+        // written for the answer: checking a prefix neither reserves a free one
+        // nor releases a held one, and the report needs no socket of its own —
+        // it is a report on the store, not an address for the caller to dial.
         let available = crate::state::is_legal_cname_prefix(&input.cname_prefix)
-            && crate::state::environment_reserving_cname(&store, &served_at).is_none();
+            && crate::state::environment_reserving_cname_prefix(
+                &store,
+                &region,
+                &input.cname_prefix,
+            )
+            .is_none();
 
         Ok(CheckDNSAvailabilityOutput {
             available: Some(available),

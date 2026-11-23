@@ -1689,6 +1689,76 @@ pub(crate) async fn create_eb_environment(
     Ok(Created::attributes(attributes))
 }
 
+/// The `Status` an environment that has finished its initial deployment reports:
+/// "Ready: Environment is available to have an action performed on it, such as
+/// update or terminate" (`EnvironmentDescription$Status`), which is what says the
+/// resource is created.
+const ENVIRONMENT_READY: &str = "Ready";
+
+/// The statuses that same member documents for an environment work is still
+/// running on: "Launching: Environment is in the process of initial deployment",
+/// "Updating: Environment is in the process of updating its configuration
+/// settings or application version", "Aborting: Environment is in the process of
+/// aborting a deployment", and the two an environment of a group is in while it
+/// is being linked ("LinkingFrom", "LinkingTo"). None of them is a state the
+/// environment can be acted on in, so each is waited out.
+const ENVIRONMENT_IN_PROGRESS: &[&str] = &[
+    "Aborting",
+    "Launching",
+    "LinkingFrom",
+    "LinkingTo",
+    "Updating",
+];
+
+/// Whether Elastic Beanstalk reports the created environment ready for a client
+/// to use.
+///
+/// `CreateEnvironment` "launches an environment for the specified application"
+/// and ANSWERS WHILE that launch is running: the environment it answers for is
+/// `Launching` ("Environment is in the process of initial deployment"), in which
+/// it is not "available to have an action performed on it, such as update or
+/// terminate" — the two statuses `EnvironmentDescription$Status` documents. So the
+/// stack holds the resource's creation open until that service reports the
+/// environment `Ready`, and a client that reads the stack as complete finds an
+/// environment it can really deploy to, update, probe or terminate.
+///
+/// Every other in-progress status is waited out the same way
+/// ([`ENVIRONMENT_IN_PROGRESS`]). An environment in the shut-down process, one
+/// that is not running, and one that service no longer holds at all are in the
+/// same position as each other: no wait brings a launch out of them, so the
+/// resource FAILS with what that service reports rather than waiting the window
+/// out.
+pub(crate) async fn eb_environment_readiness(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Readiness, Refusal> {
+    let Some(environment) = describe_eb_environment(ctx, region, physical_resource_id).await?
+    else {
+        return Ok(Readiness::Failed(format!(
+            "Elastic Beanstalk holds no environment named {physical_resource_id}"
+        )));
+    };
+    let status = environment
+        .get("Status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if status == ENVIRONMENT_READY {
+        return Ok(Readiness::Ready);
+    }
+    if ENVIRONMENT_IN_PROGRESS.contains(&status) {
+        return Ok(Readiness::Pending(status.to_string()));
+    }
+    Ok(Readiness::Failed(match status {
+        "" => format!(
+            "Elastic Beanstalk reports no status for environment {physical_resource_id}"
+        ),
+        status => format!(
+            "Elastic Beanstalk reports environment {physical_resource_id} in status {status}"
+        ),
+    }))
+}
+
 /// Delete the application a stack created, addressed by its name — this resource's
 /// physical id.
 ///

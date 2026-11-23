@@ -376,6 +376,14 @@ impl Provisioner {
             Self::SsmQuickSetupConfigurationManager => {
                 configuration_manager_readiness(ctx, region, physical_resource_id).await
             }
+            // `CreateEnvironment` "launches an environment for the specified application"
+            // and answers while that launch is still running, so the environment it answers
+            // for is `Launching` — not yet "available to have an action performed on it,
+            // such as update or terminate" — and the resource's creation is finished once
+            // Elastic Beanstalk reports it `Ready` ([`eb_environment_readiness`]).
+            Self::ElasticBeanstalkEnvironment => {
+                eb_environment_readiness(ctx, region, physical_resource_id).await
+            }
             _ => Ok(Readiness::Ready),
         }
     }

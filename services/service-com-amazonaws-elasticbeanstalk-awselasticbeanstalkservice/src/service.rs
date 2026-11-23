@@ -109,7 +109,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // name. Edit this for anything the model does not express — a signing
         // name shared by several services, or access-key-id-based routing.
         match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
+            Some(key) if key == self.entry.identity().signing_name() => true,
             // And an ENVIRONMENT's own traffic: a request addressed to the
             // address an environment of this store publishes
             // ([`environment_plane::claims_parts`]). Such a request names no
@@ -117,7 +117,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             // service — a client of a published address has no AWS credential to
             // sign with — so the front door answered a routing failure for the
             // one address this service told the caller to use.
-            None => environment_plane::claims_parts(&*self.engine, parts),
+            //
+            // Asked whatever route key the request resolved, because the
+            // published address is a NAME whose first label is the environment's
+            // CNAME prefix: that label names no service, so the key resolved from
+            // it is the prefix itself. The claim is narrowed to an environment
+            // this service HOLDS, so a request addressed to another service's
+            // host is not claimed here.
+            _ => environment_plane::claims_parts(&*self.engine, parts),
         }
     }
 

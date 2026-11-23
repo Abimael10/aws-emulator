@@ -15,11 +15,12 @@
 
 use crate::harness::{Answer, Emulator, PAST_DUE, SOLUTION_STACK};
 
-/// The path segment every environment address this service derives carries —
-/// an environment's CNAME is the emulator's own endpoint with the environment's
-/// Region and CNAME prefix in the path, so the marker below is the plane the
-/// address names and the prefix is read off the value rather than repeated here.
-const CNAME_PLANE: &str = "/_aws/elasticbeanstalk/";
+/// The label every environment address this service derives carries between the
+/// Region and the zone it is announced in — an environment's CNAME is a DNS name
+/// whose first label is its CNAME prefix and whose second is its Region, so the
+/// marker below is the label that names this service in it and the prefix is read
+/// off the value rather than repeated here.
+const CNAME_SERVICE_LABEL: &str = ".elasticbeanstalk.";
 
 /// The awsQuery error envelope's `<Message>`, or `""` on an answer that carries
 /// none. Read through the shared harness's element reader, so this suite adds no
@@ -199,14 +200,14 @@ async fn the_two_selected_environments_exchange_their_cnames() {
             ("destination", &destination_before, row.destination_prefix),
         ] {
             assert!(
-                cname.contains(CNAME_PLANE),
-                "case {case:?}: the {label} CNAME must be an address on this emulator's own \
-                 {CNAME_PLANE} plane, got {cname:?}"
+                cname.contains(CNAME_SERVICE_LABEL),
+                "case {case:?}: the {label} CNAME must be a name this emulator announces for \
+                 this service, got {cname:?}"
             );
             if let Some(prefix) = prefix {
                 assert!(
-                    cname.ends_with(&format!("/{prefix}")),
-                    "case {case:?}: the {label} CNAME must end at its prefix {prefix:?}, got {cname:?}"
+                    cname.starts_with(&format!("{prefix}.")),
+                    "case {case:?}: the {label} CNAME must start at its prefix {prefix:?}, got {cname:?}"
                 );
             }
         }

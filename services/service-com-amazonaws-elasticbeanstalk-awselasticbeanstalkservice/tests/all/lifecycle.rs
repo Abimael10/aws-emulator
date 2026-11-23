@@ -259,6 +259,23 @@ impl Emulator {
         )
     }
 
+    /// The address an environment with the CNAME prefix `prefix` in `region`
+    /// PUBLISHES — its `CNAME` and `EndpointURL`.
+    ///
+    /// The FORM is spelled out here rather than read off the crate, so a suite
+    /// that asserts the published value holds the service to it: the prefix
+    /// label, the Region label, this service's own label and the loopback zone
+    /// the core binds its listeners in, on the plane socket's own port. Only the
+    /// PORT is read off that socket, because the port is the core's to choose.
+    pub(crate) fn published_cname(&self, region: &str, prefix: &str) -> String {
+        let authority = self.plane_authority();
+        let port = authority
+            .rsplit_once(':')
+            .map(|(_host, port)| port.to_string())
+            .unwrap_or_else(|| panic!("the environment plane socket is open: {authority:?}"));
+        format!("{prefix}.{region}.elasticbeanstalk.localhost:{port}")
+    }
+
     /// Dispatch a request the caller built itself, for a suite that drives
     /// ANOTHER mounted service over ITS own wire protocol (the SNS awsQuery
     /// surface, the SQS awsJson one) rather than this service's.
@@ -1168,7 +1185,7 @@ async fn created_environments_are_derived_from_the_request_and_persisted() {
             .unwrap_or_else(|| format!("{name}-{}", environment_id.trim_start_matches("e-")));
         assert_eq!(
             cname,
-            emulator.environment_address(case.region, &expected_prefix),
+            emulator.published_cname(case.region, &expected_prefix),
             "case {name:?}: unexpected CNAME, got {cname:?}"
         );
         assert_eq!(
