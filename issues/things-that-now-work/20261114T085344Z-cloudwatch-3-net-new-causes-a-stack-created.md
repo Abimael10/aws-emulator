@@ -48,3 +48,35 @@ Cause 3 — expected the lifecycle to complete (its own stack budget is 900 s of
 Cause 1: CreateStack with an AWS::CloudWatch::Alarm plus an AWS::CloudWatch::CompositeAlarm whose AlarmRule references it; after CREATE_COMPLETE call DescribeAlarms(AlarmNames=[<composite>]) — CompositeAlarms is empty.
 Cause 2: CreateStack with a valid metric alarm, a CompositeAlarm whose AlarmRule is ALARM("<name-never-created>"), and nothing creating that name; poll DescribeStacks — it reaches CREATE_COMPLETE instead of ROLLBACK_COMPLETE. Equivalently call PutCompositeAlarm directly with an AlarmRule naming a non-existent alarm: it is accepted.
 Cause 3: deploy the mstrx monitoring template (two AWS::CloudWatch::MetricStream resources, one with ExcludeFilters) and then list/read the streams — the sequence never completes.
+
+## Resolution
+
+Cause 1 — FIXED. The CloudFormation arm for `AWS::CloudWatch::CompositeAlarm`
+(`services/service-com-amazonaws-cloudformation-cloudformation/src/state/provisioner/cloudwatch_composite_alarms.rs`)
+creates the alarm through CloudWatch's own `PutCompositeAlarm`, so a stack-created composite alarm
+is one `DescribeAlarms` reports in its `CompositeAlarms` list and whose state is derived from the
+`AlarmRule` over the children the same stack created. Pinned by
+`services/service-com-amazonaws-cloudformation-cloudformation/tests/all/declared_alarm_is_readable_in_cloudwatch.rs`
+(`a_composite_alarm_a_stack_declares_derives_its_state_in_cloudwatch`); the check this issue is
+keyed on replays green.
+
+Cause 2 — FIXED on the emulator side: `PutCompositeAlarm` resolves every alarm its `AlarmRule`
+references, and the alarm its `ActionsSuppressor` names, against the stored alarms and refuses a
+reference nothing answers to
+(`services/service-com-amazonaws-cloudwatch-graniteserviceversion20100801/src/ops/put_composite_alarm.rs`,
+`write_composite_alarm`), so the resource create fails and the stack ends `ROLLBACK_COMPLETE` with
+no composite alarm left behind. The check now gets past that assertion and fails later, on the
+CloudFormation failure reason not carrying CloudWatch's own `Error Code: ValidationError` field —
+which is cause 9 of `20261117T121318Z-cloudwatch-9-net-new-causes-putmetricdata-accepts-an.md`, the
+issue that owns that key.
+
+Cause 3 — no emulator-side non-termination exists in this code base. The whole recorded lifecycle —
+a CREATE change set waited for and executed, `GetMetricStream` per stream, the paginated
+`ListMetricStreams` walk (with a page size and with none), `StopMetricStreams`, emptying the
+destination, `DeleteStack`, and the post-destroy not-found reads — is driven end to end over the
+assembled emulator by `core/router/tests/all/cloudformation_monitoring_metric_streams_lifecycle.rs`
+and every call answers; the two rows together take about 19 s, of which the stack create and the
+stack delete are one transition span each. What is left is the recorded client's own 60 s budget
+against the delivery stream's configured buffering interval
+(`BufferingHints$IntervalInSeconds`, whose documented default is five minutes) and against its own
+poll granularity — neither of which this emulator decides.
