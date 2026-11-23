@@ -27,7 +27,7 @@ use service_com_amazonaws_rds_amazonrdsv19::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::db_instances::{call, emulator, expect_ok, optional_text, text};
-use crate::engine_default_parameters::{reported, Reported};
+use crate::engine_default_parameters::{published_source, reported, Reported};
 
 /// A group name one row can be created under: the documented name rule admits letters,
 /// digits and hyphens only, so a family's dots and underscores become hyphens, and the row's
@@ -222,11 +222,11 @@ async fn a_db_parameter_groups_listing_reports_an_apply_method_for_every_paramet
             assert_eq!(
                 (entry.source.as_deref(), entry.apply_method.as_deref()),
                 (
-                    Some(PARAMETER_SOURCE_ENGINE_DEFAULT),
+                    Some(published_source(&entry.name)),
                     Some(APPLY_METHOD_PENDING_REBOOT)
                 ),
-                "case {case:?}: an unchanged parameter is the engine's default and waits for \
-                 the reboot, got {entry:?}"
+                "case {case:?}: an unchanged parameter is reported under the source its value \
+                 comes from and waits for the reboot, got {entry:?}"
             );
         }
 

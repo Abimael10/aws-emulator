@@ -32,13 +32,13 @@
 //! [`crate::engine_default_parameters`]'s, reused rather than copied.
 
 use service_com_amazonaws_rds_amazonrdsv19::state::{
-    APPLY_TYPE_DYNAMIC, APPLY_TYPE_STATIC, PARAMETER_SOURCE_ENGINE_DEFAULT, PARAMETER_SOURCE_USER,
+    APPLY_TYPE_DYNAMIC, APPLY_TYPE_STATIC, PARAMETER_SOURCE_USER,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::db_instances::{call, emulator, expect_error, expect_ok, subtrees, text, REGION};
 use crate::db_parameters::{create_group, describe, modify_in};
-use crate::engine_default_parameters::{reported, Reported, DATA_TYPES};
+use crate::engine_default_parameters::{published_source, reported, Reported, DATA_TYPES};
 
 /// The report under test.
 const ACTION: &str = "DescribeEngineDefaultParameters";
@@ -144,8 +144,9 @@ async fn every_published_family_publishes_its_instance_level_records() {
             );
             assert_eq!(
                 parameter.source.as_deref(),
-                Some(PARAMETER_SOURCE_ENGINE_DEFAULT),
-                "case {case:?}: {name} is the ENGINE's default, got {:?}",
+                Some(published_source(&name)),
+                "case {case:?}: {name} is reported under the source its value comes from, \
+                 got {:?}",
                 parameter.source
             );
             assert!(

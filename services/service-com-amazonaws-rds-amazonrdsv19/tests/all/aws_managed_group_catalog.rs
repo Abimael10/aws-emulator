@@ -24,6 +24,7 @@
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::db_instances::{call, emulator, expect_error, expect_ok, optional_text, subtrees, text, texts, REGION};
+use crate::engine_default_parameters::published_source;
 
 /// The canonical account id every generated emulator presents.
 const ACCOUNT: &str = "000000000000";
@@ -401,11 +402,12 @@ async fn a_default_parameter_group_reports_its_familys_parameters_and_cannot_be_
          published parameters, got {reported}"
     );
     for parameter in &parameters {
+        let name = text(parameter, "ParameterName");
         assert_eq!(
             text(parameter, "Source"),
-            "engine-default",
+            published_source(&name),
             "case \"the parameters of a default group\": a parameter nobody set reports the \
-             engine's own default, got {parameter}"
+             source its published value comes from, got {parameter}"
         );
     }
 

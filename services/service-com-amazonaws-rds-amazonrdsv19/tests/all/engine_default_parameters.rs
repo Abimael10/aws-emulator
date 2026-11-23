@@ -34,7 +34,7 @@ use std::collections::BTreeSet;
 
 use service_com_amazonaws_rds_amazonrdsv19::state::{
     APPLY_TYPE_DYNAMIC, APPLY_TYPE_STATIC, DB_INSTANCE_ENGINES, MAX_RECORDS_RANGE,
-    PARAMETER_SOURCE_ENGINE_DEFAULT, SIBLING_CONTROL_PLANE_ENGINES,
+    PARAMETER_SOURCE_ENGINE_DEFAULT, PARAMETER_SOURCE_SYSTEM, SIBLING_CONTROL_PLANE_ENGINES,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -58,11 +58,45 @@ pub(crate) const DATA_TYPES: [&str; 4] = ["boolean", "float", "integer", "string
 
 /// The parameters whose value the engine does not PUBLISH, and which therefore report no
 /// `ParameterValue` at all: MySQL's `back_log` is autosized from the permitted connection
-/// count ("Default Value: -1 (autosized)"), `host_cache_size` is autosized the same way
-/// ("Default Value: -1 (signifies autosizing)"), and `basedir` is the installation directory
-/// the managed service owns and reports unset. Every other published parameter must report
-/// the value its engine runs with; these are the NAMED exceptions, not a licence to omit one.
-const AUTOSIZED: [&str; 3] = ["back_log", "basedir", "host_cache_size"];
+/// count ("Default Value: -1 (autosized)") and `host_cache_size` is autosized the same way
+/// ("Default Value: -1 (signifies autosizing)"). Every other published parameter must report
+/// the value its engine runs with — or, where the managed service supplies that value, the
+/// value it supplies ([`SERVICE_SUPPLIED_PARAMETERS`]); these are the NAMED exceptions, not a
+/// licence to omit one.
+const AUTOSIZED: [&str; 2] = ["back_log", "host_cache_size"];
+
+/// The published parameters whose reported value the managed SERVICE supplies rather than the
+/// engine's own build, and which a report therefore sources `system` with that value: the
+/// MySQL-compatible families' installation directory (`basedir`, whose value is the path the
+/// service installed the server in) and the binary-log cache size its own default parameter
+/// group pins. Every other published parameter runs at the engine's own default and is sourced
+/// `engine-default`.
+///
+/// Source: recorded behaviour of those families' published defaults. `pub(crate)` because the
+/// sibling parameter suites assert the same `Source` on the same two entries, wherever a
+/// published parameter is reported.
+pub(crate) const SERVICE_SUPPLIED_PARAMETERS: [&str; 2] = ["basedir", "binlog_cache_size"];
+
+/// The `Source` a report carries for the published parameter `name`
+/// ([`SERVICE_SUPPLIED_PARAMETERS`]).
+pub(crate) fn published_source(name: &str) -> &'static str {
+    if SERVICE_SUPPLIED_PARAMETERS.contains(&name) {
+        PARAMETER_SOURCE_SYSTEM
+    } else {
+        PARAMETER_SOURCE_ENGINE_DEFAULT
+    }
+}
+
+/// The parameters a published family list carries only from the engine's LATER release line
+/// although the engine itself carried them at the earlier one too: the bound is the published
+/// catalog's, not an engine release, so such an entry reports no `MinimumEngineVersion` at the
+/// line that does carry it.
+///
+/// Source: recorded behaviour of the MySQL families' published defaults — the 5.7-line list
+/// carries no entry for the server's on-disk temporary-table choice, while the 8.0-line list
+/// carries it and names no engine version for it. `pub(crate)` for the sibling suites that
+/// compare two lines of one engine.
+pub(crate) const PUBLISHED_FROM_THE_LATER_LINE: [&str; 1] = ["big_tables"];
 
 /// The parameters the engine bounds by NOTHING it publishes, and which therefore report no
 /// `AllowedValues` at all: `basedir` is a path the managed service owns, so there is no
@@ -212,9 +246,10 @@ async fn every_published_family_reports_its_engines_defaults() {
             let name = &parameter.name;
             assert_eq!(
                 parameter.source.as_deref(),
-                Some(PARAMETER_SOURCE_ENGINE_DEFAULT),
-                "case {case:?}: {name} is the engine's default, so expected Source \
-                 {PARAMETER_SOURCE_ENGINE_DEFAULT}, got {:?}",
+                Some(published_source(name)),
+                "case {case:?}: {name} is reported under the source its value comes from, \
+                 expected {:?}, got {:?}",
+                published_source(name),
                 parameter.source
             );
             assert!(
@@ -490,13 +525,20 @@ async fn a_family_reports_its_engines_published_parameters() {
             .iter()
             .find(|p| &p.name == name)
             .unwrap_or_else(|| panic!("case {name:?}: just read from this report"));
-        assert!(
-            row.minimum_engine_version
-                .as_deref()
-                .is_some_and(|version| version.starts_with("8.")),
-            "case {name:?}: a parameter only the later family publishes is one the engine \
-             introduced in that line, so it reports a MinimumEngineVersion inside it, got \
-             {:?}",
+        // A parameter only the later family publishes is either one the engine INTRODUCED in
+        // that line — which reports the release it can first apply at — or one the published
+        // list of the earlier line simply does not carry
+        // ([`PUBLISHED_FROM_THE_LATER_LINE`]), where no engine release is being named.
+        let catalog_bound = PUBLISHED_FROM_THE_LATER_LINE.contains(&name.as_str());
+        let introduced_in_the_line = row
+            .minimum_engine_version
+            .as_deref()
+            .is_some_and(|version| version.starts_with("8."));
+        assert_eq!(
+            introduced_in_the_line, !catalog_bound,
+            "case {name:?}: a parameter only the later family publishes reports a \
+             MinimumEngineVersion inside that line exactly when the engine introduced it \
+             there, got {:?}",
             row.minimum_engine_version
         );
     }

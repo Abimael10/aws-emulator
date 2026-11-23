@@ -208,19 +208,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let reported: BTreeMap<String, Parameter> = match input.source.as_deref() {
             None => every_parameter_type(&group),
             Some(source) => match crate::state::parameter_source_filter(Some(source)) {
-                // The family's published defaults, with the values the engine runs with.
-                crate::state::ParameterSourceFilter::Engine => published_defaults(&group),
+                // The family's published defaults that the ENGINE's own build settles the
+                // value of.
+                crate::state::ParameterSourceFilter::Engine => published_defaults_sourced(
+                    &group,
+                    crate::state::PARAMETER_SOURCE_ENGINE_DEFAULT,
+                ),
                 // The group's own parameters: the ones a caller set.
                 crate::state::ParameterSourceFilter::Customer => group
                     .parameters
                     .keys()
                     .map(|name| (name.clone(), group.parameter_to_wire(name)))
                     .collect(),
-                // Nothing for `system`, because this emulator sets no service-sourced
-                // parameter. A value outside the three the member publishes was refused
-                // above, so the `Unknown` arm is unreachable here.
-                crate::state::ParameterSourceFilter::Service
-                | crate::state::ParameterSourceFilter::Unknown => BTreeMap::new(),
+                // The published parameters whose value the managed SERVICE supplies rather
+                // than the engine, which are the ones reported under that source
+                // (`crate::state::published_parameter_source`): a `Source` selects the
+                // parameters a report would carry under it. A value outside the three the
+                // member publishes was refused above, so the `Unknown` arm selects nothing.
+                crate::state::ParameterSourceFilter::Service => {
+                    published_defaults_sourced(&group, crate::state::PARAMETER_SOURCE_SYSTEM)
+                }
+                crate::state::ParameterSourceFilter::Unknown => BTreeMap::new(),
             },
         };
 
@@ -268,10 +276,10 @@ fn check_filter_names(filters: &[Filter]) -> Result<(), String> {
     Ok(())
 }
 
-/// The parameters `group`'s family publishes, each with the default value the engine runs
-/// with, `Source` `engine-default` and the apply method the group reports for a parameter
-/// nobody has changed: what a `Source` naming the engine reports, and the half of
-/// [`every_parameter_type`] the group has set nothing for.
+/// The parameters `group`'s family publishes, each with the value that family publishes for
+/// it, the `Source` that value comes from and the apply method the group reports for a
+/// parameter nobody has changed: the half of [`every_parameter_type`] the group has set
+/// nothing for.
 fn published_defaults(
     group: &crate::state::DbParameterGroupRecord,
 ) -> BTreeMap<String, Parameter> {
@@ -292,11 +300,25 @@ fn published_defaults(
     .collect()
 }
 
+/// The half of [`published_defaults`] a request naming `source` asks for: the published
+/// parameters a report carries under that source and no others, since `Source` "returns only
+/// parameters for a specific source" and the source a parameter is reported under is the one
+/// its value comes from (`crate::state::published_parameter_source`).
+fn published_defaults_sourced(
+    group: &crate::state::DbParameterGroupRecord,
+    source: &str,
+) -> BTreeMap<String, Parameter> {
+    published_defaults(group)
+        .into_iter()
+        .filter(|(name, _)| crate::state::published_parameter_source(&group.family, name) == source)
+        .collect()
+}
+
 /// Every parameter type of `group` at once, which is what a request naming no `Source`
 /// reports: each parameter its family publishes, under the value and apply method the GROUP
-/// sets for it where it sets one (`Source` `user`) and under the engine's own default where
-/// it does not (`Source` `engine-default`), plus any parameter the group carries that the
-/// family publishes nothing for.
+/// sets for it where it sets one (`Source` `user`) and under the family's own published value
+/// where it does not (`Source` the source that value comes from), plus any parameter the group
+/// carries that the family publishes nothing for.
 ///
 /// Keyed by parameter name, so the report is in name order whichever half an entry came
 /// from — the order its pagination marker walks.

@@ -38,7 +38,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::db_instances::{
     call, call_in, emulator, expect_error, expect_ok, optional_text, text, REGION,
 };
-use crate::engine_default_parameters::reported;
+use crate::engine_default_parameters::{published_source, reported};
 
 /// The error code Amazon RDS answers a parameter value it cannot serve with.
 const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
@@ -234,10 +234,19 @@ async fn a_modified_parameter_is_reported_from_persisted_state() {
         Some(PARAMETER_SOURCE_ENGINE_DEFAULT),
     )
     .await;
+    // `Source` "returns only parameters for a specific source", and a published parameter is
+    // reported under the source its value comes from: the engine's own default for most of
+    // the catalog, and the managed service for the entries it supplies the value of.
+    let engine_sourced: Vec<&str> = catalog
+        .iter()
+        .map(|spec| spec.name)
+        .filter(|name| published_source(name) == PARAMETER_SOURCE_ENGINE_DEFAULT)
+        .collect();
     assert_eq!(
         defaults.len(),
-        catalog.len(),
-        "case {:?}: expected the family's whole published catalog, got {defaults:?}",
+        engine_sourced.len(),
+        "case {:?}: expected the published catalog's engine-sourced parameters, got \
+         {defaults:?}",
         "a fresh group's engine defaults"
     );
 
@@ -306,14 +315,31 @@ async fn a_modified_parameter_is_reported_from_persisted_state() {
         "every parameter type"
     );
 
-    // 6. This emulator sets no service-sourced parameter, so the one remaining published
-    //    source selects nothing — and a value outside the three the member publishes is
-    //    refused rather than selecting nothing.
+    // 6. The remaining published source selects the parameters whose value the managed
+    //    service supplies rather than the engine — the source such a parameter is reported
+    //    under — and a value outside the three the member publishes is refused rather than
+    //    selecting nothing.
     let case = format!("Source {PARAMETER_SOURCE_SYSTEM:?}");
+    let service_sourced: Vec<String> = catalog
+        .iter()
+        .map(|spec| spec.name)
+        .filter(|name| published_source(name) == PARAMETER_SOURCE_SYSTEM)
+        .map(ToString::to_string)
+        .collect();
+    assert!(
+        !service_sourced.is_empty(),
+        "case {case:?}: this family publishes parameters the managed service supplies the \
+         value of, so the table must name some"
+    );
+    let supplied = reported_for(&router, &case, &group, Some(PARAMETER_SOURCE_SYSTEM)).await;
     assert_eq!(
-        reported_for(&router, &case, &group, Some(PARAMETER_SOURCE_SYSTEM)).await,
-        Vec::new(),
-        "case {case:?}: expected no parameter reported"
+        supplied
+            .iter()
+            .map(|(name, ..)| name.clone())
+            .collect::<Vec<String>>(),
+        service_sourced,
+        "case {case:?}: expected exactly the parameters reported under that source, got \
+         {supplied:?}"
     );
     for source in ["service", "not-a-source"] {
         let case = format!("Source {source:?}");
@@ -424,16 +450,20 @@ fn admitted_and_refused(spec: &ClusterParameterSpec) -> (Vec<String>, Vec<String
             vec!["not-a-published-value".to_string()],
         ),
         Some((low, high)) if spec.data_type == "integer" => {
-            let low: i64 = low.parse().expect("an integer range bound");
-            let high: i64 = high.parse().expect("an integer range bound");
-            // One step outside each published bound, computed in a wider type so a
+            // The bounds are read as the WIDE integer the service itself reads them as
+            // (`ClusterParameterSpec::admits`), because a published domain can reach past
+            // the largest signed 64-bit value — a cache size in bytes on a 64-bit build is
+            // bounded by the unsigned 64-bit range.
+            let low: i128 = low.parse().expect("an integer range bound");
+            let high: i128 = high.parse().expect("an integer range bound");
+            // One step outside each published bound, computed in that wider type so a
             // parameter whose published maximum is the largest integer the service parses
             // still has a value past it to be refused for.
             (
                 vec![low.to_string(), high.to_string()],
                 vec![
-                    (i128::from(low) - 1).to_string(),
-                    (i128::from(high) + 1).to_string(),
+                    (low - 1).to_string(),
+                    (high + 1).to_string(),
                     "not-a-number".to_string(),
                 ],
             )

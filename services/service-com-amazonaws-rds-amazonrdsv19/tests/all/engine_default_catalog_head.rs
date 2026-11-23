@@ -14,9 +14,10 @@
 //! sample taken from the middle of it, and `EngineDefaults.Marker` is a position in that
 //! same order, from which the next page continues the sequence.
 //!
-//! A family is one RELEASE LINE of an engine, and it publishes the parameters that line
-//! carries: a parameter the engine introduced in a later line is not among the earlier
-//! family's defaults, so the head of the 8.0-line families opens with the parameter that
+//! A family is one RELEASE LINE of an engine, and it publishes the parameters the published
+//! list of THAT family carries: a parameter the engine introduced in a later line is not among
+//! the earlier family's defaults, and neither is an entry the published lists of the earlier
+//! lines do not carry — so the head of the 8.0-line families opens with the parameter that
 //! line added and the 5.7-line ones open at the next published name.
 //!
 //! The expected rows below are LITERALS, written from the engines' own published parameter
@@ -28,13 +29,11 @@
 //! MariaDB and Aurora MySQL, and two families of one engine — and the named-row table below
 //! pins entries no issue cited.
 
-use service_com_amazonaws_rds_amazonrdsv19::state::{
-    APPLY_TYPE_DYNAMIC, APPLY_TYPE_STATIC, PARAMETER_SOURCE_ENGINE_DEFAULT,
-};
+use service_com_amazonaws_rds_amazonrdsv19::state::{APPLY_TYPE_DYNAMIC, APPLY_TYPE_STATIC};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::db_instances::{call, emulator, expect_ok, optional_text};
-use crate::engine_default_parameters::{reported, Reported};
+use crate::engine_default_parameters::{published_source, reported, Reported};
 
 /// The operation under test.
 const ACTION: &str = "DescribeEngineDefaultParameters";
@@ -84,6 +83,16 @@ const INTRODUCED_IN_8_0: [(&str, &str); 3] = [
     ("binlog_row_metadata", "8.0.1"),
 ];
 
+/// The parameters a published family list carries only from the engine's 8.0 release line,
+/// each with the line its own entry starts at: the rows an 8.0-line family publishes and a
+/// 5.7-line family does not, although the engine itself carries them at both lines. The bound
+/// is the published catalog's rather than an engine release, so such a row reports no
+/// `MinimumEngineVersion` ([`INTRODUCED_IN`] is the other kind).
+///
+/// Source: the published defaults of these families — the 5.7-line list carries no entry for
+/// the server's on-disk temporary-table choice, while the 8.0-line list carries it.
+const PUBLISHED_FROM_8_0: [(&str, &str); 1] = [("big_tables", "8.0")];
+
 /// The parameters the engine DROPPED in its 8.4 release line, each with the release that
 /// dropped it: the rows every earlier family publishes and an 8.4-line family does not, the
 /// mirror of [`INTRODUCED_IN_8_0`].
@@ -106,18 +115,18 @@ const HEAD_8_0: [&str; PAGE] = [
     "big_tables",
     "binlog_cache_size",
     "binlog_checksum",
-    "binlog_direct_non_transactional_updates",
     "binlog_error_action",
     "binlog_expire_logs_seconds",
     "binlog_format",
     "binlog_group_commit_sync_delay",
     "binlog_group_commit_sync_no_delay_count",
+    "binlog_gtid_simple_recovery",
     "binlog_max_flush_queue_time",
 ];
 
 /// The same page for a family of the 5.7 line: the same published order with the parameters
-/// the engine had not introduced yet left out and the one it later dropped still in, so it
-/// reaches two names further.
+/// the engine had not introduced yet left out, and without the entry the published lists only
+/// carry from the later line ([`PUBLISHED_FROM_8_0`]), so it reaches two names further.
 const HEAD_5_7: [&str; PAGE] = [
     "allow-suspicious-udfs",
     "auto_generate_certs",
@@ -128,17 +137,17 @@ const HEAD_5_7: [&str; PAGE] = [
     "avoid_temporal_upgrade",
     "back_log",
     "basedir",
-    "big_tables",
     "binlog_cache_size",
     "binlog_checksum",
-    "binlog_direct_non_transactional_updates",
     "binlog_error_action",
     "binlog_format",
     "binlog_group_commit_sync_delay",
     "binlog_group_commit_sync_no_delay_count",
+    "binlog_gtid_simple_recovery",
     "binlog_max_flush_queue_time",
     "binlog_order_commits",
     "binlog_row_image",
+    "binlog_rows_query_log_events",
 ];
 
 /// The head a family of `line` publishes.
@@ -170,7 +179,7 @@ const AFTER_HEAD_8_0: &str = "binlog_order_commits";
 /// `Marker` is asserted to continue the one ordered sequence.
 fn after_head(line: Line) -> &'static str {
     match line {
-        Line::Mysql5_7 => "binlog_rows_query_log_events",
+        Line::Mysql5_7 => "binlog_stmt_cache_size",
         Line::Mysql8_0 | Line::Mariadb => AFTER_HEAD_8_0,
         Line::Mysql8_4 => "binlog_row_image",
     }
@@ -182,10 +191,11 @@ fn after_head(line: Line) -> &'static str {
 /// can apply" is only a fact worth reporting where the engine did not always carry the
 /// parameter. The 8.0-line rows are in [`INTRODUCED_IN_8_0`], which a 5.7-line family does
 /// not carry at all.
-const INTRODUCED_IN: [(&str, &str); 3] = [
+const INTRODUCED_IN: [(&str, &str); 4] = [
     ("auto_generate_certs", "5.7.5"),
     ("binlog_group_commit_sync_delay", "5.7.5"),
     ("binlog_group_commit_sync_no_delay_count", "5.7.5"),
+    ("binlog_gtid_simple_recovery", "5.7.6"),
 ];
 
 /// One named row of the published record table: the parameter, its apply type, data type,
@@ -230,13 +240,14 @@ const DECLARED: [Declared; 7] = [
         true,
     ),
     (
-        // The installation directory the managed engine owns: it publishes neither a domain
-        // nor a value for it, and does not let a caller modify it.
+        // The installation directory the managed service owns: it publishes no domain for a
+        // path, does not let a caller modify it, and reports the path it installed the
+        // server in as the value it supplies for the parameter.
         "basedir",
         APPLY_TYPE_STATIC,
         "string",
         None,
-        None,
+        Some("/rdsdbbin/mysql"),
         false,
     ),
     (
@@ -345,17 +356,19 @@ async fn the_first_page_is_the_engines_first_published_defaults() {
             );
             assert_eq!(
                 row.source.as_deref(),
-                Some(PARAMETER_SOURCE_ENGINE_DEFAULT),
-                "case {case:?}: {} is an engine default, got Source {:?}",
+                Some(published_source(&row.name)),
+                "case {case:?}: {} is reported under the source its value comes from, got \
+                 Source {:?}",
                 row.name,
                 row.source
             );
         }
 
         // A parameter the engine introduced in the 8.0 line is published by a family of
-        // that line and by no earlier one, and one it DROPPED there by every family but that
-        // line's: the family's own release decides both, and a family whose engine numbers
-        // its own releases carries them all.
+        // that line and by no earlier one, one it DROPPED there by every family but that
+        // line's, and one the published lists only carry from that line by the same families
+        // as the first: the family's own release decides all three, and a family whose engine
+        // numbers its own releases carries them all.
         let walked_names = walked.clone();
         for (introduced, _) in INTRODUCED_IN_8_0 {
             let carried = walked_names.contains(&introduced);
@@ -366,13 +379,23 @@ async fn the_first_page_is_the_engines_first_published_defaults() {
                  only a family of that line or a later one publishes it, got {walked_names:?}"
             );
         }
-        for (removed, release) in REMOVED_IN_8_4 {
-            let carried = walked_names.contains(&removed);
+        for (published_from, from_line) in PUBLISHED_FROM_8_0 {
+            let (removed, release) = REMOVED_IN_8_4[0];
             assert_eq!(
-                carried,
-                line != Line::Mysql8_4,
-                "case {case:?}: {removed} was dropped from the engine at {release}, so only \
-                 a family outside that line publishes it, got {walked_names:?}"
+                published_from, removed,
+                "case {case:?}: both bounds below are about the one entry"
+            );
+            // The entry is bounded at BOTH ends: the published lists carry it from the 8.0
+            // line on and the engine dropped it in the 8.4 line, so exactly the lines in
+            // between publish it — and a family whose engine numbers its own releases
+            // against neither bound carries it either way.
+            let carried = walked_names.contains(&published_from);
+            let expected = matches!(line, Line::Mysql8_0 | Line::Mariadb);
+            assert_eq!(
+                carried, expected,
+                "case {case:?}: the published lists carry {published_from} from the \
+                 {from_line} line on and the engine dropped it at {release}, got \
+                 {walked_names:?}"
             );
         }
     }

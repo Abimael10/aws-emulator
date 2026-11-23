@@ -31,7 +31,7 @@ use service_com_amazonaws_rds_amazonrdsv19::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::db_instances::{call, emulator, expect_error, expect_ok, optional_text, text};
-use crate::engine_default_parameters::{reported, Reported};
+use crate::engine_default_parameters::{published_source, reported, Reported};
 
 /// The error code Amazon RDS answers a parameter value it cannot serve with.
 const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
@@ -173,8 +173,10 @@ fn published_record(family: &str, spec: &ClusterParameterSpec) -> (&'static str,
 ///
 /// An EMPTY column is one the engine publishes nothing for, and the matching member is then
 /// left out rather than reported empty, which is how the service projects it: `ParameterValue`
-/// for a parameter the engine autosizes (MySQL's `back_log`) or whose value the managed
-/// service owns (`basedir`), and `AllowedValues` for one the engine bounds by nothing.
+/// for a parameter the engine autosizes (MySQL's `back_log`), and `AllowedValues` for one the
+/// engine bounds by nothing. `Source` names where the reported value comes from: the managed
+/// service for the entries it supplies the value of, and the engine's own build otherwise
+/// (`crate::engine_default_parameters::published_source`).
 fn published(family: &str, spec: &ClusterParameterSpec) -> Declared {
     let (apply_type, default_value) = published_record(family, spec);
     (
@@ -183,7 +185,7 @@ fn published(family: &str, spec: &ClusterParameterSpec) -> Declared {
         (!spec.allowed_values.is_empty()).then(|| spec.allowed_values.to_string()),
         (!default_value.is_empty()).then(|| default_value.to_string()),
         Some(spec.is_modifiable.to_string()),
-        Some(PARAMETER_SOURCE_ENGINE_DEFAULT.to_string()),
+        Some(published_source(spec.name).to_string()),
     )
 }
 

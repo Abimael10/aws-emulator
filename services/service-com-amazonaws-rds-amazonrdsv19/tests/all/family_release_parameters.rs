@@ -27,12 +27,16 @@
 //!
 //! The same rule holds at the other end of a parameter's life: a parameter the engine
 //! dropped in a later release is not among the parameters of a family naming that line,
-//! while every earlier family still carries it.
+//! while every earlier family still carries it. A third bound is the published CATALOG's
+//! rather than the engine's: an entry the published list of the earlier lines does not carry
+//! is no parameter of those families either, and the line it starts at is not an engine
+//! release, so nothing reports it as one
+//! (`crate::engine_default_parameters::PUBLISHED_FROM_THE_LATER_LINE`).
 
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::db_instances::{call, emulator, expect_ok, optional_text};
-use crate::engine_default_parameters::{reported, Reported};
+use crate::engine_default_parameters::{reported, Reported, PUBLISHED_FROM_THE_LATER_LINE};
 
 /// Which level of parameter group a row is about, which is the pair of operations that
 /// answers for it: the engine-default report of a family, and the listing of a group of
@@ -159,12 +163,16 @@ const ROWS: &[Row] = &[
         carried: true,
     },
     Row {
-        case: "a parameter the engine DROPPED in a later line, read at an earlier one",
+        // The published list of a 5.7-line family carries no entry for this one, although the
+        // engine itself has it at that line: the bound is the published catalog's
+        // ([`PUBLISHED_FROM_THE_LATER_LINE`]), which is why no `MinimumEngineVersion` is
+        // reported for it where it IS carried.
+        case: "a parameter the published list of the earlier line does not carry",
         level: Level::Instance,
         family: "mysql5.7",
         parameter: "big_tables",
         introduced_in: None,
-        carried: true,
+        carried: false,
     },
     Row {
         case: "the same parameter one line before the one that dropped it",
@@ -442,11 +450,17 @@ async fn an_earlier_release_lines_parameters_are_a_subset_of_a_later_lines() {
             .into_iter()
             .find(|entry| &entry.name == name)
             .unwrap_or_else(|| panic!("case {case:?}: just read from this report"));
-            assert!(
+            // A parameter only the later line carries is either one the engine INTRODUCED
+            // there — which reports the release it can first apply at — or one the published
+            // list of the earlier line simply does not carry, where no engine release is
+            // being named ([`PUBLISHED_FROM_THE_LATER_LINE`]).
+            let catalog_bound = PUBLISHED_FROM_THE_LATER_LINE.contains(&name.as_str());
+            assert_eq!(
                 row.minimum_engine_version.is_some(),
-                "case {case:?}: a parameter only the later line carries is one the engine \
-                 introduced there, so it reports the release it can first apply at, got \
-                 {row:?}"
+                !catalog_bound,
+                "case {case:?}: a parameter only the later line carries reports the release \
+                 the engine introduced it at exactly when the engine is what introduced it, \
+                 got {row:?}"
             );
         }
     }

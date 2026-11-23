@@ -643,6 +643,78 @@ const REMOVED_PARAMETERS: &[(ParameterVocabulary, &str, &str)] = &[
     (ParameterVocabulary::MysqlCompatible, "big_tables", "8.4.0"),
 ];
 
+/// The parameters a published family list only carries from a later release line than the
+/// earliest one this catalog's entries are published for, each beside the catalog it is an
+/// entry of and the line its own entry starts at; see [`parameter_published_from`].
+///
+/// A family publishes the parameter list AWS publishes FOR that family, and those lists are
+/// not all the same list: an entry the list of one release line carries can be absent from the
+/// list of an earlier line of the same engine, whatever the engine's own releases carry. That
+/// bound is a fact about the published CATALOG, not about the engine, so it is separate from
+/// the entry's `minimum_engine_version` — which is "the earliest engine version to which the
+/// parameter can apply" and is reported on the wire
+/// ([`crate::state::engine_default_parameter_to_wire`]) — and reporting it there would state a
+/// release the engine never named.
+///
+/// Source: recorded behaviour of the MySQL-compatible families' published defaults, whose 5.7
+/// line's list carries no entry for the server's on-disk temporary-table choice while the 8.0
+/// line's does (and names no engine version for it).
+const CATALOG_PUBLISHED_FROM: &[(ParameterVocabulary, &str, &str)] =
+    &[(ParameterVocabulary::MysqlCompatible, "big_tables", "8.0")];
+
+/// The release line from which the published list of a family of `engine` carries the entry
+/// `name`, or `None` for an entry every family's list carries
+/// ([`CATALOG_PUBLISHED_FROM`]).
+///
+/// Answered per ENGINE, like [`parameter_removed_in`]: a row names the catalog it belongs to
+/// and answers only for the engines that share it, so an entry of another catalog carrying the
+/// same name is never withheld by it.
+pub(crate) fn parameter_published_from(engine: &str, name: &str) -> Option<&'static str> {
+    CATALOG_PUBLISHED_FROM
+        .iter()
+        .find(|(vocabulary, parameter, _)| {
+            *parameter == name && vocabulary.is_spoken_by(engine)
+        })
+        .map(|(_, _, line)| *line)
+}
+
+/// The parameters whose reported value the MANAGED SERVICE supplies rather than the engine's
+/// own build, each beside the catalog it is an entry of; see [`parameter_value_source`].
+///
+/// `Parameter$Source` is "the source of the parameter value"
+/// (`smithy_query(query="doc", shape="Parameter", member="Source")`), and its published values
+/// are `engine-default`, `system` and `user` (`crate::state::PARAMETER_SOURCES`). A parameter
+/// the managed service itself supplies the value of — one taken from the engine INSTALLATION it
+/// owns, or one its own default parameter group pins on every instance of the family — comes
+/// from the system around the engine rather than from the engine's compiled-in default, and is
+/// reported under `system` with that value; every other entry is reported under
+/// `engine-default`.
+///
+/// Source: recorded behaviour of the MySQL-compatible engine defaults, which report the
+/// server's installation directory and the binary-log cache size under `system`.
+const SERVICE_SUPPLIED_PARAMETERS: &[(ParameterVocabulary, &str)] = &[
+    (ParameterVocabulary::MysqlCompatible, "basedir"),
+    (ParameterVocabulary::MysqlCompatible, "binlog_cache_size"),
+];
+
+/// Where the value a report carries for the parameter `name` of `engine`'s catalog comes from,
+/// as `Parameter$Source` names it: [`crate::state::PARAMETER_SOURCE_SYSTEM`] for a value the
+/// managed service supplies ([`SERVICE_SUPPLIED_PARAMETERS`]) and
+/// [`crate::state::PARAMETER_SOURCE_ENGINE_DEFAULT`] for one the engine's own build settles.
+///
+/// A value a CALLER set is neither: a group reports its own settings under
+/// `crate::state::PARAMETER_SOURCE_USER`, whichever source the published entry has.
+pub(crate) fn parameter_value_source(engine: &str, name: &str) -> &'static str {
+    let supplied = SERVICE_SUPPLIED_PARAMETERS
+        .iter()
+        .any(|(vocabulary, parameter)| *parameter == name && vocabulary.is_spoken_by(engine));
+    if supplied {
+        crate::state::PARAMETER_SOURCE_SYSTEM
+    } else {
+        crate::state::PARAMETER_SOURCE_ENGINE_DEFAULT
+    }
+}
+
 /// Whether a DB parameter group family of `engine` names its version in the SAME release
 /// NUMBERING as the introduction and removal releases its catalog publishes.
 ///
@@ -710,6 +782,25 @@ const MYSQL_CHARACTER_SETS: &str = "big5,dec8,cp850,hp8,koi8r,latin1,latin2,swe7
      keybcs2,macce,macroman,cp852,latin7,utf8mb4,cp1251,utf16,cp1256,cp1257,utf32,binary,\
      geostd8,cp932,eucjpms";
 
+/// The installation directory the managed service reports for the MySQL-compatible engines,
+/// as the value of the parameter that names it: the path the server the service runs was
+/// installed in, which is the service's own and not the engine's compiled-in default — so the
+/// report carries it under `system` ([`SERVICE_SUPPLIED_PARAMETERS`]).
+///
+/// Source: recorded behaviour of these engines' published defaults.
+const MYSQL_INSTALLATION_BASE_DIRECTORY: &str = "/rdsdbbin/mysql";
+
+/// The domain the MySQL-compatible engines publish for the binary-log cache sizes, as their
+/// `AllowedValues` reports it: from the smallest cache the server admits up to the largest its
+/// 64-bit build does.
+///
+/// Source: the MySQL manual's "Server System Variables", which gives both the transactional
+/// and the statement binary-log cache size a minimum of 4096 and a maximum of
+/// 18446744073709547520 on 64-bit platforms. The upper bound is past the largest signed 64-bit
+/// integer, which is why a published range is read as a wide integer
+/// (`service_common::rds_cluster_parameters::ClusterParameterSpec::admits`).
+const MYSQL_BINLOG_CACHE_SIZES: &str = "4096-18446744073709547520";
+
 /// The parameters the MySQL-compatible engines publish.
 ///
 /// Source: the engine parameter lists in the Amazon RDS and Amazon Aurora User Guides
@@ -733,8 +824,13 @@ const MYSQL_CHARACTER_SETS: &str = "big5,dec8,cp850,hp8,koi8r,latin1,latin2,swe7
 /// past it. It is NOT a complete prefix of AWS's list: a name in that range this table does
 /// not carry is a parameter this emulator does not publish, not one the engine lacks. Past the
 /// head, what a caller can rely on is that a family this service serves reports its engine's
-/// parameters with the metadata above, each sourced `engine-default`, in parameter-name order,
-/// filtered and paginated as this operation documents.
+/// parameters with the metadata above, each under the source its value comes from
+/// ([`parameter_value_source`]), in parameter-name order, filtered and paginated as this
+/// operation documents.
+///
+/// The table is the vocabulary the MySQL-compatible engines SHARE, and the published list of
+/// one family is not the published list of another: an entry the lists of the earlier release
+/// lines do not carry is no parameter of those families ([`CATALOG_PUBLISHED_FROM`]).
 ///
 /// A parameter the managed engine PROTECTS is published like any other, with
 /// `is_modifiable` false: `basedir` is one, and a request that tries to set one is refused
@@ -873,11 +969,14 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         crate::state::APPLY_TYPE_STATIC,
         "string",
         // The engine publishes neither an enumeration nor a range for the installation
-        // directory, and no default for it either: the managed service owns the path and
-        // reports the parameter with its value unset, which is what an empty column here
-        // means (see [`super::super::state::engine_default_parameter_to_wire`]).
+        // directory: it is a path rather than a value out of a domain, which is what an empty
+        // column here means (see [`super::super::state::engine_default_parameter_to_wire`]).
         "",
-        "",
+        // The directory the managed service installed the server in, which is the value it
+        // supplies for this parameter ([`MYSQL_INSTALLATION_BASE_DIRECTORY`]); it is therefore
+        // reported under `system` rather than as an engine default
+        // ([`SERVICE_SUPPLIED_PARAMETERS`]).
+        MYSQL_INSTALLATION_BASE_DIRECTORY,
         // The server's own installation directory is the managed service's, so the engine
         // does not let a caller modify it — which is why a request that tries is refused
         // rather than stored.
@@ -886,8 +985,10 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "The MySQL installation base directory.",
     ),
     parameter(
-        // Deprecated inside the 8.0 line and dropped in 8.4, so the families up to 8.0 carry
-        // it and the later line does not ([`parameter_removed_in`]).
+        // The published list of a family of the engine's 8.0 line carries this entry and the
+        // lists of the earlier lines do not ([`CATALOG_PUBLISHED_FROM`]); the engine
+        // deprecated the variable inside that line and dropped it in 8.4, so the later line
+        // does not carry it either ([`parameter_removed_in`]).
         "big_tables",
         crate::state::APPLY_TYPE_DYNAMIC,
         "boolean",
@@ -901,11 +1002,14 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "binlog_cache_size",
         crate::state::APPLY_TYPE_DYNAMIC,
         "integer",
-        "4096-9223372036854775807",
+        MYSQL_BINLOG_CACHE_SIZES,
+        // The size the managed service's own default parameter group pins for the binary-log
+        // cache, which is why this entry is reported under `system`
+        // ([`SERVICE_SUPPLIED_PARAMETERS`]).
         "32768",
         true,
         "",
-        "The size in bytes of the cache holding changes to the binary log during a \
+        "The size of the cache to hold the SQL statements for the binary log during a \
          transaction.",
     ),
     parameter(
@@ -917,16 +1021,6 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         true,
         "",
         "Whether the server writes a checksum for each event in the binary log.",
-    ),
-    parameter(
-        "binlog_direct_non_transactional_updates",
-        crate::state::APPLY_TYPE_DYNAMIC,
-        "boolean",
-        "0,1",
-        "0",
-        true,
-        "",
-        "Whether updates to nontransactional tables are written directly to the binary log.",
     ),
     parameter(
         "binlog_error_action",
@@ -968,8 +1062,8 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "0",
         true,
         "5.7.5",
-        "The time in microseconds the server waits before synchronizing transactions to \
-         disk.",
+        "Controls how many microseconds the binary log commit waits before synchronizing \
+         the binary log file to disk.",
     ),
     parameter(
         "binlog_group_commit_sync_no_delay_count",
@@ -983,6 +1077,20 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
          binary log commit delay.",
     ),
     parameter(
+        // Introduced in the engine's 5.7 line, which replaced the earlier
+        // simplified-recovery variable with it.
+        "binlog_gtid_simple_recovery",
+        crate::state::APPLY_TYPE_STATIC,
+        "boolean",
+        "0,1",
+        "1",
+        // The server reads it at startup and does not let a session change it.
+        false,
+        "5.7.6",
+        "Controls how binary log files are iterated during the search for GTIDs when the \
+         server starts or restarts.",
+    ),
+    parameter(
         "binlog_max_flush_queue_time",
         crate::state::APPLY_TYPE_DYNAMIC,
         "integer",
@@ -990,8 +1098,10 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "0",
         true,
         "",
-        "The time in microseconds the server keeps reading transactions before flushing \
-         them to the binary log.",
+        "How long in microseconds to keep reading transactions from the flush queue before \
+         proceeding with the group commit (and syncing the log to disk, if sync_binlog is \
+         greater than 0). If the value is 0 (the default), there is no timeout and the \
+         server keeps reading new transactions until the queue is empty.",
     ),
     parameter(
         "binlog_order_commits",
@@ -1042,7 +1152,7 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "binlog_stmt_cache_size",
         crate::state::APPLY_TYPE_DYNAMIC,
         "integer",
-        "4096-9223372036854775807",
+        MYSQL_BINLOG_CACHE_SIZES,
         "32768",
         true,
         "",

@@ -71,7 +71,8 @@ pub enum ParameterSourceFilter {
     Customer,
     /// The parameters the engine family publishes, with their default values.
     Engine,
-    /// The parameters the service itself sets; this emulator sets none.
+    /// The parameters the managed service itself supplies the value of, rather than the
+    /// engine's own build: the ones a report carries under [`PARAMETER_SOURCE_SYSTEM`].
     Service,
     /// A value naming no source this service knows: it selects nothing.
     Unknown,
@@ -167,6 +168,11 @@ impl ClusterParameterSpec {
     /// `<low>-<high>` range ([`Self::range`]) is parsed as the numeric type and
     /// bounds-checked inclusively.
     ///
+    /// An integer bound is read as a WIDE integer, because an engine's published domain can
+    /// reach past the largest signed 64-bit value: a cache size in bytes on a 64-bit build is
+    /// bounded by the unsigned 64-bit range, and reading such a bound as a narrower integer
+    /// would fail to parse and refuse every value the engine admits.
+    ///
     /// A parameter the engine publishes NO allowed values for admits every value: the empty
     /// column is how a catalog writes "the engine publishes none" — a parameter whose value is
     /// a free-form string, an ARN among them, is bounded by nothing the API publishes — and
@@ -185,9 +191,9 @@ impl ClusterParameterSpec {
         match self.range() {
             Some((low, high)) if self.data_type == "integer" => {
                 match (
-                    value.parse::<i64>(),
-                    low.trim().parse::<i64>(),
-                    high.trim().parse::<i64>(),
+                    value.parse::<i128>(),
+                    low.trim().parse::<i128>(),
+                    high.trim().parse::<i128>(),
                 ) {
                     (Ok(value), Ok(low), Ok(high)) => (low..=high).contains(&value),
                     _ => false,
@@ -726,7 +732,7 @@ mod tests {
             &'static str,
             &'static str,
         );
-        let rows: [Row; 5] = [
+        let rows: [Row; 7] = [
             ("a positive range", "1-100", Some(("1", "100")), "100", "101"),
             (
                 "a negative low bound",
@@ -738,6 +744,22 @@ mod tests {
             ("two negative bounds", "-15--2", Some(("-15", "-2")), "-15", "-16"),
             ("a single admitted value", "8192", None, "8192", "8193"),
             ("an enumeration", "0,1", None, "1", "2"),
+            // A bound past the largest signed 64-bit value: the unsigned 64-bit maximum a
+            // cache size in bytes is published up to, at the bound and one step past it.
+            (
+                "an unsigned 64-bit upper bound",
+                "4096-18446744073709547520",
+                Some(("4096", "18446744073709547520")),
+                "18446744073709547520",
+                "18446744073709547521",
+            ),
+            (
+                "an unsigned 64-bit upper bound, at its low end",
+                "4096-18446744073709547520",
+                Some(("4096", "18446744073709547520")),
+                "4096",
+                "4095",
+            ),
         ];
 
         for (case, allowed_values, halves, inside, outside) in rows {

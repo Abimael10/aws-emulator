@@ -837,8 +837,9 @@ pub fn db_parameter_default_apply_method(family: &str, name: &str) -> &'static s
 }
 
 /// A parameter the engine publishes for a family, as the modelled `Parameter` with its
-/// default value and `Source` [`PARAMETER_SOURCE_ENGINE_DEFAULT`]: what a describe reports
-/// when the caller asks for the engine's own parameters rather than a group's.
+/// published value and the `Source` that value comes from
+/// ([`crate::ops::describe_engine_default_parameters::parameter_value_source`]): what a describe
+/// reports when the caller asks for the engine's own parameters rather than a group's.
 ///
 /// `family` is the DB parameter group family the report is ABOUT, which is what the
 /// published record is resolved for ([`published_spec_for_family`]): one catalog serves
@@ -856,13 +857,20 @@ pub fn db_parameter_default_apply_method(family: &str, name: &str) -> &'static s
 /// published list carries no explanatory text for has no description; reporting an empty
 /// string for any of them would say the engine runs that parameter at the empty value, admits
 /// only it, or describes it as the empty sentence, none of which the engine ever published.
+///
+/// `Source` is "the source of the parameter value": a value the managed service itself
+/// supplies is reported under [`PARAMETER_SOURCE_SYSTEM`] and one the engine's own build
+/// settles under [`PARAMETER_SOURCE_ENGINE_DEFAULT`], as the catalog's own entry says
+/// ([`crate::ops::describe_engine_default_parameters::parameter_value_source`]). A family whose
+/// engine cannot be resolved reports the engine's source, since nothing names a service-supplied
+/// value for it.
 pub fn engine_default_parameter_to_wire(family: &str, spec: &ClusterParameterSpec) -> Parameter {
     let spec = published_spec_for_family(family, spec);
     Parameter {
         parameter_name: Some(spec.name.to_string()),
         parameter_value: published_default(spec.default_value),
         description: published_column(spec.description),
-        source: Some(PARAMETER_SOURCE_ENGINE_DEFAULT.to_string()),
+        source: Some(published_parameter_source(family, spec.name).to_string()),
         apply_type: Some(spec.apply_type.to_string()),
         data_type: Some(spec.data_type.to_string()),
         allowed_values: published_column(spec.allowed_values),
@@ -871,6 +879,26 @@ pub fn engine_default_parameter_to_wire(family: &str, spec: &ClusterParameterSpe
             .then(|| spec.minimum_engine_version.to_string()),
         apply_method: None,
         supported_engine_modes: None,
+    }
+}
+
+/// The `Source` a report carries for the published parameter `name` of `family`: where the
+/// value that family publishes for it comes from
+/// ([`crate::ops::describe_engine_default_parameters::parameter_value_source`]).
+///
+/// It is answered for the family's ENGINE, because which parameters a managed service supplies
+/// the value of is a fact about that service around that engine; a value naming no engine this
+/// front door serves reports the engine source.
+///
+/// Read by the projections above and by the reports whose `Source` SELECTS parameters
+/// (`crate::state::parameter_source_filter`), so the source a report filters by and the source
+/// it carries are one answer.
+pub fn published_parameter_source(family: &str, name: &str) -> &'static str {
+    match crate::ops::describe_engine_default_parameters::family_engine(family) {
+        Some(engine) => {
+            crate::ops::describe_engine_default_parameters::parameter_value_source(engine, name)
+        }
+        None => PARAMETER_SOURCE_ENGINE_DEFAULT,
     }
 }
 
@@ -1003,6 +1031,11 @@ pub const POSTGRES_FORCE_SSL_PARAMETER: &str = "rds.force_ssl";
 /// parameter `spec` publishes the record of.
 ///
 /// A family is one release line of one engine (`mysql8.0`, `aurora-postgresql16`,
+/// `sqlserver-ee-15.0`), and it publishes the parameters the published list OF THAT FAMILY
+/// carries: an entry outside the releases the line names, and one the lists of the earlier
+/// lines do not carry, are both outside the family's parameters.
+///
+/// A family is one release line of one engine (`mysql8.0`, `aurora-postgresql16`,
 /// `sqlserver-ee-15.0`), and a parameter exists in the engine from the release that
 /// introduced it until the release that removed it: the first is the fact a catalog entry's
 /// `Parameter$MinimumEngineVersion` states, "the earliest engine version to which the
@@ -1023,7 +1056,8 @@ pub const POSTGRES_FORCE_SSL_PARAMETER: &str = "rds.force_ssl";
 /// Where a catalog publishes no such release the parameter is carried, since nothing is
 /// withheld on a guess: an entry that names no introducing release is one the engine has
 /// carried since before any version this service serves, a parameter no entry names a
-/// removal for has never been dropped, a family whose version this front door cannot read as
+/// removal for has never been dropped, an entry no row bounds the published lists of is one
+/// every family's list carries, a family whose version this front door cannot read as
 /// a dotted release is compared against neither end, and neither is a family whose engine
 /// numbers its own releases independently of the catalog's
 /// (`crate::ops::describe_engine_default_parameters::family_version_is_in_catalog_numbering`),
@@ -1043,7 +1077,12 @@ pub fn family_carries_parameter(family: &str, spec: &ClusterParameterSpec) -> bo
     // resolved for that engine and never for another's parameter of the same name.
     let removed =
         crate::ops::describe_engine_default_parameters::parameter_removed_in(engine, spec.name);
-    if spec.minimum_engine_version.is_empty() && removed.is_none() {
+    // The release line from which the published family LISTS carry the entry, which the
+    // earlier lines' lists do not
+    // (`crate::ops::describe_engine_default_parameters::parameter_published_from`).
+    let published_from =
+        crate::ops::describe_engine_default_parameters::parameter_published_from(engine, spec.name);
+    if spec.minimum_engine_version.is_empty() && removed.is_none() && published_from.is_none() {
         return true;
     }
     let Some(version) = crate::ops::describe_engine_default_parameters::family_version(family)
@@ -1063,6 +1102,9 @@ pub fn family_carries_parameter(family: &str, spec: &ClusterParameterSpec) -> bo
     if !spec.minimum_engine_version.is_empty()
         && precedes(version, &line(spec.minimum_engine_version))
     {
+        return false;
+    }
+    if published_from.is_some_and(|from| precedes(version, &line(from))) {
         return false;
     }
     !removed.is_some_and(|removed| !precedes(version, &line(removed)))
