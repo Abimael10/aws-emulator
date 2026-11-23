@@ -79,6 +79,7 @@ const MUST_REACH: &[&str] = &[
     "s3",
     "s3vectors",
     "secretsmanager",
+    "ses",
     "sesv2",
     "sfn",
     "sns",
@@ -129,6 +130,11 @@ fn rows() -> Vec<Row> {
         Row {
             case: "another restJson1 service, signing under a different name",
             token: "sesv2",
+            reachable: true,
+        },
+        Row {
+            case: "an awsQuery service sharing that signing name, under its own SDK id",
+            token: "ses",
             reachable: true,
         },
         Row {

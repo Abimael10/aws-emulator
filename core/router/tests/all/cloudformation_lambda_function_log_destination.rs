@@ -57,7 +57,11 @@ use crate::query_wire::{form_encode, outputs_of, physical_ids_of};
 
 /// The Region every request below is signed for — the one the shared stack-status helper
 /// polls in — and so the Region every ARN here names.
-const REGION: &str = "us-east-1";
+///
+/// `pub(crate)` because the suites that drive their requests through [`dispatch`] address and
+/// sign them for THIS Region: one that asserts on a value carrying the Region reads it here
+/// rather than restating it, so the two cannot drift.
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The `StackStatus` a completed create reports.
 pub(crate) const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
