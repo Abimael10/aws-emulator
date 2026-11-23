@@ -31,9 +31,15 @@
 //! documents, which is a measurement) and what makes the period after a bulk load read the
 //! new total.
 //!
+//! A quantity that is NOT a gauge is published differently: the SEARCHES the domain's data
+//! plane served are a count of events rather than a level, so each is counted into its series
+//! by the request that served it ([`super::search_rate`]) — through the same one write below
+//! ([`publish_readings`]), so both kinds of series have one home and one dimension set.
+//!
 //! Three properties of that sampler, each of them observable:
 //!
-//! * IT IS OFF THE RESPONSE PATH. No client call produces these datapoints: the series is
+//! * IT IS OFF THE RESPONSE PATH. No client call produces one of these GAUGE datapoints: the
+//!   series is
 //!   what an operator reads, so it exists whether or not anybody is calling, and nothing on
 //!   a read path starts, advances or stops the sampler. It is claimed by the write that
 //!   gives this service a cluster to measure — `CreateDomain` — and at most one runs per
@@ -330,15 +336,52 @@ fn publish_sample<Eng: Send + Sync + 'static>(engine: &Eng) {
     publish(engine, &observed);
 }
 
-/// Append `observed` to the CloudWatch store of the SAME engine, and make every alarm
-/// watching one of those series due for evaluation.
+/// Publish one sample's gauges: `observed` as the [`Reading`]s they are, appended to the
+/// CloudWatch store of the SAME engine ([`publish_readings`]).
 ///
 /// Call it with NO store of this service locked (this module's lock order). An engine
 /// carrying no CloudWatch has nothing to publish to, and a CloudWatch store already holding
 /// its full complement of series drops the reading rather than failing anything: the series
 /// is published off every answer, so it can never be what refuses a call.
 pub fn publish<Eng: Send + Sync + 'static>(engine: &Eng, observed: &[ClusterGauges]) {
-    if observed.is_empty() {
+    let readings: Vec<Reading> = observed
+        .iter()
+        .flat_map(|gauges| {
+            gauges.series().into_iter().map(|(metric, value)| Reading {
+                domain_name: gauges.domain_name.clone(),
+                metric,
+                value,
+            })
+        })
+        .collect();
+    publish_readings(engine, &readings);
+}
+
+/// ONE reading of ONE series this service publishes: the domain it is dimensioned on
+/// ([`dimensions`]), the series it belongs to, and the value the quantity took.
+///
+/// The gauges of a sample become these ([`publish`]), and so does the count a search the
+/// domain's data plane served leaves behind ([`super::search_rate`]) — so every `AWS/ES`
+/// datapoint of this service is written by the one function below, under one namespace and
+/// the one dimension set a cluster-level series carries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reading {
+    /// The `DomainName` the series is dimensioned on.
+    pub domain_name: String,
+    /// The series the reading belongs to.
+    pub metric: String,
+    /// The value the quantity took.
+    pub value: f64,
+}
+
+/// Append `readings` to the CloudWatch store of the SAME engine, each under this service's
+/// namespace and the dimension set of the domain it is of, and make every alarm watching one
+/// of those series due for evaluation.
+///
+/// The ONE write this service makes into that store — a sample's gauges and a served search's
+/// count alike — and like [`publish`] it is called with NO store of this service locked.
+pub fn publish_readings<Eng: Send + Sync + 'static>(engine: &Eng, readings: &[Reading]) {
+    if readings.is_empty() {
         return;
     }
     let Some(state) = cloudwatch::service_state(engine) else {
@@ -354,32 +397,30 @@ pub fn publish<Eng: Send + Sync + 'static>(engine: &Eng, observed: &[ClusterGaug
     // once per series: a store at capacity stays at capacity, so a line per series per
     // sample would bury the log the emulator shares with everything else.
     let mut dropped = 0usize;
-    for gauges in observed {
-        for (metric, value) in gauges.series() {
-            let key = cloudwatch::MetricKey {
-                namespace: METRIC_NAMESPACE.to_string(),
-                metric_name: metric,
-                dimensions: dimensions(&gauges.domain_name),
-            };
-            let datum = cloudwatch::StoredDatum {
-                timestamp_secs: at_secs,
-                sample_count: 1.0,
-                sum: value,
-                minimum: value,
-                maximum: value,
-                unit: Some(COUNT_UNIT.to_string()),
-                storage_resolution: STANDARD_STORAGE_RESOLUTION_SECONDS,
-            };
-            let unit = datum.unit().to_string();
-            if store.append_datapoints(key.clone(), vec![datum]).is_err() {
-                dropped += 1;
-                continue;
-            }
-            written.push(cloudwatch::WrittenSeries {
-                key,
-                units: vec![unit],
-            });
+    for reading in readings {
+        let key = cloudwatch::MetricKey {
+            namespace: METRIC_NAMESPACE.to_string(),
+            metric_name: reading.metric.clone(),
+            dimensions: dimensions(&reading.domain_name),
+        };
+        let datum = cloudwatch::StoredDatum {
+            timestamp_secs: at_secs,
+            sample_count: 1.0,
+            sum: reading.value,
+            minimum: reading.value,
+            maximum: reading.value,
+            unit: Some(COUNT_UNIT.to_string()),
+            storage_resolution: STANDARD_STORAGE_RESOLUTION_SECONDS,
+        };
+        let unit = datum.unit().to_string();
+        if store.append_datapoints(key.clone(), vec![datum]).is_err() {
+            dropped += 1;
+            continue;
         }
+        written.push(cloudwatch::WrittenSeries {
+            key,
+            units: vec![unit],
+        });
     }
     if dropped > 0 {
         ::tracing::warn!(

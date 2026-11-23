@@ -111,6 +111,10 @@ pub mod audit;
 /// gauge reads, and the cadence they are observed on.
 pub mod cluster_metrics;
 
+/// The `AWS/ES` series the SEARCHES a domain's data plane served are counted into: a count of
+/// events rather than a gauge, so each served search is counted by the request that served it.
+pub mod search_rate;
+
 /// The SHARD ALLOCATION of a domain's cluster — which shard copies the nodes it provisions
 /// can hold — and the health colour it leaves the cluster in: the ONE reading every reader of
 /// that allocation is computed from.

@@ -1010,6 +1010,7 @@ fn answered<Eng: Send + Sync + 'static>(engine: &Eng, incoming: &Incoming<'_>) -
         started: ::std::time::Instant::now(),
         at: now,
         published: ::std::cell::RefCell::new(Vec::new()),
+        searches: ::std::cell::Cell::new(0),
         notifications: ::std::cell::RefCell::new(Vec::new()),
         pending_run: ::std::cell::RefCell::new(None),
         pending_snapshot: ::std::cell::RefCell::new(None),
@@ -1072,6 +1073,11 @@ fn answered<Eng: Send + Sync + 'static>(engine: &Eng, incoming: &Incoming<'_>) -
         Some(planned) => snapshot::performed(engine, &resolved.domain_name, planned, now),
         None => answer,
     };
+    // The searches this request had the cluster execute are counted into the domain's own
+    // `SearchRate` series here, for the same reason and in the same order as the log records
+    // above: the count was taken while this service's store was held and is published with it
+    // released, so no two stores are held at once.
+    state::search_rate::publish_searches(engine, &resolved.domain_name, request.searches.get());
     state::log_publishing::deliver(engine, &request.published.into_inner());
     Served {
         response: answer,
@@ -1407,6 +1413,13 @@ struct Request<'a> {
     /// by the step that did it ([`Request::record_served`]) and delivered once this
     /// service's store is released, so no two stores are held at once.
     published: ::std::cell::RefCell<Vec<state::log_publishing::PublishedRecord>>,
+    /// How many SEARCHES this request had the cluster execute — noted by the step that
+    /// executed one ([`record_searched`]) and counted into the domain's own `SearchRate`
+    /// series once this service's store is released
+    /// ([`state::search_rate::publish_searches`]), for the same reason the log records are
+    /// delivered there. Zero for every request but a search and a count, and for one the
+    /// cluster refused before it executed either.
+    searches: ::std::cell::Cell<u64>,
     /// The notifications the work this request did owes a channel — filled in by the
     /// monitor run that decided a trigger fired ([`monitor_run`]) and published once this
     /// service's store is released, for the same reason the log records are.
@@ -3742,10 +3755,16 @@ fn search(
     ok(&Value::Object(answer))
 }
 
-/// Note the read a search or a count performed, for the domain's search slow-log
-/// publishing: ONE record per index the path named, because the threshold that decides
-/// whether the read was slow is each index's own.
+/// Note the read a search or a count performed: ONE record per index the path named for the
+/// domain's search slow-log publishing, because the threshold that decides whether the read
+/// was slow is each index's own — and ONE search for the domain's own `SearchRate` series,
+/// because the request asked the cluster for one search of the documents it named, whatever
+/// the scan that answered it visited ([`state::search_rate`]).
+///
+/// Called by the step that SERVED the read, once it has been served, so neither is noted for a
+/// request the cluster refused before it executed anything.
 fn record_searched(domain: &Domain, request: &Request<'_>, named: &str) {
+    request.searches.set(request.searches.get().saturating_add(1));
     let took = request.took();
     let source = ::std::str::from_utf8(request.body).unwrap_or_default();
     let served: Vec<state::log_publishing::Served<'_>> = resolved_indexes(domain, Some(named))

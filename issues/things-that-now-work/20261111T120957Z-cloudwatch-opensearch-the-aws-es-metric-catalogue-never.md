@@ -40,3 +40,20 @@ Actual: the AWS/ES catalogue never appears; the wait cannot complete and no call
 2. Index ~25 documents into the domain.
 3. cloudwatch ListMetrics(Namespace='AWS/ES') and GetMetricStatistics for ClusterStatus.green / Nodes / SearchableDocuments with Dimensions [{ClientId}, {DomainName}].
 4. Expect the metric catalogue and datapoints; observe neither, and the wait runs to the budget.
+
+## Resolution
+The check's unit now replays green end to end (`replay_issue_units`: verdict `passed`, this report's
+`Issue-Key` state `fixed`).
+
+Two legs had to be served for that, and they landed in two commits:
+
+1. the GAUGE catalogue this report states its expectation in — `ClusterStatus.green/.yellow/.red`,
+   `Nodes` and `SearchableDocuments` (the last tracking the documents indexed into the domain),
+   dimensioned `{ClientId, DomainName}` — is published by the cadence sampler in the opensearch
+   crate's `src/state/cluster_metrics.rs`, with `tests/all/cluster_metrics.rs` pinning it. That leg
+   was already served when this report was picked up, and is unchanged by the closing commit;
+2. the SEARCH-REQUEST COUNT the same check waits for after them — `SearchRate` over the searches the
+   domain's data plane served, filed separately as
+   `20261122T080343Z-cloudwatch-opensearch-aws-es-searchrate-is-never-published.md` — was still
+   missing, and is what the closing commit adds: `src/state/search_rate.rs`, counted on the
+   data-plane request path and pinned by `tests/all/search_rate.rs`.

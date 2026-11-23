@@ -538,6 +538,9 @@ fn searched(
         started: ::std::time::Instant::now(),
         at: request.at,
         published: ::std::cell::RefCell::new(Vec::new()),
+        // The searches this one executes are counted into the domain's `SearchRate` series
+        // like a client's, through the request that drove the run (below).
+        searches: ::std::cell::Cell::new(0),
         notifications: ::std::cell::RefCell::new(Vec::new()),
         pending_run: ::std::cell::RefCell::new(None),
         // Nor any repository work: a search plans none.
@@ -550,12 +553,19 @@ fn searched(
         internal_user: request.internal_user,
     };
     let answer = super::search(domain, &searching, pattern, &CrossCluster::default(), files);
-    // The searches a run performed are work the domain's log publishing has a record of, so
-    // the records they produced travel with the request that drove the run.
+    // The searches a run performed are work the domain's log publishing has a record of, and
+    // searches the cluster executed, so both the records they produced and their count travel
+    // with the request that drove the run.
     request
         .published
         .borrow_mut()
         .extend(searching.published.into_inner());
+    request.searches.set(
+        request
+            .searches
+            .get()
+            .saturating_add(searching.searches.get()),
+    );
     let status = answer.status().as_u16();
     let payload = answer.body().bytes().unwrap_or_default().to_vec();
     let read: Value = ::serde_json::from_slice(&payload).unwrap_or(Value::Null);
