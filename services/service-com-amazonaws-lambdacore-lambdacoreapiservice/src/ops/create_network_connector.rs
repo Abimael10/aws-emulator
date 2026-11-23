@@ -340,9 +340,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let version = 1_i64;
         // "The network connector starts in PENDING state while ENIs are
         // provisioned in your VPC": the clock owes it ACTIVE, and nothing a
-        // caller does brings that forward.
+        // caller does brings that forward or holds it back — the transient is
+        // this answer's own `State`, and the settlement is owed from the
+        // instant this call started it ([`crate::state::settles_at`]), so the
+        // first report of the connector after it already carries ACTIVE.
         let provisioned = crate::state::PendingTransition {
-            due: now + crate::state::LIFECYCLE_TRANSITION,
+            due: crate::state::settles_at(now),
             change: crate::state::PendingChange::State(crate::state::STATE_ACTIVE.to_string()),
             // The creation this call started is still the event that puts the
             // connector in `ACTIVE`, so the narrative recorded below explains

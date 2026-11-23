@@ -21,13 +21,16 @@
 //! pass.
 
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_lambdacore_lambdacoreapiservice::state::service_state;
 
+use crate::lifecycle_convergence::{reschedule, ALREADY_DUE, NOT_YET_DUE};
+
 use crate::network_connector_lifecycle::{
-    assert_conflict, at, create, delete, emulator, emulator_with_engine, get, minimal_create, text,
-    update, vpc_egress, wait_for_the_clock,
+    assert_conflict, at, create, delete, emulator_with_engine, get, minimal_create, text, update,
+    vpc_egress,
 };
 
 /// What the create's configuration carries, so a refused update can be shown to have
@@ -222,7 +225,9 @@ async fn a_state_gated_refusal_is_worded_by_the_state_not_by_the_request() {
 /// what the next read reports.
 ///
 /// The rows differ along how many subnets the accepted update carries, so the row that
-/// succeeds is not one particular request.
+/// succeeds is not one particular request. Each row holds the connector in `PENDING` by
+/// moving the instant its provisioning falls due, so the refusal and the acceptance are
+/// decided by the state and not by how fast the host runs.
 #[tokio::test]
 async fn the_same_update_is_accepted_once_the_connector_is_active() {
     let rows: Vec<(&str, Vec<&str>)> = vec![
@@ -234,7 +239,7 @@ async fn the_same_update_is_accepted_once_the_connector_is_active() {
     ];
 
     for (case, subnets) in rows {
-        let router = emulator();
+        let (router, engine) = emulator_with_engine();
         let created = create(&router, minimal_create("settles")).await;
         assert_eq!(
             created.status, 202,
@@ -244,6 +249,12 @@ async fn the_same_update_is_accepted_once_the_connector_is_active() {
         let id = text(&created.body, "/Id");
         let request = json!({ "Configuration": vpc_egress(&subnets, &[], None, None) });
 
+        reschedule(
+            &engine,
+            "settles",
+            &format!("{case} while the create is still pending"),
+            SystemTime::now() + NOT_YET_DUE,
+        );
         let refused = update(&router, &id, request.clone()).await;
         assert_conflict(
             &format!("{case} while the create is still pending"),
@@ -254,7 +265,12 @@ async fn the_same_update_is_accepted_once_the_connector_is_active() {
             ),
         );
 
-        wait_for_the_clock();
+        reschedule(
+            &engine,
+            "settles",
+            &format!("{case} once provisioning has fallen due"),
+            SystemTime::now() - ALREADY_DUE,
+        );
         let accepted = update(&router, &id, request).await;
         assert_eq!(
             accepted.status, 202,

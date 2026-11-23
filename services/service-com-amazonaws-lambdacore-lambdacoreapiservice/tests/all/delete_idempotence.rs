@@ -22,21 +22,28 @@
 //!    the deletion completed, and the delete of a single historical version repeated on its
 //!    own.
 //!
-//! 2. Every operation reports the state the resource has REACHED: a transition the clock
-//!    owes is materialised by the first call taken at or after the instant it falls due,
-//!    so no reached state is withheld from a caller that polls the documented way, and the
-//!    transient state (`PENDING`, `InProgress`, `DELETING`) is still observable by a
-//!    caller acting straight after the call that started the work.
+//! 2. Every operation reports the state the resource has REACHED: the outcome of
+//!    asynchronous work is owed from the instant the call that started it answered, so the
+//!    FIRST call after it reports that outcome and no reached state is withheld from a
+//!    caller that polls the documented way — however often, or seldom, it looks. The
+//!    transient (`PENDING`, `InProgress`, `DELETING`) is carried by the answer of the call
+//!    that starts the work, and a deletion keeps the window the model's idempotent repeat
+//!    is stated over.
 //!
-//! The harness (router, request helpers, the clock wait) is the lifecycle suite's; it is
-//! `pub(crate)` there so every suite drives the emulator the same way.
+//! The harness (router, request helpers) is the lifecycle suite's; it is `pub(crate)` there
+//! so every suite drives the emulator the same way. A case that needs a transition NOT to
+//! have fallen due yet, or to have fallen due already, moves the instant the record itself
+//! carries (`lifecycle_convergence::reschedule`) rather than racing a span.
+
+use std::time::SystemTime;
 
 use serde_json::json;
 use smithy_server_runtime::MultiServiceRouter;
 
+use super::lifecycle_convergence::{reschedule, ALREADY_DUE, NOT_YET_DUE};
 use super::network_connector_lifecycle::{
-    at, create, delete, emulator, expected_arn, get, list, minimal_configuration, minimal_create,
-    text, update, vpc_egress, wait_for_the_clock, Answer, OPERATOR_ROLE,
+    at, create, delete, emulator, emulator_with_engine, expected_arn, get, list,
+    minimal_configuration, minimal_create, text, update, vpc_egress, Answer, OPERATOR_ROLE,
 };
 use super::not_found_message::{expected_message, expected_update_message};
 
@@ -45,8 +52,8 @@ use super::not_found_message::{expected_message, expected_update_message};
 /// carried.
 const DELETING: &str = "DELETING";
 
-/// Create `name` and wait out the provisioning the clock owes it, so it is `ACTIVE` and
-/// deletable. Answers the connector's id.
+/// Create `name` and answer the connector's id. Provisioning settles from the instant the
+/// create answered, so the next call finds the connector `ACTIVE` and deletable.
 async fn active_connector(router: &MultiServiceRouter, name: &str, subnets: &[&str]) -> String {
     let created = create(
         router,
@@ -62,7 +69,6 @@ async fn active_connector(router: &MultiServiceRouter, name: &str, subnets: &[&s
         "creating {name:?} must succeed, got {} with {:?}",
         created.status, created.body
     );
-    wait_for_the_clock();
     text(&created.body, "/Id")
 }
 
@@ -89,7 +95,6 @@ async fn append_versions(router: &MultiServiceRouter, name: &str, count: usize) 
             "appending a version to {name:?} must succeed, got {} with {:?}",
             updated.status, updated.body
         );
-        wait_for_the_clock();
     }
 }
 
@@ -174,7 +179,7 @@ async fn a_repeated_delete_is_accepted_until_the_deletion_completes() {
     ];
 
     for (index, (case, extra_versions, completed)) in cases.iter().enumerate() {
-        let router = emulator();
+        let (router, engine) = emulator_with_engine();
         let name = format!("repeat-{index}");
         let id = active_connector(&router, &name, &["subnet-0123456789abcdef0"]).await;
         let arn = expected_arn(&id);
@@ -186,13 +191,18 @@ async fn a_repeated_delete_is_accepted_until_the_deletion_completes() {
         if *completed {
             // The deletion the call started is owed by the clock; once it falls due the
             // record is forgotten and `GetNetworkConnector` refuses the identifier.
-            wait_for_the_clock();
+            reschedule(&engine, &name, case, SystemTime::now() - ALREADY_DUE);
             let gone = get(&router, &name).await;
             assert_not_found(
                 &format!("{case}: the connector after deletion"),
                 &gone,
                 &name,
             );
+        } else {
+            // The repeat this row is about arrives while the record is still there, which
+            // is the window the clock owes the removal: the case holds that window open
+            // rather than racing it.
+            reschedule(&engine, &name, case, SystemTime::now() + NOT_YET_DUE);
         }
 
         // Every form the caller could repeat the delete with resolves to the same
@@ -258,7 +268,7 @@ async fn a_repeated_delete_is_accepted_until_the_deletion_completes() {
 /// connector ever held.
 #[tokio::test]
 async fn an_identifier_that_names_no_connector_is_refused() {
-    let router = emulator();
+    let (router, engine) = emulator_with_engine();
     let name = "short-lived";
     let id = active_connector(&router, name, &["subnet-0123456789abcdef0"]).await;
     let arn = expected_arn(&id);
@@ -266,7 +276,12 @@ async fn an_identifier_that_names_no_connector_is_refused() {
     append_versions(&router, name, 1).await;
     let accepted = delete(&router, name).await;
     assert_accepted("the delete under test", &accepted, &arn, name, &id);
-    wait_for_the_clock();
+    reschedule(
+        &engine,
+        name,
+        "the deletion under test",
+        SystemTime::now() - ALREADY_DUE,
+    );
 
     // Each row is an identifier that names no connector of this account: a name, an id and
     // an ARN that were never minted, a version one past the deleted connector's last one, a
@@ -386,13 +401,18 @@ async fn a_repeated_delete_of_a_historical_version_is_accepted() {
 /// names nothing through any operation.
 #[tokio::test]
 async fn a_freed_name_rebinds_while_the_old_id_names_nothing() {
-    let router = emulator();
+    let (router, engine) = emulator_with_engine();
     let name = "reused";
     let first_id = active_connector(&router, name, &["subnet-0123456789abcdef0"]).await;
     let arn = expected_arn(&first_id);
     let accepted = delete(&router, name).await;
     assert_accepted("the first delete", &accepted, &arn, name, &first_id);
-    wait_for_the_clock();
+    reschedule(
+        &engine,
+        name,
+        "the deletion that frees the name",
+        SystemTime::now() - ALREADY_DUE,
+    );
 
     let recreated = create(&router, minimal_create(name)).await;
     assert_eq!(
@@ -441,7 +461,6 @@ async fn a_freed_name_rebinds_while_the_old_id_names_nothing() {
 
     // Deleting by NAME now addresses the live connector, which is the one that goes — and
     // it answers under its OWN ARN, whose resource segment is its own Id.
-    wait_for_the_clock();
     let live = delete(&router, name).await;
     assert_accepted(
         "the live connector by name",
@@ -452,14 +471,13 @@ async fn a_freed_name_rebinds_while_the_old_id_names_nothing() {
     );
 }
 
-/// RULE 2: the first call taken at or after the instant a transition falls due already
-/// reports the state the resource reached — nothing is withheld for a later call — while a
-/// caller acting straight after the starting call still sees the transient state.
+/// RULE 2: the first call after the one that started asynchronous work already reports the
+/// value the work reached — nothing is withheld for a later call — and the transient is
+/// carried by the starting call's own answer.
 #[tokio::test]
 async fn the_first_read_after_a_transition_falls_due_reports_the_reached_state() {
-    // Provisioning: the create answers PENDING, and the FIRST call after the span is the
-    // one that reports ACTIVE.
-    let router = emulator();
+    // Provisioning: the create answers PENDING, and the FIRST call after it reports ACTIVE.
+    let (router, engine) = emulator_with_engine();
     let created = create(&router, minimal_create("settling")).await;
     assert_eq!(
         text(&created.body, "/State"),
@@ -467,39 +485,30 @@ async fn the_first_read_after_a_transition_falls_due_reports_the_reached_state()
         "the create itself carries the transient state, got {:?}",
         at(&created.body, "/State")
     );
-    let transient = get(&router, "settling").await;
-    assert_eq!(
-        text(&transient.body, "/State"),
-        "PENDING",
-        "a caller acting straight after the create still observes PENDING, got {:?}",
-        at(&transient.body, "/State")
-    );
-    wait_for_the_clock();
     let settled = get(&router, "settling").await;
     assert_eq!(
         text(&settled.body, "/State"),
         "ACTIVE",
-        "the first read taken once provisioning is due reports ACTIVE, got {:?}",
+        "the first read after the create reports the state provisioning reached, got {:?}",
         at(&settled.body, "/State")
     );
 
-    // The same, with NO read before the span elapses: the transition is not waiting for an
-    // earlier call to materialise it.
-    let router = emulator();
-    create(&router, minimal_create("unread")).await;
-    wait_for_the_clock();
-    let first_read = get(&router, "unread").await;
+    // The same with NO read in between: nothing was waiting for an earlier call to
+    // materialise it, so a client whose budget allows a single look still sees it.
+    let (second_router, _second_engine) = emulator_with_engine();
+    create(&second_router, minimal_create("unread")).await;
+    let first_read = get(&second_router, "unread").await;
     assert_eq!(
         text(&first_read.body, "/State"),
         "ACTIVE",
-        "the very first read after the span reports ACTIVE, got {:?}",
+        "the very first read after a create reports ACTIVE, got {:?}",
         at(&first_read.body, "/State")
     );
 
-    // An update's own asynchronous work, reported by the first read after it is due.
+    // An update's own asynchronous work, reported by the first read after it.
     let updated = update(
         &router,
-        "unread",
+        "settling",
         json!({ "Configuration": vpc_egress(&["subnet-0fedcba9876543210"], &[], None, None) }),
     )
     .await;
@@ -509,30 +518,48 @@ async fn the_first_read_after_a_transition_falls_due_reports_the_reached_state()
         "the update itself carries the transient status, got {:?}",
         at(&updated.body, "/LastUpdateStatus")
     );
-    wait_for_the_clock();
-    let after_update = get(&router, "unread").await;
+    let after_update = get(&router, "settling").await;
     assert_eq!(
         text(&after_update.body, "/LastUpdateStatus"),
         "Successful",
-        "the first read taken once the update is due reports Successful, got {:?}",
+        "the first read after the update reports Successful, got {:?}",
         at(&after_update.body, "/LastUpdateStatus")
     );
 
-    // And a deletion: DELETING in the answer, and the first read after the span refuses
-    // the identifier — "after deletion completes, subsequent calls to GetNetworkConnector
-    // return ResourceNotFoundException".
-    let removed = delete(&router, "unread").await;
+    // And a deletion, whose removal the clock owes over a window the record is still there
+    // for: DELETING in the answer and for as long as that window is open, and once it falls
+    // due the identifier is refused — "after deletion completes, subsequent calls to
+    // GetNetworkConnector return ResourceNotFoundException".
+    let removed = delete(&router, "settling").await;
     assert_eq!(
         text(&removed.body, "/State"),
         DELETING,
         "the delete itself carries the transient state, got {:?}",
         at(&removed.body, "/State")
     );
-    wait_for_the_clock();
-    let after_delete = get(&router, "unread").await;
+    reschedule(
+        &engine,
+        "settling",
+        "a deletion the clock still owes",
+        SystemTime::now() + NOT_YET_DUE,
+    );
+    let while_deleting = get(&router, "settling").await;
+    assert_eq!(
+        text(&while_deleting.body, "/State"),
+        DELETING,
+        "a read inside the window the removal is owed over reports DELETING, got {:?}",
+        at(&while_deleting.body, "/State")
+    );
+    reschedule(
+        &engine,
+        "settling",
+        "a deletion that has fallen due",
+        SystemTime::now() - ALREADY_DUE,
+    );
+    let after_delete = get(&router, "settling").await;
     assert_not_found(
         "the first read after the deletion is due",
         &after_delete,
-        "unread",
+        "settling",
     );
 }

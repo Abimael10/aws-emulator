@@ -14,20 +14,31 @@
 //! converges, and a client that polls nothing finds the change already made on its
 //! next call.
 //!
-//! Both halves of that rule are load bearing. The convergence half is what
-//! `CreateNetworkConnector` instructs a client to rely on ("Use GetNetworkConnector
-//! to poll the connector state until it reaches `ACTIVE`"). The transient half is
-//! what the model's state gates are stated over: `UpdateNetworkConnector`'s "the
-//! connector must be in `ACTIVE` state to accept updates" and
-//! `DeleteNetworkConnector`'s "you can delete connectors in `ACTIVE` or `FAILED`
-//! states" have nothing to refuse unless a connector is observably not yet
-//! provisioned after its create.
+//! WHEN each change falls due follows from that. Provisioning and an update settle
+//! from the instant the call that started them answered, because
+//! `CreateNetworkConnector` tells a client to "use `GetNetworkConnector` to poll the
+//! connector state until it reaches `ACTIVE`" and an update's status "transitions
+//! through `InProgress` to `Successful`" — promises made to a client polling on ITS
+//! own schedule, which may be one single look taken immediately. So a single probe
+//! converges, and the transient stays where the model exposes it: in the answer of
+//! the call that starts the work. A deletion keeps a window the record is still
+//! there for, because the model states a behaviour over it —
+//! `DeleteNetworkConnector` is idempotent, "calling delete on a connector that is
+//! already deleting ... succeeds without error", while a delete of an identifier
+//! this account holds no connector for is the modelled `ResourceNotFoundException`.
+//!
+//! The state gates (`UpdateNetworkConnector`'s "the connector must be in `ACTIVE`
+//! state to accept updates" and `DeleteNetworkConnector`'s "you can delete
+//! connectors in `ACTIVE` or `FAILED` states") are stated over a connector whose
+//! provisioning the clock still owes, which is a record carrying a due instant it
+//! has not reached — whatever put it there.
 //!
 //! The cases below put a transition on either side of its due instant by moving the
 //! instant the record itself carries, so each assertion is decided by the rule
-//! rather than by how fast the host runs; the one end-to-end case polls for the
-//! condition and never for a span. The request helpers are the lifecycle suite's,
-//! so this suite drives the emulator over HTTP exactly as a client does.
+//! rather than by how fast the host runs; the convergence cases take ONE call after
+//! the call under test and the end-to-end case polls for the condition, never for a
+//! span. The request helpers are the lifecycle suite's, so this suite drives the
+//! emulator over HTTP exactly as a client does.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -38,7 +49,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::network_connector_lifecycle::{
     at, create, delete, emulator, emulator_with_engine, get, list, list_versions, minimal_create,
-    text, update, vpc_egress, Answer,
+    text, update, vpc_egress, Answer, OPERATOR_ROLE,
 };
 
 /// How far in the past a case puts a due instant it wants already reached: long
@@ -519,4 +530,199 @@ async fn a_client_that_polls_get_reaches_active() {
         "case {case:?}: the settled connector is listed among the ACTIVE ones, got {:?}",
         listed.body
     );
+}
+
+/// Every configuration a convergence row creates its connector from: the members
+/// `NetworkConnectorVpcEgressConfiguration` declares, varied one at a time (`SubnetIds`
+/// 1..16, `SecurityGroupIds` 0..16, `NetworkProtocol` one of `IPv4` / `DualStack`,
+/// `AssociatedComputeResourceTypes` one of `MicroVm` / `WebFunction`, per
+/// `smithy_query(query="shape",shape="NetworkConnectorVpcEgressConfiguration")`), paired
+/// with a `Name` shape the model admits. Convergence is a property of the lifecycle, so no
+/// row may be the one request shape a recording happened to carry.
+fn converging_rows() -> Vec<(&'static str, &'static str, serde_json::Value)> {
+    vec![
+        (
+            "one subnet, nothing else named",
+            "converging",
+            vpc_egress(&["subnet-0123456789abcdef0"], &[], None, None),
+        ),
+        (
+            "two subnets and two groups, IPv4 for MicroVm",
+            "converging_02",
+            vpc_egress(
+                &["subnet-0123456789abcdef0", "subnet-0fedcba9876543210"],
+                &["sg-0123456789abcdef0", "sg-00112233445566778"],
+                Some("IPv4"),
+                Some("MicroVm"),
+            ),
+        ),
+        (
+            "a dual-stack connector for a WebFunction",
+            "c",
+            vpc_egress(
+                &["subnet-00112233445566778"],
+                &["sg-0a1b2c3d4e5f60718"],
+                Some("DualStack"),
+                Some("WebFunction"),
+            ),
+        ),
+        (
+            "three subnets, no groups, name spelled like an id",
+            "nc-00000000000000ff",
+            vpc_egress(
+                &[
+                    "subnet-0123456789abcdef0",
+                    "subnet-0fedcba9876543210",
+                    "subnet-0a1b2c3d4e5f60718",
+                ],
+                &[],
+                Some("IPv4"),
+                None,
+            ),
+        ),
+    ]
+}
+
+/// Create the row's connector and assert its own answer carries the transient state.
+/// Answers the identity the create reported.
+async fn start_provisioning(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+    configuration: serde_json::Value,
+) -> Created {
+    let created = create(
+        router,
+        json!({
+            "Name": name,
+            "Configuration": configuration,
+            "OperatorRole": OPERATOR_ROLE,
+        }),
+    )
+    .await;
+    assert_eq!(
+        created.status, 202,
+        "case {case:?}: creating {name:?} must succeed, got {} with {:?}",
+        created.status, created.body
+    );
+    assert_eq!(
+        text(&created.body, "/State"),
+        "PENDING",
+        "case {case:?}: the create that starts provisioning carries the transient state \
+         itself, got {:?}",
+        at(&created.body, "/State")
+    );
+    Created {
+        name: name.to_string(),
+        id: text(&created.body, "/Id"),
+        arn: text(&created.body, "/Arn"),
+    }
+}
+
+/// CONVERGENCE, as a client with ONE probe experiences it: the single call a client takes
+/// straight after `CreateNetworkConnector` — the first since the create, with nothing in
+/// between, nothing waited for and nothing arranged — already reports the state
+/// provisioning reached.
+///
+/// The rows span what the rule generalises over: the configuration and `Name` the connector
+/// was created from ([`converging_rows`]), and which operation the one probe is, including
+/// every identifier form the read admits.
+#[tokio::test]
+async fn one_probe_straight_after_the_create_already_reports_active() {
+    for (row, name, configuration) in converging_rows() {
+        for report in EVERY_REPORT {
+            let case = format!("{row}, probed through {report:?}");
+            let router = emulator();
+            let connector = start_provisioning(&router, &case, name, configuration.clone()).await;
+
+            let first = reported_state(&router, report, &connector).await;
+            assert_eq!(
+                first, "ACTIVE",
+                "case {case:?}: the ONE call a client takes after the create must report the \
+                 state provisioning reached, got {first:?}"
+            );
+        }
+    }
+}
+
+/// The same for the other work a call of this control plane starts: the single call taken
+/// straight after an accepted `UpdateNetworkConnector` reports the update settled —
+/// `LastUpdateStatus` `Successful` on the connector, `ACTIVE` on the version it appended —
+/// while the update's own answer carries `InProgress`.
+///
+/// The rows span the configuration the update asks for ([`converging_rows`], whose
+/// configurations are all different from the one the create stored) and which operation the
+/// one probe is.
+#[tokio::test]
+async fn one_probe_straight_after_an_update_already_reports_it_settled() {
+    for (row, name, configuration) in converging_rows() {
+        for probe in [
+            "a read by name",
+            "a read by id",
+            "the version listing",
+        ] {
+            let case = format!("{row}, probed through {probe}");
+            let router = emulator();
+            let connector = start_provisioning(
+                &router,
+                &case,
+                name,
+                vpc_egress(&["subnet-01234567890abcdef"], &[], None, None),
+            )
+            .await;
+            // One call settles the create, which is what makes the connector ACTIVE and so
+            // able to accept the update under test.
+            let provisioned = reported_state(&router, Report::GetById, &connector).await;
+            assert_eq!(
+                provisioned, "ACTIVE",
+                "case {case:?}: the update under test needs a provisioned connector, got \
+                 {provisioned:?}"
+            );
+
+            let updated = update(
+                &router,
+                &connector.id,
+                json!({ "Configuration": configuration.clone() }),
+            )
+            .await;
+            assert_eq!(
+                updated.status, 202,
+                "case {case:?}: an ACTIVE connector accepts the update, got {} with {:?}",
+                updated.status, updated.body
+            );
+            assert_eq!(
+                text(&updated.body, "/LastUpdateStatus"),
+                "InProgress",
+                "case {case:?}: the update that starts the work carries the transient status \
+                 itself, got {:?}",
+                at(&updated.body, "/LastUpdateStatus")
+            );
+
+            // ONE call, the first since that update.
+            let (answer, pointer, expected) = match probe {
+                "a read by name" => (
+                    get(&router, &connector.name).await,
+                    "/LastUpdateStatus",
+                    "Successful",
+                ),
+                "a read by id" => (
+                    get(&router, &connector.id).await,
+                    "/LastUpdateStatus",
+                    "Successful",
+                ),
+                _ => (
+                    list_versions(&router, &connector.name, "").await,
+                    "/NetworkConnectorVersions/1/State",
+                    "ACTIVE",
+                ),
+            };
+            assert_eq!(
+                text(&answer.body, pointer),
+                expected,
+                "case {case:?}: the ONE call after the update must report {pointer} as \
+                 {expected:?}, got {:?}",
+                at(&answer.body, pointer)
+            );
+        }
+    }
 }

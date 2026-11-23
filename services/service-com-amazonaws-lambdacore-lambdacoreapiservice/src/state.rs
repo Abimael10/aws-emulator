@@ -147,35 +147,48 @@ pub const MAX_VERSIONS_PER_CONNECTOR: usize = 100;
 /// workflow needs.
 pub const MAX_IDEMPOTENCY_TOKENS: usize = 1_000;
 
-/// How long the asynchronous work a call started is still in flight before the
-/// clock owes its outcome: provisioning a new connector (`PENDING` -> `ACTIVE`),
-/// an update (`InProgress` -> `Successful`) and a deletion (`DELETING` -> the
-/// record is forgotten).
+/// The instant the outcome of the asynchronous work a call `started` falls due, for the
+/// work whose TRANSIENT that call's own answer already carries: the instant the work
+/// started, so the outcome is owed by the time the call has answered and the FIRST report
+/// of the resource after it carries the value the work reached.
 ///
-/// `CreateNetworkConnector` documents that provisioning "typically takes up to
-/// 10 minutes"; the emulator chooses a span instead, and it is deliberately NOT
-/// zero so a caller acting straight after the call still observes the transient
-/// state. The instant it falls due is stored on the record and materialised by
-/// whichever later call reads it — nothing sleeps.
+/// That work is provisioning a new connector (`PENDING` -> `ACTIVE`, on the connector and
+/// on the version the create minted) and an update (`LastUpdateStatus` `InProgress` ->
+/// `Successful`, with the version it appends provisioning in turn).
+/// `CreateNetworkConnector` is "asynchronous", starts the connector "in `PENDING` state
+/// while ENIs are provisioned" and tells a client to "use `GetNetworkConnector` to poll the
+/// connector state until it reaches `ACTIVE`"; an update's status "transitions through
+/// `InProgress` to `Successful`". Each of those promises CONVERGENCE to a client polling on
+/// ITS OWN schedule, which may be a single look taken immediately — so the outcome cannot
+/// be withheld behind a span of this emulator's wall clock. A client whose budget allows
+/// one look would otherwise never observe the value the resource reached, and everything
+/// this service documents as gated on `ACTIVE` would be unreachable. The transient is
+/// reported where the model exposes it: in the `202` answer of the call that starts the work
+/// (`State` on the create, `LastUpdateStatus` on the update), which is built from the record
+/// as that call left it.
 ///
-/// Both halves of that are load bearing, so neither a longer nor a zero span
-/// serves this service:
+/// Nothing sleeps, and no read advances anything: the instant is stored on the record and
+/// materialised by whichever later call reports it ([`NetworkConnector::settle`]), so the
+/// outcome is owed whether or not anybody calls, and a record carrying a due instant that
+/// has not been reached still reports its transient through every operation.
+pub const fn settles_at(started: SystemTime) -> SystemTime {
+    started
+}
+
+/// How long a connector a delete has been accepted for stays in the store before the clock
+/// forgets the record — the `DELETING` -> the-record-is-gone transition.
 ///
-/// * CONVERGENCE. The outcome is owed by the clock alone: it falls due at the
-///   instant stored on the record whether or not anybody calls, and the FIRST
-///   call at or after that instant reports it, whichever operation makes it
-///   (every reporting handler settles the record it reads). So a client
-///   following `CreateNetworkConnector`'s instruction to "poll the connector
-///   state until it reaches `ACTIVE`" converges, and no number of reads moves
-///   the instant it converges at.
-/// * THE TRANSIENT WINDOW. `UpdateNetworkConnector` ("the connector must be in
-///   `ACTIVE` state to accept updates") and `DeleteNetworkConnector` ("you can
-///   delete connectors in `ACTIVE` or `FAILED` states") are both stated over a
-///   connector that is not provisioned yet, so their modelled
-///   `ResourceConflictException` exists only while a freshly created connector
-///   is observably `PENDING` through the operations that report it — not just in
-///   the create's own answer.
-pub const LIFECYCLE_TRANSITION: Duration = Duration::from_millis(500);
+/// This one is NOT due when the delete answers, because the model states a behaviour over
+/// the window it opens: `DeleteNetworkConnector` is `idempotent: true` and documented
+/// "calling delete on a connector that is already deleting or has been deleted succeeds
+/// without error", while the recorded answer for a delete of an identifier this account
+/// holds no connector for is the modelled `ResourceNotFoundException`. The repeat that
+/// succeeds is therefore exactly the one that arrives while the record is still there, so a
+/// window of no length at all would leave that arm of the operation unreachable. Within it
+/// every read reports `DELETING` — "being deleted, cleaning up resources" — which is the
+/// state the model documents for a deletion in flight rather than a value withheld from the
+/// caller.
+pub const DELETION_COMPLETES_AFTER: Duration = Duration::from_millis(500);
 
 /// What the clock owes a connector once its transition falls due.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,6 +203,9 @@ pub enum PendingChange {
 /// A change the clock owes: the instant it falls due, and what it does.
 #[derive(Debug, Clone)]
 pub struct PendingTransition {
+    /// When the change falls due, after which the first call that reports the record
+    /// materialises it: [`settles_at`] for work whose transient the starting call's own
+    /// answer carries, and [`DELETION_COMPLETES_AFTER`] past the delete for a removal.
     pub due: SystemTime,
     pub change: PendingChange,
     /// The human-readable narrative to record beside the status this transition sets, so

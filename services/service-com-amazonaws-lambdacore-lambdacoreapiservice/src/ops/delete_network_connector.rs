@@ -310,7 +310,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(crate::state::STATE_REASON_DELETION_REQUESTED.to_string());
             connector.last_modified = now;
             connector.pending = Some(crate::state::PendingTransition {
-                due: now + crate::state::LIFECYCLE_TRANSITION,
+                due: now + crate::state::DELETION_COMPLETES_AFTER,
                 change: crate::state::PendingChange::Removal,
                 // The record is forgotten when this falls due, so there is no
                 // state left to explain.

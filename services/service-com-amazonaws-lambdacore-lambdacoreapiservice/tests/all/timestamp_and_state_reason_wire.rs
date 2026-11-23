@@ -54,7 +54,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use super::lifecycle_convergence::{reschedule, ALREADY_DUE, NOT_YET_DUE};
 use super::network_connector_lifecycle::{
     at, create, delete, emulator, emulator_with_engine, expected_arn, get, list, list_versions,
-    minimal_configuration, minimal_create, text, update, vpc_egress, wait_for_the_clock, Answer,
+    minimal_configuration, minimal_create, text, update, vpc_egress, Answer,
     OPERATOR_ROLE,
 };
 
@@ -153,16 +153,14 @@ async fn every_date_time_member_is_an_iso8601_string_on_the_wire() {
     let id = text(&created.body, "/Id");
     let arn = expected_arn(name);
 
-    // An update is accepted once provisioning has settled the connector to ACTIVE, and it
-    // is what gives the versions list a second row.
-    wait_for_the_clock();
+    // An update is accepted because the create's provisioning settled the connector to
+    // ACTIVE, and it is what gives the versions list a second row.
     let updated = update(&router, name, json!({ "Configuration": changed_configuration() })).await;
     assert_eq!(
         updated.status, 202,
         "expected HTTP 202 from UpdateNetworkConnector, got {} with {:?}",
         updated.status, updated.body
     );
-    wait_for_the_clock();
 
     let by_name = get(&router, name).await;
     let by_id = get(&router, &id).await;
@@ -283,7 +281,7 @@ fn every_date_time_member_schema_reports_the_modelled_format() {
 /// on the connector.
 #[tokio::test]
 async fn a_reported_state_always_carries_the_reason_for_it() {
-    let router = emulator();
+    let (router, engine) = emulator_with_engine();
     let name = "state-reasoned";
     let created = create(&router, minimal_create(name)).await;
     assert_eq!(
@@ -294,8 +292,15 @@ async fn a_reported_state_always_carries_the_reason_for_it() {
     let id = text(&created.body, "/Id");
     let arn = expected_arn(name);
 
-    // While provisioning is still owed, the connector is in its transient state — and the
-    // reason for it is reported, which is the case the issue's recording covers.
+    // While provisioning is still owed — the window held open by moving the instant the
+    // record carries — the connector is in its transient state, and the reason for it is
+    // reported, which is the case the issue's recording covers.
+    reschedule(
+        &engine,
+        name,
+        "a connector still provisioning",
+        SystemTime::now() + NOT_YET_DUE,
+    );
     let pending_forms = [
         ("PENDING, looked up by name", name.to_string()),
         ("PENDING, looked up by id", id.clone()),
@@ -331,7 +336,12 @@ async fn a_reported_state_always_carries_the_reason_for_it() {
 
     // Once the clock settles provisioning the state moves, and the reason the connector
     // reached it is still reported with it.
-    wait_for_the_clock();
+    reschedule(
+        &engine,
+        name,
+        "a connector whose provisioning has fallen due",
+        SystemTime::now() - ALREADY_DUE,
+    );
     let settled = get(&router, name).await;
     let (state, active_reason) = state_and_reason("ACTIVE after provisioning", &settled.body, "");
     assert_eq!(
@@ -340,12 +350,19 @@ async fn a_reported_state_always_carries_the_reason_for_it() {
     );
 
     // An update appends a version. Each version reports its own state with its own reason,
-    // and the two were put in that state by different events.
+    // and the two were put in that state by different events. The appended version is still
+    // provisioning for as long as the clock owes that, which the case holds open.
     let updated = update(&router, name, json!({ "Configuration": changed_configuration() })).await;
     assert_eq!(
         updated.status, 202,
         "expected HTTP 202 from UpdateNetworkConnector, got {} with {:?}",
         updated.status, updated.body
+    );
+    reschedule(
+        &engine,
+        name,
+        "an update still in flight",
+        SystemTime::now() + NOT_YET_DUE,
     );
     let versions = list_versions(&router, name, "").await;
     let (first_state, first_reason) =
@@ -371,12 +388,20 @@ async fn a_reported_state_always_carries_the_reason_for_it() {
          creation, so its reason differs, got {second_reason:?}"
     );
 
-    // A delete moves the connector to its own state, with the reason for THAT state.
+    // A delete moves the connector to its own state, with the reason for THAT state. The
+    // record is still there for as long as the clock owes the removal, which the case holds
+    // open rather than racing.
     let deleted = delete(&router, name).await;
     assert_eq!(
         deleted.status, 202,
         "expected HTTP 202 from DeleteNetworkConnector, got {} with {:?}",
         deleted.status, deleted.body
+    );
+    reschedule(
+        &engine,
+        name,
+        "a deletion the clock still owes",
+        SystemTime::now() + NOT_YET_DUE,
     );
     let deleting = get(&router, name).await;
     let (state, deleting_reason) = state_and_reason("DELETING after a delete", &deleting.body, "");

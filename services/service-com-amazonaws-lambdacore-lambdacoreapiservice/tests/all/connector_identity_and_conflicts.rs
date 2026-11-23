@@ -17,11 +17,14 @@
 //!    it by that same `Id` and states the state it is in, and a delete refused because the
 //!    connector is in a state it cannot be deleted from states the state and nothing else.
 
+use std::time::SystemTime;
+
 use serde_json::{json, Value};
 
+use crate::lifecycle_convergence::{reschedule, ALREADY_DUE, NOT_YET_DUE};
 use crate::network_connector_lifecycle::{
-    assert_conflict, at, create, delete, emulator, expected_arn, get, list, list_versions,
-    minimal_create, text, update, vpc_egress, wait_for_the_clock,
+    assert_conflict, at, create, delete, emulator, emulator_with_engine, expected_arn, get, list,
+    list_versions, minimal_create, text, update, vpc_egress,
 };
 
 /// What every ARN of a connector carries before the identifier of the resource.
@@ -79,8 +82,8 @@ async fn every_arn_a_connector_is_reported_under_names_its_id() {
         );
 
         // Each extra version is appended by an update, so the qualified ARNs below span
-        // more than the first version.
-        wait_for_the_clock();
+        // more than the first version. The create's provisioning has settled by the time
+        // the next call arrives, so the connector is ACTIVE and accepts them.
         for extra in 0..extra_versions {
             let subnets: Vec<String> = (0..=extra)
                 .map(|index| format!("subnet-0123456789abcde{index:01x}"))
@@ -97,7 +100,6 @@ async fn every_arn_a_connector_is_reported_under_names_its_id() {
                 "case {case:?}: each update must succeed, got {} with {:?}",
                 updated.status, updated.body
             );
-            wait_for_the_clock();
         }
 
         // Every operation that reports the connector reports the same consistent pair,
@@ -190,13 +192,15 @@ async fn every_arn_a_connector_is_reported_under_names_its_id() {
 /// the service names it, whichever of the three forms the caller used.
 #[tokio::test]
 async fn a_state_conflict_names_the_connector_by_its_id() {
-    // A connector is PENDING from the create until the clock owes it ACTIVE, and DELETING
-    // from an accepted delete until the removal falls due: the two non-ACTIVE states a
-    // caller can observe through this API.
+    // The two non-`ACTIVE` states this API drives a connector into: `PENDING` from the
+    // create until provisioning falls due, and `DELETING` from an accepted delete until the
+    // removal does. Each row holds the connector in that state by moving the instant the
+    // change the service itself recorded falls due, so the case is decided by the rule and
+    // not by how fast the host runs.
     let addressed: [&str; 3] = ["the name", "the id", "the unqualified ARN"];
 
     for form in addressed {
-        let router = emulator();
+        let (router, engine) = emulator_with_engine();
         let created = create(&router, minimal_create("conflicted")).await;
         let id = text(&created.body, "/Id");
         let arn = text(&created.body, "/Arn");
@@ -205,6 +209,12 @@ async fn a_state_conflict_names_the_connector_by_its_id() {
             "the unqualified ARN" => arn.clone(),
             _ => "conflicted".to_string(),
         };
+        reschedule(
+            &engine,
+            "conflicted",
+            &format!("a connector still provisioning, addressed by {form}"),
+            SystemTime::now() + NOT_YET_DUE,
+        );
 
         // PENDING: the update is refused, and so is the delete.
         let refused = update(
@@ -239,12 +249,23 @@ async fn a_state_conflict_names_the_connector_by_its_id() {
 
         // DELETING: the same rule, one state along. The delete is accepted once the
         // connector is ACTIVE, and an update is refused for as long as the removal is owed.
-        wait_for_the_clock();
+        reschedule(
+            &engine,
+            "conflicted",
+            &format!("a connector whose provisioning is due, addressed by {form}"),
+            SystemTime::now() - ALREADY_DUE,
+        );
         let accepted = delete(&router, &identifier).await;
         assert_eq!(
             accepted.status, 202,
             "case {form:?}: an ACTIVE connector is deletable, got {} with {:?}",
             accepted.status, accepted.body
+        );
+        reschedule(
+            &engine,
+            "conflicted",
+            &format!("a connector still deleting, addressed by {form}"),
+            SystemTime::now() + NOT_YET_DUE,
         );
         let while_deleting = update(
             &router,

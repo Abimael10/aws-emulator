@@ -14,12 +14,13 @@
 //! rather than keeping a second copy of it.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_lambdacore_lambdacoreapiservice::state::{
-    ComAmazonawsLambdacoreLambdacoreapiserviceState, LIFECYCLE_TRANSITION, MAX_IDEMPOTENCY_TOKENS,
+    ComAmazonawsLambdacoreLambdacoreapiserviceState, DELETION_COMPLETES_AFTER,
+    MAX_IDEMPOTENCY_TOKENS,
 };
 use service_com_amazonaws_lambdacore_lambdacoreapiservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -238,10 +239,14 @@ fn listed_versions(answer: &Answer) -> Vec<i64> {
         .collect()
 }
 
-/// Wait out the span the clock owes an asynchronous transition, then a margin. Nothing is
+/// Wait out the one span this control plane still owes to the clock — the window a deleted
+/// connector stays in the store ([`DELETION_COMPLETES_AFTER`]) — then a margin. Nothing is
 /// called here: the transition is owed by the clock, not by a request.
+///
+/// Provisioning and an update settle from the instant the call that starts them answered,
+/// so a case that only needs an `ACTIVE` connector needs no wait at all.
 pub(crate) fn wait_for_the_clock() {
-    std::thread::sleep(LIFECYCLE_TRANSITION + Duration::from_millis(250));
+    std::thread::sleep(DELETION_COMPLETES_AFTER + Duration::from_millis(250));
 }
 
 /// A `VpcEgressConfiguration` built from its four modelled members, so a case can vary one
@@ -496,12 +501,12 @@ async fn a_created_connector_is_reported_from_what_was_stored() {
     }
 }
 
-/// A connector is not usable the instant the create returns: it reports `PENDING` to a
-/// caller acting straight away, and the clock owes it `ACTIVE` without any further call.
+/// The create's own answer carries the transient `PENDING` the model documents for it, and
+/// the connector the clock owes `ACTIVE` is reported `ACTIVE` by the FIRST call after that
+/// create — through the read, the listing and the version listing alike.
 #[tokio::test]
-async fn a_new_connector_is_pending_until_the_clock_owes_it_active() {
+async fn a_new_connector_reports_pending_on_the_create_and_active_on_the_first_read() {
     let router = emulator();
-    let started = Instant::now();
     let created = create(&router, minimal_create("provisioning")).await;
     assert_eq!(
         at(&created.body, "/State"),
@@ -511,36 +516,18 @@ async fn a_new_connector_is_pending_until_the_clock_owes_it_active() {
     );
 
     let immediately = get(&router, "provisioning").await;
-    if started.elapsed() < LIFECYCLE_TRANSITION {
-        assert_eq!(
-            at(&immediately.body, "/State"),
-            json!("PENDING"),
-            "a caller acting inside the transition span still sees PENDING, got {:?}",
-            at(&immediately.body, "/State")
-        );
-        // An update needs an ACTIVE connector, and a delete one that is ACTIVE or FAILED.
-        let refused = update(
-            &router,
-            "provisioning",
-            json!({ "Configuration": vpc_egress(&["subnet-0fedcba9876543210"], &[], None, None) }),
-        )
-        .await;
-        assert!(
-            refused.is_error(409, "ResourceConflictException"),
-            "updating a connector that is not ACTIVE is refused with 409 \
-             ResourceConflictException, got {} {:?}",
-            refused.status,
-            refused.body
-        );
-    }
-
-    wait_for_the_clock();
+    assert_eq!(
+        at(&immediately.body, "/State"),
+        json!("ACTIVE"),
+        "the first read after the create reports the state provisioning reached, got {:?}",
+        at(&immediately.body, "/State")
+    );
 
     let settled = get(&router, "provisioning").await;
     assert_eq!(
         at(&settled.body, "/State"),
         json!("ACTIVE"),
-        "once the transition span has passed the connector is ACTIVE, got {:?}",
+        "a connector that reached ACTIVE stays ACTIVE, got {:?}",
         at(&settled.body, "/State")
     );
     let listed = list(&router, "").await;
