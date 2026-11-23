@@ -133,12 +133,16 @@ pub(crate) fn logs_policy() -> Value {
     })
 }
 
-/// One answered request: its status, the one response header a caller asserts on, and its
+/// One answered request: its status, every response header a caller may assert on, and its
 /// body verbatim.
 pub(crate) struct Answered {
     pub(crate) status: u16,
     /// What AWS Lambda reported in `X-Amz-Function-Error`, where it reported one at all.
     pub(crate) function_error: Option<String>,
+    /// The headers the answer carried, for a caller reading one this struct does not name:
+    /// an invocation's own id, or the log tail a `LogType=Tail` call asked for, each of which
+    /// AWS Lambda binds to a header rather than to the body.
+    pub(crate) headers: ::http::HeaderMap,
     pub(crate) body: Bytes,
 }
 
@@ -149,6 +153,15 @@ impl Answered {
 
     pub(crate) fn json(&self) -> Value {
         serde_json::from_slice(&self.body).unwrap_or(Value::Null)
+    }
+
+    /// The value of the response header `name`, where the answer carried one. Header names are
+    /// case-insensitive, which is how an SDK reads one back.
+    pub(crate) fn header(&self, name: &str) -> Option<String> {
+        self.headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
     }
 }
 
@@ -172,8 +185,12 @@ fn authorization(signing_name: &str) -> String {
     )
 }
 
-/// Dispatch one request as it arrives on the wire.
-async fn dispatch(
+/// Dispatch one request as it arrives on the wire, with the headers `headers` names.
+///
+/// `pub(crate)` so a suite needing a header this harness's own callers do not send — an
+/// invocation's `X-Amz-Log-Type`, say — sends it through this one request builder rather than
+/// re-deriving the builder and the credential scope.
+pub(crate) async fn dispatch(
     router: &MultiServiceRouter,
     signing_name: &str,
     method: &str,
@@ -202,6 +219,7 @@ async fn dispatch(
     Answered {
         status: parts.status.as_u16(),
         function_error,
+        headers: parts.headers,
         body,
     }
 }
@@ -538,6 +556,54 @@ pub(crate) async fn invoke(router: &MultiServiceRouter, case: &str, name: &str, 
         "case {case:?}: expected the handler's own result for {marker:?}, got {:?}",
         invoked.text()
     );
+}
+
+/// Deploy `template` as the stack `stack`, and answer the function name its `FunctionName`
+/// output publishes once the stack reports complete and AWS Lambda reports that function
+/// active.
+///
+/// `pub(crate)` because every suite driving a DEPLOYED function's own log needs exactly this
+/// deploy-and-wait, so the crate states it once rather than in a copy per suite. Both waits are
+/// on CONDITIONS another service owes — the stack's status, and then the function's `State`,
+/// since "during this time, you can't invoke or modify the function" (`CreateFunction`) — so
+/// nothing here sleeps a fixed span on their behalf.
+pub(crate) async fn given_stack_function(
+    router: &MultiServiceRouter,
+    case: &str,
+    stack: &str,
+    template: &str,
+) -> String {
+    let created = cloudformation(
+        router,
+        "CreateStack",
+        &[
+            ("StackName", stack),
+            ("TemplateBody", template),
+            // The templates these suites deploy declare an IAM role, which is acknowledged with
+            // CAPABILITY_IAM.
+            ("Capabilities.member.1", "CAPABILITY_IAM"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        created.status, 200,
+        "case {case:?}: expected HTTP 200 from CreateStack, got {} with {:?}",
+        created.status,
+        created.text()
+    );
+    let (reached, described) = wait_for_stack_status(router, stack, CREATE_COMPLETE).await;
+    assert_eq!(
+        reached, CREATE_COMPLETE,
+        "case {case:?}: expected the stack to reach {CREATE_COMPLETE}, got {described}"
+    );
+    let function = outputs_of(&described)
+        .get("FunctionName")
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: the stack published no function name in {described}")
+        });
+    wait_until_active(router, case, &function).await;
+    function
 }
 
 #[tokio::test]

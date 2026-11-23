@@ -40,16 +40,13 @@
 //! own, and every asserted record is built from them.
 
 use serde_json::{json, Map, Value};
-use smithy_server_runtime::MultiServiceRouter;
 
-use crate::cloudformation_firehose_stream_stabilisation::wait_for_stack_status;
-// The ONE assembled emulator, wire harness and group readers this test crate owns for a
-// deployed function's log, rather than second copies of them.
+// The ONE assembled emulator, wire harness, deploy-and-wait and group readers this test crate
+// owns for a deployed function's log, rather than second copies of them.
 use crate::cloudformation_lambda_function_log_destination::{
-    cloudformation, emulator, filtered, groups_named, invoke, messages_at_least, messages_in,
-    trust_policy, wait_until_active, CREATE_COMPLETE, DEFAULT_GROUP_PREFIX, FUNCTION_TIMEOUT,
+    emulator, filtered, given_stack_function, groups_named, invoke, messages_at_least, messages_in,
+    trust_policy, DEFAULT_GROUP_PREFIX, FUNCTION_TIMEOUT,
 };
-use crate::query_wire::outputs_of;
 
 /// The logical ids each row's template declares.
 const ROLE_ID: &str = "ExecutionRole";
@@ -57,7 +54,10 @@ const FUNCTION_ID: &str = "Logger";
 
 /// The ARN of the policy AWS publishes for a function that writes its own logs, which is what
 /// a least-privilege execution role carries for the purpose.
-const BASIC_EXECUTION_POLICY: &str =
+///
+/// `pub(crate)` so a suite whose rows differ along the same grant names that policy through one
+/// statement of it (`lambda_invoke_log_tail_is_whole_without_a_logs_grant`).
+pub(crate) const BASIC_EXECUTION_POLICY: &str =
     "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole";
 
 /// The three calls an invocation's log delivery makes, which is what that policy allows and
@@ -69,9 +69,12 @@ const DELIVERY_ACTIONS: [&str; 3] = [
 ];
 
 /// The fixed text of the frames the plain-text format writes around one run.
-const START_PREFIX: &str = "START RequestId: ";
+///
+/// `pub(crate)` for the reason [`TEXT_FRAMES`] is: the suites reading a run's own framing share
+/// one statement of its fixed text.
+pub(crate) const START_PREFIX: &str = "START RequestId: ";
 /// See [`START_PREFIX`].
-const END_PREFIX: &str = "END RequestId: ";
+pub(crate) const END_PREFIX: &str = "END RequestId: ";
 /// See [`START_PREFIX`].
 const REPORT_PREFIX: &str = "REPORT RequestId: ";
 /// See [`START_PREFIX`]: the frames of one run, which is the least the platform itself writes.
@@ -268,47 +271,6 @@ pub(crate) fn default_group(function: &str) -> String {
     format!("{DEFAULT_GROUP_PREFIX}{function}")
 }
 
-/// Deploy `row`'s stack and answer the function name it published, once the stack is complete
-/// and AWS Lambda reports that function active.
-async fn given_deployed(router: &MultiServiceRouter, row: &Row, stack: &str) -> String {
-    let case = row.case;
-    let template = row.template();
-    let created = cloudformation(
-        router,
-        "CreateStack",
-        &[
-            ("StackName", stack),
-            ("TemplateBody", &template),
-            // The template declares an IAM role, which is acknowledged with CAPABILITY_IAM.
-            ("Capabilities.member.1", "CAPABILITY_IAM"),
-        ],
-    )
-    .await;
-    assert_eq!(
-        created.status,
-        200,
-        "case {case:?}: expected HTTP 200 from CreateStack, got {} with {}",
-        created.status,
-        created.text()
-    );
-    let (reached, described) = wait_for_stack_status(router, stack, CREATE_COMPLETE).await;
-    assert_eq!(
-        reached, CREATE_COMPLETE,
-        "case {case:?}: expected the stack to reach {CREATE_COMPLETE}, got {described}"
-    );
-    let function = outputs_of(&described)
-        .get("FunctionName")
-        .cloned()
-        .unwrap_or_else(|| {
-            panic!("case {case:?}: the stack published no function name in {described}")
-        });
-    // The function has to be invocable before any of this can be read: "During this time, you
-    // can't invoke or modify the function" (`CreateFunction`). The span is that service's own,
-    // so the wait is on that CONDITION.
-    wait_until_active(router, case, &function).await;
-    function
-}
-
 /// The text of ONE delivered record: the message the group holds with the single line break
 /// that closed it taken off, asserting it was there and was the only one.
 ///
@@ -350,7 +312,7 @@ async fn every_delivered_log_record_carries_the_line_break_that_closed_its_write
     for (index, row) in ROWS.iter().enumerate() {
         let case = row.case;
         let stack = format!("xsvc-log-record-{index}");
-        let function = given_deployed(&router, row, &stack).await;
+        let function = given_stack_function(&router, case, &stack, &row.template()).await;
         let group = default_group(&function);
         let marker = format!("{function}-{index}");
         let printed = format!("out-{marker}");
