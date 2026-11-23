@@ -596,6 +596,12 @@ impl StoredStack {
         // deployment adopts and the ones an earlier one did ([`Self::adopted`]). Read out
         // here so the walk below only reads it.
         let adopted_in_force = self.adopted.clone();
+        // What each declared resource DEPENDS ON: read here, before the passes below, because
+        // a declaration that references another resource is the only one whose identity those
+        // passes can change ([`template::renamed_against_identities_in_force`]). The
+        // deployment's own walk is ordered by the same relation ([`timeline`]), so it is built
+        // once.
+        let dependencies = template::direct_dependencies(&declared);
         // The identities in force are taken over, and the declarations resolved against them
         // again, until a pass takes over nothing new.
         //
@@ -612,6 +618,40 @@ impl StoredStack {
         for _ in 0..MAX_IDENTITY_PASSES {
             if !adopt_identities_in_force(&mut resources, &already_created, &adopted_in_force) {
                 break;
+            }
+            // A resource whose own NAME is composed out of a value another resource of this
+            // stack carries was named around the stand-in the naming rules computed for that
+            // value, because `provision` runs before any identity is in force. Its identity is
+            // re-evaluated against the records the pass above has just settled, so a redeploy
+            // addresses the resource under the name its declaration really resolves to rather
+            // than reading as a rename of it — which would create it again under a name no
+            // reader of that identifier can build and take the real one down with it.
+            //
+            // The records whose identity is not this deployment's to compute are left alone:
+            // the ones an owning service, a provider or CloudFormation itself assigned, and a
+            // resource the stack ADOPTED whose declaration names it nowhere — the very records
+            // the pass above has just carried forward.
+            {
+                let keeps_its_identity = |resource: &StoredResource| {
+                    identity_is_assigned_elsewhere(&resource.resource_type)
+                        || (adopted_in_force.contains_key(&resource.logical_id)
+                            && declared_name(resource).is_none())
+                };
+                let in_force: BTreeMap<String, StoredResource> = resources
+                    .iter()
+                    .map(|resource| (resource.logical_id.clone(), resource.clone()))
+                    .collect();
+                template::renamed_against_identities_in_force(
+                    &declared,
+                    &mut resources,
+                    &dependencies,
+                    &template::Scope {
+                        resources: &in_force,
+                        ..scope
+                    },
+                    &keeps_its_identity,
+                    &mut budget,
+                );
             }
             // A property naming a resource whose identity its owning service MINTED was
             // resolved against the stand-in the naming rules recomputed above, not against the
@@ -648,10 +688,6 @@ impl StoredStack {
         // is not locked, and charged to the SAME budget as every other evaluation of this
         // deployment, so what one request can ask for stays bounded in total.
         let wait_conditions = wait_conditions::declared(&declared, &resources, &mut budget);
-        // What each declared resource WAITS FOR, read here for the same reason: the
-        // deployment's walk over these resources is ordered by it ([`timeline`]), and a
-        // read must not re-parse a caller-sized body under the store lock.
-        let dependencies = template::direct_dependencies(&declared);
         // Which exports this template really IMPORTS, resolved against the same scope its
         // resources and outputs were: only those names belong on the stack, and they are
         // what makes each exporting stack's export in use.

@@ -4826,6 +4826,8 @@ mod naming_rules;
 mod resource_attributes;
 mod replacement_properties;
 mod read_only_properties;
+mod identities_in_force;
+pub(crate) use identities_in_force::*;
 pub use read_only_properties::*;
 pub use replacement_properties::*;
 pub(crate) use naming_rules::*;
