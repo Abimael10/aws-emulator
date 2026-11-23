@@ -409,6 +409,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // Where every object of this export is written, which the calls below are authorized
+        // on: "the Amazon S3 bucket prefix to use as the file name and path of the exported
+        // data" (`S3Prefix`) with the export task's own folder below it. Resolved here
+        // because the authorization probe needs it — a destination policy is written about
+        // the KEYS a call writes — and used again by the export itself further down.
+        let prefix =
+            crate::state::export_prefix(input.s3_prefix.as_deref(), &input.export_task_identifier);
+
         // "The provided IAM role must have access to the S3 bucket". The role IAM holds is
         // judged call by call, and each answer is reported as the fault that answer carries:
         // a role IAM HOLDS that the
@@ -418,12 +426,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it — is the modelled `IamRoleMissingPermissionsFault`, naming the first such call.
         // Whether the value resolves to a role of this account AT ALL was decided above, with
         // the grant that is created for it.
+        //
+        // The object write is judged on an object this export really writes — its own summary
+        // file, which every export leaves behind — because that is the resource of the call:
+        // a policy written about the keys under the export's prefix decides it as IAM does.
         match crate::state::export_role_defect(
             ctx,
             &*self.engine,
             &region,
             &input.iam_role_arn,
             &input.s3_bucket_name,
+            &crate::state::export_info_key(&prefix, &input.export_task_identifier),
         )
         .await
         {
@@ -501,8 +514,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .await
             .unwrap_or_else(|| input.kms_key_id.clone());
         let started = ::std::time::SystemTime::now();
-        let prefix =
-            crate::state::export_prefix(input.s3_prefix.as_deref(), &input.export_task_identifier);
         let part_file = crate::state::part_file_name(&crate::state::export_part_id(
             &input.export_task_identifier,
         ));

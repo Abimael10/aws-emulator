@@ -79,8 +79,11 @@ pub async fn export_grant_is_not_creatable(
 /// Judge the export role the way Amazon RDS does before it accepts an export: `None` for a
 /// role the export can run under, and the defect that stops it otherwise.
 ///
-/// `bucket` is the destination, whose own policy is the other half of every call's decision
-/// and whose objects are the resource the object write is authorized on.
+/// `bucket` is the destination, whose own policy is the other half of every call's decision,
+/// and `object_key` one of the objects the export would write into it — the resource the
+/// object write is really authorized on, so a policy written about the keys under the
+/// export's own prefix decides that call as IAM decides it (a statement's resource element is
+/// matched against the resource of the CALL).
 ///
 /// Nothing is refused on an answer this emulator could not get: an IAM that is not mounted
 /// beside this service leaves a role it holds unjudged. Policies that could not be
@@ -94,6 +97,7 @@ pub async fn export_role_defect<Eng: Send + Sync + 'static>(
     region: &str,
     role_arn: &str,
     bucket: &str,
+    object_key: &str,
 ) -> Option<ExportRoleDefect> {
     // Every question below is a question about a role of THIS account — what its trust
     // document says, and what its policies let it do — so a value that names none is judged
@@ -111,11 +115,13 @@ pub async fn export_role_defect<Eng: Send + Sync + 'static>(
         return Some(ExportRoleDefect::NotAssumable);
     }
     // The destination itself, which the bucket-level call is authorized on
-    // ("arn:aws:s3:::your-s3-bucket", `IamRoleArn`), and the objects the export writes,
-    // which the object write is ("arn:aws:s3:::your-s3-bucket/*").
+    // ("arn:aws:s3:::your-s3-bucket", `IamRoleArn`), and ONE of the objects the export
+    // writes, which the object write is ("arn:aws:s3:::your-s3-bucket/*"): the key of a call
+    // rather than the wildcard, because a policy element states a rule that IAM matches
+    // against the resource the CALL names.
     let destination = ::service_com_amazonaws_s3_amazons3::state::bucket_arn(bucket);
-    let objects = ::service_com_amazonaws_s3_amazons3::state::object_arn(bucket, "*");
-    let principals = export_principals(role_arn);
+    let objects = ::service_com_amazonaws_s3_amazons3::state::object_arn(bucket, object_key);
+    let principals = destination_principals(role_arn);
     let context = export_context(role_arn);
     let policy = bucket_policy(engine, bucket);
     // The role's own identity policies: a role carrying none of them can make none of the
@@ -164,6 +170,22 @@ fn export_principals(role_arn: &str) -> Vec<String> {
     principals.extend(::service_common::iam_authorization::account_principals(
         role_arn,
     ));
+    principals
+}
+
+/// Every spelling of the identity the calls an export makes on its DESTINATION carry, for a
+/// bucket policy that states a rule about one of them.
+///
+/// The export is performed by Amazon RDS under the role the request named, so a destination
+/// policy may name the role itself, the ACCOUNT the role belongs to
+/// ([`export_principals`]), or the Amazon RDS service principal the export runs as — the
+/// export principal `export.rds.amazonaws.com` the role is assumed by, and the service's own
+/// `rds.amazonaws.com`. Each of them names the one identity this call is made under, so a
+/// statement about any of them is a statement about this export.
+fn destination_principals(role_arn: &str) -> Vec<String> {
+    let mut principals = export_principals(role_arn);
+    principals.push(super::EXPORT_SERVICE_PRINCIPAL.to_string());
+    principals.push(super::RDS_SERVICE_PRINCIPAL.to_string());
     principals
 }
 
@@ -272,7 +294,7 @@ async fn resolved_key_arn(kms: &::aws_sdk_kms::Client, key_id: &str) -> Option<S
 
 /// The KMS operations an export has to be authorized to run on the key its data is
 /// encrypted under, as `KmsKeyId` lists them.
-const EXPORT_KEY_ACTIONS: [&str; 2] = ["kms:CreateGrant", "kms:DescribeKey"];
+const EXPORT_KEY_ACTIONS: [&str; 2] = [EXPORT_KEY_GRANT_ACTION, "kms:DescribeKey"];
 
 /// The condition keys the KMS call `action` of an export really carries, so a key policy
 /// statement scoped by one of them is DECIDED rather than left undecided — which the shared
