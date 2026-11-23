@@ -676,16 +676,18 @@ struct SimulatedCase {
     /// different: a real call carries a value for it, so its clause is decided against
     /// that value.
     real_call_refused: bool,
-    /// The context keys the result must report as missing.
+    /// The context keys the policies in force require that this request supplies no value
+    /// for — what `MissingContextValues` names, whichever clause tests them and however the
+    /// absence settles that clause.
     missing: &'static [&'static str],
 }
 
 /// Rows spanning the readings an absent key gets under a `Deny`'s clause and the two ways
 /// the request can settle it: a negated operator the absence itself satisfies (so the deny
-/// applies and nothing was needed), the same clause with the value supplied, the positive
-/// operator the absence makes false (so the deny does not apply, and the value the policy
-/// needed is reported) — in its text and its ADDRESS spellings — and an operator this
-/// evaluation does not implement, which no value settles, so the deny stands.
+/// applies, and the key the policy tests is still one the request supplied no value for),
+/// the same clause with the value supplied, the positive operator the absence makes false
+/// (so the deny does not apply) — in its text and its ADDRESS spellings — and an operator
+/// this evaluation does not implement, which no value settles, so the deny stands.
 const SIMULATED_CASES: &[SimulatedCase] = &[
     SimulatedCase {
         case: "a negated operator over a key the request leaves out",
@@ -693,7 +695,7 @@ const SIMULATED_CASES: &[SimulatedCase] = &[
         supplied: None,
         decision: EXPLICIT_DENY,
         real_call_refused: true,
-        missing: &[],
+        missing: &["aws:SourceVpce"],
     },
     SimulatedCase {
         case: "the same clause with the matching value supplied",
@@ -742,11 +744,12 @@ const SIMULATED_CASES: &[SimulatedCase] = &[
     },
 ];
 
-/// RULE: `MissingContextValues` reports the keys the simulated DECISION needed a value for
-/// and the request supplied none — so a key whose clause the absence itself decides is not
-/// reported, and the decision is the one that absence gives.
+/// RULE: `MissingContextValues` reports the keys the policies in force REQUIRE — a
+/// statement of a document the simulation includes tests them — and the request supplied no
+/// value for, by each resource's own result, and by the action's own result where the
+/// decision was not an allow; a key the request supplied a value for is named nowhere.
 #[tokio::test]
-async fn the_simulator_reports_only_the_keys_its_decision_needed() {
+async fn the_simulator_reports_the_keys_the_policies_require_and_the_request_left_out() {
     let router = router();
 
     for (row, case) in SIMULATED_CASES.iter().enumerate() {
@@ -822,20 +825,20 @@ async fn the_simulator_reports_only_the_keys_its_decision_needed() {
             .iter()
             .map(|key| (*key).to_string())
             .collect();
-        // Reported per (action, resource) pair: the action the clause is about is the only
-        // one that needed the key, so the other action's result reports none.
+        // In body order: the unconditioned action's own result (its decision is the allow,
+        // which needed no value), then its resource's own result, then the conditioned
+        // action's own result — which carries the keys only where its decision is not the
+        // allow — and then that action's resource result.
+        let mut expected: Vec<String> = missing.clone();
+        if case.decision != ALLOWED {
+            expected.extend(missing.iter().cloned());
+        }
+        expected.extend(missing.iter().cloned());
         let reported_missing = missing_keys(&body);
         assert_eq!(
-            reported_missing,
-            // One entry per result the key is reported on: the action's own result and its
-            // one resource-specific result.
-            missing
-                .iter()
-                .chain(missing.iter())
-                .cloned()
-                .collect::<Vec<String>>(),
-            "case {:?}: expected the keys the decision needed, got {reported_missing:?}: \
-             {body}",
+            reported_missing, expected,
+            "case {:?}: expected the keys the policies require and the request left out, \
+             got {reported_missing:?}: {body}",
             case.case
         );
 
@@ -970,8 +973,10 @@ async fn only_a_name_a_context_key_can_have_is_reported_as_missing() {
             key.len()
         );
         // A positive clause over a key the request supplies no value for is false, so the
-        // deny does not apply and the key is one the decision needed a value for — the
-        // reading `the_simulator_reports_only_the_keys_its_decision_needed` pins.
+        // deny does not apply and the grant stands — while the key is still one the policies
+        // require and the request left out, the reading
+        // `the_simulator_reports_the_keys_the_policies_require_and_the_request_left_out`
+        // pins.
         put_policy(
             &router,
             case,
@@ -1006,9 +1011,9 @@ async fn only_a_name_a_context_key_can_have_is_reported_as_missing() {
         );
         let reported_missing = missing_keys(&body);
         let expected: Vec<String> = if *reportable {
-            // One entry per result the key is reported on: the action's own result and its
-            // one resource-specific result.
-            vec![key.clone(), key.clone()]
+            // One entry per result the key is reported on: the resource's own result, since
+            // the action's own decision is the allow and reports no key as still needed.
+            vec![key.clone()]
         } else {
             Vec::new()
         };

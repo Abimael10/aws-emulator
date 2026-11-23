@@ -558,12 +558,13 @@ struct Decided {
     /// Whether the service control policies in force allowed this pair, when the request
     /// named any level of a hierarchy at all.
     allowed_by_organizations: Option<bool>,
-    /// The keys the pair's decision needed a value for that the documents in force on the
-    /// PRINCIPAL reference — its own result's list less the ones only the resource-based
-    /// policy tests, which is what the ACTION's own result is folded from
+    /// The keys the IDENTITY-based documents deciding this pair require and the request
+    /// left unsupplied, which is what the ACTION's own result is folded from
     /// ([`evaluate_page`]): "each resource in the simulation is treated as if it had this
-    /// policy attached" (`ResourcePolicy`), so a key only that policy tests was needed to
-    /// decide about a RESOURCE and is reported by that resource's own result.
+    /// policy attached" (`ResourcePolicy`), so a key only the resource-based policy requires
+    /// was needed to decide about a RESOURCE and is reported by that resource's own result
+    /// instead. None at all for a pair the documents GRANTED, whose decision needed no value
+    /// the request left out, and none for a pair no document was read for.
     identity_missing_context_keys: Vec<String>,
     /// Whether the action can be performed on this resource AT ALL
     /// ([`super::action_resource_types::applies_to_resource`]): a pair naming a resource the
@@ -612,19 +613,17 @@ pub async fn evaluate_page(
         // the request asked about, the way the permissions boundary's detail beside it is
         // aggregated ([`boundary_detail`]).
         let mut allowed_by_organizations: Option<bool> = None;
-        // "A list of context keys that are required by the included input policies but
-        // that were not provided by one of the input parameters … in the top-level result,
-        // this field contains the deduplicated set of missing context values across all
-        // requested resources": the keys the DECISION needed a value for, folded over the
-        // resources the action was decided about — the ones the documents in force on the
-        // PRINCIPAL needed, since a key only the resource-based policy tests was needed to
-        // decide about a resource and is reported by that resource's own result
-        // ([`Decided::identity_missing_context_keys`]). The per-resource lists are reported
-        // only where the response carries the per-resource results at all.
+        // What the ACTION's own result reports as missing: the keys the identity-based
+        // documents require and the request left unsupplied, folded over the resources whose
+        // decision still wanted them ([`Decided::identity_missing_context_keys`]) — "in the
+        // top-level result, this field contains the deduplicated set of missing context
+        // values across all requested resources". A pair the documents GRANTED contributes
+        // none, and so does one no document was read for at all: the member names what a
+        // caller must supply for a decision that is not settled yet.
         //
         // Folded as each pair is decided rather than over the finished page, so the bound
-        // below is reached — and the request refused — at the pair that reaches it,
-        // before the keys of the pairs after it are retained.
+        // below is reached — and the request refused — at the pair that reaches it, before
+        // the keys of the pairs after it are retained.
         let mut missing: ::std::collections::BTreeMap<String, String> =
             ::std::collections::BTreeMap::new();
         for resource in resources {
@@ -641,9 +640,8 @@ pub async fn evaluate_page(
             fold_keys_into(&mut missing, decided.identity_missing_context_keys);
             // The list is reported on every result the page carries, so its length is a
             // factor of the response's size: past the bound the request is refused rather
-            // than answered with a report nothing bounds. Truncating the list instead
-            // would be worse — a short list would read as "these are the only keys
-            // missing".
+            // than answered with a report nothing bounds. Truncating the list instead would
+            // be worse — a short list would read as "these are the only keys missing".
             let reported_keys = missing.len().max(
                 decided
                     .result
@@ -755,10 +753,11 @@ pub async fn evaluate_page(
             eval_decision: decision,
             // "In the top-level result, this field contains the deduplicated set of
             // missing context values across all requested resources": the member is what
-            // the result reports about the keys the decision needed, so it is REPORTED
-            // whatever that set is — empty when the decision needed a value for none.
-            // Absent would be a third answer the member does not have: a caller could not
-            // tell "no key was missing" from "the keys were not reported".
+            // the result reports about the keys the documents in force on the principal
+            // left unsupplied, so it is REPORTED whatever that set is — empty when they
+            // test none the request left out. Absent would be a third answer the member
+            // does not have: a caller could not tell "no key was missing" from "the keys
+            // were not reported".
             missing_context_values: Some(missing),
             permissions_boundary_decision_detail: boundary_detail(&per_resource),
             resource_specific_results: reports_each_resource.then_some(per_resource),
@@ -825,13 +824,14 @@ fn most_restrictive_per_policy_type(
 /// context is exactly the entries its caller supplied: nothing else can put a value in it.
 /// So IAM's absent-key rule decides a clause over a key the request left out — a positive
 /// comparison does not hold, while a negated one, an `IfExists` spelling and
-/// `Null: {key: true}` do — rather than leaving the statement undecided, and
-/// `MissingContextValues` is what the evaluation says it needed a value for and did not
-/// get.
+/// `Null: {key: true}` do — rather than leaving the statement undecided.
 ///
 /// `may_report` is how many statements are left of what the whole page may report
 /// ([`MAX_REPORTED_STATEMENTS_PER_PAGE`]): this pair's own report stops one entry past it,
 /// which is the length [`evaluate_page`] refuses on.
+///
+/// What the pair reports as missing is read off the documents the simulation INCLUDES
+/// ([`iam::required_context_keys`]) rather than off the decision; see below.
 ///
 /// A pair the action cannot be performed as at all — an action published with no resource
 /// type, asked about one concrete resource — is decided before any document is read: see
@@ -866,8 +866,8 @@ fn decide(
                 ),
             },
             allowed_by_organizations: (!simulated.organization_levels.is_empty()).then_some(false),
-            // No document was read for this pair, so no condition in one was reached for a
-            // value to have been missing.
+            // No document was read for this pair, so none of them was asked for a value
+            // this request left out.
             identity_missing_context_keys: Vec::new(),
             applies: false,
         };
@@ -976,33 +976,44 @@ fn decide(
         }
     }
 
-    // The keys THIS pair's decision needed a value for and the request supplied none: every
-    // document that took part in it is asked, since a condition in any of them is one the
-    // simulation needed the value for. Each answer is already bounded by the evaluation
-    // (`service_common::iam_authorization::MAX_REQUIRED_CONTEXT_KEYS`), and the list kept
-    // per pair stops one key past the bound this report is answered under and holds no name
-    // longer than one ([`MAX_CONTEXT_KEY_NAME_CHARACTERS`]) — so the page's retention is its
-    // pairs times two constants of this module rather than times what the documents carry;
-    // [`evaluate_page`] refuses past the first of them.
+    // What this pair reports as missing: "a list of context keys that are required by the
+    // included input policies but that were not provided by one of the input parameters … to
+    // discover the context keys used by a set of policies, you can call
+    // GetContextKeysForCustomPolicy or GetContextKeysForPrincipalPolicy"
+    // (`EvaluationResult$MissingContextValues`) — so the keys are read off the documents the
+    // simulation INCLUDES ([`iam::required_context_keys`]) rather than off what the decision
+    // reached: a clause the absent value itself settles, one in a statement scoped to another
+    // resource and one in a statement about another action all still name a key those
+    // policies require and the request did not supply.
     //
-    // The keys the PRINCIPAL's own documents needed are kept apart from the ones only the
-    // resource-based policy did, because the two are reported in different places
-    // ([`Decided::identity_missing_context_keys`]).
+    // The keys the PRINCIPAL's own documents require are kept apart from the ones only the
+    // resource-based policy does, because the two are reported in different places
+    // ([`Decided::identity_missing_context_keys`]). The SCPs of a named hierarchy require
+    // none that are reported at all: "this field doesn't include context keys referenced by
+    // service control policies (SCPs)". Each list stops one key past the bound this report
+    // is answered under and holds no name longer than one
+    // ([`MAX_CONTEXT_KEY_NAME_CHARACTERS`]), so the page's retention is its pairs times two
+    // constants of this module rather than times what the documents carry; [`evaluate_page`]
+    // refuses past the first of them.
     let identity_missing_context_keys = folded_keys(
-        identity
-            .required_context_keys
-            .iter()
-            .chain(&from_boundary.required_context_keys)
-            .chain(&from_organizations.required_context_keys)
-            .take(MAX_SIMULATED_CONTEXT_KEYS + 1)
-            .cloned(),
+        iam::required_context_keys(simulated.documents, &granting)
+            .into_iter()
+            .chain(iam::required_context_keys(simulated.boundary, &granting))
+            .take(MAX_SIMULATED_CONTEXT_KEYS + 1),
     );
     let missing_context_values = folded_keys(
         identity_missing_context_keys
             .iter()
-            .chain(&from_resource.required_context_keys)
-            .take(MAX_SIMULATED_CONTEXT_KEYS + 1)
-            .cloned(),
+            .cloned()
+            .chain(
+                simulated
+                    .resource_policy
+                    .map(|document| {
+                        iam::required_context_keys(::std::slice::from_ref(document), &granting)
+                    })
+                    .unwrap_or_default(),
+            )
+            .take(MAX_SIMULATED_CONTEXT_KEYS + 1),
     );
 
     Decided {
@@ -1012,8 +1023,8 @@ fn decide(
             // "A list of context keys that are required by the included input policies but
             // that were not provided by one of the input parameters … this list is used when
             // a list of ARNs is included in the ResourceArns parameter instead of '*'"
-            // (`ResourceSpecificResult$MissingContextValues`): what the decision about THIS
-            // resource needed, which includes the keys the resource-based policy tests —
+            // (`ResourceSpecificResult$MissingContextValues`): the keys required to decide
+            // about THIS resource, which includes the ones the resource-based policy tests —
             // "each resource in the simulation is treated as if it had this policy attached"
             // (`ResourcePolicy`), so those keys were needed to decide about a resource and
             // are reported by the resource's own result.
@@ -1039,7 +1050,16 @@ fn decide(
             ),
         },
         allowed_by_organizations: (!no_organization).then_some(allowed_by_organizations),
-        identity_missing_context_keys,
+        // A pair the documents in force GRANTED needed no value the request left out: its
+        // decision is settled, and the keys the caller would supply to settle one are what
+        // the ACTION's own result reports ([`Decided::identity_missing_context_keys`]). The
+        // pair's OWN result still reports them, since they are the keys deciding about that
+        // resource required.
+        identity_missing_context_keys: if decision == DECISION_ALLOWED {
+            Vec::new()
+        } else {
+            identity_missing_context_keys
+        },
         applies: true,
     }
 }

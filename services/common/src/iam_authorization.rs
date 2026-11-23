@@ -95,11 +95,14 @@
 //! ## The keys a decision needed a value for
 //!
 //! A caller that must report which keys the request should have carried — the IAM policy
-//! simulator's `MissingContextValues` — reads them off the decision
-//! ([`Outcome::required_context_keys`]) rather than off the documents: a key is reported
-//! when a clause reached by the request needed a value for it and the request carried
-//! none, so a clause the ABSENCE itself satisfies (a negated operator, an `IfExists`
-//! spelling, `Null` asking for absence) needs nothing and names no key.
+//! simulator's `MissingContextValues` — reads them off the documents
+//! ([`required_context_keys`]): a key is reported when a statement of a document included in
+//! the simulation TESTS it and the request carried no value for it, whether or not the
+//! decision reached that statement. A caller that needs only the keys ONE DECISION was left
+//! unable to settle reads those off the decision instead
+//! ([`Outcome::required_context_keys`]), where a clause the ABSENCE itself satisfies (a
+//! negated operator, an `IfExists` spelling, `Null` asking for absence) needs nothing and
+//! names no key.
 //!
 //! ## Policy variables
 //!
@@ -545,6 +548,47 @@ pub fn resource_outcome_prepared(document: &PreparedDocument, request: &Request<
         Flavor::Resource,
         RequiredKeys::reported(),
     )
+}
+
+/// The condition keys the policy `documents` TEST and `request` carries no value for, over
+/// every statement of theirs — identity-based or resource-based alike.
+///
+/// What the IAM policy simulator reports as missing context values: "a list of context keys
+/// that are required by the included input policies but that were not provided by one of
+/// the input parameters … to discover the context keys used by a set of policies, you can
+/// call GetContextKeysForCustomPolicy or GetContextKeysForPrincipalPolicy"
+/// (`EvaluationResult$MissingContextValues`). A key is REQUIRED because a statement of an
+/// included document tests it — the set those operations answer for the same documents —
+/// and PROVIDED because the request carries a value for it. So the answer is a fact about
+/// those documents and that request, and not about what the DECISION reached: a clause the
+/// absent value itself settles, one in a statement scoped to another resource and one in a
+/// statement about another action all still name a key the included policies require and
+/// the caller did not supply.
+///
+/// The list is bounded exactly as a decision's own is ([`MAX_REQUIRED_CONTEXT_KEYS`]), and
+/// its names are folded by case the same way.
+#[must_use]
+pub fn required_context_keys(documents: &[PreparedDocument], request: &Request<'_>) -> Vec<String> {
+    let mut required = RequiredKeys::reported();
+    for document in documents {
+        for statement in statements(document) {
+            let Some(clauses) = statement["Condition"].as_object() else {
+                continue;
+            };
+            for keys in clauses.values().filter_map(|keys| keys.as_object()) {
+                for key in keys.keys() {
+                    let actual: Vec<&str> = request
+                        .context
+                        .iter()
+                        .filter(|(known, _)| known.eq_ignore_ascii_case(key))
+                        .map(|(_, value)| value.as_str())
+                        .collect();
+                    required.note(key, &actual);
+                }
+            }
+        }
+    }
+    required.into_reported()
 }
 
 /// Whether the request is allowed, given the two decisions.
