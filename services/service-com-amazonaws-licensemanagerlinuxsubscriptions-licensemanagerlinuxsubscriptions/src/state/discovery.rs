@@ -189,6 +189,10 @@ fn ec2(ctx: &smithy_server_runtime::OperationContext<'_>, region: &str) -> ::aws
 /// ([`crate::state::DiscoveryResume`]) and the next pass's plan begins there
 /// ([`crate::state::ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscriptionsState::discovery_plan`]),
 /// so every Region the settings name is asked about rather than only the first few of them.
+/// The point recorded is the EARLIEST one of the walk at which inventory was left unread:
+/// one pass can stop inside one Region's inventory and still read Regions further along its
+/// plan, and only resuming at the first remainder it left behind reads that remainder
+/// instead of walking the same prefix of that Region again.
 ///
 /// The settings are therefore re-read from the store at every point the pass needs them —
 /// before each Region's hop and under the lock each write takes — rather than snapshotted
@@ -212,14 +216,23 @@ pub async fn materialize_for_report<Eng: Send + Sync + 'static>(
         pages: MAX_INVENTORY_PAGES,
         records: MAX_DISCOVERED_INSTANCES,
     };
-    // Where this pass got to, recorded at the end so the NEXT one resumes there.
-    let mut stopped: Option<crate::state::DiscoveryResume> = None;
+    // The FIRST point of this walk at which the pass left inventory of a Region unread,
+    // which is where the next pass has to pick the plan up: a pass can leave a remainder
+    // behind in one Region and go on to read later ones, and only resuming at the earliest
+    // of those remainders reads it — the next pass's plan begins there and goes on through
+    // every other Region of the rotation, so nothing a later Region leaves behind is lost
+    // by starting here either.
+    let mut unread_from: Option<crate::state::DiscoveryResume> = None;
+    // Where the WALK itself got to, which is where the next pass continues the plan when
+    // this one left no Region's inventory half-read but did not get through its plan
+    // either.
+    let mut walked_to: Option<crate::state::DiscoveryResume> = None;
     // Whether the pass left part of its plan unread: a plan it walked to the end holds
     // nothing for a later pass to pick up, so that pass starts the plan afresh.
-    let mut unread = false;
+    let mut plan_unread = false;
     for (position, region) in plan.regions.iter().enumerate() {
         if budget.spent() {
-            unread = true;
+            plan_unread = true;
             break;
         }
         // Asked again right before the hop: an account does not discover a Region its
@@ -244,7 +257,7 @@ pub async fn materialize_for_report<Eng: Send + Sync + 'static>(
             // on past it instead of stopping on the same unanswerable hop. A read that WAS
             // answered in part does not come here — it is a truncated read below, whose
             // records are merged and whose unread remainder the next pass resumes at.
-            stopped = Some(crate::state::DiscoveryResume::After(region.clone()));
+            walked_to = Some(crate::state::DiscoveryResume::After(region.clone()));
             continue;
         };
         let now = SystemTime::now();
@@ -263,11 +276,17 @@ pub async fn materialize_for_report<Eng: Send + Sync + 'static>(
                 state.lock().merge_discovery_pass(found, now);
             }
         }
-        stopped = Some(read.resume);
+        // A Region whose inventory this read stopped INSIDE holds unread work, whether the
+        // walk went on past it or ended here: the earliest such Region of the walk is the
+        // one the next pass resumes, so the remainder is read rather than overwritten by
+        // what a Region further along the plan left behind.
+        if unread_from.is_none()
+            && matches!(read.resume, crate::state::DiscoveryResume::Inside(_, _))
+        {
+            unread_from = Some(read.resume.clone());
+        }
+        walked_to = Some(read.resume);
     }
-    // A Region whose inventory this pass stopped INSIDE is unread work too, even when it
-    // was the last Region of the plan and the loop above ended on its own.
-    let unread = unread || matches!(stopped, Some(crate::state::DiscoveryResume::Inside(_, _)));
     // Discovery holds data for the Regions it discovers and no others, so a Region the
     // settings no longer name is dropped — including one dropped while this pass was
     // reading another, and every Region at once for an account that discovers none. The
@@ -275,8 +294,15 @@ pub async fn materialize_for_report<Eng: Send + Sync + 'static>(
     // which is what lets it drop a Region this pass itself still had in its plan.
     let mut store = state.lock();
     store.retain_discovered_regions();
-    // What is left for the next pass to read, which is what decides where its plan begins.
-    store.record_discovery_resume(if unread { stopped } else { None });
+    // What is left for the next pass to read, which is what decides where its plan begins:
+    // the earliest Region this pass left a remainder inside, else — for a pass that left
+    // Regions of its plan unreached — the point its walk stopped at, and nothing at all for
+    // one that got through its whole plan.
+    store.record_discovery_resume(match (unread_from, plan_unread) {
+        (Some(inside), _) => Some(inside),
+        (None, true) => walked_to,
+        (None, false) => None,
+    });
 }
 
 /// What ONE refresh may still spend: pages of the owner's inventory, and records it may

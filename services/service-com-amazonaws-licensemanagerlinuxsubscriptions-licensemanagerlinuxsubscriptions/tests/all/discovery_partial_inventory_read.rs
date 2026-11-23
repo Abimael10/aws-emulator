@@ -26,9 +26,14 @@
 //! token for the rest, is an answer `DescribeInstances` documents ("the token to include in
 //! another request to get the next page of items") — and refuses ONE named hop with EC2's
 //! own throttle, which is the hop that cannot be arranged from the client side of a read.
+//!
+//! That paging EC2 is `pub` here, because the suite whose rule is about a MULTI-REGION pass
+//! (`tests/all/discovery_keeps_the_earliest_unread_cursor.rs`) cuts a Region's walk short
+//! through the same seam rather than assembling a second copy of it.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_types::body::SdkBody;
@@ -69,32 +74,39 @@ const FLEET: usize = 12;
 /// Which hops of the inventory walk are answered, shared between the test and the service
 /// in front of EC2 so a row can state the hop that is not.
 #[derive(Debug)]
-struct InventoryHops {
+pub struct InventoryHops {
     /// The items each answered page carries.
     page_size: usize,
-    /// The hop that is refused, counted from one; `None` refuses none of them.
-    refused: Option<usize>,
+    /// The hop that is refused: the source Region whose inventory walk it belongs to and
+    /// its position in that Region's walk, counted from one. `None` refuses none of them.
+    refused: Option<(String, usize)>,
     /// Whether the inventory reads arriving now are the PASS's hops. A row's setup reads
     /// the inventory itself — it waits for the state EC2's clock owes its launches — and
     /// those reads are neither counted nor answered differently: until a row arms this, EC2
     /// answers its own `DescribeInstances` whole.
     armed: AtomicBool,
-    /// How many hops have arrived so far.
+    /// How many hops have arrived so far, over every Region.
     seen: AtomicUsize,
+    /// How many hops have arrived for each Region, so the refused hop is a position in ONE
+    /// Region's walk — which is what makes it nameable when a pass walks several Regions.
+    seen_per_region: Mutex<BTreeMap<String, usize>>,
 }
 
 impl InventoryHops {
-    fn new(page_size: usize, refused: Option<usize>) -> Self {
+    /// Answer every hop with a page of `page_size` items, refusing the hop `refused` names
+    /// (its Region and its position in that Region's walk, counted from one).
+    pub fn new(page_size: usize, refused: Option<(&str, usize)>) -> Self {
         Self {
             page_size,
-            refused,
+            refused: refused.map(|(region, hop)| (region.to_string(), hop)),
             armed: AtomicBool::new(false),
             seen: AtomicUsize::new(0),
+            seen_per_region: Mutex::new(BTreeMap::new()),
         }
     }
 
     /// Count the inventory reads from here on as the pass's hops.
-    fn arm(&self) {
+    pub fn arm(&self) {
         self.armed.store(true, Ordering::SeqCst);
     }
 
@@ -103,14 +115,25 @@ impl InventoryHops {
         self.armed.load(Ordering::SeqCst)
     }
 
-    /// Count one arriving hop and answer whether it is the refused one.
-    fn refuses_this_hop(&self) -> bool {
-        let hop = self.seen.fetch_add(1, Ordering::SeqCst) + 1;
-        self.refused == Some(hop)
+    /// Count one arriving hop of `region`'s walk and answer whether it is the refused one.
+    fn refuses_this_hop(&self, region: &str) -> bool {
+        self.seen.fetch_add(1, Ordering::SeqCst);
+        let hop = {
+            let mut seen = self
+                .seen_per_region
+                .lock()
+                .expect("the hop counter is never held across a panic");
+            let hop = seen.entry(region.to_string()).or_insert(0);
+            *hop += 1;
+            *hop
+        };
+        self.refused
+            .as_ref()
+            .is_some_and(|(refused, at)| refused == region && *at == hop)
     }
 
-    /// How many hops have arrived.
-    fn seen(&self) -> usize {
+    /// How many hops have arrived, over every Region.
+    pub fn seen(&self) -> usize {
         self.seen.load(Ordering::SeqCst)
     }
 }
@@ -120,9 +143,9 @@ impl InventoryHops {
 /// Its identity, protocol and operations are EC2's own — the definition is the real
 /// service's, so every other operation the pass calls (the AMI reads) is served by EC2
 /// itself — and only the inventory read is answered through [`InventoryHop`].
-struct PagedEc2 {
-    inner: ec2::EmulatedService<engine::InMemoryEngine>,
-    hop: InventoryHop,
+pub struct PagedEc2 {
+    pub inner: ec2::EmulatedService<engine::InMemoryEngine>,
+    pub hop: InventoryHop,
 }
 
 impl Service for PagedEc2 {
@@ -142,8 +165,8 @@ impl Service for PagedEc2 {
 
 /// One hop of the inventory walk: refused when it is the hop the row named, and otherwise
 /// answered by EC2's own `DescribeInstances` over a smaller page.
-struct InventoryHop {
-    hops: Arc<InventoryHops>,
+pub struct InventoryHop {
+    pub hops: Arc<InventoryHops>,
 }
 
 impl ErasedOperation for InventoryHop {
@@ -154,7 +177,7 @@ impl ErasedOperation for InventoryHop {
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         let armed = self.hops.armed();
-        let refused = armed && self.hops.refuses_this_hop();
+        let refused = armed && self.hops.refuses_this_hop(&hop_region(req));
         let page_size = self.hops.page_size;
         Box::pin(async move {
             if refused {
@@ -173,6 +196,21 @@ impl ErasedOperation for InventoryHop {
             describe.run(svc, &paged, ctx).await
         })
     }
+}
+
+/// The source Region whose inventory walk `req` is a hop of: the pass asks each Region
+/// through that Region's own endpoint (`ec2.<region>.amazonaws.com`), so the host of the
+/// request names it.
+///
+/// A request addressed any other way is a hop this seam cannot place, which would silently
+/// stop cutting a named Region's walk short — so it fails here instead.
+fn hop_region(req: &RtRequest) -> String {
+    let uri = req.uri();
+    uri.split('/')
+        .find(|part| part.starts_with("ec2."))
+        .and_then(|host| host.split('.').nth(1))
+        .unwrap_or_else(|| panic!("an inventory hop addressed to ec2.<region>., got {uri:?}"))
+        .to_string()
 }
 
 /// The value of the form-encoded field `name` in `req`'s body, if it carries one.
@@ -296,7 +334,7 @@ async fn a_pass_records_the_inventory_pages_the_owner_answered() {
 
     for row in rows {
         let case = row.case;
-        let hops = Arc::new(InventoryHops::new(PAGE, row.refused));
+        let hops = Arc::new(InventoryHops::new(PAGE, row.refused.map(|hop| (REGION, hop))));
         let fleet = Fleet::with_ec2({
             let hops = Arc::clone(&hops);
             move |inner| PagedEc2 {
