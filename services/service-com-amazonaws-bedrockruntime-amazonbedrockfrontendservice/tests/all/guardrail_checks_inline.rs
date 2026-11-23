@@ -12,11 +12,15 @@
 //!    outside a modelled value set is refused `400 ValidationException` whose
 //!    clause names the member and lists the WHOLE modelled set — asserted for
 //!    every enum of this operation's input.
-//! 2. **A value set is listed in the order this service lists it in.** For the two
+//! 2. **A value set is listed in the order this service lists it in.** For the
 //!    sets whose order the recordings show, the clause ends with that order, not
 //!    with the order the model happens to declare; and the set this service orders
 //!    is exactly the modelled set, so a value the model adds or drops cannot go
 //!    unreported.
+//! 3. **The WHOLE message is the template with its variable parts taken from the
+//!    request.** The rejected value and the member path — including the one-based
+//!    collection step, which is the index the client sent — are the request's, and
+//!    the value set is the service's fixed listing for that member.
 //!
 //! Every assertion names its case and the actual value.
 
@@ -24,6 +28,7 @@ use serde_json::json;
 
 use service_com_amazonaws_bedrockruntime_amazonbedrockfrontendservice::ops::types::{
     GUARDRAIL_CHECKS_CONTENT_FILTER_CATEGORY_VALUES, GUARDRAIL_CHECKS_ROLE_VALUES,
+    GUARDRAIL_CHECKS_SENSITIVE_INFORMATION_ENTITY_TYPE_VALUES,
 };
 use service_com_amazonaws_bedrockruntime_amazonbedrockfrontendservice::state;
 
@@ -163,6 +168,15 @@ async fn a_value_set_is_listed_in_the_order_this_service_lists_it_in() {
             &state::MESSAGE_ROLE_ORDER,
             GUARDRAIL_CHECKS_ROLE_VALUES,
         ),
+        (
+            "the sensitive-information entity-type set",
+            json!({
+                "messages": [{ "role": "user", "content": [{ "text": "hello" }] }],
+                "checks": { "sensitiveInformation": { "entities": [{ "type": "NOPE" }] } },
+            }),
+            &state::SENSITIVE_INFORMATION_ENTITY_ORDER,
+            GUARDRAIL_CHECKS_SENSITIVE_INFORMATION_ENTITY_TYPE_VALUES,
+        ),
     ];
 
     for (case, body, ordered, modelled) in rows {
@@ -182,6 +196,110 @@ async fn a_value_set_is_listed_in_the_order_this_service_lists_it_in() {
             ordered_set, modelled_set,
             "case {case:?}: expected the order to cover exactly the modelled value set \
              {modelled_set:?}, got {ordered_set:?}"
+        );
+    }
+}
+
+/// RULE 3: the whole refusal message is the envelope's template, with the rejected
+/// value and the member path taken from the REQUEST and the value set listed in the
+/// order this service lists that member's values in.
+///
+/// The rows differ along everything the rule generalises over: which member is
+/// refused, which value was rejected, how long the list is, and where in it the
+/// rejected element sits — so the one-based collection step in the path is the index
+/// the client sent and no row can pass on a message keyed to one recorded shape.
+#[tokio::test]
+async fn an_enum_refusal_states_the_whole_validation_message() {
+    let router = emulator();
+    // (case, the request, the rejected value, the member path, the value set as this
+    // service lists it)
+    let rows: Vec<(&str, serde_json::Value, &str, &str, &[&str])> = vec![
+        (
+            "the only entity of the list",
+            json!({
+                "messages": [{ "role": "user", "content": [{ "text": "hello" }] }],
+                "checks": { "sensitiveInformation": { "entities": [
+                    { "type": "NOT_A_REAL_ENTITY_TYPE" },
+                ] } },
+            }),
+            "NOT_A_REAL_ENTITY_TYPE",
+            "checks.sensitiveInformation.entities.1.member.type",
+            &state::SENSITIVE_INFORMATION_ENTITY_ORDER,
+        ),
+        (
+            "the second entity, after a valid one",
+            json!({
+                "messages": [{ "role": "user", "content": [{ "text": "hello" }] }],
+                "checks": { "sensitiveInformation": { "entities": [
+                    { "type": "EMAIL" },
+                    { "type": "SHOE_SIZE" },
+                ] } },
+            }),
+            "SHOE_SIZE",
+            "checks.sensitiveInformation.entities.2.member.type",
+            &state::SENSITIVE_INFORMATION_ENTITY_ORDER,
+        ),
+        (
+            "the last entity of a longer list, a modelled value in the wrong case",
+            json!({
+                "messages": [{ "role": "user", "content": [{ "text": "hello" }] }],
+                "checks": { "sensitiveInformation": { "entities": [
+                    { "type": "EMAIL" },
+                    { "type": "PHONE" },
+                    { "type": "email" },
+                ] } },
+            }),
+            "email",
+            "checks.sensitiveInformation.entities.3.member.type",
+            &state::SENSITIVE_INFORMATION_ENTITY_ORDER,
+        ),
+        (
+            "a content-filter category, the second of its list",
+            json!({
+                "messages": [{ "role": "user", "content": [{ "text": "hello" }] }],
+                "checks": { "contentFilter": { "categories": [
+                    { "category": "HATE" },
+                    { "category": "RUDENESS" },
+                ] } },
+            }),
+            "RUDENESS",
+            "checks.contentFilter.categories.2.member.category",
+            &state::CONTENT_FILTER_CATEGORY_ORDER,
+        ),
+        (
+            "a message role, the second of its list",
+            json!({
+                "messages": [
+                    { "role": "user", "content": [{ "text": "hello" }] },
+                    { "role": "moderator", "content": [{ "text": "hello" }] },
+                ],
+                "checks": { "contentFilter": { "categories": [{ "category": "HATE" }] } },
+            }),
+            "moderator",
+            "messages.2.member.role",
+            &state::MESSAGE_ROLE_ORDER,
+        ),
+    ];
+
+    for (case, body, rejected, member, ordered) in rows {
+        let call = post_json(&router, PATH, &body).await;
+        assert_eq!(
+            call.status,
+            400,
+            "case {case:?}: expected 400, got {} / {}",
+            call.status,
+            String::from_utf8_lossy(&call.body)
+        );
+        let expected = format!(
+            "1 validation error detected: Value '{rejected}' at '{member}' failed to satisfy \
+             constraint: Member must satisfy enum value set: [{}]",
+            ordered.join(", ")
+        );
+        assert_eq!(
+            message_of(&call),
+            expected,
+            "case {case:?}: expected {expected:?}, got {:?}",
+            message_of(&call)
         );
     }
 }

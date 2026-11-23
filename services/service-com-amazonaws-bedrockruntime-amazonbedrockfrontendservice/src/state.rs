@@ -1357,6 +1357,52 @@ pub const CONTENT_FILTER_CATEGORY_ORDER: [&str; 5] =
 /// model's.
 pub const MESSAGE_ROLE_ORDER: [&str; 3] = ["user", "system", "assistant"];
 
+/// The order this service lists the SENSITIVE-INFORMATION ENTITY TYPES in — the
+/// value set a refusal of an entity-type member quotes.
+///
+/// As with the categories and the roles above, the order is the service's own: the
+/// model declares the same 31 values alphabetically
+/// (`smithy_query(query="shape",\
+/// shape="GuardrailChecksSensitiveInformationEntityType")`) and the recorded
+/// refusal that names the entity-type member lists them in this one
+/// (`bedrock-runtime-invoke-guardrail-checks-error-paths#task#3`). The MEMBERSHIP
+/// stays the model's: these are exactly
+/// `GUARDRAIL_CHECKS_SENSITIVE_INFORMATION_ENTITY_TYPE_VALUES`, which the crate's
+/// own test pins, so a value the model adds or drops cannot go unreported.
+pub const SENSITIVE_INFORMATION_ENTITY_ORDER: [&str; 31] = [
+    "US_INDIVIDUAL_TAX_IDENTIFICATION_NUMBER",
+    "US_BANK_ROUTING_NUMBER",
+    "MAC_ADDRESS",
+    "AWS_ACCESS_KEY",
+    "VEHICLE_IDENTIFICATION_NUMBER",
+    "CREDIT_DEBIT_CARD_EXPIRY",
+    "NAME",
+    "CA_HEALTH_NUMBER",
+    "UK_UNIQUE_TAXPAYER_REFERENCE_NUMBER",
+    "INTERNATIONAL_BANK_ACCOUNT_NUMBER",
+    "CREDIT_DEBIT_CARD_CVV",
+    "PHONE",
+    "URL",
+    "UK_NATIONAL_INSURANCE_NUMBER",
+    "UK_NATIONAL_HEALTH_SERVICE_NUMBER",
+    "DRIVER_ID",
+    "AWS_SECRET_KEY",
+    "ADDRESS",
+    "US_PASSPORT_NUMBER",
+    "PIN",
+    "USERNAME",
+    "US_SOCIAL_SECURITY_NUMBER",
+    "LICENSE_PLATE",
+    "SWIFT_CODE",
+    "PASSWORD",
+    "IP_ADDRESS",
+    "EMAIL",
+    "US_BANK_ACCOUNT_NUMBER",
+    "CREDIT_DEBIT_CARD_NUMBER",
+    "CA_SOCIAL_INSURANCE_NUMBER",
+    "AGE",
+];
+
 /// The check types a `GuardrailChecksConfig` admits, in the order this service
 /// reads them.
 ///
@@ -1388,11 +1434,16 @@ pub const EMPTY_CHECK_CONFIG_MESSAGE: &str = "At least one check type must be co
 /// order for keeps the order it arrived in — the model's — because inventing one
 /// would change a message this service does not own. The paths are the
 /// framework's own member paths, whose collection step is `<n>.member`.
-const SERVICE_VALUE_ORDERS: [(&str, &str, &[&str]); 2] = [
+const SERVICE_VALUE_ORDERS: [(&str, &str, &[&str]); 3] = [
     (
         "checks.contentFilter.categories",
         "member.category",
         &CONTENT_FILTER_CATEGORY_ORDER,
+    ),
+    (
+        "checks.sensitiveInformation.entities",
+        "member.type",
+        &SENSITIVE_INFORMATION_ENTITY_ORDER,
     ),
     ("messages", "member.role", &MESSAGE_ROLE_ORDER),
 ];
