@@ -31,8 +31,8 @@ use std::time::{Duration, Instant};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::support::{
-    borrowed, create_launch_template, create_target_group, emulator, p, query, seed_subnets,
-    tag_value, tag_values, vpc_of,
+    borrowed, create_classic_load_balancer, create_launch_template, create_target_group,
+    emulator_with_classic_elb, p, query, seed_subnets, tag_value, tag_values, vpc_of, REGION,
 };
 
 /// Every list-typed member of the group a read reports, from the model's own definition of
@@ -272,7 +272,7 @@ async fn instances_settle(router: &MultiServiceRouter, case: &str, group: &str, 
 /// collections — the classic load balancer names and the target groups from the create, the
 /// suspensions from `SuspendProcesses` and the metrics from `EnableMetricsCollection`.
 async fn account() -> Account {
-    let (router, engine) = emulator();
+    let (router, engine) = emulator_with_classic_elb();
     let subnets = seed_subnets(&engine, 2);
     let vpc_id = vpc_of(&router, &subnets[0]).await;
     create_launch_template(&router, TEMPLATE).await;
@@ -289,9 +289,12 @@ async fn account() -> Account {
             ..Given::default()
         };
         for index in 0..row.count {
-            holds
-                .load_balancer_names
-                .push(format!("{}-lb-{index}", row.group));
+            let load_balancer = format!("{}-lb-{index}", row.group);
+            // The load balancers the group names are the account's OWN Classic Load
+            // Balancers: a group is associated only with ones Elastic Load Balancing holds in
+            // its Region, so each is created there before the group names it.
+            create_classic_load_balancer(&router, REGION, &subnets[0].zone, &load_balancer).await;
+            holds.load_balancer_names.push(load_balancer);
             holds.tag_keys.push(format!("{}-key-{index}", row.group));
             holds.target_group_arns.push(
                 create_target_group(
@@ -501,7 +504,7 @@ async fn every_list_member_of_a_described_group_is_a_list() {
 /// list member still named by the answer.
 #[tokio::test]
 async fn a_group_reports_its_traffic_sources_as_a_list() {
-    let (router, engine) = emulator();
+    let (router, engine) = emulator_with_classic_elb();
     let subnets = seed_subnets(&engine, 1);
     let vpc_id = vpc_of(&router, &subnets[0]).await;
     create_launch_template(&router, TEMPLATE).await;

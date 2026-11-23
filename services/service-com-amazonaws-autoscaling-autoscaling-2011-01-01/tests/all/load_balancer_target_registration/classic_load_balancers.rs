@@ -37,7 +37,10 @@ use service_com_amazonaws_autoscaling_autoscaling_2011_01_01 as autoscaling;
 use service_com_amazonaws_ec2_amazonec2 as ec2_service;
 use service_com_amazonaws_elasticloadbalancing_elasticloadbalancing_v7 as elb_service;
 
-use crate::support::{borrowed, form_encode, p, query, tag_value, tag_values, REGION};
+use crate::support::{
+    borrowed, classic_elb_query, emulator_with_classic_elb, p, query, tag_value, tag_values,
+    REGION,
+};
 
 /// The launch template every group in this suite launches from, seeded into the account's own
 /// Amazon EC2 store by [`seed_serving_launch_template`].
@@ -96,9 +99,6 @@ fn seed_serving_launch_template(engine: &Arc<engine::InMemoryEngine>) {
 /// suite is enabled for.
 const ZONE: &str = "us-west-2a";
 
-/// The API version an Elastic Load Balancing (Classic) client puts in its awsQuery body.
-const ELB_API_VERSION: &str = "2012-06-01";
-
 /// The most load balancers ONE attach or detach may name, from the model's own documentation
 /// for `AttachLoadBalancersType$LoadBalancerNames`: "You can specify up to 10 load
 /// balancers."
@@ -138,53 +138,31 @@ const HEALTHY_THRESHOLD: i32 = 2;
 /// One emulator with the three services on ONE engine: a group's instances are the account's
 /// own Amazon EC2 instances, and the load balancers it is attached to and the registrations
 /// they hold are Elastic Load Balancing's own records, so one engine is what makes the three
-/// views one account.
+/// views one account. Built on the shared seam, with this suite's own serving launch template
+/// seeded into the account's Amazon EC2 store.
 fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let (router, engine) = emulator_with_classic_elb();
     seed_serving_launch_template(&engine);
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(autoscaling::EmulatedService::new(Arc::clone(&engine)));
-    router.register_service(ec2_service::EmulatedService::new(Arc::clone(&engine)));
-    router.register_service(elb_service::EmulatedService::new(Arc::clone(&engine)));
     (router, engine)
 }
 
 /// POST one awsQuery action to Elastic Load Balancing, the way a client does, and answer its
-/// status and body.
+/// status and body — this suite's Region, through the shared poster.
 async fn elb_query(
     router: &MultiServiceRouter,
     action: &str,
     params: &[(String, String)],
 ) -> (u16, String) {
-    let mut body = format!("Action={action}&Version={ELB_API_VERSION}");
-    for (key, value) in params {
-        body.push('&');
-        body.push_str(key);
-        body.push('=');
-        body.push_str(&form_encode(value));
-    }
-    let request = http::Request::builder()
-        .method("POST")
-        .uri(format!("https://elasticloadbalancing.{REGION}.amazonaws.com/"))
-        .header("content-type", "application/x-www-form-urlencoded")
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{REGION}\
-                 /elasticloadbalancing/aws4_request, SignedHeaders=host, Signature=abc"
-            ),
-        )
-        .body(bytes::Bytes::from(body))
-        .expect("a valid request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let text = String::from_utf8_lossy(response.body()).to_string();
-    (status, text)
+    classic_elb_query(router, REGION, action, params).await
 }
 
 /// Create one Classic Load Balancer over Elastic Load Balancing's own wire, with one HTTP
 /// listener and a health check that reaches a verdict in [`HEALTHY_THRESHOLD`] checks.
+///
+/// Posts its own create rather than taking the shared one: what this suite asserts is
+/// registrations the load balancer's health checks ANSWER, so its listener has to forward to
+/// the port its instances serve ([`SERVED_PORT`]) and its health check has to name that
+/// target.
 async fn create_load_balancer(router: &MultiServiceRouter, name: &str) {
     let (status, body) = elb_query(
         router,

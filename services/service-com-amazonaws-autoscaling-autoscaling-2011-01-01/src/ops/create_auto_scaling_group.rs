@@ -14,6 +14,12 @@
 //! ([`crate::state::ec2_subnets`]), because the zone a subnet is in is a fact about
 //! that subnet rather than a value this caller supplies.
 //!
+//! The load balancers a group is associated with have to EXIST: every name the request's
+//! `LoadBalancerNames` carries is resolved against the account's own Classic Load Balancers
+//! of the signed Region ([`crate::state::elb_classic_instances`]), exactly as the attach of
+//! the same member resolves them, and a request naming one that resolves to nothing is
+//! refused whole — no group is stored.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -624,6 +630,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(crate::scaffolded::Scaffolded::validation_error(
                 crate::state::elbv2_targets::UNATTACHABLE_TARGET_GROUPS_MESSAGE.to_string(),
+            ));
+        }
+        // A group is associated with Classic Load Balancers of its OWN Region that Elastic
+        // Load Balancing really HOLDS: `LoadBalancerNames` is "a list of Classic Load
+        // Balancers associated with this Auto Scaling group", and the association is what
+        // registers the group's instances with each of them — so a name that service holds no
+        // load balancer under is an association no instance of the group could ever be
+        // registered through. Resolved against that service's own store for the signed Region,
+        // through the SAME resolution the attach of this very member is held to
+        // ([`crate::state::elb_classic_instances::first_unresolvable_load_balancer`]), and
+        // taken on the INPUT before this service's store is locked — so the refusal is
+        // whole, and a create naming one leaves no group behind at all.
+        if crate::state::elb_classic_instances::first_unresolvable_load_balancer(
+            &*self.engine,
+            &region,
+            input
+                .load_balancer_names
+                .iter()
+                .flatten()
+                .map(String::as_str),
+        )
+        .is_some()
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::elb_classic_instances::UNRESOLVABLE_LOAD_BALANCERS_MESSAGE
+                    .to_string(),
             ));
         }
         // The zones the group places instances in. `VPCZoneIdentifier` is "a

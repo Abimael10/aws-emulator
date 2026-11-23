@@ -13,6 +13,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_autoscaling_autoscaling_2011_01_01 as autoscaling;
 use service_com_amazonaws_ec2_amazonec2 as ec2_service;
 use service_com_amazonaws_ec2_amazonec2::state as ec2;
+use service_com_amazonaws_elasticloadbalancing_elasticloadbalancing_v7 as elb_service;
 use service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10 as elbv2_service;
 use service_com_amazonaws_iam_awsidentitymanagementv20100508 as iam_service;
 
@@ -169,6 +170,94 @@ pub fn emulator_with_iam() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) 
     let (mut router, engine) = emulator();
     router.register_service(iam_service::EmulatedService::new(Arc::clone(&engine)));
     (router, engine)
+}
+
+/// [`emulator`] with Elastic Load Balancing (Classic) mounted beside the three, on that same
+/// engine.
+///
+/// THE ONE COPY for every suite here whose subject reaches the account's own Classic Load
+/// Balancers: the load balancers a group's `LoadBalancerNames` names are that service's
+/// records, so a suite that needs them to EXIST creates them where they live.
+pub fn emulator_with_classic_elb() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    let (mut router, engine) = emulator();
+    router.register_service(elb_service::EmulatedService::new(Arc::clone(&engine)));
+    (router, engine)
+}
+
+/// POST one awsQuery action to Elastic Load Balancing (Classic), signed for `region`, the way
+/// a client does, and answer its status and body.
+///
+/// The API version is that service's own statement of the version a Classic client sends,
+/// rather than a copy of it written out here.
+pub async fn classic_elb_query(
+    router: &MultiServiceRouter,
+    region: &str,
+    action: &str,
+    params: &[(String, String)],
+) -> (u16, String) {
+    let mut body = format!(
+        "Action={action}&Version={}",
+        elb_service::service::api_version::CLASSIC_API_VERSION
+    );
+    for (key, value) in params {
+        body.push('&');
+        body.push_str(key);
+        body.push('=');
+        body.push_str(&form_encode(value));
+    }
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!(
+            "https://elasticloadbalancing.{region}.amazonaws.com/"
+        ))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{region}\
+                 /elasticloadbalancing/aws4_request, SignedHeaders=host, Signature=abc"
+            ),
+        )
+        .body(bytes::Bytes::from(body))
+        .expect("a valid request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let text = String::from_utf8_lossy(response.body()).to_string();
+    (status, text)
+}
+
+/// Create one Classic Load Balancer named `name` in `region`, enabled for the Availability
+/// Zone `zone` and carrying one HTTP listener on port 80, over Elastic Load Balancing's own
+/// wire.
+///
+/// For the suites here whose groups name load balancers the account has to HOLD: a Classic
+/// Load Balancer is identified within one Region, so the Region it is created in is stated by
+/// the caller. A suite that cares what its listener forwards to, or what its health check
+/// asks for, posts its own create instead.
+pub async fn create_classic_load_balancer(
+    router: &MultiServiceRouter,
+    region: &str,
+    zone: &str,
+    name: &str,
+) {
+    let (status, body) = classic_elb_query(
+        router,
+        region,
+        "CreateLoadBalancer",
+        &[
+            p("LoadBalancerName", name),
+            p("AvailabilityZones.member.1", zone),
+            p("Listeners.member.1.Protocol", "HTTP"),
+            p("Listeners.member.1.LoadBalancerPort", "80"),
+            p("Listeners.member.1.InstanceProtocol", "HTTP"),
+            p("Listeners.member.1.InstancePort", "80"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "CreateLoadBalancer for {name:?} in {region:?} expected 200, got {status}: {body}"
+    );
 }
 
 /// POST one awsQuery action to Elastic Load Balancing v2, the way a client does, and answer
