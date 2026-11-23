@@ -202,9 +202,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(bad_request)?;
 
         // The page's content is generated FROM the REST endpoint it documents, so an
-        // identifier naming none describes no page at all and the create is refused.
+        // identifier naming an endpoint the account does not have describes no page at all
+        // and the create is refused — resolved against every store the account's APIs and
+        // their stages live in ([`crate::state::rest_endpoint`]).
         // RESOLVED here, before this service's own store is locked — the lock order every
-        // cross-service question of this crate is asked in — and ANSWERED below, after the
+        // cross-store question of this crate is asked in — and ANSWERED below, after the
         // product the URI names has been resolved: a request that addresses no product is
         // told that first, whatever else it carries.
         let unresolved_endpoint = crate::state::unresolved_rest_endpoint(&*self.engine, parts);

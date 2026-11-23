@@ -184,9 +184,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // An update RE-GENERATES the page's content from the REST endpoint the page
-        // documents, so that endpoint has to be one the account still has — resolved
-        // against the service that owns REST APIs and, like every cross-service question of
-        // this crate, asked BEFORE this service's own store lock is taken. The identifier
+        // documents, so that endpoint has to be one the account still has — resolved against
+        // every store the account's APIs and their stages live in and, like every cross-store
+        // question of this crate, asked BEFORE this service's own store lock is taken. The
+        // identifier
         // it is asked about belongs to the STORED page (it is not an input of this
         // operation), so the record is read for it here and patched under the lock below; a
         // page the store does not hold is answered there, where every other refusal of this
