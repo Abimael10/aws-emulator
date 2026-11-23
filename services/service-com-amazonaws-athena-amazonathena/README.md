@@ -44,11 +44,17 @@ visible with the code rather than only in a review:
   column, expression-depth and compound-select limits. One run is additionally bounded by
   a wall-clock deadline and a step budget enforced from the engine's progress handler, and
   the retained result set is capped in rows, cells and bytes. `load_extension` is not an
-  enabled feature of the dependency, so it is not reachable from this crate at all. The one
-  SQL function this crate registers of its own (`src/state/query_engine/exact_decimal.rs`,
-  the EXACT-NUMERIC reading Athena's `DECIMAL` type needs and this engine has no counterpart
-  for) computes in this process over the digits a value carries, reaches nothing outside the
-  database, and is bounded twice before it rescales anything: the declaration it is called
+  enabled feature of the dependency, so it is not reachable from this crate at all. The SQL
+  functions this crate registers of its own each compute in this process over the value they
+  are handed and reach nothing outside the database: the CHECKED reading of a cast
+  (`src/state/query_engine/strict_casts.rs`, which refuses a value that is not a value of the
+  type the cast names), the reading of a typed date/time literal
+  (`src/state/query_engine/typed_literals.rs`, a production this engine's own dialect has
+  none of, bounded by the fractional digits such a type carries), and the EXACT-NUMERIC
+  reading Athena's `DECIMAL` type needs and this engine has no counterpart for
+  (`src/state/query_engine/exact_decimal.rs`). The last of those
+  computes over the digits a value carries and is bounded twice before it rescales anything:
+  the declaration it is called
   with carries a precision of 1 to 38 and a scale no larger than it, and both the text of a
   value and the number that text denotes are refused past the digits this emulator reads one
   to — so neither the scale a statement declares nor the magnitude of a value it names

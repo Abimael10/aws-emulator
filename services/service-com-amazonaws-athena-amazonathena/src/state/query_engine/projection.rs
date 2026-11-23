@@ -30,6 +30,7 @@ use ::sqlparser::ast::{
 };
 
 use super::exact_decimal::EXACT_DECIMAL_FUNCTION;
+use super::typed_literals::{self, TEMPORAL_LITERAL_FUNCTION};
 use super::{ColumnType, SourceColumnTypes};
 use crate::state::catalog_sql::statement::{parse_statements, unnamed_column};
 
@@ -265,6 +266,11 @@ fn fixed_result_type(function: &Function) -> Option<ColumnType> {
     let name = folded_function_name(function)?;
     if name == EXACT_DECIMAL_FUNCTION {
         return exact_decimal_type(function);
+    }
+    // A typed date/time literal is typed by the type its own literal names, which the reading
+    // that replaced it carries (see [`typed_literals`]).
+    if name == TEMPORAL_LITERAL_FUNCTION {
+        return typed_literals::projected_type(function);
     }
     FIXED_RESULT_FUNCTIONS
         .iter()

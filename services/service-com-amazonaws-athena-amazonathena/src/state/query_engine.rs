@@ -38,6 +38,10 @@ mod strict_casts;
 /// has no production for.
 mod table_functions;
 
+/// The typed date/time literal Athena's own language writes a value of those types as, which
+/// this engine's dialect has no production for.
+mod typed_literals;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -70,6 +74,14 @@ const TYPE_BIGINT: (&str, i32, i32) = ("bigint", 19, 0);
 const TYPE_DOUBLE: (&str, i32, i32) = ("double", 17, 0);
 /// Athena's type name for a boolean column; see [`TYPE_INTEGER`].
 const TYPE_BOOLEAN: (&str, i32, i32) = ("boolean", 0, 0);
+/// Athena's type name for a column of calendar days; see [`TYPE_INTEGER`]. A date/time type
+/// declares no digits of its own — a value of one is a day and a time of day, not a number —
+/// so the precision and the scale beside it are zero, as a boolean's are.
+const TYPE_DATE: (&str, i32, i32) = ("date", 0, 0);
+/// Athena's type name for a column of times of day; see [`TYPE_DATE`].
+const TYPE_TIME: (&str, i32, i32) = ("time", 0, 0);
+/// Athena's type name for a column of instants; see [`TYPE_DATE`].
+const TYPE_TIMESTAMP: (&str, i32, i32) = ("timestamp", 0, 0);
 /// Athena's type name for a character column; see [`TYPE_INTEGER`].
 const TYPE_VARCHAR: (&str, i32, i32) = ("varchar", 2_147_483_647, 0);
 /// HIVE's type name for a character column, which is what a statement Athena performs on
@@ -341,6 +353,12 @@ impl Database {
         // a value of the type a cast names fails the query rather than being read by this
         // engine's own rules (see [`strict_casts`]).
         strict_casts::register_strict_casts(&connection)?;
+
+        // The reading of a TYPED DATE/TIME LITERAL, registered for the same reason: this
+        // engine's dialect has no production for such a literal at all, so a statement
+        // carrying one is refused as text that is not SQL unless the reading is there to
+        // answer the value it names (see [`typed_literals`]).
+        typed_literals::register_typed_literals(&connection)?;
 
         // Default-deny: every action a query legitimately needs is named, and anything
         // else — including an action a future engine version introduces — is refused.
@@ -708,6 +726,10 @@ pub fn run_over(
     parameters: &[String],
     scanned_bytes: i64,
 ) -> Completion {
+    // A typed date/time literal — a production this dialect has none of at all — is read as
+    // the value it names; a statement carrying none is run exactly as submitted.
+    let temporal = typed_literals::as_values(sql);
+    let sql = temporal.as_deref().unwrap_or(sql);
     // A statement reading its rows from a table function this dialect lacks names those
     // same rows in a production it has; one carrying none is run exactly as submitted.
     let expanded = table_functions::expanded(sql);
@@ -1384,6 +1406,12 @@ enum ColumnType {
     },
     /// A boolean.
     Boolean,
+    /// A calendar day.
+    Date,
+    /// A time of day.
+    Time,
+    /// A calendar day with a time of day.
+    Timestamp,
     /// Character data.
     VarChar,
     /// Binary data.
@@ -1462,8 +1490,13 @@ impl ColumnType {
             // a double holds a value of any scale at the precision it carries.
             Self::Decimal { .. } => 3,
             Self::Double => 4,
-            Self::VarBinary => 5,
-            Self::VarChar => 6,
+            // A date/time value is carried as the calendar text it is written as (see
+            // [`typed_literals`]), which character data holds; no value this engine produced
+            // is ever OBSERVED as one of these types, so they are ordered only against the
+            // type that holds their text.
+            Self::Date | Self::Time | Self::Timestamp => 5,
+            Self::VarBinary => 6,
+            Self::VarChar => 7,
         }
     }
 
@@ -1474,6 +1507,9 @@ impl ColumnType {
             Self::BigInt => TYPE_BIGINT,
             Self::Double => TYPE_DOUBLE,
             Self::Decimal { precision, scale } => (TYPE_DECIMAL, precision, scale),
+            Self::Date => TYPE_DATE,
+            Self::Time => TYPE_TIME,
+            Self::Timestamp => TYPE_TIMESTAMP,
             Self::Boolean => TYPE_BOOLEAN,
             Self::VarChar => TYPE_VARCHAR,
             Self::VarBinary => TYPE_VARBINARY,

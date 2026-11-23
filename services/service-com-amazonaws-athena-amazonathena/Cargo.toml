@@ -49,10 +49,12 @@ service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true 
 # default-deny authorizer, `SQLITE_LIMIT_ATTACHED = 0`, defensive mode, untrusted schema,
 # no URI filenames, `temp_store = MEMORY`, `max_page_count`, `hard_heap_limit`, plus
 # length, column, depth and compound-select limits. `limits` and `hooks` are the features
-# those controls need; `load_extension` is deliberately absent. `functions` registers ONE
-# function of this crate's own on each connection — the exact-decimal reading of a value
-# (`state::query_engine::exact_decimal`), which computes in this process over the digits a
-# value carries and reaches nothing outside the database.
+# those controls need; `load_extension` is deliberately absent. `functions` registers the
+# functions of this crate's own on each connection — the exact-decimal reading of a value
+# (`state::query_engine::exact_decimal`), the checked reading of a cast
+# (`state::query_engine::strict_casts`) and the reading of a typed date/time literal
+# (`state::query_engine::typed_literals`) — each of which computes in this process over the
+# value it is handed and reaches nothing outside the database.
 #
 # PINNED at 0.41, the release reviewed and built here: it is the first one whose
 # `libsqlite3-sys` (0.39) carries a SQLite C library without RUSTSEC-2026-0459 (a
