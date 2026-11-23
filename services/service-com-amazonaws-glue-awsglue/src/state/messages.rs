@@ -1204,9 +1204,12 @@ pub fn federation_source_not_registered(source: &str) -> String {
 /// `CreateCatalog` for a `Name` the account already holds a catalog under.
 ///
 /// RECORDED constant, and the whole message: the sentence is fixed text that names the
-/// resource kind, withholds the requested name, and ends in a full stop like the database
-/// duplicate's own wording ([`DATABASE_ALREADY_EXISTS`]).
-pub const CATALOG_ALREADY_EXISTS: &str = "Catalog already exists.";
+/// resource kind and withholds the requested name, and it ends with the word `exists` —
+/// no terminal full stop. Each surface words its own already-exists condition, so this
+/// one is NOT derived from the database duplicate's sentence
+/// ([`DATABASE_ALREADY_EXISTS`], which does carry a stop) any more than it is from the
+/// blueprint's or the workflow's.
+pub const CATALOG_ALREADY_EXISTS: &str = "Catalog already exists";
 
 /// `CreateCatalog` whose `Name` is the account's own id. Stated by the model: the
 /// catalog's name "Cannot be the same as the account ID" (`Catalog$Name`), because
