@@ -868,6 +868,17 @@ pub struct ComAmazonawsIotAwsiotserviceState {
     /// [`MAX_TOPIC_RULE_DESTINATIONS`] is the ceiling `CreateTopicRuleDestination`
     /// refuses past.
     pub topic_rule_destinations: BTreeMap<String, RegisteredTopicRuleDestination>,
+    /// How many endpoint deliveries of `http` topic-rule actions this store's rules engine has
+    /// IN FLIGHT right now ([`rules_engine`]).
+    ///
+    /// Such a delivery is a request made over this emulator's own in-process transport, so it
+    /// reaches a service of this very emulator and can reach one whose own answer runs the
+    /// rules engine again — a chain that nests rather than iterating, which the per-message
+    /// ceilings of ONE evaluation cannot see. Counting the deliveries that are open bounds that
+    /// nesting: each level holds one count for as long as its request is open, so a chain is
+    /// refused a few levels deep, at the ceiling that module states. It is the EMULATOR's own
+    /// ceiling and not a quota the service publishes.
+    pub endpoint_deliveries_in_flight: usize,
     /// Every custom authorizer that exists, keyed by `authorizerName`.
     ///
     /// The name is the authorizer's identity — the model binds it as the

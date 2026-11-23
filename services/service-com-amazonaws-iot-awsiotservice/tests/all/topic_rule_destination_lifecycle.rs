@@ -1101,6 +1101,9 @@ async fn a_delivery_carries_the_actions_headers_but_not_the_ones_dispatch_reads(
             &recorder.transport(),
             &action(url, None, &[(name, value)]),
             b"{\"marker\":\"one\"}",
+            // The share of the message's action budget this delivery is handed, which is not
+            // what this case is about: nothing here runs the rules engine again.
+            1,
         )
         .await;
         assert!(

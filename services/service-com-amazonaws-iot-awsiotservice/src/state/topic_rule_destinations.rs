@@ -544,14 +544,24 @@ pub fn http_action_is_allowed(
 /// only what this emulator serves itself.
 ///
 /// The GATE is the caller's ([`http_action_is_allowed`]): this sends what it is given.
+///
+/// `actions_budget` is the share of the published message's action budget this delivery is
+/// handed, carried on the request ([`super::rules_engine::ACTIONS_BUDGET_HEADER`]) because the
+/// endpoint is reached over this emulator's own dispatch: an answer that runs the rules engine
+/// again performs its actions out of that share rather than out of a fresh budget.
 pub async fn deliver_to_endpoint(
     transport: &InProcessTransport,
     action: &HttpAction,
     message: &[u8],
+    actions_budget: usize,
 ) -> Result<(), String> {
     let mut request = ::http::Request::builder()
         .method(::http::Method::POST)
-        .uri(&action.url);
+        .uri(&action.url)
+        .header(
+            super::rules_engine::ACTIONS_BUDGET_HEADER,
+            super::rules_engine::actions_budget_value(actions_budget),
+        );
     // The authority of the URL the gate admitted, which the destination's own
     // `confirmationUrl` is a prefix of — so the host named here is the confirmed
     // destination's.
@@ -723,18 +733,22 @@ pub fn authority_of(url: &str) -> Option<String> {
 
 /// The headers this emulator's own request dispatch reads: the host that selects which
 /// service answers, and the SigV4 values that say who the request is from
-/// (`emulator_server::resolve_route_key` and the authenticator behind it).
+/// (`emulator_server::resolve_route_key` and the authenticator behind it), plus the one this
+/// emulator's rules engine reads off a delivery it made itself
+/// ([`super::rules_engine::ACTIONS_BUDGET_HEADER`]).
 ///
 /// A rule's `headers` are values for its DESTINATION, so none of these travels: a delivery
 /// made over this emulator's own dispatch ([`InProcessTransport`]) must not let a rule pick
-/// the service that answers it or the identity it is answered as.
-const HEADERS_READ_BY_DISPATCH: &[&str] = &[
+/// the service that answers it, the identity it is answered as, or the work budget the engine
+/// serves it under.
+pub const HEADERS_READ_BY_DISPATCH: &[&str] = &[
     "host",
     "authorization",
     "x-amz-target",
     "x-amz-security-token",
     "x-amz-date",
     "x-amz-content-sha256",
+    super::rules_engine::ACTIONS_BUDGET_HEADER,
 ];
 
 /// Whether `name` is one of [`HEADERS_READ_BY_DISPATCH`]. HTTP header names are

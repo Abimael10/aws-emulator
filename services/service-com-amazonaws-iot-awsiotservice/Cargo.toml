@@ -59,6 +59,13 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 # published message.
 sqlparser = "0.59"
 
+# The CloudWatch metric store the rules engine publishes its own `AWS/IoT` series into — one
+# count per rule action it attempted, so what a rule did with a message is readable where a
+# client reads every other series (`state::rules_engine::action_metrics`): that service's own
+# state struct, in the SAME shared engine, written through its own accessors rather than
+# through a second copy of them.
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+
 # The IAM store a topic-rule action's `roleArn` is resolved against, to decide whether the
 # rules engine may assume that role and make the action's API call under it
 # (`state::rule_action_role`), and the identity-based policy documents in force on the

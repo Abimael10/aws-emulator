@@ -15751,6 +15751,7 @@ dependencies = [
  "rustls",
  "serde_json",
  "service-com-amazonaws-acm-certificatemanager",
+ "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-iotdataplane-iotmoonrakerservice",
  "service-com-amazonaws-kinesis-kinesis-20131202",
