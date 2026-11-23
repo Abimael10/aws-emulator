@@ -159,7 +159,11 @@ const PUBLISHED_RETENTION_PERIODS: &[i32] = &[7, 31, 93, 465, 713, 731];
 const REFUSED_RETENTION_PERIODS: &[i32] = &[0, 30, 94, 744, 762];
 
 /// Create an `available` DB instance of this file's own shape.
-async fn an_instance(
+///
+/// `pub(crate)` so the sibling suites of this one test target stage a change on an instance
+/// whose maintenance window is a known one rather than keeping a second copy of this
+/// fixture.
+pub(crate) async fn an_instance(
     router: &smithy_server_runtime::MultiServiceRouter,
     identifier: &str,
     extra: &[(&str, String)],
@@ -229,7 +233,9 @@ fn the_one_instance(case: &str, body: &str) -> String {
 /// loop is the shared one this test target polls every owed transition through
 /// ([`poll_until`]), bounded by a monotonic deadline that is generous beside the span a
 /// transition is owed in. `what` names the condition for the panic a deadline raises.
-async fn poll_instance(
+///
+/// `pub(crate)` for the same reason [`an_instance`] is.
+pub(crate) async fn poll_instance(
     router: &smithy_server_runtime::MultiServiceRouter,
     case: &str,
     what: &str,
@@ -273,7 +279,9 @@ async fn settled_instance(
 /// The element itself is reported on every instance envelope — "specific changes are
 /// identified by subelements", and an instance with nothing pending carries it with no
 /// subelement inside — so an EMPTY element is what "nothing is pending" reads as here.
-fn pending(instance: &str) -> Option<String> {
+///
+/// `pub(crate)` for the same reason [`an_instance`] is.
+pub(crate) fn pending(instance: &str) -> Option<String> {
     subtrees(instance, "PendingModifiedValues")
         .into_iter()
         .find(|reported| !element_is_empty(reported, "PendingModifiedValues"))
@@ -970,7 +978,9 @@ pub(crate) fn window_days_ahead() -> String {
 /// fall outside it: a whole-day span is closed again in the minute after its last one and
 /// names yesterday's weekday once midnight has passed, and either would leave a change
 /// staged against this window waiting for a week.
-fn window_that_started() -> String {
+///
+/// `pub(crate)` for the same reason [`window_days_ahead`] is.
+pub(crate) fn window_that_started() -> String {
     let now = chrono::Utc::now();
     let margin = chrono::Duration::hours(2);
     format!(
@@ -982,7 +992,10 @@ fn window_that_started() -> String {
 
 /// One `ddd:hh24:mi` point of a window: the UTC weekday, hour and minute of `at`, read
 /// through the calendar of the `chrono` crate rather than by hand.
-fn window_point(at: chrono::DateTime<chrono::Utc>) -> String {
+///
+/// `pub(crate)` so a sibling suite builds a window around an instant of its own through this
+/// one calendar walk rather than through a second copy of it.
+pub(crate) fn window_point(at: chrono::DateTime<chrono::Utc>) -> String {
     use chrono::Timelike;
 
     format!("{}:{:02}:{:02}", weekday_name(at), at.hour(), at.minute())

@@ -37,7 +37,11 @@
 //! Every wait here is a poll loop over a REPORTING call
 //! ([`crate::lifecycle_poll_loops::poll_until`]) — nothing sleeps and no assertion is on how
 //! fast the host runs — and every call goes over the wire through the harness
-//! `db_instances.rs` keeps, so each assertion reads the XML the emulator itself answered.
+//! `db_instances.rs` keeps, so each assertion reads the XML the emulator itself answered. For
+//! the same reason every instance below keeps a maintenance window that names a weekday days
+//! away: a change parked for the window is applied once the clock is inside an occurrence of
+//! it, so a case that reads a parked change back pins the window it is parked against rather
+//! than leaving it to the hour the suite runs in.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -50,6 +54,7 @@ use crate::db_instances::{
     REGION,
 };
 use crate::lifecycle_poll_loops::poll_until;
+use crate::pending_modified_values::window_days_ahead;
 
 /// The master user every resource below is created with, and its password — test credentials,
 /// and the only place in this suite they appear.
@@ -193,6 +198,12 @@ async fn available_cluster_snapshot(router: &MultiServiceRouter, case: &str, ide
 }
 
 /// `CreateDBInstance` for a standalone DB instance of `engine`.
+///
+/// Every instance this suite creates keeps a maintenance window that is NOT open: a change a
+/// case parks for the window is applied once the clock is inside an occurrence of the window
+/// the instance keeps, so an instance left on the window a create resolves by default would
+/// have a parked change applied under the case that reads it whenever the suite happened to
+/// run inside that window.
 async fn create_instance(
     router: &MultiServiceRouter,
     case: &str,
@@ -212,6 +223,7 @@ async fn create_instance(
                 "AllocatedStorage" => 20,
                 "MasterUsername" => MASTER_USER,
                 "MasterUserPassword" => MASTER_PASSWORD,
+                "PreferredMaintenanceWindow" => window_days_ahead(),
             ],
         )
         .await,
