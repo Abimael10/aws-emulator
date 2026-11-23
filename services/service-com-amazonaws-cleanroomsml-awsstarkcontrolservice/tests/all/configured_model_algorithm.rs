@@ -8,12 +8,19 @@
 //! optional member the create omitted is reported absent rather than invented, and an ARN
 //! this regional endpoint holds no record for is refused as not found.
 //!
+//! The refusal's WORDING is part of that rule, and it belongs to the kind of resource the
+//! request addressed rather than to the service or to the operation: the
+//! configured-model-algorithm kind is reported `<kind>: <identifier> not found.`, and the
+//! kinds recorded with the other wording `<kind> <identifier> does not exist.`. The last
+//! two suites below pin that across the kinds this service resolves by identifier and
+//! across the operations that resolve them, with the algorithm kind as their anchor.
+//!
 //! Every assertion goes through the router, so each case exercises routing,
 //! deserialization, the handler, the persisted state and serialization — the same path a
 //! client takes. The rows of each table differ along what the rule generalises over: which
 //! optional members are present, how deep the container configuration goes, how many tags
-//! and metric definitions there are, the name's length and characters, and the region the
-//! request is signed for.
+//! and metric definitions there are, the name's length and characters, the region the
+//! request is signed for, and which resource kind a refusal names.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -88,12 +95,12 @@ pub(crate) async fn get_algorithm(
 
 /// A `ConfiguredModelAlgorithmArn` in `partition` and `region` for `account` whose resource
 /// id is `id`: the name of a resource this emulator never minted, used by the cases that
-/// read one.
+/// read one. The prefix every Clean Rooms ML ARN shares is spelled once, in [`ml_arn`].
 ///
 /// `pub(crate)` because a sibling suite names the same missing resources through this one
 /// builder rather than repeating that shape's format.
 pub(crate) fn unknown_arn(partition: &str, region: &str, account: &str, id: &str) -> String {
-    format!("arn:{partition}:cleanrooms-ml:{region}:{account}:{RESOURCE}/{id}")
+    ml_arn(partition, region, account, &format!("{RESOURCE}/{id}"))
 }
 
 /// A create request carrying only the two required members.
@@ -427,6 +434,227 @@ async fn an_arn_naming_no_persisted_algorithm_is_not_found() {
     assert_eq!(
         still_there.status, 200,
         "the persisted algorithm must still be served after the misses, got {} with {:?}",
+        still_there.status, still_there.body
+    );
+}
+
+/// A `cleanrooms-ml` ARN of any of this service's resource types: the partition, the
+/// service, the signed region and the account, then the resource path the type's own ARN
+/// shape spells out (`configured-model-algorithm/<id>`, `training-dataset/<id>`,
+/// `audience-model/<id>`, `membership/<uuid>/configured-model-algorithm-association/<id>`).
+/// Built here rather than taken from the crate, so a wrong ARN in a handler fails.
+fn ml_arn(partition: &str, region: &str, account: &str, resource_path: &str) -> String {
+    format!("arn:{partition}:cleanrooms-ml:{region}:{account}:{resource_path}")
+}
+
+/// The not-found refusal is worded for the KIND of resource the request addressed, and
+/// the kind's sentence carries the identifier the request sent for it and nothing else.
+///
+/// The configured-model-algorithm kind is reported `<kind>: <identifier> not found.`; the
+/// kinds recorded with the other wording are reported `<kind> <identifier> does not
+/// exist.`. The sentence follows the kind being RESOLVED rather than the operation doing
+/// the resolving, so an audience-model create that refers to an absent training dataset
+/// words its refusal for the training-dataset kind, and a read of a sub-resource words it
+/// for the sub-resource's own kind.
+///
+/// The rows differ along what the rule generalises over: which kind is addressed, which
+/// operation addresses it (a read, a delete, a create that refers to another kind, a
+/// sub-resource read under a membership) and the shape of the identifier.
+#[tokio::test]
+async fn the_not_found_refusal_words_the_kind_the_request_addressed() {
+    /// One refusal case: the call, and the whole message it must answer with.
+    struct Refusal {
+        case: &'static str,
+        method: &'static str,
+        uri: String,
+        body: Option<Value>,
+        expected: String,
+    }
+
+    // A `UUID`, the shape `GetConfiguredModelAlgorithmAssociationRequest$membershipIdentifier`
+    // declares (@length 36..36, `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`).
+    let membership = "a1b2c3d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
+    let algorithm = unknown_arn("aws", REGION, ACCOUNT, "9c6b1a0e-4d2f-4a11-8e77-5b0c3d9f1a2b");
+    let nested_algorithm = unknown_arn("aws", REGION, ACCOUNT, "team.ml/algorithms/trainer.v2");
+    let dataset = ml_arn(
+        "aws",
+        REGION,
+        ACCOUNT,
+        "training-dataset/5f1c7d3a-9b84-4f62-ae30-6c21d7e8b905",
+    );
+    let model = ml_arn(
+        "aws",
+        REGION,
+        ACCOUNT,
+        "audience-model/7d2e4c8b-13af-4d59-9c62-0fa8b4e7d316",
+    );
+    // Every one of these ARN shapes admits any `aws[-a-z]*` partition, so one row names a
+    // resource in another one: the refusal still echoes the identifier it was sent.
+    let other_partition_model = ml_arn(
+        "aws-us-gov",
+        REGION,
+        ACCOUNT,
+        "audience-model/2b8f6a14-7c35-4e90-bd21-3f07c5a9e648",
+    );
+    let association = ml_arn(
+        "aws",
+        REGION,
+        ACCOUNT,
+        &format!(
+            "membership/{membership}/configured-model-algorithm-association/\
+             1a2b3c4d-5e6f-4071-8293-a4b5c6d7e8f9"
+        ),
+    );
+
+    let cases = vec![
+        Refusal {
+            case: "a configured model algorithm read by its own ARN",
+            method: "GET",
+            uri: format!("/configured-model-algorithms/{}", label(&algorithm)),
+            body: None,
+            expected: format!("Configured Model Algorithm: {algorithm} not found."),
+        },
+        Refusal {
+            case: "a configured model algorithm whose id carries the dots and slashes its \
+                   pattern admits",
+            method: "GET",
+            uri: format!("/configured-model-algorithms/{}", label(&nested_algorithm)),
+            body: None,
+            expected: format!("Configured Model Algorithm: {nested_algorithm} not found."),
+        },
+        Refusal {
+            case: "a training dataset read by its ARN",
+            method: "GET",
+            uri: format!("/training-dataset/{}", label(&dataset)),
+            body: None,
+            expected: format!("Training Dataset {dataset} does not exist."),
+        },
+        Refusal {
+            case: "a training dataset deleted by its ARN",
+            method: "DELETE",
+            uri: format!("/training-dataset/{}", label(&dataset)),
+            body: None,
+            expected: format!("Training Dataset {dataset} does not exist."),
+        },
+        Refusal {
+            case: "an audience model read by its ARN",
+            method: "GET",
+            uri: format!("/audience-model/{}", label(&model)),
+            body: None,
+            expected: format!("Audience Model {model} does not exist."),
+        },
+        Refusal {
+            case: "an audience model of another partition deleted by its ARN",
+            method: "DELETE",
+            uri: format!("/audience-model/{}", label(&other_partition_model)),
+            body: None,
+            expected: format!("Audience Model {other_partition_model} does not exist."),
+        },
+        Refusal {
+            case: "the training dataset an audience-model create refers to",
+            method: "POST",
+            uri: "/audience-model".to_string(),
+            body: Some(json!({
+                "name": "am-on-an-absent-dataset",
+                "trainingDatasetArn": dataset,
+            })),
+            expected: format!("Training Dataset {dataset} does not exist."),
+        },
+        Refusal {
+            case: "a configured model algorithm association read under a membership",
+            method: "GET",
+            uri: format!(
+                "/memberships/{membership}/configured-model-algorithm-associations/{}",
+                label(&association)
+            ),
+            body: None,
+            expected: format!(
+                "Configured Model Algorithm Association {association} does not exist."
+            ),
+        },
+    ];
+
+    let router = emulator();
+    // One real resource exists, so every miss below is a miss on a store that holds
+    // records rather than on an empty one.
+    let created = create_algorithm(&router, REGION, minimal_algorithm("cma-wording")).await;
+    assert_eq!(
+        created.status, 200,
+        "the fixture create must answer HTTP 200, got {} with {:?}",
+        created.status, created.body
+    );
+
+    for Refusal {
+        case,
+        method,
+        uri,
+        body,
+        expected,
+    } in cases
+    {
+        let answer = signed_call(&router, REGION, method, &uri, body).await;
+        assert_eq!(
+            answer.status, 404,
+            "case {case:?}: expected HTTP 404 from {method} {uri}, got {} with {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.error_code(),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException from {method} {uri}, got {:?}",
+            answer.body
+        );
+        let message = answer.at("message").as_str().unwrap_or_default().to_string();
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected the refusal to say {expected:?}, got {message:?}"
+        );
+    }
+}
+
+/// The kind's sentence is answered for an ARN this emulator itself minted, not only for a
+/// synthetic one: an algorithm created in one region is not a resource any other regional
+/// endpoint holds, and each of those endpoints refuses it with the configured-model-algorithm
+/// kind's own wording, naming the minted ARN the request carried.
+#[tokio::test]
+async fn another_endpoint_refuses_a_minted_arn_in_the_algorithm_kinds_wording() {
+    // Rows differ along the endpoint the read is signed for — what the rule generalises
+    // over here — and none of them is the region the create was signed for.
+    let other_regions = ["eu-central-1", "sa-east-1", "us-gov-east-1"];
+    let router = emulator();
+
+    let created = create_algorithm(&router, REGION, minimal_algorithm("cma-one-region")).await;
+    assert_eq!(
+        created.status, 200,
+        "the fixture create must answer HTTP 200, got {} with {:?}",
+        created.status, created.body
+    );
+    let arn = created
+        .at("configuredModelAlgorithmArn")
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    for region in other_regions {
+        let answer = get_algorithm(&router, region, &arn).await;
+        assert_eq!(
+            answer.status, 404,
+            "case {region:?}: expected HTTP 404 for {arn:?}, got {} with {:?}",
+            answer.status, answer.body
+        );
+        let message = answer.at("message").as_str().unwrap_or_default().to_string();
+        let expected = format!("Configured Model Algorithm: {arn} not found.");
+        assert_eq!(
+            message, expected,
+            "case {region:?}: expected the refusal to say {expected:?}, got {message:?}"
+        );
+    }
+
+    // The refusals changed nothing: the endpoint that minted the ARN still serves it.
+    let still_there = get_algorithm(&router, REGION, &arn).await;
+    assert_eq!(
+        still_there.status, 200,
+        "the minting endpoint must still serve {arn:?}, got {} with {:?}",
         still_there.status, still_there.body
     );
 }
