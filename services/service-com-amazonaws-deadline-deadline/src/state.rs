@@ -220,6 +220,27 @@ pub const QUEUE_FLEET_ASSOCIATION_STATUS_STOPPED: &str = "STOPPED";
 /// by the clock.
 pub const QUEUE_LIMIT_ASSOCIATION_STATUS_ACTIVE: &str = "ACTIVE";
 
+/// How long after `UpdateQueueLimitAssociation` asks an association to stop the queue's use
+/// of the limit the `STOP_LIMIT_USAGE_AND_* -> STOPPED` move comes due.
+///
+/// `smithy_query(query="doc", shape="UpdateQueueLimitAssociation")` documents the delay
+/// itself — "If you set the status to one of the STOP_LIMIT_USAGE* values, there will be a
+/// delay before the status transitions to the STOPPED state" — but no length for it, so
+/// this is the emulator's chosen span, the one the other association of a queue drains over
+/// ([`QUEUE_FLEET_ASSOCIATION_STOPPED_AFTER`]): a caller that reads the association straight
+/// back still observes it stopping, and nothing ever sleeps for it, because the due instant
+/// is stored and compared on read.
+pub const QUEUE_LIMIT_ASSOCIATION_STOPPED_AFTER: Duration = Duration::from_secs(3);
+
+/// The `QueueLimitAssociationStatus` an association has stopped the queue's use of the
+/// limit in.
+///
+/// The one TERMINAL value of that enum: the two `STOP_LIMIT_USAGE_AND_*` statuses are the
+/// association on its way here, and [`QUEUE_LIMIT_ASSOCIATION_STATUS_ACTIVE`] is the queue's
+/// work subject to the limit. The limit is released from the queue's work only in this
+/// status.
+pub const QUEUE_LIMIT_ASSOCIATION_STATUS_STOPPED: &str = "STOPPED";
+
 /// `BudgetStatus` a freshly created budget carries.
 ///
 /// From `smithy_query(query="shape", shape="BudgetStatus")`: `ACTIVE`, `INACTIVE`. A
@@ -903,6 +924,59 @@ pub struct QueueLimitAssociation {
     pub created_by: String,
     pub updated_at: Option<SystemTime>,
     pub updated_by: Option<String>,
+    /// When the clock-owed `STOP_LIMIT_USAGE_AND_* -> STOPPED` move comes due; `None` while
+    /// no stop is underway, and again once it has been materialised. See
+    /// [`QUEUE_LIMIT_ASSOCIATION_STOPPED_AFTER`].
+    pub stopped_due_at: Option<Instant>,
+}
+
+impl QueueLimitAssociation {
+    /// Whether this association has stopped subjecting the queue's work to the limit.
+    ///
+    /// [`QUEUE_LIMIT_ASSOCIATION_STATUS_STOPPED`] is the one status in which neither new
+    /// usage of the limit nor the completion or cancellation of the tasks already using it
+    /// is still attached to the queue.
+    pub fn stopped(&self) -> bool {
+        self.status == QUEUE_LIMIT_ASSOCIATION_STATUS_STOPPED
+    }
+
+    /// Materialise the `STOP_LIMIT_USAGE_AND_* -> STOPPED` move the clock already made due.
+    ///
+    /// A read calls this before answering: the stop was owed at this instant whether or not
+    /// anybody called, so applying it on read is reporting, not mutating. It writes no
+    /// timestamp — `updatedAt` stays at the update that asked for the stop, so what a read
+    /// reports does not depend on when somebody polled — exactly as the queue's other
+    /// association leaves it ([`QueueFleetAssociation::settle_status`]).
+    pub fn settle_status(&mut self) {
+        if let Some(due) = self.stopped_due_at {
+            if Instant::now() >= due {
+                self.status = QUEUE_LIMIT_ASSOCIATION_STATUS_STOPPED.to_string();
+                self.stopped_due_at = None;
+            }
+        }
+    }
+
+    /// Ask this association for `status`, as `UpdateQueueLimitAssociation` names it.
+    ///
+    /// `ACTIVE` subjects the queue's work to the limit again at once, so nothing is owed by
+    /// the clock for it; either `STOP_LIMIT_USAGE_AND_*` is the association winding the
+    /// queue's usage of the limit down, which the clock finishes
+    /// [`QUEUE_LIMIT_ASSOCIATION_STOPPED_AFTER`] later. That wind-down is the service
+    /// stopping usage, so an association that has already stopped has none left to stop:
+    /// asking it for either stop status leaves it
+    /// [`QUEUE_LIMIT_ASSOCIATION_STATUS_STOPPED`], and asking for the status it already
+    /// carries changes nothing and does not restart a stop underway.
+    pub fn ask_for_status(&mut self, status: &str, by: &str) {
+        let stopping = status != QUEUE_LIMIT_ASSOCIATION_STATUS_ACTIVE;
+        if self.status == status || (stopping && self.stopped()) {
+            return;
+        }
+        self.status = status.to_string();
+        self.stopped_due_at =
+            stopping.then(|| Instant::now() + QUEUE_LIMIT_ASSOCIATION_STOPPED_AFTER);
+        self.updated_at = Some(SystemTime::now());
+        self.updated_by = Some(by.to_string());
+    }
 }
 
 /// A persisted job, as `CreateJob` stored it under its queue.
@@ -1428,6 +1502,31 @@ impl ComAmazonawsDeadlineDeadlineState {
         self.queue(farm_id, queue_id)?
             .limit_associations
             .get(limit_id)
+    }
+
+    /// Mutable form of [`queue_limit_association`](Self::queue_limit_association).
+    pub fn queue_limit_association_mut(
+        &mut self,
+        farm_id: &str,
+        queue_id: &str,
+        limit_id: &str,
+    ) -> Option<&mut QueueLimitAssociation> {
+        self.queue_mut(farm_id, queue_id)?
+            .limit_associations
+            .get_mut(limit_id)
+    }
+
+    /// [`queue_limit_association`](Self::queue_limit_association) with any clock-owed stop
+    /// already materialised: what a read of the association reports.
+    pub fn settled_queue_limit_association(
+        &mut self,
+        farm_id: &str,
+        queue_id: &str,
+        limit_id: &str,
+    ) -> Option<&QueueLimitAssociation> {
+        let association = self.queue_limit_association_mut(farm_id, queue_id, limit_id)?;
+        association.settle_status();
+        Some(association)
     }
 
     /// The limit already associated with `queue_id` that declares

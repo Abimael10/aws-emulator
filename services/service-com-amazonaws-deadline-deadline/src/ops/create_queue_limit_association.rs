@@ -229,6 +229,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 created_by,
                 updated_at: None,
                 updated_by: None,
+                // Nothing is owed by the clock for a fresh association: only an update
+                // asking it to stop starts a wind-down.
+                stopped_due_at: None,
             });
 
         Ok(CreateQueueLimitAssociationOutput {})

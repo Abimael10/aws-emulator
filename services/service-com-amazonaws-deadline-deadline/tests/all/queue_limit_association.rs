@@ -34,18 +34,18 @@ fn create_association_path(farm_id: &str) -> String {
 /// `GET /2023-10-12/farms/{farmId}/queue-limit-associations/{queueId}/{limitId}` — where
 /// one association is read, from
 /// `smithy_query(query="operation", operation="GetQueueLimitAssociation")`.
-fn association_path(farm_id: &str, queue_id: &str, limit_id: &str) -> String {
+pub(crate) fn association_path(farm_id: &str, queue_id: &str, limit_id: &str) -> String {
     format!("/2023-10-12/farms/{farm_id}/queue-limit-associations/{queue_id}/{limit_id}")
 }
 
 /// The composite id this service reports for a queue-limit association: the three ids of
 /// its path, since the model mints the association no id of its own.
-fn association_id(farm_id: &str, queue_id: &str, limit_id: &str) -> String {
+pub(crate) fn association_id(farm_id: &str, queue_id: &str, limit_id: &str) -> String {
     format!("{farm_id}, {queue_id} and {limit_id}")
 }
 
 /// A `CreateLimit` body for a limit declaring `amount_requirement_name`.
-fn limit_body(display_name: &str, amount_requirement_name: &str) -> Value {
+pub(crate) fn limit_body(display_name: &str, amount_requirement_name: &str) -> Value {
     json!({
         "displayName": display_name,
         "amountRequirementName": amount_requirement_name,
@@ -71,7 +71,7 @@ async fn associate(
 }
 
 /// Associate the pair and fail the test unless the create was accepted.
-async fn associate_ok(emulator: &Emulator, farm_id: &str, queue_id: &str, limit_id: &str) {
+pub(crate) async fn associate_ok(emulator: &Emulator, farm_id: &str, queue_id: &str, limit_id: &str) {
     let (status, body) = associate(emulator, farm_id, queue_id, limit_id).await;
     assert_eq!(
         status, 200,
@@ -84,7 +84,7 @@ async fn associate_ok(emulator: &Emulator, farm_id: &str, queue_id: &str, limit_
 }
 
 /// Read one association back, failing the test if it can't be read.
-async fn read_association(
+pub(crate) async fn read_association(
     emulator: &Emulator,
     farm_id: &str,
     queue_id: &str,

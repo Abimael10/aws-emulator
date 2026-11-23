@@ -154,8 +154,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A read: nothing about a queue-limit association is owed by the clock, so this
-        // reports the stored association and writes nothing at all.
+        // A read: the only thing it writes is the `STOP_LIMIT_USAGE_AND_* -> STOPPED` move
+        // the clock already made due, which was owed at this instant whether or not anybody
+        // called, so a later caller sees exactly what it would have seen anyway.
         let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
@@ -165,7 +166,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        let store = state.lock();
+        let mut store = state.lock();
 
         if store.farm(&input.farm_id).is_none() {
             return Err(GetQueueLimitAssociationErrorModeled::ResourceNotFoundException(
@@ -191,7 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Past that, the association is identified by the three ids of its path, so a held
         // limit this queue is not associated with is the association that can't be found.
         let Some(association) =
-            store.queue_limit_association(&input.farm_id, &input.queue_id, &input.limit_id)
+            store.settled_queue_limit_association(&input.farm_id, &input.queue_id, &input.limit_id)
         else {
             return Err(GetQueueLimitAssociationErrorModeled::ResourceNotFoundException(
                 crate::state::queue_limit_association_not_found(
