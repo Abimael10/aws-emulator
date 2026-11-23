@@ -539,8 +539,8 @@ async fn a_request_outside_the_documented_rules_is_refused_and_persists_nothing(
             "AddPermission",
             json!({"QueueUrl": url, "Label": "too-many-actions",
                    "AWSAccountIds": [OTHER_ACCOUNT], "Actions": past_the_action_bound}),
-            400,
-            "InvalidParameterValue",
+            403,
+            "OverLimit",
         ),
         (
             "one principal past what a statement may name",
@@ -674,6 +674,127 @@ async fn a_grant_past_the_permission_bound_is_refused_as_over_limit() {
         status, 200,
         "case granting after a revoke made room: expected HTTP 200, got {status} with {parsed}"
     );
+}
+
+/// A statement may allow at most the actions AWS publishes for one, and a grant naming
+/// more is a LIMIT violation rather than a bad parameter: it is refused `OverLimit` at HTTP
+/// 403 with the sentence a policy ceiling is stated in — the count the request named and
+/// the ceiling — and the queue keeps the policy it had.
+///
+/// The rows span what the rule generalises over: HOW FAR past the ceiling the request
+/// reaches (one action, two, the whole catalog) and WHICH actions it names, so the count
+/// the sentence reports is the request's own and not the ceiling restated. The row AT the
+/// ceiling is served, which is what makes the refusal about the action the request added.
+#[tokio::test]
+async fn a_grant_past_the_action_ceiling_is_refused_as_over_limit() {
+    // The ceiling AWS publishes for one statement, spelled out here rather than imported,
+    // so a wrong constant in the service cannot make a row pass: "An Amazon SQS policy can
+    // have a maximum of seven actions per statement" (`AddPermission`'s own documentation).
+    const PUBLISHED_ACTION_CEILING: usize = 7;
+    assert_eq!(
+        MAX_ACTIONS_PER_STATEMENT, PUBLISHED_ACTION_CEILING,
+        "case the published ceiling: expected the limit AWS publishes, got \
+         {MAX_ACTIONS_PER_STATEMENT}"
+    );
+
+    let router = emulator();
+    let url = create_ok(&router, "action-ceiling", &json!({})).await;
+    let catalog: Vec<&str> = policy_action_names().to_vec();
+    assert!(
+        catalog.len() > PUBLISHED_ACTION_CEILING + 1,
+        "case the action catalog: expected more names than the ceiling, got {catalog:?}"
+    );
+
+    // (case, the actions the grant names)
+    let refused: Vec<(&str, Vec<&str>)> = vec![
+        (
+            "one action past the ceiling",
+            catalog.iter().take(PUBLISHED_ACTION_CEILING + 1).copied().collect(),
+        ),
+        (
+            "two actions past the ceiling",
+            catalog.iter().take(PUBLISHED_ACTION_CEILING + 2).copied().collect(),
+        ),
+        (
+            "the last names of the catalog, one past the ceiling",
+            catalog
+                .iter()
+                .rev()
+                .take(PUBLISHED_ACTION_CEILING + 1)
+                .copied()
+                .collect(),
+        ),
+        ("every action this service has", catalog.clone()),
+        (
+            "the wildcard action repeated past the ceiling",
+            vec![EXPECTED_ANY_ACTION; PUBLISHED_ACTION_CEILING + 1],
+        ),
+    ];
+
+    let before = policy_of(&router, &url).await;
+    for (index, (case, actions)) in refused.iter().enumerate() {
+        let label = format!("past-the-ceiling-{index}");
+        let (status, parsed) = grant(&router, &url, &label, &[OTHER_ACCOUNT], actions).await;
+        let expected = format!(
+            "{} Actions were found, maximum allowed is {PUBLISHED_ACTION_CEILING}. ",
+            actions.len()
+        );
+        assert_eq!(
+            (status, error_code(&parsed).as_str(), message_of(&parsed)),
+            (403, "OverLimit", expected.clone()),
+            "case {case}: expected a 403 OverLimit reading {expected:?}, got {status} with \
+             {parsed}"
+        );
+        assert_eq!(
+            policy_of(&router, &url).await,
+            before,
+            "case {case}: a refused grant must leave the policy as it was"
+        );
+    }
+
+    // The grant AT the ceiling is served, and its statement carries every action it named.
+    let at_the_ceiling: Vec<&str> = catalog
+        .iter()
+        .take(PUBLISHED_ACTION_CEILING)
+        .copied()
+        .collect();
+    let (status, parsed) = grant(
+        &router,
+        &url,
+        "at-the-ceiling",
+        &[OTHER_ACCOUNT],
+        &at_the_ceiling,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case the grant at the ceiling: expected HTTP 200, got {status} with {parsed}"
+    );
+    let policy = policy_of(&router, &url)
+        .await
+        .expect("case the grant at the ceiling: the queue reports no Policy");
+    let allowed = statement_for(&policy, "at-the-ceiling")
+        .get("Action")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let wanted: Vec<Value> = at_the_ceiling
+        .iter()
+        .map(|action| json!(format!("{EXPECTED_ACTION_PREFIX}{action}")))
+        .collect();
+    assert_eq!(
+        allowed, wanted,
+        "case the grant at the ceiling: expected every action it named, got {policy}"
+    );
+}
+
+/// The `message` member of a refusal, as awsJson renders it.
+fn message_of(body: &Value) -> String {
+    body.get("message")
+        .or_else(|| body.get("Message"))
+        .and_then(Value::as_str)
+        .unwrap_or("<no message>")
+        .to_string()
 }
 
 /// The policy a queue carries is bounded in BYTES as well as in statements: grants that

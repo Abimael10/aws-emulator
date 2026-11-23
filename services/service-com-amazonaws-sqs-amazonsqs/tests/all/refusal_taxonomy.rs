@@ -32,7 +32,7 @@ use service_com_amazonaws_sqs_amazonsqs::state::{
     MAX_TAG_VALUE_LENGTH,
 };
 
-use super::support::{call, create_ok, dead_letter_queue, emulator, error_code, expected_arn};
+use super::support::{call, create_ok, dead_letter_queue, emulator, error_code, expected_arn, messages, ok};
 
 /// Every error code a refusal of this service may carry.
 ///
@@ -858,5 +858,177 @@ async fn a_refused_request_leaves_the_queue_as_it_was() {
         after.get("VisibilityTimeout"),
         before.get("VisibilityTimeout"),
         "case a refused update: VisibilityTimeout must keep the value it had, got {after:?}"
+    );
+}
+
+/// The class a body this endpoint's JSON wire could not READ is answered under, and the
+/// whole document that answer carries.
+///
+/// This is the OTHER half of the taxonomy above: a value the body carried that the
+/// operation does not accept is an input fault, reported per member under the parameter
+/// classes this service words; a value whose JSON TYPE the member's modelled shape cannot
+/// hold fails deserialization before any member is read, and is answered as the wire fault
+/// it is — `SerializationException`, named by the shape id of the request framework in front
+/// of this service, with a body of exactly the class and one sentence. A client
+/// distinguishes a bug in its own serializer (never retryable, no member to fix) from a
+/// value it must correct, so neither class may be answered as the other — and neither may
+/// be answered as `ValidationException`, which is no shape of this model.
+///
+/// The rows span what the rule generalises over rather than the one body a defect was
+/// reported for: the OPERATION, the MEMBER's modelled shape (a string, a list, a map, a
+/// structure, an integer), WHERE the wrong type sits (the member itself, or one element of
+/// its collection) and WHICH JSON type the body held there.
+#[tokio::test]
+async fn a_body_the_json_wire_cannot_read_is_answered_as_a_serialization_fault() {
+    let router = emulator();
+    let url = create_ok(&router, "unreadable-body", &json!({})).await;
+
+    // (case, the request body as it arrives on the wire, the sentence the answer owes)
+    let rows: Vec<(&str, Value, &str)> = vec![
+        (
+            "a number in a list of strings",
+            json!({"QueueUrl": url, "MessageAttributeNames": [5]}),
+            "NUMBER_VALUE cannot be converted to String",
+        ),
+        (
+            "a boolean in a list of strings",
+            json!({"QueueUrl": url, "MessageAttributeNames": [true]}),
+            "BOOLEAN_VALUE cannot be converted to String",
+        ),
+        (
+            "a structure in a list of strings",
+            json!({"QueueUrl": url, "MessageAttributeNames": [{"a": "b"}]}),
+            "Start of structure or map found where not expected",
+        ),
+        (
+            "a number where a list is declared",
+            json!({"QueueUrl": url, "MessageAttributeNames": 42}),
+            "Unexpected field type",
+        ),
+        (
+            "a structure where a list is declared",
+            json!({"QueueUrl": url, "MessageAttributeNames": {"a": "b"}}),
+            "Unexpected field type",
+        ),
+        (
+            "a number where a string member is declared",
+            json!({"QueueUrl": 5}),
+            "NUMBER_VALUE cannot be converted to String",
+        ),
+        (
+            "a string where an integer member is declared",
+            json!({"QueueUrl": url, "MaxNumberOfMessages": "two"}),
+            "STRING_VALUE cannot be converted to Integer",
+        ),
+    ];
+
+    for (case, body, sentence) in &rows {
+        let (status, answer) = unreadable(&router, "ReceiveMessage", body).await;
+        assert_serialization_fault(case, status, &answer, sentence);
+    }
+
+    // The same rule on the members of other operations: a map member whose value is no
+    // map, and a list of structures holding something that is no structure.
+    let other_operations: Vec<(&str, &str, Value, &str)> = vec![
+        (
+            "a list where a map member is declared",
+            "SetQueueAttributes",
+            json!({"QueueUrl": url, "Attributes": []}),
+            "Unexpected field type",
+        ),
+        (
+            "a number where a batch entry is declared",
+            "SendMessageBatch",
+            json!({"QueueUrl": url, "Entries": [7]}),
+            "Unexpected field type",
+        ),
+        (
+            "a structure where a batch entry's string member is declared",
+            "SendMessageBatch",
+            json!({"QueueUrl": url, "Entries": [{"Id": "one", "MessageBody": {"a": "b"}}]}),
+            "Start of structure or map found where not expected",
+        ),
+    ];
+    for (case, operation, body, sentence) in &other_operations {
+        let (status, answer) = unreadable(&router, operation, body).await;
+        assert_serialization_fault(case, status, &answer, sentence);
+    }
+
+    // A body this wire CAN read is still served afterwards: the refusals above are about
+    // the bodies that carried a wrong type and about nothing else.
+    let _ = ok(
+        &router,
+        "SendMessage",
+        json!({"QueueUrl": url, "MessageBody": "payload"}),
+    )
+    .await;
+    let received = messages(
+        &ok(
+            &router,
+            "ReceiveMessage",
+            json!({"QueueUrl": url, "MessageAttributeNames": ["All"]}),
+        )
+        .await,
+    );
+    assert_eq!(
+        received.len(),
+        1,
+        "case a well-formed request after the unreadable ones: expected the one sent \
+         message, got {received:?}"
+    );
+}
+
+/// The class and the sentence a deserialization fault is answered with, and the two members
+/// that answer carries.
+///
+/// The id is written out here rather than read off the service, so a name that drifts away
+/// from the one a client resolves its typed exception from fails this suite.
+const SERIALIZATION_EXCEPTION: &str = "com.amazon.coral.service#SerializationException";
+
+/// Send `body` VERBATIM as `operation`'s request document — no shape of the service is
+/// involved in writing it, so a member can carry a JSON type its model does not declare —
+/// and answer the status and the parsed document.
+async fn unreadable(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
+    let (status, answered) = super::support::post_bytes(
+        router,
+        operation,
+        serde_json::to_vec(body).expect("the request body serializes"),
+    )
+    .await;
+    (
+        status,
+        serde_json::from_slice(&answered).unwrap_or(Value::Null),
+    )
+}
+
+/// One answer to a body the wire could not read: HTTP 400, the deserialization class, the
+/// sentence stating the mismatch, and exactly those two members — a per-member validation
+/// report is not what this class carries.
+fn assert_serialization_fault(case: &str, status: u16, answer: &Value, sentence: &str) {
+    let named = answer.get("__type").and_then(Value::as_str);
+    assert_eq!(
+        (status, named),
+        (400, Some(SERIALIZATION_EXCEPTION)),
+        "case {case}: expected a 400 {SERIALIZATION_EXCEPTION}, got {status} with {answer}"
+    );
+    let reported = answer.get("Message").and_then(Value::as_str);
+    assert_eq!(
+        reported,
+        Some(sentence),
+        "case {case}: expected the sentence {sentence:?}, got {answer}"
+    );
+    let mut members: Vec<&str> = answer
+        .as_object()
+        .map(|document| document.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    members.sort_unstable();
+    assert_eq!(
+        members,
+        vec!["Message", "__type"],
+        "case {case}: the answer carries exactly the class and the sentence, got {answer}"
     );
 }

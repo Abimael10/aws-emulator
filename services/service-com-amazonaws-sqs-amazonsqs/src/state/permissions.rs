@@ -126,17 +126,50 @@ pub const ACTION_NAMES: &[&str] = &[
     "UntagQueue",
 ];
 
+/// How a refusal states a count past a published ceiling on what a queue policy may hold:
+/// the count the REQUEST named, the collection it named them in, and the ceiling.
+///
+/// RECORDED: a grant naming more actions than one statement may allow is refused in exactly
+/// this sentence — "<n> Actions were found, maximum allowed is <ceiling>. " — and so is one
+/// past the statements a policy may carry. One sentence for every ceiling of this document,
+/// so the three it words cannot drift apart. The fixed text is everything outside the two
+/// numbers and the collection's name, down to the space the sentence ends with; neither the
+/// queue nor any value of the request is named, because the pair of numbers is the whole of
+/// what the caller has to fix the request from.
+fn policy_limit_message(were_found: usize, collection: &str, maximum: usize) -> String {
+    format!("{were_found} {collection} were found, maximum allowed is {maximum}. ")
+}
+
 /// How a refusal states that a grant would take the queue's policy past the statements one
 /// policy may carry.
 ///
 /// `would_hold` is the number of statements the REQUEST would leave the policy with — the
 /// count it asked for, not the count the policy holds today — and the ceiling is the
-/// published one ([`MAX_POLICY_STATEMENTS`]). The fixed text is everything outside those two
-/// numbers, down to the space the sentence ends with; the queue is not named, because the
-/// pair of numbers is the whole of what the caller has to fix the request from.
+/// published one ([`MAX_POLICY_STATEMENTS`]).
 pub fn policy_statement_limit_message(would_hold: usize) -> String {
-    format!("{would_hold} Statements were found, maximum allowed is {MAX_POLICY_STATEMENTS}. ")
+    policy_limit_message(would_hold, STATEMENT_COLLECTION, MAX_POLICY_STATEMENTS)
 }
+
+/// How a refusal states that a statement would allow more actions than one may: the same
+/// sentence over the actions the request named, against the published per-statement ceiling
+/// ([`MAX_ACTIONS_PER_STATEMENT`]).
+pub fn policy_action_limit_message(were_found: usize) -> String {
+    policy_limit_message(were_found, ACTION_COLLECTION, MAX_ACTIONS_PER_STATEMENT)
+}
+
+/// How a refusal states that a statement names more principals than one may: the same
+/// sentence again, against the published per-statement ceiling
+/// ([`MAX_PRINCIPALS_PER_STATEMENT`]).
+pub fn policy_principal_limit_message(were_found: usize) -> String {
+    policy_limit_message(were_found, PRINCIPAL_COLLECTION, MAX_PRINCIPALS_PER_STATEMENT)
+}
+
+/// The collections a policy ceiling is counted over, named as the thing counted: the
+/// statements of the policy document, and the request's own members a grant names its
+/// actions and its principals in (`AddPermissionRequest$Actions` / `$AWSAccountIds`).
+const STATEMENT_COLLECTION: &str = "Statements";
+const ACTION_COLLECTION: &str = "Actions";
+const PRINCIPAL_COLLECTION: &str = "AWSAccountIds";
 
 /// Why a permission cannot be granted, as the text of the refusal a caller has to fix
 /// the request from. The two kinds answer under different error codes, which is why they
@@ -197,21 +230,19 @@ pub(super) fn principals_refusal(account_numbers: &[String]) -> Option<Permissio
         }
     }
     (account_numbers.len() > MAX_PRINCIPALS_PER_STATEMENT).then(|| {
-        PermissionRefusal::Limit(format!(
-            "An Amazon SQS policy statement can name a maximum of \
-             {MAX_PRINCIPALS_PER_STATEMENT} principals, and this one names {}.",
-            account_numbers.len()
-        ))
+        PermissionRefusal::Limit(policy_principal_limit_message(account_numbers.len()))
     })
 }
 
 /// Why the actions a grant allows cannot be allowed, or `None` when they can.
 ///
-/// The per-statement ceiling is refused as a PARAMETER fault rather than as a limit: the
-/// condition `OverLimit` is documented for on this call is the other one — "AddPermission
-/// returns this error if the maximum number of permissions for the queue is reached" —
-/// and a request naming more actions than one statement may allow is a request this call
-/// could never serve, whatever the queue already carries.
+/// The two kinds of fault answer differently, which is the whole of this reading: a name
+/// this service has no action for is a PARAMETER fault, because no count of actions would
+/// make it an action; the per-statement ceiling is a published LIMIT — "An Amazon SQS
+/// policy can have a maximum of seven actions per statement" — and `OverLimit` is the
+/// class this call models for exactly that ("The specified action violates a limit"), so a
+/// statement naming more actions than one may allow is refused under it, in the sentence a
+/// policy ceiling is stated in ([`policy_action_limit_message`]).
 pub(super) fn actions_refusal(actions: &[String]) -> Option<PermissionRefusal> {
     for action in actions {
         if action != ANY_ACTION && !authorization::policy_action_names().contains(&action.as_str()) {
@@ -224,16 +255,8 @@ pub(super) fn actions_refusal(actions: &[String]) -> Option<PermissionRefusal> {
             )));
         }
     }
-    (actions.len() > MAX_ACTIONS_PER_STATEMENT).then(|| {
-        PermissionRefusal::Parameter(invalid_parameter_message_without_value(
-            ACTION_PARAMETER,
-            &format!(
-                "An Amazon SQS policy can have a maximum of {MAX_ACTIONS_PER_STATEMENT} actions \
-                 per statement, and this one has {}.",
-                actions.len()
-            ),
-        ))
-    })
+    (actions.len() > MAX_ACTIONS_PER_STATEMENT)
+        .then(|| PermissionRefusal::Limit(policy_action_limit_message(actions.len())))
 }
 
 /// The reason a grant is refused for an action name this service has no action for: the

@@ -909,7 +909,7 @@ async fn md5_of_message_attributes_matches_the_documented_byte_layout() {
 }
 
 /// `MessageAttributeNames` selects by exact name, by the `prefix.*` wildcard, or
-/// everything with `All`/`.*` — and an absent list selects nothing.
+/// everything with `All`/`*`/`.*` — and an absent list selects nothing.
 #[tokio::test]
 async fn message_attribute_names_select_exactly_what_was_asked_for() {
     let sqs = Emulator::new();
@@ -932,13 +932,15 @@ async fn message_attribute_names_select_exactly_what_was_asked_for() {
     let cases: [(Vec<&str>, Vec<&str>); 8] = [
         (vec!["All"], vec!["bar.baz", "barbaz", "qux"]),
         (vec![".*"], vec!["bar.baz", "barbaz", "qux"]),
+        // The bare wildcard is the third spelling of the select-all form, beside `All`
+        // and `.*`.
+        (vec!["*"], vec!["bar.baz", "barbaz", "qux"]),
         // `bar.*` selects every name starting with `bar`, the `.` being the wildcard's
         // own separator — so `barbaz` is selected too.
         (vec!["bar.*"], vec!["bar.baz", "barbaz"]),
-        // The wildcard form is `prefix.*`: `bar*` and a bare `*` are exact names, which
-        // nothing here is called.
+        // The prefix form is `prefix.*`: `bar*` names no wildcard suffix, so it is an
+        // exact name, which nothing here is called.
         (vec!["bar*"], vec![]),
-        (vec!["*"], vec![]),
         (vec!["qux"], vec!["qux"]),
         (vec!["qux", "barbaz"], vec!["barbaz", "qux"]),
         (vec![], vec![]),

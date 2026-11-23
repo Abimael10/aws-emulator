@@ -203,13 +203,17 @@ const MAX_NUMBER_OF_MESSAGES_RANGE: (i32, i32) = (1, 10);
 
 /// Does `requested` ask for the message attribute (or system attribute) `name`?
 ///
-/// The forms Amazon SQS accepts in `MessageAttributeNames`: `All` selects every
-/// attribute, and a name ending in `.*` is a PREFIX selector — it selects every
-/// attribute whose name begins with what stands before the `.*`, so a bare `.*` selects
-/// everything. Anything else is an exact name.
+/// The forms Amazon SQS accepts in `MessageAttributeNames`: `All`, `*` and `.*` each
+/// select EVERY attribute, and a name ending in `.*` is a PREFIX selector — it selects
+/// every attribute whose name begins with what stands before the `.*`, so the bare `.*`
+/// selects everything by selecting the empty prefix. Anything else is an exact name.
+///
+/// The three select-all forms are one selector with three spellings, so a consumer written
+/// against the one its SDK's samples use projects the same set as a consumer written
+/// against either other.
 fn selects(requested: &[String], name: &str) -> bool {
     requested.iter().any(|pattern| {
-        if pattern == sqs::ALL_ATTRIBUTES {
+        if pattern == sqs::ALL_ATTRIBUTES || pattern == EVERY_ATTRIBUTE {
             return true;
         }
         match pattern.strip_suffix(".*") {
@@ -218,6 +222,11 @@ fn selects(requested: &[String], name: &str) -> bool {
         }
     })
 }
+
+/// The bare wildcard that selects every attribute, beside `All` ([`sqs::ALL_ATTRIBUTES`])
+/// and `.*`. It is the whole selector, not a prefix one: `order*` names no `.*` suffix and
+/// no attribute called `order*`, so it selects nothing.
+const EVERY_ATTRIBUTE: &str = "*";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the

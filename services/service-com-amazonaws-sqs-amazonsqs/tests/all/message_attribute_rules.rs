@@ -516,6 +516,167 @@ async fn message_attribute_types_and_values_are_validated() {
     }
 }
 
+/// Which TYPE a refused attribute's message names, which is not the same type in the two
+/// refusals an attribute's value can earn.
+///
+/// The rule: a value that is absent or empty is refused against the type the request
+/// DECLARED, so the message names the `DataType` as submitted — "you can also append custom
+/// labels", and a caller shown only the base type cannot see what it sent; a value supplied
+/// in the field the other type names is refused against the BASE type, because the base
+/// type is what decides which field carries the value. One `InvalidParameterValue` either
+/// way, and nothing is enqueued.
+///
+/// The rows span what the rule generalises over: each base type, with and without a custom
+/// label, each way a value can be missing (absent, empty) and each way it can be misplaced.
+#[tokio::test]
+async fn a_refused_attribute_value_names_the_type_the_request_declared() {
+    let router = emulator();
+    let url = create_ok(&router, "declared-type-refusals", &json!({})).await;
+
+    // (case, the attribute the send supplies, the whole message the refusal owes)
+    let rows: Vec<(&str, Value, String)> = vec![
+        (
+            "no value, a bare base type",
+            json!({ "DataType": "String" }),
+            missing_value_message("String"),
+        ),
+        (
+            "no value, a custom label on String",
+            json!({ "DataType": "String.custom" }),
+            missing_value_message("String.custom"),
+        ),
+        (
+            "no value, a custom label on Binary",
+            json!({ "DataType": "Binary.custom" }),
+            missing_value_message("Binary.custom"),
+        ),
+        (
+            "no value, a bare Number",
+            json!({ "DataType": "Number" }),
+            missing_value_message("Number"),
+        ),
+        (
+            "no value, a custom label on Number",
+            json!({ "DataType": "Number.float" }),
+            missing_value_message("Number.float"),
+        ),
+        (
+            "no value, two label segments",
+            json!({ "DataType": "String.custom.v2" }),
+            missing_value_message("String.custom.v2"),
+        ),
+        (
+            "an empty StringValue under a custom label",
+            json!({ "DataType": "String.custom", "StringValue": "" }),
+            missing_value_message("String.custom"),
+        ),
+        (
+            "an empty BinaryValue under a custom label",
+            json!({ "DataType": "Binary.custom", "BinaryValue": "" }),
+            missing_value_message("Binary.custom"),
+        ),
+        (
+            "a labelled Binary supplied in StringValue",
+            json!({ "DataType": "Binary.custom", "StringValue": "abc" }),
+            wrong_field_message("Binary", "Binary"),
+        ),
+        (
+            "a labelled String supplied in BinaryValue",
+            json!({ "DataType": "String.custom", "BinaryValue": "3q2+7w==" }),
+            wrong_field_message("String", "String"),
+        ),
+        (
+            "a labelled Number supplied in BinaryValue",
+            json!({ "DataType": "Number.float", "BinaryValue": "3q2+7w==" }),
+            wrong_field_message("Number", "String"),
+        ),
+        (
+            "a bare Binary supplied in StringValue",
+            json!({ "DataType": "Binary", "StringValue": "abc" }),
+            wrong_field_message("Binary", "Binary"),
+        ),
+    ];
+
+    for (case, value, expected) in &rows {
+        let before = held(&router, &url).await;
+        let (status, answer) = send_with_attributes(&router, &url, &json!({ ATTRIBUTE: value })).await;
+        let reported = answer
+            .get("message")
+            .or_else(|| answer.get("Message"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert_eq!(
+            (status, error_code(&answer).as_str(), reported),
+            (REFUSAL.0, REFUSAL.1, expected.as_str()),
+            "case {case}: expected a {} {} reading {expected:?}, got {status} with {answer}",
+            REFUSAL.0,
+            REFUSAL.1
+        );
+        assert_eq!(
+            held(&router, &url).await,
+            before,
+            "case {case}: a refused send must enqueue nothing"
+        );
+    }
+
+    // A well-formed value under a custom label is taken and round-trips with the label it
+    // was sent under: the refusals above are about the value, not about the label.
+    let sent = ok(
+        &router,
+        "SendMessage",
+        json!({
+            "QueueUrl": url,
+            "MessageBody": "payload",
+            "MessageAttributes": {
+                ATTRIBUTE: { "DataType": "String.custom", "StringValue": "ok-value" },
+            },
+        }),
+    )
+    .await;
+    assert!(
+        sent["MD5OfMessageAttributes"].is_string(),
+        "case a well-formed custom-typed attribute: expected it taken, got {sent}"
+    );
+    let received = messages(
+        &ok(
+            &router,
+            "ReceiveMessage",
+            json!({"QueueUrl": url, "MessageAttributeNames": ["All"]}),
+        )
+        .await,
+    );
+    assert_eq!(
+        received.len(),
+        1,
+        "case a well-formed custom-typed attribute: expected the one sent message, got \
+         {received:?}"
+    );
+    assert_eq!(
+        received[0]["MessageAttributes"][ATTRIBUTE],
+        json!({ "DataType": "String.custom", "StringValue": "ok-value" }),
+        "case a well-formed custom-typed attribute: expected it back as sent, got {}",
+        received[0]
+    );
+}
+
+/// The attribute name every row of the table above supplies its value under: one name, so
+/// what differs between rows is the type and the value alone.
+const ATTRIBUTE: &str = "N";
+
+/// The sentence a value that is absent or empty earns, naming the type as SUBMITTED.
+fn missing_value_message(declared: &str) -> String {
+    format!(
+        "Message (user) attribute '{ATTRIBUTE}' must contain a non-empty value of type \
+         '{declared}'."
+    )
+}
+
+/// The sentence a value supplied in the wrong field earns, naming the BASE type and the
+/// field that type's values travel in.
+fn wrong_field_message(base: &str, field: &str) -> String {
+    format!("Message (user) attribute '{ATTRIBUTE}' with type '{base}' must use field '{field}'.")
+}
+
 /// A taken attribute round-trips: every member the send supplied comes back on the
 /// receive, under the same name, for each logical type.
 #[tokio::test]
@@ -901,7 +1062,8 @@ async fn a_message_system_attribute_does_not_count_toward_the_message_size() {
 
 /// `MessageAttributeNames` selects by exact name or by the `prefix.*` wildcard, which
 /// takes every attribute whose name STARTS WITH what stands before the `.*` — the
-/// period being the wildcard's own separator, not part of the prefix.
+/// period being the wildcard's own separator, not part of the prefix — and `All`, `*` and
+/// `.*` are three spellings of the one selector that takes every attribute.
 #[tokio::test]
 async fn the_attribute_name_wildcard_selects_by_name_prefix() {
     let router = emulator();
@@ -931,6 +1093,9 @@ async fn the_attribute_name_wildcard_selects_by_name_prefix() {
     let rows: &[(&[&str], &[&str])] = &[
         (&["All"], &carried),
         (&[".*"], &carried),
+        (&["*"], &carried),
+        (&["*", "order.id"], &carried),
+        (&["order.id", "*"], &carried),
         (&["order.*"], &["order.id", "order.total", "orderly"]),
         (
             &["ord.*"],
@@ -970,6 +1135,114 @@ async fn the_attribute_name_wildcard_selects_by_name_prefix() {
             "case {requested:?}: expected the attributes {wanted:?}, got {actual:?}"
         );
     }
+}
+
+/// The three select-all spellings answer identically, and a prefix selector answers the
+/// subset it names with the digest recomputed over THAT subset.
+///
+/// A consumer written against the spelling its SDK's samples use must see what a consumer
+/// written against either other sees, down to the digest it verifies the projection with:
+/// the digest covers the attributes the answer HANDED OVER, not the set the send carried.
+#[tokio::test]
+async fn every_select_all_spelling_projects_the_same_attributes_and_digest() {
+    let router = emulator();
+    let url = create_ok(&router, "select-all-spellings", &json!({})).await;
+    let carried = [("order.id", "A-1"), ("status", "open")];
+    let attributes: Map<String, Value> = carried
+        .iter()
+        .map(|(name, value)| {
+            (
+                (*name).to_string(),
+                json!({ "DataType": "String", "StringValue": value }),
+            )
+        })
+        .collect();
+    let sent = ok(
+        &router,
+        "SendMessage",
+        json!({
+            "QueueUrl": url,
+            "MessageBody": "payload",
+            "MessageAttributes": Value::Object(attributes),
+        }),
+    )
+    .await;
+
+    // The digest of the WHOLE set, written out from the Developer Guide's own encoding,
+    // which is what every select-all spelling must answer with.
+    let whole_set: Vec<u8> = carried
+        .iter()
+        .flat_map(|(name, value)| string_attribute_encoding(name, "String", value))
+        .collect();
+    let whole_digest = hex::encode(Md5::digest(&whole_set));
+    assert_eq!(
+        sent["MD5OfMessageAttributes"].as_str(),
+        Some(whole_digest.as_str()),
+        "case the send: expected the digest of both attributes, got {sent}"
+    );
+
+    let wanted: BTreeSet<String> = carried
+        .iter()
+        .map(|(name, _)| (*name).to_string())
+        .collect();
+    for selector in ["All", "*", ".*"] {
+        let (names, digest) = projected_attributes(&router, &url, selector).await;
+        assert_eq!(
+            (&names, digest.as_str()),
+            (&wanted, whole_digest.as_str()),
+            "case {selector:?}: every select-all spelling projects every attribute with the \
+             digest of the set it handed over, got {names:?} and {digest:?}"
+        );
+    }
+
+    // A prefix selector takes its own subset, and the digest covers exactly that subset.
+    let (names, digest) = projected_attributes(&router, &url, "order.*").await;
+    assert_eq!(
+        names,
+        ["order.id".to_string()].into_iter().collect::<BTreeSet<String>>(),
+        "case the prefix selector: expected only the attribute it names, got {names:?}"
+    );
+    let subset = string_attribute_encoding("order.id", "String", "A-1");
+    assert_eq!(
+        digest,
+        hex::encode(Md5::digest(&subset)),
+        "case the prefix selector: the digest must cover the projected subset alone"
+    );
+}
+
+/// The attribute names and the digest one receive asking for `selector` hands over.
+///
+/// The receive asks for a zero visibility timeout, so every selector in a table sees the
+/// same message.
+async fn projected_attributes(
+    router: &MultiServiceRouter,
+    url: &str,
+    selector: &str,
+) -> (BTreeSet<String>, String) {
+    let received = messages(
+        &ok(
+            router,
+            "ReceiveMessage",
+            json!({
+                "QueueUrl": url,
+                "VisibilityTimeout": 0,
+                "MessageAttributeNames": [selector],
+            }),
+        )
+        .await,
+    );
+    assert_eq!(
+        received.len(),
+        1,
+        "case {selector:?}: expected the one sent message, got {received:?}"
+    );
+    (
+        attribute_names(&received[0]),
+        received[0]["MD5OfMessageAttributes"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+    )
 }
 
 /// The batch send applies the same rules per ENTRY: an entry whose attributes or system

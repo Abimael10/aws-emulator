@@ -52,6 +52,9 @@ pub mod management_events;
 /// The AWS Query protocol this endpoint serves the same API over, beside `awsJson1_0`.
 pub mod query_protocol;
 
+/// The answer to a request body this endpoint's JSON wire could not read at all.
+pub mod serialization_faults;
+
 use management_events::AuditedDefinition;
 use query_protocol::{QueryServedApi, QueryServedDefinition};
 use smithy_server_runtime::{
@@ -442,9 +445,11 @@ fn qualified_type_document(mut document: serde_json::Value) -> Option<Vec<u8>> {
     serde_json::to_vec(&document).ok()
 }
 
-/// `resp` as this `awsQueryCompatible` service answers it: the error class named in full in
-/// the body ([`naming_the_class_in_full`]) and its legacy query code reported in the header
-/// ([`reporting_the_query_error`]).
+/// `resp` as this `awsQueryCompatible` service answers it: a body the JSON wire could not
+/// read answered as the deserialization fault it is
+/// ([`serialization_faults::answering_a_deserialization_fault`]), the error class named in
+/// full in the body ([`naming_the_class_in_full`]) and its legacy query code reported in
+/// the header ([`reporting_the_query_error`]).
 ///
 /// A success names no class and passes through untouched.
 fn completing_the_envelope(
@@ -453,6 +458,7 @@ fn completing_the_envelope(
     if resp.status().as_u16() < FIRST_FAILURE_STATUS {
         return resp;
     }
+    let resp = serialization_faults::answering_a_deserialization_fault(resp);
     reporting_the_query_error(naming_the_class_in_full(resp))
 }
 

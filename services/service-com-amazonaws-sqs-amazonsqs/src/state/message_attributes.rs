@@ -121,10 +121,19 @@ pub(super) fn attribute_value_refusal(name: &str, parts: AttributeParts<'_>) -> 
              '{field}'."
         ));
     }
+    // The two refusals name the type differently, and each names the one the caller has to
+    // act on. A value in the wrong FIELD is about the field, which the BASE type decides
+    // (every `String.…` is carried in `String`), so that refusal names the base type; a
+    // value that is absent or empty is about the TYPE THE REQUEST DECLARED, so that refusal
+    // names the `DataType` as submitted — custom label and all, since "you can also append
+    // custom labels" and a caller shown only the base type cannot see what it sent. The
+    // declared type is echoed only once it is known to be one this service reads
+    // ([`attribute_logical_type`]), so it is inside that bound and holds only the
+    // characters a type may.
     if carried.is_none_or(|length| length == 0) {
         return Some(format!(
-            "Message (user) attribute '{name}' must contain a non-empty value of type \
-             '{field}'."
+            "Message (user) attribute '{name}' must contain a non-empty value of type '{}'.",
+            parts.data_type
         ));
     }
     if logical_type == "Number" {
