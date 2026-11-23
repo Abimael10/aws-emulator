@@ -139,6 +139,29 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         // the limit's amount and its period and no device at all, so a declaration naming
         // another device asks for a different limit.
         BRAKET_SPENDING_LIMIT => &["DeviceArn"],
+        // An AWS HealthLake FHIR data store keeps what its create made it with: the FHIR
+        // release version it hosts, the Synthea data it was preloaded with and the key it is
+        // encrypted under are members of `CreateFHIRDatastore` and of no member of
+        // `UpdateFHIRDatastore` — which takes a store's id with its name and its analytics,
+        // NLP, profile, identity-provider and backup configurations and nothing else
+        // (`smithy_query(query="operation",operation="CreateFHIRDatastore,\
+        // UpdateFHIRDatastore")`) — so a declaration restating one of them asks for a
+        // DIFFERENT data store, which CloudFormation replaces.
+        HEALTHLAKE_FHIR_DATASTORE => &[
+            "DatastoreTypeVersion",
+            "PreloadDataConfig",
+            "SseConfiguration",
+        ],
+        // A data transformation profile keeps what it was created with too: its name, the
+        // source format it converts from, the source its DRAFT content came from and the key
+        // that content is encrypted at rest under are members of
+        // `CreateDataTransformationProfile` and of no member of
+        // `UpdateDataTransformationProfile`, which takes a profile's id with a new mapping and
+        // a change description alone — so a declaration restating any of them asks for a
+        // DIFFERENT profile.
+        HEALTHLAKE_DATA_TRANSFORMATION_PROFILE => {
+            &["KmsKeyId", "ProfileName", "Source", "SourceFormat"]
+        }
         // A VPC Lattice service network keeps the SHARING setting it was created with:
         // `UpdateServiceNetwork` takes the network's `authType` and nothing else, so a
         // declaration restating the sharing configuration asks for a different network. (Its

@@ -219,6 +219,15 @@ impl Provisioner {
             Self::MwaaEnvironment => {
                 mwaa_environment_readiness(ctx, region, physical_resource_id).await
             }
+            // `CreateFHIRDatastore` answers the data store `CREATING` — "the data store
+            // status" a store is in while HealthLake brings it up, in which its FHIR endpoint
+            // serves no interaction — so the resource is held open until that service reports
+            // it `ACTIVE` ([`healthlake_resources::fhir_datastore_readiness`]). (A data
+            // transformation PROFILE needs no arm: its create makes it in DRAFT state, which
+            // is readable as that call answers.)
+            Self::HealthLakeFhirDatastore => {
+                fhir_datastore_readiness(ctx, region, physical_resource_id).await
+            }
             // A created directory is `Requested` and then `Creating` — its domain controllers
             // are still being built, and it serves no directory traffic in either stage — so
             // the resource is held open until Directory Service reports it `Active`, which is
@@ -457,6 +466,12 @@ impl Provisioner {
             Self::MwaaEnvironment => {
                 mwaa_environment_ready_attributes(ctx, region, physical_resource_id).await
             }
+            // A data store's `DatastoreStatus` is `CREATING` when its create answers, and the
+            // FHIR endpoint HealthLake serves it at is that service's to decide, so the
+            // type's attributes are read off the store again once it reports it `ACTIVE`.
+            Self::HealthLakeFhirDatastore => {
+                fhir_datastore_ready_attributes(ctx, region, physical_resource_id).await
+            }
             // A directory's `Alias` is the directory id itself until an alias is assigned, and
             // its DNS servers hold no address until its controllers are up, so the type's
             // attributes are read off the directory again once that service reports it
@@ -588,6 +603,14 @@ impl Provisioner {
             // and the deletion is finished once Amazon MWAA no longer holds it.
             Self::MwaaEnvironment => {
                 mwaa_environment_removal(ctx, region, physical_resource_id).await
+            }
+            // `DeleteFHIRDatastore` leaves the data store `DELETING` and HealthLake goes on
+            // reporting it in that status while it takes the store away, so it is still there
+            // when the delete answers and the deletion is finished once that service reports
+            // it `DELETED` ([`healthlake_resources::fhir_datastore_removal`]). (A PROFILE
+            // needs no arm: the call that deletes one takes it away as it answers.)
+            Self::HealthLakeFhirDatastore => {
+                fhir_datastore_removal(ctx, region, physical_resource_id).await
             }
             // `DeleteDirectory` leaves the directory `Deleting` — the modelled stage it is
             // reported in while its servers are decommissioned — so it is still there when the

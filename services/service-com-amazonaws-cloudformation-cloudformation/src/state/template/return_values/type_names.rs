@@ -320,6 +320,87 @@ pub const BRAKET_ARN_NAMESPACE: &str = "braket";
 /// for it, from that same pattern.
 pub(super) const BRAKET_SPENDING_LIMIT_PATH: &str = "spending-limit";
 
+/// The `AWS::<cloudFormationName>::<Resource>` types of the two AWS HealthLake resources a
+/// template declares. The middle segment is that model's own `awsService.cloudFormationName`
+/// (`HealthLake`).
+///
+/// * a FHIR DATASTORE — the FHIR-enabled data store that service's own `CreateFHIRDatastore`
+///   makes. "Ref returns the DatastoreId", and `Fn::GetAtt` reads `DatastoreArn`,
+///   `DatastoreEndpoint`, `DatastoreId` and `DatastoreStatus`. HealthLake MINTS that id (a
+///   `DatastoreId` of 32 characters, which its create takes no member for) and answers the
+///   ARN, the endpoint and the status built around it, so [`identity_is_service_assigned`]
+///   names the type and none of those values can be recomputed from the template;
+/// * a DATA TRANSFORMATION PROFILE — the profile `CreateDataTransformationProfile` makes in
+///   DRAFT state. That service mints the profile's id the same way (`ProfileIdString`:
+///   `^[a-f0-9]{32}$`, which its create takes no member for) and the type's `Ref` returns the
+///   profile's ARN, built around that id, with `Fn::GetAtt` reading `ProfileArn` and
+///   `ProfileId` — so the same holds.
+pub const HEALTHLAKE_FHIR_DATASTORE: &str = "AWS::HealthLake::FHIRDatastore";
+pub const HEALTHLAKE_DATA_TRANSFORMATION_PROFILE: &str =
+    "AWS::HealthLake::DataTransformationProfile";
+
+/// AWS HealthLake's ARN namespace, which that model carries as `awsService.arnNamespace`
+/// (`healthlake`) and both resources' ARNs are named under.
+pub const HEALTHLAKE_ARN_NAMESPACE: &str = "healthlake";
+
+/// The resource paths the two ARNs carry before the identifier HealthLake minted, from the
+/// modelled `AmazonResourceName` pattern — `…:healthlake:<region>:<account>:(datastore\/\
+/// fhir\/.{32}|dataTransformationProfile\/[a-f0-9]{32})$` — which is also the
+/// `DataTransformationProfile` resource's own `aws.api#arn` template
+/// (`dataTransformationProfile/{ProfileId}`).
+pub const HEALTHLAKE_DATASTORE_ARN_PATH: &str = "datastore/fhir";
+pub const HEALTHLAKE_PROFILE_ARN_PATH: &str = "dataTransformationProfile";
+
+/// How many lowercase hexadecimal characters each identifier HealthLake mints carries: 32,
+/// which is the width the `ProfileIdString` pattern fixes and the one the `AmazonResourceName`
+/// pattern's `.{32}` admits for a data store — so the STAND-IN computed before the create is
+/// of that same width. The salts keep the two labels distinct for one resource.
+pub(super) const HEALTHLAKE_ID_HEX_DIGITS: usize = 32;
+pub(super) const HEALTHLAKE_DATASTORE_ID_SALT: &str = "healthlake/datastore";
+pub(super) const HEALTHLAKE_PROFILE_ID_SALT: &str = "healthlake/data-transformation-profile";
+
+/// Every `Fn::GetAtt` attribute each of the two types publishes, in the sorted order a
+/// resource's own attribute map holds them in.
+///
+/// Each is a read-only value of its type: for the data store, the ARN, the FHIR endpoint, the
+/// id and the status HealthLake reports for one; for the profile, the ARN its `Ref` returns
+/// beside the members `CreateDataTransformationProfile` answers that a template does not
+/// declare — the id, the version it was created at, the format it converts to and the instant
+/// that service recorded.
+///
+/// Only the data store's ARN and its id, the profile's, and the two values the profile's own
+/// create documents ([`HEALTHLAKE_PROFILE_TARGET_FORMAT`],
+/// [`HEALTHLAKE_PROFILE_DRAFT_VERSION`]) are computable here, and the identifiers only as
+/// stand-ins of HealthLake's own forms; the endpoint it serves a store at, the status it
+/// reports the store in and the instant it recorded for a profile are that service's own and
+/// reach the resource off its report
+/// ([`crate::state::provisioner::healthlake_resources`]).
+pub(super) const HEALTHLAKE_FHIR_DATASTORE_ATTRIBUTES: &[&str] = &[
+    "DatastoreArn",
+    "DatastoreEndpoint",
+    "DatastoreId",
+    "DatastoreStatus",
+];
+pub(super) const HEALTHLAKE_PROFILE_ATTRIBUTES: &[&str] = &[
+    "LastUpdatedAt",
+    "ProfileArn",
+    "ProfileId",
+    "TargetFormat",
+    "Version",
+];
+
+/// The format a data transformation profile's content converts TO, which is the one value the
+/// modelled `TargetFormat` enum declares and which
+/// `CreateDataTransformationProfile$TargetFormat` documents as "Always FHIR_R4" — so it is a
+/// value these naming rules compute rather than stand in for.
+pub(super) const HEALTHLAKE_PROFILE_TARGET_FORMAT: &str = "FHIR_R4";
+
+/// The version a CREATED profile carries: "The starting version is always 0, which indicates
+/// the profile is in DRAFT state" (`CreateDataTransformationProfile$Version`, a
+/// `ProfileVersion` of range 0..99). What the resource publishes is what the create answered;
+/// this is that answer's own documented value.
+pub(super) const HEALTHLAKE_PROFILE_DRAFT_VERSION: &str = "0";
+
 /// The `AWS::<cloudFormationName>::<Resource>` types of the two AWS Direct Connect resources a
 /// template declares. The middle segment is that model's own `awsService.cloudFormationName`
 /// (`DirectConnect`).

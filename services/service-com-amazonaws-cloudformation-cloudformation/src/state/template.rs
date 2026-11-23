@@ -3150,6 +3150,11 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     FIS_EXPERIMENT_TEMPLATE,
     GUARDDUTY_DETECTOR,
     GUARDDUTY_IP_SET,
+    // The two AWS HealthLake types: the FHIR data store, publishing the ARN, the endpoint,
+    // the id and the status HealthLake reports for one, and the data transformation profile,
+    // publishing the ARN and the id it minted for one.
+    HEALTHLAKE_FHIR_DATASTORE,
+    HEALTHLAKE_DATA_TRANSFORMATION_PROFILE,
     IAM_ACCESS_KEY,
     "AWS::IAM::Role",
     // The AWS IoT Core Device Advisor suite definition, publishing the id that service mints

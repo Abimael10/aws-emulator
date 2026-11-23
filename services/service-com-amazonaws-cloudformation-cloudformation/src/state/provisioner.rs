@@ -518,6 +518,8 @@ use super::template::{
     ELASTIC_BEANSTALK_ENVIRONMENT, GLUE_CRAWLER, GLUE_DATABASE, GLUE_TABLE,
     GLUE_TABLE_OPTIMIZER, GRAFANA_WORKSPACE,
     GUARDDUTY_DETECTOR, GUARDDUTY_IP_SET,
+    HEALTHLAKE_ARN_NAMESPACE, HEALTHLAKE_DATA_TRANSFORMATION_PROFILE,
+    HEALTHLAKE_FHIR_DATASTORE, HEALTHLAKE_PROFILE_ARN_PATH,
     IAM_ACCESS_KEY,
     IOT_CORE_DEVICE_ADVISOR_SUITE_DEFINITION,
     KINESIS_STREAM,
@@ -1365,6 +1367,20 @@ pub(super) enum Provisioner {
     /// the `spendingLimitArn` the type publishes — the handle every spending-limit API takes
     /// — so it is read off that create's own answer and is the identity a `Ref` resolves to.
     BraketSpendingLimit,
+    /// `AWS::HealthLake::FHIRDatastore`: the FHIR-enabled data store AWS HealthLake's own
+    /// `CreateFHIRDatastore` makes and `DeleteFHIRDatastore` removes. That service MINTS the
+    /// `DatastoreId` the type's `Ref` returns, and the ARN and the FHIR endpoint built around
+    /// it, so each is read off its own report of the store. The create leaves the store
+    /// `CREATING` and the delete leaves it `DELETING`, so the resource's creation and its
+    /// deletion are each held open on that report ([`healthlake_resources`]).
+    HealthLakeFhirDatastore,
+    /// `AWS::HealthLake::DataTransformationProfile`: the data transformation profile the same
+    /// control plane's `CreateDataTransformationProfile` makes in DRAFT state and
+    /// `DeleteDataTransformationProfile` removes. That service mints the `ProfileId` the type
+    /// publishes, and the ARN built around it is what its `Ref` returns — the handle that
+    /// service's own tagging surface addresses a profile by, which is what the create reads
+    /// back to establish the identity the stack publishes ([`healthlake_resources`]).
+    HealthLakeDataTransformationProfile,
     /// `AWS::SSMQuickSetup::ConfigurationManager`: the Quick Setup configuration manager
     /// `CreateConfigurationManager` makes — "a collection of desired state configurations for
     /// multiple configuration definitions" — which `UpdateConfigurationManager` renames and
@@ -1888,6 +1904,10 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
             Some(Provisioner::BedrockAgentCoreWorkloadIdentity)
         }
         BRAKET_SPENDING_LIMIT => Some(Provisioner::BraketSpendingLimit),
+        HEALTHLAKE_FHIR_DATASTORE => Some(Provisioner::HealthLakeFhirDatastore),
+        HEALTHLAKE_DATA_TRANSFORMATION_PROFILE => {
+            Some(Provisioner::HealthLakeDataTransformationProfile)
+        }
         SSM_QUICKSETUP_CONFIGURATION_MANAGER => {
             Some(Provisioner::SsmQuickSetupConfigurationManager)
         }
@@ -2919,6 +2939,18 @@ impl Provisioner {
             // declaration asks for.
             Self::BraketSpendingLimit => {
                 create_braket_spending_limit(ctx, region, resource, propagated).await
+            }
+            // `AWS::HealthLake::FHIRDatastore` publishes `Tags` as the `[{Key, Value}]` list
+            // `CreateFHIRDatastore`'s own `Tags` member takes, and
+            // `AWS::HealthLake::DataTransformationProfile` publishes it as the map
+            // `CreateDataTransformationProfile`'s does — so each resource a stack creates
+            // carries the tags CloudFormation gives it beside the ones its declaration asks
+            // for.
+            Self::HealthLakeFhirDatastore => {
+                create_fhir_datastore(ctx, region, resource, propagated).await
+            }
+            Self::HealthLakeDataTransformationProfile => {
+                create_data_transformation_profile(ctx, region, resource, propagated).await
             }
             // `AWS::SSMQuickSetup::ConfigurationManager` publishes `Tags` as a MAP, which is
             // the shape `CreateConfigurationManager`'s own `Tags` member takes, so a manager a
@@ -4267,6 +4299,15 @@ impl Provisioner {
             Self::BraketSpendingLimit => {
                 delete_braket_spending_limit(ctx, region, physical_resource_id).await
             }
+            // The delete addresses the data store by the `DatastoreId` HealthLake minted for
+            // it, which is this resource's physical id, and the profile by the `ProfileId`
+            // inside the ARN that is the profile resource's physical id.
+            Self::HealthLakeFhirDatastore => {
+                delete_fhir_datastore(ctx, region, physical_resource_id).await
+            }
+            Self::HealthLakeDataTransformationProfile => {
+                delete_data_transformation_profile(ctx, region, physical_resource_id).await
+            }
             // The delete addresses the manager by the `ManagerArn` Quick Setup minted for it,
             // which is this resource's physical id.
             Self::SsmQuickSetupConfigurationManager => {
@@ -4797,6 +4838,13 @@ use sagemaker_resources::*;
 mod directconnect_resources;
 use directconnect_resources::*;
 use braket_spending_limits::*;
+/// The AWS HealthLake arms: the FHIR data store an `AWS::HealthLake::FHIRDatastore` declares
+/// and the data transformation profile an `AWS::HealthLake::DataTransformationProfile`
+/// declares, each created in the service that owns it so a client's own
+/// `DescribeFHIRDatastore`, `ListFHIRDatastores`, `GetDataTransformationProfile` and
+/// `ListDataTransformationProfiles` resolve the identities the stack publishes.
+mod healthlake_resources;
+use healthlake_resources::*;
 use ssm_quicksetup_configuration_managers::*;
 use iot_core_device_advisor_suite_definitions::*;
 use bcm_dashboards::*;

@@ -366,6 +366,14 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         // service's own report of the limit rather than from here, exactly as a knowledge
         // base's instants do.
         BRAKET_SPENDING_LIMIT => &["SpendingLimitArn"],
+        // An AWS HealthLake FHIR data store publishes the four read-only values its own
+        // "Return values" section names, and a data transformation profile the five its own
+        // does; only each resource's ARN and the id inside it, and the version and target
+        // format a created profile's own contract states, are values these naming rules
+        // compute, the store's endpoint and status and the profile's instant reaching the
+        // resource off that service's own report of it.
+        HEALTHLAKE_FHIR_DATASTORE => HEALTHLAKE_FHIR_DATASTORE_ATTRIBUTES,
+        HEALTHLAKE_DATA_TRANSFORMATION_PROFILE => HEALTHLAKE_PROFILE_ATTRIBUTES,
         // A Direct Connect gateway and a resiliency group each publish the identifier AWS
         // Direct Connect minted for them, which is the one return value these naming rules
         // compute a stand-in for before the resource exists.
@@ -1094,6 +1102,16 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // That ARN is also what every call on a limit takes (`UpdateSpendingLimit` and
         // `DeleteSpendingLimit` each address one by it).
         || resource_type == BRAKET_SPENDING_LIMIT
+        // The two AWS HEALTHLAKE types are two more: neither create takes an identifier for
+        // the resource — a template declares a data store's name and FHIR release version,
+        // and a profile's name, source format and initial content — and each answers the
+        // identifier HealthLake minted (a `DatastoreId`, a `ProfileId` of the form
+        // `^[a-f0-9]{32}$`). The data store's `Ref` returns that id and the profile's the ARN
+        // built around its own, and every HealthLake call on either addresses it by one of
+        // them, so no name CloudFormation decides is the identity and the one in force is what
+        // that service answered.
+        || resource_type == HEALTHLAKE_FHIR_DATASTORE
+        || resource_type == HEALTHLAKE_DATA_TRANSFORMATION_PROFILE
         // The two Amazon VPC LATTICE types are two more: `CreateServiceNetwork` takes the
         // network's name and answers the `sn-` id it drew with the ARN built around it, and
         // `CreateAccessLogSubscription` takes no identifier at all and answers the `als-` id

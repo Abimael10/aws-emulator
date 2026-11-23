@@ -772,6 +772,14 @@ impl Provisioner {
             Self::BraketSpendingLimit => {
                 describe_braket_spending_limit(ctx, region, physical_resource_id).await
             }
+            // AWS HealthLake's own reads: the data store by the `DatastoreId` it minted for
+            // it, and the profile by the `ProfileId` inside the ARN the stack published.
+            Self::HealthLakeFhirDatastore => {
+                describe_fhir_datastore(ctx, region, physical_resource_id).await
+            }
+            Self::HealthLakeDataTransformationProfile => {
+                describe_data_transformation_profile(ctx, region, physical_resource_id).await
+            }
             // AWS Direct Connect's own reads: the gateway out of the listing its
             // `directConnectGatewayId` narrows, and the group through that service's own
             // `GetResiliencyGroup`, each by the identifier the ARN the stack published

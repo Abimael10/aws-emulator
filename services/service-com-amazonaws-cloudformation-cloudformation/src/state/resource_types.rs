@@ -111,6 +111,7 @@ use super::template::{
     CUSTOMER_PROFILES_DOMAIN, DIRECT_CONNECT_GATEWAY, DIRECT_CONNECT_RESILIENCY_GROUP,
     DIRECTORY_SERVICE_MICROSOFT_AD, DIRECTORY_SERVICE_SIMPLE_AD,
     DLM_LIFECYCLE_POLICY, GLUE_TABLE_OPTIMIZER,
+    HEALTHLAKE_DATA_TRANSFORMATION_PROFILE, HEALTHLAKE_FHIR_DATASTORE,
     IOT_CORE_DEVICE_ADVISOR_SUITE_DEFINITION, MEDIACONVERT_CERTIFICATE_ASSOCIATION,
     MWAA_ENVIRONMENT, NEPTUNE_GRAPH_GRAPH,
     NEPTUNE_GRAPH_GRAPH_SNAPSHOT,
@@ -689,6 +690,11 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::GuardDuty::Master",
     "AWS::GuardDuty::Member",
     "AWS::GuardDuty::ThreatIntelSet",
+    // AWS HealthLake. The FHIR data store and the data transformation profile are both
+    // created in the owning service (`super::provisioner::healthlake_resources`), which mints
+    // each resource's own identifier.
+    HEALTHLAKE_DATA_TRANSFORMATION_PROFILE,
+    HEALTHLAKE_FHIR_DATASTORE,
     // AWS IAM — the catalogue the capability rule draws on too
     // (`super::template::required_capabilities`).
     "AWS::IAM::AccessKey",

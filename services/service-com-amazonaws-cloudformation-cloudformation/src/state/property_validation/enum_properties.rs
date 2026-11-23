@@ -114,6 +114,26 @@ pub const RESILIENCY_MODEL_VALUES: &[&str] = &[
 /// author has to act on is the set as the schema publishes it.
 pub const SAGEMAKER_AUTH_MODE_VALUES: &[&str] = &["SSO", "IAM"];
 
+/// The `enum` the registry schema of `AWS::HealthLake::FHIRDatastore` states for the FHIR
+/// release version the data store hosts.
+///
+/// These are the values of AWS HealthLake's own `FHIRVersion`
+/// (`smithy_query(query="shape", shape="FHIRVersion")` of the
+/// `com-amazonaws-healthlake-healthlake` model: "The FHIR version supported by the data
+/// store"), in that enum's declaration order, which is also what
+/// `CreateFHIRDatastore$DatastoreTypeVersion` documents: "Current support is for version
+/// R4." The order is the one a refusal lists them back in.
+pub const FHIR_VERSION_VALUES: &[&str] = &["R4"];
+
+/// The `enum` the registry schema of `AWS::HealthLake::DataTransformationProfile` states for
+/// the source data format the profile converts from.
+///
+/// These are the values of that service's own `SourceFormat` (`smithy_query(query="shape",
+/// shape="SourceFormat")` of the same model), in that enum's declaration order, which
+/// `CreateDataTransformationProfile$SourceFormat` documents as "Consolidated Clinical
+/// Document Architecture (C-CDA) or Comma-separated values (CSV)".
+pub const SOURCE_FORMAT_VALUES: &[&str] = &["CCDA", "CSV"];
+
 /// The properties this stage knows a schema-stated value set of.
 ///
 /// Source for each row: the `enum` the resource type's REGISTRY SCHEMA states for the
@@ -132,7 +152,9 @@ pub const SAGEMAKER_AUTH_MODE_VALUES: &[&str] = &["SSO", "IAM"];
 /// The fourth is the `MergeType` of an `AWS::AppSync::SourceApiAssociation`'s merge
 /// configuration ([`APPSYNC_MERGE_TYPE_VALUES`]), a member nested one level down in that
 /// property's structure. The fifth is the `AuthMode` an `AWS::SageMaker::Domain`'s members
-/// authenticate with ([`SAGEMAKER_AUTH_MODE_VALUES`]).
+/// authenticate with ([`SAGEMAKER_AUTH_MODE_VALUES`]). The last two are the AWS HealthLake
+/// pair: the `DatastoreTypeVersion` of a FHIR data store ([`FHIR_VERSION_VALUES`]) and the
+/// `SourceFormat` of a data transformation profile ([`SOURCE_FORMAT_VALUES`]).
 pub const ENUM_PROPERTIES: &[EnumProperty] = &[
     EnumProperty {
         resource_type:
@@ -171,6 +193,20 @@ pub const ENUM_PROPERTIES: &[EnumProperty] = &[
         resource_type: crate::state::provisioning::sagemaker_studio::SAGEMAKER_DOMAIN,
         property: &["AuthMode"],
         values: SAGEMAKER_AUTH_MODE_VALUES,
+    },
+    // The FHIR release version an `AWS::HealthLake::FHIRDatastore` hosts, and the source data
+    // format an `AWS::HealthLake::DataTransformationProfile` converts from: each is a value
+    // no handler of its type could be given outside the set its schema states, so the schema
+    // validation refuses it — and the RESOURCE fails on it rather than the template.
+    EnumProperty {
+        resource_type: crate::state::template::HEALTHLAKE_FHIR_DATASTORE,
+        property: &["DatastoreTypeVersion"],
+        values: FHIR_VERSION_VALUES,
+    },
+    EnumProperty {
+        resource_type: crate::state::template::HEALTHLAKE_DATA_TRANSFORMATION_PROFILE,
+        property: &["SourceFormat"],
+        values: SOURCE_FORMAT_VALUES,
     },
 ];
 

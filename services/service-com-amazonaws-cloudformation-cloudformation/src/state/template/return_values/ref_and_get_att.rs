@@ -2140,6 +2140,84 @@ pub(crate) fn return_values(
             attributes.insert("SpendingLimitArn".to_string(), arn.clone());
             (arn, attributes)
         }
+        // AWS HealthLake's own control plane: the FHIR data store an
+        // `AWS::HealthLake::FHIRDatastore` declares. "Ref returns the DatastoreId";
+        // Fn::GetAtt reads `DatastoreArn`, `DatastoreEndpoint`, `DatastoreId` and
+        // `DatastoreStatus`. HealthLake MINTS that id — `CreateFHIRDatastore` takes no
+        // identifier for the store and answers the `DatastoreId` it drew — so the id here is
+        // a STAND-IN of that service's own form (32 lowercase hexadecimal characters, the
+        // width the `AmazonResourceName` pattern's `datastore/fhir/.{32}` admits), with the
+        // ARN built around it, and `super::provisioning` re-points both at what the create
+        // really answered
+        // ([`super::provisioner::Provisioner::HealthLakeFhirDatastore`]). The ENDPOINT that
+        // service serves the store at and the STATUS it reports the store in are its own and
+        // are not computed here: both reach the resource off its report of the store.
+        HEALTHLAKE_FHIR_DATASTORE => {
+            let datastore_id = derived_digits(
+                HEALTHLAKE_DATASTORE_ID_SALT,
+                name,
+                HEALTHLAKE_ID_HEX_DIGITS,
+                Alphabet::Lower,
+            );
+            attributes.insert(
+                "DatastoreArn".to_string(),
+                ::emulator_server::emulator_arn(
+                    HEALTHLAKE_ARN_NAMESPACE,
+                    region,
+                    &format!("{HEALTHLAKE_DATASTORE_ARN_PATH}/{datastore_id}"),
+                ),
+            );
+            attributes.insert(
+                "DatastoreEndpoint".to_string(),
+                service_assigned_document(name, "DatastoreEndpoint"),
+            );
+            attributes.insert("DatastoreId".to_string(), datastore_id.clone());
+            attributes.insert(
+                "DatastoreStatus".to_string(),
+                service_assigned_document(name, "DatastoreStatus"),
+            );
+            (datastore_id, attributes)
+        }
+        // The same control plane's data transformation profile, which an
+        // `AWS::HealthLake::DataTransformationProfile` declares. "Ref returns the profile
+        // ARN" (the type's primary identifier); Fn::GetAtt reads the type's read-only values
+        // ([`HEALTHLAKE_PROFILE_ATTRIBUTES`]). HealthLake mints that id too —
+        // `CreateDataTransformationProfile` takes no identifier and answers the `ProfileId`
+        // it drew (`^[a-f0-9]{32}$`) — so the id and the ARN here are STAND-INS of that form,
+        // which `super::provisioning` re-points at the id the create really answered and the
+        // ARN composed around it
+        // ([`super::provisioner::Provisioner::HealthLakeDataTransformationProfile`]). The
+        // VERSION and the TARGET FORMAT a created profile carries are what that create's own
+        // contract states, so both are computed; the instant it recorded is that service's
+        // clock and reaches the resource off its own answer.
+        HEALTHLAKE_DATA_TRANSFORMATION_PROFILE => {
+            let profile_id = derived_digits(
+                HEALTHLAKE_PROFILE_ID_SALT,
+                name,
+                HEALTHLAKE_ID_HEX_DIGITS,
+                Alphabet::Lower,
+            );
+            let arn = ::emulator_server::emulator_arn(
+                HEALTHLAKE_ARN_NAMESPACE,
+                region,
+                &format!("{HEALTHLAKE_PROFILE_ARN_PATH}/{profile_id}"),
+            );
+            attributes.insert(
+                "LastUpdatedAt".to_string(),
+                service_assigned_document(name, "LastUpdatedAt"),
+            );
+            attributes.insert("ProfileArn".to_string(), arn.clone());
+            attributes.insert("ProfileId".to_string(), profile_id);
+            attributes.insert(
+                "TargetFormat".to_string(),
+                HEALTHLAKE_PROFILE_TARGET_FORMAT.to_string(),
+            );
+            attributes.insert(
+                "Version".to_string(),
+                HEALTHLAKE_PROFILE_DRAFT_VERSION.to_string(),
+            );
+            (arn, attributes)
+        }
         // AWS Direct Connect's own control plane: the gateway an
         // `AWS::DirectConnect::DirectConnectGateway` declares and the group an
         // `AWS::DirectConnect::ResiliencyGroup` declares. Either type's `Ref` returns the
