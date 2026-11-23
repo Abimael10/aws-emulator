@@ -38,6 +38,11 @@ const SERVICE_ACCOUNT_TYPE: &str = "ServiceAccount";
 /// operation="DeleteWorkspaceServiceAccount")` — `workspaceId` carries that pattern.
 const UNMINTED_WORKSPACE_ID: &str = "g-ffffffffff";
 
+/// How long a case waits for a status the clock owes a workspace before giving up, and how
+/// often it looks again. Nothing asserts on how long it actually took.
+const CLOCK_DEADLINE: Duration = LIFECYCLE_TRANSITION.saturating_mul(20);
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
 /// The emulator under test: the router a client talks to, beside the one shared engine its
 /// handlers write through, so a test can read the state back as stored.
 struct Emulator {
@@ -535,12 +540,11 @@ async fn the_released_accounts_token_keys_stop_authorizing() {
             create_token(&emulator, &workspace_id, &bystander, "bystander").await;
 
         // The workspace's own Grafana HTTP API answers once the clock has moved the
-        // workspace out of CREATING.
-        tokio::time::sleep(LIFECYCLE_TRANSITION + Duration::from_millis(100)).await;
-        let (host, path) = split_endpoint(&endpoint);
+        // workspace out of CREATING: look again until it is ACTIVE.
+        await_active(&emulator, &workspace_id).await;
 
         for (index, (id, key)) in keys.iter().enumerate() {
-            let answered = authorize(&emulator, &host, &path, key).await;
+            let answered = authorize(&emulator, &endpoint, key).await;
             assert_eq!(
                 answered.status, 200,
                 "case {case:?}: token {index} ({id}) must authorize before the delete, got {} \
@@ -557,7 +561,7 @@ async fn the_released_accounts_token_keys_stop_authorizing() {
         );
 
         for (index, (id, key)) in keys.iter().enumerate() {
-            let revoked = authorize(&emulator, &host, &path, key).await;
+            let revoked = authorize(&emulator, &endpoint, key).await;
             assert_eq!(
                 revoked.status, 401,
                 "case {case:?}: the released account's token {index} ({id}) must authorize \
@@ -566,7 +570,7 @@ async fn the_released_accounts_token_keys_stop_authorizing() {
             );
         }
 
-        let answered = authorize(&emulator, &host, &path, &bystander_key).await;
+        let answered = authorize(&emulator, &endpoint, &bystander_key).await;
         assert_eq!(
             answered.status, 200,
             "case {case:?}: another account's token ({bystander_token}) must keep authorizing, \
@@ -576,30 +580,34 @@ async fn the_released_accounts_token_keys_stop_authorizing() {
     }
 }
 
-/// Present `key` as a bearer token to the workspace's own Grafana HTTP API.
-async fn authorize(emulator: &Emulator, host: &str, path: &str, key: &str) -> Answer {
+/// Present `key` as a bearer token to the workspace's own Grafana HTTP API, at the
+/// `endpoint` host the control plane announced for it.
+async fn authorize(emulator: &Emulator, endpoint: &str, key: &str) -> Answer {
     request(
         emulator,
         "GET",
-        &format!("{path}/api/org"),
-        host,
+        "/api/org",
+        endpoint,
         Some(&format!("Bearer {key}")),
         None,
     )
     .await
 }
 
-/// The `host:port` and the path of an announced endpoint: what a client splits a URL into
-/// when it issues the request.
-fn split_endpoint(endpoint: &str) -> (String, String) {
-    let without_scheme = endpoint
-        .strip_prefix("https://")
-        .unwrap_or_else(|| panic!("an announced endpoint must be https, got {endpoint:?}"));
-    match without_scheme.find('/') {
-        Some(cut) => (
-            without_scheme[..cut].to_string(),
-            without_scheme[cut..].to_string(),
-        ),
-        None => (without_scheme.to_string(), String::new()),
+/// Look again at the workspace `id` until it is ACTIVE, or the deadline passes.
+async fn await_active(emulator: &Emulator, id: &str) {
+    let deadline = std::time::Instant::now() + CLOCK_DEADLINE;
+    loop {
+        let described = control(emulator, "GET", &format!("/workspaces/{id}"), None).await;
+        if described.body["workspace"]["status"] == json!("ACTIVE") {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "workspace {id} never reached ACTIVE, last read {} with {:?}",
+            described.status,
+            described.body
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }

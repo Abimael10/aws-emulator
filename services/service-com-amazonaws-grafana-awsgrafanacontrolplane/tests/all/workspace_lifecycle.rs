@@ -19,10 +19,18 @@ use service_com_amazonaws_grafana_awsgrafanacontrolplane::state::{
 use service_com_amazonaws_grafana_awsgrafanacontrolplane::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-/// The version `CreateWorkspaceRequest$grafanaVersion` documents as the default ("defaults
-/// to the latest version (for example, 10.4)"). Spelled out here, independently of the
-/// constant the implementation carries, so a wrong default in `src/state.rs` fails.
-const LATEST_GRAFANA_VERSION: &str = "10.4";
+/// The version a create that names none runs: `CreateWorkspaceRequest$grafanaVersion`
+/// "defaults to the latest version", the newest version the service offers (the last entry
+/// of the catalogue `ListVersions` publishes, which `list_versions` owns). Spelled out
+/// here, independently of the constant the implementation carries, so a wrong default in
+/// `src/state.rs` fails.
+const LATEST_GRAFANA_VERSION: &str = "13.2";
+
+/// `IPAddressType$IPv4` ("connections to this workspace can only be made over IPv4"), the
+/// type a workspace created without naming one is reported with. Source: the model's own
+/// `IPAddressType` values, `IPv4` | `DualStack`
+/// (`smithy_query(query="shape",shape="IPAddressType")`).
+const DEFAULT_IP_ADDRESS_TYPE: &str = "IPv4";
 
 /// The largest page `ListWorkspacesRequest$maxResults` admits (`@range(min: 1, max: 100)`),
 /// spelled out here rather than imported for the same reason.
@@ -43,13 +51,19 @@ const SIGNED_FOR_EU_WEST_1: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIDEXAMPLE/20260101/eu-west-1/grafana/aws4_request, \
      SignedHeaders=host, Signature=abc";
 
-/// The endpoint host every request below reaches this emulator on — and so the
-/// authority the workspace endpoint it announces has to name.
+/// The endpoint host every request below reaches this emulator on.
 const EMULATOR_HOST: &str = "127.0.0.1:9297";
 
-/// The path prefix a workspace endpoint carries under that host, spelled out here
-/// independently of the crate's own `WORKSPACE_API_PATH_PREFIX`.
-const ENDPOINT_PREFIX: &str = "/grafana-workspaces/";
+/// The region the requests below are signed for ([`SIGNED_FOR_EU_WEST_1`]), which is the
+/// region the workspaces they create live in — and so the region label of the endpoint
+/// host each workspace announces.
+const REGION: &str = "eu-west-1";
+
+/// The endpoint host the workspace `id` announces: a bare host whose first label is the
+/// workspace id, spelled out here independently of the crate's own constants.
+fn expected_endpoint(id: &str) -> String {
+    format!("{id}.grafana-workspace.{REGION}.amazonaws.com")
+}
 
 /// A create request with only the three required members, for a case that is about
 /// something other than the optional ones.
@@ -308,9 +322,9 @@ async fn a_created_workspace_is_described_from_what_was_stored() {
         );
         assert_eq!(
             at(created.workspace(), "/endpoint"),
-            json!(format!("https://{EMULATOR_HOST}{ENDPOINT_PREFIX}{id}")),
-            "case {case:?}: the endpoint must name the address this emulator was reached at \
-             and the workspace, got {:?}",
+            json!(expected_endpoint(&id)),
+            "case {case:?}: the endpoint must be the bare host naming this workspace and \
+             its region, got {:?}",
             at(created.workspace(), "/endpoint")
         );
         assert_eq!(
@@ -350,6 +364,18 @@ async fn a_created_workspace_is_described_from_what_was_stored() {
                 at(described.workspace(), "/grafanaVersion"),
                 json!(LATEST_GRAFANA_VERSION),
                 "case {case:?}: an unspecified grafanaVersion defaults to the latest version"
+            );
+        }
+        // `ipAddressType` is optional on the create, and a workspace created without one
+        // supports IPv4 only — so it is REPORTED rather than left absent, whichever way the
+        // request named it.
+        if request.get("ipAddressType").is_none() {
+            assert_eq!(
+                at(described.workspace(), "/ipAddressType"),
+                json!(DEFAULT_IP_ADDRESS_TYPE),
+                "case {case:?}: a workspace created without an ipAddressType must report \
+                 {DEFAULT_IP_ADDRESS_TYPE}, got {:?}",
+                at(described.workspace(), "/ipAddressType")
             );
         }
         assert_eq!(

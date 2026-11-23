@@ -23,17 +23,22 @@ use crate::ops::types::{
 ///
 /// This is the emulator's single statement of the supported set: the catalogue
 /// `ListVersions` publishes ("Lists available versions of Grafana. These are
-/// available when calling CreateWorkspace") and the one
-/// [`DEFAULT_GRAFANA_VERSION`] reads "latest" off. The entries are the major
-/// versions Amazon Managed Grafana names in this service's own model docs —
-/// `CreateWorkspaceRequest$grafanaVersion` ("defaults to the latest version (for
-/// example, 10.4)") and `UpdateWorkspaceConfigurationRequest$grafanaVersion`
-/// ("Can only be used to upgrade (for example, from 8.4 to 9.4)").
+/// available when calling CreateWorkspace"), the one [`DEFAULT_GRAFANA_VERSION`]
+/// reads "latest" off, and the one [`upgrade_targets`] computes an upgrade set
+/// from.
+///
+/// `GrafanaVersionList`'s member is constrained only by its length (1..255) and
+/// the model names no value set, so the supported set is the set Amazon Managed
+/// Grafana OFFERS: the majors it currently answers `ListVersions` with. A major
+/// it has retired (it no longer offers 8.4, which the model's own
+/// `UpdateWorkspaceConfigurationRequest$grafanaVersion` doc still uses as its
+/// upgrade example) is not in the set, and a workspace may still be pinned to
+/// one — `CreateWorkspace` stores the version it is given.
 ///
 /// Oldest first is what makes the slice its own total order, so a `ListVersions`
 /// page can be cut at any index and resumed from the version its `nextToken`
 /// names.
-pub const SUPPORTED_GRAFANA_VERSIONS: &[&str] = &["8.4", "9.4", "10.4"];
+pub const SUPPORTED_GRAFANA_VERSIONS: &[&str] = &["9.4", "10.4", "12.4", "13.2"];
 
 /// The Grafana version a workspace runs when `CreateWorkspace` names none.
 ///
@@ -49,28 +54,30 @@ pub const DEFAULT_GRAFANA_VERSION: &str =
 /// an empty object is the document that overrides nothing.
 pub const DEFAULT_WORKSPACE_CONFIGURATION: &str = "{}";
 
-/// The host a URL this emulator announces names when the asking request carries
-/// no address at all — only an in-process caller that builds a path-only URI with
-/// no `Host` does.
+/// The labels every workspace endpoint host carries after the workspace's own id:
+/// `<workspaceId>.grafana-workspace.<region>.amazonaws.com`.
 ///
-/// Loopback is where the emulator binds by default (`EMULATOR_BIND_ADDRESS`), so
-/// an announced URL still names this emulator rather than a host it does not
-/// serve; it is the fallback
-/// `service-com-amazonaws-codecommit-codecommit-20150413` uses for the same
-/// question about its own clone URL.
-pub const LOOPBACK_HOST: &str = "127.0.0.1";
+/// `WorkspaceDescription$endpoint` is "The URL that users can use to access the
+/// Grafana console in the workspace", and the value Amazon Managed Grafana
+/// announces there is a bare HOST — no scheme, no port and no path — whose first
+/// DNS label is the workspace id and whose remaining labels are these, with the
+/// region the workspace lives in between them. A client splices it into an
+/// address itself (`https://<endpoint>/api/...`) or uses it as a host name (DNS,
+/// SNI, a `Host` header, an allow-list), which is why the stored value is the
+/// host and not a URL.
+pub const WORKSPACE_ENDPOINT_LABEL: &str = "grafana-workspace";
 
-/// The path prefix a workspace's own (native) Grafana HTTP API answers on, under
-/// the endpoint this emulator is reached at: `<prefix><workspaceId>` is the base
-/// `WorkspaceDescription$endpoint` reports, and the Grafana API's own routes hang
-/// off it (`<endpoint>/api/org`).
+/// The DNS suffix an AWS endpoint host ends in, after the region label.
+pub const AWS_ENDPOINT_SUFFIX: &str = "amazonaws.com";
+
+/// `IPAddressType$IPv4` ("connections to this workspace can only be made over
+/// IPv4"): the type a workspace whose create named none is reported with.
 ///
-/// On AWS the endpoint is a per-workspace HOST; this emulator serves every face of
-/// itself on the one address it is reached on, so the workspace is named by a path
-/// segment instead. The prefix is disjoint from the control plane's own URI space
-/// (`/workspaces`, `/tags`, `/versions`), so a data-plane request can never be
-/// mistaken for a modelled operation.
-pub const WORKSPACE_API_PATH_PREFIX: &str = "/grafana-workspaces/";
+/// `CreateWorkspaceRequest$ipAddressType` is optional and a workspace created
+/// without it is single-stack, so every read of such a workspace reports this
+/// value rather than nothing — the discriminator a client branches on is never
+/// absent.
+pub const DEFAULT_IP_ADDRESS_TYPE: &str = "IPv4";
 
 /// The `AuthenticationProviderTypes` value naming SAML 2.0 authentication, one
 /// of the two that enum admits (`AWS_SSO`, `SAML`).
@@ -318,12 +325,12 @@ pub struct Workspace {
     pub status: String,
     /// The status change the clock owes this workspace, if any.
     pub pending: Option<PendingTransition>,
-    /// The URL this workspace's own Grafana HTTP API answers on, as
+    /// The host this workspace's Grafana console and HTTP API answer on, as
     /// `WorkspaceDescription$endpoint` / `WorkspaceSummary$endpoint` report it:
-    /// the endpoint the create was reached at, plus this workspace's own path
-    /// ([`ServingEndpoint::workspace_endpoint`]). It is stored because it is the
-    /// address announced for the workspace's whole life, so every later read
-    /// reports the one a client was first handed.
+    /// the bare host [`workspace_endpoint`] composes from this workspace's id and
+    /// the region it was created in. It is stored because it is the address
+    /// announced for the workspace's whole life, so every later read reports the
+    /// one a client was first handed.
     pub endpoint: String,
     pub grafana_version: String,
     pub data_sources: Vec<String>,
@@ -334,7 +341,10 @@ pub struct Workspace {
     pub workspace_role_arn: Option<String>,
     pub vpc_configuration: Option<VpcConfiguration>,
     pub network_access_control: Option<NetworkAccessConfiguration>,
-    pub ip_address_type: Option<String>,
+    /// One of `IPAddressType`'s values, always one: a workspace whose create
+    /// named none is [`DEFAULT_IP_ADDRESS_TYPE`], so no read reports the
+    /// discriminator as absent.
+    pub ip_address_type: String,
     pub kms_key_id: Option<String>,
     /// The `OverridableConfigurationJson` document the workspace was created or
     /// updated with.
@@ -597,7 +607,7 @@ impl Workspace {
             network_access_control: self.network_access_control.clone(),
             // The Grafana Labs token is minted by `AssociateLicense`.
             grafana_token: None,
-            ip_address_type: self.ip_address_type.clone(),
+            ip_address_type: Some(self.ip_address_type.clone()),
             kms_key_id: self.kms_key_id.clone(),
             // Only reported "if the workspace is in the DEGRADED status".
             degraded_workspace_reason: None,
@@ -822,71 +832,44 @@ impl ComAmazonawsGrafanaAwsgrafanacontrolplaneState {
     }
 }
 
-/// The endpoint a client reached this emulator at: the scheme and authority every
-/// URL this emulator announces for itself has to name.
+/// The endpoint a workspace announces: the bare host
+/// `<workspaceId>.grafana-workspace.<region>.amazonaws.com`.
 ///
-/// `WorkspaceDescription$endpoint` is the address the workspace's own Grafana HTTP
-/// API answers on (`CreateWorkspaceApiKey` mints a key "used to authenticate
-/// requests sent to the workspace's HTTP API"), so in an emulator it is the
-/// address THIS emulator answers on — the endpoint the request arrived at — and
-/// not a `*.grafana-workspace.<region>.amazonaws.com` host, which is a different
-/// server entirely and would send a client that follows it off the emulator.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServingEndpoint {
-    pub scheme: String,
-    pub authority: String,
+/// It is a host name and nothing else — no scheme, no port, no path — because that
+/// is what `WorkspaceDescription$endpoint` carries: a client splices it into an
+/// address of its own (`https://<endpoint>/api/...`) or uses it where only a host
+/// name will do. Its variable parts are the workspace's own id, which is its first
+/// DNS label, and the region the workspace lives in; the rest is
+/// [`WORKSPACE_ENDPOINT_LABEL`] and [`AWS_ENDPOINT_SUFFIX`].
+///
+/// This emulator answers that host too: a request whose `Host` is a workspace
+/// endpoint is claimed by [`crate::service::workspace_api`], so a client that
+/// resolves the announced name to this emulator reaches the workspace's own
+/// Grafana HTTP API at the address the control plane gave it.
+pub fn workspace_endpoint(id: &str, region: &str) -> String {
+    format!("{id}.{WORKSPACE_ENDPOINT_LABEL}.{region}.{AWS_ENDPOINT_SUFFIX}")
 }
 
-impl ServingEndpoint {
-    /// The endpoint this request arrived at: the `Host` header (or, on HTTP/2, the
-    /// URI authority), under the scheme the request names.
-    ///
-    /// A request that carries neither — only an in-process caller that builds a
-    /// path-only URI with no `Host` — falls back to [`LOOPBACK_HOST`], so every
-    /// URL this service announces names an address this emulator serves. Each
-    /// source is read on its own, in that order, and the FIRST one that names an
-    /// address wins: a `Host` header carrying nothing leaves the URI's authority
-    /// still to be read.
-    pub fn from_request(parts: &::http::request::Parts) -> Self {
-        let authority = [
-            parts
-                .headers
-                .get(::http::header::HOST)
-                .and_then(|host| host.to_str().ok()),
-            parts.uri.authority().map(::http::uri::Authority::as_str),
-        ]
-        .into_iter()
-        .flatten()
-        .find(|authority| !authority.is_empty())
-        .unwrap_or(LOOPBACK_HOST)
-        .to_string();
-        let scheme = parts
-            .uri
-            .scheme_str()
-            .or_else(|| {
-                parts
-                    .headers
-                    .get("x-forwarded-proto")
-                    .and_then(|proto| proto.to_str().ok())
-            })
-            // The emulator's own listener serves HTTPS, which is also the only
-            // scheme Amazon Managed Grafana publishes a workspace endpoint for.
-            .unwrap_or("https")
-            .to_string();
-        Self { scheme, authority }
+/// The workspace id the endpoint host `host` names, or `None` when `host` is not a
+/// workspace endpoint of this service at all.
+///
+/// The inverse of [`workspace_endpoint`]: the first label must be a `WorkspaceId`,
+/// the next must be [`WORKSPACE_ENDPOINT_LABEL`], and the host must end in
+/// [`AWS_ENDPOINT_SUFFIX`] with a region label between them. Any `:port` a client
+/// carried in its `Host` header is cut off first, and the comparison is
+/// case-insensitive because a DNS name is.
+pub fn workspace_id_at_endpoint_host(host: &str) -> Option<String> {
+    let host = host.rsplit('@').next().unwrap_or(host);
+    let host = host.split(':').next().unwrap_or(host);
+    let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+    let mut labels = host.split('.');
+    let id = labels.next()?;
+    if !is_workspace_id(id) || labels.next()? != WORKSPACE_ENDPOINT_LABEL {
+        return None;
     }
-
-    /// The URL the workspace's own Grafana HTTP API answers on — the one
-    /// `WorkspaceDescription$endpoint` / `WorkspaceSummary$endpoint` report, and
-    /// the base the native routes hang off (`<endpoint>/api/org`). It is served by
-    /// [`crate::service::workspace_api`] at
-    /// [`WORKSPACE_API_PATH_PREFIX`]`<workspaceId>`.
-    pub fn workspace_endpoint(&self, id: &str) -> String {
-        format!(
-            "{}://{}{WORKSPACE_API_PATH_PREFIX}{id}",
-            self.scheme, self.authority
-        )
-    }
+    let region = labels.next()?;
+    let suffix: Vec<&str> = labels.collect();
+    (!region.is_empty() && suffix.join(".") == AWS_ENDPOINT_SUFFIX).then(|| id.to_string())
 }
 
 /// True when `value` satisfies `WorkspaceId`'s `^g-[0-9a-f]{10}$`.

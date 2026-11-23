@@ -10,7 +10,9 @@
 //! (`ListTagsForResource`, `DescribeWorkspace`, `ListWorkspaces`) then report the
 //! remaining set. A `resourceArn` naming no workspace this store holds is a
 //! `ResourceNotFoundException`, and one that names no Grafana workspace at all is a
-//! `ValidationException`; neither removes anything.
+//! `ValidationException`; neither removes anything. A served tag removal answers 204 No
+//! Content with no body: its output structure declares no member, so there is nothing for
+//! a caller to parse.
 //!
 //! Every assertion goes through the router, so each case exercises routing, the query
 //! and label bindings, the handler, the persisted state and serialization.
@@ -43,6 +45,18 @@ const ACCOUNT: &str = "000000000000";
 /// `smithy_query(query="shape", shape="TagKeys,TagKey")`: a `TagKeys` member is a
 /// `TagKey` of length 1..128.
 const MAX_KEY_LEN: usize = 128;
+
+/// The status a SERVED tag mutation answers: `UntagResourceResponse` (like
+/// `TagResourceResponse`) declares no member, so the answer carries nothing to parse and
+/// is 204 No Content. The protocol leaves the code defaulted
+/// (`smithy_query(query="operation",operation="UntagResource")` reports `codeDefaulted`),
+/// so this is the service's own behaviour.
+const TAG_MUTATION_SUCCESS_STATUS: u16 = 204;
+
+/// How long a case waits for something the clock owes the store before giving up, and how
+/// often it looks again. Nothing asserts on how long it actually took.
+const CLOCK_DEADLINE: Duration = LIFECYCLE_TRANSITION.saturating_mul(20);
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// One emulator: a router carrying only this service, over one shared engine.
 fn emulator() -> MultiServiceRouter {
@@ -338,9 +352,17 @@ async fn untag_resource_removes_exactly_the_named_keys_and_the_readers_report_th
         for (index, submission) in case.submissions.iter().enumerate() {
             let answer = untag(&router, &arn, submission).await;
             assert_eq!(
-                answer.status, 200,
-                "case {name:?}: UntagResource call {index} must answer 200, got {} with {:?}",
+                answer.status, TAG_MUTATION_SUCCESS_STATUS,
+                "case {name:?}: UntagResource call {index} must answer \
+                 {TAG_MUTATION_SUCCESS_STATUS}, got {} with {:?}",
                 answer.status, answer.body
+            );
+            assert_eq!(
+                answer.body,
+                Value::Null,
+                "case {name:?}: UntagResource call {index} answers no content, so it carries \
+                 no body, got {:?}",
+                answer.body
             );
         }
 
@@ -382,15 +404,16 @@ async fn a_removed_key_can_be_associated_again() {
     )
     .await;
     assert_eq!(
-        tagged.status, 200,
-        "case {case:?}: TagResource must answer 200, got {} with {:?}",
+        tagged.status, TAG_MUTATION_SUCCESS_STATUS,
+        "case {case:?}: TagResource must answer {TAG_MUTATION_SUCCESS_STATUS}, got {} with {:?}",
         tagged.status, tagged.body
     );
 
     let removed = untag(&router, &arn, &keys(&["env"])).await;
     assert_eq!(
-        removed.status, 200,
-        "case {case:?}: UntagResource must answer 200, got {} with {:?}",
+        removed.status, TAG_MUTATION_SUCCESS_STATUS,
+        "case {case:?}: UntagResource must answer {TAG_MUTATION_SUCCESS_STATUS}, got {} with \
+         {:?}",
         removed.status, removed.body
     );
     let after_removal = reported_tags(&router, case, &arn).await;
@@ -408,8 +431,9 @@ async fn a_removed_key_can_be_associated_again() {
     )
     .await;
     assert_eq!(
-        retagged.status, 200,
-        "case {case:?}: the second TagResource must answer 200, got {} with {:?}",
+        retagged.status, TAG_MUTATION_SUCCESS_STATUS,
+        "case {case:?}: the second TagResource must answer {TAG_MUTATION_SUCCESS_STATUS}, got \
+         {} with {:?}",
         retagged.status, retagged.body
     );
     let after_retag = reported_tags(&router, case, &arn).await;
@@ -433,8 +457,22 @@ async fn an_arn_naming_no_stored_workspace_is_a_resource_not_found() {
         deleted.status, deleted.body
     );
     // The delete is ACCEPTED, not finished: the workspace is removed from the store once
-    // the removal the clock owes it falls due, and only then does its ARN name nothing.
-    tokio::time::sleep(LIFECYCLE_TRANSITION + Duration::from_millis(200)).await;
+    // the removal the clock owes it falls due, and only then does its ARN name nothing. So
+    // look again until the read reports it gone rather than waiting a span of time.
+    let deadline = std::time::Instant::now() + CLOCK_DEADLINE;
+    loop {
+        let described = call(&router, "GET", &format!("/workspaces/{created}"), None).await;
+        if described.status == 404 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the deleted workspace was never released, last read {} with {:?}",
+            described.status,
+            described.body
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 
     for (case, id) in [
         ("a workspace id that was never minted", "g-ffffffffff".to_string()),
@@ -573,8 +611,9 @@ async fn concurrent_untag_resource_calls_all_take_effect() {
     for (index, task) in running.into_iter().enumerate() {
         let answer = task.await.expect("an untagging task must not panic");
         assert_eq!(
-            answer.status, 200,
-            "case {case:?}: concurrent call {index} must answer 200, got {} with {:?}",
+            answer.status, TAG_MUTATION_SUCCESS_STATUS,
+            "case {case:?}: concurrent call {index} must answer \
+             {TAG_MUTATION_SUCCESS_STATUS}, got {} with {:?}",
             answer.status, answer.body
         );
     }

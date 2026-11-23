@@ -11,16 +11,15 @@
 //! exactly as `service-com-amazonaws-codecommit-codecommit-20150413` serves git's
 //! smart-HTTP transport.
 //!
-//! The address it answers on is the one
-//! [`crate::state::ServingEndpoint::workspace_endpoint`] announces: the endpoint
-//! this emulator was reached at, plus
-//! [`crate::state::WORKSPACE_API_PATH_PREFIX`]`<workspaceId>`. So a client that
-//! reads `endpoint` from the control plane and appends a Grafana route reaches
-//! this module:
+//! The address it answers on is the one [`crate::state::workspace_endpoint`]
+//! announces: the bare host `<workspaceId>.grafana-workspace.<region>.amazonaws.com`
+//! the control plane reports as `WorkspaceDescription$endpoint`. A client that reads
+//! `endpoint`, resolves it to this emulator and appends a Grafana route reaches this
+//! module:
 //!
 //! | request | meaning |
 //! |---|---|
-//! | `GET <endpoint>/api/org` | the workspace's organization: its `id` and `name` |
+//! | `GET https://<endpoint>/api/org` | the workspace's organization: its `id` and `name` |
 //!
 //! Every other route under the endpoint is answered with **501**, never an empty
 //! 200: a client cannot tell an unimplemented route from an implemented one that
@@ -49,7 +48,7 @@ use std::time::SystemTime;
 
 use crate::state::{
     ComAmazonawsGrafanaAwsgrafanacontrolplaneState as Store, Workspace,
-    WORKSPACE_ACTIVE as ACTIVE, WORKSPACE_API_PATH_PREFIX,
+    WORKSPACE_ACTIVE as ACTIVE,
 };
 
 /// The id of the one organization a workspace's Grafana has.
@@ -87,52 +86,46 @@ pub struct Response {
 /// The content type every answer below carries.
 pub const CONTENT_TYPE: &str = "application/json";
 
-/// The request a `method` and `path` name, or `None` when the path is not under a
-/// workspace endpoint this emulator announces.
+/// The request a `method`, `host` and `path` name, or `None` when the request is
+/// not addressed to a workspace endpoint this service announces.
 ///
-/// A path is this data plane's when it is
-/// [`WORKSPACE_API_PATH_PREFIX`]`<workspaceId>` followed by nothing or by a route:
-/// the workspace id is matched against the model's own `WorkspaceId` pattern, so a
-/// path cannot address anything but a workspace record. It is the one thing that
-/// identifies such a request — a Grafana client sends no SigV4 credential and no
-/// `X-Amz-Target` — so it is also what [`crate::service::EmulatedService::can_handle`]
-/// claims on.
-pub fn route(method: &str, path: &str) -> Option<Request> {
-    let rest = path.strip_prefix(WORKSPACE_API_PATH_PREFIX)?;
-    let (workspace_id, route_path) = match rest.find('/') {
-        Some(cut) => (&rest[..cut], &rest[cut..]),
-        None => (rest, ""),
-    };
-    if !crate::state::is_workspace_id(workspace_id) {
-        return None;
-    }
-    let route = if method.eq_ignore_ascii_case("GET") && route_path == "/api/org" {
+/// A request is this data plane's when its `Host` is the endpoint host of a
+/// workspace ([`crate::state::workspace_id_at_endpoint_host`]) — the address the
+/// control plane announced for it. The host is the one thing that identifies such
+/// a request: a Grafana client sends no SigV4 credential and no `X-Amz-Target`, so
+/// it is also what [`crate::service::EmulatedService::can_handle`] claims on. The
+/// whole path is then the Grafana route, because the endpoint is a host and
+/// carries no path of its own.
+pub fn route(method: &str, host: Option<&str>, path: &str) -> Option<Request> {
+    let workspace_id = crate::state::workspace_id_at_endpoint_host(host?)?;
+    let route = if method.eq_ignore_ascii_case("GET") && path == "/api/org" {
         Route::Org
     } else {
         Route::Unserved {
             method: method.to_string(),
-            path: route_path.to_string(),
+            path: path.to_string(),
         }
     };
     Some(Request {
-        workspace_id: workspace_id.to_string(),
+        workspace_id,
         route,
     })
 }
 
-/// Whether a resolved route key names a service at all.
+/// The authority a request addresses: its `Host` header, or — on HTTP/2 and an
+/// absolute-form request line, which carry none — the authority of its URI.
 ///
-/// An AWS signing name is made of ASCII letters, digits and hyphens, so a key
-/// that holds anything else was not read off a service-naming host: the framework
-/// resolves the authority of an IPv6-literal endpoint (`[::1]:9297`) to its
-/// leading `[`, which names nothing. Such a request may therefore still be claimed
-/// by the path its endpoint announced, exactly as a loopback IPv4 endpoint's is
-/// (that one resolves to no key at all).
-pub fn names_a_service(route_key: &str) -> bool {
-    !route_key.is_empty()
-        && route_key
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+/// Each source is read in that order and the first one that names an address wins,
+/// so a `Host` header carrying nothing leaves the URI's authority still to be
+/// read. It is what [`route`] matches a workspace endpoint against.
+pub fn addressed_host<'a>(
+    host_header: Option<&'a str>,
+    uri_authority: Option<&'a str>,
+) -> Option<&'a str> {
+    [host_header, uri_authority]
+        .into_iter()
+        .flatten()
+        .find(|value| !value.is_empty())
 }
 
 /// The path of a URI that may be absolute or origin-form.

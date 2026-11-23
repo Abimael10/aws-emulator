@@ -137,7 +137,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "UntagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // The tag removal is answered with 204 No Content, for the same reason its sibling
+    // `TagResource` is: the output structure is empty and Amazon Managed Grafana reports
+    // a successful tag mutation with no content, where the model's 200 is only the
+    // framework's default for an operation that declares no `@http(code:)`.
+    const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
         &self,

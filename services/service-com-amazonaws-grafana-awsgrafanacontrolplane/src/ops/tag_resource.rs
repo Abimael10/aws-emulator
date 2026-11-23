@@ -140,7 +140,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "TagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // The tag write is answered with 204 No Content: the operation's output structure
+    // is empty, and Amazon Managed Grafana reports a successful tag write with no
+    // content rather than with the framework's defaulted 200 (the model declares no
+    // `@http(code:)` for it, so the status is the service's own behaviour).
+    const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
         &self,

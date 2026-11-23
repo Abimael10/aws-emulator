@@ -10,6 +10,9 @@
 //! `ResourceNotFoundException`, and one that names no Grafana workspace at all is a
 //! `ValidationException`.
 //!
+//! `ValidationException`. A served tag write answers 204 No Content with no body: its
+//! output structure declares no member, so there is nothing for a caller to parse.
+//!
 //! Every assertion goes through the router, so each case exercises routing,
 //! deserialization, the handler, the persisted state and serialization.
 
@@ -43,6 +46,17 @@ const ACCOUNT: &str = "000000000000";
 const MAX_TAGS: usize = 50;
 const MAX_KEY_LEN: usize = 128;
 const MAX_VALUE_LEN: usize = 256;
+
+/// The status a SERVED tag mutation answers: `TagResourceResponse` declares no member, so
+/// the answer carries nothing to parse and is 204 No Content. The protocol leaves the code
+/// defaulted (`smithy_query(query="operation",operation="TagResource")` reports
+/// `codeDefaulted`), so this is the service's own behaviour.
+const TAG_MUTATION_SUCCESS_STATUS: u16 = 204;
+
+/// How long a case waits for something the clock owes the store before giving up, and how
+/// often it looks again. Nothing asserts on how long it actually took.
+const CLOCK_DEADLINE: Duration = LIFECYCLE_TRANSITION.saturating_mul(20);
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// One emulator: a router carrying only this service, over one shared engine.
 fn emulator() -> MultiServiceRouter {
@@ -152,6 +166,165 @@ async fn list_tags(router: &MultiServiceRouter, arn: &str) -> Answer {
 
 async fn describe(router: &MultiServiceRouter, id: &str) -> Answer {
     call(router, "GET", &format!("/workspaces/{id}"), None).await
+}
+
+/// What one call answered on the wire, unparsed: the status, the length it states for its
+/// body, and the body bytes themselves — so a body a renderer wrote is visible whatever it
+/// holds.
+struct RawAnswer {
+    status: u16,
+    length: Option<String>,
+    body: Vec<u8>,
+}
+
+impl RawAnswer {
+    /// The body as text, for an assertion message.
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.body).to_string()
+    }
+}
+
+/// Send one request and report exactly what came back.
+async fn raw_call(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> RawAnswer {
+    let payload = body.map(|value| value.to_string()).unwrap_or_default();
+    let mut builder = ::http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("host", "grafana.eu-west-1.amazonaws.com")
+        .header("authorization", SIGNED_FOR_EU_WEST_1);
+    if !payload.is_empty() {
+        builder = builder.header("content-type", "application/json");
+    }
+    let request = builder
+        .body(Bytes::from(payload))
+        .expect("the test request is well formed");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let length = response
+        .headers()
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    RawAnswer {
+        status,
+        length,
+        body: response.into_body().to_vec(),
+    }
+}
+
+/// The length an answer that carries no content states for the body it does not have, so a
+/// client that frames a bodyless message by its stated length reads an explicitly empty
+/// one. It is the framing of the response this emulator hands out; what a socket client
+/// reads is framed by the layer below this crate.
+const NO_CONTENT_LENGTH: &str = "0";
+
+/// Both tag mutations answer the no-content status with no body at all and state the length
+/// that nothing has, while every answer that DOES carry members keeps the status that says
+/// a body follows.
+///
+/// The rows span what the rule generalises over rather than one recorded call: which
+/// mutation is called (so both the POST and the DELETE route), how many keys one call
+/// carries, whether a key is new, overwrites one already there, is removed, or is not
+/// carried by the resource at all, and whether the call is the first or a repeat. The
+/// answer is the same for all of them, which is the point: the status and the absent body
+/// follow the OUTPUT SHAPE — an output structure with no member — not how much the call
+/// changed.
+#[tokio::test]
+async fn a_served_tag_mutation_answers_no_content_with_no_body() {
+    // (case, method, the query the DELETE carries, the body the POST carries)
+    let cases: Vec<(&str, &str, String, Option<Value>)> = vec![
+        (
+            "one new key written",
+            "POST",
+            String::new(),
+            Some(json!({"tags": {"env": "dev"}})),
+        ),
+        (
+            "several keys written at once, one of them overwriting",
+            "POST",
+            String::new(),
+            Some(json!({"tags": {"env": "prod", "team": "observability", "owner": "ana"}})),
+        ),
+        (
+            "a key written with the value it already carries",
+            "POST",
+            String::new(),
+            Some(json!({"tags": {"env": "prod"}})),
+        ),
+        (
+            "one carried key removed",
+            "DELETE",
+            "?tagKeys=owner".to_string(),
+            None,
+        ),
+        (
+            "two keys named in one removal",
+            "DELETE",
+            "?tagKeys=env&tagKeys=team".to_string(),
+            None,
+        ),
+        (
+            "a key the resource does not carry, so nothing is removed",
+            "DELETE",
+            "?tagKeys=never-set".to_string(),
+            None,
+        ),
+    ];
+
+    let router = emulator();
+    let id = create_workspace(&router, &BTreeMap::new()).await;
+    let arn = workspace_arn(&id);
+
+    for (case, method, query, body) in cases {
+        let uri = format!("{}{query}", tags_uri(&arn));
+        for attempt in ["first", "repeated"] {
+            let answer = raw_call(&router, method, &uri, body.clone()).await;
+            assert_eq!(
+                answer.status, TAG_MUTATION_SUCCESS_STATUS,
+                "case {case:?} ({attempt}): expected HTTP {TAG_MUTATION_SUCCESS_STATUS}, got {} \
+                 with {:?}",
+                answer.status,
+                answer.text()
+            );
+            assert!(
+                answer.body.is_empty(),
+                "case {case:?} ({attempt}): expected no body at all, got {:?}",
+                answer.text()
+            );
+            assert_eq!(
+                answer.length.as_deref(),
+                Some(NO_CONTENT_LENGTH),
+                "case {case:?} ({attempt}): expected a stated length of {NO_CONTENT_LENGTH}, \
+                 got {:?}",
+                answer.length
+            );
+        }
+    }
+
+    // An answer that carries members keeps the status that says a body follows: the tag
+    // reader and the workspace read are both still answered with content, so the
+    // no-content status is the mutation's and not the service's.
+    for (case, uri) in [
+        ("ListTagsForResource", tags_uri(&arn)),
+        ("DescribeWorkspace", format!("/workspaces/{id}")),
+    ] {
+        let answer = raw_call(&router, "GET", &uri, None).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: expected HTTP 200, got {} with {:?}",
+            answer.status,
+            answer.text()
+        );
+        assert!(
+            !answer.body.is_empty(),
+            "case {case:?}: expected a body to parse, got none"
+        );
+    }
 }
 
 /// The tag map at `value`, as an ordered map so two sets compare regardless of the
@@ -292,9 +465,17 @@ async fn tag_resource_merges_the_submitted_tags_and_the_readers_report_them() {
         for (index, submission) in case.submissions.iter().enumerate() {
             let tagged = tag(&router, &arn, submission).await;
             assert_eq!(
-                tagged.status, 200,
-                "case {name:?}: TagResource call {index} must answer 200, got {} with {:?}",
+                tagged.status, TAG_MUTATION_SUCCESS_STATUS,
+                "case {name:?}: TagResource call {index} must answer \
+                 {TAG_MUTATION_SUCCESS_STATUS}, got {} with {:?}",
                 tagged.status, tagged.body
+            );
+            assert_eq!(
+                tagged.body,
+                Value::Null,
+                "case {name:?}: TagResource call {index} answers no content, so it carries no \
+                 body, got {:?}",
+                tagged.body
             );
         }
 
@@ -334,14 +515,14 @@ async fn tag_lengths_are_accepted_at_the_published_bounds_and_refused_past_them(
             "the shortest key the model admits",
             "k".to_string(),
             "v".to_string(),
-            200,
+            TAG_MUTATION_SUCCESS_STATUS,
             "",
         ),
         (
             "the longest key the model admits",
             "k".repeat(MAX_KEY_LEN),
             "v".to_string(),
-            200,
+            TAG_MUTATION_SUCCESS_STATUS,
             "",
         ),
         (
@@ -355,14 +536,14 @@ async fn tag_lengths_are_accepted_at_the_published_bounds_and_refused_past_them(
             "the shortest value the model admits",
             "empty".to_string(),
             String::new(),
-            200,
+            TAG_MUTATION_SUCCESS_STATUS,
             "",
         ),
         (
             "the longest value the model admits",
             "long".to_string(),
             "v".repeat(MAX_VALUE_LEN),
-            200,
+            TAG_MUTATION_SUCCESS_STATUS,
             "",
         ),
         (
@@ -387,7 +568,7 @@ async fn tag_lengths_are_accepted_at_the_published_bounds_and_refused_past_them(
         );
 
         let reported = reported_tags(&router, case, &arn).await;
-        if expected_status == 200 {
+        if expected_status == TAG_MUTATION_SUCCESS_STATUS {
             assert_eq!(
                 reported, submission,
                 "case {case:?}: the accepted tag must be stored verbatim, got {reported:?}"
@@ -449,8 +630,8 @@ async fn a_request_past_the_tag_maximum_is_refused_and_stores_nothing() {
     let case = "rewriting an existing key at the maximum";
     let rewritten = tag(&router, &arn, &pairs(&[("key00", "rewritten")])).await;
     assert_eq!(
-        rewritten.status, 200,
-        "case {case:?}: expected HTTP 200, got {} with {:?}",
+        rewritten.status, TAG_MUTATION_SUCCESS_STATUS,
+        "case {case:?}: expected HTTP {TAG_MUTATION_SUCCESS_STATUS}, got {} with {:?}",
         rewritten.status, rewritten.body
     );
     let after = reported_tags(&router, case, &arn).await;
@@ -479,8 +660,22 @@ async fn an_arn_naming_no_stored_workspace_is_a_resource_not_found() {
         deleted.status, deleted.body
     );
     // The delete is ACCEPTED, not finished: the workspace is removed from the store once
-    // the removal the clock owes it falls due, and only then does its ARN name nothing.
-    tokio::time::sleep(LIFECYCLE_TRANSITION + Duration::from_millis(200)).await;
+    // the removal the clock owes it falls due, and only then does its ARN name nothing. So
+    // look again until the read reports it gone rather than waiting a span of time.
+    let deadline = std::time::Instant::now() + CLOCK_DEADLINE;
+    loop {
+        let described = describe(&router, &created).await;
+        if described.status == 404 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the deleted workspace was never released, last read {} with {:?}",
+            described.status,
+            described.body
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 
     for (case, id) in [
         ("a workspace id that was never minted", "g-ffffffffff".to_string()),
@@ -589,8 +784,8 @@ async fn list_tags_for_resource_does_not_change_what_a_later_caller_sees() {
     let submitted = pairs(&[("env", "dev"), ("team", "observability")]);
     let tagged = tag(&router, &arn, &submitted).await;
     assert_eq!(
-        tagged.status, 200,
-        "case {case:?}: TagResource must answer 200, got {} with {:?}",
+        tagged.status, TAG_MUTATION_SUCCESS_STATUS,
+        "case {case:?}: TagResource must answer {TAG_MUTATION_SUCCESS_STATUS}, got {} with {:?}",
         tagged.status, tagged.body
     );
 
@@ -627,8 +822,9 @@ async fn concurrent_tag_resource_calls_all_persist() {
     for (index, task) in running.into_iter().enumerate() {
         let answer = task.await.expect("a tagging task must not panic");
         assert_eq!(
-            answer.status, 200,
-            "case {case:?}: concurrent call {index} must answer 200, got {} with {:?}",
+            answer.status, TAG_MUTATION_SUCCESS_STATUS,
+            "case {case:?}: concurrent call {index} must answer \
+             {TAG_MUTATION_SUCCESS_STATUS}, got {} with {:?}",
             answer.status, answer.body
         );
     }

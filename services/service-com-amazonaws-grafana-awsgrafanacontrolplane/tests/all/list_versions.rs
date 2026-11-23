@@ -19,15 +19,29 @@ use serde_json::{json, Value};
 use service_com_amazonaws_grafana_awsgrafanacontrolplane::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-/// The Grafana versions Amazon Managed Grafana supports, oldest first.
+/// The Grafana versions Amazon Managed Grafana OFFERS, oldest first — the catalogue
+/// `ListVersions` publishes, which is also the set `CreateWorkspace` takes its default
+/// ("the latest version") from and the set an upgrade target is chosen out of.
 ///
-/// SOURCE: this service's own model docs, which name the supported majors —
-/// `CreateWorkspaceRequest$grafanaVersion` ("defaults to the latest version (for example,
-/// 10.4)") and `UpdateWorkspaceConfigurationRequest$grafanaVersion` ("Can only be used to
-/// upgrade (for example, from 8.4 to 9.4)"). Spelled out here rather than imported from
-/// `src/state.rs`, so a wrong catalogue in the implementation fails instead of agreeing
-/// with itself.
-const SUPPORTED_VERSIONS: [&str; 3] = ["8.4", "9.4", "10.4"];
+/// SOURCE: the versions the service answers `ListVersions` with. `GrafanaVersionList`'s
+/// member is bounded only by its length (1..255) and the model names no value set
+/// (`smithy_query(query="shape",shape="GrafanaVersionList")`), so the offered set is the
+/// service's own behaviour rather than a modelled enumeration; a major it has retired —
+/// 8.4, which the model's own `UpdateWorkspaceConfigurationRequest$grafanaVersion` doc
+/// still uses as an upgrade example — is no longer in it. Spelled out here rather than
+/// imported from `src/state.rs`, so a wrong catalogue in the implementation fails instead
+/// of agreeing with itself.
+const SUPPORTED_VERSIONS: [&str; 4] = ["9.4", "10.4", "12.4", "13.2"];
+
+/// A Grafana major Amazon Managed Grafana no longer offers. It is not in the catalogue,
+/// and a workspace may still be pinned to it — `CreateWorkspace` stores the version it is
+/// given — in which case every offered version is an upgrade from it.
+const RETIRED_VERSION: &str = "8.4";
+
+/// The published bounds of `GrafanaVersion`'s own `@length(min: 1, max: 255)`, which every
+/// catalogue entry has to satisfy.
+const MIN_VERSION_LENGTH: usize = 1;
+const MAX_VERSION_LENGTH: usize = 255;
 
 /// The largest page `ListVersionsRequest$maxResults` admits (`@range(min: 1, max: 100)`),
 /// spelled out here for the same reason.
@@ -209,6 +223,56 @@ async fn list_versions_publishes_the_supported_catalog() {
     );
 }
 
+/// Every entry of the published catalogue is a Grafana version the model admits, and the
+/// catalogue is ordered oldest first with the components compared as NUMBERS — the order
+/// its pagination token depends on, and the one that makes its last entry the newest
+/// offered version.
+///
+/// This is the rule the catalogue itself has to satisfy, whatever it holds, so it is
+/// asserted over what the emulator published rather than over the table above.
+#[tokio::test]
+async fn the_published_catalog_is_well_formed_and_ordered_oldest_first() {
+    let router = emulator();
+    let published = list_versions(&router, "").await.versions();
+    assert!(
+        !published.is_empty(),
+        "the catalogue must offer at least one version, got {published:?}"
+    );
+
+    let mut previous: Option<Vec<u64>> = None;
+    for version in &published {
+        assert!(
+            (MIN_VERSION_LENGTH..=MAX_VERSION_LENGTH).contains(&version.len()),
+            "case {version:?}: a catalogue entry must satisfy GrafanaVersion's length bounds"
+        );
+        let components: Vec<&str> = version.split('.').collect();
+        assert!(
+            components.len() >= 2
+                && components
+                    .iter()
+                    .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())),
+            "case {version:?}: a catalogue entry must be a dotted numeric Grafana version"
+        );
+        let order: Vec<u64> = components
+            .iter()
+            .map(|part| part.parse().expect("a numeric component"))
+            .collect();
+        if let Some(previous) = &previous {
+            assert!(
+                previous < &order,
+                "case {version:?}: the catalogue must be ordered oldest first, numerically; \
+                 {previous:?} is not older than {order:?}"
+            );
+        }
+        previous = Some(order);
+    }
+
+    assert!(
+        !published.iter().any(|version| version == RETIRED_VERSION),
+        "a version the service no longer offers must not be published, got {published:?}"
+    );
+}
+
 /// `@paginated(items: grafanaVersions)`: whatever `maxResults` it is given, following
 /// `nextToken` to the end enumerates the served set exactly once in one stable order, no
 /// page is longer than was asked for, and a token this operation never issued is refused.
@@ -318,18 +382,33 @@ async fn list_versions_pages_over_one_stable_order() {
 #[tokio::test]
 async fn list_versions_for_a_workspace_reports_only_newer_versions() {
     // (case, the version the workspace is created with, the versions it can upgrade to)
-    let cases: [(&str, Option<&str>, &[&str]); 6] = [
-        ("the oldest supported version", Some("8.4"), &["9.4", "10.4"]),
-        // A byte comparison would order "10.4" before "9.4" and report no upgrade here.
-        ("a middle supported version", Some("9.4"), &["10.4"]),
-        ("the newest supported version", Some("10.4"), &[]),
+    let cases: [(&str, Option<&str>, &[&str]); 8] = [
+        (
+            "a major the service no longer offers",
+            Some(RETIRED_VERSION),
+            &["9.4", "10.4", "12.4", "13.2"],
+        ),
+        // A byte comparison would order every "1…" version before "9.4" and report no
+        // upgrade at all here.
+        (
+            "the oldest offered version",
+            Some("9.4"),
+            &["10.4", "12.4", "13.2"],
+        ),
+        ("a middle offered version", Some("10.4"), &["12.4", "13.2"]),
+        ("the newest offered version", Some("13.2"), &[]),
         ("no version named, so the newest", None, &[]),
         (
-            "older than every supported version",
+            "older than every offered version",
             Some("7.5"),
-            &["8.4", "9.4", "10.4"],
+            &["9.4", "10.4", "12.4", "13.2"],
         ),
-        ("newer than every supported version", Some("11.4"), &[]),
+        (
+            "between two offered majors",
+            Some("11.4"),
+            &["12.4", "13.2"],
+        ),
+        ("newer than every offered version", Some("14.1"), &[]),
     ];
 
     let router = emulator();
@@ -407,7 +486,7 @@ async fn list_versions_for_an_unknown_workspace_is_refused_by_kind() {
 
     let router = emulator();
     // One real workspace, so a refusal cannot be an artefact of an empty store.
-    let stored = workspace_running(&router, Some("8.4")).await;
+    let stored = workspace_running(&router, Some(RETIRED_VERSION)).await;
 
     for (case, id, status, code) in cases {
         let answer = list_versions(&router, &format!("?workspace-id={id}")).await;

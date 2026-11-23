@@ -13,7 +13,7 @@
 //! table — built from the Smithy model at compile time. You do not edit the
 //! entry; you edit the behavioral seams below.
 //!
-//! Five opt-in seams are yours to change; every one defaults to the framework's
+//! Six opt-in seams are yours to change; every one defaults to the framework's
 //! own behaviour, so an unedited service still routes and answers correctly:
 //!
 //! - `can_handle` — which requests this service claims. The default matches the
@@ -34,6 +34,10 @@
 //!   failure the orchestrator detects up front (e.g. a malformed `aws-chunked`
 //!   body). The default returns `None`, keeping the entry's protocol-correct
 //!   rendering. Return `Some(resp)` to reword it if desired.
+//! - `override_protocol` — the wire protocol this service serves. The default
+//!   returns `None`, so the generated entry's own protocol renders every request
+//!   and response. This service returns its model's `restJson1` with one framing
+//!   correction, see [`no_content_framing`].
 //!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
@@ -46,8 +50,8 @@
 //! Grafana console in the workspace", so it is a promise that a caller can follow it:
 //! reading the field and calling Grafana's own REST API under it is what a client that
 //! minted a workspace API key or a service-account token does with it. That API is not
-//! in the Smithy model, so it is claimed by PATH and served from the two seams below;
-//! [`workspace_api`] is the module that answers it.
+//! in the Smithy model, so it is claimed by the HOST the request addresses and served
+//! from the two seams below; [`workspace_api`] is the module that answers it.
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
@@ -55,7 +59,10 @@ use smithy_server_runtime::{
 use std::sync::Arc;
 
 pub mod authorization;
+pub mod no_content_framing;
 pub mod workspace_api;
+
+use no_content_framing::NoContentRestJson;
 
 /// The error code the service's request validator answers a request whose BODY
 /// does not satisfy the model's own rules with, and the message it states.
@@ -170,6 +177,11 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// operation. It reaches this service's store through this handle, exactly as
     /// a handler reaches it through its own `self.engine`.
     engine: Arc<Eng>,
+    /// This service's wire protocol, built ONCE here because
+    /// [`Service::override_protocol`] hands back a borrow of it: the model's own
+    /// `restJson1`, with the framing a tag mutation's no-content answer needs (see
+    /// [`no_content_framing`]).
+    protocol: NoContentRestJson,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -180,6 +192,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
             engine,
+            protocol: NoContentRestJson::new(),
         }
     }
 }
@@ -204,24 +217,23 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             return true;
         }
         // And a request to a workspace's own Grafana HTTP API, which is claimed by
-        // PATH because that is the only thing that identifies it: a client holding
-        // a workspace API key or a service-account token presents it as a bearer
-        // token, with no SigV4 credential and no `X-Amz-Target`, and addresses the
-        // endpoint the control plane announced — this emulator's own, whose host
-        // (an IP literal, `localhost`) names no service. Without this the router
-        // answers `UnknownService` for an endpoint this service handed out.
-        //
-        // A request that DOES name another service is left to it: a second
-        // claimant would only make the router refuse both as `AmbiguousService`.
-        if route_key
-            .as_deref()
-            .is_some_and(workspace_api::names_a_service)
-        {
-            return false;
-        }
+        // the HOST it addresses because that is the only thing that identifies it:
+        // a client holding a workspace API key or a service-account token presents
+        // it as a bearer token, with no SigV4 credential and no `X-Amz-Target`, and
+        // addresses the endpoint host the control plane announced for the workspace
+        // (`<workspaceId>.grafana-workspace.<region>.amazonaws.com`). Without this
+        // the router answers `UnknownService` for an endpoint this service handed
+        // out.
+        let host = workspace_api::addressed_host(
+            parts
+                .headers
+                .get(::http::header::HOST)
+                .and_then(|host| host.to_str().ok()),
+            parts.uri.authority().map(::http::uri::Authority::as_str),
+        );
         // `http::Uri::path` already strips the scheme, the authority and the
         // query, for an origin-form request line and an absolute-form one alike.
-        workspace_api::route(parts.method.as_str(), parts.uri.path()).is_some()
+        workspace_api::route(parts.method.as_str(), host, parts.uri.path()).is_some()
     }
 
     fn override_operation(
@@ -274,7 +286,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // than in an AWS error envelope, because a Grafana client is what reads
         // it.
         let path = workspace_api::uri_path(req.uri());
-        let request = workspace_api::route(req.method(), &path)?;
+        let parsed = req.uri().parse::<::http::Uri>().ok();
+        let host = workspace_api::addressed_host(
+            req.headers().get("host"),
+            parsed
+                .as_ref()
+                .and_then(::http::Uri::authority)
+                .map(::http::uri::Authority::as_str),
+        );
+        let request = workspace_api::route(req.method(), host, &path)?;
         let now = ::std::time::SystemTime::now();
         let response = match crate::state::service_state(&*self.engine) {
             Some(state) => {
@@ -319,5 +339,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // The model's own `restJson1`, with one framing correction on the way out: a
+        // tag mutation's success carries no content, so it carries no body rather
+        // than the empty JSON object the renderer writes for a members-less output
+        // structure (see [`no_content_framing`]). Every answer that does carry
+        // content is left exactly as rendered.
+        Some(&self.protocol)
     }
 }

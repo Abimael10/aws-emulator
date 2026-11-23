@@ -7,14 +7,15 @@
 //! takes.
 //!
 //! The rule under test: the `endpoint` the control plane reports for a workspace
-//! is an address THIS emulator serves, and it serves that workspace's Grafana HTTP
-//! API there — a request carrying `Authorization: Bearer <credential the control
-//! plane minted for that workspace>` is answered from the workspace record, and a
+//! is the bare host `<workspaceId>.grafana-workspace.<region>.amazonaws.com`, and
+//! this emulator serves that workspace's Grafana HTTP API at that host — a request
+//! addressed to it carrying `Authorization: Bearer <credential the control plane
+//! minted for that workspace>` is answered from the workspace record, and a
 //! credential the workspace no longer holds (deleted, expired, or belonging to a
 //! deleted workspace) authenticates nothing.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -22,10 +23,24 @@ use service_com_amazonaws_grafana_awsgrafanacontrolplane::state::LIFECYCLE_TRANS
 use service_com_amazonaws_grafana_awsgrafanacontrolplane::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-/// The path prefix a workspace endpoint carries, spelled out here independently of
-/// the crate's own `WORKSPACE_API_PATH_PREFIX` so a wrong value in `src/state.rs`
-/// fails this test.
-const ENDPOINT_PREFIX: &str = "/grafana-workspaces/";
+/// The region every request below is signed for, which is the region the workspaces
+/// they create live in — and so the region label of the endpoint host each
+/// announces.
+const REGION: &str = "eu-west-1";
+
+/// The endpoint host the workspace `id` announces, spelled out here independently of
+/// the crate's own constants so a wrong composition in `src/state.rs` fails.
+fn expected_endpoint(id: &str) -> String {
+    format!("{id}.grafana-workspace.{REGION}.amazonaws.com")
+}
+
+/// How long a case waits for something the clock owes (a status, a key's expiry)
+/// before giving up. Far above every span below, so a loaded host still reaches it;
+/// nothing asserts on how long it actually took.
+const CLOCK_DEADLINE: Duration = LIFECYCLE_TRANSITION.saturating_mul(20);
+
+/// How often such a wait looks again.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// A SigV4 credential scope naming this service; it is what routes a control-plane
 /// request here. The data-plane requests below carry no SigV4 credential at all —
@@ -133,45 +148,53 @@ async fn control(
     .await
 }
 
-/// A call to the workspace's own Grafana HTTP API: `route` appended to the
-/// `endpoint` the control plane announced, reached the way a Grafana client
-/// reaches it — no SigV4 credential, only the bearer `authorization` given.
+/// A call to the workspace's own Grafana HTTP API: `route` under the `endpoint` host
+/// the control plane announced, reached the way a Grafana client reaches it — that
+/// host in the request, no SigV4 credential, only the bearer `authorization` given.
 async fn native(
     emulator: &Emulator,
     endpoint: &str,
     route: &str,
     authorization: Option<&str>,
 ) -> Answer {
-    let (host, path) = split_endpoint(endpoint);
-    request(
-        emulator,
-        "GET",
-        &format!("{path}{route}"),
-        &host,
-        authorization,
-        None,
-    )
-    .await
+    // The endpoint is a host and carries no path, so a route the client appends to it
+    // is the whole request path; the Grafana API's own root is `/`.
+    let path = if route.is_empty() { "/" } else { route };
+    request(emulator, "GET", path, endpoint, authorization, None).await
 }
 
-/// The `host:port` and the path of an announced endpoint: what a client splits a
-/// URL into when it issues the request.
-fn split_endpoint(endpoint: &str) -> (String, String) {
-    let without_scheme = endpoint
-        .strip_prefix("https://")
-        .unwrap_or_else(|| panic!("an announced endpoint must be https, got {endpoint:?}"));
-    match without_scheme.find('/') {
-        Some(cut) => (
-            without_scheme[..cut].to_string(),
-            without_scheme[cut..].to_string(),
-        ),
-        None => (without_scheme.to_string(), String::new()),
+/// Look again at `route` under `endpoint` until it answers `want`, or the deadline
+/// passes: the wait for something the clock owes, with nothing asserted about how
+/// long it took.
+async fn await_native_status(
+    emulator: &Emulator,
+    endpoint: &str,
+    route: &str,
+    authorization: Option<&str>,
+    want: u16,
+    what: &str,
+) -> Answer {
+    let deadline = Instant::now() + CLOCK_DEADLINE;
+    loop {
+        let answered = native(emulator, endpoint, route, authorization).await;
+        if answered.status == want {
+            return answered;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: expected HTTP {want} from the workspace's Grafana API, last read {} \
+             with {:?}",
+            answered.status,
+            answered.body
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 
 /// A workspace reached on `host`, named `name` when one is given, plus its
 /// announced endpoint. The wait is the one the clock owes a new workspace: it is
-/// `CREATING` until then.
+/// `CREATING` until the transition falls due, so this looks again until the status
+/// is there.
 async fn active_workspace(
     emulator: &Emulator,
     host: &str,
@@ -204,13 +227,7 @@ async fn active_workspace(
         .expect("CreateWorkspace answers an endpoint")
         .to_string();
 
-    tokio::time::sleep(LIFECYCLE_TRANSITION + Duration::from_millis(100)).await;
-    let described = control(emulator, "GET", &format!("/workspaces/{id}"), host, None).await;
-    assert_eq!(
-        described.body["workspace"]["status"], "ACTIVE",
-        "the workspace must be ACTIVE once the transition span has passed, got {:?}",
-        described.body["workspace"]["status"]
-    );
+    let described = await_active(emulator, host, &id).await;
     assert_eq!(
         described.body["workspace"]["endpoint"]
             .as_str()
@@ -219,6 +236,24 @@ async fn active_workspace(
         "DescribeWorkspace must report the endpoint the create announced"
     );
     (id, endpoint)
+}
+
+/// Look again at the workspace `id` until it is ACTIVE, or the deadline passes.
+async fn await_active(emulator: &Emulator, host: &str, id: &str) -> Answer {
+    let deadline = Instant::now() + CLOCK_DEADLINE;
+    loop {
+        let described = control(emulator, "GET", &format!("/workspaces/{id}"), host, None).await;
+        if described.body["workspace"]["status"] == json!("ACTIVE") {
+            return described;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "workspace {id} never reached ACTIVE, last read {} with {:?}",
+            described.status,
+            described.body
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// A workspace API key, as `CreateWorkspaceApiKey` minted it.
@@ -255,36 +290,39 @@ fn bearer(token: &str) -> String {
     format!("Bearer {token}")
 }
 
-/// The endpoint a workspace announces is an address THIS emulator serves: the one
-/// the asking request reached it at, plus the workspace's own path.
+/// The endpoint a workspace announces is the bare host composed from its own id and
+/// its region, whatever address the asking client reached this emulator on — and it
+/// is a host this emulator answers that workspace's Grafana API at.
 ///
 /// The rows differ along the endpoint forms a client reaches an emulator through:
 /// loopback by address with the default port and another, loopback by name, an
 /// IPv6 literal, a routable private address, and no `Host` at all (an in-process
-/// caller with an origin-form URI), which falls back to loopback.
+/// caller with an origin-form URI). None of them is part of the announced endpoint,
+/// which is what the first assertion pins.
 #[tokio::test]
-async fn the_announced_endpoint_is_the_address_this_emulator_was_reached_at() {
-    let cases: [(&str, &str, &str); 6] = [
-        ("loopback by address, default port", EMULATOR_HOST, EMULATOR_HOST),
-        ("loopback by address, another port", "127.0.0.1:34567", "127.0.0.1:34567"),
-        ("loopback by name", "localhost:9297", "localhost:9297"),
-        ("an IPv6 loopback literal", "[::1]:9297", "[::1]:9297"),
-        ("a routable private address", "10.1.2.3:8443", "10.1.2.3:8443"),
-        ("no Host header at all", "", "127.0.0.1"),
+async fn the_announced_endpoint_is_the_workspaces_own_host_and_serves_its_grafana_api() {
+    let cases: [(&str, &str); 6] = [
+        ("loopback by address, default port", EMULATOR_HOST),
+        ("loopback by address, another port", "127.0.0.1:34567"),
+        ("loopback by name", "localhost:9297"),
+        ("an IPv6 loopback literal", "[::1]:9297"),
+        ("a routable private address", "10.1.2.3:8443"),
+        ("no Host header at all", ""),
     ];
 
-    for (case, host, expected_authority) in cases {
+    for (case, host) in cases {
         let emulator = emulator();
         let (id, endpoint) = active_workspace(&emulator, host, None, None).await;
-        let expected = format!("https://{expected_authority}{ENDPOINT_PREFIX}{id}");
+        let expected = expected_endpoint(&id);
         assert_eq!(
             endpoint, expected,
-            "case {case:?}: the endpoint must name the address this emulator was reached \
-             at and the workspace, got {endpoint:?}"
+            "case {case:?}: the endpoint must be the workspace's own host, expected \
+             {expected:?}, got {endpoint:?}"
         );
 
-        // And it is an address this emulator answers on: the endpoint's own path
-        // reaches the data plane rather than the router's UnknownService refusal.
+        // And it is an address this emulator answers on: a request addressed to that
+        // host reaches the workspace's Grafana API rather than the router's
+        // UnknownService refusal.
         let answered = native(&emulator, &endpoint, "/api/org", None).await;
         assert_eq!(
             answered.status, 401,
@@ -546,12 +584,17 @@ async fn a_credential_past_its_seconds_to_live_authenticates_nothing() {
         );
     }
 
-    // The expiry is owed by the clock, not by a call: nothing is done here but
-    // wait.
-    tokio::time::sleep(Duration::from_secs(MIN_SECONDS_TO_LIVE as u64) + Duration::from_millis(250))
-        .await;
-
-    let expired = native(&emulator, &endpoint, "/api/org", Some(&bearer(&expiring))).await;
+    // The expiry is owed by the clock, not by a call: nothing is done here but look
+    // again until the key the shortest lifetime was minted with stops authenticating.
+    let expired = await_native_status(
+        &emulator,
+        &endpoint,
+        "/api/org",
+        Some(&bearer(&expiring)),
+        401,
+        "a key past its secondsToLive must authenticate nothing",
+    )
+    .await;
     assert_eq!(
         expired.status, 401,
         "a key past its secondsToLive must authenticate nothing, got {} with {:?}",
@@ -693,17 +736,26 @@ async fn the_endpoint_answers_only_for_a_live_active_workspace() {
         early.status, early.body
     );
 
-    tokio::time::sleep(LIFECYCLE_TRANSITION + Duration::from_millis(100)).await;
-    let serving = native(&emulator, &endpoint, "/api/org", Some(&bearer(&key))).await;
+    // The transition to ACTIVE is owed by the clock: look again until the Grafana API
+    // is serving there.
+    let serving = await_native_status(
+        &emulator,
+        &endpoint,
+        "/api/org",
+        Some(&bearer(&key)),
+        200,
+        "once the workspace is ACTIVE its endpoint serves the Grafana API",
+    )
+    .await;
     assert_eq!(
         serving.status, 200,
         "once the workspace is ACTIVE its endpoint serves the Grafana API, got {} with {:?}",
         serving.status, serving.body
     );
 
-    // An endpoint whose workspace id names no workspace, and the endpoint of a
+    // An endpoint host whose workspace id names no workspace, and the endpoint of a
     // workspace that has been deleted: neither is served.
-    let unknown = format!("https://{EMULATOR_HOST}{ENDPOINT_PREFIX}g-0123456789");
+    let unknown = expected_endpoint("g-0123456789");
     let absent = native(&emulator, &unknown, "/api/org", Some(&bearer(&key))).await;
     assert_eq!(
         absent.status, 404,
@@ -733,8 +785,15 @@ async fn the_endpoint_answers_only_for_a_live_active_workspace() {
         "a workspace whose deletion is in flight serves no Grafana API, got {} with {:?}",
         deleting.status, deleting.body
     );
-    tokio::time::sleep(LIFECYCLE_TRANSITION + Duration::from_millis(100)).await;
-    let gone = native(&emulator, &endpoint, "/api/org", Some(&bearer(&key))).await;
+    let gone = await_native_status(
+        &emulator,
+        &endpoint,
+        "/api/org",
+        Some(&bearer(&key)),
+        404,
+        "a removed workspace serves nothing at its endpoint",
+    )
+    .await;
     assert_eq!(
         gone.status, 404,
         "a removed workspace serves nothing at its endpoint, got {} with {:?}",
@@ -776,30 +835,54 @@ async fn a_route_the_emulator_does_not_serve_answers_501() {
         );
     }
 
-    // And a path that only looks like one: the first segment must satisfy
-    // `WorkspaceId`'s ^g-[0-9a-f]{10}$, or this service claims nothing and the
+    // And a host that only looks like a workspace endpoint: the first label must
+    // satisfy `WorkspaceId`'s ^g-[0-9a-f]{10}$ and the labels after it must be the
+    // ones a workspace endpoint carries, or this service claims nothing and the
     // router answers its own refusal.
-    for path in [
-        format!("{ENDPOINT_PREFIX}not-a-workspace/api/org"),
-        format!("{ENDPOINT_PREFIX}g-0123456789abc/api/org"),
-        format!("{ENDPOINT_PREFIX}G-0123456789/api/org"),
+    for host in [
+        format!("not-a-workspace.grafana-workspace.{REGION}.amazonaws.com"),
+        format!("g-0123456789abc.grafana-workspace.{REGION}.amazonaws.com"),
+        format!("{id}.grafana.{REGION}.amazonaws.com"),
+        format!("{id}.grafana-workspace.{REGION}.amazonaws.com.example.test"),
+        format!("{id}.grafana-workspace.amazonaws.com"),
     ] {
         let answered = request(
             &emulator,
             "GET",
-            &path,
-            EMULATOR_HOST,
+            "/api/org",
+            &host,
             Some(&bearer(&key)),
             None,
         )
         .await;
-        assert_eq!(
-            (answered.status, answered.error_code()),
-            (404, "UnknownService"),
-            "path {path:?} names no workspace endpoint, so this service must not claim it, \
-             got {} with {:?}",
-            answered.status,
+        assert_ne!(
+            answered.status, 200,
+            "host {host:?} is no workspace endpoint, so this service must not serve the \
+             Grafana API there, got {} with {:?}",
+            answered.status, answered.body
+        );
+        assert!(
+            answered.body["message"].as_str().is_none_or(|message| {
+                !message.contains("not implemented in this emulator")
+            }),
+            "host {host:?} is no workspace endpoint, so no Grafana route may answer for it, \
+             got {:?}",
             answered.body
         );
     }
+
+    // A DNS name is case-insensitive, so the announced host in another casing
+    // addresses the same workspace.
+    let shouted = native(
+        &emulator,
+        &endpoint.to_ascii_uppercase(),
+        "/api/org",
+        Some(&bearer(&key)),
+    )
+    .await;
+    assert_eq!(
+        shouted.status, 200,
+        "the announced endpoint in upper case names the same workspace, got {} with {:?}",
+        shouted.status, shouted.body
+    );
 }

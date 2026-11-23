@@ -18,10 +18,11 @@ use service_com_amazonaws_grafana_awsgrafanacontrolplane::state::LIFECYCLE_TRANS
 use service_com_amazonaws_grafana_awsgrafanacontrolplane::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-/// The version `CreateWorkspaceRequest$grafanaVersion` documents as the default
-/// ("defaults to the latest version (for example, 10.4)"). Spelled out here,
-/// independently of the constant the implementation carries.
-const LATEST_GRAFANA_VERSION: &str = "10.4";
+/// The version a create that names none runs: `CreateWorkspaceRequest$grafanaVersion`
+/// "defaults to the latest version", which is the newest version the service OFFERS (the
+/// last entry of the catalogue `ListVersions` publishes; `list_versions` owns that set).
+/// Spelled out here, independently of the constant the implementation carries.
+const LATEST_GRAFANA_VERSION: &str = "13.2";
 
 /// The document a workspace created without a `configuration` carries: the JSON
 /// document that overrides nothing, and the shortest one `OverridableConfigurationJson`'s

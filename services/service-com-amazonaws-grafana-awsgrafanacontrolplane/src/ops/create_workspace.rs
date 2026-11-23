@@ -274,10 +274,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
-        // The endpoint a workspace announces is the address its own Grafana HTTP
-        // API answers on, which for an emulator is the address THIS emulator was
-        // reached at (see `crate::state::ServingEndpoint`).
-        let serving = crate::state::ServingEndpoint::from_request(ctx.parts());
+        // The endpoint a workspace announces is a host composed from its own id and
+        // the region it lives in, which is the region this request is served in
+        // (see `crate::state::workspace_endpoint`).
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         // Release every workspace whose accepted deletion has fallen due: the instant it
         // fell due is when that workspace stopped occupying the store, whether or not
@@ -324,7 +324,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let id = store.mint_workspace_id();
         let workspace = crate::state::Workspace {
-            endpoint: serving.workspace_endpoint(&id),
+            endpoint: crate::state::workspace_endpoint(&id, &region),
             id: id.clone(),
             name: input.workspace_name,
             description: input.workspace_description,
@@ -353,7 +353,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             workspace_role_arn: input.workspace_role_arn,
             vpc_configuration: input.vpc_configuration,
             network_access_control: input.network_access_control,
-            ip_address_type: input.ip_address_type,
+            // `ipAddressType` is optional, and a workspace created without one
+            // supports IPv4 only, so the type is stored rather than left unset:
+            // every read reports the discriminator.
+            ip_address_type: input
+                .ip_address_type
+                .unwrap_or_else(|| crate::state::DEFAULT_IP_ADDRESS_TYPE.to_string()),
             kms_key_id: input.kms_key_id,
             configuration: input
                 .configuration

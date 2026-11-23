@@ -39,6 +39,11 @@ const SERVICE_ACCOUNT_TOKEN_TYPE: &str = "ServiceAccountToken";
 /// operation="DeleteWorkspaceServiceAccountToken")` — `workspaceId` carries that pattern.
 const UNMINTED_WORKSPACE_ID: &str = "g-ffffffffff";
 
+/// How long a case waits for a status the clock owes a workspace before giving up, and how
+/// often it looks again. Nothing asserts on how long it actually took.
+const CLOCK_DEADLINE: Duration = LIFECYCLE_TRANSITION.saturating_mul(20);
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
 /// The emulator under test: the router a client talks to, beside the one shared engine
 /// its handlers write through, so a test can read the state back as stored.
 struct Emulator {
@@ -517,16 +522,15 @@ async fn the_released_tokens_key_stops_authorizing() {
         }
 
         // The workspace's own Grafana HTTP API answers once the clock has moved the
-        // workspace out of CREATING.
-        tokio::time::sleep(LIFECYCLE_TRANSITION + Duration::from_millis(100)).await;
-        let (host, path) = split_endpoint(&endpoint);
+        // workspace out of CREATING: look again until it is ACTIVE.
+        await_active(&emulator, &workspace_id).await;
 
         for (index, (id, key)) in tokens.iter().enumerate() {
             let answered = request(
                 &emulator,
                 "GET",
-                &format!("{path}/api/org"),
-                &host,
+                "/api/org",
+                &endpoint,
                 Some(&format!("Bearer {key}")),
                 None,
             )
@@ -550,8 +554,8 @@ async fn the_released_tokens_key_stops_authorizing() {
         let revoked = request(
             &emulator,
             "GET",
-            &format!("{path}/api/org"),
-            &host,
+            "/api/org",
+            &endpoint,
             Some(&format!("Bearer {target_key}")),
             None,
         )
@@ -569,8 +573,8 @@ async fn the_released_tokens_key_stops_authorizing() {
             let answered = request(
                 &emulator,
                 "GET",
-                &format!("{path}/api/org"),
-                &host,
+                "/api/org",
+                &endpoint,
                 Some(&format!("Bearer {key}")),
                 None,
             )
@@ -585,17 +589,20 @@ async fn the_released_tokens_key_stops_authorizing() {
     }
 }
 
-/// The `host:port` and the path of an announced endpoint: what a client splits a URL
-/// into when it issues the request.
-fn split_endpoint(endpoint: &str) -> (String, String) {
-    let without_scheme = endpoint
-        .strip_prefix("https://")
-        .unwrap_or_else(|| panic!("an announced endpoint must be https, got {endpoint:?}"));
-    match without_scheme.find('/') {
-        Some(cut) => (
-            without_scheme[..cut].to_string(),
-            without_scheme[cut..].to_string(),
-        ),
-        None => (without_scheme.to_string(), String::new()),
+/// Look again at the workspace `id` until it is ACTIVE, or the deadline passes.
+async fn await_active(emulator: &Emulator, id: &str) {
+    let deadline = std::time::Instant::now() + CLOCK_DEADLINE;
+    loop {
+        let described = control(emulator, "GET", &format!("/workspaces/{id}"), None).await;
+        if described.body["workspace"]["status"] == json!("ACTIVE") {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "workspace {id} never reached ACTIVE, last read {} with {:?}",
+            described.status,
+            described.body
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }

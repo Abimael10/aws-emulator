@@ -349,7 +349,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             workspace.organizational_units = value;
         }
         if let Some(value) = input.ip_address_type {
-            workspace.ip_address_type = Some(value);
+            workspace.ip_address_type = value;
         }
         if let Some(value) = input.vpc_configuration {
             workspace.vpc_configuration = Some(value);
