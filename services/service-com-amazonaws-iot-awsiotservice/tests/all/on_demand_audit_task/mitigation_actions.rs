@@ -905,7 +905,10 @@ async fn a_mitigation_action_the_store_cannot_take_is_refused_and_changes_nothin
     );
     assert_eq!(
         duplicate.error_message(),
-        format!("MitigationAction cannot be created - name already exists (name={action_name})"),
+        format!(
+            "Resource already exists for account with different attributes, {}",
+            expected_arn(action_name)
+        ),
         "case a name already taken: expected this family's already-exists sentence, got {}",
         duplicate.text()
     );

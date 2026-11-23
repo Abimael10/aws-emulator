@@ -222,15 +222,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The name is the schedule's identity, so a name already taken is a conflict:
         // `ResourceAlreadyExistsException` (HTTP 409), worded with this family's own
-        // already-exists sentence rather than one phrased here. Like the other families
-        // whose 409 reports no identity members, it sends the message alone: a scheduled
-        // audit has no id of its own beside the name the request already carried.
+        // already-exists sentence rather than one phrased here — which names the ARN of
+        // the schedule the account ALREADY holds, read off that record. Like the other
+        // families whose 409 reports no identity members, it sends the message alone: a
+        // scheduled audit has no id of its own beside the name the request already carried.
         if let Some(existing) = store.scheduled_audits.get(&input.scheduled_audit_name) {
             return Err(
                 CreateScheduledAuditErrorModeled::ResourceAlreadyExistsException(
                     ResourceAlreadyExistsException {
                         message: Some(crate::state::existing_scheduled_audit_message(
-                            &existing.scheduled_audit_name,
+                            &existing.scheduled_audit_arn,
                         )),
                         resource_id: None,
                         resource_arn: None,

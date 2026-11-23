@@ -199,13 +199,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The name is the action's identity, so a name already taken is a conflict:
         // `ResourceAlreadyExistsException` (HTTP 409), worded with this family's own
         // already-exists sentence ([`crate::state::existing_mitigation_action_message`])
-        // rather than one phrased here, and reporting the record that holds the name.
+        // rather than one phrased here, which names the ARN of the action the account
+        // ALREADY holds, and reporting that record.
         if let Some(existing) = store.mitigation_actions.get(&input.action_name) {
             return Err(
                 CreateMitigationActionErrorModeled::ResourceAlreadyExistsException(
                     ResourceAlreadyExistsException {
                         message: Some(crate::state::existing_mitigation_action_message(
-                            &existing.action_name,
+                            &existing.action_arn,
                         )),
                         resource_id: Some(existing.action_id.clone()),
                         resource_arn: Some(existing.action_arn.clone()),

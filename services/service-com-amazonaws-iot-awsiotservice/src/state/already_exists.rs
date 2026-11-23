@@ -5,13 +5,19 @@
 //!
 //! AWS IoT has no single already-exists sentence, exactly as it has no single not-found
 //! one ([`super::not_found`]): each resource FAMILY states the collision in its own fixed
-//! text, and the only variable part of it is the identifier the REQUEST carried — never a
-//! value taken from one call.
+//! text, whose only variable part is the IDENTIFIER of the resource that already holds the
+//! name — for most families the one the REQUEST carried, and for the Device Defender
+//! families the existing record's ARN — never any other value of one call.
 //!
-//! * The NAMED-RESOURCE families whose create is refused "by name" — a policy, a
-//!   mitigation action, a scheduled audit — word it
+//! * The POLICY family, whose create is refused "by name", words it
 //!   `<Family> cannot be created - name already exists (name=<name>)`
 //!   ([`name_already_exists`]).
+//! * The DEVICE DEFENDER named resources — a mitigation action, a scheduled audit —
+//!   report the resource that already holds the name by its ARN:
+//!   `Resource already exists for account with different attributes, <arn>`
+//!   ([`resource_already_exists`]). This is the one family whose variable part is read
+//!   from the STORE rather than from the request, because what it reports is the full
+//!   identity (partition, region, account, resource path) of the record that exists.
 //! * The ROLE ALIAS family states the collision with the family's own two-word noun and
 //!   scopes it to the account: `Role alias <name> already exists for this account`
 //!   ([`existing_role_alias_message`]).
@@ -49,10 +55,24 @@
 /// The sentence a family that refuses a create BY NAME states a taken name with: the
 /// family noun, the fixed clause, and the name the request asked for in `name=<...>`.
 ///
-/// The noun is the family's own spelling of itself (`Policy`, `MitigationAction`), and
-/// nothing of the stored record is part of the sentence.
+/// The noun is the family's own spelling of itself (`Policy`), and nothing of the stored
+/// record is part of the sentence.
 fn name_already_exists(family: &str, name: &str) -> String {
     format!("{family} cannot be created - name already exists (name={name})")
+}
+
+/// The sentence the DEVICE DEFENDER named resources state a taken name with: one fixed
+/// clause for the whole family, whose single variable part is the ARN of the resource the
+/// account ALREADY holds.
+///
+/// Nothing of the refused request is in it — not even the name it asked for, which the ARN
+/// already carries — and no family noun, so the two Device Defender creates word one
+/// collision one way. The ARN is the existing record's own
+/// ([`super::mitigation_action_arn`], [`super::scheduled_audit_arn`]), which is why this
+/// clause reports the conflicting resource's full identity: partition, region, account and
+/// resource path.
+fn resource_already_exists(existing_arn: &str) -> String {
+    format!("Resource already exists for account with different attributes, {existing_arn}")
 }
 
 /// The sentence the JOBS and COMMANDS planes state a taken id with: the family noun, the
@@ -177,24 +197,23 @@ pub fn existing_certificate_message(certificate_id: &str) -> String {
 }
 
 /// How this service refuses a `CreateMitigationAction` under a name the account already
-/// holds a mitigation action under: the policy family's by-name form, with this family's
-/// own noun.
-pub fn existing_mitigation_action_message(action_name: &str) -> String {
-    name_already_exists("MitigationAction", action_name)
+/// holds a mitigation action under: the Device Defender family's clause, naming the
+/// existing action's ARN.
+pub fn existing_mitigation_action_message(action_arn: &str) -> String {
+    resource_already_exists(action_arn)
 }
 
 /// How this service refuses a `CreateScheduledAudit` under a name the account already
 /// holds a scheduled audit under.
 ///
-/// The nearest create this service already refuses by name is the other DEVICE DEFENDER
-/// named resource's ([`existing_mitigation_action_message`]), so a scheduled audit's
-/// collision is stated in that same by-name form with this family's own noun — the
-/// resource's own spelling of itself, as that form takes it. The family's NOT-FOUND
-/// sentence is in the audit subsystem's voice instead
-/// ([`super::missing_scheduled_audit_message`]), exactly as the mitigation-action family's
-/// two sentences are.
-pub fn existing_scheduled_audit_message(scheduled_audit_name: &str) -> String {
-    name_already_exists("ScheduledAudit", scheduled_audit_name)
+/// A scheduled audit is a DEVICE DEFENDER named resource, so its collision is stated in
+/// that family's clause ([`resource_already_exists`]) — the same one the other Device
+/// Defender create refuses with ([`existing_mitigation_action_message`]) — naming the ARN
+/// of the schedule the account already holds. The family's NOT-FOUND sentence is in the
+/// audit subsystem's voice instead ([`super::missing_scheduled_audit_message`]), exactly
+/// as the mitigation-action family's two sentences are.
+pub fn existing_scheduled_audit_message(scheduled_audit_arn: &str) -> String {
+    resource_already_exists(scheduled_audit_arn)
 }
 
 /// How this service refuses a `CreatePackage` under a name the catalog already holds.

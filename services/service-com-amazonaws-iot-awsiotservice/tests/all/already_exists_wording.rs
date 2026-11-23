@@ -12,8 +12,8 @@
 //! identifier the REQUEST carried, and each family's 409 carries only the members that
 //! family sends:
 //!
-//! * the NAMED-RESOURCE families refused by name — a policy, a mitigation action — word
-//!   it `<Family> cannot be created - name already exists (name=<name>)`, and a policy
+//! * the NAMED-RESOURCE family refused by name — a policy — words it
+//!   `<Family> cannot be created - name already exists (name=<name>)`, and a policy
 //!   DOES report the record that exists, in `resourceId`/`resourceArn`;
 //! * the ROLE ALIAS family spells its noun as two words and scopes the collision to the
 //!   account — `Role alias <name> already exists for this account` — and reports the

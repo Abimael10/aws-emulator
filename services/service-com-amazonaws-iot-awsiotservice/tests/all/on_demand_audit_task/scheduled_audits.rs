@@ -187,9 +187,13 @@ fn expected_arn(scheduled_audit_name: &str) -> String {
 }
 
 /// How this service states that a create's name is already taken by a scheduled audit:
-/// the by-name form this service refuses a Device Defender named resource's create with.
+/// the clause this service refuses a Device Defender named resource's create with, whose
+/// only variable part is the ARN of the schedule the account already holds.
 fn already_exists_message(scheduled_audit_name: &str) -> String {
-    format!("ScheduledAudit cannot be created - name already exists (name={scheduled_audit_name})")
+    format!(
+        "Resource already exists for account with different attributes, {}",
+        expected_arn(scheduled_audit_name)
+    )
 }
 
 /// How this service states that a name names no scheduled audit this account holds.
