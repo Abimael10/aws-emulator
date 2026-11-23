@@ -1510,12 +1510,13 @@ const BACKEND_ENVIRONMENT_NAME_MAX: usize = 10;
 ///
 /// `EnvironmentName` is modelled `@length 1..255, pattern ^(?s).+$`
 /// (`smithy_query(query="operation",operation="CreateBackendEnvironment")`), which admits
-/// any non-empty value, so the form is recorded behaviour: a rule the service enforces
-/// and the model does not express, refused with HTTP 400 and the error code
-/// `ValidationException` the model does not declare either
-/// ([`backend_environment_name_message`]). It is the SAME rule, with the same bounds and
-/// the same alphabet, that the AmplifyBackend API holds a Gen 1 environment name to, and
-/// the refusal states it in the same sentence.
+/// any non-empty value, so the form is a rule the service enforces and the model does not
+/// express: it is refused with the operation's own modelled client error,
+/// `BadRequestException` (HTTP 400), stating the sentence
+/// [`backend_environment_name_invalid_message`] builds — the same class of refusal, and
+/// the same construction, a branch name outside its character set takes
+/// ([`is_branch_name`]). It is the SAME rule, with the same bounds and the same alphabet,
+/// that the AmplifyBackend API holds a Gen 1 environment name to.
 ///
 /// The bound is on the name a create brings into being; a name a request merely ADDRESSES
 /// is not checked against it, so a read or a delete of an environment outside the form
@@ -1526,36 +1527,19 @@ pub fn is_backend_environment_name(name: &str) -> bool {
         && name.chars().all(|character| character.is_ascii_lowercase())
 }
 
-/// The message a backend environment name outside [`is_backend_environment_name`] is
+/// The sentence a backend environment name outside [`is_backend_environment_name`] is
 /// refused with.
 ///
-/// The sentence states the RULE the value broke — the length window and the alphabet —
-/// and quotes nothing back: it is the same text for every name that breaks it, whatever
-/// the request sent, and nothing from this store enters it.
-pub fn backend_environment_name_message() -> String {
+/// Everything but the name is fixed text — the operation the create failed, the length
+/// window and the alphabet — and `environment_name` is the value the request sent,
+/// quoted verbatim so a client parsing the message can report which name was rejected.
+/// The first sentence closes without a space before the second, as the service words it.
+pub fn backend_environment_name_invalid_message(environment_name: &str) -> String {
     format!(
-        "Environment name must be between {BACKEND_ENVIRONMENT_NAME_MIN} and \
-         {BACKEND_ENVIRONMENT_NAME_MAX} characters, and lowercase only."
+        "Failed to create backend environment.The environment name {environment_name} is \
+         invalid. Environment name should be between {BACKEND_ENVIRONMENT_NAME_MIN} and \
+         {BACKEND_ENVIRONMENT_NAME_MAX} characters (only lowercase alphabets)."
     )
-}
-
-/// Refuse the request unless `name` is a backend environment name this service may create
-/// ([`is_backend_environment_name`]): HTTP 400 with the error code `ValidationException`,
-/// which this model does not declare, so it is raised through the crate's own
-/// [`crate::scaffolded::Scaffolded::validation`] channel.
-///
-/// Generic over the operation's modelled error enum, so one rule serves every operation
-/// that brings an environment into being and cannot be worded two ways.
-pub fn require_backend_environment_name<E>(
-    name: &str,
-) -> Result<(), crate::scaffolded::Scaffolded<E>> {
-    if is_backend_environment_name(name) {
-        Ok(())
-    } else {
-        Err(crate::scaffolded::Scaffolded::validation(
-            backend_environment_name_message(),
-        ))
-    }
 }
 
 /// Per-service state for com-amazonaws-amplify-amplify. A handler reaches it through [`service_state`].

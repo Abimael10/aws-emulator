@@ -8,13 +8,14 @@
 //!
 //! The rule under test: `CreateBackendEnvironment` brings a Gen 1 backend environment
 //! into being only under a name of two to ten characters, every one of them a lowercase
-//! letter. A name outside that form is refused with HTTP 400 and the error code
-//! `ValidationException`, stating the rule it broke and quoting nothing back, and nothing
-//! is stored — so the name the request asked for is readable nowhere afterwards and the
-//! app's listing is unchanged. The bound is on the name a create brings into being: a
-//! name a request merely ADDRESSES is not held to it, so a read or a delete of a name
-//! outside the form answers the same `NotFoundException` as any other environment this
-//! store does not hold (`backend_environment_absence_wording`).
+//! letter. A name outside that form is refused with the operation's own modelled client
+//! error — HTTP 400 `BadRequestException` — whose sentence is fixed apart from the
+//! rejected name, which it quotes verbatim from the request, and nothing is stored — so
+//! the name the request asked for is readable nowhere afterwards and the app's listing is
+//! unchanged. The bound is on the name a create brings into being: a name a request
+//! merely ADDRESSES is not held to it, so a read or a delete of a name outside the form
+//! answers the same `NotFoundException` as any other environment this store does not hold
+//! (`backend_environment_absence_wording`).
 //!
 //! `EnvironmentName` is modelled `length 1..255, pattern ^(?s).+$`
 //! (`smithy_query(query="operation",operation="CreateBackendEnvironment")`), which admits
@@ -30,14 +31,22 @@ use serde_json::{json, Value};
 
 use crate::app_branch_lifecycle::{string_member, Emulator, Reply};
 
-/// The error code a value outside a rule this service enforces and the model does not
-/// express is refused with.
-const VALIDATION_EXCEPTION: &str = "ValidationException";
+/// The error code a name outside the form is refused with: one of the operation's own
+/// modelled errors (`BadRequestException`, `InternalFailureException`,
+/// `LimitExceededException`, `NotFoundException`, `UnauthorizedException`, from
+/// `smithy_query(query="operation",operation="CreateBackendEnvironment")`), and the one
+/// AWS answers a malformed `environmentName` with.
+const BAD_REQUEST_EXCEPTION: &str = "BadRequestException";
 
-/// The sentence the refusal states, which is the rule and carries nothing from the
-/// request.
-const NAME_RULE_MESSAGE: &str =
-    "Environment name must be between 2 and 10 characters, and lowercase only.";
+/// The sentence the refusal states for `name`: fixed text apart from the rejected name,
+/// which is quoted verbatim from the request (including the service's own missing space
+/// after the first sentence).
+fn name_rule_message(name: &str) -> String {
+    format!(
+        "Failed to create backend environment.The environment name {name} is invalid. \
+         Environment name should be between 2 and 10 characters (only lowercase alphabets)."
+    )
+}
 
 /// `CreateBackendEnvironment` over the wire.
 async fn create_environment(emulator: &Emulator, app_id: &str, request: &Value) -> Reply {
@@ -112,6 +121,10 @@ fn refused_name_cases() -> Vec<(&'static str, String)> {
         ("a dot", "my.env".to_string()),
         ("an inner space", "my env".to_string()),
         ("non-ASCII lower-case letters", "staging\u{e9}".to_string()),
+        (
+            "several classes at once: case, digits and a hyphen",
+            "stg-7F2".to_string(),
+        ),
     ]
 }
 
@@ -159,14 +172,15 @@ async fn a_create_under_a_name_outside_the_form_is_refused_and_stores_nothing() 
         );
         assert_eq!(
             refused.error_code.as_deref(),
-            Some(VALIDATION_EXCEPTION),
-            "case {label:?}: expected the error code {VALIDATION_EXCEPTION:?}, got {:?}",
+            Some(BAD_REQUEST_EXCEPTION),
+            "case {label:?}: expected the error code {BAD_REQUEST_EXCEPTION:?}, got {:?}",
             refused.error_code
         );
+        let expected_message = name_rule_message(&name);
         assert_eq!(
-            refused.message().as_deref(),
-            Some(NAME_RULE_MESSAGE),
-            "case {label:?}: expected the refusal to state the rule {NAME_RULE_MESSAGE:?}, got {:?}",
+            refused.message(),
+            Some(expected_message.clone()),
+            "case {label:?}: expected the refusal to state {expected_message:?}, got {:?}",
             refused.message()
         );
 
@@ -199,6 +213,40 @@ async fn a_create_under_a_name_outside_the_form_is_refused_and_stores_nothing() 
             .member("backendEnvironment"),
         keeper_record,
         "a refused create must leave the stored environment alone"
+    );
+}
+
+#[tokio::test]
+async fn the_refusal_quotes_the_name_the_request_sent() {
+    let emulator = Emulator::new();
+    let app_id = emulator.app_id_of_new_app("backend-env-name-quoted").await;
+
+    // The sentence's only variable part is the rejected name, so no two names that break
+    // the rule can be refused with the same sentence, and each one carries its own name.
+    let mut seen: Vec<String> = Vec::new();
+    for (label, name) in refused_name_cases() {
+        let refused =
+            create_environment(&emulator, &app_id, &json!({ "environmentName": &name })).await;
+        let message = refused.message().unwrap_or_else(|| {
+            panic!("case {label:?}: the refusal must carry a message, got {refused:?}")
+        });
+        assert!(
+            message.contains(&name),
+            "case {label:?}: the refusal must quote the rejected name {name:?}, got {message:?}"
+        );
+        assert!(
+            !seen.contains(&message),
+            "case {label:?}: the sentence is templated on the name, so it must differ from \
+             every other refused name's, got {message:?}"
+        );
+        seen.push(message);
+    }
+
+    // Nothing the refusals named reached the app.
+    assert!(
+        listed_names(&emulator, &app_id).await.is_empty(),
+        "refused creates must store nothing, got {:?}",
+        listed_names(&emulator, &app_id).await
     );
 }
 
