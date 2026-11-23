@@ -332,7 +332,10 @@ async fn update_pipeline(router: &MultiServiceRouter, body: &Value) -> (u16, Val
 }
 
 /// `GetImagePipeline` on `arn`.
-async fn get_pipeline(router: &MultiServiceRouter, arn: &str) -> (u16, Value) {
+///
+/// `pub(crate)`: the sibling suite [`super::image_pipeline_create_call`] reads the same
+/// pipeline back and borrows this one rather than writing a second GetImagePipeline URI.
+pub(crate) async fn get_pipeline(router: &MultiServiceRouter, arn: &str) -> (u16, Value) {
     call(
         router,
         "GET",
