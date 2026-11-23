@@ -1375,7 +1375,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cannot be updated with this operation"). Only a NEW pack has to fit under this
         // Region's conformance pack quota.
         let existing = store.conformance_packs.get(&name).cloned();
-        let (id, arn, stack_arn, pack_type, tags, previously_deployed) = match existing {
+        let (id, arn, deployed_stack_arn, pack_type, tags, previously_deployed) = match existing {
             Some(pack) => (
                 pack.id,
                 pack.arn,
@@ -1399,19 +1399,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .into(),
                     );
                 }
-                // The id, the ARN and the stack ARN are Config's to assign, never read
-                // off the request. The stack's own id is CloudFormation's, which is why
-                // it is DRAWN rather than derived from the pack.
+                // The id and the ARN are Config's to assign, never read off the request.
+                // The pack's STACK is what its deployment creates, so it is minted with
+                // the deployment below rather than here.
                 let id = crate::state::mint_conformance_pack_id();
                 (
                     id.clone(),
                     crate::state::conformance_pack_arn(&region, &name, &id),
-                    crate::state::conformance_pack_stack_arn(
-                        &region,
-                        &name,
-                        &id,
-                        &crate::state::stack_id(),
-                    ),
+                    None,
                     // This call is the account deploying a pack of its own, which is the
                     // provenance the pack reports from here on.
                     crate::state::CONFORMANCE_PACK_TYPE_CUSTOM.to_string(),
@@ -1533,6 +1528,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             }
         }
+
+        // The pack's CloudFormation stack is what the deployment CREATES: a pack that
+        // has one keeps it, a deployment that is performed for a pack that has none is
+        // given one, and a deployment that could not be performed created no stack at all
+        // — so a pack whose only deployment failed has none to report. The stack's own id
+        // is CloudFormation's, which is why it is DRAWN rather than derived from the pack.
+        let stack_arn = match deployed_stack_arn {
+            Some(stack_arn) => Some(stack_arn),
+            None if failure_reason.is_some() => None,
+            None => Some(crate::state::conformance_pack_stack_arn(
+                &region,
+                &name,
+                &id,
+                &crate::state::stack_id(),
+            )),
+        };
 
         store.conformance_packs.insert(
             name.clone(),

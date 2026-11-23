@@ -216,7 +216,16 @@ fn stack_arn_prefix(region: &str, name: &str, id: &str) -> String {
 
 /// Assert the stack ARN `stack_arn` is the CloudFormation stack ARN of the pack
 /// `(name, id)`, and answer the stack id it ends in.
-fn stack_id_of(case: &str, region: &str, name: &str, id: &str, stack_arn: &str) -> String {
+///
+/// `pub(crate)` because every suite that reads a pack's stack back checks its layout the
+/// same way (`conformance_packs` is the other one), so the layout lives in ONE place.
+pub(crate) fn stack_id_of(
+    case: &str,
+    region: &str,
+    name: &str,
+    id: &str,
+    stack_arn: &str,
+) -> String {
     let prefix = stack_arn_prefix(region, name, id);
     assert!(
         stack_arn.starts_with(&prefix),

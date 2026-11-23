@@ -31,9 +31,10 @@ pub const CONFORMANCE_PACK_TYPE_CUSTOM: &str = "CUSTOM";
 /// declares are written into
 /// [`ComAmazonawsConfigserviceStarlingdoveserviceState::config_rules`] (and their
 /// remediation configurations beside them) and named here in
-/// [`Self::deployed_rule_names`], so a pack reported complete is a pack whose resources
-/// exist; a deployment that could not create them carries [`Self::failure_reason`] and
-/// is reported `CREATE_FAILED` instead.
+/// [`Self::deployed_rule_names`], and the CloudFormation stack it created is named in
+/// [`Self::stack_arn`] — so a pack reported complete is a pack whose resources exist; a
+/// deployment that could not create them carries [`Self::failure_reason`], is reported
+/// `CREATE_FAILED`, and has neither resources nor a stack.
 ///
 /// [`ConformancePackStatusDetail$StackArn`]: ConformancePackStatusDetail
 #[derive(Debug, Clone)]
@@ -45,8 +46,16 @@ pub struct ConformancePackEntry {
     /// last segment of [`Self::arn`] and never changes once minted.
     pub id: String,
     pub arn: String,
-    /// The ARN of the CloudFormation stack the pack is deployed as.
-    pub stack_arn: String,
+    /// The ARN of the CloudFormation stack the pack is deployed as, where the pack HAS
+    /// one.
+    ///
+    /// The deployment is what CREATES the stack, and a pack keeps the stack it was
+    /// deployed as for as long as it lives, so a redeploy reports the one it was created
+    /// with. A deployment that could not be performed ([`Self::failure_reason`]) created
+    /// none, so a pack no deployment of which has succeeded has no stack to report and
+    /// carries no `StackArn` at all ([`Self::to_status_detail`]) rather than an ARN that
+    /// resolves to nothing.
+    pub stack_arn: Option<String>,
     /// WHICH KIND of conformance pack this is, as the pack's reads report it in `Type`
     /// ([`CONFORMANCE_PACK_TYPE_CUSTOM`]). Taken at creation from the provenance of the
     /// call that created the pack, and kept by a redeploy, so a pack's provenance cannot
@@ -105,7 +114,9 @@ impl ConformancePackEntry {
     /// The modelled `ConformancePackStatusDetail`, read back out of state at `now`.
     ///
     /// `ConformancePackStatusReason` is "the reason of conformance pack creation
-    /// failure", which a deployment that is in progress or complete has none of, and
+    /// failure", which a deployment that is in progress or complete has none of;
+    /// `StackArn` is "Amazon Resource Name (ARN) of CloudFormation stack", which a pack
+    /// whose deployment created no stack has none of ([`Self::stack_arn`]); and
     /// `LastUpdateCompletedTime` is "last time when conformation pack creation and
     /// update was successful", which neither a deployment still in progress nor a failed
     /// one has reached.

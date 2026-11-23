@@ -34,7 +34,7 @@ use service_com_amazonaws_configservice_starlingdoveservice::state::{
 };
 
 use crate::config_setup_and_rule_loop::Emulator;
-use crate::conformance_pack_type_and_stack_identity::{is_stack_id, settled};
+use crate::conformance_pack_type_and_stack_identity::{is_stack_id, settled, stack_id_of};
 
 /// Long enough for the clock to have made a pack's deployment due, read from the service
 /// itself so the test cannot drift from the span the service owes.
@@ -840,14 +840,7 @@ async fn a_put_for_a_pack_whose_deployment_is_still_in_flight_is_refused() {
     // The rule is about a deployment in FLIGHT, not about the pack existing: a deployment
     // that FAILED is finished, so the pack it left behind is redeployed with no wait.
     let emulator = Emulator::new();
-    let mut oversized = String::from("Resources:\n");
-    for index in 0..=CONFIG_RULES_QUOTA {
-        oversized.push_str(&format!(
-            "  Rule{index}:\n    Type: {CONFIG_RULE_TYPE}\n    Properties:\n      \
-             ConfigRuleName: rule-{index}\n      Source:\n        Owner: AWS\n        \
-             SourceIdentifier: IAM_PASSWORD_POLICY\n"
-        ));
-    }
+    let oversized = rules_template(CONFIG_RULES_QUOTA + 1);
     emulator
         .ok(
             "PutConformancePack",
@@ -1044,14 +1037,7 @@ async fn a_deployment_whose_rules_would_pass_the_config_rules_quota_fails_and_cr
 
     for (case, declared) in cases {
         let emulator = Emulator::new();
-        let mut template = String::from("Resources:\n");
-        for index in 0..declared {
-            template.push_str(&format!(
-                "  Rule{index}:\n    Type: {CONFIG_RULE_TYPE}\n    Properties:\n      \
-                 ConfigRuleName: rule-{index}\n      Source:\n        Owner: AWS\n        \
-                 SourceIdentifier: IAM_PASSWORD_POLICY\n"
-            ));
-        }
+        let template = rules_template(declared);
 
         // The pack itself is created — the template is a valid conformance pack template
         // — and its deployment is what failed.
@@ -1249,6 +1235,170 @@ async fn a_status_read_pages_over_the_packs_this_account_holds() {
             status == 400 && (code == expected || code == "ValidationException"),
             "case {case:?}: expected 400 {expected} (or the boundary's ValidationException), \
              got {status} {code}"
+        );
+    }
+}
+
+/// A conformance pack template declaring one Config rule scoped by BOTH a resource type
+/// and a tag — a scope no Config rule can carry, since "a rule's scope can include one or
+/// more resource types, a combination of a tag key and value, or a combination of one
+/// resource type and one resource ID" (`Scope`), which are ALTERNATIVES — so the account
+/// could not create the rule the template declares.
+fn both_dimensions_template(rule_name: &str) -> String {
+    format!(
+        "{}      Scope:\n        ComplianceResourceTypes:\n          - AWS::S3::Bucket\n        \
+         TagKey: owner\n",
+        rule_template(rule_name)
+    )
+}
+
+/// A template declaring `declared` Config rules, which is how a case reaches past this
+/// Region's Config rules quota: the deployment of a pack declaring more rules than the
+/// quota admits cannot create them all.
+fn rules_template(declared: usize) -> String {
+    let mut body = String::from("Resources:\n");
+    for index in 0..declared {
+        body.push_str(&format!(
+            "  Rule{index}:\n    Type: {CONFIG_RULE_TYPE}\n    Properties:\n      \
+             ConfigRuleName: rule-{index}\n      Source:\n        Owner: AWS\n        \
+             SourceIdentifier: IAM_PASSWORD_POLICY\n"
+        ));
+    }
+    body
+}
+
+/// Assert `detail`'s `StackArn` is the CloudFormation stack ARN of the pack this status
+/// read describes, and answer it.
+///
+/// The ARN's own layout — the conformance pack stack-name prefix, the pack's name and id,
+/// and CloudFormation's own uuid, which is neither — is asserted through the one reading of
+/// it this crate's suites share ([`stack_id_of`]), so no case here spells that layout a
+/// second time.
+fn stack_of(case: &str, region: &str, name: &str, detail: &Value) -> String {
+    let id = detail["ConformancePackId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: expected the pack's id, got {detail}"));
+    let stack_arn = detail["StackArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a StackArn, got {detail}"));
+    stack_id_of(case, region, name, id, stack_arn);
+    stack_arn.to_string()
+}
+
+#[tokio::test]
+async fn a_pack_reports_a_stack_only_once_a_deployment_of_it_has_created_one() {
+    // `StackArn` is "Amazon Resource Name (ARN) of CloudFormation stack"
+    // (`ConformancePackStatusDetail$StackArn`), and the pack's deployment is what creates
+    // that stack: a deployment that could not be performed created none, so the pack has
+    // no stack to report and the member is absent rather than carrying an ARN that
+    // resolves to nothing. Rows differ along WHY the deployment could not be performed —
+    // a declared rule the account could not create, a declared remediation action it
+    // could not create, more rules than the Region's quota admits — beside the positive
+    // control of a deployment that IS performed.
+    let cases: [(&str, String, bool); 4] = [
+        (
+            "a template the account can deploy",
+            rule_template("only-rule"),
+            true,
+        ),
+        (
+            "a declared rule scoped along both of a scope's dimensions",
+            both_dimensions_template("scoped-rule"),
+            false,
+        ),
+        (
+            "a declared automatic remediation with no role to run as",
+            format!(
+                "{}  TheFix:\n    Type: {REMEDIATION_TYPE}\n    Properties:\n      \
+                 ConfigRuleName: fixed-rule\n      TargetType: SSM_DOCUMENT\n      TargetId: \
+                 AWS-EnableS3BucketVersioning\n      Automatic: true\n",
+                rule_template("fixed-rule")
+            ),
+            false,
+        ),
+        (
+            "more declared rules than this Region's Config rules quota admits",
+            rules_template(CONFIG_RULES_QUOTA + 1),
+            false,
+        ),
+    ];
+
+    for (case, template_body, deploys) in cases {
+        let emulator = Emulator::new();
+        let name = "stacked-pack";
+        emulator
+            .ok("PutConformancePack", &pack_from_body(name, &template_body))
+            .await;
+        let detail = settled(case, &emulator, name).await;
+
+        if deploys {
+            assert_eq!(
+                detail["ConformancePackState"].as_str(),
+                Some(CONFORMANCE_PACK_STATE_CREATE_COMPLETE),
+                "case {case:?}: a deployment the account can perform completes, got {detail}"
+            );
+            stack_of(case, &emulator.region, name, &detail);
+            continue;
+        }
+
+        assert_eq!(
+            detail["ConformancePackState"].as_str(),
+            Some(CONFORMANCE_PACK_STATE_CREATE_FAILED),
+            "case {case:?}: a deployment the account cannot perform is \
+             {CONFORMANCE_PACK_STATE_CREATE_FAILED}, got {detail}"
+        );
+        assert!(
+            detail["ConformancePackStatusReason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty()),
+            "case {case:?}: a deployment that failed carries the reason it failed for, got \
+             {detail}"
+        );
+        assert!(
+            detail.get("StackArn").is_none(),
+            "case {case:?}: a deployment that created no stack reports no StackArn member at \
+             all, got {detail}"
+        );
+
+        // The pack is still the account's to redeploy, and the deployment that IS
+        // performed is what gives it a stack.
+        tokio::time::sleep(past_the_deployment()).await;
+        emulator
+            .ok(
+                "PutConformancePack",
+                &pack_from_body(name, &rule_template("only-rule")),
+            )
+            .await;
+        let redeployed = settled(case, &emulator, name).await;
+        assert_eq!(
+            redeployed["ConformancePackState"].as_str(),
+            Some(CONFORMANCE_PACK_STATE_CREATE_COMPLETE),
+            "case {case:?}: the redeploy the account can perform completes, got {redeployed}"
+        );
+        let stack_arn = stack_of(case, &emulator.region, name, &redeployed);
+
+        // And the stack a deployment created is the pack's from then on: a LATER
+        // deployment that fails leaves the stack it already has standing, rather than
+        // taking the pack's stack away.
+        tokio::time::sleep(past_the_deployment()).await;
+        emulator
+            .ok(
+                "PutConformancePack",
+                &pack_from_body(name, &both_dimensions_template("scoped-rule")),
+            )
+            .await;
+        let failed_again = settled(case, &emulator, name).await;
+        assert_eq!(
+            (
+                failed_again["ConformancePackState"].as_str(),
+                failed_again["StackArn"].as_str(),
+            ),
+            (
+                Some(CONFORMANCE_PACK_STATE_CREATE_FAILED),
+                Some(stack_arn.as_str()),
+            ),
+            "case {case:?}: a failed redeploy keeps the stack the pack already has, got \
+             {failed_again}"
         );
     }
 }
