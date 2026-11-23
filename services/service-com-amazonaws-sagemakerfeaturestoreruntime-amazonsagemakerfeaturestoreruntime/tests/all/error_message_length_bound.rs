@@ -67,6 +67,18 @@ impl Emulator {
     /// does: by registering its definition in the ONE shared directory this data plane
     /// resolves names against.
     fn create_feature_group(&self, name: &str) {
+        self.create_group(name, true);
+    }
+
+    /// Create a feature group whose definition enables NO `OnlineStore` — the other state
+    /// a read of a group that DOES resolve is refused for, worded by this data plane's
+    /// second shared refusal.
+    fn create_group_without_online_store(&self, name: &str) {
+        self.create_group(name, false);
+    }
+
+    /// Register one feature-group definition, with or without an `OnlineStore`.
+    fn create_group(&self, name: &str, online_store_enabled: bool) {
         self.engine
             .state::<FeatureGroupDirectory>()
             .lock()
@@ -75,7 +87,7 @@ impl Emulator {
                 arn: format!("arn:aws:sagemaker:{REGION}:{ACCOUNT}:feature-group/{name}"),
                 record_identifier_feature_name: IDENTIFIER_FEATURE.to_owned(),
                 event_time_feature_name: EVENT_TIME_FEATURE.to_owned(),
-                online_store_enabled: true,
+                online_store_enabled,
                 offline_store: None,
                 default_ttl_seconds: None,
             });
@@ -143,9 +155,8 @@ fn message(body: &Value) -> String {
 
 /// The first per-element `ErrorMessage` a batch response reports, and the code beside it.
 fn first_batch_error(body: &Value) -> (String, String) {
-    body.get("Errors")
-        .and_then(Value::as_array)
-        .and_then(|errors| errors.first())
+    batch_errors(body)
+        .first()
         .map(|error| {
             (
                 error["ErrorCode"].as_str().unwrap_or_default().to_owned(),
@@ -830,6 +841,316 @@ async fn a_refusal_is_answered_whole_up_to_the_bound_and_cut_only_past_it() {
                     stated.chars().take(120).collect::<String>()
                 );
             }
+        }
+    }
+}
+
+/// The feature group the rows below read while its definition enables no `OnlineStore`.
+const NO_ONLINE_STORE_GROUP: &str = "offline-only";
+
+/// How this data plane states a READ of a feature group whose definition enables no
+/// `OnlineStore`, unbounded: the group is named as its definition records it. The second
+/// of the two refusals a `BatchGetRecord` entry can report.
+fn no_online_store(group: &str) -> String {
+    format!("Validation Error: FeatureGroup {group} has no OnlineStore enabled.")
+}
+
+/// The per-element error list of a batch response, as JSON values.
+fn batch_errors(body: &Value) -> Vec<Value> {
+    body.get("Errors")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn batch_get_record_cuts_the_message_of_every_element_of_every_refused_entry() {
+    // The bound belongs to the MEMBER, so it holds for EVERY element a batch reports, not
+    // only the first one a client happens to read: one `BatchGetRecord` carries a refusal
+    // per identifier of every entry that is refused. The entries span the identifier
+    // counts within an entry and both spellings the modelled `FeatureGroupNameOrArn`
+    // admits, with the Region — which the caller's own credential scope names and nothing
+    // bounds — past the maximum, so every element's message has to be cut.
+    let region = "a".repeat(3_000);
+    // (the group the entry names, the spelling it names it with, how many identifiers)
+    let entries: Vec<(&str, String, usize)> = vec![
+        ("ghost", "ghost".to_owned(), 3),
+        (
+            "phantom",
+            "arn:aws:sagemaker:eu-west-1:123456789012:feature-group/phantom".to_owned(),
+            2,
+        ),
+        ("missing", "missing".to_owned(), 1),
+    ];
+
+    let emulator = Emulator::new();
+    emulator.create_feature_group(GROUP);
+    // The one entry that DOES resolve holds a record, so the batch serves a read beside
+    // the refusals and the cut is shown not to disturb what is served.
+    let (status, body) = emulator
+        .send_in(
+            &region,
+            "PUT",
+            &format!("/FeatureGroup/{GROUP}"),
+            Some(json!({ "Record": [
+                feature(IDENTIFIER_FEATURE, "R1"),
+                feature(EVENT_TIME_FEATURE, "2026-10-23T18:20:13Z")
+            ] })),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "expected PutRecord to seed the resolvable group with 200, got {status} with {body}"
+    );
+
+    let mut identifiers = vec![json!({
+        "FeatureGroupName": GROUP,
+        "RecordIdentifiersValueAsString": ["R1"]
+    })];
+    // (the element's `FeatureGroupName`, its identifier, the UNBOUNDED refusal it states)
+    let mut expected_errors: Vec<(String, String, String)> = Vec::new();
+    for (name, spelling, count) in &entries {
+        let wanted: Vec<String> = (0..*count).map(|at| format!("{name}-{at}")).collect();
+        identifiers.push(json!({
+            "FeatureGroupName": spelling,
+            "RecordIdentifiersValueAsString": wanted
+        }));
+        for identifier in wanted {
+            expected_errors.push((
+                spelling.clone(),
+                identifier,
+                no_such_feature_group(&region, name),
+            ));
+        }
+    }
+
+    let (status, answered) = emulator
+        .send_in(
+            &region,
+            "POST",
+            "/BatchGetRecord",
+            Some(json!({ "Identifiers": identifiers })),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "expected BatchGetRecord to report its refusals in a 200, got {status} with {answered}"
+    );
+    let errors = batch_errors(&answered);
+    assert_eq!(
+        errors.len(),
+        expected_errors.len(),
+        "expected one error element per identifier of every refused entry ({}), got {}",
+        expected_errors.len(),
+        errors.len()
+    );
+    for (element, (group, identifier, expected)) in errors.iter().zip(&expected_errors) {
+        let case = format!("{group} / {identifier}");
+        let stated = element
+            .get("ErrorMessage")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert_eq!(
+            (
+                element
+                    .get("FeatureGroupName")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                element
+                    .get("RecordIdentifierValueAsString")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                element
+                    .get("ErrorCode")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+            ),
+            (group.as_str(), identifier.as_str(), "ValidationError"),
+            "case {case:?}: expected the element to pair with the entry as it was sent, got \
+             the element with {:?}…",
+            stated.chars().take(80).collect::<String>()
+        );
+        assert_cut_to_bound(&case, stated, expected);
+    }
+
+    // What resolved is served exactly as it would be with no refusal beside it.
+    let records = answered
+        .get("Records")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        records.len(),
+        1,
+        "expected the one record of the entry that resolves, got {records:?}"
+    );
+    assert_eq!(
+        (
+            records[0]
+                .get("FeatureGroupName")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            records[0]
+                .get("RecordIdentifierValueAsString")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        ),
+        (GROUP, "R1"),
+        "expected the record the resolvable entry asked for, got {:?}",
+        records[0]
+    );
+}
+
+#[tokio::test]
+async fn batch_get_record_answers_a_per_element_refusal_inside_the_bound_verbatim() {
+    // Cutting is what a message PAST the maximum gets: one the member admits is answered
+    // whole, so nothing a client needs is dropped. Both refusals an entry of this
+    // operation can report are driven — a name that denotes no feature group, in either
+    // modelled spelling, and a group that resolves while its definition enables no
+    // `OnlineStore`.
+    //
+    // (case, the spelling the entry carries, the refusal it must state)
+    let rows: Vec<(&str, String, String)> = vec![
+        (
+            "a name that denotes no feature group",
+            "ghost".to_owned(),
+            no_such_feature_group(REGION, "ghost"),
+        ),
+        (
+            "a name that denotes no feature group, spelled as an ARN",
+            format!("arn:aws:sagemaker:{REGION}:{ACCOUNT}:feature-group/ghost"),
+            no_such_feature_group(REGION, "ghost"),
+        ),
+        (
+            "a group whose definition enables no OnlineStore",
+            NO_ONLINE_STORE_GROUP.to_owned(),
+            no_online_store(NO_ONLINE_STORE_GROUP),
+        ),
+    ];
+
+    for (case, spelling, expected) in rows {
+        assert!(
+            expected.len() <= MAX_MESSAGE_BYTES,
+            "case {case:?}: the row must state a message the {MAX_MESSAGE_BYTES}-byte bound \
+             admits to be answered whole, but it is {} bytes",
+            expected.len()
+        );
+        let emulator = Emulator::new();
+        emulator.create_feature_group(GROUP);
+        emulator.create_group_without_online_store(NO_ONLINE_STORE_GROUP);
+        let (status, answered) = emulator
+            .send_in(
+                REGION,
+                "POST",
+                "/BatchGetRecord",
+                Some(json!({ "Identifiers": [{
+                    "FeatureGroupName": spelling,
+                    "RecordIdentifiersValueAsString": ["R1", "R2"]
+                }] })),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected BatchGetRecord to report its refusal in a 200, got \
+             {status} with {answered}"
+        );
+        let errors = batch_errors(&answered);
+        assert_eq!(
+            errors.len(),
+            2,
+            "case {case:?}: expected one error element per identifier of the entry, got \
+             {errors:?}"
+        );
+        for element in &errors {
+            let stated = element
+                .get("ErrorMessage")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            assert_eq!(
+                stated, expected,
+                "case {case:?}: expected the refusal the bound admits answered whole, got {} \
+                 bytes ({stated:?})",
+                stated.len()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn batch_get_record_states_a_per_element_refusal_whole_up_to_the_bound_and_cuts_past_it() {
+    // The member's own edges, driven through the per-element `ErrorMessage` by PADDING the
+    // Region the refused entry's ARN carries so the unbounded refusal lands just below the
+    // maximum, exactly on it, and just past it.
+    //
+    // (how long the UNBOUNDED refusal is)
+    let lengths = [
+        MAX_MESSAGE_BYTES - 1,
+        MAX_MESSAGE_BYTES,
+        MAX_MESSAGE_BYTES + 1,
+        MAX_MESSAGE_BYTES + 2,
+    ];
+
+    for length in lengths {
+        let case = format!("BatchGetRecord stating a {length}-byte refusal");
+        let unpadded = no_such_feature_group("", "ghost").len();
+        let padding = length.checked_sub(unpadded).unwrap_or_else(|| {
+            panic!("case {case:?}: the refusal is already longer than {length} bytes")
+        });
+        let region = "r".repeat(padding);
+        let expected = no_such_feature_group(&region, "ghost");
+        assert_eq!(
+            expected.len(),
+            length,
+            "case {case:?}: expected a {length}-byte refusal to drive the row, got {} bytes",
+            expected.len()
+        );
+
+        let emulator = Emulator::new();
+        emulator.create_feature_group(GROUP);
+        let (status, answered) = emulator
+            .send_in(
+                &region,
+                "POST",
+                "/BatchGetRecord",
+                Some(json!({ "Identifiers": [{
+                    "FeatureGroupName": "ghost",
+                    "RecordIdentifiersValueAsString": ["R1"]
+                }] })),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected BatchGetRecord to report its refusal in a 200, got \
+             {status} with {:?}…",
+            answered.to_string().chars().take(120).collect::<String>()
+        );
+        let (code, stated) = first_batch_error(&answered);
+        assert_eq!(
+            code, "ValidationError",
+            "case {case:?}: expected one ValidationError element, got {code:?} with {:?}…",
+            stated.chars().take(120).collect::<String>()
+        );
+        if length <= MAX_MESSAGE_BYTES {
+            assert_eq!(
+                stated, expected,
+                "case {case:?}: expected the refusal the bound admits answered whole, got {} \
+                 bytes",
+                stated.len()
+            );
+        } else {
+            assert_eq!(
+                stated.len(),
+                MAX_MESSAGE_BYTES,
+                "case {case:?}: expected a refusal past the bound cut to exactly \
+                 {MAX_MESSAGE_BYTES} bytes, got {} bytes",
+                stated.len()
+            );
+            assert!(
+                expected.starts_with(&stated),
+                "case {case:?}: expected the answered message to be a prefix of the \
+                 {length}-byte refusal, got {:?}…",
+                stated.chars().take(120).collect::<String>()
+            );
         }
     }
 }
