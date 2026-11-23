@@ -42,8 +42,8 @@
 //!
 //! A sixth seam, `override_protocol`, is one this service also takes, for one thing the
 //! generic renderer cannot express: a failure reports its request id in the
-//! `x-amzn-RequestId` response header rather than as a member of the error document. See
-//! [`wire`].
+//! `x-amzn-RequestId` response header as well as in the error document the model declares
+//! it in. See [`wire`].
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
@@ -150,11 +150,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
-        // The model's own restJson1 codec, with the ONE difference the generic renderer
-        // cannot express: a modelled failure reports the request id of the call in the
-        // `x-amzn-RequestId` response header, and its error document carries the error
-        // shape's other members only (see `wire`). Borrowed from the field built in
-        // `new`, never constructed per request.
+        // The model's own restJson1 codec, with the ONE addition the generic renderer
+        // cannot express: a modelled failure repeats the request id its error document
+        // carries in the `x-amzn-RequestId` response header (see `wire`). Borrowed from
+        // the field built in `new`, never constructed per request.
         //
         // This seam drives the MODELLED sequence only. A refusal rendered before a
         // handler runs still renders in the generated entry's envelope, which is correct:

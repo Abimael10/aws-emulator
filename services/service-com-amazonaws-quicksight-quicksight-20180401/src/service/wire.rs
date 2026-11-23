@@ -2,35 +2,33 @@
 
 //! How this service's `restJson1` answers report the request id of a FAILED call.
 //!
-//! RULE: the request id of a failed call travels in the `x-amzn-RequestId` RESPONSE
-//! HEADER, and the error document carries the error shape's other modelled members only —
-//! a rendered error body of this service never carries a `RequestId` member, whatever the
-//! handler that refused the call put in it. Every exception shape of this model declares
-//! `RequestId` as an OPTIONAL member (`smithy_query(query="shape",
+//! RULE: a failed call of this service reports the request id in BOTH places AWS puts it —
+//! the `RequestId` member of the error document, which every exception shape of this model
+//! declares (`smithy_query(query="shape",
 //! shape="ResourceNotFoundException,ResourceExistsException,LimitExceededException",
 //! model_path="services/service-com-amazonaws-quicksight-quicksight-20180401/smithy-model/com-amazonaws-quicksight-quicksight-20180401.json")`),
-//! so writing it is the renderer's choice rather than the model's requirement, and the
-//! wire this service emulates leaves it out of the document: a client correlating a
-//! failure with a service-side request id reads the header, which is the one place the id
-//! is reported. A SUCCESS is a different contract — the output shapes declare `RequestId`
-//! as a body member and the answer carries it there — so nothing here touches one.
+//! and the `x-amzn-RequestId` response header every answer of an AWS service carries. The
+//! two report the SAME id: the one the refusing handler allocated for the call. A SUCCESS
+//! is the same contract read through the output shapes, which declare `RequestId` as a body
+//! member too.
 //!
-//! The framework's generic serializer writes every member a handler set, and `vendor/` is
-//! read-only, so the correction lives at the one seam a service owns over the answers it
-//! writes: [`RequestIdInHeaderRestJson`] is the protocol `service.rs` hands the dispatch
-//! sequence through [`smithy_server_runtime::Service::override_protocol`], so EVERY
-//! modelled failure of EVERY operation goes out the same way and no handler, shape
-//! declaration or error constructor mentions the rendering at all. The id itself is the
-//! one the refusing handler allocated — it is moved from the document to the header, never
-//! re-minted here — and an error shape that declares no such member is rendered exactly as
-//! the framework writes it.
+//! The framework's generic serializer writes the document — every member the handler set,
+//! the request id among them — but knows nothing of the header, and `vendor/` is read-only,
+//! so the one addition lives at the seam a service owns over the answers it writes:
+//! [`RequestIdInHeaderRestJson`] is the protocol `service.rs` hands the dispatch sequence
+//! through [`smithy_server_runtime::Service::override_protocol`], so EVERY modelled failure
+//! of EVERY operation goes out the same way and no handler, shape declaration or error
+//! constructor mentions the rendering at all. The id is OBSERVED as the document is
+//! written, never re-minted here, so the header can only ever repeat what the body says;
+//! an error shape that declares no such member is rendered exactly as the framework writes
+//! it and reports no id anywhere.
 //!
 //! Everything else is the framework's own `restJson1` protocol, delegated to unchanged:
 //! routing, request deserialization, success bodies, the status, `x-amzn-errortype` and
-//! every other member of the error document. One class of failure is not reachable from
-//! this seam and is left as the framework writes it: a refusal rendered BEFORE a handler
-//! runs (an absent required member, a value outside a modelled bound, an unauthenticated
-//! caller), whose synthetic shape has no request-id member to withhold in the first place.
+//! every member of the error document. One class of failure is not reachable from this seam
+//! and is left as the framework writes it: a refusal rendered BEFORE a handler runs (an
+//! absent required member, a value outside a modelled bound, an unauthenticated caller),
+//! whose synthetic shape has no request-id member in the first place.
 
 use std::cell::RefCell;
 
@@ -41,8 +39,7 @@ use aws_smithy_schema_server::protocol::{ProtocolError, ServerProtocol};
 use aws_smithy_schema_server::RestJsonServerProtocol;
 use aws_smithy_types::{BigDecimal, BigInteger, DateTime, Document};
 
-/// The response header AWS reports the request id of a call in, and the only place a
-/// failure of this service reports it.
+/// The response header AWS reports the request id of a call in, beside the document member.
 const REQUEST_ID_HEADER: &str = "x-amzn-RequestId";
 
 /// The member this model's exception shapes declare the request id under.
@@ -65,50 +62,47 @@ fn request_id_member(error_schema: &Schema) -> Option<&Schema> {
     })
 }
 
-/// An error structure serialized with its own members except the request id, which is
-/// captured in `withheld` for the header to carry instead.
-struct RequestIdWithheld<'a> {
+/// An error structure serialized exactly as the framework writes it, with the request id it
+/// carries noted in `observed` so the response can repeat it in its header.
+struct RequestIdObserved<'a> {
     inner: &'a dyn SerializableStruct,
     request_id: &'a Schema,
-    withheld: &'a RefCell<Option<String>>,
+    observed: &'a RefCell<Option<String>>,
 }
 
-impl SerializableStruct for RequestIdWithheld<'_> {
+impl SerializableStruct for RequestIdObserved<'_> {
     fn serialize_members(&self, serializer: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
-        let mut withholding = Withholding {
+        let mut observing = Observing {
             inner: &mut *serializer,
             member_name: self.request_id.member_name(),
-            withheld: self.withheld,
+            observed: self.observed,
         };
-        self.inner.serialize_members(&mut withholding)
+        self.inner.serialize_members(&mut observing)
     }
 }
 
 /// The serializer an error's members are written through: every write is the wrapped
-/// serializer's, except a write of the request-id member, which is kept out of the
-/// document and noted so the response can report it in its header.
-struct Withholding<'a> {
+/// serializer's, unchanged, and a write of the request-id member is additionally noted so
+/// the response can report the same id in its header.
+struct Observing<'a> {
     inner: &'a mut dyn ShapeSerializer,
     member_name: Option<&'a str>,
-    withheld: &'a RefCell<Option<String>>,
+    observed: &'a RefCell<Option<String>>,
 }
 
-impl Withholding<'_> {
-    /// Whether `schema` is the member this rule keeps out of the document.
-    fn withholds(&self, schema: &Schema) -> bool {
+impl Observing<'_> {
+    /// Whether `schema` is the member whose value the header repeats.
+    fn observes(&self, schema: &Schema) -> bool {
         self.member_name.is_some() && schema.member_name() == self.member_name
     }
 }
 
-impl ShapeSerializer for Withholding<'_> {
+impl ShapeSerializer for Observing<'_> {
     fn write_struct(
         &mut self,
         schema: &Schema,
         value: &dyn SerializableStruct,
     ) -> Result<(), SerdeError> {
-        if self.withholds(schema) {
-            return Ok(());
-        }
         self.inner.write_struct(schema, value)
     }
 
@@ -117,9 +111,6 @@ impl ShapeSerializer for Withholding<'_> {
         schema: &Schema,
         write_elements: &dyn Fn(&mut dyn ShapeSerializer) -> Result<(), SerdeError>,
     ) -> Result<(), SerdeError> {
-        if self.withholds(schema) {
-            return Ok(());
-        }
         self.inner.write_list(schema, write_elements)
     }
 
@@ -128,117 +119,74 @@ impl ShapeSerializer for Withholding<'_> {
         schema: &Schema,
         write_entries: &dyn Fn(&mut dyn ShapeSerializer) -> Result<(), SerdeError>,
     ) -> Result<(), SerdeError> {
-        if self.withholds(schema) {
-            return Ok(());
-        }
         self.inner.write_map(schema, write_entries)
     }
 
     fn write_boolean(&mut self, schema: &Schema, value: bool) -> Result<(), SerdeError> {
-        if self.withholds(schema) {
-            return Ok(());
-        }
         self.inner.write_boolean(schema, value)
     }
 
     fn write_byte(&mut self, schema: &Schema, value: i8) -> Result<(), SerdeError> {
-        if self.withholds(schema) {
-            return Ok(());
-        }
         self.inner.write_byte(schema, value)
     }
 
     fn write_short(&mut self, schema: &Schema, value: i16) -> Result<(), SerdeError> {
-        if self.withholds(schema) {
-            return Ok(());
-        }
         self.inner.write_short(schema, value)
     }
 
     fn write_integer(&mut self, schema: &Schema, value: i32) -> Result<(), SerdeError> {
-        if self.withholds(schema) {
-            return Ok(());
-        }
         self.inner.write_integer(schema, value)
     }
 
     fn write_long(&mut self, schema: &Schema, value: i64) -> Result<(), SerdeError> {
-        if self.withholds(schema) {
-            return Ok(());
-        }
         self.inner.write_long(schema, value)
     }
 
     fn write_float(&mut self, schema: &Schema, value: f32) -> Result<(), SerdeError> {
-        if self.withholds(schema) {
-            return Ok(());
-        }
         self.inner.write_float(schema, value)
     }
 
     fn write_double(&mut self, schema: &Schema, value: f64) -> Result<(), SerdeError> {
-        if self.withholds(schema) {
-            return Ok(());
-        }
         self.inner.write_double(schema, value)
     }
 
     fn write_big_integer(&mut self, schema: &Schema, value: &BigInteger) -> Result<(), SerdeError> {
-        if self.withholds(schema) {
-            return Ok(());
-        }
         self.inner.write_big_integer(schema, value)
     }
 
     fn write_big_decimal(&mut self, schema: &Schema, value: &BigDecimal) -> Result<(), SerdeError> {
-        if self.withholds(schema) {
-            return Ok(());
-        }
         self.inner.write_big_decimal(schema, value)
     }
 
     fn write_string(&mut self, schema: &Schema, value: &str) -> Result<(), SerdeError> {
-        if self.withholds(schema) {
-            // The id the handler allocated for this call: kept out of the document and
-            // reported in the response header instead.
-            *self.withheld.borrow_mut() = Some(value.to_string());
-            return Ok(());
+        if self.observes(schema) {
+            // The id the handler allocated for this call: written to the document by the
+            // wrapped serializer below, and noted here so the header repeats it.
+            *self.observed.borrow_mut() = Some(value.to_string());
         }
         self.inner.write_string(schema, value)
     }
 
     fn write_blob(&mut self, schema: &Schema, value: &[u8]) -> Result<(), SerdeError> {
-        if self.withholds(schema) {
-            return Ok(());
-        }
         self.inner.write_blob(schema, value)
     }
 
     fn write_timestamp(&mut self, schema: &Schema, value: &DateTime) -> Result<(), SerdeError> {
-        if self.withholds(schema) {
-            return Ok(());
-        }
         self.inner.write_timestamp(schema, value)
     }
 
     fn write_document(&mut self, schema: &Schema, value: &Document) -> Result<(), SerdeError> {
-        if self.withholds(schema) {
-            return Ok(());
-        }
         self.inner.write_document(schema, value)
     }
 
     fn write_null(&mut self, schema: &Schema) -> Result<(), SerdeError> {
-        if self.withholds(schema) {
-            return Ok(());
-        }
         self.inner.write_null(schema)
     }
 }
 
 /// The `restJson1` codec that reports a failure's request id in the `x-amzn-RequestId`
-/// response header rather than in the error document: the model's own protocol in every
-/// other respect.
+/// response header as well as in the error document the model declares it in: the model's
+/// own protocol in every other respect.
 #[derive(Debug)]
 pub struct RequestIdInHeaderRestJson {
     inner: RestJsonServerProtocol,
@@ -310,17 +258,17 @@ impl ServerProtocol for RequestIdInHeaderRestJson {
         http_status: u16,
     ) -> Result<Self::Response, ProtocolError> {
         let Some(request_id) = request_id_member(error_schema) else {
-            // A shape with no request-id member has nothing to move.
+            // A shape with no request-id member reports none in its header either.
             return self
                 .inner
                 .serialize_error(error, error_schema, error_code, http_status);
         };
-        let withheld: RefCell<Option<String>> = RefCell::new(None);
+        let observed: RefCell<Option<String>> = RefCell::new(None);
         let mut response = self.inner.serialize_error(
-            &RequestIdWithheld {
+            &RequestIdObserved {
                 inner: error,
                 request_id,
-                withheld: &withheld,
+                observed: &observed,
             },
             error_schema,
             error_code,
@@ -328,8 +276,9 @@ impl ServerProtocol for RequestIdInHeaderRestJson {
         )?;
         // Dropped rather than fatal if the HTTP layer cannot carry the value: `try_insert`
         // is the fallible half of the insert the framework itself uses on the error path,
-        // where a panic would become a 500 an SDK retries.
-        if let Some(id) = withheld.into_inner() {
+        // where a panic would become a 500 an SDK retries. The document already carries the
+        // id, so a dropped header costs a client nothing it cannot read from the body.
+        if let Some(id) = observed.into_inner() {
             let _ = response.headers_mut().try_insert(REQUEST_ID_HEADER, id);
         }
         Ok(response)

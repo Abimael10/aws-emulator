@@ -2099,9 +2099,11 @@ async fn a_role_is_reached_only_in_an_account_that_holds_a_quicksight_identity_s
                      {ROLE_DENIAL_MESSAGE:?}, got {body}"
                 );
                 assert!(
-                    body.get("RequestId").is_none(),
-                    "case {case:?} {call} {role}: a refusal reports its request id in the \
-                     x-amzn-RequestId header, never as a document member: {body}"
+                    body["RequestId"]
+                        .as_str()
+                        .is_some_and(|request_id| !request_id.is_empty()),
+                    "case {case:?} {call} {role}: a refusal reports its request id as the \
+                     RequestId member its error shape declares: {body}"
                 );
             }
         }
