@@ -284,6 +284,16 @@ impl Provisioner {
             Self::RdsDbSubnetGroup => {
                 describe_db_subnet_group(ctx, region, physical_resource_id, RDS_SDK_SERVICE).await
             }
+            // Amazon RDS's own read of the event subscription, by the name it was created
+            // under.
+            Self::RdsEventSubscription => {
+                Box::pin(rds_event_subscriptions::read_subscription(
+                    ctx,
+                    region,
+                    physical_resource_id,
+                ))
+                .await
+            }
             // Amazon RDS's own read of the option group, by the name it was created under.
             Self::RdsOptionGroup => {
                 Box::pin(rds_option_groups::read_option_group(

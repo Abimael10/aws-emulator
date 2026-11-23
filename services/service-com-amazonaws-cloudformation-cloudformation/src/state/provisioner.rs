@@ -1019,6 +1019,12 @@ pub(super) enum Provisioner {
     /// reports the one a completed stack declared, so a stack declaring one has to create it
     /// there for real.
     RdsGlobalCluster,
+    /// `AWS::RDS::EventSubscription`: the event notification subscription that publishes Amazon
+    /// RDS's events to an Amazon SNS topic, which `CreateEventSubscription` creates under the
+    /// `SubscriptionName` the declaration states — the name this type's `Ref` returns —
+    /// `DescribeEventSubscriptions` reports and `DeleteEventSubscription` removes
+    /// ([`rds_event_subscriptions`]).
+    RdsEventSubscription,
     /// `AWS::Neptune::DBParameterGroup` and `AWS::Neptune::DBClusterParameterGroup`: the two
     /// levels of Amazon Neptune parameter group, created, written, read and deleted by the
     /// parameter-group operations of the one relational front door that serves this engine's
@@ -1752,6 +1758,9 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
             Some(Provisioner::RdsDbClusterEndpoint)
         }
         rds_global_clusters::RDS_GLOBAL_CLUSTER => Some(Provisioner::RdsGlobalCluster),
+        rds_event_subscriptions::RDS_EVENT_SUBSCRIPTION => {
+            Some(Provisioner::RdsEventSubscription)
+        }
         neptune_relational::NEPTUNE_DB_PARAMETER_GROUP => {
             Some(Provisioner::NeptuneDbParameterGroup)
         }
@@ -2349,6 +2358,18 @@ impl Provisioner {
                     RDS_DB_SUBNET_GROUP,
                     RDS_SDK_SERVICE,
                 )
+                .await
+            }
+            // `AWS::RDS::EventSubscription` publishes `Tags` as the `{Key, Value}` list
+            // `CreateEventSubscription`'s own `Tags` member takes, so a subscription a stack
+            // creates carries the tags CloudFormation gives it beside the declared ones.
+            Self::RdsEventSubscription => {
+                Box::pin(rds_event_subscriptions::create_subscription(
+                    ctx,
+                    region,
+                    resource,
+                    propagated,
+                ))
                 .await
             }
             // `AWS::RDS::OptionGroup` publishes `Tags` as the `{Key, Value}` list
@@ -3744,6 +3765,10 @@ impl Provisioner {
             Self::RdsOptionGroup => {
                 rds_option_groups::delete_option_group(ctx, region, physical_resource_id).await
             }
+            Self::RdsEventSubscription => {
+                rds_event_subscriptions::delete_subscription(ctx, region, physical_resource_id)
+                    .await
+            }
             Self::RdsDbParameterGroup => {
                 delete_parameter_group(
                     ctx,
@@ -4599,6 +4624,12 @@ pub(in crate::state) mod rds_cluster_endpoints;
 /// declares, created in the service that owns it so a DB cluster that joins it and a client's
 /// own read of that service resolve the one the stack publishes.
 pub(in crate::state) mod rds_global_clusters;
+/// The Amazon RDS EVENT SUBSCRIPTION arm: the subscription an `AWS::RDS::EventSubscription`
+/// declares, created in the service that owns it so a client's own `DescribeEventSubscriptions`
+/// resolves the name the stack publishes. Visible to the rest of this service's state because
+/// the type's own NAME lives here, beside the arms that provision it, and the catalogue of
+/// declarable types and the naming rules key their entries for it by that name.
+pub(in crate::state) mod rds_event_subscriptions;
 /// The Amazon Neptune RELATIONAL arms: the two parameter-group levels, the subnet group and
 /// the global database an `AWS::Neptune::*` type declares, each registered against the arm the
 /// Amazon RDS type of the same document has — one front door serves both control planes.

@@ -889,7 +889,9 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::RDS::DBSecurityGroup",
     "AWS::RDS::DBSnapshot",
     "AWS::RDS::DBSubnetGroup",
-    "AWS::RDS::EventSubscription",
+    // The event notification subscription is created in the owning service
+    // (`super::provisioner`), through that service's own `CreateEventSubscription`.
+    crate::state::provisioner::rds_event_subscriptions::RDS_EVENT_SUBSCRIPTION,
     "AWS::RDS::GlobalCluster",
     "AWS::RDS::OptionGroup",
     // Amazon CloudWatch RUM

@@ -338,6 +338,14 @@ pub(super) fn naming_rules(resource_type: &str) -> Option<NameRules> {
         | crate::state::provisioner::neptune_relational::NEPTUNE_GLOBAL_CLUSTER => {
             rules(63, Characters::LowercaseAlphanumeric)
         }
+        // Amazon RDS `CreateEventSubscription.SubscriptionName`: "The name of the
+        // subscription", whose one published constraint is "The name must be less than 255
+        // characters" (that member's own doc) — RDS's model carries no `@length` for it. That
+        // member states no case folding, so a generated name is held as generated and only the
+        // LENGTH is a bound one could break.
+        crate::state::provisioner::rds_event_subscriptions::RDS_EVENT_SUBSCRIPTION => {
+            rules(254, Characters::AsGenerated)
+        }
         // Amazon RDS `CreateDBProxy.DBProxyName`: `@length(min: 1, max: 63)` with pattern
         // `^[a-zA-Z](?:-?[a-zA-Z0-9]+)*$` (`smithy_query(query="operation",
         // operation="CreateDBProxy")`) — which, unlike the identifiers above, is NOT folded
@@ -918,6 +926,15 @@ pub(super) fn declared_name_property(resource_type: &str) -> Option<&'static str
         // `ClusterSnapshotIdentifier` finds it.
         crate::state::provisioner::rds_snapshots::RDS_CLUSTER_SNAPSHOT => {
             Some("DBClusterSnapshotIdentifier")
+        }
+        // The same service's `CreateEventSubscription` takes a `SubscriptionName` — "the name of
+        // the subscription", and "Ref returns the subscription name" — and the type publishes it,
+        // so the name the template states is the subscription's. The type's last segment is
+        // `EventSubscription`, so neither `EventSubscriptionName` nor `Name` finds it, and a
+        // generated `<stack>-<logical id>-<unique id>` would name no subscription that service
+        // holds.
+        crate::state::provisioner::rds_event_subscriptions::RDS_EVENT_SUBSCRIPTION => {
+            Some(crate::state::provisioner::rds_event_subscriptions::SUBSCRIPTION_NAME_MEMBER)
         }
         // AWS IoT's `CreateProvisioningTemplate` takes a `templateName` — "Ref returns the
         // provisioning template name" — so the type publishes `TemplateName`; the type's last
