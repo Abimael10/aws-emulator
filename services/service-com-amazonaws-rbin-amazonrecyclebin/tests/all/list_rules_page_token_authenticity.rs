@@ -64,7 +64,24 @@ async fn list_rules_in(router: &MultiServiceRouter, region: &str, body: Value) -
     call_signed_for(router, region, "POST", "/list-rules", Some(body)).await
 }
 
-/// `DELETE /rules/{Identifier}` signed for `region` — `DeleteRule`.
+/// `DELETE /rules/{Identifier}` signed for `region`, failing the case unless the rule is
+/// gone — the one call site of that assertion, shared with the suites that delete a rule
+/// to reach the state they are about.
+pub(crate) async fn delete_rule_in_expecting_no_content(
+    router: &MultiServiceRouter,
+    region: &str,
+    identifier: &str,
+    case: &str,
+) {
+    let status = delete_rule_in(router, region, identifier).await;
+    assert_eq!(
+        status, 204,
+        "case {case:?}: expected HTTP 204 from DeleteRule {identifier}, got {status}"
+    );
+}
+
+/// `DELETE /rules/{Identifier}` signed for `region` — `DeleteRule`. The status, so a
+/// caller states its own case when asserting on it.
 async fn delete_rule_in(router: &MultiServiceRouter, region: &str, identifier: &str) -> u16 {
     let (status, _body) =
         call_signed_for(router, region, "DELETE", &format!("/rules/{identifier}"), None).await;
@@ -442,11 +459,7 @@ async fn a_cursor_stays_usable_after_the_rule_it_names_is_deleted() {
             panic!("case {case:?}: expected a NextToken after a page of one rule")
         });
         for identifier in &first {
-            let status = delete_rule_in(&router, region, identifier).await;
-            assert_eq!(
-                status, 204,
-                "case {case:?}: expected HTTP 204 from DeleteRule {identifier}, got {status}"
-            );
+            delete_rule_in_expecting_no_content(&router, region, identifier, &case).await;
         }
 
         let (resumed, _token) = page_in(

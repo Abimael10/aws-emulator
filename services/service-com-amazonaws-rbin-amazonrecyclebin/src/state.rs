@@ -7,8 +7,11 @@
 //! index. The ordering is load-bearing: `ListRules` pages through the map in key
 //! order, and its `NextToken` is a cursor naming the last identifier it returned, so a
 //! page boundary stays stable while rules are added or removed. A cursor is honoured
-//! only by the endpoint that issued it and only for a position it really handed out
-//! ([`ComAmazonawsRbinAmazonrecyclebinState::page_cursor`]).
+//! only by the endpoint that issued it and only for a position that endpoint really
+//! handed out ([`ComAmazonawsRbinAmazonrecyclebinState::page_cursor`]), which the rules
+//! answer for while they are stored and
+//! [`ComAmazonawsRbinAmazonrecyclebinState::retired_positions`] answers for once they
+//! are deleted.
 //!
 //! A retention rule is a REGIONAL resource — it exists only in the Region it was
 //! created in — so every rule carries that Region ([`Rule::region`]) and every
@@ -96,6 +99,21 @@ pub const MAX_RULES: usize = 1000;
 /// answers the modelled quota error past it, so no sequence of calls can leave the store
 /// larger than this.
 pub const RULE_STORE_LIMIT: usize = 2 * MAX_RULES;
+
+/// The most retired page positions this emulator remembers, across every Region —
+/// [`ComAmazonawsRbinAmazonrecyclebinState::retired_positions`], the record of which
+/// Region's endpoint handed out a position whose rule has since been deleted.
+///
+/// Not an AWS quota: a deleted rule leaves a position its Region's pager had already
+/// handed out, so the record has to outlive the rule, and a `CreateRule`/`DeleteRule`
+/// cycle would otherwise grow it for the process's whole lifetime. The store never holds
+/// more than [`RULE_STORE_LIMIT`] rules at once, so remembering that many retired
+/// positions covers deleting every rule the store can hold, and past the cap the OLDEST
+/// retired position is forgotten first. A cursor at a forgotten position is refused
+/// rather than resumed, which is the direction that reports no page at all instead of one
+/// silently missing rules; a position a stored rule still occupies is answered from that
+/// rule and is never affected.
+pub const RETIRED_POSITION_MEMORY: usize = RULE_STORE_LIMIT;
 
 /// The number of tags one retention rule may carry, after which assigning more is
 /// refused with the modelled `ServiceQuotaExceededException` ("The request would
@@ -1243,9 +1261,26 @@ pub struct ComAmazonawsRbinAmazonrecyclebinState {
     /// value those operations can be asked for: a caller can always hand back what a
     /// create reported.
     pub arn_index: HashMap<String, String>,
-    /// Monotonic counter behind [`Self::mint_identifier`]. A fresh store starts it at
-    /// [`INITIAL_IDENTIFIER_SEED`], the one seed whose rendering is never handed out.
+    /// Monotonic counter behind [`Self::mint_identifier`], which advances it BEFORE it
+    /// renders a candidate, so the seed a fresh store starts at (what
+    /// `#[derive(Default)]` leaves here) is the one seed whose rendering is never handed
+    /// out.
     pub next_identifier_seed: u64,
+    /// The positions this store handed out whose rule has since been DELETED, keyed by
+    /// `Identifier` and holding the Region whose endpoint minted each one.
+    ///
+    /// A page cursor belongs to ONE Region's walk ([`Self::page_from`]) while the
+    /// counter above hands out positions from a space every Region shares, so "is this a
+    /// position the endpoint being called handed out?"
+    /// ([`Self::has_minted_identifier`]) is a per-Region question that the rules
+    /// themselves answer for as long as they are stored — a stored rule carries the
+    /// Region it was created in. Deleting a rule does not retract the cursor its page
+    /// handed out, so the position it occupied is recorded here as that Region's when the
+    /// rule goes, and nothing else can claim it: the identifier order never reuses a
+    /// position.
+    ///
+    /// Bounded by [`RETIRED_POSITION_MEMORY`], oldest position first.
+    pub retired_positions: BTreeMap<String, String>,
 }
 
 impl ComAmazonawsRbinAmazonrecyclebinState {
@@ -1296,10 +1331,22 @@ impl ComAmazonawsRbinAmazonrecyclebinState {
     /// Remove the rule `identifier` addresses in `region` and drop its ARN index entry.
     /// `None` when that Region holds no such rule — including one another Region holds,
     /// which this Region's endpoint may not reach, let alone delete.
+    ///
+    /// The position the removed rule occupied is retired to [`Self::retired_positions`]:
+    /// its Region's pager handed that position out and deleting the rule does not
+    /// retract the cursor naming it ([`Self::has_minted_identifier`]).
     pub fn remove_rule(&mut self, region: &str, identifier: &str) -> Option<Rule> {
         self.rule(region, identifier)?;
         let removed = self.rules.remove(identifier)?;
         self.arn_index.remove(&removed.rule_arn);
+        self.retired_positions
+            .insert(removed.identifier.clone(), removed.region.clone());
+        // Oldest position first, so what a client is most likely to still be paging with
+        // is what the store keeps. A loop rather than one pop, so a store somehow loaded
+        // above the cap settles back to it.
+        while self.retired_positions.len() > RETIRED_POSITION_MEMORY {
+            self.retired_positions.pop_first();
+        }
         Some(removed)
     }
 
@@ -1379,21 +1426,23 @@ impl ComAmazonawsRbinAmazonrecyclebinState {
         }
     }
 
-    /// Whether `identifier` is one this store has already MINTED.
+    /// Whether `identifier` is a position `region`'s endpoint has handed out.
     ///
-    /// [`Self::mint_identifier`] ADVANCES the seed before rendering it, and the seed only
-    /// ever rises, so the seeds it has rendered are exactly those after
-    /// [`INITIAL_IDENTIFIER_SEED`] up to and including the current one.
-    /// [`base62_identifier`] renders every seed as the same number of digits in
-    /// ascending-byte order and so maps that span of seeds onto exactly the span of
-    /// renderings between the two bounds below. An identifier-shaped value ABOVE the
-    /// upper bound names a position this store has not reached yet, and one AT OR BELOW
-    /// the lower bound names a seed it never rendered at all: nothing could have been
-    /// minted at either, whether or not a rule still holds it today.
-    pub fn has_minted_identifier(&self, identifier: &str) -> bool {
-        is_rule_identifier(identifier)
-            && identifier > base62_identifier(INITIAL_IDENTIFIER_SEED).as_str()
-            && identifier <= base62_identifier(self.next_identifier_seed).as_str()
+    /// Asked of the Region the request is signed for, because that is the walk the
+    /// answer guards: [`Self::mint_identifier`] draws every Region's positions from one
+    /// shared counter, so a position the counter has already reached may well belong to
+    /// another Region — in which case this Region's pager never emitted it, and resuming
+    /// after it would drop this Region's rules sorting at or before it. A position is
+    /// this Region's when a rule of this Region still occupies it, or when this Region
+    /// retired it by deleting the rule that did ([`Self::retired_positions`]). Every
+    /// other identifier-shaped value — one no mint has reached, one no mint can occupy,
+    /// and one another Region's endpoint handed out — is none of its positions.
+    pub fn has_minted_identifier(&self, region: &str, identifier: &str) -> bool {
+        self.rule(region, identifier).is_some()
+            || self
+                .retired_positions
+                .get(identifier)
+                .is_some_and(|minted_in| minted_in == region)
     }
 
     /// The position `token` resumes a page of `region` at, or `None` when this endpoint
@@ -1402,15 +1451,23 @@ impl ComAmazonawsRbinAmazonrecyclebinState {
     /// A cursor is honoured only when it is one of THIS endpoint's own: it has to decode
     /// to the cursor form [`encode_page_token`] renders, to have been issued by the
     /// Region this request is signed for, and to name a position this store has actually
-    /// minted ([`Self::has_minted_identifier`]). Anything else is no cursor at all — a
-    /// value a client invented that merely satisfies `NextToken`'s `@pattern`, or a
-    /// cursor another Region's endpoint issued — and resuming "after" a position never
-    /// handed out would answer a page that silently drops every rule sorting at or
-    /// before it (an empty one, for a value sorting above them all), so the caller
-    /// refuses it with [`invalid_page_token`] instead.
+    /// minted FOR THAT REGION ([`Self::has_minted_identifier`]). Anything else is no
+    /// cursor at all — a value a client invented that merely satisfies `NextToken`'s
+    /// `@pattern`, a cursor another Region's endpoint issued, or one naming this Region
+    /// but a position only another Region's endpoint handed out — and resuming "after" a
+    /// position this Region never handed out would answer a page that silently drops
+    /// every rule of it sorting at or before that position (an empty one, for a value
+    /// sorting above them all), so the caller refuses it with [`invalid_page_token`]
+    /// instead.
+    ///
+    /// One cursor of this endpoint's own is refused too, by design: one at a position
+    /// whose rule is deleted and which has since fallen out of the store's bounded record
+    /// of retired positions ([`RETIRED_POSITION_MEMORY`]), since nothing then says whose
+    /// walk it belonged to. The refusal is the direction that answers no page rather than
+    /// one silently missing rules.
     pub fn page_cursor(&self, region: &str, token: &str) -> Option<String> {
         let cursor = parse_page_token(token)?;
-        (cursor.region == region && self.has_minted_identifier(&cursor.identifier))
+        (cursor.region == region && self.has_minted_identifier(region, &cursor.identifier))
             .then_some(cursor.identifier)
     }
 
@@ -1434,15 +1491,6 @@ impl ComAmazonawsRbinAmazonrecyclebinState {
             .filter(move |(_, rule)| rule.region == region)
     }
 }
-
-/// The seed a fresh store's counter starts at — what `#[derive(Default)]` leaves in
-/// [`ComAmazonawsRbinAmazonrecyclebinState::next_identifier_seed`].
-///
-/// [`ComAmazonawsRbinAmazonrecyclebinState::mint_identifier`] advances the counter
-/// BEFORE it renders a candidate, so this seed's own rendering is the one
-/// identifier-shaped value no store state can ever have handed out: the first identifier
-/// minted is the rendering of the seed after it.
-const INITIAL_IDENTIFIER_SEED: u64 = 0;
 
 /// Render `seed` as exactly [`IDENTIFIER_LEN`] base62 digits, most significant
 /// first and left-padded with `0`, so the result satisfies `^[0-9a-zA-Z]{11}$` and
