@@ -1327,7 +1327,18 @@ pub(super) async fn create_cluster(
     if let Value::Object(properties) = &resource.properties {
         for (property, member) in ECS_CLUSTER_MEMBERS {
             if let Some(value) = properties.get(*property) {
-                request.insert((*member).to_string(), lower_camel_members(value, 0)?);
+                // The one reading of a declared value as the TYPES Amazon ECS models
+                // `CreateCluster`'s members as: a quoted number or flag — which is every value
+                // that reached the property through a template parameter — is read as the
+                // number or the flag that call takes.
+                request.insert(
+                    (*member).to_string(),
+                    modelled_declaration(
+                        member,
+                        &lower_camel_members(value, 0)?,
+                        &crate::state::provisioning::ecs_scalars::cluster_scalar,
+                    ),
+                );
             }
         }
     }

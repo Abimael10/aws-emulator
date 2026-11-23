@@ -51,7 +51,10 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
-use super::{applicable_tags, call_json_rpc, Created, Readiness, Refusal, Removal, AWS_JSON_1_1};
+use super::{
+    applicable_tags, call_json_rpc, ecs_scalars, modelled_declaration, Created, Readiness,
+    Refusal, Removal, AWS_JSON_1_1,
+};
 use crate::state::provisioner::tags_of;
 use crate::state::StoredResource;
 
@@ -318,7 +321,18 @@ fn register_members(properties: &Value) -> Result<Map<String, Value>, Refusal> {
         let Some(value) = properties.get(*property).filter(|value| !value.is_null()) else {
             continue;
         };
-        request.insert(lower_camel(property), api_members(value, 0)?);
+        let member = lower_camel(property);
+        let carried = api_members(value, 0)?;
+        // ...and then read as the TYPES Amazon ECS models those members as: a template's
+        // scalar is TEXT wherever the author quoted it or fed it through a parameter, while
+        // the member it reaches is modelled as a number or a boolean. The walk is told which
+        // top-level member it was entered at, which is what tells a container's integer
+        // reservation from the task's own size as text
+        // ([`crate::state::provisioning::ecs_scalars::task_definition_scalar`]).
+        let read = modelled_declaration(&member, &carried, &|inner| {
+            ecs_scalars::task_definition_scalar(inner, &member)
+        });
+        request.insert(member, read);
     }
     Ok(request)
 }

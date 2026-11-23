@@ -255,6 +255,11 @@ mod modelled_declaration;
 // the call THEY make types members as numbers and booleans too, so they read a declaration
 // through this one walk rather than a second copy of it.
 pub(in crate::state) use modelled_declaration::{modelled_declaration, ModelledScalar};
+/// What Amazon ECS models the members of its create calls as, where that is not text — the
+/// member catalogue the three `AWS::ECS::*` arms read a declaration through
+/// ([`ecs_scalars`]). Visible to the rest of this service's state because two of those arms
+/// live in [`crate::state::provisioner`].
+pub(in crate::state) mod ecs_scalars;
 /// The three Amazon SageMaker AI Studio types a stack declares — the domain, a user profile of
 /// one and a shared space in one: created in that control plane itself ([`sagemaker_studio`]).
 /// Visible to the rest of this service's state because the types' own NAMES live here, beside

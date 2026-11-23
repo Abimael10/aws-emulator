@@ -42,6 +42,8 @@
 
 use super::*;
 
+use crate::state::provisioning::ecs_scalars;
+
 /// The members `CreateService` takes this type's properties as, as (property, member) pairs.
 ///
 /// Source: AWS's CloudFormation resource reference for the type, member by member against the
@@ -154,6 +156,14 @@ const TAGS_PROPERTY: &str = "Tags";
 /// service rather than travelling beside the others on an update or a delete.
 const CLUSTER_PROPERTY: &str = "Cluster";
 
+/// The one reading of a declared value as the TYPES Amazon ECS models this call's members as
+/// ([`crate::state::provisioning::ecs_scalars`]): a template's scalar is TEXT wherever the
+/// author quoted it or fed it through a parameter, while the member it reaches is modelled as
+/// a number or a boolean, so each is read as that type before the request is sent.
+fn modelled(member: &str, value: &Value) -> Value {
+    modelled_declaration(member, value, &ecs_scalars::service_scalar)
+}
+
 /// The property a template may name the service itself with, which is the name
 /// CloudFormation decided for the resource.
 const SERVICE_NAME_PROPERTY: &str = "ServiceName";
@@ -197,7 +207,10 @@ pub(super) async fn create_ecs_service(
     if let Value::Object(properties) = &resource.properties {
         for (property, member) in ECS_SERVICE_MEMBERS {
             if let Some(value) = properties.get(*property).filter(|value| !value.is_null()) {
-                request.insert((*member).to_string(), lower_camel_members(value, 0)?);
+                request.insert(
+                    (*member).to_string(),
+                    modelled(member, &lower_camel_members(value, 0)?),
+                );
             }
         }
     }
@@ -267,7 +280,10 @@ pub(super) async fn update_ecs_service(
                 continue;
             }
             if let Some(value) = properties.get(*property).filter(|value| !value.is_null()) {
-                request.insert((*member).to_string(), lower_camel_members(value, 0)?);
+                request.insert(
+                    (*member).to_string(),
+                    modelled(member, &lower_camel_members(value, 0)?),
+                );
             }
         }
     }

@@ -121,7 +121,19 @@ pub(super) async fn create_ecs_capacity_provider(
     if let Value::Object(properties) = &resource.properties {
         for (property, member) in ECS_CAPACITY_PROVIDER_MEMBERS {
             if let Some(value) = properties.get(*property).filter(|value| !value.is_null()) {
-                request.insert((*member).to_string(), lower_camel_members(value, 0)?);
+                // Read as the TYPES Amazon ECS models `CreateCapacityProvider`'s members as,
+                // through the one walk every arm in this position shares: a quoted step size,
+                // target capacity or flag — which is every value that reached the property
+                // through a template parameter — is the number or the flag that call takes
+                // ([`crate::state::provisioning::ecs_scalars::capacity_provider_scalar`]).
+                request.insert(
+                    (*member).to_string(),
+                    modelled_declaration(
+                        member,
+                        &lower_camel_members(value, 0)?,
+                        &crate::state::provisioning::ecs_scalars::capacity_provider_scalar,
+                    ),
+                );
             }
         }
     }
