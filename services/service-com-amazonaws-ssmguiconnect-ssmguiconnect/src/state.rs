@@ -19,9 +19,9 @@
 //!   validator refused, which is not the framework's aggregated envelope.
 //! * [`resource_not_found_message`] — the one template every path reports the absent
 //!   singleton with.
-//! * the account-level just-in-time node access gate
-//!   ([`ComAmazonawsSsmguiconnectSsmguiconnectState::just_in_time_node_access_enabled`]),
-//!   which `UpdateConnectionRecordingPreferences` is refused by.
+//! * [`just_in_time_node_access`] — the account-level just-in-time node access gate
+//!   `UpdateConnectionRecordingPreferences` is refused by, answered from the account's own
+//!   persisted enrollment rather than from a copy held here.
 //! * [`authorization`] — whether the CALLER's own identity-based IAM policies allow the
 //!   action an operation asks for, which every operation is refused by before it reads
 //!   or writes anything, and before the account gate above.
@@ -41,6 +41,11 @@ use crate::ops::types::{ConnectionRecordingPreferences, RecordingDestinations, S
 /// — the decision every operation of this service takes before it reads or writes
 /// anything. See that module's docs.
 pub mod authorization;
+
+/// Whether the ACCOUNT is enrolled in just-in-time node access in the Region a request was
+/// signed for — the precondition `UpdateConnectionRecordingPreferences` is gated on. See
+/// that module's docs.
+pub mod just_in_time_node_access;
 
 /// Most idempotency outcomes retained at once, after which the OLDEST is evicted.
 ///
@@ -69,19 +74,6 @@ pub struct ComAmazonawsSsmguiconnectSsmguiconnectState {
     /// `None` means never configured (or deleted), which every read reports as
     /// `ResourceNotFoundException`.
     connection_recording_preferences: Option<RecordingPrefsRecord>,
-    /// Whether this account/Region is enrolled in just-in-time node access, the
-    /// account-level feature `UpdateConnectionRecordingPreferences` is gated by.
-    ///
-    /// `false` is the state of an account nobody has enrolled, which is what the
-    /// default is: enrollment is performed by SSM Quick Setup's just-in-time node
-    /// access configuration — a different API, which this service does not model and
-    /// this emulator does not implement — so no operation of THIS service turns it on.
-    /// It is state rather than a constant because the gate is a property of the
-    /// account, not of the request: whoever enrolls the account (an enrollment path
-    /// this emulator grows later, or a test standing the enrolled account up) sets it
-    /// through [`ComAmazonawsSsmguiconnectSsmguiconnectState::set_just_in_time_node_access_enabled`]
-    /// and every later Update reads it back.
-    just_in_time_node_access_enabled: bool,
     /// First outcome per `@idempotencyToken`, so replaying an `@idempotent`
     /// Update/Delete with the same `ClientToken` returns that outcome instead of
     /// mutating twice. Keyed by operation as well as token: the same token
@@ -150,21 +142,6 @@ impl ComAmazonawsSsmguiconnectSsmguiconnectState {
     /// The stored singleton, or `None` when nothing is configured.
     pub fn preferences(&self) -> Option<&RecordingPrefsRecord> {
         self.connection_recording_preferences.as_ref()
-    }
-
-    /// Whether this account/Region is enrolled in just-in-time node access. `false`
-    /// until something enrolls it, which is what the Update gate reads.
-    pub fn just_in_time_node_access_enabled(&self) -> bool {
-        self.just_in_time_node_access_enabled
-    }
-
-    /// Enroll (or un-enroll) this account/Region in just-in-time node access.
-    ///
-    /// The ONE writer of the gate's flag. No modelled operation of this service calls
-    /// it — enrollment belongs to SSM Quick Setup — so it exists for whoever stands an
-    /// enrolled account up.
-    pub fn set_just_in_time_node_access_enabled(&mut self, enabled: bool) {
-        self.just_in_time_node_access_enabled = enabled;
     }
 
     /// Create-or-REPLACE the singleton, and record the outcome under `record`'s own

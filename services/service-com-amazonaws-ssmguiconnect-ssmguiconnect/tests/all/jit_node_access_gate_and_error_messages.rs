@@ -10,6 +10,9 @@
 //!    whatever the request holds, and leaves nothing behind. The gate is evaluated
 //!    AFTER the request-shape validation the model declares and BEFORE anything the
 //!    request names is examined. `DeleteConnectionRecordingPreferences` is not gated.
+//!    The enrollment the gate reads is the account's OWN persisted state — the
+//!    access-request approval policy it holds, created and deleted through Systems
+//!    Manager's own API — so every case here stands its account up over the wire.
 //! 2. THE IDEMPOTENT REMOVAL. An `@idempotent` delete is asked for a state, not for a
 //!    resource: with nothing configured it succeeds (200) and reports the effective
 //!    `ClientToken`, however many times it is called.
@@ -28,20 +31,28 @@ use service_com_amazonaws_ssmguiconnect_ssmguiconnect::state::{
     resource_not_found_message, CONNECTION_RECORDING_PREFERENCES,
     JUST_IN_TIME_NODE_ACCESS_DISABLED,
 };
-use service_com_amazonaws_ssmguiconnect_ssmguiconnect::{
-    ComAmazonawsSsmguiconnectSsmguiconnectState, EmulatedService,
-};
+use service_com_amazonaws_ssmguiconnect_ssmguiconnect::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-/// A router carrying only this service over a fresh engine, so each case has its own
+use crate::identity_authorization::{
+    create_ssm_document, delete_ssm_document, register_systems_manager, APPROVAL_POLICY_NAME,
+    AUTO_APPROVAL_POLICY, MANUAL_APPROVAL_POLICY,
+};
+
+/// The Region every call of this suite is signed for.
+const REGION: &str = "us-east-1";
+
+/// A router carrying this service over a fresh engine, so each case has its own
 /// store. The account starts as AWS leaves one: NOT enrolled in just-in-time node
-/// access.
+/// access. Systems Manager rides along because the account's enrollment is that
+/// service's own state (see [`enroll`]).
 fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signature verification is the framework's job and is exercised elsewhere.
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    register_systems_manager(&mut router, &engine);
     (router, engine)
 }
 
@@ -49,28 +60,26 @@ fn router() -> MultiServiceRouter {
     router_with_engine().0
 }
 
-/// Enroll (or un-enroll) the account in just-in-time node access.
-///
-/// Written to the account's own state rather than sent as a request because
-/// enrollment belongs to SSM Quick Setup: no operation of THIS service performs it.
-fn enroll(engine: &engine::InMemoryEngine, enrolled: bool) {
-    engine
-        .state::<ComAmazonawsSsmguiconnectSsmguiconnectState>()
-        .lock()
-        .set_just_in_time_node_access_enabled(enrolled);
+/// Enroll (or un-enroll) the account in just-in-time node access, over the wire: the
+/// enrollment IS an access-request approval policy Systems Manager holds, so it is created
+/// and deleted through that service's own API.
+async fn enroll(router: &MultiServiceRouter, enrolled: bool) {
+    crate::identity_authorization::enroll(router, REGION, enrolled).await;
 }
 
 /// A restJson1 request for `op`, routed by its SigV4 credential scope the way every
-/// signed AWS SDK request is.
-fn request(op: &str, body: &serde_json::Value) -> http::Request<bytes::Bytes> {
+/// signed AWS SDK request is, signed for `region`.
+fn request_in(region: &str, op: &str, body: &serde_json::Value) -> http::Request<bytes::Bytes> {
     http::Request::builder()
         .method("POST")
         .uri(format!("/{op}"))
         .header(
             "authorization",
-            "AWS4-HMAC-SHA256 \
-             Credential=AKIDEXAMPLE/20260101/us-east-1/ssm-guiconnect/aws4_request, \
-             SignedHeaders=host, Signature=0",
+            format!(
+                "AWS4-HMAC-SHA256 \
+                 Credential=AKIDEXAMPLE/20260101/{region}/ssm-guiconnect/aws4_request, \
+                 SignedHeaders=host, Signature=0"
+            ),
         )
         .header("content-type", "application/json")
         .body(bytes::Bytes::from(
@@ -79,13 +88,14 @@ fn request(op: &str, body: &serde_json::Value) -> http::Request<bytes::Bytes> {
         .expect("build the request")
 }
 
-/// Status code plus parsed JSON body of one call.
-async fn call(
+/// Status code plus parsed JSON body of one call signed for `region`.
+async fn call_in(
     router: &MultiServiceRouter,
+    region: &str,
     op: &str,
     body: serde_json::Value,
 ) -> (u16, serde_json::Value) {
-    let response = router.dispatch(request(op, &body)).await;
+    let response = router.dispatch(request_in(region, op, &body)).await;
     let status = response.status().as_u16();
     let bytes = response.into_body();
     let json = if bytes.is_empty() {
@@ -94,6 +104,15 @@ async fn call(
         serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
     };
     (status, json)
+}
+
+/// Status code plus parsed JSON body of one call signed for [`REGION`].
+async fn call(
+    router: &MultiServiceRouter,
+    op: &str,
+    body: serde_json::Value,
+) -> (u16, serde_json::Value) {
+    call_in(router, REGION, op, body).await
 }
 
 /// The `__type` of a restJson1 error body, shortened to the shape name.
@@ -444,7 +463,7 @@ async fn shape_validation_precedes_the_gate_and_the_gate_precedes_everything_els
 /// written in between stays readable.
 #[tokio::test]
 async fn the_gate_follows_the_accounts_enrollment() {
-    let (router, engine) = router_with_engine();
+    let router = router();
     let body = |token: &str| {
         serde_json::json!({
             "ConnectionRecordingPreferences":
@@ -462,7 +481,7 @@ async fn the_gate_follows_the_accounts_enrollment() {
     ];
 
     for (case, enrolled, expected) in cases {
-        enroll(&engine, enrolled);
+        enroll(&router, enrolled).await;
         let (status, response) = call(&router, UPDATE, body(&format!("token-{expected}"))).await;
         assert_eq!(
             status, expected,
@@ -488,6 +507,150 @@ async fn the_gate_follows_the_accounts_enrollment() {
     );
 }
 
+/// The gate's input is the account's own ENROLLMENT, which is an access-request approval
+/// policy the account holds: a request that creates one lets the next Update through, and a
+/// document of any other type leaves the account un-enrolled.
+///
+/// The rows differ along the document type the account holds — both of the approval-policy
+/// types (`smithy_query(query="shape",shape="DocumentType",
+/// model_path="services/service-com-amazonaws-ssm-amazonssm/smithy-model/com-amazonaws-ssm-amazonssm.json")`,
+/// whose two approval-policy values are what the workflow is turned on by), two other values
+/// of that same modelled set, and no document at all.
+#[tokio::test]
+async fn an_approval_policy_the_account_holds_is_what_enrolls_it() {
+    // (case, the DocumentType the account holds or nothing, the status the Update gets)
+    let rows: [(&str, Option<&str>, u16); 5] = [
+        ("no document at all", None, 403),
+        ("an auto-approval policy", Some(AUTO_APPROVAL_POLICY), 200),
+        ("a manual-approval policy", Some(MANUAL_APPROVAL_POLICY), 200),
+        ("a session document", Some("Session"), 403),
+        ("a Quick Setup configuration", Some("QuickSetup"), 403),
+    ];
+
+    for (case, document_type, expected) in rows {
+        let router = router();
+        if let Some(document_type) = document_type {
+            let (status, body) =
+                create_ssm_document(&router, REGION, "JitnaGateProbe", document_type).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the setup document must be created, got {status} with {body}"
+            );
+        }
+        let (status, response) = call(
+            &router,
+            UPDATE,
+            serde_json::json!({
+                "ConnectionRecordingPreferences":
+                    preferences("123456789012", "rdp-recordings", KEY_ARN),
+                "ClientToken": "enrollment-probe",
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, expected,
+            "case {case:?}: expected {expected}, got {status:?} with {response:?}"
+        );
+        if expected == 200 {
+            // The accepted Update is backed by state: the singleton reads back.
+            let (status, got) = call(&router, GET, serde_json::json!({})).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the written record must read back, got {status:?} with {got:?}"
+            );
+            assert_eq!(
+                got["ConnectionRecordingPreferences"]["RecordingDestinations"]["S3Buckets"][0]
+                    ["BucketName"]
+                    .as_str(),
+                Some("rdp-recordings"),
+                "case {case:?}: expected the stored bucket, got {got:?}"
+            );
+        } else {
+            assert_eq!(
+                error_code(&response),
+                "AccessDeniedException",
+                "case {case:?}: expected AccessDeniedException, got {response:?}"
+            );
+            assert_eq!(
+                error_message(&response),
+                JUST_IN_TIME_NODE_ACCESS_DISABLED,
+                "case {case:?}: expected the feature gate's own denial message, got {response:?}"
+            );
+            assert_absent(&router, case).await;
+        }
+    }
+}
+
+/// The enrollment is decided per REGION, because the approval policy that constitutes it is
+/// a regional document: an Update signed for a Region whose policy the account holds is
+/// served, and one signed for any other Region is refused — in both directions, as policies
+/// come and go.
+#[tokio::test]
+async fn the_enrollment_is_decided_for_the_region_the_request_was_signed_for() {
+    /// Another Region, and a third in another partition's geography, so the rows are not
+    /// two neighbours of one prefix.
+    const OTHER_REGION: &str = "us-west-2";
+    const THIRD_REGION: &str = "eu-west-3";
+
+    let router = router();
+    let body = |token: &str| {
+        serde_json::json!({
+            "ConnectionRecordingPreferences":
+                preferences("123456789012", "rdp-recordings", KEY_ARN),
+            "ClientToken": token,
+        })
+    };
+
+    let (status, created) =
+        create_ssm_document(&router, REGION, APPROVAL_POLICY_NAME, AUTO_APPROVAL_POLICY).await;
+    assert_eq!(
+        status, 200,
+        "the setup policy must be created in {REGION}, got {status} with {created}"
+    );
+
+    // (case, the Region the Update is signed for, the status it gets)
+    let only_one_region: [(&str, &str, u16); 3] = [
+        ("the Region holding the policy", REGION, 200),
+        ("another Region", OTHER_REGION, 403),
+        ("a third Region", THIRD_REGION, 403),
+    ];
+    for (case, region, expected) in only_one_region {
+        let (status, response) = call_in(&router, region, UPDATE, body("one-region")).await;
+        assert_eq!(
+            status, expected,
+            "case {case:?} ({region}): expected {expected}, got {status:?} with {response:?}"
+        );
+    }
+
+    // Enrolling the second Region and withdrawing the first one's policy moves the decision
+    // with them, Region by Region.
+    let (status, created) =
+        create_ssm_document(&router, OTHER_REGION, APPROVAL_POLICY_NAME, AUTO_APPROVAL_POLICY)
+            .await;
+    assert_eq!(
+        status, 200,
+        "the setup policy must be created in {OTHER_REGION}, got {status} with {created}"
+    );
+    let (status, removed) = delete_ssm_document(&router, REGION, APPROVAL_POLICY_NAME).await;
+    assert_eq!(
+        status, 200,
+        "the policy of {REGION} must be removable, got {status} with {removed}"
+    );
+
+    let after: [(&str, &str, u16); 3] = [
+        ("the Region whose policy went away", REGION, 403),
+        ("the Region enrolled afterwards", OTHER_REGION, 200),
+        ("a Region never enrolled", THIRD_REGION, 403),
+    ];
+    for (case, region, expected) in after {
+        let (status, response) = call_in(&router, region, UPDATE, body("moved-region")).await;
+        assert_eq!(
+            status, expected,
+            "case {case:?} ({region}): expected {expected}, got {status:?} with {response:?}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Rule 2 — the idempotent removal
 // ---------------------------------------------------------------------------
@@ -507,8 +670,8 @@ async fn deleting_an_unconfigured_singleton_succeeds_idempotently() {
     ];
 
     for (case, enrolled, token, repeats) in cases {
-        let (router, engine) = router_with_engine();
-        enroll(&engine, enrolled);
+        let router = router();
+        enroll(&router, enrolled).await;
         for attempt in 1..=repeats {
             let body = match token {
                 Some(token) => serde_json::json!({ "ClientToken": token }),
@@ -605,10 +768,10 @@ async fn the_absent_singleton_is_reported_through_the_not_found_template() {
          {expected:?}"
     );
 
-    let (router, engine) = router_with_engine();
+    let router = router();
     for case in ["never configured", "configured then deleted"] {
         if case == "configured then deleted" {
-            enroll(&engine, true);
+            enroll(&router, true).await;
             let (status, _) = call(
                 &router,
                 UPDATE,

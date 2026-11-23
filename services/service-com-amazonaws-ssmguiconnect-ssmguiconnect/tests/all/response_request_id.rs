@@ -319,7 +319,7 @@ async fn an_error_body_carries_the_id_beside_the_envelope_it_already_had() {
 #[tokio::test]
 async fn naming_the_request_changes_nothing_else_about_the_answer() {
     let emulator = Emulator::new();
-    emulator.enroll(true);
+    emulator.enroll(true).await;
 
     let written = emulator
         .call(ACCOUNT_KEY, UPDATE, &update_body("unchanged"))

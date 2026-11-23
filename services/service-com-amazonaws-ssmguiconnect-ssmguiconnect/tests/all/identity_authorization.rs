@@ -31,9 +31,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use service_com_amazonaws_ssmguiconnect_ssmguiconnect::{
-    ComAmazonawsSsmguiconnectSsmguiconnectState, EmulatedService,
-};
+use service_com_amazonaws_ssmguiconnect_ssmguiconnect::EmulatedService;
 
 /// The Region every call below is signed for, so the resource the decisions are made
 /// about is the one this Region's instances carry.
@@ -93,10 +91,10 @@ pub(crate) struct Principal {
 }
 
 /// The emulator these suites drive: one shared engine carrying this service beside the IAM
-/// and STS services the principals and their policies are made with.
+/// and STS services the principals and their policies are made with, and the Systems
+/// Manager service the account's just-in-time node access enrollment lives in.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
-    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -117,18 +115,14 @@ impl Emulator {
                 Arc::clone(&engine),
             ),
         );
-        Self { router, engine }
+        register_systems_manager(&mut router, &engine);
+        Self { router }
     }
 
-    /// Enroll (or un-enroll) the account in just-in-time node access.
-    ///
-    /// Written to the account's own state rather than sent as a request because
-    /// enrollment belongs to SSM Quick Setup: no operation of THIS service performs it.
-    pub(crate) fn enroll(&self, enrolled: bool) {
-        self.engine
-            .state::<ComAmazonawsSsmguiconnectSsmguiconnectState>()
-            .lock()
-            .set_just_in_time_node_access_enabled(enrolled);
+    /// Enroll (or un-enroll) the account in just-in-time node access in [`REGION`], over
+    /// the wire — see [`enroll`].
+    pub(crate) async fn enroll(&self, enrolled: bool) {
+        enroll(&self.router, REGION, enrolled).await;
     }
 
     /// Dispatch one request as it stands and answer the whole response, so a suite can read
@@ -245,6 +239,141 @@ impl Emulator {
                 .unwrap_or_else(|| panic!("CreateAccessKey answers an AccessKeyId, got {minted}")),
             arn,
         }
+    }
+}
+
+/// How the account is enrolled in just-in-time node access: the enrollment IS an
+/// access-request approval policy, held as a Systems Manager document of an
+/// approval-policy type, so a client stands an enrolled account up by creating that
+/// document and withdraws the enrollment by deleting it. These helpers do exactly that,
+/// over the wire, so nothing a suite sets up is reachable only from in-process Rust.
+///
+/// The name is the test's own: nothing addresses the policy by name — it is its PRESENCE in
+/// the Region that is the enrollment.
+pub(crate) const APPROVAL_POLICY_NAME: &str = "ConnectionRecordingApprovalPolicy";
+
+/// The `DocumentType` of an approval policy that decides the requests it covers without an
+/// approver acting, one of Systems Manager's modelled document types
+/// (`smithy_query(query="shape",shape="DocumentType",
+/// model_path="services/service-com-amazonaws-ssm-amazonssm/smithy-model/com-amazonaws-ssm-amazonssm.json")`).
+pub(crate) const AUTO_APPROVAL_POLICY: &str = "AutoApprovalPolicy";
+
+/// The `DocumentType` of an approval policy that leaves each request to an approver, from
+/// the same modelled value set. Either type is an enrollment.
+pub(crate) const MANUAL_APPROVAL_POLICY: &str = "ManualApprovalPolicy";
+
+/// A document content Systems Manager accepts for a policy document: a JSON document
+/// declaring the schema version every SSM document carries.
+const APPROVAL_POLICY_CONTENT: &str =
+    r#"{"schemaVersion":"1.0","description":"who may approve a node access request"}"#;
+
+/// Systems Manager's awsJson1_1 target prefix — the `x-amz-target` prefix its own suites
+/// address it by.
+const SSM_TARGET_PREFIX: &str = "AmazonSSM";
+
+/// Systems Manager's SigV4 signing name, which is what routes a request to it.
+const SSM_SIGNING_NAME: &str = "ssm";
+
+/// Mount Systems Manager on `router` over the same engine, so a suite can enroll the
+/// account the way a client does.
+pub(crate) fn register_systems_manager(
+    router: &mut MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
+) {
+    router.register_service(service_com_amazonaws_ssm_amazonssm::EmulatedService::new(
+        Arc::clone(engine),
+    ));
+}
+
+/// One awsJson1_1 call to Systems Manager, signed for `region` with the account's own
+/// credential, answering `(status, body-as-text)`.
+pub(crate) async fn systems_manager(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    body: &Value,
+) -> (u16, String) {
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("content-type", "application/x-amz-json-1.1")
+        .header("x-amz-target", format!("{SSM_TARGET_PREFIX}.{operation}"))
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential={ACCOUNT_KEY}/20260101/{region}/\
+                 {SSM_SIGNING_NAME}/aws4_request, SignedHeaders=host;x-amz-target, Signature=0"
+            ),
+        )
+        .body(bytes::Bytes::from(
+            serde_json::to_vec(body).expect("serialize the request body"),
+        ))
+        .expect("build the request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    (
+        status,
+        String::from_utf8_lossy(&response.into_body()).to_string(),
+    )
+}
+
+/// Create an SSM document of `document_type` named `name` in `region`, through Systems
+/// Manager's own `CreateDocument` — which, for an approval-policy type, is what enrolls the
+/// account in just-in-time node access there.
+pub(crate) async fn create_ssm_document(
+    router: &MultiServiceRouter,
+    region: &str,
+    name: &str,
+    document_type: &str,
+) -> (u16, String) {
+    systems_manager(
+        router,
+        region,
+        "CreateDocument",
+        &json!({
+            "Name": name,
+            "DocumentType": document_type,
+            "Content": APPROVAL_POLICY_CONTENT,
+        }),
+    )
+    .await
+}
+
+/// Delete the document named `name` in `region` — what withdraws an enrollment the
+/// approval policy of that name stood for.
+pub(crate) async fn delete_ssm_document(
+    router: &MultiServiceRouter,
+    region: &str,
+    name: &str,
+) -> (u16, String) {
+    systems_manager(router, region, "DeleteDocument", &json!({ "Name": name })).await
+}
+
+/// Bring the account to the enrollment `enrolled` names in `region`, through Systems
+/// Manager's own API: enrolled means it holds the approval policy, un-enrolled means it
+/// holds none. Idempotent, so a case may ask for the state it is already in.
+pub(crate) async fn enroll(router: &MultiServiceRouter, region: &str, enrolled: bool) {
+    if enrolled {
+        let (status, body) =
+            create_ssm_document(router, region, APPROVAL_POLICY_NAME, AUTO_APPROVAL_POLICY).await;
+        // An account that already holds the policy is already enrolled, which the create
+        // reports as a document of that name existing; either way the Region holds an
+        // approval policy once this returns, which is what "enrolled" is.
+        assert!(
+            status == 200 || body.contains("DocumentAlreadyExists"),
+            "case \"enroll {region}\": creating the approval policy must either create it or \
+             report that it is already there, got {status} with {body}"
+        );
+    } else {
+        // An account that holds no policy is already un-enrolled, which the delete reports
+        // as a document that does not exist; either way the Region holds no approval policy
+        // once this returns, which is what "not enrolled" is.
+        let (status, body) = delete_ssm_document(router, region, APPROVAL_POLICY_NAME).await;
+        assert!(
+            status == 200 || body.contains("InvalidDocument"),
+            "case \"un-enroll {region}\": deleting the approval policy must either remove it or \
+             report that there is none, got {status} with {body}"
+        );
     }
 }
 
@@ -398,7 +527,7 @@ async fn a_principal_with_no_policy_is_refused_every_operation() {
         let emulator = Emulator::new();
         // The account IS enrolled, so the only thing that can deny the call is the
         // caller's own lack of a grant.
-        emulator.enroll(true);
+        emulator.enroll(true).await;
         let principal = emulator.user(&format!("noperm-{index}"), None).await;
         let reply = emulator
             .call(
@@ -445,7 +574,7 @@ async fn a_principal_with_no_policy_is_refused_every_operation() {
 #[tokio::test]
 async fn a_grant_is_read_for_the_action_and_the_resource_the_request_is_for() {
     let emulator = Emulator::new();
-    emulator.enroll(true);
+    emulator.enroll(true).await;
     let action = action_of(DELETE);
     let resource = instances_of(REGION);
 
@@ -639,7 +768,7 @@ async fn the_iam_denial_and_the_account_gate_do_not_share_a_message() {
 #[tokio::test]
 async fn a_refused_call_discloses_nothing_and_changes_nothing() {
     let emulator = Emulator::new();
-    emulator.enroll(true);
+    emulator.enroll(true).await;
     let refused = emulator.user("silent", None).await;
 
     // Configured by the account's own credential, so there IS state to disclose.

@@ -40,9 +40,12 @@ use service_com_amazonaws_ssmguiconnect_ssmguiconnect::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-/// A router carrying only this service, over a fresh engine — one isolated store
-/// per test — for an account as AWS leaves it: NOT enrolled in just-in-time node
-/// access, which is what `UpdateConnectionRecordingPreferences` is gated on.
+use crate::identity_authorization::{register_systems_manager, REGION};
+
+/// A router carrying this service, over a fresh engine — one isolated store per test —
+/// for an account as AWS leaves it: NOT enrolled in just-in-time node access, which is
+/// what `UpdateConnectionRecordingPreferences` is gated on. Systems Manager rides along
+/// because the account's enrollment is that service's own state.
 fn router() -> MultiServiceRouter {
     router_with_engine().0
 }
@@ -56,33 +59,32 @@ fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     // these cases are about this service's behaviour.
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    // Systems Manager, because the account's just-in-time node access enrollment is that
+    // service's own state: a case that needs an enrolled account creates the enrollment
+    // through its API (see `enroll`).
+    register_systems_manager(&mut router, &engine);
     (router, engine)
 }
 
 /// A router over an account that IS enrolled in just-in-time node access — the
 /// precondition `UpdateConnectionRecordingPreferences` is gated on, and therefore the
 /// store every case about a CONFIGURED resource needs.
-fn enrolled_router() -> MultiServiceRouter {
-    enrolled_router_with_engine().0
+async fn enrolled_router() -> MultiServiceRouter {
+    enrolled_router_with_engine().await.0
 }
 
 /// [`enrolled_router`], beside its engine.
-fn enrolled_router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+async fn enrolled_router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let (router, engine) = router_with_engine();
-    enroll(&engine, true);
+    enroll(&router, true).await;
     (router, engine)
 }
 
-/// Enroll (or un-enroll) the account in just-in-time node access.
-///
-/// Set on the account's own state rather than through an API because enrollment
-/// belongs to SSM Quick Setup: no operation of THIS service performs it, so there is
-/// no request a test could send to stand an enrolled account up.
-fn enroll(engine: &engine::InMemoryEngine, enrolled: bool) {
-    engine
-        .state::<ComAmazonawsSsmguiconnectSsmguiconnectState>()
-        .lock()
-        .set_just_in_time_node_access_enabled(enrolled);
+/// Enroll (or un-enroll) the account in just-in-time node access, over the wire: the
+/// enrollment is an access-request approval policy Systems Manager holds, so it is created
+/// and deleted through that service's own API — there is no in-process back door.
+async fn enroll(router: &MultiServiceRouter, enrolled: bool) {
+    crate::identity_authorization::enroll(router, REGION, enrolled).await;
 }
 
 /// The access key id every case signs with unless it needs its own.
@@ -197,7 +199,7 @@ async fn update_then_get_reports_every_stored_member() {
     ];
 
     for (case, owner, bucket, key_arn) in cases {
-        let router = enrolled_router();
+        let router = enrolled_router().await;
         let token = format!("token-for-{case}").replace(' ', "-");
         let token: String = token.chars().take(64).collect();
 
@@ -296,7 +298,7 @@ async fn reading_an_unconfigured_singleton_is_not_found() {
 /// latest write and nothing of the earlier ones.
 #[tokio::test]
 async fn a_later_update_replaces_the_stored_record() {
-    let router = enrolled_router();
+    let router = enrolled_router().await;
     // (case, owner, bucket, key arn, token)
     let cases: [(&str, &str, &str, &str, &str); 4] = [
         ("first write", "123456789012", "first-bucket", KEY_ARN, "tok-1"),
@@ -364,7 +366,7 @@ async fn a_later_update_replaces_the_stored_record() {
 /// second round proves the delete left no residue behind.
 #[tokio::test]
 async fn delete_makes_the_singleton_observably_gone() {
-    let router = enrolled_router();
+    let router = enrolled_router().await;
 
     for round in ["first round", "second round"] {
         let (status, _) = call(
@@ -448,7 +450,7 @@ async fn replaying_an_update_token_returns_the_first_outcome() {
     ];
 
     for (case, replayed) in cases {
-        let router = enrolled_router();
+        let router = enrolled_router().await;
         let first = preferences("123456789012", "first-bucket", KEY_ARN);
         let (status, _) = call(
             &router,
@@ -504,7 +506,7 @@ async fn replaying_an_update_token_returns_the_first_outcome() {
 #[tokio::test]
 async fn replaying_a_delete_token_returns_the_first_outcome() {
     for replays in [1_u32, 2, 5] {
-        let router = enrolled_router();
+        let router = enrolled_router().await;
         let (status, _) = call(
             &router,
             "UpdateConnectionRecordingPreferences",
@@ -561,7 +563,7 @@ async fn replaying_a_delete_token_returns_the_first_outcome() {
 /// resource records. Asserted for Update and, over the same store, for Delete.
 #[tokio::test]
 async fn an_omitted_client_token_is_service_provided() {
-    let router = enrolled_router();
+    let router = enrolled_router().await;
     let mut minted: Vec<String> = Vec::new();
 
     for case in ["first write", "second write"] {
@@ -631,7 +633,7 @@ async fn an_omitted_client_token_is_service_provided() {
 /// it.
 #[tokio::test]
 async fn reads_do_not_change_what_a_later_caller_sees() {
-    let router = enrolled_router();
+    let router = enrolled_router().await;
     let (status, _) = call(
         &router,
         "UpdateConnectionRecordingPreferences",
@@ -684,7 +686,7 @@ async fn reads_do_not_change_what_a_later_caller_sees() {
 async fn a_replay_whose_resource_changed_is_not_answered_from_the_first_outcome() {
     // An Update token replayed after the singleton was DELETED must write again, not
     // report a record that is gone.
-    let rewritten = enrolled_router();
+    let rewritten = enrolled_router().await;
     for case in ["first write", "replay after delete"] {
         let (status, updated) = call(
             &rewritten,
@@ -724,7 +726,7 @@ async fn a_replay_whose_resource_changed_is_not_answered_from_the_first_outcome(
 
     // A Delete token replayed after the singleton was RECONFIGURED must remove the new
     // record, so its 200 still means "there are no preferences now".
-    let reconfigured = enrolled_router();
+    let reconfigured = enrolled_router().await;
     for case in ["first delete", "replay after reconfigure"] {
         let (status, _) = call(
             &reconfigured,
@@ -768,7 +770,7 @@ async fn a_replay_whose_resource_changed_is_not_answered_from_the_first_outcome(
 /// the service keeps answering, and that the newest token is still replayable.
 #[tokio::test]
 async fn the_idempotency_store_stays_bounded() {
-    let (router, engine) = enrolled_router_with_engine();
+    let (router, engine) = enrolled_router_with_engine().await;
     // Comfortably past the crate's cap, so eviction has to have happened for the count
     // to stay put. Asserted against the exported constant, not a literal, so raising
     // the cap cannot silently loosen this check.
@@ -887,7 +889,7 @@ async fn a_re_recorded_outcome_outlives_the_outcomes_recorded_before_it() {
             "case {case:?}: the table must not ask for more evictions ({overflow}) than there \
              are earlier outcomes ({EARLIER})"
         );
-        let (router, engine) = enrolled_router_with_engine();
+        let (router, engine) = enrolled_router_with_engine().await;
 
         // The request each of the two recording operations is driven with. The OTHER
         // operation is what every fresh-token call below uses, so each of them also
@@ -1194,7 +1196,7 @@ async fn an_input_outside_a_modeled_constraint_is_refused() {
     ];
 
     for (case, body) in cases {
-        let router = enrolled_router();
+        let router = enrolled_router().await;
         let (status, response) = call(&router, "UpdateConnectionRecordingPreferences", body).await;
         assert_eq!(
             status, 400,
@@ -1403,7 +1405,7 @@ async fn every_call_emits_a_structured_audit_record() {
         "case \"subscriber self-test\": the capture must receive events, got {probe:?}"
     );
 
-    let (router, engine) = enrolled_router_with_engine();
+    let router = enrolled_router().await;
     let good = serde_json::json!({
         "ConnectionRecordingPreferences": preferences("123456789012", "rdp-recordings", KEY_ARN),
         "ClientToken": "audited-token",
@@ -1503,7 +1505,7 @@ async fn every_call_emits_a_structured_audit_record() {
     // The last outcome the service can report needs the OTHER account state: an
     // account that is not enrolled in just-in-time node access, whose Update the gate
     // refuses.
-    enroll(&engine, false);
+    enroll(&router, false).await;
     let _ = captured.drain();
     let (status, response) = call_as(
         &router,

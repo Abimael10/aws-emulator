@@ -32,6 +32,11 @@ service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true 
 # The IAM store, for the identity-based policy documents in force on that principal,
 # which decide whether the caller may perform the action an operation asks for.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# The Systems Manager store, for whether the account is enrolled in just-in-time node
+# access in the Region a request was signed for: the access-request approval policy that
+# enrollment consists of is a document THAT service holds, read through its own accessor
+# rather than from a second copy of the answer here (`state::just_in_time_node_access`).
+service-com-amazonaws-ssm-amazonssm = { workspace = true }
 
 # Everything else this service needs — the `@pattern` sub-checks, the
 # `@idempotencyToken` mint and the test's audit capture — is built on the standard

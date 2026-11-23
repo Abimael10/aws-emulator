@@ -14,6 +14,9 @@
 //! be enrolled in just-in-time node access, so an account that is not enrolled is
 //! refused with the modeled `AccessDeniedException` (403) — after the request-shape
 //! validation AWS performs first, and before anything the request names is looked up.
+//! The enrollment is the account's own persisted state, read where this emulator holds
+//! it ([`crate::state::just_in_time_node_access`]), so a caller that sets the workflow
+//! up is enrolled on its next Update.
 //!
 //! GATED on the CALLER too, and ahead of that: a principal whose identity-based IAM
 //! policies do not allow this action is refused with the same modeled error and its own
@@ -195,16 +198,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let mut store = state.lock();
-
         // THE ACCOUNT-LEVEL GATE: configuring RDP connection recording requires the
         // account to be enrolled in just-in-time node access, so an account that is
         // not enrolled is refused outright — before any lookup of the resources the
         // request names (a bucket, a key), and before the idempotency record, so the
         // denial is the same for a fresh token and for a replayed one. The enrollment
-        // is persisted account state (`crate::state`), not a property of the request.
-        if !store.just_in_time_node_access_enabled() {
-            drop(store);
+        // is the account's OWN persisted state, read from the store that holds it
+        // (`crate::state::just_in_time_node_access`) and not a property of the request —
+        // so a caller that sets the workflow up is enrolled on its next Update, and one
+        // that tears it down is refused again. Asked before this service's own store
+        // guard is taken, the way the authorization decision above is.
+        if !crate::state::just_in_time_node_access::account_is_enrolled(
+            &*self.engine,
+            ctx.parts(),
+        ) {
             audit(Self::NAME, ctx, AuditOutcome::AccessDenied);
             return Err(UpdateConnectionRecordingPreferencesErrorModeled::AccessDeniedException(
                 AccessDeniedException {
@@ -230,6 +237,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or_else(crate::state::mint_client_token);
 
         let key = (IdempotentOperation::Update, client_token.clone());
+
+        // THIS service's own store, taken only once every gate above has passed: the
+        // cross-crate reads those gates make are done with no guard of it held.
+        let mut store = state.lock();
 
         // This operation is `@idempotent`: a replayed token answers with the record
         // the FIRST call persisted and writes nothing — but only while that record is

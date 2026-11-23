@@ -126,7 +126,7 @@ async fn a_pattern_violation_is_worded_as_the_one_sentence() {
         let emulator = Emulator::new();
         // Enrolled, so nothing else about the account can refuse the call: what is left is
         // the member's shape.
-        emulator.enroll(true);
+        emulator.enroll(true).await;
         let reply = emulator
             .call(ACCOUNT_KEY, UPDATE, &body(&owner, &bucket))
             .await;
@@ -176,7 +176,7 @@ async fn a_pattern_violation_is_worded_as_the_one_sentence() {
 #[tokio::test]
 async fn the_sentence_names_whichever_member_failed() {
     let emulator = Emulator::new();
-    emulator.enroll(true);
+    emulator.enroll(true).await;
 
     let by_name = emulator
         .call(ACCOUNT_KEY, UPDATE, &body("123456789012", "192.168.1.1"))
