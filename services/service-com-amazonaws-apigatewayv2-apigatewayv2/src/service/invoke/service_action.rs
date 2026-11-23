@@ -40,8 +40,10 @@
 //! each action's own module, from what is recorded for its subtype, because it is a fact
 //! about the api API Gateway performs the action over and not about this gateway: for
 //! [`eventbridge`], [`kinesis`] and [`stepfunctions`] it is the JSON document that service's
-//! protocol answers with, and for
-//! [`sqs`] the `{Action}Response` envelope the queue api's query interface answers with. An
+//! protocol answers with, for
+//! [`sqs`] the `{Action}Response` envelope the queue api's query interface answers with, and
+//! for [`appconfig`] — whose action binds its result to the response's own payload — those
+//! bytes under the media type that interface stated for them. An
 //! action the service serving it
 //! ANSWERED a refusal for is that refusal, RELAYED: that service's own status, the error
 //! shape it named and the text it stated, which is what tells a client a missing permission
@@ -53,7 +55,7 @@
 //! does.
 //!
 //! The subtypes performed here are the ones whose service this emulator mounts and whose
-//! parameters are the action's own: [`eventbridge`], [`kinesis`], [`sqs`] and
+//! parameters are the action's own: [`appconfig`], [`eventbridge`], [`kinesis`], [`sqs`] and
 //! [`stepfunctions`]. Any other
 //! subtype is reported as an integration this emulator cannot perform, which is the answer it
 //! already had — never a success for a call nothing made.
@@ -84,7 +86,9 @@ const INTEGRATION_ROLE_PROVIDER: &str = "ApiGatewayIntegrationCredentials";
 /// The media types the action's answer is carried to the caller as — one per wire form an
 /// api this emulator performs an action over states an answer in: the document an AWS JSON
 /// protocol answers with, and the envelope a QUERY interface answers with — and the status a
-/// performed action answers with.
+/// performed action answers with. An action whose answer is a REST interface's own PAYLOAD
+/// carries the media type THAT interface stated for it instead, which is a value of the
+/// answer rather than a constant here ([`Performed::payload`]).
 const JSON_CONTENT_TYPE: &str = "application/json";
 const XML_CONTENT_TYPE: &str = "text/xml";
 const PERFORMED_STATUS: u16 = 200;
@@ -139,6 +143,7 @@ macro_rules! action_client {
     }};
 }
 
+mod appconfig;
 pub mod credentials;
 mod eventbridge;
 mod kinesis;
@@ -244,19 +249,26 @@ impl ServiceAnswer {
 /// the wire.
 ///
 /// A first-class integration is the caller reaching that service THROUGH the api, so what the
-/// caller receives is the document the action answered in the form the interface it was
-/// performed over states one in — the document an AWS JSON protocol answers with, or the
-/// `{Action}Response` envelope a QUERY interface answers with — and not a re-encoding of it
-/// into a shape or media type of this gateway's own: a client of such a route parses the
-/// answer it would have been given calling that action itself, which is where it reads the id
-/// of what it just did. Which of the two an action is relayed in is that action's own module's
-/// to state, from what is recorded for its subtype.
+/// caller receives is the answer the action gave in the form the interface it was performed
+/// over states one in — the document an AWS JSON protocol answers with, the
+/// `{Action}Response` envelope a QUERY interface answers with, or, where that interface binds
+/// the result to the response's own PAYLOAD, those bytes under the media type it stated for
+/// them — and not a re-encoding of it into a shape or media type of this gateway's own: a
+/// client of such a route parses the answer it would have been given calling that action
+/// itself, which is where it reads the id of what it just did or the content it just asked
+/// for. Which form an action is relayed in is that action's own module's to state, from what
+/// is recorded for its subtype.
 #[derive(Debug, Clone)]
 pub struct Performed {
-    /// The document, exactly as that api states one.
+    /// The answer's body, exactly as that api states one.
     body: Vec<u8>,
-    /// The media type it carries it under.
-    content_type: &'static str,
+    /// The media type it carries it under, and `None` for an answer the interface stated no
+    /// media type for — which is then reported with none rather than with one guessed here.
+    content_type: Option<::std::borrow::Cow<'static, str>>,
+    /// Every OTHER header that interface binds a member of the answer onto, as it stated it:
+    /// a REST interface states part of an answer in headers, and those are as much of the
+    /// answer as the payload is.
+    headers: Vec<(&'static str, String)>,
 }
 
 impl Performed {
@@ -264,7 +276,8 @@ impl Performed {
     fn json(document: &Value) -> Self {
         Self {
             body: document.to_string().into_bytes(),
-            content_type: JSON_CONTENT_TYPE,
+            content_type: Some(::std::borrow::Cow::Borrowed(JSON_CONTENT_TYPE)),
+            headers: Vec::new(),
         }
     }
 
@@ -273,7 +286,24 @@ impl Performed {
     fn query_envelope(envelope: String) -> Self {
         Self {
             body: envelope.into_bytes(),
-            content_type: XML_CONTENT_TYPE,
+            content_type: Some(::std::borrow::Cow::Borrowed(XML_CONTENT_TYPE)),
+            headers: Vec::new(),
+        }
+    }
+
+    /// The answer of an action performed over a REST interface that binds its result to the
+    /// response's own PAYLOAD: the bytes are the body as they stand, `content_type` is the
+    /// media type that interface stated describes them (and `None` where it stated none), and
+    /// `headers` are the other members it binds onto headers.
+    fn payload(
+        body: Vec<u8>,
+        content_type: Option<String>,
+        headers: Vec<(&'static str, String)>,
+    ) -> Self {
+        Self {
+            body,
+            content_type: content_type.map(::std::borrow::Cow::Owned),
+            headers,
         }
     }
 
@@ -287,7 +317,12 @@ impl Performed {
             SdkBody::from(self.body),
         );
         let headers = response.headers_mut();
-        let _ = headers.try_insert("content-type", self.content_type);
+        if let Some(content_type) = self.content_type {
+            let _ = headers.try_insert("content-type", content_type.into_owned());
+        }
+        for (name, value) in self.headers {
+            let _ = headers.try_insert(name, value);
+        }
         let _ = headers.try_insert("content-length", length.to_string());
         response
     }
@@ -357,6 +392,8 @@ pub async fn perform<Eng: Send + Sync + 'static>(
 /// The service actions this emulator performs for a first-class subtype integration.
 #[derive(Debug, Clone, Copy)]
 enum Action {
+    /// `AppConfig-GetConfiguration`: read the configuration in force for the triple it names.
+    AppConfigGetConfiguration,
     /// `EventBridge-PutEvents`: publish the mapped event onto the bus it names.
     EventBridgePutEvents,
     /// `Kinesis-PutRecord`: put the mapped record on the stream it names.
@@ -385,6 +422,7 @@ impl Action {
     /// any other way names no action.
     fn named(subtype: &str) -> Option<Self> {
         match subtype {
+            appconfig::GET_CONFIGURATION_SUBTYPE => Some(Self::AppConfigGetConfiguration),
             eventbridge::PUT_EVENTS_SUBTYPE => Some(Self::EventBridgePutEvents),
             kinesis::PUT_RECORD_SUBTYPE => Some(Self::KinesisPutRecord),
             sqs::SEND_MESSAGE_SUBTYPE => Some(Self::SqsSendMessage),
@@ -404,6 +442,7 @@ impl Action {
     /// request shape declares.
     fn parameters(self) -> &'static [&'static str] {
         match self {
+            Self::AppConfigGetConfiguration => appconfig::GET_CONFIGURATION_PARAMETERS,
             Self::EventBridgePutEvents => eventbridge::PUT_EVENTS_PARAMETERS,
             Self::KinesisPutRecord => kinesis::PUT_RECORD_PARAMETERS,
             Self::SqsSendMessage => sqs::SEND_MESSAGE_PARAMETERS,
@@ -422,6 +461,7 @@ impl Action {
     /// request shape marks REQUIRED.
     fn required_parameters(self) -> &'static [&'static str] {
         match self {
+            Self::AppConfigGetConfiguration => appconfig::GET_CONFIGURATION_REQUIRED_PARAMETERS,
             Self::EventBridgePutEvents => eventbridge::PUT_EVENTS_REQUIRED_PARAMETERS,
             Self::KinesisPutRecord => kinesis::PUT_RECORD_REQUIRED_PARAMETERS,
             Self::SqsSendMessage => sqs::SEND_MESSAGE_REQUIRED_PARAMETERS,
@@ -450,6 +490,9 @@ impl Action {
         mapped: &Mapped,
     ) -> Result<Performed, Unperformed> {
         match self {
+            Self::AppConfigGetConfiguration => {
+                appconfig::get_configuration(ctx, region, identity, mapped).await
+            }
             Self::EventBridgePutEvents => {
                 eventbridge::put_events(ctx, region, identity, mapped).await
             }
@@ -530,6 +573,11 @@ mod tests {
         // empty value.
         let rows: &[(&str, &str, Option<&str>)] = &[
             (
+                "the AppConfig read",
+                appconfig::GET_CONFIGURATION_SUBTYPE,
+                Some("Configuration"),
+            ),
+            (
                 "the EventBridge publication",
                 eventbridge::PUT_EVENTS_SUBTYPE,
                 Some("Detail"),
@@ -569,7 +617,7 @@ mod tests {
             ("a case-folded spelling", "eventbridge-putevents", None),
             (
                 "an action this emulator does not perform",
-                "AppConfig-GetConfiguration",
+                "S3-PutObject",
                 None,
             ),
             ("nothing at all", "", None),

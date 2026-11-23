@@ -1134,6 +1134,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-appconfig"
+version = "1.128.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f933d20f3cc002140a121448af60403aad2d48677d50870a3d60c8df4c8aa735"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.1",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.2.0",
+ "aws-smithy-types",
+ "aws-types",
+ "fastrand",
+ "http",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-autoscaling"
 version = "1.145.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10034,6 +10058,7 @@ dependencies = [
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
  "aws-sdk-acm",
+ "aws-sdk-appconfig",
  "aws-sdk-ec2",
  "aws-sdk-eventbridge",
  "aws-sdk-kinesis",
@@ -10062,6 +10087,7 @@ dependencies = [
  "service-com-amazonaws-acm-certificatemanager",
  "service-com-amazonaws-apigateway-backplanecontrolservice",
  "service-com-amazonaws-apigatewaymanagementapi-apigatewaymanagementapi",
+ "service-com-amazonaws-appconfig-amazonappconfig",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
  "service-com-amazonaws-cloudwatchlogs-logs-20140328",
  "service-com-amazonaws-cognitoidentityprovider-awscognitoidentityproviderservice",

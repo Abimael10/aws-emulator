@@ -55,6 +55,10 @@ aws-sdk-sfn = { version = "1", default-features = false }
 # performs by putting the mapped record on the stream THAT service holds
 # (`src/service/invoke/service_action/kinesis.rs`).
 aws-sdk-kinesis = { version = "1", default-features = false }
+# And the same for AppConfig, whose `AppConfig-GetConfiguration` subtype a route performs by
+# reading the configuration in force for the triple it maps out of THAT service
+# (`src/service/invoke/service_action/appconfig.rs`).
+aws-sdk-appconfig = { version = "1", default-features = false }
 # Base64, for the one encoding an HTTP api's proxy event states a payload in when it is not
 # text (`isBase64Encoded`), in both directions.
 base64 = "0.22"
@@ -188,6 +192,11 @@ service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 # `tests/all/http_api_step_functions_subtype.rs` reads the execution back through its own
 # `DescribeExecution`. DEV-ONLY.
 service-com-amazonaws-sfn-awsstepfunctions = { workspace = true }
+# AppConfig, mounted beside this one in the test harness: a route whose integration names the
+# `AppConfig-GetConfiguration` subtype reads a configuration THAT service holds and deployed,
+# and `tests/all/http_api_appconfig_subtype.rs` deploys it through AppConfig's own operations
+# rather than planting it. DEV-ONLY.
+service-com-amazonaws-appconfig-amazonappconfig = { workspace = true }
 # The XML reader the service-action suite reads a first-class subtype route's answer with:
 # the answer of a QUERY api is that api's own `{Action}Response` envelope, so the test parses
 # it the way a client's XML reader does rather than by slicing the body. DEV-ONLY.

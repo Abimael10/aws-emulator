@@ -931,17 +931,16 @@ async fn the_action_a_subtype_route_performs_is_the_one_its_subtype_names() {
             None,
         ),
         (
-            // A first-class subtype whose action belongs to a service this emulator performs
-            // no action of, configured with every parameter the control plane holds it to, so
-            // the route exists and only the ACTION is missing.
+            // A subtype this emulator catalogues NO action for: `IntegrationSubtype` is an
+            // opaque string the control plane admits whatever it names, so the route exists,
+            // the mapping is whatever that action would take, and only the action is missing.
             "a subtype this emulator performs no action for",
-            "AppConfig-GetConfiguration",
+            "S3-PutObject",
             |_url| {
                 json!({
-                    "Application": "orders",
-                    "Environment": "live",
-                    "Configuration": "limits",
-                    "ClientId": "a-client",
+                    "Bucket": "orders",
+                    "Key": "placed",
+                    "Body": "$request.body.note",
                 })
             },
             None,
