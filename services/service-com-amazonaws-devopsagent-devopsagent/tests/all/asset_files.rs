@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end HTTP tests for the asset FILE plane: `CreateAssetFile` and the
-//! `GetAssetFile` read-back it is proved through.
+//! End-to-end HTTP tests for the asset FILE plane: `CreateAssetFile`, the
+//! `GetAssetFile` read-back it is proved through, and what a read of one file
+//! reports at each revision of its asset.
 //!
 //! Every case drives the service through the same router the emulator serves, so
 //! the routes, status codes, protocol envelope and state are all exercised.
@@ -14,7 +15,9 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_devopsagent_devopsagent::state::{
-    MAX_ASSET_CONTENT_BYTES, MAX_ASSET_FILE_PATH_LEN,
+    asset_file_not_found_message, asset_not_found_message, asset_version_not_found_message,
+    not_a_file_of_the_asset_message, ACCESS_DENIED_MESSAGE, MAX_ASSET_CONTENT_BYTES,
+    MAX_ASSET_FILE_PATH_LEN,
 };
 
 /// A SigV4 credential scope naming this service's signing name (`aidevops`), which
@@ -749,5 +752,490 @@ async fn asset_content_size_bounds_a_created_file() {
     assert_eq!(
         status, 413,
         "case \"one byte past a full asset\": expected 413, got {status}: {full}"
+    );
+}
+
+/// RULE: a read of one file reports the file as of the revision of the asset the
+/// request names — omitted, the revision the asset is at — so a revision that has
+/// been superseded still reports the content, metadata and revision number it was
+/// read with, and a path the named revision held no file at is missing in it
+/// however the revisions around it stand.
+///
+/// How a revision comes into being and how far back they are retained are pinned
+/// by the suites that own those operations (`asset_file_updates`, `asset_versions`);
+/// what this covers is what a READ of one file answers at each of them.
+#[tokio::test]
+async fn a_file_read_reports_the_revision_it_names() {
+    let router = new_router();
+    let space = create_space(&router, "revision-read-space").await;
+    let asset = create_bundle_asset(&router, &space, "revision reads").await;
+
+    // Three files, created while the asset is at its first revision.
+    for (path, content) in [("a.md", "a"), ("b.md", "b"), ("dir/c.md", "c")] {
+        let (status, created) = call(
+            &router,
+            "POST",
+            &asset_file_uri(&space, &asset, path),
+            Some(json!({"content": {"text": content}, "metadata": {"origin": path}})),
+        )
+        .await;
+        assert_eq!(
+            status, 201,
+            "setup: expected 201 creating {path:?}, got {status}: {created}"
+        );
+    }
+
+    // Changing a stored file moves the asset to its next revision, and so does
+    // removing one — the two kinds of change whose earlier content a revision has
+    // to keep readable.
+    let (status, updated) = call(
+        &router,
+        "PATCH",
+        &asset_file_uri(&space, &asset, "a.md"),
+        Some(json!({"content": {"text": "a-again"}, "metadata": {"origin": "updated"}})),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "setup: expected 200 from UpdateAssetFile, got {status}: {updated}"
+    );
+    let (status, deleted) = call(
+        &router,
+        "DELETE",
+        &asset_file_uri(&space, &asset, "b.md"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "setup: expected 200 from DeleteAssetFile, got {status}: {deleted}"
+    );
+
+    // The revision the asset is at after those two changes, read from the asset
+    // itself rather than assumed, which is the revision a read naming none reports.
+    let asset_uri = format!("/asset/agent-space/{space}/assets/{asset}");
+    let (status, read_asset) = call(&router, "GET", &asset_uri, None).await;
+    assert_eq!(
+        status, 200,
+        "setup: expected 200 from GetAsset, got {status}: {read_asset}"
+    );
+    let current_version = read_asset["asset"]["version"].as_i64().unwrap_or_else(|| {
+        panic!("setup: no asset version to read the current revision from: {read_asset}")
+    });
+    // Changing a stored file and removing one each mint a revision, so the asset
+    // left its first one twice.
+    assert_eq!(
+        current_version, 3,
+        "setup: expected the two changes to mint two revisions, got revision {current_version}"
+    );
+
+    /// One read: the revision it names (`None` names no revision at all, so the
+    /// read reports the one the asset is at), the path it names, and what that
+    /// revision holds at that path — the content and the `origin` member of the
+    /// file's metadata, or `None` because the revision holds no file there.
+    struct RevisionRead {
+        case: &'static str,
+        version: Option<i64>,
+        path: &'static str,
+        holds: Option<(&'static str, &'static str)>,
+    }
+
+    // The rows differ along the revision the read names and along how the file at
+    // the path stands in it: created in it, changed after it, deleted after it,
+    // or never there.
+    let rows = vec![
+        RevisionRead {
+            case: "first revision, file later changed",
+            version: Some(1),
+            path: "a.md",
+            holds: Some(("a", "a.md")),
+        },
+        RevisionRead {
+            case: "first revision, file later deleted",
+            version: Some(1),
+            path: "b.md",
+            holds: Some(("b", "b.md")),
+        },
+        RevisionRead {
+            case: "first revision, nested file",
+            version: Some(1),
+            path: "dir/c.md",
+            holds: Some(("c", "dir/c.md")),
+        },
+        RevisionRead {
+            case: "second revision, changed file",
+            version: Some(2),
+            path: "a.md",
+            holds: Some(("a-again", "updated")),
+        },
+        RevisionRead {
+            case: "second revision, file not yet deleted",
+            version: Some(2),
+            path: "b.md",
+            holds: Some(("b", "b.md")),
+        },
+        RevisionRead {
+            case: "second revision, untouched file",
+            version: Some(2),
+            path: "dir/c.md",
+            holds: Some(("c", "dir/c.md")),
+        },
+        RevisionRead {
+            case: "current revision, changed file",
+            version: Some(3),
+            path: "a.md",
+            holds: Some(("a-again", "updated")),
+        },
+        RevisionRead {
+            case: "current revision, deleted file",
+            version: Some(3),
+            path: "b.md",
+            holds: None,
+        },
+        RevisionRead {
+            case: "current revision, untouched file",
+            version: Some(3),
+            path: "dir/c.md",
+            holds: Some(("c", "dir/c.md")),
+        },
+        RevisionRead {
+            case: "no revision named, changed file",
+            version: None,
+            path: "a.md",
+            holds: Some(("a-again", "updated")),
+        },
+        RevisionRead {
+            case: "no revision named, deleted file",
+            version: None,
+            path: "b.md",
+            holds: None,
+        },
+        RevisionRead {
+            case: "no revision named, untouched file",
+            version: None,
+            path: "dir/c.md",
+            holds: Some(("c", "dir/c.md")),
+        },
+    ];
+
+    for row in &rows {
+        let (case, version, path, expected) = (row.case, &row.version, &row.path, &row.holds);
+        let uri = match version {
+            Some(version) => format!(
+                "{}?assetVersion={version}",
+                asset_file_uri(&space, &asset, path)
+            ),
+            None => asset_file_uri(&space, &asset, path),
+        };
+        let (status, body) = call(&router, "GET", &uri, None).await;
+        match expected {
+            Some((content, origin)) => {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected 200 from {uri}, got {status}: {body}"
+                );
+                assert_eq!(
+                    body["file"]["path"],
+                    json!(path),
+                    "case {case:?}: the read reported the path {:?}",
+                    body["file"]["path"]
+                );
+                assert_eq!(
+                    body["file"]["content"],
+                    json!({"text": content}),
+                    "case {case:?}: the read reported the content {:?}",
+                    body["file"]["content"]
+                );
+                // `AssetFile$version` is the asset revision the file belongs to, so
+                // a file read at a revision reports that revision.
+                assert_eq!(
+                    body["file"]["version"],
+                    json!(version.unwrap_or(current_version)),
+                    "case {case:?}: the read reported revision {:?}",
+                    body["file"]["version"]
+                );
+                // The metadata the file carried in that revision, completed with
+                // the media type of the content stored for it.
+                assert_eq!(
+                    body["file"]["metadata"],
+                    json!({"origin": origin, "mimeType": "text/markdown"}),
+                    "case {case:?}: the read reported the metadata {:?}",
+                    body["file"]["metadata"]
+                );
+            }
+            None => {
+                assert_eq!(
+                    status, 404,
+                    "case {case:?}: expected 404 from {uri}, got {status}: {body}"
+                );
+                assert_eq!(
+                    error_message(&body),
+                    asset_file_not_found_message(path),
+                    "case {case:?}: the refusal said {:?}",
+                    error_message(&body)
+                );
+            }
+        }
+    }
+
+    // Reading reports the asset; it moves it to no further revision, so the asset
+    // is still at the revision the two changes above took it to.
+    let (status, after_the_reads) = call(&router, "GET", &asset_uri, None).await;
+    assert_eq!(
+        status, 200,
+        "after the reads: expected 200 from GetAsset, got {status}: {after_the_reads}"
+    );
+    assert_eq!(
+        after_the_reads["asset"]["version"],
+        json!(current_version),
+        "after the reads: the asset is at revision {:?}",
+        after_the_reads["asset"]["version"]
+    );
+}
+
+/// RULE: a read of one file refuses what it cannot serve — an agent space the
+/// caller cannot reach is refused before anything inside it is looked up (HTTP
+/// 403), an asset the space does not hold and a revision the asset does not have
+/// are missing (HTTP 404), and a value that names no file of the asset is invalid
+/// (HTTP 400) — and a refused read reports no file and changes nothing.
+///
+/// That an unreachable space and an absent resource are refused this way by EVERY
+/// in-space operation is pinned by `in_space_resource_refusals`; the rows for them
+/// are here too because what this read must get right is the ORDER — the space
+/// before anything inside it.
+#[tokio::test]
+async fn a_file_read_refuses_what_it_cannot_serve() {
+    let router = new_router();
+    let space = create_space(&router, "read-refusal-space").await;
+    let asset = create_bundle_asset(&router, &space, "read refusals").await;
+
+    // Each row: the space, the asset, the wire path and the query the read names,
+    // and the status, error code and message it must answer with. The rows differ
+    // along WHICH part of the request cannot be served, and — for a revision —
+    // along how far past the one the asset is at the named one is. `message` is
+    // `None` only where the wording belongs to the modelled constraint rather than
+    // to this service, so there is nothing of this service's to assert.
+    struct Refusal {
+        case: &'static str,
+        space: Option<&'static str>,
+        asset: Option<&'static str>,
+        path: String,
+        query: String,
+        status: u16,
+        code: &'static str,
+        message: Option<String>,
+    }
+
+    let rows = vec![
+        Refusal {
+            case: "an agent space that does not exist",
+            space: Some("as-0000000000000000"),
+            asset: None,
+            path: "bundled.md".to_string(),
+            query: String::new(),
+            status: 403,
+            code: "AccessDeniedException",
+            message: Some(ACCESS_DENIED_MESSAGE.to_string()),
+        },
+        Refusal {
+            case: "an asset the space does not hold",
+            space: None,
+            asset: Some("asset-0000000000000000"),
+            path: "bundled.md".to_string(),
+            query: String::new(),
+            status: 404,
+            code: "ResourceNotFoundException",
+            message: Some(asset_not_found_message("asset-0000000000000000")),
+        },
+        Refusal {
+            case: "a path the asset holds no file at",
+            space: None,
+            asset: None,
+            path: "absent.md".to_string(),
+            query: String::new(),
+            status: 404,
+            code: "ResourceNotFoundException",
+            message: Some(asset_file_not_found_message("absent.md")),
+        },
+        Refusal {
+            case: "a nested path the asset holds no file at",
+            space: None,
+            asset: None,
+            path: "nothing/here.md".to_string(),
+            query: String::new(),
+            status: 404,
+            code: "ResourceNotFoundException",
+            message: Some(asset_file_not_found_message("nothing/here.md")),
+        },
+        Refusal {
+            case: "the revision just past the one the asset is at",
+            space: None,
+            asset: None,
+            path: "bundled.md".to_string(),
+            query: "?assetVersion=2".to_string(),
+            status: 404,
+            code: "ResourceNotFoundException",
+            message: Some(asset_version_not_found_message(&asset, 2)),
+        },
+        Refusal {
+            case: "a revision far beyond the one the asset is at",
+            space: None,
+            asset: None,
+            path: "bundled.md".to_string(),
+            query: "?assetVersion=9999".to_string(),
+            status: 404,
+            code: "ResourceNotFoundException",
+            message: Some(asset_version_not_found_message(&asset, 9999)),
+        },
+        Refusal {
+            case: "a path that starts at a root",
+            space: None,
+            asset: None,
+            path: "/escape.md".to_string(),
+            query: String::new(),
+            status: 400,
+            code: "ValidationException",
+            message: Some(not_a_file_of_the_asset_message("/escape.md")),
+        },
+        Refusal {
+            case: "a path that walks out of the asset",
+            space: None,
+            asset: None,
+            path: "../escape.md".to_string(),
+            query: String::new(),
+            status: 400,
+            code: "ValidationException",
+            message: Some(not_a_file_of_the_asset_message("../escape.md")),
+        },
+        Refusal {
+            case: "a nested path that walks out of the asset",
+            space: None,
+            asset: None,
+            path: "dir/../../escape.md".to_string(),
+            query: String::new(),
+            status: 400,
+            code: "ValidationException",
+            message: Some(not_a_file_of_the_asset_message("dir/../../escape.md")),
+        },
+        Refusal {
+            // The two rows below are refused by the modelled constraint itself
+            // (`AssetFilePath`'s own length bound, and `assetVersion`'s
+            // `@range(min: 1)`), whose wording the framework owns rather than
+            // this service — so they name no expected message.
+            case: "a path past the modelled length bound",
+            space: None,
+            asset: None,
+            path: "x".repeat(MAX_ASSET_FILE_PATH_LEN + 1),
+            query: String::new(),
+            status: 400,
+            code: "ValidationException",
+            message: None,
+        },
+        Refusal {
+            case: "a revision below the first one, which the model admits no value of",
+            space: None,
+            asset: None,
+            path: "bundled.md".to_string(),
+            query: "?assetVersion=0".to_string(),
+            status: 400,
+            code: "ValidationException",
+            message: None,
+        },
+    ];
+
+    for row in &rows {
+        let case = row.case;
+        let uri = format!(
+            "{}{}",
+            asset_file_uri(
+                row.space.unwrap_or(space.as_str()),
+                row.asset.unwrap_or(asset.as_str()),
+                &row.path,
+            ),
+            row.query
+        );
+        let (status, body) = call(&router, "GET", &uri, None).await;
+        assert_eq!(
+            status, row.status,
+            "case {case:?}: expected {} from {uri}, got {status}: {body}",
+            row.status
+        );
+        assert_eq!(
+            error_code(&body),
+            row.code,
+            "case {case:?}: refusal answered {:?}: {body}",
+            error_code(&body)
+        );
+        if let Some(expected) = &row.message {
+            assert_eq!(
+                &error_message(&body),
+                expected,
+                "case {case:?}: the refusal said {:?}",
+                error_message(&body)
+            );
+        }
+        assert!(
+            body.get("file").is_none(),
+            "case {case:?}: a refused read must report no file: {body}"
+        );
+    }
+
+    // The WORDING of each class of refusal, spelled out here rather than taken from
+    // the builders above, so a change in the text of one is a failure here and not
+    // a change on both sides of an assertion. The values inside each message are
+    // the request's own and the asset's own; only the fixed text is spelled out.
+    for (case, path, query, expected) in [
+        (
+            "a path the asset holds no file at",
+            "absent.md".to_string(),
+            String::new(),
+            "Asset file not found: absent.md".to_string(),
+        ),
+        (
+            "a path that walks out of the asset",
+            "../escape.md".to_string(),
+            String::new(),
+            "../escape.md does not name a file of the asset".to_string(),
+        ),
+        (
+            "a revision the asset does not have",
+            "bundled.md".to_string(),
+            "?assetVersion=2".to_string(),
+            format!("Asset not found: {asset} version 2"),
+        ),
+    ] {
+        let (_, body) = call(
+            &router,
+            "GET",
+            &format!("{}{query}", asset_file_uri(&space, &asset, &path)),
+            None,
+        )
+        .await;
+        assert_eq!(
+            error_message(&body),
+            expected,
+            "case {case:?}: expected the message {expected:?}, got {:?}",
+            error_message(&body)
+        );
+    }
+
+    // None of the refused reads changed what a later caller sees: the file the
+    // asset does hold still reads back at the revision the asset is still at.
+    let (status, held) = call(
+        &router,
+        "GET",
+        &asset_file_uri(&space, &asset, "bundled.md"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "after the refusals: expected 200 reading the file the asset holds, got {status}: {held}"
+    );
+    assert_eq!(
+        held["file"]["version"],
+        json!(1),
+        "after the refusals: the file belongs to revision {:?}",
+        held["file"]["version"]
     );
 }
