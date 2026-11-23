@@ -2,7 +2,8 @@
 
 //! @op DetachImageWatermark
 //! IMPLEMENTED: removes the watermark the request names from one of the account's own AMIs in
-//! [`crate::state`] and answers `true`. This is the ONLY file to touch for this operation.
+//! [`crate::state`] and answers whether that removal happened. This is the ONLY file to touch
+//! for this operation.
 //!
 //! The watermark lives ON the image, in the modelled `Image$ImageWatermarks` list
 //! `DescribeImages` reports ([`crate::ops::attach_image_watermark`] puts it there), so the
@@ -10,10 +11,11 @@
 //! gives the bytes it held back to the store's budget.
 //!
 //! "This is an idempotent operation. It succeeds even if the watermark does not exist on the
-//! image" (`DetachImageWatermark`), so a key the image does not carry is answered `true` and
-//! nothing is written. "Removing a watermark from an image does not affect derivative images
-//! that already carry the watermark": the list is the image's own, so no other image is
-//! touched.
+//! image" (`DetachImageWatermark`), so a key the image does not carry is answered HTTP 200 and
+//! nothing is written — and the single `Return` member reports what the call DID: `true` only
+//! when a watermark was actually taken off the image, `false` when the image held none under
+//! that key. "Removing a watermark from an image does not affect derivative images that
+//! already carry the watermark": the list is the image's own, so no other image is touched.
 //!
 //! The refusals are the ATTACH's, because the same image is resolved: a value that is no AMI
 //! id is `InvalidAMIID.Malformed`, an id the account can see no image for is
@@ -199,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // list, and the bytes it held go back to the store's budget — the charge
         // `AttachImageWatermark` made when it stored the key. A key the image does not carry
         // takes nothing out and gives nothing back, which is what makes the call idempotent.
-        let released = store
+        let detached = store
             .images
             .get_mut(&input.image_id)
             .and_then(|image| image.image_watermarks.as_mut())
@@ -208,15 +210,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 watermarks.retain(|watermark| {
                     watermark.watermark_key.as_deref() != Some(input.watermark_key.as_str())
                 });
-                (before - watermarks.len()) * input.watermark_key.len()
+                before - watermarks.len()
             });
-        store.release_stored_bytes(released);
+        store.release_stored_bytes(detached * input.watermark_key.len());
 
-        // "Returns `true` if the request succeeds; otherwise, it returns an error"
-        // (`$Return`): the image no longer carries that watermark, which a later
-        // `DescribeImages` reports from the same place.
+        // `Return` reports the detach this call performed: `true` only once a watermark the
+        // image held has been taken off it, and `false` for the idempotent call that found
+        // nothing under that key and therefore removed nothing. Either way the image's own
+        // list is what a later `DescribeImages` reports from.
         Ok(DetachImageWatermarkOutput {
-            r#return: Some(true),
+            r#return: Some(detached > 0),
         })
     }
 }

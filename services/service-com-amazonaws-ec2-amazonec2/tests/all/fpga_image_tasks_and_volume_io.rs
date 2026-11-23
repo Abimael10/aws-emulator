@@ -746,13 +746,16 @@ async fn attach_image_watermark_refuses_an_ami_it_cannot_watermark() {
 }
 
 /// `DetachImageWatermark` takes exactly the watermark its `WatermarkKey` names off the AMI,
-/// which a later `DescribeImages` reports; it is idempotent, so a key the image does not
-/// carry answers `true` and leaves the list exactly as it was; and it refuses the AMIs it
-/// cannot act on the way the attach does.
+/// which a later `DescribeImages` reports, and its single `Return` member reports whether a
+/// watermark was actually detached: `true` only when one was removed, `false` when the image
+/// held none under that key. It is idempotent either way — such a call still succeeds with
+/// HTTP 200 and leaves the list exactly as it was — and it refuses the AMIs it cannot act on
+/// the way the attach does.
 ///
 /// The rows differ along what the rule generalises over: which of the attached keys is
-/// detached, a key the image never carried, and each class of `ImageId` the detach cannot
-/// resolve.
+/// detached, a key the image never carried, a key another account's name space holds, a key
+/// differing from a held one only in case, an AMI that never carried a watermark at all, and
+/// each class of `ImageId` the detach cannot resolve.
 #[tokio::test]
 async fn a_detached_watermark_is_gone_from_the_ami_and_the_detach_is_idempotent() {
     let (router, engine) = emulator();
@@ -826,12 +829,72 @@ async fn a_detached_watermark_is_gone_from_the_ami_and_the_detach_is_idempotent(
     }
 
     // "This is an idempotent operation. It succeeds even if the watermark does not exist on
-    // the image": a key the AMI does not carry — one already detached, one never attached,
-    // and one of another account — answers the same success and writes nothing.
-    for (case, key) in [
-        ("a key already detached", key_of("approved-ami")),
-        ("a key never attached", key_of("never-attached")),
-        ("a key of another account", "210987654321:approved-ami".to_string()),
+    // the image": a key the AMI does not carry — one already detached, one never attached, and
+    // one of another account — is answered HTTP 200, writes nothing, and reports `false`,
+    // because nothing was detached. The last row is an AMI of its own that never carried a
+    // watermark at all, so the answer does not depend on the image having held one before.
+    let never_watermarked = seed_private_image(&engine, "never-watermarked-ami");
+    for (case, target, key) in [
+        ("a key already detached", &image_id, key_of("approved-ami")),
+        ("a key never attached", &image_id, key_of("never-attached")),
+        (
+            "a key of another account",
+            &image_id,
+            "210987654321:approved-ami".to_string(),
+        ),
+        (
+            "an AMI that never carried a watermark",
+            &never_watermarked,
+            key_of("never-attached"),
+        ),
+    ] {
+        let (status, body) = op(
+            &router,
+            "DetachImageWatermark",
+            &[p("ImageId", target), p("WatermarkKey", key)],
+        )
+        .await;
+        assert_eq!(
+            (status, element(&body, "return").as_deref()),
+            (200, Some("false")),
+            "case {case:?}: an idempotent detach must succeed reporting that it detached \
+             nothing, got {status} with body {body}"
+        );
+        assert!(
+            reported_keys(&router, case, target).await.is_empty(),
+            "case {case:?}: an idempotent detach must write nothing"
+        );
+    }
+
+    // The key names the row EXACTLY: against an AMI that does carry a watermark, a detach
+    // whose key differs from the held one only in case takes nothing off and reports `false`,
+    // and the watermark it did not name is still reported — which the rows above, run against
+    // an AMI holding nothing, cannot tell apart from the no-op they assert. The key the AMI
+    // does carry then detaches and reports `true` from the same list.
+    let (status, body) = op(
+        &router,
+        "AttachImageWatermark",
+        &[p("ImageId", &image_id), p("WatermarkName", "approved-ami")],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "re-attaching before the case-variant detach: expected HTTP 200, got {status} with \
+         body {body}"
+    );
+    for (case, key, detached, held) in [
+        (
+            "a key differing only in case from the one the AMI carries",
+            key_of("Approved-Ami"),
+            "false",
+            vec![key_of("approved-ami")],
+        ),
+        (
+            "the key the AMI carries",
+            key_of("approved-ami"),
+            "true",
+            Vec::new(),
+        ),
     ] {
         let (status, body) = op(
             &router,
@@ -841,12 +904,14 @@ async fn a_detached_watermark_is_gone_from_the_ami_and_the_detach_is_idempotent(
         .await;
         assert_eq!(
             (status, element(&body, "return").as_deref()),
-            (200, Some("true")),
-            "case {case:?}: an idempotent detach must succeed, got {status} with body {body}"
+            (200, Some(detached)),
+            "case {case:?}: expected HTTP 200 reporting {detached}, got {status} with body \
+             {body}"
         );
-        assert!(
-            reported_keys(&router, case, &image_id).await.is_empty(),
-            "case {case:?}: an idempotent detach must write nothing"
+        assert_eq!(
+            reported_keys(&router, case, &image_id).await,
+            held,
+            "case {case:?}: expected exactly {held:?} left on the AMI"
         );
     }
 }
