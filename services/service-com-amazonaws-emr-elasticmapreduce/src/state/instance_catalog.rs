@@ -668,6 +668,22 @@ pub fn vcpu_for_size(size: &str) -> Option<i32> {
     }
 }
 
+/// The memory, in MiB, one instance of `instance_type` carries, or `None` for a value this
+/// catalog names no instance type under.
+///
+/// The same figure [`InstanceFamilySpec::instance_types`] reports as
+/// `SupportedInstanceType$MemoryGB` — a size's vCPU count times its family's memory per vCPU
+/// — in the unit every memory a scheduler allocates is stated in, so one table answers both.
+pub fn instance_type_memory_mib(instance_type: &str) -> Option<i64> {
+    const MIB_PER_GIB: f32 = 1024.0;
+    let (family, size) = instance_type.split_once('.')?;
+    let spec = INSTANCE_FAMILIES
+        .iter()
+        .find(|spec| spec.family == family && spec.sizes.contains(&size))?;
+    let vcpu = vcpu_for_size(size)?;
+    Some((vcpu as f32 * spec.memory_gb_per_vcpu * MIB_PER_GIB) as i64)
+}
+
 /// The instance types the release `release` — a `(major, minor, patch)` triple, as
 /// [`catalog_release`] resolves a label to — supports, in catalog order: by family as
 /// [`INSTANCE_FAMILIES`] declares them, and within a family smallest size first.

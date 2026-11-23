@@ -59,8 +59,9 @@
 //!
 //! # What is NOT answered here
 //!
-//! The two classes of submission this service really runs — a `spark-submit` of a Python
-//! application ([`super::spark_step_run`]) and a read-only statement resolvable in the
+//! The classes of submission this service answers for itself — a `spark-submit` of a Python
+//! application ([`super::spark_step_run`]), a `spark-submit` whose admission its cluster's own
+//! capacity answers ([`super::spark_submission`]) and a read-only statement resolvable in the
 //! cluster's Hive metastore ([`super::step_runner`]) — answer for themselves, so a step
 //! submitting one of them is never read as a command.
 

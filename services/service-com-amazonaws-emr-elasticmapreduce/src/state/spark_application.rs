@@ -50,7 +50,10 @@ const MAX_COMMAND_WORDS: usize = 512;
 /// SOURCE: `spark-submit --help`'s own option list. An option written with `=`
 /// (`--conf k=v`) carries its value in the same word and needs no entry; a boolean flag
 /// (`--verbose`, `--supervise`) takes no value and is skipped as the option word it is.
-const VALUE_OPTIONS: &[&str] = &[
+///
+/// `pub` because the reading of what a submission ASKS its cluster for walks the same
+/// grammar ([`super::spark_submission`]) rather than keeping a second copy of this list.
+pub const VALUE_OPTIONS: &[&str] = &[
     "--master",
     "--deploy-mode",
     "--class",

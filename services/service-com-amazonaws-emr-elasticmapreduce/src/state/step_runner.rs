@@ -378,16 +378,25 @@ pub fn uses_glue_data_catalog(cluster: &ClusterRecord) -> bool {
         .is_some_and(|value| value.trim() == GLUE_METASTORE_FACTORY_CLASS)
 }
 
-/// The value `property` carries anywhere in a configuration tree, searched to
-/// [`MAX_CONFIGURATIONS_WALKED`] structures.
+/// The value `property` carries anywhere in a configuration tree.
 ///
 /// A property is matched by the END of its key, because a configuration that passes a
 /// Hadoop property through another engine's configuration carries it under a prefix of
 /// that engine's own (`spark.hadoop.<property>`), and it is the same property.
-fn configuration_property<'a>(
+///
+/// What ONE lookup costs is bounded by [`MAX_CONFIGURATIONS_WALKED`]: every structure AND
+/// every property entry of a structure counts against it, so the search is bounded by what
+/// the tree holds rather than by its shape, and the suffix it compares against is built once
+/// instead of once per key.
+///
+/// `pub` because what a cluster's configuration sets is also what fills in the resources a
+/// submission did not state ([`super::spark_submission`]), which reads the same tree the same
+/// way.
+pub fn configuration_property<'a>(
     configurations: &'a [Configuration],
     property: &str,
 ) -> Option<&'a String> {
+    let suffixed = format!(".{property}");
     let mut pending: Vec<&Configuration> = configurations.iter().collect();
     let mut walked = 0usize;
     while let Some(configuration) = pending.pop() {
@@ -395,13 +404,16 @@ fn configuration_property<'a>(
         if walked > MAX_CONFIGURATIONS_WALKED {
             return None;
         }
-        if let Some(value) = configuration.properties.as_ref().and_then(|properties| {
-            properties
-                .iter()
-                .find(|(key, _)| key.as_str() == property || key.ends_with(&format!(".{property}")))
-                .map(|(_, value)| value)
-        }) {
-            return Some(value);
+        if let Some(properties) = configuration.properties.as_ref() {
+            for (key, value) in properties {
+                walked += 1;
+                if walked > MAX_CONFIGURATIONS_WALKED {
+                    return None;
+                }
+                if key.as_str() == property || key.ends_with(&suffixed) {
+                    return Some(value);
+                }
+            }
         }
         if let Some(children) = configuration.configurations.as_deref() {
             pending.extend(children.iter());
@@ -414,10 +426,11 @@ fn configuration_property<'a>(
 /// the cluster's step queue up to `now`.
 ///
 /// The queue, the concurrency slots, the timeline and the stops are the cluster's own step
-/// runner's ([`ClusterRecord::advance_to`]); this adds the one thing that needs state
-/// beyond this service's own: what the work a step submitted answered, resolved against
-/// the metastore the cluster's configuration selects ([`resolve_outcome`]). A step whose
-/// answer is resolved ends in it; every other step ends as the cluster's runner ends it,
+/// runner's ([`ClusterRecord::advance_to`]); this adds the two things that need more than the
+/// step's own command: whether the cluster ADMITS the submission a `spark-submit` step made
+/// ([`resolve_due_submissions`]), and what the work a step submitted answered, resolved
+/// against the metastore the cluster's configuration selects ([`resolve_outcome`]). A step
+/// whose answer is resolved ends in it; every other step ends as the cluster's runner ends it,
 /// in the modelled failure state saying no application ran ([`STEP_NOT_EXECUTED_REASON`]).
 ///
 /// An answer is resolved ONCE and then stored, before the step's own end comes due, so two
@@ -436,6 +449,7 @@ pub fn run_due_steps<Eng: Send + Sync + 'static>(
     let Some(cluster) = store.clusters.get_mut(cluster_id) else {
         return;
     };
+    resolve_due_submissions(cluster);
     resolve_cluster_outcomes(engine, cluster);
     cluster.advance_to(now);
 }

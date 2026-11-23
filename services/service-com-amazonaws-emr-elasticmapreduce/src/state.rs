@@ -181,6 +181,12 @@ pub use spark_application::*;
 mod spark_runtime;
 pub use spark_runtime::*;
 
+/// What a cluster ADMITS a `spark-submit` step to — the containers its submission asks for
+/// against the largest the cluster's own capacity can allocate — split out and re-exported
+/// the same way.
+mod spark_submission;
+pub use spark_submission::*;
+
 /// RUNNING the application a step submitted — fetching it out of Amazon S3, executing it and
 /// reading what the step ends in off that run — split out and re-exported the same way.
 mod spark_step_run;
@@ -1583,13 +1589,15 @@ pub const STEP_RUN_SPAN: Duration = Duration::from_secs(2);
 ///
 /// This service always runs the step LIFECYCLE: it accepts a step, queues it behind whatever
 /// its cluster is already running, starts it when a concurrency slot frees and records its
-/// timeline. What it can RUN is the submission it holds an engine and bytes for — a
-/// `spark-submit` of a Python application in Amazon S3 ([`spark_step_run`]), a read-only
-/// statement resolvable in the cluster's metastore ([`step_runner`]) and a command whose exit
-/// status the session-local utilities answer ([`step_command_status`]). Every other
-/// submission — a jar, a command this service answers for nothing of — produced no outcome,
-/// so the step ENDS in the modelled failure state with this reason saying exactly why,
-/// rather than reporting `COMPLETED` for work nothing performed.
+/// timeline. What it can answer for is the submission it holds an engine, bytes or the
+/// cluster's own state for — a `spark-submit` of a Python application in Amazon S3
+/// ([`spark_step_run`]), a `spark-submit` its cluster's capacity answers the admission of
+/// ([`spark_submission`]), a read-only statement resolvable in the cluster's metastore
+/// ([`step_runner`]) and a command whose exit status the session-local utilities answer
+/// ([`step_command_status`]). Every other submission — a jar of the submitter's own, a command
+/// this service answers for nothing of — produced no outcome, so the step ENDS in the modelled
+/// failure state with this reason saying exactly why, rather than reporting `COMPLETED` for
+/// work nothing performed.
 pub const STEP_NOT_EXECUTED_REASON: &str =
     "This emulator runs the step lifecycle but executes no Hadoop jar, so the step ended \
      without running its application.";

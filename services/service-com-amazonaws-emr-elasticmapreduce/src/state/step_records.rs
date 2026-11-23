@@ -51,6 +51,17 @@ pub struct StepRecord {
     /// application has been RUN and its answer recorded in
     /// [`StepRecord::outcome`] ([`run_due_step_applications`]).
     pub application: Option<SparkApplication>,
+    /// What the `spark-submit` this step's command line is asks its cluster FOR, read off
+    /// that command line once when the step was submitted ([`submitted_spark_request`]), and
+    /// `None` for a step whose command line is no single `spark-submit`. Whether the cluster
+    /// admits it is resolved against that cluster's own capacity
+    /// ([`resolve_due_submissions`]), and a submission it does not admit is what the step
+    /// ends in.
+    pub submission: Option<SparkSubmitRequest>,
+    /// Whether that admission has been ANSWERED: an admission follows from the submission and
+    /// the capacity the cluster holds, so it is answered once and recorded here, and a later
+    /// read of this step answers nothing again ([`Self::awaits_admission`]).
+    pub submission_admitted: bool,
     /// The COMMAND this step's command line is, read off that command line once when the
     /// step was submitted ([`StepCommand::of`]) for a step that submits neither of the two
     /// classes above — those answer for themselves. What it answers is the status it exits
@@ -112,11 +123,17 @@ impl StepRecord {
         // The application the command submits, read the same way and for the same reason:
         // the command never changes, and what it submits is what the step will RUN.
         let application = submitted_spark_application(&config.hadoop_jar_step.jar, &args);
+        // What the `spark-submit` the command line is asks its CLUSTER for, read the same way:
+        // the resources a submission asks for are stated on the command line, and whether the
+        // cluster can allocate them is resolved against that cluster when the runner
+        // dispatches the step.
+        let submission = submitted_spark_request(&config.hadoop_jar_step.jar, &args);
         // The command the step's command line is, read the same way. It is read only for a
-        // step that submits neither of the two classes above: an application and a statement
-        // resolvable in the cluster's metastore answer for themselves, and what the command
-        // ANSWERS is the status it exits with, performed when the step's run ends.
-        let command = (work.is_none() && application.is_none())
+        // step that submits none of the classes above: an application, a submission its
+        // cluster answers the admission of, and a statement resolvable in the cluster's
+        // metastore all answer for themselves, and what the command ANSWERS is the status it
+        // exits with, performed when the step's run ends.
+        let command = (work.is_none() && application.is_none() && submission.is_none())
             .then(|| StepCommand::of(&config.hadoop_jar_step.jar, &args))
             .flatten();
         Self {
@@ -145,12 +162,28 @@ impl StepRecord {
             work,
             outcome: None,
             application,
+            submission,
+            submission_admitted: false,
             command,
             published_state: None,
             abandoned_runs: 0,
             delivered_log_uri: None,
             resource_manager_application_ids: Vec::new(),
         }
+    }
+
+    /// Whether this step is still owed the ADMISSION of the submission it made: it made one,
+    /// nothing has answered it yet, and the step has neither ended nor been answered for
+    /// otherwise.
+    ///
+    /// A step whose admission has been answered is owed nothing further by
+    /// [`resolve_due_submissions`], however often it is read afterwards.
+    #[must_use]
+    pub fn awaits_admission(&self) -> bool {
+        self.submission.is_some()
+            && !self.submission_admitted
+            && self.outcome.is_none()
+            && !self.is_terminal()
     }
 
     /// Whether this step is still owed the RUN of the application it submitted: it submitted
@@ -294,8 +327,12 @@ impl StepRecord {
     /// not end until it has ([`Self::awaits_application`]) — and a statement whose only
     /// effect is reading, submitted to a cluster whose Hive metastore this service holds,
     /// ends `COMPLETED` when every table it names resolves and `FAILED` with the driver's
-    /// table-not-found when one does not ([`run_due_steps`]). A step that submits neither of
-    /// those submits a COMMAND, and it ends in the status that command exited with — zero is
+    /// table-not-found when one does not ([`run_due_steps`]). A `spark-submit` of anything
+    /// else ends in what its cluster's own capacity ANSWERED: the refusal `spark-submit` gives
+    /// a submission whose containers the cluster cannot allocate, and `COMPLETED` for one it
+    /// admits whose application file is the cluster node's own
+    /// ([`resolve_due_submissions`]). A step that submits none of those submits a
+    /// COMMAND, and it ends in the status that command exited with — zero is
     /// `COMPLETED` and anything else `FAILED` ([`resolve_due_step_commands`]) — which is what
     /// `AddJobFlowSteps` documents a step's completion as; such a step does not end until
     /// that command has been performed ([`Self::awaits_command`]).
