@@ -75,14 +75,16 @@ use aws_smithy_schema_server::{
     ProtocolError, QueryServerProtocol, QueryShapeDeserializer, ServerProtocol,
 };
 
-// The claim on a request that names NO service: this service's own wire form, read through
-// the tree's one copy of that rule (whose module docs state it). This service's
+// The claim on a request this service's own protocol addresses it by, read through the
+// tree's one copy of that rule (whose module docs state it). This service's
 // `AssumeRoleWithWebIdentity` and `AssumeRoleWithSAML` are modelled anonymous, so a
 // conforming client sends them UNSIGNED — no SigV4 credential scope to resolve a routing key
 // from — and a client pointed at this emulator's own endpoint (a loopback address) leaves
 // the host tier nothing to resolve either, so claiming by the signing name alone would leave
-// them to the router's `UnknownService` in an envelope an `awsQuery` client cannot parse.
-use ::service_common::query_wire_form::addresses_unattributed_query_request;
+// them to the router's `UnknownService` in an envelope an `awsQuery` client cannot parse. An
+// `X-Amz-Target` attached to a request of this protocol is read the same way: the operation
+// is the body's `Action`, so the header names no service this protocol routes on.
+use ::service_common::query_wire_form::addresses_query_request;
 
 /// The `awsQuery` field naming the operation a request is for.
 ///
@@ -564,13 +566,21 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing name, and —
-        // when NOTHING in the request names a service — one that addresses this
-        // service's own `awsQuery` wire form, which is what makes the operations the
-        // model marks anonymous reachable from a client holding no credential (see
-        // [`addresses_unattributed_query_request`]).
+        // Claim a request whose resolved route key is this service's signing name, and one
+        // addressed to this service's own `awsQuery` wire form by the signals that protocol
+        // carries — its credential scope and its endpoint host, with an `X-Amz-Target`
+        // neither routed on nor allowed to shadow them, and with a request that names no
+        // service at all claimed by the wire form alone (see
+        // [`addresses_query_request`]). The second claim is what makes the operations the
+        // model marks anonymous reachable from a client holding no credential, and what
+        // keeps a request carrying an `awsJson` target header — which this protocol has no
+        // use for — from reaching nobody.
         let claimed = ::service_common::routes_to(parts, self.entry.identity().signing_name())
-            || addresses_unattributed_query_request(parts);
+            || addresses_query_request(
+                parts,
+                self.entry.identity().signing_name(),
+                self.entry.identity().shape_id(),
+            );
         if claimed {
             // The credential this request presented, kept for the length of the request
             // so an authentication refusal can be worded for the credential it refused;
@@ -684,7 +694,7 @@ mod tests {
     //! these tables are the rules themselves, row by row.
 
     use super::{
-        addresses_unattributed_query_request, remember_presented_access_key_id, EmulatedService,
+        addresses_query_request, remember_presented_access_key_id, EmulatedService,
         SIGNATURE_MISMATCH_CODE, SIGNATURE_MISMATCH_MESSAGE, UNRESOLVED_CREDENTIAL_CODE,
         UNRESOLVED_CREDENTIAL_MESSAGE,
     };
@@ -698,6 +708,11 @@ mod tests {
     /// This service's SigV4 signing name, as the generated identity states it
     /// (`smithy_query(query="service_info")` -> `sigv4Name` `sts`).
     const SIGNING_NAME: &str = "sts";
+
+    /// This service's shape, as the model declares it
+    /// (`smithy_query(query="service_info")` -> the service shape id), which is the name an
+    /// `X-Amz-Target` attached to one of its requests spells.
+    const SERVICE_SHAPE_ID: &str = "com.amazonaws.sts#AWSSecurityTokenServiceV20110615";
 
     /// A credential scope naming `signing_name`, the primary routing signal.
     fn authorization(access_key_id: &str, signing_name: &str) -> String {
@@ -736,10 +751,16 @@ mod tests {
             .0
     }
 
-    /// A request naming no service is claimed by the `awsQuery` wire form, and only by it.
+    /// A request is claimed on this protocol's own wire form, by the signals this protocol
+    /// carries: a request naming no service at all, and one whose credential scope or
+    /// endpoint host names this service. An `X-Amz-Target` is not one of them — this
+    /// protocol takes the operation from the body's `Action` — so one naming this service is
+    /// carried along and one naming another service is left to it.
     #[test]
-    fn an_unattributed_request_is_claimed_only_on_this_protocol_s_wire_form() {
-        // One row: how the request is addressed, and whether the wire form claims it.
+    fn a_request_is_claimed_on_this_protocol_s_wire_form_whatever_target_it_carries() {
+        /// The target a client that attached one to this service's request writes.
+        const OWN_TARGET: &str = "AWSSecurityTokenServiceV20110615.GetCallerIdentity";
+        // One row: how the request is addressed, and whether this protocol's claim admits it.
         let rows: Vec<(&str, super::http::request::Parts, bool)> = vec![
             (
                 "unsigned form POST to the root path",
@@ -764,6 +785,25 @@ mod tests {
                 true,
             ),
             (
+                // The header an `awsJson` client names its operation in, attached to a
+                // request of this protocol: the call is still the body's `Action`.
+                "unsigned form POST carrying this service's own target",
+                parts("POST", "/", None, Some(OWN_TARGET), Some("127.0.0.1:9297"), Some(QUERY_CONTENT_TYPE)),
+                true,
+            ),
+            (
+                "the same POST with the target naming an operation no model binds",
+                parts(
+                    "POST",
+                    "/",
+                    None,
+                    Some("AWSSecurityTokenServiceV20110615.NotAnOperation"),
+                    Some("127.0.0.1:9297"),
+                    Some(QUERY_CONTENT_TYPE),
+                ),
+                true,
+            ),
+            (
                 // The credential scope names a service, so that service's claim decides.
                 "signed for another service",
                 parts("POST", "/", Some(("AKIDEXAMPLE", "iam")), None, None, Some(QUERY_CONTENT_TYPE)),
@@ -772,7 +812,19 @@ mod tests {
             (
                 "signed for this service",
                 parts("POST", "/", Some(("AKIDEXAMPLE", SIGNING_NAME)), None, None, Some(QUERY_CONTENT_TYPE)),
-                false,
+                true,
+            ),
+            (
+                "signed for this service, with a target attached beside the scope",
+                parts(
+                    "POST",
+                    "/",
+                    Some(("AKIDEXAMPLE", SIGNING_NAME)),
+                    Some(OWN_TARGET),
+                    None,
+                    Some(QUERY_CONTENT_TYPE),
+                ),
+                true,
             ),
             (
                 "targeted at an awsJson service",
@@ -787,8 +839,25 @@ mod tests {
                 false,
             ),
             (
-                "addressed by a service's endpoint host",
+                "addressed by this service's endpoint host",
                 parts("POST", "/", None, None, Some("sts.us-east-1.amazonaws.com"), Some(QUERY_CONTENT_TYPE)),
+                true,
+            ),
+            (
+                "addressed by this service's endpoint host, with a target attached",
+                parts(
+                    "POST",
+                    "/",
+                    None,
+                    Some(OWN_TARGET),
+                    Some("sts.us-east-1.amazonaws.com"),
+                    Some(QUERY_CONTENT_TYPE),
+                ),
+                true,
+            ),
+            (
+                "addressed by another service's endpoint host",
+                parts("POST", "/", None, None, Some("iam.amazonaws.com"), Some(QUERY_CONTENT_TYPE)),
                 false,
             ),
             (
@@ -814,7 +883,7 @@ mod tests {
         ];
 
         for (case, parts, expected) in rows {
-            let actual = addresses_unattributed_query_request(&parts);
+            let actual = addresses_query_request(&parts, SIGNING_NAME, SERVICE_SHAPE_ID);
             assert_eq!(
                 actual, expected,
                 "case {case:?}: expected the wire-form claim == {expected}, got {actual}"

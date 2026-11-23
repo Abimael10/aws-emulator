@@ -111,22 +111,31 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing name — and,
-        // when NOTHING in the request names a service, one addressed in the AWS Query
-        // API's own wire form, which is how the 2009-04-15 API on this endpoint arrives.
-        // That API is signed with Signature Version 2, which carries the caller's
-        // credential in the form-encoded body instead of in an `Authorization` header, so
-        // its requests bring no SigV4 credential scope; and a client pointed at this
-        // emulator reaches it on a loopback address, which names no service in the host
-        // either. Without this claim such a request resolves to no service here and is
-        // swallowed by whichever peer claims the shared wire form.
+        // Claim a request whose resolved route key is this service's signing name — and one
+        // addressed in the AWS Query API's own wire form by the signals that protocol
+        // carries, which is how the 2009-04-15 API on this endpoint arrives. That API is
+        // signed with Signature Version 2, which carries the caller's credential in the
+        // form-encoded body instead of in an `Authorization` header, so its requests bring
+        // no SigV4 credential scope; and a client pointed at this emulator reaches it on a
+        // loopback address, which names no service in the host either. Without this claim
+        // such a request resolves to no service here and is swallowed by whichever peer
+        // claims the shared wire form.
+        //
+        // An `X-Amz-Target` is not one of this protocol's signals — the operation is the
+        // body's `Action` — so a target naming this service is carried along and one naming
+        // another service is left to it (see
+        // [`::service_common::query_wire_form::addresses_query_request`]).
         //
         // The wire form is shared by every query API, so claiming it is not deciding: the
         // router keeps the claimants that name an operation for the request, and
         // `override_operation` below names one only for a request that states THIS API
         // (see [`sdb_query_api::addresses_query_api`]).
         ::service_common::routes_to(parts, self.entry.identity().signing_name())
-            || ::service_common::query_wire_form::addresses_unattributed_query_request(parts)
+            || ::service_common::query_wire_form::addresses_query_request(
+                parts,
+                self.entry.identity().signing_name(),
+                self.entry.identity().shape_id(),
+            )
     }
 
     fn override_operation(
