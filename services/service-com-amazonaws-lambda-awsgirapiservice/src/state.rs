@@ -248,6 +248,19 @@ pub use sqs_poller::{
     POLL_INTERVAL,
 };
 
+/// And [`mq_poller`] for a mapping on an Amazon MQ for RabbitMQ broker, whose queue hands the
+/// message at its head to ONE consumer and holds it out of the queue until that consumer
+/// acknowledges it — which is neither how a queue source's records are held nor how a shard's
+/// are positioned. It is re-exported here for the same reason as the two above.
+pub mod mq_poller;
+pub use mq_poller::drive_mq_pollers;
+
+/// The instants this crate publishes as CALENDAR TEXT rather than as an epoch count — a
+/// function URL's Common Log Format instant and an Amazon MQ record's `basicProperties`
+/// timestamp — live in [`calendar_fields`], each one `chrono` format of the instant, so
+/// neither caller reads an instant's fields out of a rendering of its own.
+pub mod calendar_fields;
+
 /// Which records of a source a mapping's `FilterCriteria` admit — the one decision BOTH
 /// pollers above take about each record they polled — lives in [`event_source_filter`],
 /// beside them, and is re-exported here for the same reason as [`capacity_provider`]: the
@@ -2792,7 +2805,8 @@ pub use event_source_mapping::{
     EVENT_SOURCE_RESOURCE_TABLE, EVENT_SOURCE_RESOURCE_VPC_CONNECTION,
     EVENT_SOURCE_VENDOR_DOCUMENT_DB, EVENT_SOURCE_VENDOR_DYNAMODB, EVENT_SOURCE_VENDOR_KAFKA,
     EVENT_SOURCE_VENDOR_KINESIS, EVENT_SOURCE_VENDOR_MQ, EVENT_SOURCE_VENDOR_QUEUE,
-    INFINITE_RETENTION, LAST_PROCESSING_RESULT_FUNCTION_CALL_FAILED,
+    INFINITE_RETENTION, LAST_PROCESSING_RESULT_CONNECTION_ERROR,
+    LAST_PROCESSING_RESULT_FUNCTION_CALL_FAILED,
     LAST_PROCESSING_RESULT_NO_RECORDS, LAST_PROCESSING_RESULT_OK,
     MAX_EVENT_SOURCE_MAPPINGS, MAX_EVENT_SOURCE_MAPPING_PAGE_SIZE,
     STARTING_POSITION_AT_TIMESTAMP, STARTING_POSITION_LATEST, STARTING_POSITION_TRIM_HORIZON,

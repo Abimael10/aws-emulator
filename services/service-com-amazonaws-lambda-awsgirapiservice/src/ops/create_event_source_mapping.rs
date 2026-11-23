@@ -101,10 +101,12 @@
 //! An accepted mapping on a queue also STARTS POLLING it: "Lambda reads items from the
 //! event source and invokes the function", so this call arms the mapping's OWN poller
 //! ([`crate::state::drive_sqs_pollers`]) that takes each batch out of the queue and hands
-//! it to the mapping's function. Nothing waits for a poll here — each mapping's poller runs
+//! it to the mapping's function. A mapping on an Amazon MQ broker is armed the same way
+//! ([`crate::state::drive_mq_pollers`]), consuming the one `Queues` entry it names on that
+//! broker. Nothing waits for a poll here — each mapping's poller runs
 //! on its own clock, so a mapping's deliveries wait on no other mapping — and what one poll
 //! does, including why an unprocessed batch is left on the queue, is documented in
-//! [`crate::state::sqs_poller`].
+//! [`crate::state::sqs_poller`] and [`crate::state::mq_poller`].
 //!
 //! ## Shape of an operation
 //!
@@ -1016,12 +1018,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Standing the mapping's poller up is what this call started: "Lambda reads items
         // from the event source and invokes the function", and the reading is the poller's.
-        // Which poller depends on the kind of source — the queue loop, or this mapping's own
-        // reader of a shard source's shards — and each decides for itself whether it
-        // has anything to do. The store's lock is released first (each poller takes it
-        // itself) and nothing here waits for a poll: they run on their own clock.
+        // Which poller depends on the kind of source — the queue loop, the reader of a
+        // broker's queue, or this mapping's own reader of a shard source's shards — and each
+        // decides for itself whether it has anything to do. The store's lock is released
+        // first (each poller takes it itself) and nothing here waits for a poll: they run on
+        // their own clock.
         drop(store);
         crate::state::drive_sqs_pollers(ctx, &self.engine);
+        crate::state::drive_mq_pollers(ctx, &self.engine);
         crate::state::event_source_poller::drive_mapping(ctx, &self.engine, &uuid);
 
         Ok(reported)

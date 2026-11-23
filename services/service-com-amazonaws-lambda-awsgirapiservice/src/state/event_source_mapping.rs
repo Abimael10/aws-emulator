@@ -109,6 +109,9 @@ pub fn event_source_mapping_transition_reason(event_source_arn: Option<&str>) ->
 /// `LastProcessingResult` for a mapping on a shard source whose poller has not attempted a
 /// batch yet: "the result of the event source mapping's last processing attempt" is that no
 /// record has been processed, which is a reading of the mapping rather than an unknown.
+///
+/// It is also what a pass over a queue the broker DOES hold and that holds nothing comes to
+/// ([`crate::state::mq_poller`]): the pass read the source and processed no record.
 pub const LAST_PROCESSING_RESULT_NO_RECORDS: &str = "No records processed";
 
 /// The `ResourceInUseException` sentence `DeleteEventSourceMapping` refuses a mapping that
@@ -220,6 +223,18 @@ pub const LAST_PROCESSING_RESULT_OK: &str = "OK";
 /// unsuccessful attempt in. The batch is not consumed, so it is read again: a shard source
 /// is not checkpointed past it and a queue source deletes none of its messages.
 pub const LAST_PROCESSING_RESULT_FUNCTION_CALL_FAILED: &str = "PROBLEM: Function call failed";
+
+/// `LastProcessingResult` after a pass that could not REACH the event source at all, in that
+/// same `PROBLEM: <reason>` form — the sentence AWS Lambda words a mapping's failure to
+/// connect to its source in, naming the mapping's own source configuration as what to check.
+///
+/// It is a reading of the SOURCE and not of the function: a mapping whose source Lambda
+/// cannot consume from — a broker that is not there, or one holding no queue of the name the
+/// mapping consumes — has made no attempt at a batch, so this is what its last pass came to,
+/// and the mapping keeps polling, which is what lets the reading change by itself once the
+/// source is in place.
+pub const LAST_PROCESSING_RESULT_CONNECTION_ERROR: &str =
+    "PROBLEM: Connection error. Please check your event source connection configuration.";
 
 /// Where in ONE shard of a mapping's event source that mapping reads next.
 ///

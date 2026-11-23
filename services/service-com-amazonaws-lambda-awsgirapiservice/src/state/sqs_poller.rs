@@ -155,7 +155,11 @@ const MIN_HOLD_RENEWAL: Duration = Duration::from_millis(250);
 /// the count a caller chose is clamped before anything is polled, exactly as the reader of a
 /// shard source clamps it. A mapping configured above it polls this many messages per batch
 /// instead, which is a smaller batch and never a message that is not polled.
-const MAX_MESSAGES_PER_BATCH: usize = 1_000;
+///
+/// `pub(crate)` because it is this emulator's bound on one batch of MESSAGES, whichever
+/// message source a mapping takes them from: the reader of a broker's queue
+/// ([`super::mq_poller`]) holds the count a caller chose to the same ceiling.
+pub(crate) const MAX_MESSAGES_PER_BATCH: usize = 1_000;
 
 /// The longest batching window a mapping gathers a batch over.
 ///

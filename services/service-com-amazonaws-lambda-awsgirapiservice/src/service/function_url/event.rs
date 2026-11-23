@@ -370,33 +370,11 @@ fn textual(content_type: Option<&str>) -> bool {
 }
 
 /// The instant `at` in the Common Log Format `requestContext.time` carries
-/// (`31/Oct/2026:12:00:00 +0000`).
+/// (`31/Oct/2026:12:00:00 +0000`), written by this crate's one renderer of such text
+/// ([`crate::state::calendar_fields`]).
 fn clf_time(at: ::std::time::SystemTime) -> String {
-    let at = ::aws_smithy_types::DateTime::from(at);
-    let rendered = at
-        .fmt(::aws_smithy_types::date_time::Format::DateTime)
-        .unwrap_or_default();
-    // `2026-10-31T21:10:43Z` -> the day, the month's name, and the time of day.
-    let (date, rest) = rendered.split_once('T').unwrap_or((rendered.as_str(), ""));
-    let time = rest.trim_end_matches('Z');
-    let mut parts = date.split('-');
-    let (year, month, day) = (
-        parts.next().unwrap_or_default(),
-        parts.next().unwrap_or_default(),
-        parts.next().unwrap_or_default(),
-    );
-    let month = month
-        .parse::<usize>()
-        .ok()
-        .and_then(|month| MONTH_NAMES.get(month.saturating_sub(1)).copied())
-        .unwrap_or_default();
-    format!("{day}/{month}/{year}:{time} +0000")
+    crate::state::calendar_fields::common_log_format(at)
 }
-
-/// The month names the Common Log Format writes, January first.
-const MONTH_NAMES: &[&str] = &[
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
 
 /// The instant `at` as the milliseconds since the epoch `requestContext.timeEpoch` carries:
 /// the one reading of an instant this crate states ([`crate::state::execution::epoch_millis`]).

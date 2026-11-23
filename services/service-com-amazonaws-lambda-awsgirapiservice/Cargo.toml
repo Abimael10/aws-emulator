@@ -38,8 +38,14 @@ service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 # An event source mapping on an Amazon MQ broker is accepted only against a broker that
 # EXISTS, and brokers live in the Amazon MQ emulator's own store
 # (`state::event_source_request`): it is reached through the shared engine, which needs the
-# owning service's state TYPE.
+# owning service's state TYPE. The same store holds the QUEUES of each broker's own data
+# plane, which the mapping's poller consumes (`state::mq_poller`).
 service-com-amazonaws-mq-mq = { workspace = true }
+# The AMQP 0-9-1 basic properties a message of such a broker carries, which is how the
+# message is stored and what the event a RabbitMQ mapping hands its function reports for it
+# (`state::mq_poller`): the same codec the broker's own wire is served with, so one process
+# has one reading of those values.
+amq-protocol = { version = "10.7", default-features = false }
 # A mapping is also accepted against what the invoked function's EXECUTION ROLE may read on
 # the event source (`state::event_source_authorization`): the role's policies live in the
 # IAM emulator's store, reached through that same shared engine. The same store holds the
