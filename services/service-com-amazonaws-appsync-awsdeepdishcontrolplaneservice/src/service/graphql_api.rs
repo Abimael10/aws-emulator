@@ -16,8 +16,11 @@
 //!   one, and the `data` frames a subscription receives.
 //!
 //! What a call presenting a TOKEN is decided by is the mode that issued it: a Cognito user
-//! pool token is verified against the pool the API configured ([`user_pool`]), and a Lambda
-//! authorizer's input is handed to the function the API named ([`authorizer`]).
+//! pool token is verified against the pool the API configured ([`user_pool`]), an OpenID
+//! Connect token against the provider it configured ([`open_id_connect`]), and a Lambda
+//! authorizer's input is handed to the function the API named ([`authorizer`]). Both endpoints
+//! read that decision through ONE seam ([`token_decision`]), so a token admitted on a call is
+//! admitted on a connection and refused alike.
 //!
 //! Both are opened when the API is created ([`open_for_api`], called by `CreateGraphqlApi`)
 //! and closed when it is deleted, and the `host:port` each landed on is what the API
@@ -63,6 +66,7 @@ pub mod introspection;
 pub mod lambda;
 pub mod mapping_template;
 pub mod metrics;
+pub mod open_id_connect;
 pub mod query;
 pub mod realtime;
 pub mod relational_database;
@@ -239,6 +243,157 @@ pub fn authorized(
             .additional_authentication_providers
             .iter()
             .any(|provider| matches!(provider_type(provider), Some(named) if named != API_KEY_AUTH_TYPE))
+}
+
+/// What the TOKEN modes of an API decided about one value presented in a call's own
+/// `authorization` field.
+///
+/// The modes that decide a call by a token each read the same field, so the decision is taken
+/// once, HERE, and both of the API's endpoints read it through this one seam: a call on the
+/// `GRAPHQL` endpoint ([`query`]) and a connection or a `start` on the `REALTIME` one
+/// ([`realtime`]) cannot differ about what a token authorizes.
+#[derive(Debug, Clone)]
+pub enum TokenDecision {
+    /// No token mode of this API decides the value presented: the API configured none, the
+    /// call presented nothing in that field, or what it presented is another provider's
+    /// material.
+    NotApplicable,
+    /// The value authorizes nobody, and the call reaches no field of the API.
+    Refused(user_pool::Refusal),
+    /// The call is served, under what the token says about the caller.
+    Admitted {
+        /// What a resolver reads as `$context.identity` for this caller.
+        identity: ::serde_json::Value,
+        /// The groups an admitted Cognito user pool token CLAIMS, which the group guards a
+        /// schema writes are judged against ([`user_pool::refused_fields`]) — `None` for a
+        /// mode whose tokens carry no such claim, which states no group requirement to judge.
+        groups: Option<Vec<String>>,
+    },
+}
+
+/// Decide `presented` — the value a call carries in its own `authorization` field — under the
+/// token modes the API `api_id` is served for, at `now`, for a call that came from `source_ip`.
+///
+/// The modes are read in the order they claim material: the Cognito user pool mode first
+/// ([`user_pool::decided`]), which defers a value it cannot place to whichever other token
+/// mode the API set up, and the OpenID Connect mode for what is left
+/// ([`open_id_connect::decided`]). A mode the API did not set up decides nothing, so an API
+/// that set up neither leaves every value to the plane's own authorization rule
+/// ([`authorized`]).
+pub fn token_decision(
+    context: &PlaneContext,
+    presented: &str,
+    source_ip: Option<String>,
+    now: ::std::time::SystemTime,
+) -> TokenDecision {
+    match user_pool::decided(context, presented, source_ip, now) {
+        user_pool::Decided::Refused(refused) => TokenDecision::Refused(refused),
+        user_pool::Decided::Admitted(admitted) => TokenDecision::Admitted {
+            identity: admitted.identity,
+            groups: Some(admitted.groups),
+        },
+        user_pool::Decided::NotApplicable => {
+            match open_id_connect::decided(context, presented, now) {
+                open_id_connect::Decided::Refused(refused) => TokenDecision::Refused(refused),
+                open_id_connect::Decided::Admitted(admitted) => TokenDecision::Admitted {
+                    identity: admitted.identity,
+                    groups: None,
+                },
+                open_id_connect::Decided::NotApplicable => TokenDecision::NotApplicable,
+            }
+        }
+    }
+}
+
+/// The authorization modes that decide a call by the value its `authorization` field carries,
+/// each named by the module that decides it.
+///
+/// What they share: one field of the request is their input, so a value one of them cannot
+/// place is another's to judge ([`another_token_mode_configured`]), and each judges the CLIENT
+/// a token names against an expression its own configuration states
+/// ([`client_unmatched`]).
+pub const TOKEN_MODES: [&str; 3] = [
+    user_pool::USER_POOL_AUTH_TYPE,
+    open_id_connect::OPEN_ID_CONNECT_AUTH_TYPE,
+    authorizer::LAMBDA_AUTH_TYPE,
+];
+
+/// Whether the API `context` serves set up a token mode BESIDES `besides`.
+///
+/// What it decides: whether a value the mode `besides` cannot place is REFUSED by it or left to
+/// another mode that reads the same field. An API that set up no other token mode has no second
+/// reader for such a value, so it authorizes nobody there; an API that did set one up leaves
+/// the judgement to it. The ONE reading of that question, so no two token modes can differ
+/// about which of them a value is left to.
+pub fn another_token_mode_configured(context: &PlaneContext, besides: &str) -> bool {
+    let store = context.state.lock();
+    store
+        .graphql_apis
+        .get(&context.api_id)
+        .is_some_and(|api| {
+            TOKEN_MODES
+                .iter()
+                .any(|mode| *mode != besides && configures(api, mode))
+        })
+}
+
+/// Why the client `token` names does not satisfy the expression `configured`, which the API's
+/// configuration states in `member`, or `None` when it does — including when the configuration
+/// states none, where no filtering is applied.
+///
+/// The ONE reading of that check, which every token mode of this plane states one member for: a
+/// Cognito user pool configuration's `appIdClientRegex` ("a regular expression for validating
+/// the incoming Amazon Cognito user pool app client ID. If this value isn't set, no filtering is
+/// applied") and an OpenID Connect configuration's `clientId` ("you can specify a regular
+/// expression so that AppSync can validate against multiple client identifiers at a time").
+///
+/// The clients read are the shared ones: an identity token names its client in `aud`, an access
+/// token in `client_id`, and a match under either satisfies the configuration
+/// ([`::service_common::jwt::CompactJws::audiences`]). The expression comes from a stored
+/// configuration rather than from this crate, so it is compiled under the explicit program
+/// budget this crate compiles every caller-supplied pattern under — and one past that budget
+/// REFUSES every token, because a filter this emulator could not evaluate has not admitted
+/// anything: treating it as "no filtering" would be a success reported for a check nobody
+/// performed. `configured_for` names, for this emulator's own log, the configuration the
+/// expression came from.
+pub fn client_unmatched(
+    configured: Option<&str>,
+    token: &::service_common::jwt::CompactJws,
+    member: &str,
+    configured_for: &str,
+) -> Option<String> {
+    let expression = configured
+        .map(str::trim)
+        .filter(|expression| !expression.is_empty())?;
+    let compiled = ::regex::RegexBuilder::new(expression)
+        .size_limit(mapping_template::utilities::MAX_PATTERN_PROGRAM_BYTES)
+        .dfa_size_limit(mapping_template::utilities::MAX_PATTERN_DFA_BYTES)
+        .build();
+    let pattern = match compiled {
+        Ok(pattern) => pattern,
+        Err(_) => {
+            ::tracing::warn!(
+                %configured_for,
+                %member,
+                "this API's client expression is not a regular expression this emulator \
+                 evaluates within its compiled-size budget, so no token satisfies it"
+            );
+            return Some(format!(
+                "this API's {member} is not an expression this emulator evaluates, so the \
+                 presented token's client could not be validated against it"
+            ));
+        }
+    };
+    if token
+        .audiences()
+        .iter()
+        .any(|audience| pattern.is_match(audience))
+    {
+        return None;
+    }
+    Some(format!(
+        "the presented token's client does not match this API's {member}"
+    ))
 }
 
 /// Whether `api` SET UP the authorization type `auth_type`: either "The authentication

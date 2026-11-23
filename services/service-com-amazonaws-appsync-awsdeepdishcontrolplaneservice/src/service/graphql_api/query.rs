@@ -64,7 +64,7 @@ use ::service_com_amazonaws_wafv2_awswaf_20190729::service::edge as waf_edge;
 use ::tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::execution::{self, GraphqlRequest};
-use super::{authorizer, caller, field_auth, field_logs, user_pool, PlaneContext};
+use super::{authorizer, caller, field_auth, field_logs, PlaneContext};
 use crate::service::event_api::{self, PresentedAuth};
 
 /// The response field every answer this endpoint writes carries the request's own id in, as
@@ -449,20 +449,22 @@ async fn served_request(
     let mut identity = signed
         .as_ref()
         .map_or(Json::Null, |caller| caller.identity.clone());
-    // What the API's `AMAZON_COGNITO_USER_POOLS` mode decides about this call, which is taken
-    // BEFORE any field of it resolves: the token the request presents is verified against the
-    // user pool the API configured, and what that token CLAIMS is who the call speaks for
-    // ([`user_pool`]). An API that configured no user pool decides nothing here. The groups an
-    // admitted token claims are kept, because the API's schema may guard its fields by them.
+    // What the API's TOKEN modes decide about this call, which is taken BEFORE any field of it
+    // resolves: the value the request presents in its `authorization` field is judged by the
+    // mode that issued it — verified against the user pool the API configured, or against the
+    // OpenID Connect provider it configured — and what the admitted token CLAIMS is who the
+    // call speaks for ([`super::token_decision`]). An API that set up no token mode decides
+    // nothing here. The groups an admitted user pool token claims are kept, because the API's
+    // schema may guard its fields by them.
     let mut user_pool_groups: Option<Vec<String>> = None;
-    match user_pool::decided(
+    match super::token_decision(
         context,
         presented_material(&parts.headers),
         caller::source_ip(&parts.headers),
         started,
     ) {
-        user_pool::Decided::NotApplicable => {}
-        user_pool::Decided::Refused(refused) => {
+        super::TokenDecision::NotApplicable => {}
+        super::TokenDecision::Refused(refused) => {
             ::tracing::info!(
                 api_id = %context.api_id,
                 reason = %refused.reason,
@@ -479,9 +481,12 @@ async fn served_request(
             )
             .await;
         }
-        user_pool::Decided::Admitted(admitted) => {
-            identity = admitted.identity;
-            user_pool_groups = Some(admitted.groups);
+        super::TokenDecision::Admitted {
+            identity: admitted,
+            groups,
+        } => {
+            identity = admitted;
+            user_pool_groups = groups;
         }
     }
     let Ok(document) = ::serde_json::from_slice::<Json>(body) else {

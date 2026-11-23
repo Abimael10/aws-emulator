@@ -121,7 +121,12 @@ const DATA_SOURCE: &str = "local";
 /// A router with AppSync, CloudWatch and Amazon Cognito user pools mounted over ONE engine:
 /// the pool whose tokens the API accepts is the one this suite created through that service's
 /// own operations.
-fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+///
+/// Shared with the sibling suite that drives an `OPENID_CONNECT` API over tokens of such a pool
+/// ([`crate::graphql_api_open_id_connect_authorization`]), together with the pool, user and
+/// sign-in helpers below, so the tree holds ONE reading of how a provider of this emulator and
+/// a token of it are made.
+pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -172,7 +177,7 @@ async fn cognito(router: &MultiServiceRouter, operation: &str, body: Value) -> V
 
 /// One user pool with one app client that admits the administrative password flow, as
 /// (`UserPoolId`, `ClientId`).
-async fn pool_with_client(router: &MultiServiceRouter, name: &str) -> (String, String) {
+pub(crate) async fn pool_with_client(router: &MultiServiceRouter, name: &str) -> (String, String) {
     let pool = cognito(router, "CreateUserPool", json!({ "PoolName": name })).await;
     let user_pool_id = pool["UserPool"]["Id"]
         .as_str()
@@ -202,7 +207,7 @@ async fn app_client(router: &MultiServiceRouter, user_pool_id: &str, name: &str)
 
 /// Create `username` in `user_pool_id` with a permanent password, and put it in every group
 /// of `groups` — creating each group first, as a pool holds no group it was not asked for.
-async fn user_in_groups(
+pub(crate) async fn user_in_groups(
     router: &MultiServiceRouter,
     user_pool_id: &str,
     username: &str,
@@ -246,7 +251,7 @@ async fn user_in_groups(
 }
 
 /// Sign `username` in and answer its `AuthenticationResult` — the tokens the pool minted.
-async fn sign_in(
+pub(crate) async fn sign_in(
     router: &MultiServiceRouter,
     user_pool_id: &str,
     client_id: &str,
@@ -267,7 +272,7 @@ async fn sign_in(
 }
 
 /// The identity token of a sign-in.
-fn id_token(result: &Value) -> String {
+pub(crate) fn id_token(result: &Value) -> String {
     result["IdToken"]
         .as_str()
         .unwrap_or_else(|| panic!("a sign-in must mint an IdToken, got {result}"))
@@ -283,7 +288,7 @@ fn access_token(result: &Value) -> String {
 }
 
 /// The claim set of a compact JWS, read with the tree's one base64url codec.
-fn claims_of(token: &str) -> Value {
+pub(crate) fn claims_of(token: &str) -> Value {
     let segments: Vec<&str> = token.split('.').collect();
     assert_eq!(
         segments.len(),
@@ -298,7 +303,7 @@ fn claims_of(token: &str) -> Value {
 
 /// `token` with its CLAIM SET rewritten: the same header and the same signature over claims
 /// nobody signed, which is what a holder of a token can do to one it holds.
-fn with_rewritten_claims(token: &str, rewrite: impl Fn(&mut Value)) -> String {
+pub(crate) fn with_rewritten_claims(token: &str, rewrite: impl Fn(&mut Value)) -> String {
     let segments: Vec<&str> = token.split('.').collect();
     let mut claims = claims_of(token);
     rewrite(&mut claims);
@@ -330,7 +335,7 @@ fn with_rewritten_signature(token: &str) -> String {
 /// window has already elapsed ("the duration can range from five minutes to one day"), so the
 /// row that presents one signs it with the pool's own key rather than asserting on a value no
 /// pool would have signed.
-fn pool_signed_token(
+pub(crate) fn pool_signed_token(
     engine: &Arc<engine::InMemoryEngine>,
     user_pool_id: &str,
     claims: &Value,
@@ -348,7 +353,7 @@ fn pool_signed_token(
 }
 
 /// Seconds since the epoch, `ago` before now — what an elapsed `exp` claim states.
-fn seconds_ago(ago: Duration) -> i64 {
+pub(crate) fn seconds_ago(ago: Duration) -> i64 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();

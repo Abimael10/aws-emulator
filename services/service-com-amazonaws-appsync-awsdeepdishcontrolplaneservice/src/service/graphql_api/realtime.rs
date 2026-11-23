@@ -558,13 +558,15 @@ async fn served_message(
             };
             // A token presented for a connection is decided by the mode that issued it, by
             // the same rule the API's GraphQL endpoint applies to a call
-            // ([`super::user_pool`]): a Cognito user pool token has to be one the pool the
-            // API configured signed, inside its own window, and a refusal carries the
-            // sentence that decision states.
+            // ([`super::token_decision`]): a Cognito user pool token has to be one the pool
+            // the API configured signed and an OpenID Connect token one its configured
+            // provider accepts, each inside the window its configuration states, and a
+            // refusal carries the sentence that decision states.
             let refused_token = match token_decision(context, connection_auth) {
-                super::user_pool::Decided::Refused(refused) => Some(refused),
-                super::user_pool::Decided::Admitted(_)
-                | super::user_pool::Decided::NotApplicable => None,
+                super::TokenDecision::Refused(refused) => Some(refused),
+                super::TokenDecision::Admitted { .. } | super::TokenDecision::NotApplicable => {
+                    None
+                }
             };
             if !authorized || refused_token.is_some() {
                 // A connect this endpoint turned away on the client's own account is what
@@ -647,11 +649,10 @@ async fn started(
         .filter(PresentedAuth::is_present)
         .unwrap_or_else(|| connection_auth.clone());
     // A token presented for a subscription is decided by the mode that issued it, by the same
-    // rule the API's GraphQL endpoint applies to a call ([`super::user_pool`]). Taken before
-    // the store is locked, because that decision reads this store and the user-pool
-    // service's.
+    // rule the API's GraphQL endpoint applies to a call ([`super::token_decision`]). Taken
+    // before the store is locked, because that decision reads this store and the issuer's.
     let admitted_groups = match token_decision(context, &auth) {
-        super::user_pool::Decided::Refused(refused) => {
+        super::TokenDecision::Refused(refused) => {
             ::tracing::info!(
                 api_id = %context.api_id,
                 reason = %refused.reason,
@@ -663,8 +664,8 @@ async fn started(
                 refused.message,
             );
         }
-        super::user_pool::Decided::Admitted(admitted) => Some(admitted.groups),
-        super::user_pool::Decided::NotApplicable => None,
+        super::TokenDecision::Admitted { groups, .. } => groups,
+        super::TokenDecision::NotApplicable => None,
     };
     // The subscription field's OWN group guard, for a subscriber the user pool mode admitted:
     // a field the schema guards with `@aws_auth(cognito_groups: …)` is one a caller claiming
@@ -871,14 +872,14 @@ pub(super) fn complete_frame(subscription_id: &str) -> String {
 
 /// What the mode that issued the token `auth` presents decides about this connection or
 /// subscription, by the rule the API's GraphQL endpoint applies to a call
-/// ([`super::user_pool`]).
+/// ([`super::token_decision`]).
 ///
 /// A handshake carries no request fields, so the material travels in the base64url
 /// authorization object this endpoint reads it from ([`PresentedAuth`]); what is decided
 /// about it is the same. No address is reported for it: a real-time client states none in
 /// that object, so nothing of `$context.identity.sourceIp` is invented for one.
-fn token_decision(context: &PlaneContext, auth: &PresentedAuth) -> super::user_pool::Decided {
-    super::user_pool::decided(
+fn token_decision(context: &PlaneContext, auth: &PresentedAuth) -> super::TokenDecision {
+    super::token_decision(
         context,
         auth.authorization.as_deref().unwrap_or_default(),
         None,

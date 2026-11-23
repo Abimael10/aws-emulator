@@ -52,11 +52,11 @@ const UNAUTHORIZED_FIELD: &str = "Not Authorized to access";
 /// `@aws_auth` is NOT among them: it is the group guard an API that set up the user pool mode
 /// ALONE writes ([`super::user_pool`]), and it names groups rather than a mode.
 pub const MODE_DIRECTIVES: [(&str, &str); 5] = [
-    ("aws_api_key", "API_KEY"),
+    ("aws_api_key", API_KEY_MODE),
     ("aws_iam", "AWS_IAM"),
-    ("aws_oidc", "OPENID_CONNECT"),
+    ("aws_oidc", OIDC_MODE),
     ("aws_cognito_user_pools", "AMAZON_COGNITO_USER_POOLS"),
-    ("aws_lambda", "AWS_LAMBDA"),
+    ("aws_lambda", LAMBDA_MODE),
 ];
 
 /// What the call PRESENTED, as the modes of an API read it: the pieces [`resolved_mode`]
@@ -224,5 +224,7 @@ fn named_modes(directives: &[DirectiveUse]) -> Vec<&'static str> {
 
 /// The modes named above that are not spelled out by a module of their own.
 const API_KEY_MODE: &str = "API_KEY";
-const OIDC_MODE: &str = "OPENID_CONNECT";
 const LAMBDA_MODE: &str = "AWS_LAMBDA";
+
+// The OpenID Connect mode, named by the module that decides a call of it.
+use super::open_id_connect::OPEN_ID_CONNECT_AUTH_TYPE as OIDC_MODE;

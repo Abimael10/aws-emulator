@@ -56,11 +56,6 @@ use crate::state::DirectiveUse;
 /// `AuthenticationType`.
 pub const USER_POOL_AUTH_TYPE: &str = "AMAZON_COGNITO_USER_POOLS";
 
-/// The two modes beside this one that decide a call by a value presented in the request's own
-/// `authorization` field. An API that configured one of them is an API where a value this
-/// mode cannot place is left to that mode instead of refused here.
-const OPEN_ID_CONNECT_AUTH_TYPE: &str = "OPENID_CONNECT";
-
 /// The scheme a SigV4-signed request presents its material under, which is the `AWS_IAM`
 /// mode's material and never this one's.
 const SIGV4_SCHEME: &str = "AWS4-HMAC-SHA256";
@@ -119,8 +114,12 @@ pub struct Refusal {
 }
 
 impl Refusal {
-    /// A value this mode could not read as a JSON Web Token.
-    fn unreadable(reason: String) -> Self {
+    /// A value a token mode could not read as a JSON Web Token.
+    ///
+    /// Raised here for every mode that decides a call by a presented token, so the two
+    /// sentences a refused token earns are worded in ONE place ([`super::open_id_connect`]
+    /// states the same two).
+    pub(super) fn unreadable(reason: String) -> Self {
         Self {
             message: UNREADABLE_TOKEN_MESSAGE,
             reason,
@@ -354,14 +353,7 @@ fn configured_pools(context: &PlaneContext) -> Vec<ConfiguredPool> {
 /// A value this mode cannot place is that mode's input on such an API, and nobody's on an API
 /// that configured neither.
 fn defers_to_another_token_mode(context: &PlaneContext) -> bool {
-    let store = context.state.lock();
-    store
-        .graphql_apis
-        .get(&context.api_id)
-        .is_some_and(|api| {
-            super::configures(api, OPEN_ID_CONNECT_AUTH_TYPE)
-                || super::configures(api, super::authorizer::LAMBDA_AUTH_TYPE)
-        })
+    super::another_token_mode_configured(context, USER_POOL_AUTH_TYPE)
 }
 
 /// The configured pool `issuer` names and the key set it publishes, or `None` when no pool
@@ -391,50 +383,20 @@ fn issuing_pool(
 /// `appIdClientRegex`, or `None` when it does — including when the configuration declares
 /// none, which is where "no filtering is applied".
 ///
-/// The audiences read are the shared ones: an identity token names its app client in `aud`,
-/// an access token of the same pool in `client_id`, and a match under either satisfies the
-/// expression. The expression comes from a stored configuration rather than from this crate,
-/// so it is compiled under the explicit program budget this crate compiles every
-/// caller-supplied pattern under — and one past that budget REFUSES every token, because a
-/// filter this emulator could not evaluate has not admitted anything: treating it as "no
-/// filtering" would be a success reported for a check nobody performed.
+/// The plane's one reading of that check ([`super::client_unmatched`]), which the OpenID
+/// Connect mode judges its own `clientId` by: what differs between the two modes is only the
+/// member the expression is stated in.
 fn audience_unmatched(configured: &ConfiguredPool, token: &jwt::CompactJws) -> Option<String> {
-    let expression = configured
-        .app_id_client_regex
-        .as_deref()
-        .map(str::trim)
-        .filter(|expression| !expression.is_empty())?;
-    let compiled = ::regex::RegexBuilder::new(expression)
-        .size_limit(super::mapping_template::utilities::MAX_PATTERN_PROGRAM_BYTES)
-        .dfa_size_limit(super::mapping_template::utilities::MAX_PATTERN_DFA_BYTES)
-        .build();
-    let pattern = match compiled {
-        Ok(pattern) => pattern,
-        Err(_) => {
-            ::tracing::warn!(
-                user_pool_id = %configured.user_pool_id,
-                "this API's appIdClientRegex is not a regular expression this emulator \
-                 evaluates within its compiled-size budget, so no token satisfies it"
-            );
-            return Some(
-                "this API's appIdClientRegex is not an expression this emulator evaluates, \
-                 so the presented token's app client could not be validated against it"
-                    .to_string(),
-            );
-        }
-    };
-    if token
-        .audiences()
-        .iter()
-        .any(|audience| pattern.is_match(audience))
-    {
-        return None;
-    }
-    Some(
-        "the presented token's app client does not match this API's appIdClientRegex"
-            .to_string(),
+    super::client_unmatched(
+        configured.app_id_client_regex.as_deref(),
+        token,
+        APP_ID_CLIENT_REGEX_MEMBER,
+        &configured.user_pool_id,
     )
 }
+
+/// The member this mode's configuration states that expression in.
+const APP_ID_CLIENT_REGEX_MEMBER: &str = "appIdClientRegex";
 
 /// The groups `token` claims, in the order it claims them.
 fn claimed_groups(token: &jwt::CompactJws) -> Vec<String> {
