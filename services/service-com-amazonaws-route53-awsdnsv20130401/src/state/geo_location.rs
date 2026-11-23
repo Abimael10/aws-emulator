@@ -362,10 +362,21 @@ pub const COUNTRIES: &[(&str, &str)] = &[
 /// to Appendix B alone. The other country the service places traffic by
 /// subdivision in is the one `GeoLocation$CountryCode` singles out beside the
 /// standard ("Route 53 also supports the country code UA for Ukraine"), whose
-/// rows carry that country's own subdivision codes and names — the numeric codes
-/// ISO 3166-2 assigns its regions, which is why `GeoLocationSubdivisionCode`
-/// admits up to three characters rather than exactly two, beside that same
-/// standard's romanised names for them.
+/// rows carry that country's own subdivision codes and names — mostly the numeric
+/// codes ISO 3166-2 assigns its regions, which is why
+/// `GeoLocationSubdivisionCode` admits up to three characters rather than exactly
+/// two, beside that same standard's romanised names for them.
+///
+/// What this table is, though, is the SERVICE's published catalog and not the
+/// standard it is mostly drawn from: where the service publishes a territory
+/// under a code and a name of its own, THAT is the row carried here, and the
+/// standard's code for the same territory is carried by no row at all — the
+/// catalog holds a location only where the service places traffic in it, so a
+/// code the service publishes no location for is one `GetGeoLocation` refuses and
+/// one no geolocation record set can match. The two rows that depart from the
+/// standard's numbering are the peninsula territories the service publishes as
+/// `11`/`Crimea` and `20`/`Sevastopol`, which that standard instead numbers `43`
+/// and `40`.
 ///
 /// The table is keyed by country rather than hard-wired to one, so a country the
 /// service starts placing traffic by subdivision in is rows here and no change
@@ -374,17 +385,17 @@ pub const SUBDIVISIONS: &[(&str, &str, &str)] = &[
     ("UA", "05", "Vinnytska oblast"),
     ("UA", "07", "Volynska oblast"),
     ("UA", "09", "Luhanska oblast"),
+    ("UA", "11", "Crimea"),
     ("UA", "12", "Dnipropetrovska oblast"),
     ("UA", "14", "Donetska oblast"),
     ("UA", "18", "Zhytomyrska oblast"),
+    ("UA", "20", "Sevastopol"),
     ("UA", "21", "Zakarpatska oblast"),
     ("UA", "23", "Zaporizka oblast"),
     ("UA", "26", "Ivano-Frankivska oblast"),
     ("UA", "30", "Kyiv"),
     ("UA", "32", "Kyivska oblast"),
     ("UA", "35", "Kirovohradska oblast"),
-    ("UA", "40", "Sevastopol"),
-    ("UA", "43", "Avtonomna Respublika Krym"),
     ("UA", "46", "Lvivska oblast"),
     ("UA", "48", "Mykolaivska oblast"),
     ("UA", "51", "Odeska oblast"),

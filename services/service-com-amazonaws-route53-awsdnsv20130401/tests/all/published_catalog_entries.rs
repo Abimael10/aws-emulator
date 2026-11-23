@@ -23,7 +23,9 @@
 //!    traffic in (which `GetGeoLocation` therefore refuses), and its subdivisions
 //!    are not one country's: every country the service places traffic by
 //!    subdivision in has its own subdivisions listed immediately after it, each
-//!    resolvable on its own.
+//!    resolvable on its own, under the code and the name the SERVICE publishes
+//!    for it and not the one a standard it is mostly drawn from assigns, with no
+//!    row for a code the service publishes no location for.
 //!
 //! Every test drives the service through the real router, using the same harness
 //! the hosted-zone suites use, so what is asserted is the HTTP/restXml behaviour a
@@ -105,17 +107,20 @@ const UNPLACED_COUNTRY_CODES: &[&str] = &["BV", "CX", "EH", "HM"];
 /// How many subdivisions the catalog holds for each country that has any, as
 /// `(country code, count)`.
 ///
-/// Source: ISO 3166-2, which assigns 51 codes to the states and the federal
-/// district of the United States (the two-letter abbreviations the United States
-/// Postal Service publishes, which `GeoLocationDetails$SubdivisionCode` points
-/// at) and 27 to the regions of Ukraine — the other country
-/// `GeoLocation$CountryCode` singles out ("Route 53 also supports the country
-/// code UA for Ukraine").
+/// Source: the service's own geolocation catalog, which carries 51 rows for the
+/// states and the federal district of the United States (the two-letter
+/// abbreviations the United States Postal Service publishes, which
+/// `GeoLocationDetails$SubdivisionCode` points at) and 27 for the regions of
+/// Ukraine — the other country `GeoLocation$CountryCode` singles out ("Route 53
+/// also supports the country code UA for Ukraine").
 const SUBDIVISION_COUNTS: &[(&str, usize)] = &[("UA", 27), ("US", 51)];
 
 /// Subdivisions the catalog has to hold, as `(country code, subdivision code)`.
 ///
-/// Source: ISO 3166-2's codes for the two countries above. The rows span both
+/// Source: the subdivision codes the service's own catalog publishes for the two
+/// countries above, which `GeoLocationDetails$SubdivisionCode` sends a client to
+/// this listing for ("For a list of all supported subdivision codes, use the
+/// ListGeoLocations API") rather than to one standard. The rows span both
 /// countries and both kinds of row Ukraine's set has — a region and a city with
 /// special status — and none of them is a subdivision any report cited.
 const PUBLISHED_SUBDIVISIONS: &[(&str, &str)] = &[
@@ -124,9 +129,39 @@ const PUBLISHED_SUBDIVISIONS: &[(&str, &str)] = &[
     ("US", "WY"),
     ("UA", "05"),
     ("UA", "30"),
-    ("UA", "43"),
     ("UA", "77"),
 ];
+
+/// Subdivisions the catalog publishes, as `(country code, subdivision code,
+/// published name)`.
+///
+/// Source: the same catalog, read for the NAME each code is published under. The
+/// rows span both countries that have subdivisions and the three kinds of row the
+/// set holds — a state abbreviation, a numeric region code, and a territory the
+/// service publishes under a code of its own where ISO 3166-2 numbers the same
+/// territory differently (`11` and `20` here, against that standard's `43` and
+/// `40`) — and most of them are codes no report cited.
+const PUBLISHED_SUBDIVISION_NAMES: &[(&str, &str, &str)] = &[
+    ("US", "AK", "Alaska"),
+    ("US", "DC", "District of Columbia"),
+    ("US", "HI", "Hawaii"),
+    ("UA", "09", "Luhanska oblast"),
+    ("UA", "11", "Crimea"),
+    ("UA", "20", "Sevastopol"),
+    ("UA", "30", "Kyiv"),
+    ("UA", "32", "Kyivska oblast"),
+    ("UA", "35", "Kirovohradska oblast"),
+];
+
+/// Codes the catalog publishes NO subdivision for, as `(country code,
+/// subdivision code)`.
+///
+/// Source: the same catalog, read for what it leaves out. The rows span the two
+/// ways such a code arises: a code ISO 3166-2 assigns a territory the service
+/// publishes under a different code of its own (`40` and `43`), and a United
+/// States Postal Service possession abbreviation the service publishes as a
+/// country of its own rather than as a subdivision of another (`PR`).
+const UNPUBLISHED_SUBDIVISIONS: &[(&str, &str)] = &[("UA", "40"), ("UA", "43"), ("US", "PR")];
 
 /// Every location the catalog reports, read through one `ListGeoLocations` call.
 async fn catalog(router: &MultiServiceRouter) -> Vec<crate::geo_locations::Entry> {
@@ -406,5 +441,148 @@ async fn every_published_subdivision_is_listed_and_resolves_on_its_own() {
             "case {case:?}: the resolver carries the listing's country name, got {:?}",
             resolved.first("CountryName")
         );
+    }
+}
+
+#[tokio::test]
+async fn every_published_subdivision_carries_the_code_and_name_the_service_publishes() {
+    // One row per published subdivision, across both countries and all three
+    // kinds of row: the listing carries that code exactly once, under the name
+    // the service publishes for it, and the resolver answers about it with the
+    // same name.
+    let router = router();
+    let listed = catalog(&router).await;
+
+    for (country_code, subdivision_code, published_name) in PUBLISHED_SUBDIVISION_NAMES {
+        let case = format!("{country_code}/{subdivision_code}");
+        let held: Vec<&crate::geo_locations::Entry> = listed
+            .iter()
+            .filter(|entry| {
+                entry.country_code.as_deref() == Some(*country_code)
+                    && entry.subdivision_code.as_deref() == Some(*subdivision_code)
+            })
+            .collect();
+        assert_eq!(
+            held.len(),
+            1,
+            "case {case:?}: the catalog publishes this subdivision exactly once, got {held:?}"
+        );
+        let listed_name = held[0].subdivision_name.as_deref();
+        assert_eq!(
+            listed_name,
+            Some(*published_name),
+            "case {case:?}: expected the published name {published_name:?}, got {listed_name:?}"
+        );
+
+        let resolved = get(&router, &location_query(country_code, subdivision_code)).await;
+        assert_eq!(
+            resolved.status, 200,
+            "case {case:?}: expected 200 from GetGeoLocation, got {} with body {}",
+            resolved.status, resolved.body
+        );
+        let resolved_name = resolved.first("SubdivisionName");
+        assert_eq!(
+            resolved_name,
+            Some(*published_name),
+            "case {case:?}: the resolver carries the published name, got {resolved_name:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_subdivision_code_the_service_publishes_no_location_for_is_neither_listed_nor_resolved() {
+    // One row per absent code: no listed location carries it, and the resolver
+    // refuses it as an unsupported location instead of answering with an entry.
+    let router = router();
+    let listed = catalog(&router).await;
+
+    for (country_code, subdivision_code) in UNPUBLISHED_SUBDIVISIONS {
+        let case = format!("{country_code}/{subdivision_code}");
+        let held: Vec<&crate::geo_locations::Entry> = listed
+            .iter()
+            .filter(|entry| {
+                entry.country_code.as_deref() == Some(*country_code)
+                    && entry.subdivision_code.as_deref() == Some(*subdivision_code)
+            })
+            .collect();
+        assert!(
+            held.is_empty(),
+            "case {case:?}: the catalog carries no subdivision for a code the service publishes \
+             none for, got {held:?}"
+        );
+
+        let refused = get(&router, &location_query(country_code, subdivision_code)).await;
+        assert_eq!(
+            refused.status, 404,
+            "case {case:?}: expected 404 from GetGeoLocation, got {} with body {}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_code(),
+            "NoSuchGeoLocation",
+            "case {case:?}: expected the NoSuchGeoLocation code, got body {}",
+            refused.body
+        );
+        let expected_message = format!(
+            "No geo location for location: [country = {country_code}, subdivision = \
+             {subdivision_code}]"
+        );
+        let message = refused.first("Error/Message");
+        assert_eq!(
+            message,
+            Some(expected_message.as_str()),
+            "case {case:?}: expected the message {expected_message:?}, got {message:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn no_country_publishes_one_subdivision_name_under_two_codes() {
+    // Read off the whole listing rather than off the tables above: a catalog that
+    // carried a territory under the service's own code AND under another table's
+    // code would report one name twice inside one country, which is how a merged
+    // or doubly-sourced table shows up. One case per country that has
+    // subdivisions.
+    let router = router();
+    let listed = catalog(&router).await;
+
+    let mut by_country: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    for entry in &listed {
+        let (Some(country_code), Some(code), Some(name)) = (
+            entry.country_code.clone(),
+            entry.subdivision_code.clone(),
+            entry.subdivision_name.clone(),
+        ) else {
+            continue;
+        };
+        by_country
+            .entry(country_code)
+            .or_default()
+            .push((code, name));
+    }
+    assert!(
+        !by_country.is_empty(),
+        "case {:?}: the catalog publishes subdivisions for at least one country, got none",
+        "the subdivisions of the whole catalog"
+    );
+
+    for (country_code, rows) in &by_country {
+        for (code, name) in rows {
+            let twice: Vec<&(String, String)> = rows
+                .iter()
+                .filter(|(other_code, other_name)| other_name == name && other_code != code)
+                .collect();
+            assert!(
+                twice.is_empty(),
+                "case {country_code:?}: {name:?} is published under one code only, got it under \
+                 {code:?} and {twice:?}"
+            );
+            let same_code = rows.iter().filter(|(other, _)| other == code).count();
+            assert_eq!(
+                same_code, 1,
+                "case {country_code:?}: the code {code:?} is published once, got it {same_code} \
+                 times"
+            );
+        }
     }
 }
