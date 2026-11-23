@@ -119,6 +119,12 @@ service-com-amazonaws-s3tables-s3tablebuckets = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# `automod`: the integration-test target's root (`tests/all/main.rs`) declares one module per
+# `tests/all/<name>.rs`, so a new suite is a new file and nothing lists it.
+automod = { workspace = true }
+# The RFC 3986 encoder a suite puts a continuation token on a query parameter with, the same
+# crate the service's own listings percent-encode with above.
+percent-encoding = "2"
 # The SigV4 key schedule a BROWSER-FORM upload's policy is signed under: the form-upload
 # suite signs its policy with the SDK signer's own derivation rather than carrying a second
 # copy of it.

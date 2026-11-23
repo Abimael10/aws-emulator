@@ -332,7 +332,10 @@ async fn a_paginating_client_sees_every_key_with_the_optional_members_set() {
         let query = if token.is_empty() {
             "&encoding-type=url&fetch-owner=true&max-keys=1".to_string()
         } else {
-            format!("&encoding-type=url&fetch-owner=true&max-keys=1&continuation-token={token}")
+            format!(
+                "&encoding-type=url&fetch-owner=true&max-keys=1&continuation-token={}",
+                super::continuation_token_alphabet::handed_back_in_query(&token)
+            )
         };
         let answer = list_objects_v2(&router, bucket_name, &query).await;
         assert_eq!(

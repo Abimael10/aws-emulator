@@ -601,7 +601,10 @@ async fn the_continuation_token_is_a_name_cursor_into_the_listing_as_it_stands()
         for page in 0..expected.len() + 2 {
             let query = match &token {
                 None => "&max-buckets=1".to_string(),
-                Some(token) => format!("&max-buckets=1&continuation-token={token}"),
+                Some(token) => format!(
+                    "&max-buckets=1&continuation-token={}",
+                    super::continuation_token_alphabet::handed_back_in_query(token)
+                ),
             };
             let answer = list_buckets(&router, &query).await;
             assert_eq!(
@@ -630,7 +633,10 @@ async fn the_continuation_token_is_a_name_cursor_into_the_listing_as_it_stands()
             if let Some(token) = &token {
                 let repeated = list_buckets(
                     &router,
-                    &format!("&max-buckets=1&continuation-token={token}"),
+                    &format!(
+                        "&max-buckets=1&continuation-token={}",
+                        super::continuation_token_alphabet::handed_back_in_query(token)
+                    ),
                 )
                 .await;
                 assert_eq!(
@@ -695,7 +701,10 @@ async fn a_token_is_carried_exactly_while_buckets_remain_whatever_the_page_holds
         for page in 0..pages {
             let query = match &token {
                 None => format!("&max-buckets={page_size}"),
-                Some(token) => format!("&max-buckets={page_size}&continuation-token={token}"),
+                Some(token) => format!(
+                    "&max-buckets={page_size}&continuation-token={}",
+                    super::continuation_token_alphabet::handed_back_in_query(token)
+                ),
             };
             let document = text(&list_buckets(&router, &query).await);
             walked += document.matches("<Name>").count();

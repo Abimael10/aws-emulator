@@ -543,7 +543,10 @@ async fn a_listing_pages_through_the_annotations_in_name_order() {
                 .map(|size| format!("&max-annotation-results={size}"))
                 .unwrap_or_default();
             if let Some(token) = &token {
-                query.push_str(&format!("&continuation-token={}", url_encoded_key(token)));
+                query.push_str(&format!(
+                    "&continuation-token={}",
+                    super::continuation_token_alphabet::handed_back_in_query(token)
+                ));
             }
             let listed = list_annotations(
                 &router,

@@ -396,6 +396,9 @@ async fn a_start_token_with_a_delimiter_resumes_after_a_whole_group() {
 
 /// `GET /<bucket>?<subresource>&continuation-token=<token>` for one of the four listings of
 /// a bucket's id-addressed configurations.
+///
+/// The token travels as a query value, percent-encoded as one
+/// ([`crate::continuation_token_alphabet::handed_back_in_query`]).
 async fn list_configurations(
     router: &MultiServiceRouter,
     name: &str,
@@ -405,7 +408,10 @@ async fn list_configurations(
     send(
         router,
         "GET",
-        &format!("/{name}?{subresource}&continuation-token={token}"),
+        &format!(
+            "/{name}?{subresource}&continuation-token={}",
+            super::continuation_token_alphabet::handed_back_in_query(token)
+        ),
         &[],
         "",
     )
@@ -418,7 +424,7 @@ async fn list_configurations(
 ///
 /// The rows differ along the SUBRESOURCE the token is handed to (every one of the four
 /// listings that pages a bucket's id-addressed configurations) and along the shape of the
-/// forged value (text that is not a token, a rendering of a stored id, and base64url that
+/// forged value (text that is not a token, a rendering of a stored id, and base64 that
 /// carries no cursor).
 #[tokio::test]
 async fn a_continuation_token_is_a_cursor_only_into_the_listing_that_issued_it() {
@@ -431,7 +437,7 @@ async fn a_continuation_token_is_a_cursor_only_into_the_listing_that_issued_it()
     for (case, token) in [
         ("text that is not a token", "not-a-token"),
         ("a rendering of a stored id", "cfg-0"),
-        ("base64url carrying no cursor", "a2VwdA"),
+        ("base64 carrying no cursor", "a2VwdA=="),
     ] {
         for subresource in ["analytics", "intelligent-tiering", "inventory", "metrics"] {
             let refused = list_configurations(&router, name, subresource, token).await;

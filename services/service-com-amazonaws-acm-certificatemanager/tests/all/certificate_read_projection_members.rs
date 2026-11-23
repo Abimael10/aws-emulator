@@ -166,10 +166,11 @@ fn reported_mailboxes(carrier: &Value) -> Option<Vec<String>> {
     Some(mailboxes)
 }
 
-/// RULE 1: for every DNS-validated name, the summary's challenge is the DNS arm carrying
-/// that name's CNAME, the very record the detail of the same certificate reports.
+/// RULE 1: for every DNS-validated name, the summary's challenge is the DNS arm, which names
+/// the kind of evidence the method asks for and carries no record — the CNAME to publish is the
+/// one the detail of the same certificate reports for that name.
 #[tokio::test]
-async fn the_dns_challenge_carries_the_cname_the_detail_reports() {
+async fn the_dns_challenge_names_the_method_and_the_detail_carries_the_cname() {
     // Rows differ along the number of names covered (one, an apex with a `www.` name,
     // three) and the form of each name (apex, subdomain, wildcard).
     let cases: &[(&str, Value, &[&str])] = &[
@@ -211,25 +212,17 @@ async fn the_dns_challenge_carries_the_cname_the_detail_reports() {
             let row = format!("{case}/{name}");
             let configuration = configuration(&router, &row, &arn, name).await;
             let challenge = &configuration["ValidationChallenge"]["DnsValidationChallenge"];
-            assert!(
-                challenge.is_object(),
-                "case {row}: a DNS-validated name carries the DNS challenge arm, got {configuration}"
-            );
             assert_eq!(
-                challenge.as_object().map(|arm| arm.len()),
-                Some(1),
-                "case {row}: the DNS challenge carries exactly its ResourceRecord, got {challenge}"
+                challenge,
+                &json!({}),
+                "case {row}: a DNS-validated name carries the DNS challenge arm and nothing \
+                 inside it, got {configuration}"
             );
 
-            // The record is a real CNAME under the name being proven, and it is the same
-            // record the certificate's detail reports for that name.
+            // The record is a real CNAME under the name being proven, reported by the
+            // certificate's own detail.
             let entry = described(&row, &detail, name);
             let record = &entry["ResourceRecord"];
-            assert_eq!(
-                &challenge["ResourceRecord"],
-                record,
-                "case {row}: both readers of one stored record report one CNAME, got {challenge}"
-            );
             assert_eq!(
                 record["Type"].as_str(),
                 Some("CNAME"),

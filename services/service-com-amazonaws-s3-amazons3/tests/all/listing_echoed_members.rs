@@ -44,7 +44,7 @@
 //! the caller hands back unread — "NextContinuationToken is obfuscated and is not a real
 //! key" (`ListObjectsV2Output$NextContinuationToken`), "ContinuationToken is obfuscated and
 //! is not a real bucket" (`ListBucketsOutput$ContinuationToken`). So it is base64 text in
-//! the URL-safe alphabet, it is no rendering of the position it resumes at in any spelling a
+//! the standard alphabet, it is no rendering of the position it resumes at in any spelling a
 //! caller could compute, and only a value this service minted for THIS LISTING names a
 //! page at all; while being a usable cursor, it resumes the listing exactly where the page
 //! stopped and is the same value for two identical reads of one unchanged listing. What the
@@ -64,6 +64,7 @@
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::bucket_lifecycle::{router, send, send_bytes, Answer};
+use super::continuation_token_alphabet::handed_back_in_query;
 use super::list_buckets::list_buckets;
 use super::object_and_tagging_roundtrip::{bucket, text};
 use super::object_annotations::put_annotation;
@@ -618,7 +619,10 @@ async fn a_continuation_token_no_listing_issued_is_refused_by_naming_the_paramet
     let resumed = send(
         &router,
         "GET",
-        &format!("/{bucket_name}?list-type=2&continuation-token={issued}"),
+        &format!(
+            "/{bucket_name}?list-type=2&continuation-token={}",
+            handed_back_in_query(&issued)
+        ),
         &[],
         "",
     )
@@ -638,13 +642,13 @@ async fn a_continuation_token_no_listing_issued_is_refused_by_naming_the_paramet
     );
 }
 
-/// Whether `token` is written in the URL-safe base64 alphabet (RFC 4648 §5), which is what
-/// lets a client hand the value it was given back on a query parameter unchanged.
-fn is_url_safe_base64(token: &str) -> bool {
+/// Whether `token` is written in the base64 alphabet (RFC 4648 §4), which is the alphabet an
+/// AWS continuation token is spelled in.
+fn is_base64(token: &str) -> bool {
     !token.is_empty()
         && token
             .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '+' | '/' | '='))
 }
 
 /// Every spelling of `position` a caller could compute for itself, none of which a
@@ -685,12 +689,12 @@ fn flip_last(token: &str) -> String {
     characters.into_iter().collect()
 }
 
-/// Assert that `token` is an opaque cursor over `position`: base64 text in the URL-safe
-/// alphabet, and no rendering of that position a caller could compute for itself.
+/// Assert that `token` is an opaque cursor over `position`: base64 text, and no rendering of
+/// that position a caller could compute for itself.
 fn assert_opaque(case: &str, token: &str, position: &str) {
     assert!(
-        is_url_safe_base64(token),
-        "case {case:?}: a continuation token is URL-safe base64 text, got {token:?}"
+        is_base64(token),
+        "case {case:?}: a continuation token is base64 text, got {token:?}"
     );
     for (spelling, computed) in computable_spellings(position) {
         assert_ne!(
@@ -850,7 +854,10 @@ async fn the_object_listing_hands_back_an_opaque_token_whatever_key_it_resumes_a
         let second = list_objects_v2(
             &router,
             &bucket_name,
-            &format!("&max-keys=1&continuation-token={token}"),
+            &format!(
+                "&max-keys=1&continuation-token={}",
+                handed_back_in_query(&token)
+            ),
         )
         .await;
         assert_eq!(
@@ -900,7 +907,10 @@ async fn the_object_listing_hands_back_an_opaque_token_whatever_key_it_resumes_a
             let refused = list_objects_v2(
                 &router,
                 &bucket_name,
-                &format!("&max-keys=1&continuation-token={value}"),
+                &format!(
+                    "&max-keys=1&continuation-token={}",
+                    handed_back_in_query(&value)
+                ),
             )
             .await;
             assert_token_refused(&format!("{case}/{why}"), &refused, true);
@@ -916,7 +926,10 @@ async fn the_object_listing_hands_back_an_opaque_token_whatever_key_it_resumes_a
         let foreign = list_objects_v2(
             &router,
             &elsewhere,
-            &format!("&max-keys=1&continuation-token={token}"),
+            &format!(
+                "&max-keys=1&continuation-token={}",
+                handed_back_in_query(&token)
+            ),
         )
         .await;
         assert_eq!(
@@ -984,7 +997,8 @@ async fn the_bucket_listing_hands_back_an_opaque_token_that_resumes_the_account(
         let query = match token.is_empty() {
             true => format!("&max-buckets=1&prefix={BUCKET_PREFIX}"),
             false => format!(
-                "&max-buckets=1&prefix={BUCKET_PREFIX}&continuation-token={token}"
+                "&max-buckets=1&prefix={BUCKET_PREFIX}&continuation-token={}",
+                handed_back_in_query(&token)
             ),
         };
         let answer = list_buckets(&router, &query).await;
@@ -1040,7 +1054,10 @@ async fn the_bucket_listing_hands_back_an_opaque_token_that_resumes_the_account(
     for (why, value) in forged {
         let refused = list_buckets(
             &router,
-            &format!("&max-buckets=1&prefix={BUCKET_PREFIX}&continuation-token={value}"),
+            &format!(
+                "&max-buckets=1&prefix={BUCKET_PREFIX}&continuation-token={}",
+                handed_back_in_query(&value)
+            ),
         )
         .await;
         assert_token_refused(&format!("ListBuckets/{why}"), &refused, false);
@@ -1053,7 +1070,10 @@ async fn the_bucket_listing_hands_back_an_opaque_token_that_resumes_the_account(
     let crossed = list_objects_v2(
         &router,
         &objects,
-        &format!("&max-keys=1&continuation-token={bucket_token}"),
+        &format!(
+            "&max-keys=1&continuation-token={}",
+            handed_back_in_query(&bucket_token)
+        ),
     )
     .await;
     assert_token_refused(
@@ -1119,7 +1139,10 @@ async fn the_annotation_listing_token_is_a_cursor_only_into_the_object_it_was_is
         &router,
         bucket_name,
         keys[0],
-        &format!("&max-annotation-results=1&continuation-token={token}"),
+        &format!(
+            "&max-annotation-results=1&continuation-token={}",
+            handed_back_in_query(&token)
+        ),
     )
     .await;
     assert_eq!(
@@ -1135,7 +1158,10 @@ async fn the_annotation_listing_token_is_a_cursor_only_into_the_object_it_was_is
         &router,
         bucket_name,
         keys[1],
-        &format!("&max-annotation-results=1&continuation-token={token}"),
+        &format!(
+            "&max-annotation-results=1&continuation-token={}",
+            handed_back_in_query(&token)
+        ),
     )
     .await;
     assert_token_refused(
@@ -1159,7 +1185,10 @@ async fn the_annotation_listing_token_is_a_cursor_only_into_the_object_it_was_is
             &router,
             bucket_name,
             keys[0],
-            &format!("&max-annotation-results=1&continuation-token={value}"),
+            &format!(
+                "&max-annotation-results=1&continuation-token={}",
+                handed_back_in_query(&value)
+            ),
         )
         .await;
         assert_token_refused(&format!("ListObjectAnnotations/{why}"), &refused, false);
@@ -1238,8 +1267,12 @@ async fn an_object_listing_token_names_a_position_and_resumes_whichever_bucket_i
         let name = format!("token-position-addressed-{index}");
         bucket(&router, &name).await;
         store_keys(&router, &name, row.keys).await;
-        let resumed =
-            list_objects_v2(&router, &name, &format!("&continuation-token={token}")).await;
+        let resumed = list_objects_v2(
+            &router,
+            &name,
+            &format!("&continuation-token={}", handed_back_in_query(&token)),
+        )
+        .await;
         assert_eq!(
             resumed.status,
             200,
@@ -1293,7 +1326,7 @@ async fn an_object_listing_token_names_a_position_and_resumes_whichever_bucket_i
             let refused = list_objects_v2(
                 &router,
                 addressed,
-                &format!("&continuation-token={value}"),
+                &format!("&continuation-token={}", handed_back_in_query(&value)),
             )
             .await;
             assert_token_refused(&format!("{addressed}/{why}"), &refused, true);

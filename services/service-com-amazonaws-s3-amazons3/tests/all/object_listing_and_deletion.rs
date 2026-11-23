@@ -275,7 +275,10 @@ async fn max_keys_bounds_a_page_and_the_continuation_token_resumes_it() {
         loop {
             let query = match &token {
                 None => format!("&max-keys={page_size}"),
-                Some(token) => format!("&max-keys={page_size}&continuation-token={token}"),
+                Some(token) => format!(
+                    "&max-keys={page_size}&continuation-token={}",
+                    super::continuation_token_alphabet::handed_back_in_query(token)
+                ),
             };
             let answer = list_objects_v2(&router, bucket_name, &query).await;
             assert_eq!(
@@ -390,7 +393,9 @@ async fn max_keys_bounds_a_page_and_the_continuation_token_resumes_it() {
             folded_bucket,
             &format!(
                 "&delimiter=/&continuation-token={}",
-                first.field("NextContinuationToken")
+                super::continuation_token_alphabet::handed_back_in_query(
+                    &first.field("NextContinuationToken")
+                )
             ),
         )
         .await,

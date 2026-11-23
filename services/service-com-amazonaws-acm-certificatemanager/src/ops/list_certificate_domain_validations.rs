@@ -10,14 +10,13 @@
 //! the certificate it names — `RequestCertificate` wrote those records, and this
 //! operation reads them.
 //!
-//! The challenge CARRIES the evidence the requested method asks for, read off that same
-//! stored record: the DNS arm carries this domain's minted CNAME — the operation's own
-//! doc names retrieving "the CNAME records required for DNS validation" as what its
-//! results are for — and it is the very record
-//! `CertificateDetail$DomainValidationOptions[*].ResourceRecord` projects, so the two
-//! readers of one store cannot disagree. The email arm carries the addresses ACM has
-//! mailed and names the covered name this summary is about, while the mail SUFFIX ACM
-//! writes to for that name stays the certificate detail's `[*].ValidationDomain`.
+//! The challenge names the KIND of evidence the requested method asks for, read off that
+//! same stored record: the DNS arm says the domain is proved by publishing a CNAME, and
+//! the record to publish is the certificate's own to report, on
+//! `CertificateDetail$DomainValidationOptions[*].ResourceRecord`. The email arm carries
+//! the addresses ACM has mailed and names the covered name this summary is about, while
+//! the mail SUFFIX ACM writes to for that name stays the certificate detail's
+//! `[*].ValidationDomain`.
 //!
 //! The summaries are reported in DOMAIN-NAME order, the total order this paginated read
 //! cuts and resumes its pages in.
@@ -367,20 +366,19 @@ fn requested_configuration(
 /// so an HTTP-validated domain carries no challenge here rather than one of the two
 /// shapes that would describe evidence it does not use.
 ///
-/// Each arm carries the evidence its own method asks for, as this domain's stored record
-/// holds it — never a value synthesised here:
+/// Which arm is set is what this reports — the method a domain stands under, said in the
+/// shape of the challenge that method asks for:
 ///
 /// * the email arm names the addresses ACM has used — the empty list until a dispatch
 ///   has used one — and `ValidationDomain` is the name this summary is about: the
 ///   covered domain name as the request wrote it, its wildcard label included. The mail
 ///   SUFFIX ACM writes to for that name is the certificate's own record to report,
 ///   on `CertificateDetail$DomainValidationOptions[*].ValidationDomain`;
-/// * the DNS arm carries `ResourceRecord` — the CNAME this domain's validation minted,
-///   `{Name, Type: CNAME, Value}` — because retrieving "the CNAME records required for
-///   DNS validation" is what this operation's own doc says its results are for, and a
-///   client that publishes the record this challenge hands it publishes exactly the one
-///   `CertificateDetail$DomainValidationOptions[*].ResourceRecord` reports for the same
-///   name.
+/// * the DNS arm carries no `ResourceRecord`: the CNAME a client publishes for a
+///   DNS-validated name is reported where the certificate's detail reports it,
+///   `CertificateDetail$DomainValidationOptions[*].ResourceRecord`, and this summary says
+///   only that the domain stands under the method that asks for one, which is what the
+///   recorded summaries of a DNS-validated certificate carry.
 fn validation_challenge(
     record: &crate::state::DomainValidationRecord,
 ) -> Option<ValidationChallenge> {
@@ -391,11 +389,11 @@ fn validation_challenge(
                 validation_domain: Some(record.domain_name.clone()),
             }),
         ),
-        // The DNS challenge this domain stands under, carrying the CNAME the stored
-        // validation minted for it — the one record `DescribeCertificate` reports too.
+        // The DNS challenge this domain stands under: the kind of evidence the method
+        // asks for, with the record to publish left to the certificate's own detail.
         crate::state::VALIDATION_METHOD_DNS => Some(
             ValidationChallenge::DnsValidationChallenge(DnsValidationChallenge {
-                resource_record: record.resource_record.clone(),
+                resource_record: None,
             }),
         ),
         // `HTTP`: the union models no member for it, so there is no challenge to

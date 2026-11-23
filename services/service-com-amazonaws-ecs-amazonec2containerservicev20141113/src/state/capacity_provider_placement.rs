@@ -160,9 +160,12 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// must use the `capacityProviderStrategy` request parameter and omit the `launchType`
     /// request parameter"). A provider whose capacity Amazon ECS is still standing up counts
     /// — the account holds that capacity from the create that asked for it — while the
-    /// tombstone a deleted one leaves ([`CAPACITY_PROVIDER_INACTIVE`]) does not. Read where a
-    /// registration derives the launch types its revision is validated against
-    /// ([`super::TaskDefinitionRecord::compatibilities`]).
+    /// tombstone a deleted one leaves ([`CAPACITY_PROVIDER_INACTIVE`]) does not.
+    ///
+    /// Which launch types a task definition is VALIDATED against is a different question and
+    /// does not read this: `TaskDefinition$compatibilities` is derived from the revision's
+    /// own parameters ([`super::TaskDefinitionRecord::compatibilities`]), not from the
+    /// capacity an account happens to hold.
     pub fn holds_managed_instances_capacity(&self) -> bool {
         self.capacity_providers.values().any(|provider| {
             provider.provider_type.as_deref() == Some(CAPACITY_PROVIDER_TYPE_MANAGED_INSTANCES)

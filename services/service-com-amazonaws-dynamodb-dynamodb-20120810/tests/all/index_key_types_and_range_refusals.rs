@@ -785,18 +785,18 @@ async fn a_numeric_member_outside_its_range_is_refused_in_its_operation_s_form()
             echoes: false,
         },
         RangeRow {
-            // The SAME bound on the SAME member name as the keyed read above, stated in the
-            // other form: the table WALK echoes the rejected page size under the validator's
-            // path, while its parallel-scan bounds below keep the no-value wire form
+            // The SAME bound on the SAME member name as the keyed read above, through the
+            // other item request: one form per operation, so both reads state it in the wire
+            // form their parallel-scan bounds below also keep
             // (`tests/all/page_size_clause_forms.rs` pins every form side by side).
             case: "the same bound on another data-plane read, far below it",
             operation: "Scan",
             member: "Limit",
-            path: "limit",
+            path: "Limit",
             value: -7,
             requirement: "",
             table: Some(TABLE),
-            echoes: true,
+            echoes: false,
         },
         RangeRow {
             case: "a parallel-scan segment count one past its maximum",

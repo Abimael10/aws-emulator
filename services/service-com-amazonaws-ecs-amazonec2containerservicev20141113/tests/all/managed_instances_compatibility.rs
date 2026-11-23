@@ -6,19 +6,20 @@
 //! The rule under test: `TaskDefinition$compatibilities` ("Amazon ECS validates the task
 //! definition parameters with those supported by the launch type") is DERIVED over the whole
 //! `Compatibility` enum (`smithy_query(query="shape", shape="com.amazonaws.ecs#Compatibility")`
-//! -> `EC2`, `FARGATE`, `EXTERNAL`, `MANAGED_INSTANCES`) from the revision's own parameters and
-//! from the classes of capacity the account can place a task on at all — and managed instances
-//! are the one class no account holds by default. That capacity exists only as a capacity
-//! provider somebody created for a cluster (`CapacityProvider$cluster`: "Managed instances
-//! capacity providers are cluster-scoped"), and a placement reaches it only through such a
-//! provider (`RunTask$launchType`: "If you want to use Amazon ECS Managed Instances, you must
-//! use the `capacityProviderStrategy` request parameter and omit the `launchType` request
-//! parameter"), while the caller's own container instances (`EC2`, `EXTERNAL`) and the Fargate
-//! providers Amazon ECS holds for every account need no such create. So an account holding no
-//! managed-instances provider reports NO revision as validated against that launch type,
-//! whatever the revision declares, and an account holding one reports it wherever the caller's
-//! own EC2 capacity is reported — in the position the launch-type order gives it (`EXTERNAL`,
-//! `EC2`, `MANAGED_INSTANCES`, `FARGATE`).
+//! -> `EC2`, `FARGATE`, `EXTERNAL`, `MANAGED_INSTANCES`) from the revision's OWN parameters,
+//! and from nothing else. Amazon ECS Managed Instances run the caller's tasks on EC2 instances
+//! Amazon ECS provisions and operates, so the parameters that support the caller's own EC2
+//! capacity support that capacity too: every revision reports `MANAGED_INSTANCES`, in the
+//! position the launch-type order gives it (`EXTERNAL`, `EC2`, `MANAGED_INSTANCES`, `FARGATE`),
+//! whatever capacity providers the account holds and whatever the registration asked to be
+//! validated against.
+//!
+//! Which launch types a PLACEMENT may name outright is the narrower question, and
+//! managed-instances capacity is not reachable that way (`RunTask$launchType`: "If you want to
+//! use Amazon ECS Managed Instances, you must use the `capacityProviderStrategy` request
+//! parameter and omit the `launchType` request parameter"), which is why a revision that
+//! reports the launch type still cannot be placed by naming it
+//! ([`crate::task_definition_compatibility_validation`] drives that gate).
 //!
 //! The rows span what the rule generalises over:
 //!
@@ -28,8 +29,9 @@
 //! * what the registration ASKED to be validated against (`requiresCompatibilities`): nothing,
 //!   managed instances alone, and managed instances beside another launch type — none of which
 //!   changes the derived list either way;
-//! * whether the ACCOUNT holds managed-instances capacity, which is what the rule turns on,
-//!   including a revision registered before that capacity was created;
+//! * whether the ACCOUNT holds a managed-instances capacity provider, which the derivation does
+//!   not read: the same rows are registered against an account that created one and against one
+//!   that created none, and both report the same list;
 //! * a revision Fargate does NOT support (an Amazon ECR image with no `executionRoleArn`),
 //!   where the managed-instances answer is unchanged by the Fargate one;
 //! * and both projections of the same stored revision — the registration's echo and
@@ -77,9 +79,8 @@ fn compatibilities(definition: &Value, case: &str) -> Vec<String> {
         .collect()
 }
 
-/// The same expected list for an account that HOLDS managed-instances capacity: that launch
-/// type in the position the launch-type order gives it, straight after the caller's own EC2
-/// capacity and before Fargate.
+/// `expected` with managed instances in the position the launch-type order gives it: straight
+/// after the caller's own EC2 capacity and before Fargate.
 fn with_managed_instances(expected: &[&str]) -> Vec<String> {
     let mut reported: Vec<String> = Vec::with_capacity(expected.len() + 1);
     for launch_type in expected {
@@ -91,8 +92,8 @@ fn with_managed_instances(expected: &[&str]) -> Vec<String> {
     reported
 }
 
-/// Give the account Amazon ECS Managed Instances capacity: a cluster, and a capacity provider
-/// of that class scoped to it — the only way an account comes to hold that capacity.
+/// Give the account a managed-instances capacity provider: a cluster, and a provider of that
+/// class scoped to it — the only way an account comes to hold that capacity.
 async fn create_managed_instances_capacity(
     router: &MultiServiceRouter,
     cluster: &str,
@@ -146,7 +147,7 @@ async fn describe(router: &MultiServiceRouter, reference: &str, case: &str) -> V
 }
 
 /// (case, the request beside the family and containers, the launch types the revision reports
-/// in an account holding NO managed-instances capacity).
+/// BESIDE managed instances).
 fn rows() -> Vec<(&'static str, Value, Vec<&'static str>)> {
     vec![
         (
@@ -197,15 +198,17 @@ fn rows() -> Vec<(&'static str, Value, Vec<&'static str>)> {
     ]
 }
 
-/// RULE: an account that holds no managed-instances capacity reports no revision as validated
-/// against that launch type, whatever the revision declares and whatever it asked to be
-/// validated against.
+/// RULE: every revision is validated against managed-instances capacity wherever it is
+/// validated against the caller's own EC2 capacity, whatever the revision declares and
+/// whatever it asked to be validated against — in an account that created no capacity provider
+/// of that class.
 #[tokio::test]
-async fn no_revision_reports_managed_instances_without_that_capacity() {
+async fn every_revision_reports_managed_instances() {
     let router = service();
 
-    for (index, (case, mut request, expected)) in rows().into_iter().enumerate() {
+    for (index, (case, mut request, without)) in rows().into_iter().enumerate() {
         request["containerDefinitions"] = json!([container("app", IMAGE)]);
+        let expected = with_managed_instances(&without);
         for (source, definition) in
             register_and_describe(&router, &format!("mifam{index}"), request, case).await
         {
@@ -219,11 +222,11 @@ async fn no_revision_reports_managed_instances_without_that_capacity() {
     }
 }
 
-/// RULE, once the capacity exists: a revision registered in an account that holds a
-/// managed-instances capacity provider reports that launch type wherever the caller's own EC2
-/// capacity is reported, in the position the launch-type order gives it.
+/// RULE, the other side of it: the derivation does not read the account's capacity providers,
+/// so the same rows registered in an account that HOLDS a managed-instances capacity provider
+/// report exactly the same list.
 #[tokio::test]
-async fn every_revision_reports_managed_instances_once_that_capacity_exists() {
+async fn the_reported_list_does_not_turn_on_the_capacity_the_account_holds() {
     let router = service();
     create_managed_instances_capacity(&router, "mifleetcluster", "mifleet", "setup").await;
 
@@ -244,14 +247,13 @@ async fn every_revision_reports_managed_instances_once_that_capacity_exists() {
 }
 
 /// RULE, over time: the derived list is the validation the REGISTRATION performed, so reading a
-/// revision back never rewrites it — a revision registered before the account held
-/// managed-instances capacity reports the same list after the provider exists, and the next
-/// revision of the same family, registered against the account that now holds it, reports the
-/// launch type.
+/// revision back never rewrites it — a revision registered before the account held any
+/// managed-instances capacity provider reports the same list after one exists, and so does the
+/// next revision of the same family.
 #[tokio::test]
 async fn the_derived_list_is_the_one_the_registration_validated() {
     let router = service();
-    let case = "a revision registered before the capacity existed";
+    let case = "a revision registered before a capacity provider existed";
     let family = "mitimeline";
     let request = json!({
         "networkMode": "awsvpc",
@@ -271,11 +273,11 @@ async fn the_derived_list_is_the_one_the_registration_validated() {
         case,
     )
     .await;
-    let expected_before = vec!["EC2".to_string(), "FARGATE".to_string()];
+    let expected = with_managed_instances(&["EC2", "FARGATE"]);
     let actual = compatibilities(&before["taskDefinition"], case);
     assert_eq!(
-        actual, expected_before,
-        "case {case:?}: RegisterTaskDefinition expected compatibilities {expected_before:?}, got \
+        actual, expected,
+        "case {case:?}: RegisterTaskDefinition expected compatibilities {expected:?}, got \
          {actual:?} in {before}"
     );
 
@@ -284,18 +286,17 @@ async fn the_derived_list_is_the_one_the_registration_validated() {
     let reread = describe(&router, &format!("{family}:1"), case).await;
     let actual = compatibilities(&reread, case);
     assert_eq!(
-        actual, expected_before,
+        actual, expected,
         "case {case:?}: DescribeTaskDefinition must report the validation the registration \
-         performed, expected {expected_before:?}, got {actual:?} in {reread}"
+         performed, expected {expected:?}, got {actual:?} in {reread}"
     );
 
-    let case = "the next revision, registered against an account holding the capacity";
-    let expected_after = with_managed_instances(&["EC2", "FARGATE"]);
+    let case = "the next revision, registered against an account holding a provider";
     for (source, definition) in register_and_describe(&router, family, request, case).await {
         let actual = compatibilities(&definition, case);
         assert_eq!(
-            actual, expected_after,
-            "case {case:?}: {source} expected compatibilities {expected_after:?}, got {actual:?} \
+            actual, expected,
+            "case {case:?}: {source} expected compatibilities {expected:?}, got {actual:?} \
              in {definition}"
         );
     }
@@ -303,9 +304,9 @@ async fn the_derived_list_is_the_one_the_registration_validated() {
 
 /// RULE, where FARGATE drops out: a revision whose image can be pulled only AS the task
 /// execution role, and that names none, is not validated against Fargate — Amazon ECS's own
-/// capacity has no container instance whose role the agent could pull under — while the
-/// caller's own capacity still supports it. The managed-instances answer is the account's
-/// capacity either way, so naming the execution role puts Fargate back and moves nothing else.
+/// Fargate capacity has no container instance whose role the agent could pull under — while the
+/// caller's own capacity still supports it. The managed-instances answer is unchanged either
+/// way, so naming the execution role puts Fargate back and moves nothing else.
 #[tokio::test]
 async fn an_image_needing_a_principal_drops_only_fargate() {
     let router = service();

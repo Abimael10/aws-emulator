@@ -651,23 +651,22 @@ async fn compatibilities_read_back_in_the_launch_type_order_ecs_reports() {
     // `task_definition_compatibility_validation` and `managed_instances_compatibility`; here
     // it is the ORDER, read back through BOTH projections. Order source: the recorded ECS
     // responses — EXTERNAL, EC2, MANAGED_INSTANCES, FARGATE — filtered by what the revision
-    // supports and by the capacity the account holds, and this router holds no
-    // managed-instances capacity provider, so no row reports that launch type.
+    // supports.
     let rows: Vec<(&str, Value, Vec<&str>)> = vec![
         (
             "bridge",
             json!({ "networkMode": "bridge" }),
-            vec!["EXTERNAL", "EC2"],
+            vec!["EXTERNAL", "EC2", "MANAGED_INSTANCES"],
         ),
         (
             "awsvpc without task size",
             json!({ "networkMode": "awsvpc" }),
-            vec!["EC2"],
+            vec!["EC2", "MANAGED_INSTANCES"],
         ),
         (
             "awsvpc with task size",
             json!({ "networkMode": "awsvpc", "cpu": "256", "memory": "512" }),
-            vec!["EC2", "FARGATE"],
+            vec!["EC2", "MANAGED_INSTANCES", "FARGATE"],
         ),
         (
             "fargate requested",
@@ -677,7 +676,7 @@ async fn compatibilities_read_back_in_the_launch_type_order_ecs_reports() {
                 "memory": "1024",
                 "requiresCompatibilities": ["FARGATE"],
             }),
-            vec!["EC2", "FARGATE"],
+            vec!["EC2", "MANAGED_INSTANCES", "FARGATE"],
         ),
         // What the registration ASKED to be validated against does not reorder the derived
         // list, and adds nothing to it: every launch type it names that the parameters
@@ -690,7 +689,7 @@ async fn compatibilities_read_back_in_the_launch_type_order_ecs_reports() {
                 "memory": "1024",
                 "requiresCompatibilities": ["FARGATE", "MANAGED_INSTANCES"],
             }),
-            vec!["EC2", "FARGATE"],
+            vec!["EC2", "MANAGED_INSTANCES", "FARGATE"],
         ),
     ];
 

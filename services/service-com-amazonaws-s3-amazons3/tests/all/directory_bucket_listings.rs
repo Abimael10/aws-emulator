@@ -194,7 +194,10 @@ async fn every_directory_bucket(
     for _ in 0..MOST_PAGES {
         let query = match token.as_deref() {
             Some(resume) => {
-                format!("?max-directory-buckets={page_size}&continuation-token={resume}")
+                format!(
+                    "?max-directory-buckets={page_size}&continuation-token={}",
+                    super::continuation_token_alphabet::handed_back_in_query(resume)
+                )
             }
             None => format!("?max-directory-buckets={page_size}"),
         };
@@ -621,7 +624,10 @@ async fn paging_the_directory_bucket_listing_reports_every_bucket_once() {
                 query.push(format!("max-directory-buckets={size}"));
             }
             if let Some(resume) = token.as_deref() {
-                query.push(format!("continuation-token={resume}"));
+                query.push(format!(
+                    "continuation-token={}",
+                    super::continuation_token_alphabet::handed_back_in_query(resume)
+                ));
             }
             let page = list_directory_buckets(
                 &router,

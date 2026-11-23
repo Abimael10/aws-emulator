@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The CNAME a `ListCertificateDomainValidations` summary hands a client, over the wire
-//! (`POST /`, `X-Amz-Target: CertificateManager.<Op>`, awsJson1_1).
+//! WHAT a `ListCertificateDomainValidations` summary says about a DNS-validated name, and
+//! WHERE the CNAME that proves it is reported, over the wire (`POST /`,
+//! `X-Amz-Target: CertificateManager.<Op>`, awsJson1_1).
 //!
-//! RULE under test: a domain validation summary's `ValidationChallenge` carries the
-//! evidence the domain's current validation method asks for, read off the record the
-//! service minted for that domain — so for a DNS-validated name the `DNS` arm carries a
-//! fully populated `ResourceRecord{Name, Type: CNAME, Value}`, the very record
-//! `CertificateDetail$DomainValidationOptions[*].ResourceRecord` reports for the same
-//! name, which is what retrieving "the CNAME records required for DNS validation"
-//! through this operation means.
+//! RULE under test: a domain validation summary's `ValidationChallenge` names the KIND of
+//! evidence the domain's current validation method asks for, and no more — the `DNS` arm is
+//! reported for a DNS-validated name and carries no `ResourceRecord`, exactly as the recorded
+//! summaries of a DNS-validated certificate do. The record a client publishes is the
+//! certificate's own to report, on
+//! `CertificateDetail$DomainValidationOptions[*].ResourceRecord`: a fully populated
+//! `ResourceRecord{Name, Type: CNAME, Value}` per covered name.
 //!
 //! The tables span what the rule generalises over: the form of each covered name (apex,
 //! subdomain, deep label, wildcard), how many names one certificate covers, the page the
@@ -17,8 +18,7 @@
 //! `UpdateCertificateOptions` migration onto DNS and away from it), and whether the
 //! request needs out-of-band proof at all (a public request against a private-CA one).
 //!
-//! Every record read here is cross-checked against `DescribeCertificate`'s projection of
-//! the same stored validation, read back twice so a reporting call cannot be what mints
+//! Every record read here is read back twice so a reporting call cannot be what mints
 //! it, and compared across two certificates for one name so the record cannot be a
 //! constant.
 
@@ -70,8 +70,8 @@ async fn paged_summaries(
     }
 }
 
-/// The DNS challenge's resource record of the summary for `domain`.
-fn challenge_record(case: &str, list: &[Value], domain: &str) -> Value {
+/// Assert the summary for `domain` reports the DNS challenge arm and nothing inside it.
+fn assert_dns_challenge_is_bare(case: &str, list: &[Value], domain: &str) {
     let summary = list
         .iter()
         .find(|summary| {
@@ -81,24 +81,34 @@ fn challenge_record(case: &str, list: &[Value], domain: &str) -> Value {
         })
         .unwrap_or_else(|| panic!("case {case}: no summary for {domain} in {list:?}"));
     let configuration = &summary["RequestedValidationConfiguration"];
-    let challenge = &configuration["ValidationChallenge"]["DnsValidationChallenge"];
-    assert!(
-        challenge.is_object(),
-        "case {case}: a DNS-validated name carries the DNS challenge arm, got {configuration}"
+    assert_eq!(
+        configuration["ValidationChallenge"]["DnsValidationChallenge"],
+        json!({}),
+        "case {case}: a DNS-validated name carries the DNS challenge arm and nothing inside \
+         it, got {configuration}"
     );
-    assert_resource_record(case, &challenge["ResourceRecord"], &summary["DomainName"]);
-    // The CNAME target is a name under the zone this emulator publishes its challenges
-    // in, so a client that follows the record reaches this emulator rather than a name
-    // of its own.
-    let value = challenge["ResourceRecord"]["Value"]
-        .as_str()
-        .unwrap_or_default();
+}
+
+/// The CNAME the certificate's detail reports for `domain`, asserted to be the record a
+/// client publishes: a CNAME under the name being proven, whose target is a name under the
+/// zone this emulator publishes its challenges in, so a client that follows the record
+/// reaches this emulator rather than a name of its own.
+fn detail_record(
+    case: &str,
+    described: &std::collections::BTreeMap<String, Value>,
+    domain: &str,
+) -> Value {
+    let entry = described
+        .get(domain)
+        .unwrap_or_else(|| panic!("case {case}: {domain} is not a described validation"));
+    assert_resource_record(case, &entry["ResourceRecord"], &entry["DomainName"]);
+    let value = entry["ResourceRecord"]["Value"].as_str().unwrap_or_default();
     let zone = validation_zone();
     assert!(
         value.starts_with('_') && value.ends_with(&format!(".{zone}.")),
         "case {case}: expected a CNAME target in {zone}, got {value:?}"
     );
-    challenge["ResourceRecord"].clone()
+    entry["ResourceRecord"].clone()
 }
 
 /// Call `UpdateCertificateOptions` with one `Options` body, requiring success.
@@ -121,11 +131,11 @@ async fn migrate_to(
     );
 }
 
-/// RULE: every DNS-validated name's challenge carries that name's minted CNAME, the same
-/// record the certificate's detail reports, on every page and however the name is
-/// spelled.
+/// RULE: every DNS-validated name's summary reports the bare DNS arm on every page and
+/// however the name is spelled, while the certificate's detail reports that name's own
+/// minted CNAME.
 #[tokio::test]
-async fn every_dns_challenge_carries_the_cname_the_detail_reports() {
+async fn a_dns_challenge_is_bare_and_the_detail_carries_the_cname() {
     // Rows differ along the form of each covered name, how many names are covered, and
     // whether ACM has to prove control of them at all (public against private CA).
     let cases: &[RecordCase<'_>] = &[
@@ -179,7 +189,7 @@ async fn every_dns_challenge_carries_the_cname_the_detail_reports() {
         // the request is held out rather than raced.
         hold_pending_validations(&engine);
 
-        // Read whole and one summary per page: the record must be there either way.
+        // Read whole and one summary per page: the arm must read the same either way.
         let (whole, _next) = summaries(&router, &json!({ "CertificateArn": arn })).await;
         let paged = paged_summaries(&router, &arn, 1).await;
         let described = described_validations(&router, &arn).await;
@@ -187,21 +197,13 @@ async fn every_dns_challenge_carries_the_cname_the_detail_reports() {
         let mut records: BTreeSet<String> = BTreeSet::new();
         for name in *names {
             let row = format!("{case}/{name}");
-            let record = challenge_record(&row, &whole, name);
-            assert_eq!(
-                challenge_record(&format!("{row}/paged"), &paged, name),
-                record,
-                "case {row}: the page the summary falls on cannot change its record"
-            );
+            assert_dns_challenge_is_bare(&row, &whole, name);
+            assert_dns_challenge_is_bare(&format!("{row}/paged"), &paged, name);
 
+            let record = detail_record(&row, &described, name);
             let entry = described
                 .get(*name)
                 .unwrap_or_else(|| panic!("case {row}: {name} is not a described validation"));
-            assert_eq!(
-                &record,
-                &entry["ResourceRecord"],
-                "case {row}: the challenge must carry the stored CNAME, got {entry}"
-            );
             assert_eq!(
                 entry["ValidationStatus"].as_str(),
                 Some(PENDING_VALIDATION),
@@ -215,20 +217,26 @@ async fn every_dns_challenge_carries_the_cname_the_detail_reports() {
             "case {case}: each covered name is proven by a record of its own, got {records:?}"
         );
 
-        // A second read reports the same record: reading the challenges mints nothing.
+        // A second read reports the same summaries and the same records: reading mints
+        // nothing.
         let (again, _next) = summaries(&router, &json!({ "CertificateArn": arn })).await;
         assert_eq!(
             again, whole,
-            "case {case}: reading the challenges again must report the same records"
+            "case {case}: reading the challenges again must report the same summaries"
+        );
+        assert_eq!(
+            described_validations(&router, &arn).await,
+            described,
+            "case {case}: reading the detail again must report the same records"
         );
     }
 }
 
 /// RULE: the challenge follows the method a domain's validation currently stands under,
-/// so a domain MIGRATED onto DNS reports the CNAME minted for it then — and one migrated
-/// off DNS reports its new method's challenge instead, with no record left behind.
+/// so a domain MIGRATED onto DNS reports the DNS arm and is handed the CNAME minted for it
+/// then — and one migrated off DNS reports its new method's challenge instead.
 #[tokio::test]
-async fn a_domain_migrated_onto_dns_reports_its_new_cname() {
+async fn a_domain_migrated_onto_dns_reports_the_dns_arm_and_a_new_cname() {
     // Rows differ along the method the certificate starts on (named, defaulted) and the
     // form and number of the names covered.
     let cases: &[RecordCase<'_>] = &[
@@ -285,19 +293,12 @@ async fn a_domain_migrated_onto_dns_reports_its_new_cname() {
         let described = described_validations(&router, &arn).await;
         for name in *names {
             let row = format!("{case}/{name}/migrated onto DNS");
-            let record = challenge_record(&row, &migrated, name);
-            let entry = described
-                .get(*name)
-                .unwrap_or_else(|| panic!("case {row}: {name} is not a described validation"));
-            assert_eq!(
-                &record,
-                &entry["ResourceRecord"],
-                "case {row}: the challenge must carry the re-minted CNAME, got {entry}"
-            );
+            assert_dns_challenge_is_bare(&row, &migrated, name);
+            detail_record(&row, &described, name);
         }
 
-        // Migrated back onto a method that publishes no record, the challenge is that
-        // method's and carries no CNAME.
+        // Migrated back onto a method whose challenge describes other evidence, the
+        // challenge is that method's.
         migrate_to(&router, case, &arn, "EMAIL").await;
         let (reverted, _next) = summaries(&router, &json!({ "CertificateArn": arn })).await;
         for summary in &reverted {
@@ -313,7 +314,7 @@ async fn a_domain_migrated_onto_dns_reports_its_new_cname() {
 }
 
 /// RULE: the record is this certificate's own — two certificates covering one name are
-/// handed different CNAMEs, so no part of the challenge is a constant or an echo of the
+/// handed different CNAMEs, so no part of the evidence is a constant or an echo of the
 /// request.
 #[tokio::test]
 async fn two_certificates_for_one_name_are_handed_different_records() {
@@ -341,8 +342,19 @@ async fn two_certificates_for_one_name_are_handed_different_records() {
 
     let (first_list, _next) = summaries(&router, &json!({ "CertificateArn": first })).await;
     let (second_list, _next) = summaries(&router, &json!({ "CertificateArn": second })).await;
-    let first_record = challenge_record("two certificates/first", &first_list, domain);
-    let second_record = challenge_record("two certificates/second", &second_list, domain);
+    assert_dns_challenge_is_bare("two certificates/first", &first_list, domain);
+    assert_dns_challenge_is_bare("two certificates/second", &second_list, domain);
+
+    let first_record = detail_record(
+        "two certificates/first",
+        &described_validations(&router, &first).await,
+        domain,
+    );
+    let second_record = detail_record(
+        "two certificates/second",
+        &described_validations(&router, &second).await,
+        domain,
+    );
     assert_ne!(
         first_record, second_record,
         "case two certificates: each certificate proves the name with its own record, \

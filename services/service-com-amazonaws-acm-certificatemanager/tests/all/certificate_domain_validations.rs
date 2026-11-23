@@ -199,21 +199,18 @@ pub(crate) fn assert_summary_matches_record(
 
     let challenge = &requested["ValidationChallenge"];
     match method {
-        // `DnsValidationChallenge` carries the CNAME this domain's validation minted,
-        // which is the record `DescribeCertificate` reports for the same name on
-        // `DomainValidationOptions[*].ResourceRecord`: one store, two readers, one
-        // record.
+        // `DnsValidationChallenge` says the domain is proved by publishing a CNAME, and
+        // carries no record of its own: the CNAME to publish is the one
+        // `DescribeCertificate` reports for the same name on
+        // `DomainValidationOptions[*].ResourceRecord`.
         "DNS" => {
-            assert!(
-                challenge["DnsValidationChallenge"].is_object(),
-                "case {case}: a DNS-validated domain carries the DnsValidationChallenge arm, got {summary}"
-            );
-            assert_resource_record(case, &challenge["DnsValidationChallenge"]["ResourceRecord"], &summary["DomainName"]);
             assert_eq!(
-                challenge["DnsValidationChallenge"]["ResourceRecord"],
-                described["ResourceRecord"],
-                "case {case}: the challenge must carry the stored CNAME DescribeCertificate reports, got {summary}"
+                challenge["DnsValidationChallenge"],
+                json!({}),
+                "case {case}: a DNS-validated domain carries the DnsValidationChallenge arm and \
+                 no record inside it, got {summary}"
             );
+            assert_resource_record(case, &described["ResourceRecord"], &summary["DomainName"]);
         }
         // `EmailValidationChallenge` carries the addresses ACM used and the domain this
         // summary is about; the mail SUFFIX ACM writes to for that domain is the

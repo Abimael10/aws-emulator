@@ -77,7 +77,12 @@ pub(crate) async fn list_metrics(
 ) -> Answer {
     let uri = match token {
         None => format!("/{bucket}?metrics"),
-        Some(token) => format!("/{bucket}?metrics&continuation-token={token}"),
+        // A token travels as a query value, percent-encoded as one
+        // ([`crate::continuation_token_alphabet::handed_back_in_query`]).
+        Some(token) => format!(
+            "/{bucket}?metrics&continuation-token={}",
+            super::continuation_token_alphabet::handed_back_in_query(token)
+        ),
     };
     send(router, "GET", &uri, headers, "").await
 }

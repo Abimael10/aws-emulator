@@ -27,8 +27,8 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 
 use crate::certificate_domain_validations::{
-    assert_resource_record, assert_summary_matches_record, described_validations, names, summaries,
-    CONFIGURATION_MEMBER, DEFAULT_VALIDATION_METHOD, FAILED, PENDING_VALIDATION, PRIVATE_CA_ARN,
+    assert_summary_matches_record, described_validations, names, summaries, CONFIGURATION_MEMBER,
+    DEFAULT_VALIDATION_METHOD, FAILED, PENDING_VALIDATION, PRIVATE_CA_ARN,
     UNREPORTED_CONFIGURATION_MEMBER, VALIDATION_METHODS,
 };
 use crate::certificate_lifecycle::{
@@ -116,17 +116,14 @@ fn assert_configuration_member(case: &str, summary: &Value, method: &str, status
              arm, got {summary}"
         ),
         "DNS" => {
-            assert!(
-                challenge["DnsValidationChallenge"].is_object(),
-                "case {case}: a DNS-validated domain carries the DnsValidationChallenge arm, \
-                 got {summary}"
-            );
-            // The challenge carries the CNAME to publish, which is what the operation's
-            // own doc says its results are for.
-            assert_resource_record(
-                case,
-                &challenge["DnsValidationChallenge"]["ResourceRecord"],
-                &summary["DomainName"],
+            // The arm names the KIND of evidence the method asks for and carries no
+            // record inside it: the CNAME to publish is reported on the certificate's
+            // own `DomainValidationOptions[*].ResourceRecord`.
+            assert_eq!(
+                challenge["DnsValidationChallenge"],
+                json!({}),
+                "case {case}: a DNS-validated domain carries the DnsValidationChallenge arm \
+                 and nothing inside it, got {summary}"
             );
         }
         "HTTP" => assert!(

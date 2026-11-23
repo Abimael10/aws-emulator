@@ -279,7 +279,12 @@ async fn list_configurations(
 ) -> Answer {
     let uri = match token {
         None => format!("/{bucket}?intelligent-tiering"),
-        Some(token) => format!("/{bucket}?intelligent-tiering&continuation-token={token}"),
+        // A token travels as a query value, percent-encoded as one
+        // ([`crate::continuation_token_alphabet::handed_back_in_query`]).
+        Some(token) => format!(
+            "/{bucket}?intelligent-tiering&continuation-token={}",
+            super::continuation_token_alphabet::handed_back_in_query(token)
+        ),
     };
     send(router, "GET", &uri, headers, "").await
 }

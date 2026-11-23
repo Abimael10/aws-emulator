@@ -38,7 +38,7 @@
 //! configuration id, a bucket name, an object key, an annotation name — which is why every
 //! one of these listings walks what it reports in ascending order.
 
-use ::service_common::jwt::{decode_base64url, encode_base64url};
+use ::service_common::page_tokens::{page_cursor, page_token};
 
 pub use ::service_common::page_tokens::PageTokenKey;
 
@@ -125,15 +125,15 @@ pub fn object_version_scope(bucket: &str, key: &str, version_id: Option<&str>) -
 }
 
 /// The `NextContinuationToken` that resumes a listing at `first_not_returned` (inclusive):
-/// the authenticated bytes of that position, rendered in base64url.
+/// the authenticated bytes of that position, rendered in base64.
 ///
-/// Base64 is the spelling an AWS continuation token has, in the URL-safe alphabet (RFC 4648
-/// §5) so the value survives the `continuation-token` query parameter of the next request
-/// whatever encodes it — through the workspace's one base64url codec
-/// ([`::service_common::jwt::encode_base64url`], declared beside the JOSE reader that needed
-/// it first), so no second alphabet swap lives here. The authenticator inside is what makes a
-/// token this store did not mint detectable, which is what lets the next page refuse it
-/// instead of serving from a position the caller chose.
+/// Base64 is the spelling an AWS continuation token has, in the STANDARD alphabet (RFC 4648
+/// §4) the recorded tokens are written in — through the workspace's one rendering of an
+/// authenticated cursor ([`::service_common::page_tokens::page_token`]), so a token of this
+/// service is spelled the way every other paginated read's is, and a client hands it back on
+/// the `continuation-token` query parameter the way it hands back any other query value.
+/// The authenticator inside is what makes a token this store did not mint detectable, which
+/// is what lets the next page refuse it instead of serving from a position the caller chose.
 ///
 /// `scope` is the resource the listing was taken OVER — the bucket a configuration listing is
 /// bound to, and the empty string for a listing of the account itself — so a token issued for
@@ -144,15 +144,18 @@ pub fn encode_continuation_token(
     scope: &str,
     first_not_returned: &str,
 ) -> String {
-    encode_base64url(&key.mint(&format!(
-        "{}{CURSOR_SEPARATOR}{}{CURSOR_SEPARATOR}{first_not_returned}",
-        listing.label(),
-        scope_digest(scope)
-    )))
+    page_token(
+        key,
+        &format!(
+            "{}{CURSOR_SEPARATOR}{}{CURSOR_SEPARATOR}{first_not_returned}",
+            listing.label(),
+            scope_digest(scope)
+        ),
+    )
 }
 
 /// The position `token` resumes `listing` over `scope` at (inclusive), or `None` for any
-/// value this store did not mint for that listing and that scope: one that is not base64url,
+/// value this store did not mint for that listing and that scope: one that is not base64,
 /// one whose authenticator does not match the cursor it travels with, one issued for another
 /// listing, one issued for another BUCKET, and one carrying no cursor at all.
 pub fn decode_continuation_token(
@@ -180,7 +183,7 @@ pub enum ContinuationTokenReading {
     /// A token this store minted for this listing, but over another scope — another bucket's
     /// listing of the same family.
     OtherScope,
-    /// Not a token this store minted for this listing at all: not base64url, authenticated
+    /// Not a token this store minted for this listing at all: not base64, authenticated
     /// under another key, issued for another listing, or carrying no cursor.
     Unknown,
 }
@@ -222,7 +225,7 @@ pub fn read_continuation_token(
     scope: &str,
     token: &str,
 ) -> ContinuationTokenReading {
-    let Some(cursor) = decode_base64url(token).and_then(|bytes| key.cursor_of(&bytes)) else {
+    let Some(cursor) = page_cursor(key, &handed_back(token)) else {
         return ContinuationTokenReading::Unknown;
     };
     let Some((label, rest)) = cursor.split_once(CURSOR_SEPARATOR) else {
@@ -238,6 +241,22 @@ pub fn read_continuation_token(
         true => ContinuationTokenReading::Position(resume_at.to_string()),
         false => ContinuationTokenReading::OtherScope,
     }
+}
+
+/// The token a caller handed back, as the value this store MINTED.
+///
+/// A token travels on the `continuation-token` query parameter, and this emulator's query
+/// reader is a form decoder: a `+` a client handed back without percent-encoding it arrives
+/// as a SPACE. Amazon S3 reads the parameter as the opaque value it handed out — "you can use
+/// this ContinuationToken for pagination of the list results" — so a caller that returns that
+/// value verbatim resumes its listing, and the base64 alphabet has no space, which makes a
+/// space in a token that `+` and nothing else.
+///
+/// Every other character of the alphabet survives a query component unchanged, so nothing
+/// else is rewritten here: a value this store did not mint still names no page
+/// ([`ContinuationTokenReading::Unknown`]), because the authenticator is what decides that.
+fn handed_back(token: &str) -> String {
+    token.replace(' ', "+")
 }
 
 #[cfg(test)]
@@ -298,6 +317,15 @@ mod tests {
                 Some(id),
                 "case {listing:?}/{id:?}: a minted token must name its position, got {token:?}"
             );
+            // The same token handed back VERBATIM on a query parameter, where the form
+            // decoder has made a space of every `+` it carried ([`handed_back`]).
+            assert_eq!(
+                decode_continuation_token(&key, listing, scope, &token.replace('+', " "))
+                    .as_deref(),
+                Some(id),
+                "case {listing:?}/{id:?}: a token whose `+` arrived as a space must name the \
+                 same position, got {token:?}"
+            );
             assert_eq!(
                 decode_continuation_token(&other_store, listing, scope, &token),
                 None,
@@ -333,23 +361,22 @@ mod tests {
                 );
             }
             assert!(
-                token
-                    .chars()
-                    .all(|character| character.is_ascii_alphanumeric()
-                        || matches!(character, '-' | '_')),
-                "case {listing:?}/{id:?}: a token is URL-safe base64, got {token:?}"
+                token.chars().all(|character| character.is_ascii_alphanumeric()
+                    || matches!(character, '+' | '/' | '=')),
+                "case {listing:?}/{id:?}: a token is base64, got {token:?}"
             );
         }
 
         // Values a caller could write rather than round-trip, including one with the SHAPE
         // of a minted token, which only the authenticator can refuse.
-        let shaped =
-            encode_base64url(&[0_u8; ::service_common::page_tokens::AUTHENTICATOR_BYTES + 1]);
+        let shaped = ::aws_smithy_types::base64::encode(
+            [0_u8; ::service_common::page_tokens::AUTHENTICATOR_BYTES + 1],
+        );
         for (case, token) in [
             ("an id", "kept".to_string()),
             ("empty", String::new()),
-            ("not base64url", "not a token".to_string()),
-            ("base64url but too short", "a2VwdA".to_string()),
+            ("not base64", "not a token".to_string()),
+            ("base64 but too short", "a2VwdA==".to_string()),
             ("a minted token's shape", shaped),
         ] {
             assert_eq!(
