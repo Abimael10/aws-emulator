@@ -28,6 +28,7 @@ use serde_json::json;
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
     ATTACHMENT_STATUS_ATTACHED, ATTACHMENT_STATUS_FAILED,
 };
+use service_com_amazonaws_opensearchserverless_opensearchserverless::state::COLLECTION_ACTIVE;
 
 use super::data_source_attachments::{application, attach, describe_attachment, detach};
 use super::domain_lifecycle::{error_code, poll_until, string_member, Emulator, REGION};
@@ -36,7 +37,11 @@ use super::domain_lifecycle::{error_code, poll_until, string_member, Emulator, R
 /// Serverless requires one covering the collection's name before `CreateCollection` is
 /// served, so this suite creates one covering every collection it makes — the shape AWS's
 /// "Encryption policies for Amazon OpenSearch Serverless" documents.
-async fn created_encryption_policy(emulator: &Emulator) {
+///
+/// `pub(crate)` because the sibling suite that drives a collection all the way through to a
+/// migration ([`super::collection_backed_migration_flow`]) needs the same precondition rather
+/// than a second copy of it.
+pub(crate) async fn created_encryption_policy(emulator: &Emulator) {
     let policy = json!({
         "Rules": [{ "ResourceType": "collection", "Resource": ["collection/*"] }],
         "AWSOwnedKey": true,
@@ -60,10 +65,20 @@ async fn created_encryption_policy(emulator: &Emulator) {
 
 /// `aoss:CreateCollection` for `name`, through OpenSearch Serverless' own API, answering the
 /// ARN of the collection it minted.
-async fn created_collection(emulator: &Emulator, name: &str) -> String {
-    let answer = emulator
-        .collections_call("CreateCollection", json!({ "name": name }))
-        .await;
+///
+/// `collection_type` names the collection's `type` where a case is about one kind of
+/// collection, and is left out otherwise — a request naming none takes that service's own
+/// default. `pub(crate)` for the same reason as [`created_encryption_policy`].
+pub(crate) async fn created_collection(
+    emulator: &Emulator,
+    name: &str,
+    collection_type: Option<&str>,
+) -> String {
+    let mut body = json!({ "name": name });
+    if let Some(collection_type) = collection_type {
+        body["type"] = json!(collection_type);
+    }
+    let answer = emulator.collections_call("CreateCollection", body).await;
     assert_eq!(
         answer.status, 200,
         "case CreateCollection({name:?}): expected 200, got {} with {:?}",
@@ -90,7 +105,14 @@ async fn deleted_collection(emulator: &Emulator, arn: &str) {
 }
 
 /// The status the attach of `data_source_arn` answered with, asserting it was accepted.
-async fn attached_status(emulator: &Emulator, id: &str, data_source_arn: &str, case: &str) -> String {
+///
+/// `pub(crate)` for the same reason as [`created_encryption_policy`].
+pub(crate) async fn attached_status(
+    emulator: &Emulator,
+    id: &str,
+    data_source_arn: &str,
+    case: &str,
+) -> String {
     let answer = attach(emulator, id, json!({ "dataSourceArn": data_source_arn })).await;
     assert_eq!(
         answer.status, 200,
@@ -119,13 +141,43 @@ async fn read_status(emulator: &Emulator, id: &str, data_source_arn: &str, case:
 
 /// The TERMINAL status the attachment of `data_source_arn` settles in: the read is repeated
 /// until the status the clock owes the record has landed, so nothing here waits a fixed time.
-async fn settled_status(emulator: &Emulator, id: &str, data_source_arn: &str, case: &str) -> String {
+///
+/// `pub(crate)` for the same reason as [`created_encryption_policy`].
+pub(crate) async fn settled_status(
+    emulator: &Emulator,
+    id: &str,
+    data_source_arn: &str,
+    case: &str,
+) -> String {
     poll_until(case, || async {
         let status = read_status(emulator, id, data_source_arn, case).await;
         status == ATTACHMENT_STATUS_ATTACHED || status == ATTACHMENT_STATUS_FAILED
     })
     .await;
     read_status(emulator, id, data_source_arn, case).await
+}
+
+/// Look again until the collection `name` reports ACTIVE through its OWN service, the way a
+/// client watches a collection come up: the CONDITION is polled for rather than waited out,
+/// so nothing here depends on how fast the host runs.
+///
+/// `pub(crate)` for the same reason as [`created_encryption_policy`].
+pub(crate) async fn collection_became_active(emulator: &Emulator, name: &str, case: &str) {
+    poll_until(case, || async {
+        let answer = emulator
+            .collections_call("BatchGetCollection", json!({ "names": [name] }))
+            .await;
+        // The read itself has to be served: a collection that is merely not active yet is what
+        // this waits for, so a read that failed is reported as the failure it is rather than
+        // waited out to the deadline.
+        assert_eq!(
+            answer.status, 200,
+            "case {case}: expected 200 from BatchGetCollection({name:?}), got {} with {:?}",
+            answer.status, answer.body
+        );
+        answer.body["collectionDetails"][0]["status"] == json!(COLLECTION_ACTIVE)
+    })
+    .await;
 }
 
 /// One attach to make: where the collection it names stands, and the status the clock must
@@ -186,20 +238,12 @@ async fn an_attachment_of_a_serverless_collection_follows_that_collection() {
     for (at, row) in rows.iter().enumerate() {
         let name = format!("probe-collection-{at}");
         let arn = if row.held {
-            created_collection(&emulator, &name).await
+            created_collection(&emulator, &name, None).await
         } else {
             format!("arn:aws:aoss:{REGION}:{account}:collection/{name}")
         };
         if row.active_first {
-            // The CONDITION — the collection reporting ACTIVE through its own service — is
-            // polled for rather than waited out.
-            poll_until(row.case, || async {
-                let answer = emulator
-                    .collections_call("BatchGetCollection", json!({ "names": [name.clone()] }))
-                    .await;
-                answer.body["collectionDetails"][0]["status"] == json!("ACTIVE")
-            })
-            .await;
+            collection_became_active(&emulator, &name, row.case).await;
         }
         if row.deleted_first {
             deleted_collection(&emulator, &arn).await;
@@ -229,7 +273,7 @@ async fn a_second_detach_of_one_attachment_meets_the_removal_already_in_flight()
     let emulator = Emulator::with_collections();
     created_encryption_policy(&emulator).await;
     let id = application(&emulator, "collections-detach").await;
-    let arn = created_collection(&emulator, "detach-race-collection").await;
+    let arn = created_collection(&emulator, "detach-race-collection", None).await;
 
     let attached = attached_status(&emulator, &id, &arn, "the attachment to detach").await;
     assert!(

@@ -896,7 +896,13 @@ fn collection(id: &str) -> String {
 }
 
 /// A start of `application_id` from `source`.
-async fn start_from(emulator: &Emulator, application_id: &str, source: &str) -> Answer {
+///
+/// `pub(crate)` because a sibling suite that starts a job out of a data source the
+/// application holds ([`super::collection_backed_migration_flow`]) makes the same request
+/// rather than growing a second copy of it: what differs between those cases is the SOURCE,
+/// which is this function's parameter, and the workspace every one of them migrates into is
+/// one value.
+pub(crate) async fn start_from(emulator: &Emulator, application_id: &str, source: &str) -> Answer {
     start_migration(
         emulator,
         json!({

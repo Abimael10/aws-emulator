@@ -107,7 +107,11 @@ async fn start(emulator: &Emulator, application_id: &str, objects: usize) -> Str
 }
 
 /// The `migrationId`s a listing answer reports, in the order it reported them.
-fn listed_ids(answer: &Answer, case: &str) -> Vec<String> {
+///
+/// `pub(crate)` because a sibling suite that reads the same listing
+/// ([`super::collection_backed_migration_flow`]) names the jobs out of it this way rather
+/// than growing a second extraction.
+pub(crate) fn listed_ids(answer: &Answer, case: &str) -> Vec<String> {
     answer.body["migrations"]
         .as_array()
         .unwrap_or_else(|| {
