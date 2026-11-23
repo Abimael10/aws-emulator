@@ -407,11 +407,13 @@ const NETWORK_ACL_FILTERS: [&str; 18] = [
 /// matched by [`TAG_FILTER_PREFIX`], the one spelling every describe of this crate reads a
 /// tag filter by, and the key must not be empty: a `tag:` with no key names no tag.
 ///
-/// "Filter names are case-sensitive" (`Filter$Name`), so every other comparison is exact.
+/// "Filter names are case-sensitive" (`Filter$Name`), so every other comparison is exact —
+/// save that a documented name's camelCase spelling names the same filter, resolved for the
+/// whole list by [`crate::state::documented_filter_name`].
 fn filter_name_is_documented(name: &str) -> bool {
     name.strip_prefix(TAG_FILTER_PREFIX)
         .is_some_and(|key| !key.is_empty())
-        || NETWORK_ACL_FILTERS.contains(&name)
+        || crate::state::documented_filter_name(name, &NETWORK_ACL_FILTERS).is_some()
 }
 
 /// The protocol keywords the `entry.protocol` filter publishes beside a protocol number —
@@ -452,6 +454,9 @@ fn filter_values<'a>(network_acl: &'a NetworkAcl, name: &str) -> Vec<Cow<'a, str
 
     let associations = || network_acl.associations.iter().flatten();
     let entries = || network_acl.entries.iter().flatten();
+    // The request's spelling resolved to the documented name, so each attribute is answered
+    // in ONE place whichever spelling selected on it.
+    let name = crate::state::documented_filter_name(name, &NETWORK_ACL_FILTERS).unwrap_or(name);
     let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
         value.map(Cow::Borrowed).into_iter().collect()
     };

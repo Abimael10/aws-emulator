@@ -403,11 +403,13 @@ const ROUTE_TABLE_FILTERS: [&str; 20] = [
 /// matched by [`TAG_FILTER_PREFIX`], the one spelling every describe of this crate reads a
 /// tag filter by, and the key must not be empty: a `tag:` with no key names no tag.
 ///
-/// "Filter names are case-sensitive" (`Filter$Name`), so every other comparison is exact.
+/// "Filter names are case-sensitive" (`Filter$Name`), so every other comparison is exact —
+/// save that a documented name's camelCase spelling names the same filter, resolved for the
+/// whole list by [`crate::state::documented_filter_name`].
 fn filter_name_is_documented(name: &str) -> bool {
     name.strip_prefix(TAG_FILTER_PREFIX)
         .is_some_and(|key| !key.is_empty())
-        || ROUTE_TABLE_FILTERS.contains(&name)
+        || crate::state::documented_filter_name(name, &ROUTE_TABLE_FILTERS).is_some()
 }
 
 /// The values the EC2 filter `name` compares against this route table.
@@ -435,6 +437,10 @@ fn filter_values<'a>(route_table: &'a RouteTable, name: &str) -> Vec<Cow<'a, str
             .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
             .collect();
     }
+
+    // The request's spelling resolved to the documented name, so each attribute is answered
+    // in ONE place whichever spelling selected on it.
+    let name = crate::state::documented_filter_name(name, &ROUTE_TABLE_FILTERS).unwrap_or(name);
 
     let associations = || route_table.associations.iter().flatten();
     let routes = || route_table.routes.iter().flatten();

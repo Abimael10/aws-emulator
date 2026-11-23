@@ -371,11 +371,12 @@ const TAG_FILTER_PREFIX: &str = crate::state::TAG_FILTER_PREFIX;
 
 /// Is `name` a filter this operation documents? "Filter names are case-sensitive"
 /// (`Filter$Name`), so the comparison is exact — and a `tag:` prefix with no key names no
-/// tag, so it is as undocumented as any other misspelling.
+/// tag, so it is as undocumented as any other misspelling. A documented name's camelCase
+/// spelling names the same filter ([`crate::state::documented_filter_name`]).
 fn is_documented_filter(name: &str) -> bool {
     name.strip_prefix(TAG_FILTER_PREFIX)
         .is_some_and(|key| !key.is_empty())
-        || DHCP_OPTIONS_FILTERS.contains(&name)
+        || crate::state::documented_filter_name(name, &DHCP_OPTIONS_FILTERS).is_some()
 }
 
 /// The values the EC2 filter `name` compares against this option set.
@@ -392,6 +393,9 @@ fn filter_values<'a>(options: &'a DhcpOptions, name: &str) -> Vec<Cow<'a, str>> 
             .collect();
     }
     let configurations = || options.dhcp_configurations.iter().flatten();
+    // The request's spelling resolved to the documented name, so each attribute is answered
+    // in ONE place whichever spelling selected on it.
+    let name = crate::state::documented_filter_name(name, &DHCP_OPTIONS_FILTERS).unwrap_or(name);
     match name {
         // "The ID of a DHCP options set."
         "dhcp-options-id" => options

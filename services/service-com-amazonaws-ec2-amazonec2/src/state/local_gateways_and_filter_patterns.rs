@@ -913,6 +913,65 @@ pub fn tag_filter_values<'a>(name: &str, tags: &'a [Tag]) -> Option<Vec<Cow<'a, 
     }
 }
 
+/// The filter of `documented` that `name` selects on — `name` itself when it is one of the
+/// documented spellings, and the hyphenated name when `name` is its camelCase spelling;
+/// `None` when the list holds no such filter.
+///
+/// EC2 serves a filter under the camelCase spelling of its name as well as the hyphenated
+/// one, both naming the SAME attribute: it is the spelling the VPC resources' filters were
+/// first published under, several `Filters` members still publish it beside the hyphenated
+/// name ("You can also use `availabilityZone` as the filter name", "You can also use
+/// `cidr` or `cidrBlock` as the filter names" — `DescribeSubnetsRequest$Filters`), and
+/// recorded calls select on VPC resources with it. Resolved in ONE place and not
+/// re-spelled per describe, so a describe reads a single name per attribute whichever
+/// spelling the request carried.
+///
+/// "Filter names are case-sensitive" (`Filter$Name`), so every comparison is exact: only
+/// the camelCase spelling of a documented name resolves ([`is_camel_case_spelling_of`]),
+/// and a name that capitalises or separates its words any other way names no filter at all.
+///
+/// The request's name is compared against the list as it stands, so resolving one costs a
+/// walk of the list and allocates nothing — a describe may ask per candidate it reports.
+pub fn documented_filter_name<'a>(name: &str, documented: &[&'a str]) -> Option<&'a str> {
+    documented
+        .iter()
+        .copied()
+        .find(|entry| *entry == name || is_camel_case_spelling_of(name, entry))
+}
+
+/// Is `name` the camelCase spelling of the hyphenated filter name `documented`?
+///
+/// Each hyphen of the documented name opens the next word, so the hyphen goes and that
+/// word's first letter is capitalised: `vpc-id` is spelled `vpcId`. Everything else must
+/// match exactly — a name that opens with a capital, capitalises after a separator the
+/// documented name keeps (the `.` of a member path), or capitalises a letter the documented
+/// name does not open a word at, is a misspelling rather than a spelling of this name. A
+/// documented name of one word is re-spelled as itself, which the exact comparison in
+/// [`documented_filter_name`] has already answered, so it matches nothing here.
+fn is_camel_case_spelling_of(name: &str, documented: &str) -> bool {
+    if !documented.contains('-') {
+        return false;
+    }
+    let mut spelled = name.chars();
+    let mut opening_a_word = false;
+    for character in documented.chars() {
+        if character == '-' {
+            opening_a_word = true;
+            continue;
+        }
+        let expected = if opening_a_word {
+            character.to_ascii_uppercase()
+        } else {
+            character
+        };
+        opening_a_word = false;
+        if spelled.next() != Some(expected) {
+            return false;
+        }
+    }
+    spelled.next().is_none()
+}
+
 /// Refuse a request member's value the way EC2 does: HTTP 400 `InvalidParameterValue`,
 /// with a message naming the value at fault.
 pub fn invalid_parameter_value<E>(message: impl Into<String>) -> crate::scaffolded::Scaffolded<E> {

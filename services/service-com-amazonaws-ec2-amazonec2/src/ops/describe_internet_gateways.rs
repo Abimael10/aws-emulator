@@ -378,11 +378,13 @@ const INTERNET_GATEWAY_FILTERS: [&str; 5] = [
 /// is matched by [`TAG_FILTER_PREFIX`], the one spelling every describe of this crate reads a
 /// tag filter by, and the key must not be empty: a `tag:` with no key names no tag.
 ///
-/// "Filter names are case-sensitive" (`Filter$Name`), so every other comparison is exact.
+/// "Filter names are case-sensitive" (`Filter$Name`), so every other comparison is exact —
+/// save that a documented name's camelCase spelling names the same filter, resolved for the
+/// whole list by [`crate::state::documented_filter_name`].
 fn filter_name_is_documented(name: &str) -> bool {
     name.strip_prefix(TAG_FILTER_PREFIX)
         .is_some_and(|key| !key.is_empty())
-        || INTERNET_GATEWAY_FILTERS.contains(&name)
+        || crate::state::documented_filter_name(name, &INTERNET_GATEWAY_FILTERS).is_some()
 }
 
 /// The values the EC2 filter `name` compares against this internet gateway.
@@ -413,6 +415,10 @@ fn filter_values<'a>(internet_gateway: &'a InternetGateway, name: &str) -> Vec<C
     }
 
     let attachments = || internet_gateway.attachments.iter().flatten();
+    // The request's spelling resolved to the documented name, so each attribute is answered
+    // in ONE place whichever spelling selected on it.
+    let name =
+        crate::state::documented_filter_name(name, &INTERNET_GATEWAY_FILTERS).unwrap_or(name);
     let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
         value.map(Cow::Borrowed).into_iter().collect()
     };

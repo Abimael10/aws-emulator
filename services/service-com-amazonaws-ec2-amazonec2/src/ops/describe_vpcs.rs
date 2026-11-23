@@ -322,12 +322,12 @@ const DEFAULT_MAX_RESULTS: usize = 1000;
 /// `tag:<key>` is the one name with a variable part, so it is matched by prefix rather
 /// than listed here. Every entry must be answered by [`filter_values`].
 ///
-/// `isDefault` is the one name the member's own list does not carry: EC2 serves the
-/// default-VPC filter under the legacy camelCase spelling as well as the hyphenated
-/// `is-default` the model documents, which is the spelling the EC2 API has always accepted
-/// and which recorded `DescribeVpcs` calls use. Both name the same attribute, so
-/// [`filter_values`] answers them identically.
-const VPC_FILTERS: [&str; 15] = [
+/// The camelCase spelling of each entry selects on the same attribute, resolved for the
+/// whole list by [`crate::state::documented_filter_name`]: EC2 serves the default-VPC
+/// filter as `isDefault` as much as the `is-default` the model documents — the spelling the
+/// VPC resources' filters were first published under, which recorded `DescribeVpcs` calls
+/// use — and the same holds of `vpcId`, `dhcpOptionsId` and `ownerId`.
+const VPC_FILTERS: [&str; 14] = [
     "cidr",
     "cidr-block-association.association-id",
     "cidr-block-association.cidr-block",
@@ -338,7 +338,6 @@ const VPC_FILTERS: [&str; 15] = [
     "ipv6-cidr-block-association.ipv6-pool",
     "ipv6-cidr-block-association.state",
     "is-default",
-    "isDefault",
     "owner-id",
     "state",
     "tag-key",
@@ -351,11 +350,12 @@ const TAG_FILTER_PREFIX: &str = "tag:";
 
 /// Is `name` a filter this operation documents? "Filter names are case-sensitive"
 /// (`Filter$Name`), so the comparison is exact — and a `tag:` prefix with no key names no
-/// tag, so it is as undocumented as any other misspelling.
+/// tag, so it is as undocumented as any other misspelling. A documented name's camelCase
+/// spelling names the same filter ([`crate::state::documented_filter_name`]).
 fn is_documented_filter(name: &str) -> bool {
     name.strip_prefix(TAG_FILTER_PREFIX)
         .is_some_and(|key| !key.is_empty())
-        || VPC_FILTERS.contains(&name)
+        || crate::state::documented_filter_name(name, &VPC_FILTERS).is_some()
 }
 
 /// The values the EC2 filter `name` compares against this VPC.
@@ -363,6 +363,9 @@ fn is_documented_filter(name: &str) -> bool {
 /// A filter naming an attribute this VPC does not carry compares against NO values, so it
 /// selects nothing — the same answer AWS gives for, say,
 /// `ipv6-cidr-block-association.ipv6-pool` on a VPC with no IPv6 CIDR block.
+///
+/// The request's spelling is resolved to the documented name first, so each attribute is
+/// answered in ONE place whichever spelling selected on it.
 fn filter_values<'a>(vpc: &'a Vpc, name: &str) -> Vec<&'a str> {
     if let Some(key) = name.strip_prefix(TAG_FILTER_PREFIX) {
         return vpc
@@ -373,6 +376,8 @@ fn filter_values<'a>(vpc: &'a Vpc, name: &str) -> Vec<&'a str> {
             .filter_map(|tag| tag.value.as_deref())
             .collect();
     }
+
+    let name = crate::state::documented_filter_name(name, &VPC_FILTERS).unwrap_or(name);
 
     let ipv4_associations = || vpc.cidr_block_association_set.iter().flatten();
     let ipv6_associations = || vpc.ipv6_cidr_block_association_set.iter().flatten();
@@ -412,9 +417,8 @@ fn filter_values<'a>(vpc: &'a Vpc, name: &str) -> Vec<&'a str> {
             .collect(),
         // A boolean attribute is filtered on the value a client sends for it, which is how
         // the wire renders it: `true` or `false`. A VPC whose flag is not set carries no
-        // value for the filter to match, like any other absent attribute. Both spellings EC2
-        // serves the filter under answer from the one flag.
-        "is-default" | "isDefault" => vpc
+        // value for the filter to match, like any other absent attribute.
+        "is-default" => vpc
             .is_default
             .map(|is_default| if is_default { "true" } else { "false" })
             .into_iter()

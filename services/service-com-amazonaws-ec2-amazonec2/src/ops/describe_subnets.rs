@@ -359,13 +359,13 @@ const SUBNET_FILTERS: [&str; 24] = [
 /// `availabilityZone` as the filter name", "You can also use `availabilityZoneId` as the
 /// filter name", "You can also use `cidr` or `cidrBlock` as the filter names" and "You can
 /// also use `defaultForAz` as the filter name".
-const SUBNET_FILTER_ALIASES: [(&str, &str); 5] = [
-    ("availabilityZone", "availability-zone"),
-    ("availabilityZoneId", "availability-zone-id"),
-    ("cidr", "cidr-block"),
-    ("cidrBlock", "cidr-block"),
-    ("defaultForAz", "default-for-az"),
-];
+///
+/// Only `cidr` is listed: it ABBREVIATES the name it means rather than re-spelling it, so
+/// nothing about `cidr-block` says it. Every other alternative this member publishes is the
+/// camelCase spelling of a name in [`SUBNET_FILTERS`], which
+/// [`crate::state::documented_filter_name`] resolves for the whole list at once — a subnet
+/// is selected on `vpcId` and `subnetId` as much as on `availabilityZone`.
+const SUBNET_FILTER_ALIASES: [(&str, &str); 1] = [("cidr", "cidr-block")];
 
 /// The prefix of the tag filter: "Use the tag key in the filter name and the tag value as
 /// the filter value" (`DescribeSubnetsRequest$Filters`).
@@ -377,7 +377,9 @@ const TAG_FILTER_PREFIX: &str = "tag:";
 /// "Filter names are case-sensitive" (`Filter$Name`), so every comparison is exact — and a
 /// `tag:` prefix with no key names no tag, so it is as undocumented as any other
 /// misspelling. The `tag:<key>` family keeps its whole name, the key being part of what it
-/// selects on.
+/// selects on. A documented name's camelCase spelling resolves to the name itself, through
+/// the one resolver every EC2 filter name of a VPC resource is read by
+/// ([`crate::state::documented_filter_name`]).
 fn canonical_filter_name(name: &str) -> Option<&str> {
     if name
         .strip_prefix(TAG_FILTER_PREFIX)
@@ -385,8 +387,8 @@ fn canonical_filter_name(name: &str) -> Option<&str> {
     {
         return Some(name);
     }
-    if SUBNET_FILTERS.contains(&name) {
-        return Some(name);
+    if let Some(documented) = crate::state::documented_filter_name(name, &SUBNET_FILTERS) {
+        return Some(documented);
     }
     SUBNET_FILTER_ALIASES
         .iter()
