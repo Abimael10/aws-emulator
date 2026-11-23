@@ -471,7 +471,7 @@ async fn a_service_linked_roles_policies_are_not_removed_by_its_account() {
     // read out of the create's own response, as `tests/all/service_linked_roles.rs`
     // pins the derivation.
     let cases: [(&str, Option<&str>); 3] = [
-        ("networkmonitor.amazonaws.com", None),
+        ("ec2fleet.amazonaws.com", None),
         ("ops.apigateway.amazonaws.com", None),
         ("autoscaling.amazonaws.com", Some("debug")),
     ];

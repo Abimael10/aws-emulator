@@ -36,9 +36,8 @@ struct Case {
     custom_suffix: Option<&'static str>,
 }
 
-/// Rows spanning principals whose role name AWS publishes and principals it does
-/// not, two-, three- and five-label principals, a principal spelled with a leading
-/// capital, and both presence and absence of a `CustomSuffix`.
+/// Rows spanning two-, three- and four-label principals, a principal spelled with a
+/// leading capital, and both presence and absence of a `CustomSuffix`.
 const CASES: &[Case] = &[
     Case {
         service_principal: "elasticbeanstalk.amazonaws.com",
@@ -53,15 +52,15 @@ const CASES: &[Case] = &[
         custom_suffix: Some("1"),
     },
     Case {
-        service_principal: "networkmonitor.amazonaws.com",
+        service_principal: "ec2fleet.amazonaws.com",
         custom_suffix: None,
     },
     Case {
-        service_principal: "Mediaconvert.amazonaws.com",
+        service_principal: "Macie.amazonaws.com",
         custom_suffix: Some("Fleet_7"),
     },
     Case {
-        service_principal: "a.b.c.d.amazonaws.com",
+        service_principal: "dynamodb.application-autoscaling.amazonaws.com",
         custom_suffix: None,
     },
 ];

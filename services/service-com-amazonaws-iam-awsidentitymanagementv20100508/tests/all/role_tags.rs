@@ -464,7 +464,7 @@ async fn the_tag_bound_is_taken_against_the_merged_set() {
 async fn a_service_linked_role_can_be_tagged() {
     let router = router();
     for principal in [
-        "networkmonitor.amazonaws.com",
+        "ec2fleet.amazonaws.com",
         "autoscaling.amazonaws.com",
         "elasticbeanstalk.amazonaws.com",
     ] {

@@ -447,7 +447,7 @@ async fn bounding_a_service_linked_role_is_refused() {
 
     // Rows spanning the service the role is linked to.
     let principals = [
-        "lambda.amazonaws.com",
+        "ecs.amazonaws.com",
         "elasticbeanstalk.amazonaws.com",
         "autoscaling.amazonaws.com",
     ];

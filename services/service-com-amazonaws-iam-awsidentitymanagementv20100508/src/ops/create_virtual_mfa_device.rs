@@ -237,15 +237,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // IAM authorizes its own API: the caller's identity-based policies are evaluated
         // before the device is created and before the store is consulted, on the ARN the
-        // device WOULD carry, with the tags this request attaches handed to the gate — the
-        // same decision the other creates in this crate make. Nothing is created when it
+        // device WOULD carry — which the refusal names too, because the device does not
+        // exist yet — with the tags this request attaches handed to the gate: the same
+        // decision the other creates in this crate make. Nothing is created when it
         // refuses.
         crate::state::authorization::authorize_written(
             &store,
             ctx,
             crate::state::authorization::CREATE_VIRTUAL_MFA_DEVICE,
             &serial_number,
-            &format!("mfa device {}", input.virtual_mfa_device_name),
+            &serial_number,
             crate::state::authorization::WrittenTags::Pairs(tags.as_deref().unwrap_or_default()),
         )?;
 

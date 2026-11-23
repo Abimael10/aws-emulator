@@ -454,7 +454,7 @@ async fn attaching_to_a_service_linked_role_is_refused() {
 
     // Rows spanning the service the role is linked to.
     let principals = [
-        "mediaconvert.amazonaws.com",
+        "macie.amazonaws.com",
         "elasticbeanstalk.amazonaws.com",
         "autoscaling.amazonaws.com",
     ];

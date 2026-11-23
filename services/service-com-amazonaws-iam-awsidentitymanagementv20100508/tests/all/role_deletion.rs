@@ -318,15 +318,14 @@ async fn a_role_that_still_holds_a_policy_is_not_deleted() {
 #[tokio::test]
 async fn a_service_linked_role_is_not_deleted_by_its_account() {
     // (the service principal, the optional CustomSuffix, the role name the create
-    // names) — the naming this crate's `tests/all/service_linked_roles.rs` pins
-    // (AWS's published name for the service, or the derived fallback when AWS
-    // publishes none), written out so this suite asserts against a name rather than
-    // restating the rule.
+    // names) — the naming this crate's `tests/all/service_linked_roles.rs` pins (AWS's
+    // published name for the service, which is the only name a create mints), written
+    // out so this suite asserts against a name rather than restating the rule.
     let cases: [(&str, Option<&str>, &str); 4] = [
         (
-            "networkmonitor.amazonaws.com",
+            "ec2fleet.amazonaws.com",
             None,
-            "AWSServiceRoleForNetworkmonitor",
+            "AWSServiceRoleForEC2Fleet",
         ),
         (
             "ops.apigateway.amazonaws.com",
@@ -339,9 +338,9 @@ async fn a_service_linked_role_is_not_deleted_by_its_account() {
             "AWSServiceRoleForAutoScaling_debug",
         ),
         (
-            "Mediaconvert.amazonaws.com",
+            "Macie.amazonaws.com",
             None,
-            "AWSServiceRoleForMediaconvert",
+            "AWSServiceRoleForAmazonMacie",
         ),
     ];
 

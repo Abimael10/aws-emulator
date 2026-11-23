@@ -88,59 +88,28 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// Whether `aws_service_name` is shaped like a service principal.
-///
-/// `CreateServiceLinkedRole$AWSServiceName`'s documentation describes it as "a
-/// string similar to a URL but without the http:// in front. For example:
-/// elasticbeanstalk.amazonaws.com" — a DNS-style name, so at least two non-empty
-/// dot-separated labels. The modelled `groupNameType` pattern `^[\w+=,.@-]+$`
-/// admits far more than that (a bare word, or one that is all separators), and
-/// those name no service.
-fn is_service_principal(aws_service_name: &str) -> bool {
-    let labels: Vec<&str> = aws_service_name.split('.').collect();
-    labels.len() >= 2 && labels.iter().all(|label| !label.is_empty())
-}
-
 /// The character that joins a `CustomSuffix` to the service-provided prefix, as in
 /// `AWSServiceRoleForElasticBeanstalk_debug`. It is inside `roleNameType`'s
 /// `^[\w+=,.@-]+$`, so a name carrying a suffix is still a legal role name.
 const CUSTOM_SUFFIX_SEPARATOR: char = '_';
 
-/// The fallback name for a principal
-/// [`crate::state::PUBLISHED_SERVICE_LINKED_ROLE_NAMES`] does not name:
-/// [`crate::state::SERVICE_LINKED_ROLE_NAME_PREFIX`] followed by the principal's
-/// first label, capitalised.
+/// How IAM refuses a `CreateServiceLinkedRole` whose `AWSServiceName` names no service
+/// that has a service-linked role.
 ///
-/// AWS's label for such a service is not knowable here, so the name stays a function
-/// of the request alone — the same principal always names the same role, and two
-/// different principals never name one.
-fn derived_service_linked_role_name(service_principal: &str) -> String {
-    let service_label = service_principal
-        .split('.')
-        .next()
-        .unwrap_or(service_principal);
-    let mut role_name = String::from(crate::state::SERVICE_LINKED_ROLE_NAME_PREFIX);
-    let mut characters = service_label.chars();
-    if let Some(first) = characters.next() {
-        role_name.extend(first.to_uppercase());
-        role_name.push_str(characters.as_str());
-    }
-    role_name
+/// Fixed text apart from the value the request supplied, which is copied in exactly as the
+/// request spelled it, since that value is the one thing the caller has to correct.
+fn not_a_valid_service_name(aws_service_name: &str) -> String {
+    format!("{aws_service_name} is not a valid AWS service name (Service Principal)")
 }
 
-/// The name of the service-linked role for `service_principal`, with
-/// `custom_suffix` appended when the request supplied one.
+/// The name of the service-linked role of the service whose published name is
+/// `published_role_name`, with `custom_suffix` appended when the request supplied one.
 ///
-/// The name is the one AWS publishes for that principal where it publishes one
-/// ([`crate::state::published_service_linked_role_name`]), and the derived fallback
-/// otherwise; a `CustomSuffix` is joined to either with [`CUSTOM_SUFFIX_SEPARATOR`],
+/// A `CustomSuffix` is joined to the published name with [`CUSTOM_SUFFIX_SEPARATOR`],
 /// which is what that member's documentation describes ("combined with the
 /// service-provided prefix to form the complete role name").
-fn service_linked_role_name(service_principal: &str, custom_suffix: Option<&str>) -> String {
-    let mut role_name = match crate::state::published_service_linked_role_name(service_principal) {
-        Some(published) => published.to_string(),
-        None => derived_service_linked_role_name(service_principal),
-    };
+fn service_linked_role_name(published_role_name: &str, custom_suffix: Option<&str>) -> String {
+    let mut role_name = published_role_name.to_string();
     if let Some(custom_suffix) = custom_suffix {
         role_name.push(CUSTOM_SUFFIX_SEPARATOR);
         role_name.push_str(custom_suffix);
@@ -228,25 +197,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A service-linked role is linked to a SERVICE, named by its principal, so
-        // a value that does not name one cannot be linked to anything.
-        if !is_service_principal(&input.aws_service_name) {
-            return Err(CreateServiceLinkedRoleErrorModeled::InvalidInputException(
-                InvalidInputException {
-                    message: Some(format!(
-                        "AWSServiceName must be a service principal, such as \
-                         elasticbeanstalk.amazonaws.com; got {}",
-                        input.aws_service_name
-                    )),
-                },
-            )
-            .into());
-        }
+        // A service-linked role is "linked to a specific Amazon Web Services service", and
+        // only a service that HAS such a role has one to link: IAM mints one for a service
+        // principal that has registered a service-linked role with it, and refuses every
+        // other value as naming no AWS service at all — HTTP 403 `AccessDenied`, since no
+        // modelled client error of this operation covers it. The registry is the catalog of
+        // the role AWS publishes per service principal
+        // (`crate::state::PUBLISHED_SERVICE_LINKED_ROLE_NAMES`), which is the same table
+        // that NAMES the role: a principal it does not carry has no registered role to mint
+        // and no name AWS publishes for one, so nothing is written and nothing appears
+        // under the path IAM reserves for such roles.
+        let Some(published_role_name) =
+            crate::state::published_service_linked_role_name(&input.aws_service_name)
+        else {
+            return Err(crate::scaffolded::Scaffolded::access_denied(
+                not_a_valid_service_name(&input.aws_service_name),
+            ));
+        };
 
         let role_name =
-            service_linked_role_name(&input.aws_service_name, input.custom_suffix.as_deref());
-        // The derived name has to BE a role name: `roleNameType` bounds it at 64
-        // characters, which a long principal or a long suffix can carry it past.
+            service_linked_role_name(published_role_name, input.custom_suffix.as_deref());
+        // The name has to BE a role name: `roleNameType` bounds it at 64 characters, which
+        // a long `CustomSuffix` can carry it past.
         if role_name.chars().count() > crate::state::MAX_ROLE_NAME_CHARACTERS {
             return Err(CreateServiceLinkedRoleErrorModeled::InvalidInputException(
                 InvalidInputException {
@@ -266,15 +238,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // IAM authorizes its own API: the caller's identity-based policies are evaluated
         // before the role is created, and before the store is consulted for a name
         // collision — so a caller that may not create a service-linked role learns that it
-        // may not, never which names the account already holds. The decision is made on
-        // the ARN the role WOULD carry, and the refusal names it as the create names it.
-        // Nothing is created when it refuses.
+        // may not, never which names the account already holds. The decision is made on the
+        // ARN the role WOULD carry, and the refusal names that same ARN, because the role
+        // does not exist yet. Nothing is created when it refuses.
+        let created_arn = crate::state::role_arn(&path, &role_name);
         crate::state::authorization::authorize_named(
             &store,
             ctx,
             crate::state::authorization::CREATE_SERVICE_LINKED_ROLE,
-            &crate::state::role_arn(&path, &role_name),
-            &format!("role {role_name}"),
+            &created_arn,
+            &created_arn,
         )?;
 
         // IAM entity names are unique within the account and "are not

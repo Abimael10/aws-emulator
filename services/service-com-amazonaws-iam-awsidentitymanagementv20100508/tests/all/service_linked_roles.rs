@@ -8,9 +8,9 @@
 //! reads a request the same way.
 //!
 //! Each test is a TABLE whose rows differ along what the rule generalises over:
-//! whether AWS publishes a role name for the service principal, the principal's
-//! label count and case, whether a `CustomSuffix` is supplied, whether a
-//! `Description` is, and the length of the name the request derives.
+//! whether the service principal has a service-linked role registered at all, the
+//! principal's label count and case, whether a `CustomSuffix` is supplied, whether a
+//! `Description` is, and the length of the name the request names.
 
 use crate::user_lifecycle::{account_id, call, element, elements, error_code, router};
 
@@ -18,10 +18,8 @@ use crate::user_lifecycle::{account_id, call, element, elements, error_code, rou
 /// `Description`, and the role name the request therefore names.
 ///
 /// The expected name is written out per row rather than recomputed, so the table
-/// pins the naming instead of restating it: the name AWS publishes for that service
-/// where it publishes one, the service-provided prefix `AWSServiceRoleFor` plus the
-/// principal's first label capitalised where it does not, and `_` plus the custom
-/// suffix when one is supplied.
+/// pins the naming instead of restating it: the name AWS publishes for that service,
+/// and `_` plus the custom suffix when one is supplied.
 struct Case {
     service_principal: &'static str,
     custom_suffix: Option<&'static str>,
@@ -29,11 +27,11 @@ struct Case {
     expected_role_name: &'static str,
 }
 
-/// Rows spanning principals whose role name AWS publishes (including names nothing
-/// like the principal's first label, and one carrying a `_` of its own) and
-/// principals it does not, two- and three-label principals, an already-capitalised
-/// label, a label carrying `_`, suffixes of different shapes, and both presence and
-/// absence of `Description`.
+/// Rows spanning principals whose published role name is nothing like the
+/// principal's first label and one carrying a `_` of its own, two- and three-label
+/// principals, a principal spelled with a leading capital, a label carrying a digit
+/// and a hyphen, suffixes of different shapes, and both presence and absence of
+/// `Description`.
 const CASES: &[Case] = &[
     // Published: AWS SSM for SAP's role, the one a client confirms with `GetRole`
     // before `RegisterApplication`.
@@ -78,25 +76,28 @@ const CASES: &[Case] = &[
         description: Some("Allows Elastic Beanstalk to manage resources"),
         expected_role_name: "AWSServiceRoleForElasticBeanstalk",
     },
-    // Not published: the derived fallback, all this emulator can know for a
-    // principal no published name covers.
+    // A published name nothing like the principal's label, as every row below is.
     Case {
-        service_principal: "networkmonitor.amazonaws.com",
+        service_principal: "ec2fleet.amazonaws.com",
         custom_suffix: None,
         description: None,
-        expected_role_name: "AWSServiceRoleForNetworkmonitor",
+        expected_role_name: "AWSServiceRoleForEC2Fleet",
     },
+    // The principal spelled with a leading capital: a service principal addresses
+    // the same service however its ASCII case is spelled.
     Case {
-        service_principal: "Mediaconvert.amazonaws.com",
+        service_principal: "Macie.amazonaws.com",
         custom_suffix: Some("Fleet_7"),
         description: None,
-        expected_role_name: "AWSServiceRoleForMediaconvert_Fleet_7",
+        expected_role_name: "AWSServiceRoleForAmazonMacie_Fleet_7",
     },
+    // A label carrying a hyphen and the service's API version, which the published
+    // name carries neither of.
     Case {
-        service_principal: "sms_voice.amazonaws.com",
+        service_principal: "resource-explorer-2.amazonaws.com",
         custom_suffix: None,
         description: None,
-        expected_role_name: "AWSServiceRoleForSms_voice",
+        expected_role_name: "AWSServiceRoleForResourceExplorer",
     },
 ];
 
@@ -138,8 +139,7 @@ fn create_params(case: &Case) -> Vec<(&'static str, &'static str)> {
 }
 
 /// RULE: `CreateServiceLinkedRole` mints and persists the role the request names —
-/// the name AWS publishes for that service principal, or `AWSServiceRoleFor<Label>`
-/// derived from the principal when AWS publishes none, with `_<CustomSuffix>` when
+/// the name AWS publishes for that service principal, with `_<CustomSuffix>` when
 /// one is supplied,
 /// filed under `/aws-service-role/<service principal>/` with the ARN built from
 /// that path and name, carrying a trust policy that lets the named service
@@ -420,15 +420,18 @@ async fn a_second_create_for_the_same_service_needs_a_different_suffix() {
     }
 }
 
-/// RULE: `AWSServiceName` names a SERVICE PRINCIPAL — a DNS-style name of at least
-/// two non-empty dot-separated labels — so a value that names no service is
-/// refused with `InvalidInput` (HTTP 400) and no role is created.
+/// RULE: `CreateServiceLinkedRole` mints a role only for a service principal that
+/// has a service-linked role registered with IAM, so a value naming no such service
+/// — whatever shape it takes — is refused with HTTP 403 `AccessDenied` and AWS's
+/// sentence naming the value the request supplied, and no role is created.
 #[tokio::test]
-async fn a_name_that_is_not_a_service_principal_is_refused() {
+async fn a_principal_with_no_registered_service_linked_role_is_refused() {
     let router = router();
 
     // Rows: a bare label, a trailing empty label, a leading empty label, an inner
-    // empty label, and nothing but separators. Each is inside the modelled
+    // empty label, nothing but separators, a DNS-style name naming no service at all,
+    // and an AWS service that has no service-linked role (AWS Elemental MediaConvert
+    // acts through a role the customer creates). Each is inside the modelled
     // `groupNameType` pattern ^[\w+=,.@-]+$, so each reaches the handler.
     let refused = [
         "networkmonitor",
@@ -436,6 +439,8 @@ async fn a_name_that_is_not_a_service_principal_is_refused() {
         ".amazonaws.com",
         "networkmonitor..com",
         "..",
+        "not-a-real-service.amazonaws.com",
+        "mediaconvert.amazonaws.com",
     ];
     for name in refused {
         let (status, body) = call(
@@ -444,20 +449,28 @@ async fn a_name_that_is_not_a_service_principal_is_refused() {
             &[("AWSServiceName", name)],
         )
         .await;
-        assert_eq!(status, 400, "case {name:?}: expected 400, got {status}: {body}");
+        assert_eq!(status, 403, "case {name:?}: expected 403, got {status}: {body}");
         assert_eq!(
             error_code(&body),
-            "InvalidInput",
-            "case {name:?}: expected InvalidInput, got {:?}",
+            "AccessDenied",
+            "case {name:?}: expected AccessDenied, got {:?}",
             error_code(&body)
+        );
+        let expected = format!("{name} is not a valid AWS service name (Service Principal)");
+        assert_eq!(
+            element(&body, "Message"),
+            expected,
+            "case {name:?}: expected the message {expected:?}, got {:?}",
+            element(&body, "Message")
         );
     }
 
-    // Nothing was stored for any of them: the name the refused requests would
-    // have derived is still absent.
+    // Nothing was stored for any of them: no role carries a name built from the
+    // values the refused requests named.
     for absent in [
         "AWSServiceRoleForNetworkmonitor",
         "AWSServiceRoleForAmazonaws",
+        "AWSServiceRoleForMediaconvert",
         "AWSServiceRoleFor",
     ] {
         let (status, body) = call(&router, "GetRole", &[("RoleName", absent)]).await;
@@ -467,57 +480,66 @@ async fn a_name_that_is_not_a_service_principal_is_refused() {
         );
     }
 
-    // And a principal that IS DNS-style is accepted, including one with many
-    // labels.
-    for accepted in ["networkmonitor.amazonaws.com", "a.b.c.d.amazonaws.com"] {
+    // And nothing is listed under the path IAM reserves for service-linked roles.
+    let (status, listed) = call(
+        &router,
+        "ListRoles",
+        &[("PathPrefix", "/aws-service-role/")],
+    )
+    .await;
+    assert_eq!(status, 200, "expected the listing to be served, got {status}: {listed}");
+    assert!(
+        elements(&listed, "RoleName").is_empty(),
+        "expected no role under the service-linked role path, got {:?}",
+        elements(&listed, "RoleName")
+    );
+
+    // A principal that DOES have a registered role is minted in the same account, so
+    // the refusals above are about the value and not about the operation.
+    let (status, body) = call(
+        &router,
+        "CreateServiceLinkedRole",
+        &[("AWSServiceName", "autoscaling.amazonaws.com")],
+    )
+    .await;
+    assert_eq!(status, 200, "expected a registered principal to be served, got {status}: {body}");
+    assert_eq!(
+        element(&body, "RoleName"),
+        "AWSServiceRoleForAutoScaling",
+        "expected the published role name, got {:?}",
+        element(&body, "RoleName")
+    );
+}
+
+/// RULE: the name a create files the role under has to BE a role name, so one a
+/// `CustomSuffix` carries past `roleNameType`'s 64-character bound is refused with
+/// `InvalidInput` (HTTP 400), while a name AT the bound is created.
+#[tokio::test]
+async fn a_name_past_the_published_bound_is_refused() {
+    const MAX_ROLE_NAME: usize =
+        service_com_amazonaws_iam_awsidentitymanagementv20100508::state::MAX_ROLE_NAME_CHARACTERS;
+    /// The principal every row creates for, and the name AWS publishes for it, whose
+    /// length is what the suffix is measured against.
+    const PRINCIPAL: &str = "autoscaling.amazonaws.com";
+    const PUBLISHED_NAME: &str = "AWSServiceRoleForAutoScaling";
+
+    // The suffix length that lands the name exactly ON the bound, and the one that
+    // lands it one past: the separator between the published name and the suffix
+    // counts toward the name.
+    let at_bound = "s".repeat(MAX_ROLE_NAME - PUBLISHED_NAME.len() - 1);
+    let past_bound = "s".repeat(MAX_ROLE_NAME - PUBLISHED_NAME.len());
+
+    let cases: &[(&str, u16)] = &[(at_bound.as_str(), 200), (past_bound.as_str(), 400)];
+
+    for (suffix, expected) in cases {
+        let router = router();
         let (status, body) = call(
             &router,
             "CreateServiceLinkedRole",
-            &[("AWSServiceName", accepted)],
+            &[("AWSServiceName", PRINCIPAL), ("CustomSuffix", suffix)],
         )
         .await;
-        assert_eq!(status, 200, "case {accepted:?}: expected 200, got {status}: {body}");
-    }
-}
-
-/// RULE: the name a create derives has to be a role name, so one past
-/// `roleNameType`'s 64-character bound is refused with `InvalidInput` (HTTP 400),
-/// while a name AT the bound is created.
-#[tokio::test]
-async fn a_derived_name_past_the_published_bound_is_refused() {
-    const MAX_ROLE_NAME: usize =
-        service_com_amazonaws_iam_awsidentitymanagementv20100508::state::MAX_ROLE_NAME_CHARACTERS;
-    /// `AWSServiceRoleFor`, the service-provided prefix every derived name starts
-    /// with.
-    const PREFIX: usize = 17;
-
-    let router = router();
-
-    // The label length that lands the derived name exactly ON the bound, and the
-    // one that lands it one past.
-    let at_bound = "a".repeat(MAX_ROLE_NAME - PREFIX);
-    let past_bound = "a".repeat(MAX_ROLE_NAME - PREFIX + 1);
-    // The same bound reached through a `CustomSuffix` instead: the separator plus
-    // the suffix counts toward the name.
-    let suffix_at_bound = "s".repeat(MAX_ROLE_NAME - PREFIX - "svc".len() - 1);
-    let suffix_past_bound = "s".repeat(MAX_ROLE_NAME - PREFIX - "svc".len());
-    let at_bound_principal = format!("{at_bound}.amazonaws.com");
-    let past_bound_principal = format!("{past_bound}.amazonaws.com");
-
-    let cases: &[(&str, Option<&str>, u16)] = &[
-        (at_bound_principal.as_str(), None, 200),
-        (past_bound_principal.as_str(), None, 400),
-        ("svc.amazonaws.com", Some(suffix_at_bound.as_str()), 200),
-        ("svc.amazonaws.com", Some(suffix_past_bound.as_str()), 400),
-    ];
-
-    for (principal, suffix, expected) in cases {
-        let mut params = vec![("AWSServiceName", *principal)];
-        if let Some(suffix) = suffix {
-            params.push(("CustomSuffix", suffix));
-        }
-        let (status, body) = call(&router, "CreateServiceLinkedRole", &params).await;
-        let case = format!("{principal} + {suffix:?}");
+        let case = format!("a {}-character suffix", suffix.len());
         assert_eq!(
             status, *expected,
             "case {case:?}: expected {expected}, got {status}: {body}"
@@ -552,7 +574,7 @@ async fn reading_a_role_the_account_does_not_hold_is_not_found() {
     let (status, body) = call(
         &router,
         "CreateServiceLinkedRole",
-        &[("AWSServiceName", "networkmonitor.amazonaws.com")],
+        &[("AWSServiceName", "ec2fleet.amazonaws.com")],
     )
     .await;
     assert_eq!(status, 200, "expected the fixture create to succeed, got {status}: {body}");
@@ -562,8 +584,8 @@ async fn reading_a_role_the_account_does_not_hold_is_not_found() {
     let longest = "r".repeat(64);
     for absent in [
         "nobody",
-        "AWSServiceRoleForNetworkmonito",
-        "AWSServiceRoleForNetworkmonitors",
+        "AWSServiceRoleForEC2Flee",
+        "AWSServiceRoleForEC2Fleets",
         longest.as_str(),
     ] {
         let (status, body) = call(&router, "GetRole", &[("RoleName", absent)]).await;

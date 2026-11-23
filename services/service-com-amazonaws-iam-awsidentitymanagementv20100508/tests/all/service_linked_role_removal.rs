@@ -47,8 +47,8 @@ struct DeletionCase {
 }
 
 /// Rows spanning a role the account created and one only the owning service keeps
-/// provisioned, published and derived names, two- and three-label principals, and both
-/// presence and absence of a `CustomSuffix`.
+/// provisioned, two- and three-label principals, and both presence and absence of a
+/// `CustomSuffix`.
 const DELETION_CASES: &[DeletionCase] = &[
     // The role of the service the recorded lifecycle polls for: created by the account.
     DeletionCase {
@@ -72,12 +72,12 @@ const DELETION_CASES: &[DeletionCase] = &[
         created_by_the_account: true,
         role_name: "AWSServiceRoleForAutoScaling_debug",
     },
-    // A principal AWS publishes no name for, so the name is the derived one.
+    // Another service's own role, created by the account.
     DeletionCase {
-        service_principal: "networkmonitor.amazonaws.com",
+        service_principal: "ec2fleet.amazonaws.com",
         custom_suffix: None,
         created_by_the_account: true,
-        role_name: "AWSServiceRoleForNetworkmonitor",
+        role_name: "AWSServiceRoleForEC2Fleet",
     },
     // A three-label principal whose published name names the service rather than the
     // principal's first label, provisioned rather than created.
@@ -446,8 +446,8 @@ async fn the_reported_role_details_are_one_member_per_role_the_account_holds() {
 /// the same documentation `src/state.rs`'s `SERVICE_LINKED_ROLE_POLICIES` cites. Rows
 /// span a service whose policy is named for the service (Elastic Load Balancing,
 /// Amazon ECS), one whose policy name carries a prefix the principal does not
-/// (AWS Support), the Auto Scaling row the recorded suite reads, and two services AWS
-/// publishes no policy name this emulator carries for.
+/// (AWS Support), the Auto Scaling row the recorded suite reads, and two services whose
+/// service-linked role AWS publishes no policy name this emulator carries for.
 const POLICY_ROWS: &[(&str, Option<&str>)] = &[
     (
         "elasticloadbalancing.amazonaws.com",
@@ -456,8 +456,8 @@ const POLICY_ROWS: &[(&str, Option<&str>)] = &[
     ("ecs.amazonaws.com", Some("AmazonECSServiceRolePolicy")),
     ("support.amazonaws.com", Some("AWSSupportServiceRolePolicy")),
     ("autoscaling.amazonaws.com", Some("AutoScalingServiceRolePolicy")),
-    ("networkmonitor.amazonaws.com", None),
-    ("mediaconvert.amazonaws.com", None),
+    ("ec2fleet.amazonaws.com", None),
+    ("globalaccelerator.amazonaws.com", None),
 ];
 
 /// RULE: "the service controls the attached policies" of a service-linked role, so the

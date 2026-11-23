@@ -377,7 +377,7 @@ async fn updating_a_service_linked_roles_description_is_served() {
     // `state::PUBLISHED_SERVICE_LINKED_ROLE_NAMES`, the catalog
     // `tests/all/service_provisioned_roles.rs` pins).
     let principals = [
-        "lambda.amazonaws.com",
+        "ecs.amazonaws.com",
         "elasticbeanstalk.amazonaws.com",
         "autoscaling.amazonaws.com",
     ];

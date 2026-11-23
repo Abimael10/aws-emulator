@@ -609,7 +609,7 @@ async fn removing_a_binding_the_account_does_not_hold_is_no_such_entity() {
 const PRINCIPALS: &[&str] = &[
     "autoscaling.amazonaws.com",
     "elasticbeanstalk.amazonaws.com",
-    "networkmonitor.amazonaws.com",
+    "ec2fleet.amazonaws.com",
 ];
 
 #[tokio::test]

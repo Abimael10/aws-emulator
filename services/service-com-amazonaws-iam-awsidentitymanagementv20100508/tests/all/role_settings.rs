@@ -497,7 +497,7 @@ async fn updating_a_service_linked_roles_settings_is_served() {
 
     // Rows spanning the service the role is linked to.
     let principals = [
-        "lambda.amazonaws.com",
+        "ecs.amazonaws.com",
         "elasticbeanstalk.amazonaws.com",
         "autoscaling.amazonaws.com",
     ];

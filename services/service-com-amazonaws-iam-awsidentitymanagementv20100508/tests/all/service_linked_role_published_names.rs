@@ -63,12 +63,10 @@ const ASSIGNED_NAMES: &[(&str, &str)] = &[
 
 /// The name a MECHANICAL transformation of the principal would produce: the
 /// service-provided prefix followed by the principal's first label with only its
-/// initial letter upper-cased — the fallback
-/// `src/ops/create_service_linked_role.rs` documents for a principal AWS assigns no
-/// name to.
+/// initial letter upper-cased.
 ///
-/// Written out here so each row can assert that this name is NOT what addresses the
-/// role when AWS assigns the service one of its own.
+/// No role is ever named this way — the name belongs to the SERVICE — so it is written
+/// out here for each row to assert that this name addresses nothing.
 fn mechanically_derived_name(service_principal: &str) -> String {
     let label = service_principal
         .split('.')
@@ -249,12 +247,13 @@ async fn each_service_is_assigned_exactly_one_addressable_role_name() {
     }
 }
 
-/// RULE: the assigned name is the SERVICE's, not this emulator's, so a principal AWS
-/// assigns no name to is all the fallback can cover: the create files the role under
-/// the derived name, `GetRole` resolves it there, and a mixed-case name AWS might
-/// have assigned it addresses no role.
+/// RULE: the assigned name is the SERVICE's, not this emulator's, so a principal no
+/// service has registered a service-linked role under is refused — HTTP 403
+/// `AccessDenied`, naming the value the request supplied — and no role is filed under
+/// any name: neither a mechanical transformation of the principal nor a name a reader
+/// might have guessed AWS assigned.
 #[tokio::test]
-async fn a_service_aws_assigns_no_name_to_falls_back_to_the_derived_name() {
+async fn a_principal_no_service_registered_a_role_under_is_refused() {
     // Rows: a one-word label, a hyphenated two-word label, and a label carrying a
     // digit — none of them in the catalog, each paired with a name a reader might
     // guess AWS had assigned. Each guess differs from the derived name by more than
@@ -281,46 +280,44 @@ async fn a_service_aws_assigns_no_name_to_falls_back_to_the_derived_name() {
         let router = router();
         let derived = mechanically_derived_name(service_principal);
 
-        let (status, created) = call(
+        let (status, body) = call(
             &router,
             "CreateServiceLinkedRole",
             &[("AWSServiceName", service_principal)],
         )
         .await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: expected the create to answer 200, got {status}: {created}"
-        );
-        assert_eq!(
-            element(&created, "RoleName"),
-            derived,
-            "case {case:?}: expected the derived name {derived:?}, got {:?}",
-            element(&created, "RoleName")
-        );
-
-        let (status, fetched) = call(&router, "GetRole", &[("RoleName", derived.as_str())]).await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: expected GetRole on {derived:?} to answer 200, got {status}: {fetched}"
-        );
-        assert_eq!(
-            element(&fetched, "RoleId"),
-            element(&created, "RoleId"),
-            "case {case:?}: expected the created role to be the one read back, got {:?}",
-            element(&fetched, "RoleId")
-        );
-
-        let (status, body) = call(&router, "GetRole", &[("RoleName", guessed_name)]).await;
-        assert_eq!(
-            status, 404,
-            "case {case:?}: expected GetRole on the unassigned {guessed_name:?} to answer 404, \
-             got {status}: {body}"
+            status, 403,
+            "case {case:?}: expected the create to be refused 403, got {status}: {body}"
         );
         assert_eq!(
             error_code(&body),
-            "NoSuchEntity",
-            "case {case:?}: expected NoSuchEntity for {guessed_name:?}, got {:?}",
+            "AccessDenied",
+            "case {case:?}: expected AccessDenied, got {:?}",
             error_code(&body)
         );
+        let expected = format!("{service_principal} is not a valid AWS service name (Service Principal)");
+        assert_eq!(
+            element(&body, "Message"),
+            expected,
+            "case {case:?}: expected the message {expected:?}, got {:?}",
+            element(&body, "Message")
+        );
+
+        // Nothing was filed: neither the name a transformation of the principal would
+        // produce nor the one a reader might have guessed addresses a role.
+        for absent in [derived.as_str(), *guessed_name] {
+            let (status, body) = call(&router, "GetRole", &[("RoleName", absent)]).await;
+            assert_eq!(
+                status, 404,
+                "case {case:?}: expected GetRole on {absent:?} to answer 404, got {status}: {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "NoSuchEntity",
+                "case {case:?}: expected NoSuchEntity for {absent:?}, got {:?}",
+                error_code(&body)
+            );
+        }
     }
 }

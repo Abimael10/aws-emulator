@@ -311,6 +311,22 @@ const CURRENT_TIME_KEY: &str = "aws:CurrentTime";
 /// in epoch or Unix time".
 const EPOCH_TIME_KEY: &str = "aws:EpochTime";
 
+/// The condition key carrying the Region the request was made TO: "`aws:RequestedRegion` —
+/// the Region that was called in the request", which is what a clause scoping a grant to
+/// one Region compares against.
+const REQUESTED_REGION_KEY: &str = "aws:RequestedRegion";
+
+/// The Region every request to this service was made to, whatever Region the caller
+/// addressed it from: the one the single global IAM endpoint lives in.
+///
+/// IAM is a GLOBAL service — one endpoint for the whole partition, in the Region
+/// [`super::IAM_CONSOLE_REGION`] names — so a call signed for any other Region is still a
+/// call made to that one endpoint, and the Region it REQUESTED is that endpoint's. The
+/// Region a request named in its SigV4 credential scope is therefore not what this key
+/// answers, and the same signed request decides the same way wherever the client was
+/// configured.
+const REQUESTED_REGION: &str = super::IAM_CONSOLE_REGION;
+
 /// The keys every request to this gate models about ITSELF: the tags it writes, the
 /// address it was made from, the transport it arrived over and the instant it is decided
 /// at.
@@ -318,7 +334,9 @@ const EPOCH_TIME_KEY: &str = "aws:EpochTime";
 /// Published for every call, because each is answered from the call itself — a request
 /// that writes no tag carries no `aws:RequestTag/` and no `aws:TagKeys` value, which is
 /// exactly what a clause over one of them is then decided from, while the connection and
-/// the clock always have an answer.
+/// the clock always have an answer. [`REQUESTED_REGION_KEY`] is published beside them for
+/// a decision about THIS request, and left undeclared for one about a request nobody has
+/// made yet ([`request_context`]).
 const PUBLISHED_REQUEST_KEYS: &[&str] = &[
     REQUEST_TAG_PREFIX,
     TAG_KEYS_KEY,
@@ -430,9 +448,8 @@ impl Connection {
 /// Every OTHER key stays undeclared, and a clause over one of those is left UNDECIDED by
 /// the evaluation — fail-closed in both directions — because for those absence from the
 /// context means this emulator does not model the key rather than that the request carries
-/// no value for it: a real signed request does carry `aws:PrincipalArn`,
-/// `aws:RequestedRegion` and their peers, and this gate must not decide a clause over them
-/// from their absence here.
+/// no value for it: a real signed request does carry `aws:PrincipalArn` and its peers, and
+/// this gate must not decide a clause over them from their absence here.
 const PUBLISHED_ABSENT_KEYS: &[&str] = &[
     "aws:PrincipalOrgID",
     "aws:PrincipalOrgPaths",
@@ -562,8 +579,9 @@ fn principal_tags(role: &Role, session_tags: &[(String, String)]) -> Vec<(String
 ///
 /// The keys it fills are the caller's own ([`PUBLISHED_PRINCIPAL_KEYS`]), the target's
 /// ([`PUBLISHED_RESOURCE_TAG_KEYS`], both spellings of the one tag set), the request's own
-/// tags, the `connection` it arrived on and the clock's ([`PUBLISHED_REQUEST_KEYS`]). The
-/// resource-tag families are
+/// tags, the `connection` it arrived on, the Region it was made to when it is a request at
+/// all ([`REQUESTED_REGION_KEY`]) and the clock's
+/// ([`PUBLISHED_REQUEST_KEYS`]). The resource-tag families are
 /// DECLARED only for a resource whose tag set the account knows in full; for an ARN naming
 /// nothing it holds, a clause over one of its tags stays undecided, which is the
 /// fail-closed reading the shared evaluation gives every key this emulator cannot answer
@@ -590,6 +608,7 @@ fn request_context(
     written: WrittenTags<'_>,
     policy_arn: Option<&str>,
     connection: &Connection,
+    requested_region: Option<&str>,
 ) -> (Vec<(String, String)>, Vec<&'static str>) {
     let mut context = Vec::new();
     let mut published = Vec::new();
@@ -658,6 +677,18 @@ fn request_context(
     // Where the call came from and how it arrived, read from the connection and from
     // nothing the request's own parameters say ([`Connection`]).
     context.extend(connection.context());
+    // The Region the call was made TO, for a decision about THIS request: for this global
+    // service that is the Region its one endpoint lives in, whatever Region the caller
+    // addressed ([`REQUESTED_REGION`]). A decision about a request nobody has made yet is
+    // handed `None` and the key stays undeclared, because the Region such a request would
+    // address is not this one's.
+    if let Some(requested_region) = requested_region {
+        context.push((
+            REQUESTED_REGION_KEY.to_string(),
+            requested_region.to_string(),
+        ));
+        published.push(REQUESTED_REGION_KEY);
+    }
     let now = super::now();
     // The instant the call is decided at, in the two spellings IAM publishes it under.
     if let Ok(stated) = now.fmt(::aws_smithy_types::date_time::Format::DateTime) {
@@ -692,11 +723,17 @@ pub fn authorize(
 /// the ARN the decision is made against (`resource`).
 ///
 /// A denial reports "the resource the request was made on" ("Troubleshoot access denied
-/// error messages", IAM User Guide), and for a request that addresses a single entity by
-/// name that is the entity, not the collection it lives in — so such an operation words
-/// it as the entity's TYPE followed by the name the request carried (`user Bob`), with the
-/// type that disambiguates which entity a name belongs to. The ARN stays what the DECISION
-/// is made against, because a policy statement's `Resource` matches ARNs.
+/// error messages", IAM User Guide), and for a request that addresses an entity the account
+/// ALREADY HOLDS that is the entity, not the collection it lives in — so such an operation
+/// words it as the entity's TYPE followed by the name the request carried (`user Bob`),
+/// with the type that disambiguates which entity a name belongs to. The ARN stays what the
+/// DECISION is made against, because a policy statement's `Resource` matches ARNs.
+///
+/// A CREATE has no such entity to name: the request is made on the entity it is creating,
+/// which does not exist yet, so the only name the refusal can carry for it is the ARN it
+/// WOULD have — the very value the decision is made against. Those operations therefore
+/// take [`authorize`], or hand that ARN in for both, and the refusals of a create and of a
+/// read of the same entity differ in exactly that.
 pub fn authorize_named(
     store: &IamState,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
@@ -789,6 +826,7 @@ fn authorize_request(
         written,
         policy_arn,
         &Connection::of(ctx.parts()),
+        Some(REQUESTED_REGION),
     );
 
     let principals = [principal.clone()];
@@ -1066,6 +1104,11 @@ pub fn delegation_permission_check(
             // call: it carries no request parameter, so no managed policy ARN either.
             None,
             &connection,
+            // Nor any Region: an ask names a resource of another service that no request
+            // has addressed yet, so the Region such a request would be made to is not this
+            // call's, and a grant conditioned on it stays undecided — which is what makes
+            // the answer the third value rather than a verdict.
+            None,
         );
         let request = iam::Request::new(action, resource, &principals)
             .with_context(&ask_context)

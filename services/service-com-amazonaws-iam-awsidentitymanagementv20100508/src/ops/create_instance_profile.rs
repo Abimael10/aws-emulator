@@ -212,15 +212,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // IAM authorizes its own API: the caller's identity-based policies are evaluated
         // before the profile is created and before the store is consulted, on the ARN the
-        // profile WOULD carry, with the tags this request attaches handed to the gate — the
-        // same decision the other creates in this crate make. Nothing is created when it
+        // profile WOULD carry — which the refusal names too, because the profile does not
+        // exist yet — with the tags this request attaches handed to the gate: the same
+        // decision the other creates in this crate make. Nothing is created when it
         // refuses.
+        let created_arn = crate::state::instance_profile_arn(&path, &input.instance_profile_name);
         crate::state::authorization::authorize_written(
             &store,
             ctx,
             crate::state::authorization::CREATE_INSTANCE_PROFILE,
-            &crate::state::instance_profile_arn(&path, &input.instance_profile_name),
-            &format!("instance profile {}", input.instance_profile_name),
+            &created_arn,
+            &created_arn,
             crate::state::authorization::WrittenTags::Pairs(tags.as_deref().unwrap_or_default()),
         )?;
 

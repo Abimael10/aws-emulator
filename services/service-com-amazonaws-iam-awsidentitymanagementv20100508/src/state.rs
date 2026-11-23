@@ -1963,8 +1963,20 @@ pub const POLICY_LANGUAGE_VERSION: &str = "2012-10-17";
 /// IAM model carries that label — `CreateServiceLinkedRole$CustomSuffix`'s
 /// documentation only says a suffix "is combined with the service-provided prefix to
 /// form the complete role name" — so the published names are listed here, and a
-/// principal this list does not name falls back to the name
-/// `CreateServiceLinkedRole` derives.
+/// principal this list does not name is one no service has registered a
+/// service-linked role under: `CreateServiceLinkedRole` refuses it rather than
+/// inventing a name AWS publishes for nothing.
+///
+/// This is therefore the REGISTRY of the services that have a service-linked role as
+/// well as the table of what each is called: the two are one fact, and the create
+/// resolves both from here.
+///
+/// It is also, deliberately, a PARTIAL mirror of what AWS publishes — the services this
+/// emulator has met, each with the name its own documentation gives. So a legitimate
+/// service principal this table does not carry yet is refused where AWS would mint, and
+/// that refusal is a MISSING ROW rather than modelled behaviour: the fix is to add the
+/// row, with the name that service's "Using service-linked roles for <service>" page
+/// publishes, in its sorted place — never to let the create invent a name for it.
 ///
 /// This is also the catalog of the roles the OWNING SERVICE keeps provisioned in
 /// the account ([`service_provisioned_role`]), which is why it lives beside the
@@ -2097,6 +2109,17 @@ pub const PUBLISHED_SERVICE_LINKED_ROLE_NAMES: &[(&str, &str)] = &[
     ),
     ("lex.amazonaws.com", "AWSServiceRoleForLexBots"),
     ("macie.amazonaws.com", "AWSServiceRoleForAmazonMacie"),
+    // [model] service-com-amazonaws-mgn-applicationmigrationservice
+    // `src/state/account_initialization.rs`: an account initialization establishes
+    // this service's own service-linked role for the principal `mgn.amazonaws.com`
+    // before it will serve, which is the prerequisite "Using service-linked roles for
+    // Application Migration Service" names AWSServiceRoleForApplicationMigrationService
+    // — the service's own NAME in mixed case, which its `mgn` endpoint label is no
+    // transformation of.
+    (
+        "mgn.amazonaws.com",
+        "AWSServiceRoleForApplicationMigrationService",
+    ),
     // The AWS Migration Hub family. Each of these services is reached through a
     // HYPHENATED endpoint label (`migrationhub-orchestrator`,
     // `migrationhub-strategy` — the `cloudTrailEventSource` their own Smithy models

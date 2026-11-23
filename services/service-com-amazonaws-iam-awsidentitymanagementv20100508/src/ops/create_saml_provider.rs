@@ -281,7 +281,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // before the provider is created, and before the store is consulted for a name
         // collision — so a caller that may not create a provider learns that it may not,
         // never which names the account already holds. The decision is made on the ARN the
-        // provider WOULD carry, with the tags the request attaches handed to the gate,
+        // provider WOULD carry — which the refusal names too, because the provider does
+        // not exist yet — with the tags the request attaches handed to the gate,
         // because they are part of the request a statement may be conditioned on
         // (`aws:RequestTag/<key>`, `aws:TagKeys`). Nothing is created when it refuses.
         crate::state::authorization::authorize_written(
@@ -289,7 +290,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ctx,
             crate::state::authorization::CREATE_SAML_PROVIDER,
             &arn,
-            &format!("saml-provider {}", input.name),
+            &arn,
             crate::state::authorization::WrittenTags::Pairs(tags.as_deref().unwrap_or_default()),
         )?;
 

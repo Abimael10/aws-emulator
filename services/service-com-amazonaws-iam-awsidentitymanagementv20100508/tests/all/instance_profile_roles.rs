@@ -24,7 +24,7 @@ use crate::user_lifecycle::{call, element, elements, error_code, router};
 const PRINCIPALS: &[&str] = &[
     "autoscaling.amazonaws.com",
     "elasticbeanstalk.amazonaws.com",
-    "networkmonitor.amazonaws.com",
+    "ec2fleet.amazonaws.com",
 ];
 
 #[tokio::test]

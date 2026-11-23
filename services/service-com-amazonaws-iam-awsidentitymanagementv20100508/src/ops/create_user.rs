@@ -214,17 +214,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // before the user is created, and before the store is consulted for a name
         // collision — so a caller that may not create users learns that it may not, never
         // which names the account already holds. The decision is made on the ARN the user
-        // WOULD carry, which is the resource a statement about this call names, with the
-        // tags the request attaches handed to the gate: creating a tagged resource is the
-        // other call `aws:RequestTag/<key>` and `aws:TagKeys` are published for, so a
-        // grant conditioned on them admits exactly the tag sets it names. Nothing is
-        // created when it refuses.
+        // WOULD carry, which is the resource a statement about this call names, and the
+        // refusal names that same ARN: the user does not exist yet, so there is no held
+        // entity to name by type and name. The tags the request attaches are handed to the
+        // gate: creating a tagged resource is the other call `aws:RequestTag/<key>` and
+        // `aws:TagKeys` are published for, so a grant conditioned on them admits exactly
+        // the tag sets it names. Nothing is created when it refuses.
+        let created_arn = crate::state::user_arn(&path, &input.user_name);
         crate::state::authorization::authorize_written(
             &store,
             ctx,
             crate::state::authorization::CREATE_USER,
-            &crate::state::user_arn(&path, &input.user_name),
-            &format!("user {}", input.user_name),
+            &created_arn,
+            &created_arn,
             crate::state::authorization::WrittenTags::Pairs(
                 input.tags.as_deref().unwrap_or_default(),
             ),

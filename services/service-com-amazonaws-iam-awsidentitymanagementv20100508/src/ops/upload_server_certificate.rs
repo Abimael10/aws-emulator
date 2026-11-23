@@ -323,15 +323,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // before the certificate is stored, and before the store is consulted for a name
         // collision — so a caller that may not upload a certificate learns that it may
         // not, never which names the account already holds. The decision is made on the
-        // ARN the certificate WOULD carry, with the tags the request attaches handed to
+        // ARN the certificate WOULD carry — which the refusal names too, because the
+        // certificate does not exist yet — with the tags the request attaches handed to
         // the gate, because they are part of the request a statement may be conditioned on
         // (`aws:RequestTag/<key>`, `aws:TagKeys`). Nothing is stored when it refuses.
+        let created_arn =
+            crate::state::server_certificate_arn(&path, &input.server_certificate_name);
         crate::state::authorization::authorize_written(
             &store,
             ctx,
             crate::state::authorization::UPLOAD_SERVER_CERTIFICATE,
-            &crate::state::server_certificate_arn(&path, &input.server_certificate_name),
-            &format!("server certificate {}", input.server_certificate_name),
+            &created_arn,
+            &created_arn,
             crate::state::authorization::WrittenTags::Pairs(
                 tags.as_deref().unwrap_or_default(),
             ),

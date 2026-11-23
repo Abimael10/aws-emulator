@@ -397,7 +397,7 @@ async fn updating_a_service_linked_roles_trust_policy_is_refused() {
     // nothing here created (source: `state::PUBLISHED_SERVICE_LINKED_ROLE_NAMES`, the
     // catalog `tests/all/service_provisioned_roles.rs` pins).
     let principals = [
-        "lambda.amazonaws.com",
+        "ecs.amazonaws.com",
         "elasticbeanstalk.amazonaws.com",
         "autoscaling.amazonaws.com",
     ];

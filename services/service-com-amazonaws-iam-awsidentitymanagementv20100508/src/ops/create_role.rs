@@ -315,15 +315,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // IAM authorizes its own API: the caller's identity-based policies are evaluated
         // before the role is created and before the store is consulted, on the ARN the
-        // role WOULD carry, with the tags this request attaches handed to the gate — the
-        // same decision `CreateUser` makes for the same reasons. Nothing is created when
-        // it refuses.
+        // role WOULD carry — which the refusal names too, because the role does not exist
+        // yet — with the tags this request attaches handed to the gate: the same decision
+        // `CreateUser` makes for the same reasons. Nothing is created when it refuses.
+        let created_arn = crate::state::role_arn(&path, &input.role_name);
         crate::state::authorization::authorize_written(
             &store,
             ctx,
             crate::state::authorization::CREATE_ROLE,
-            &crate::state::role_arn(&path, &input.role_name),
-            &format!("role {}", input.role_name),
+            &created_arn,
+            &created_arn,
             crate::state::authorization::WrittenTags::Pairs(
                 tags.as_deref().unwrap_or_default(),
             ),
