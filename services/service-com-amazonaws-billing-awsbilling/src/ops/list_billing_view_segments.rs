@@ -19,6 +19,10 @@
 //! view that is not the account's PRIMARY view a `ValidationException` (400) —
 //! the modeled `arn` "must reference a primary billing view". A request that
 //! names no ARN is answered for the caller's own PRIMARY view.
+//! The requested period is held to both rules its members state: its end "must
+//! be after `beginDateInclusive`", and its begin "can't be in the future" — a
+//! period that opens after the clock is refused with the modeled
+//! `ValidationException` (400) rather than reported over.
 //!
 //! ## Shape of an operation
 //!
@@ -250,6 +254,10 @@ fn cut_point(
 /// civil calendar, so a request that carries neither bound is answered for the
 /// whole of this month and one that carries a single bound keeps the month's
 /// other end.
+///
+/// Both rules the period's members state are applied to the bounds the request
+/// itself carries: its end "must be after `beginDateInclusive`", and its begin
+/// "can't be in the future".
 fn requested_period(
     input: &ListBillingViewSegmentsInput,
     now: ::std::time::SystemTime,
@@ -258,12 +266,11 @@ fn requested_period(
         .and_then(|(year, month)| crate::state::calendar_month_period(year, month))
         .ok_or_else(|| unavailable("the current billing period cannot be determined"))?;
     let requested = input.time_range.as_ref();
-    let begin = requested
-        .and_then(|range| range.begin_date_inclusive.as_ref())
-        .map_or_else(
-            || crate::state::date_time_secs(&month_begin),
-            crate::state::date_time_secs,
-        );
+    let requested_begin = requested.and_then(|range| range.begin_date_inclusive.as_ref());
+    let begin = requested_begin.map_or_else(
+        || crate::state::date_time_secs(&month_begin),
+        crate::state::date_time_secs,
+    );
     let end = requested
         .and_then(|range| range.end_date_exclusive.as_ref())
         .map_or_else(
@@ -277,6 +284,22 @@ fn requested_period(
         return Err(invalid_field(
             "timeRange",
             "beginDateInclusive and endDateExclusive must each be an instant",
+        ));
+    }
+    // The modeled `beginDateInclusive`: "This value can't be in the future." A
+    // period that opens after the clock covers instants no billing data can
+    // have been recorded over, so such a request is refused rather than
+    // answered with the stored timeline clipped to future bounds. Only a bound
+    // the REQUEST carries is checked: the one this read defaults to is the
+    // current month's start, which the same clock has already passed. The
+    // sibling bound keeps its own modelled rule only ("must be after
+    // `beginDateInclusive`"), so a period still open at its end — the default
+    // one among them, the current month, which ends in the future — stays
+    // answerable.
+    if requested_begin.is_some() && begin > crate::state::epoch_secs(now) {
+        return Err(invalid_field(
+            "timeRange",
+            "beginDateInclusive can't be in the future",
         ));
     }
     // The period is half-open, so a range whose end does not come after its
