@@ -318,11 +318,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(StartSyncExecutionErrorModeled::StateMachineDoesNotExist(
                     StateMachineDoesNotExist {
                         message: Some(crate::state::resource_error_message(
-                            // The condition the refusal states is the one of the
-                            // resource the ARN REFERS to — the version's for a
-                            // version-qualified ARN — stated with the ARN as
-                            // submitted ([`crate::state::absent_state_machine_condition`]).
-                            crate::state::absent_state_machine_condition(&parsed),
+                            // The SYNCHRONOUS start states the STATE MACHINE's own
+                            // condition for every ARN it resolves nothing for —
+                            // unqualified, version-qualified or alias-qualified alike —
+                            // and not the version's
+                            // ([`crate::state::STATE_MACHINE_DOES_NOT_EXIST`]): a
+                            // qualifier is a route to the definition this call runs, so
+                            // an ARN this start cannot run is the state machine
+                            // answering for nothing. The ARN is stated as submitted.
+                            crate::state::STATE_MACHINE_DOES_NOT_EXIST,
                             &input.state_machine_arn,
                         )),
                     },

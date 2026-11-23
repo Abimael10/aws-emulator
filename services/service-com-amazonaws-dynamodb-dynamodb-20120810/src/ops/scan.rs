@@ -377,7 +377,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
-        let name = crate::state::resolve_table_name_in(&input.table_name, &region).map_err(lift)?;
+        // The table this read addresses, resolved in the Region the request reached. A
+        // DATA-plane operation states a refusal about a FIELD of the ARN as the
+        // table-name member's own constraint, the ARN echoed over the `tableName` path
+        // ([`crate::state::resolve_table_name_in_clause`] holds both forms).
+        let name =
+            crate::state::resolve_table_name_in_clause(&input.table_name, &region).map_err(lift)?;
 
         // Everything that speaks only about the REQUEST is settled before any table is
         // looked up, so a request that cannot hold together is refused as the client

@@ -6,12 +6,15 @@
 //!
 //! The rules under test:
 //!
-//! 1. the refusal names the resource the ARN REFERS to, whatever the operation then
-//!    does with it: an ARN qualified with a VERSION number the store holds no version
-//!    under states the version's condition — for a read of it, for a start of an
-//!    execution through it and for a listing scoped to it — while an ALIAS qualifier
-//!    keeps the state machine's condition, an alias being a route to a version rather
-//!    than a resource of its own. The ARN is stated exactly as submitted;
+//! 1. the refusal names the resource the ARN REFERS to, whatever the ASYNCHRONOUS
+//!    operation then does with it: an ARN qualified with a VERSION number the store
+//!    holds no version under states the version's condition — for a read of it, for an
+//!    asynchronous start of an execution through it and for a listing scoped to it —
+//!    while an ALIAS qualifier keeps the state machine's condition, an alias being a
+//!    route to a version rather than a resource of its own. The ARN is stated exactly
+//!    as submitted. The SYNCHRONOUS start is the one operation that states the state
+//!    machine's own condition for every form of the reference
+//!    (`tests/all/sync_start_absent_reference_condition.rs` owns that rule);
 //! 2. `ListExecutions` reports such a reference as a refusal — never as an empty page,
 //!    which would make a version that never existed indistinguishable from one that
 //!    ran nothing;
@@ -61,9 +64,9 @@ async fn machine_with_dangling_references(emulator: &Emulator) -> (String, Strin
     (machine, deleted, never_published, never_created)
 }
 
-/// An operation that starts an execution through a dangling reference reports the
-/// condition of the resource the ARN refers to: the VERSION's for a version-qualified
-/// ARN, the state machine's for an alias-qualified one.
+/// An ASYNCHRONOUS start through a dangling reference reports the condition of the
+/// resource the ARN refers to: the VERSION's for a version-qualified ARN, the state
+/// machine's for an alias-qualified one.
 #[tokio::test]
 async fn a_start_through_a_dangling_reference_names_the_resource_the_arn_refers_to() {
     let emulator = Emulator::new();
@@ -90,31 +93,22 @@ async fn a_start_through_a_dangling_reference_names_the_resource_the_arn_refers_
         ),
     ];
     for (case, arn, condition) in references {
-        for (operation, request) in [
-            (
-                "StartExecution",
-                json!({ "stateMachineArn": arn, "input": "{}" }),
-            ),
-            (
-                "StartSyncExecution",
-                json!({ "stateMachineArn": arn, "input": "{}" }),
-            ),
-        ] {
-            let (status, body) = emulator.call(operation, &request).await;
-            let code = error_code(&body);
-            assert_eq!(
-                (status, code.as_str()),
-                (400, "StateMachineDoesNotExist"),
-                "case {case:?} / {operation}: expected 400 StateMachineDoesNotExist, got {status} \
-                 {code} with body {body:?}"
-            );
-            let expected = resource_error_message(condition, arn);
-            assert_eq!(
-                body.get("message").and_then(Value::as_str),
-                Some(expected.as_str()),
-                "case {case:?} / {operation}: expected the message {expected:?}, got {body:?}"
-            );
-        }
+        let operation = "StartExecution";
+        let request = json!({ "stateMachineArn": arn, "input": "{}" });
+        let (status, body) = emulator.call(operation, &request).await;
+        let code = error_code(&body);
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "StateMachineDoesNotExist"),
+            "case {case:?} / {operation}: expected 400 StateMachineDoesNotExist, got {status} \
+             {code} with body {body:?}"
+        );
+        let expected = resource_error_message(condition, arn);
+        assert_eq!(
+            body.get("message").and_then(Value::as_str),
+            Some(expected.as_str()),
+            "case {case:?} / {operation}: expected the message {expected:?}, got {body:?}"
+        );
     }
 }
 

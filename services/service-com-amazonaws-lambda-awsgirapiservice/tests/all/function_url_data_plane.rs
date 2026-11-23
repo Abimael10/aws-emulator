@@ -398,12 +398,11 @@ pub(crate) struct Endpoint {
 }
 
 impl Endpoint {
-    /// The HOST of this address, without the port it is served on: what the event reports as
-    /// the request's `host` and as `requestContext.domainName`, both of which name a DOMAIN
-    /// (`crate::state::function_url`). Read through the one reduction this tree has for it,
-    /// which is the one the service answers that member from.
-    pub(crate) fn domain(&self) -> &str {
-        ::service_common::data_plane_addressing::host_only(&self.host)
+    /// The AUTHORITY of this address, the port it is served on included: what the event
+    /// reports as the request's `host` and as `requestContext.domainName`, both of which name
+    /// the endpoint a client was handed (`crate::state::function_url`).
+    pub(crate) fn announced_authority(&self) -> &str {
+        &self.host
     }
 }
 
@@ -702,7 +701,11 @@ async fn the_event_carries_the_request_as_payload_format_two_states_it() {
         ),
         ("the method", "method", json!("GET")),
         ("the account", "accountId", json!(ACCOUNT)),
-        ("the published host", "domainName", json!(endpoint.domain())),
+        (
+            "the published endpoint",
+            "domainName",
+            json!(endpoint.announced_authority()),
+        ),
         (
             "no authorizer on a public endpoint",
             "authorizer",
@@ -735,13 +738,13 @@ async fn the_event_carries_the_request_as_payload_format_two_states_it() {
     );
     assert_eq!(
         headers.get("host"),
-        Some(&json!(endpoint.domain())),
-        "case \"the host header\": expected the function URL's own host, got {headers:?}"
+        Some(&json!(endpoint.announced_authority())),
+        "case \"the host header\": expected the function URL's own endpoint, got {headers:?}"
     );
 
-    // The host the handler is told about is the URL's own, whichever addressing the client
-    // reached the endpoint by: a request that arrived on the emulator's own endpoint,
-    // carrying the url id in its path, is still a request to that URL's address.
+    // The endpoint the handler is told about is the URL's own, whichever addressing the
+    // client reached it by: a request that arrived on the emulator's own endpoint, carrying
+    // the url id in its path, is still a request to that URL's address.
     let by_path = send(
         &router,
         "GET",
@@ -765,10 +768,10 @@ async fn the_event_carries_the_request_as_payload_format_two_states_it() {
         let reported = reached.pointer(member).cloned().unwrap_or(Value::Null);
         assert_eq!(
             reported,
-            json!(endpoint.domain()),
-            "case {case:?}: expected the URL's own host {:?} however the endpoint was \
-             reached, got {reported}",
-            endpoint.domain()
+            json!(endpoint.announced_authority()),
+            "case {case:?}: expected the URL's own endpoint {:?} however it was reached, got \
+             {reported}",
+            endpoint.announced_authority()
         );
     }
 

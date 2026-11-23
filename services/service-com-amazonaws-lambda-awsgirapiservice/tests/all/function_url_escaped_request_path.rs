@@ -16,10 +16,10 @@
 //!
 //! And, for what the event says about WHERE the request arrived:
 //!
-//! > The `host` the event reports, and `requestContext.domainName` beside it, name the HOST
-//! > of the address this service published the URL at — a domain carries no transport port —
-//! > while the url id is reported where the format reports the endpoint's identity, as
-//! > `apiId` and `domainPrefix`.
+//! > The `host` the event reports, and `requestContext.domainName` beside it, name the
+//! > ADDRESS this service published the URL at — the endpoint a client was handed and dialed,
+//! > port included — while the url id is reported where the format reports the endpoint's
+//! > identity, as `apiId` and `domainPrefix`.
 //!
 //! The rows of the first test span what the path rule generalises over: no escape at all, an
 //! escaped space, an escaped separator, lower-case and upper-case hex digits, a multi-byte
@@ -253,18 +253,18 @@ async fn the_query_is_reported_verbatim_and_decoded_and_header_names_arrive_lowe
     );
 }
 
-/// The event names the HOST of the address the URL was published at — never the port it is
-/// served on — and reports the url id as the endpoint's identity.
+/// The event names the ADDRESS the URL was published at — the endpoint a client dials, port
+/// included — and reports the url id as the endpoint's identity.
 ///
 /// The address itself is the emulator's to choose (it is the one the URL is SERVED at), so
 /// what every row asserts is the relation between the published value and the event: the
-/// host the event reports is the published authority with its port removed, and the url id
-/// is reported where the format reports the endpoint's identity. The rows span the
-/// addressings a client reaches the endpoint by, because the answer is the URL's own however
-/// it was addressed. The forms an address itself takes — a name, a literal, a bracketed IPv6
-/// literal — are spanned by the unit rows of `state::function_url`.
+/// endpoint the event reports is the published authority itself, and the url id is reported
+/// where the format reports the endpoint's identity. The rows span the addressings a client
+/// reaches the endpoint by, because the answer is the URL's own however it was addressed. The
+/// forms an address itself takes — a name, a literal, a bracketed IPv6 literal — are spanned
+/// by the unit rows of `state::function_url`.
 #[tokio::test]
-async fn the_event_names_the_published_endpoints_host_and_the_url_id() {
+async fn the_event_names_the_published_endpoint_and_the_url_id() {
     let engine = std::sync::Arc::new(engine::InMemoryEngine::new());
     let router = router_on(&engine);
     given_function(&router, "url-published-host", &echoing_handler()).await;
@@ -272,7 +272,7 @@ async fn the_event_names_the_published_endpoints_host_and_the_url_id() {
     // client that resolves no AWS hostname is configured with.
     let endpoint = given_public_url(&router, "url-published-host", OWN_ENDPOINT).await;
     let published = endpoint.host.clone();
-    let (host, port) = published
+    let (host, _port) = published
         .rsplit_once(':')
         .filter(|(_host, port)| port.parse::<u16>().is_ok())
         .unwrap_or_else(|| {
@@ -283,9 +283,9 @@ async fn the_event_names_the_published_endpoints_host_and_the_url_id() {
         "the published address must name a host, got {published:?}"
     );
     assert_eq!(
-        host,
-        endpoint.domain(),
-        "the host the event must report is the published authority's own host"
+        published,
+        endpoint.announced_authority(),
+        "the endpoint the event must report is the published address itself"
     );
 
     // (case, the path below the endpoint the request addresses)
@@ -323,13 +323,9 @@ async fn the_event_names_the_published_endpoints_host_and_the_url_id() {
         ];
         for (member, value) in reported {
             assert_eq!(
-                value, host,
-                "case {case:?}: expected {member} to name the published host {host:?}, got \
-                 {value:?}"
-            );
-            assert!(
-                !value.contains(&format!(":{port}")),
-                "case {case:?}: expected {member} to carry no transport port, got {value:?}"
+                *value, published,
+                "case {case:?}: expected {member} to name the published endpoint \
+                 {published:?}, got {value:?}"
             );
         }
         for member in ["apiId", "domainPrefix"] {

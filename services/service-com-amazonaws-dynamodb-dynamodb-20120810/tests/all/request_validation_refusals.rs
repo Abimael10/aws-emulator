@@ -930,36 +930,48 @@ async fn an_arn_addresses_this_endpoints_own_region() {
         format!("arn:aws:dynamodb:{region}:000000000000:table/Addressed")
     };
 
-    // Each row: the operation and the rest of its request, over the data plane and the
-    // control plane — every surface whose `TableName` takes an ARN in place of a name.
-    // `GetItem` is not among them: the single-item read states the same fact as that
-    // member's own constraint clause, which the row after this loop pins.
-    let operations: Vec<(&str, Value)> = vec![
-        ("PutItem", json!({"Item": {"pk": {"S": "two"}}})),
-        ("DeleteItem", json!({"Key": {"pk": {"S": "one"}}})),
-        ("Scan", json!({})),
+    // Each row: the operation, the rest of its request, and whether it states an
+    // ARN-FIELD refusal as the `tableName` member's own constraint clause. The frame
+    // follows the PLANE the operation serves — the DATA plane states the member's
+    // clause, the control plane the diagnosis sentence over the ARN
+    // (`tests/all/table_arn_field_refusal_frames.rs` owns that rule) — and the accepted
+    // spellings are the same two on every row.
+    let operations: Vec<(&str, Value, bool)> = vec![
+        ("PutItem", json!({"Item": {"pk": {"S": "two"}}}), true),
+        ("DeleteItem", json!({"Key": {"pk": {"S": "one"}}}), true),
+        ("GetItem", json!({"Key": {"pk": {"S": "one"}}}), true),
+        ("Scan", json!({}), true),
         (
             "Query",
             json!({"KeyConditionExpression": "pk = :k",
                    "ExpressionAttributeValues": {":k": {"S": "one"}}}),
+            true,
         ),
-        ("DescribeTable", json!({})),
-        ("ListBackups", json!({})),
+        ("DescribeTable", json!({}), false),
+        ("ListBackups", json!({}), false),
     ];
 
-    for (operation, rest) in &operations {
+    for (operation, rest, member_clause) in &operations {
         // The ARN of ANOTHER region names a table this endpoint cannot reach.
         let mut request = rest.clone();
         request["TableName"] = json!(arn_in(OTHER_REGION));
         let case = format!("{operation} addressed by an ARN of {OTHER_REGION}");
         let stated = refusal(&router, &case, operation, request).await;
-        assert_eq!(
-            stated,
+        let expected = if *member_clause {
+            format!(
+                "1 validation error detected: Value '{}' at 'tableName' failed to satisfy \
+                 constraint: Invalid AWS region",
+                arn_in(OTHER_REGION)
+            )
+        } else {
             format!(
                 "1 validation error detected: Invalid AWS region in '{}'",
                 arn_in(OTHER_REGION)
-            ),
-            "case {case:?}: expected the region sentence over the ARN, got {stated:?}"
+            )
+        };
+        assert_eq!(
+            stated, expected,
+            "case {case:?}: expected the frame its plane states, {expected:?}, got {stated:?}"
         );
 
         // The ARN of THIS region names the same table the bare name does.
@@ -971,31 +983,6 @@ async fn an_arn_addresses_this_endpoints_own_region() {
         let mut request = rest.clone();
         request["TableName"] = json!("Addressed");
         ok(&router, operation, request).await;
-    }
-
-    // The single-item READ states the same fact as that member's own constraint: the
-    // `tableName` path, the ARN the request sent echoed, and the requirement its region
-    // field broke. Its accepted spellings are the same two every row above accepts.
-    let mut request = json!({"Key": {"pk": {"S": "one"}}});
-    request["TableName"] = json!(arn_in(OTHER_REGION));
-    let case = format!("GetItem addressed by an ARN of {OTHER_REGION}");
-    let stated = refusal(&router, &case, "GetItem", request).await;
-    assert_eq!(
-        stated,
-        format!(
-            "1 validation error detected: Value '{}' at 'tableName' failed to satisfy \
-             constraint: Invalid AWS region",
-            arn_in(OTHER_REGION)
-        ),
-        "case {case:?}: expected the member's constraint clause, got {stated:?}"
-    );
-    for addressed in [arn_in(REGION), "Addressed".to_string()] {
-        ok(
-            &router,
-            "GetItem",
-            json!({"TableName": addressed, "Key": {"pk": {"S": "one"}}}),
-        )
-        .await;
     }
 
     // The rule is about the endpoint the request REACHED, not about one region: the same

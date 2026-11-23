@@ -6,11 +6,12 @@
 //! RULE under test: a `TableName` may be spelled as the table's ARN ("You can also provide
 //! the Amazon Resource Name (ARN) of the table in this parameter"), and a value that is a
 //! well-formed ARN of this service naming something else is refused for the FIELD of the ARN
-//! that is wrong — its resource type, or its region. That diagnosis is stated over the ARN
-//! the request sent, and the FRAME it is stated in belongs to the OPERATION rather than to
-//! the field: an operation states every ARN field's refusal the same way, as the diagnosis
-//! sentence over the value, and the single-item read states every one of them as that
-//! member's own constraint clause instead.
+//! that is wrong — its resource type, or its region. The FRAME that diagnosis is stated in
+//! belongs to the OPERATION rather than to the field — an operation states every ARN field's
+//! refusal the same way — and follows the PLANE the operation serves: an operation of the
+//! DATA plane, which reads or writes the ITEMS of the table its `TableName` addresses,
+//! states the diagnosis as that member's own constraint clause, while a control-plane
+//! operation states it as the diagnosis sentence over the value.
 //!
 //! The rows differ along what the rule generalises over: the FIELD that is wrong (the
 //! resource type, in each of the ways it can be, and the region), the OPERATION that
@@ -71,24 +72,32 @@ fn addressed_operations(arn: &str) -> Vec<(&'static str, Value, Frame)> {
             json!({"TableName": arn, "BackupName": "frames"}),
             Frame::Sentence,
         ),
-        ("Scan", json!({"TableName": arn}), Frame::Sentence),
+        // The DATA plane — the operations that read and write the ITEMS of the table the
+        // ARN addresses — states the same facts as that member's own constraint.
+        ("Scan", json!({"TableName": arn}), Frame::MemberClause),
         (
             "Query",
             json!({"TableName": arn, "KeyConditionExpression": "pk = :k",
                    "ExpressionAttributeValues": {":k": {"S": "one"}}}),
-            Frame::Sentence,
+            Frame::MemberClause,
         ),
         (
             "PutItem",
             json!({"TableName": arn, "Item": {"pk": {"S": "one"}}}),
-            Frame::Sentence,
+            Frame::MemberClause,
         ),
         (
             "DeleteItem",
             json!({"TableName": arn, "Key": {"pk": {"S": "one"}}}),
-            Frame::Sentence,
+            Frame::MemberClause,
         ),
-        // The single-item READ states the same facts as that member's own constraint.
+        (
+            "UpdateItem",
+            json!({"TableName": arn, "Key": {"pk": {"S": "one"}},
+                   "UpdateExpression": "SET note = :n",
+                   "ExpressionAttributeValues": {":n": {"S": "a"}}}),
+            Frame::MemberClause,
+        ),
         (
             "GetItem",
             json!({"TableName": arn, "Key": {"pk": {"S": "one"}}}),
@@ -100,9 +109,11 @@ fn addressed_operations(arn: &str) -> Vec<(&'static str, Value, Frame)> {
 /// The two frames an ARN-field refusal is observed to be stated in.
 #[derive(Debug, Clone, Copy)]
 enum Frame {
-    /// The diagnosis alone, naming the ARN the request sent.
+    /// The diagnosis alone, naming the ARN the request sent — the frame the CONTROL plane
+    /// states.
     Sentence,
-    /// The `tableName` member's own constraint clause, with the ARN echoed.
+    /// The `tableName` member's own constraint clause, with the ARN echoed — the frame the
+    /// DATA plane states.
     MemberClause,
 }
 

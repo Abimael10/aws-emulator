@@ -304,6 +304,12 @@ fn region_outside_this_endpoint(member: &str, table_name: &str) -> RequestError 
 /// The frame belongs to the OPERATION rather than to the field: an operation that states one
 /// ARN field's refusal as the sentence states every other field's that way too, so the
 /// region and the resource type are reported in one frame per operation.
+///
+/// Which frame an operation states follows the PLANE it serves: an operation of the DATA
+/// plane — one that reads or writes the ITEMS of the table its request-level `TableName`
+/// addresses — states the member's own constraint clause, and a control-plane operation,
+/// which acts on the table or on a resource of its own, states the diagnosis sentence over
+/// the ARN.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArnRefusalForm {
     /// The sentence alone, naming the ARN ([`invalid_arn_region`],
@@ -359,19 +365,20 @@ fn resolve_region_addressed(
 }
 
 /// That resolution for the request-level `TableName`, stating an ARN-FIELD refusal as the
-/// sentence alone — the form every operation but the ones below is observed to state.
+/// sentence alone — the form the CONTROL plane states ([`ArnRefusalForm`]).
 pub fn resolve_table_name_in(table_name: &str, region: &str) -> Result<String, RequestError> {
     resolve_table_name_in_member(TABLE_NAME_MEMBER_PATH, table_name, region)
 }
 
 /// The same resolution whose ARN-FIELD refusals are stated as the table-name member's own
-/// CONSTRAINT CLAUSE rather than as the sentence alone — the form the single-item READ is
-/// observed to state them in, over the `tableName` path with the ARN echoed.
+/// CONSTRAINT CLAUSE rather than as the sentence alone — over the `tableName` path with the
+/// ARN echoed.
 ///
-/// Called by the operations observed to state that form; every other operation keeps the
-/// field sentence. Which form an operation states is recorded at its one call site rather
-/// than in a list here, because the operation is what makes the choice — and it is the same
-/// form for every field of the ARN ([`ArnRefusalForm`]).
+/// Called by the operations of the DATA plane, which address the ITEMS of the table their
+/// request-level `TableName` names; a control-plane operation keeps the field sentence
+/// ([`resolve_table_name_in`]). Which form an operation states is recorded at its one call
+/// site rather than in a list here, because the operation is what makes the choice — and it
+/// is the same form for every field of the ARN ([`ArnRefusalForm`]).
 pub fn resolve_table_name_in_clause(table_name: &str, region: &str) -> Result<String, RequestError> {
     resolve_region_addressed(
         TABLE_NAME_MEMBER_PATH,

@@ -3140,9 +3140,12 @@ pub const STATE_MACHINE_VERSION_DOES_NOT_EXIST: &str = "State Machine Version Do
 /// machine's condition: an alias is a route to a version rather than a resource of its
 /// own, so an ARN naming no alias names no resource but the state machine.
 ///
-/// What the refusal is about is the resource the ARN REFERS to, whatever the operation
-/// then does with it — read it, start an execution through it, or scope a listing to it —
-/// because the ARN is how the request named the thing the service holds nothing for.
+/// What the refusal is about is the resource the ARN REFERS to, whatever the ASYNCHRONOUS
+/// operation then does with it — read it, start an execution through it, or scope a listing
+/// to it — because the ARN is how the request named the thing the service holds nothing for.
+/// The SYNCHRONOUS start is the one caller that states the state machine's own condition for
+/// every form of the ARN, so it names [`STATE_MACHINE_DOES_NOT_EXIST`] directly rather than
+/// asking this.
 pub fn absent_state_machine_condition(parsed: &StateMachineArn) -> &'static str {
     match parsed.qualifier.as_deref() {
         Some(qualifier)
