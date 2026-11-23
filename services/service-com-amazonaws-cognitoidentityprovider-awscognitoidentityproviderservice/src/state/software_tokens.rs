@@ -275,6 +275,56 @@ impl User {
             .as_ref()
             .and_then(|key| key.emitting_step(user_code, at))
     }
+
+    /// Whether this user holds a software token at all: a registered
+    /// authenticator, the private key of a setup that got that far, or
+    /// `SOFTWARE_TOKEN_MFA` among the factors it has activated.
+    pub fn holds_software_token(&self) -> bool {
+        self.software_token_registered
+            || self.software_token_key.is_some()
+            || self
+                .mfa_setting_list
+                .iter()
+                .any(|setting| setting == SOFTWARE_TOKEN_MFA_SETTING)
+    }
+
+    /// Delete the software token this user set up, as of `now`, reporting
+    /// whether it held one at all ([`User::holds_software_token`]).
+    ///
+    /// Everything the factor consists of goes, because "after this operation,
+    /// the user can no longer sign in with TOTP MFA, and can register a new TOTP
+    /// factor with `AssociateSoftwareToken`" (`AdminDeleteSoftwareToken` in this
+    /// service's model): the registration that is the delivery configuration
+    /// TOTP MFA is delivered with ([`User::holds_mfa_delivery_config`]), the
+    /// private key a presented one-time password is checked against — a new
+    /// setup mints its own ([`ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState::associate_software_token`]) —
+    /// and the time step that key spent
+    /// ([`User::software_token_authenticated_step`]), which belongs to a key
+    /// nothing reads from any more.
+    ///
+    /// A factor the user can no longer receive is not one it has activated, so
+    /// `SOFTWARE_TOKEN_MFA` leaves `UserMFASettingList` exactly as deactivating
+    /// it does ([`User::set_mfa_preference`]) — and a factor that is not
+    /// activated is not one the user prefers, so a preference for it goes with
+    /// it. A user that holds no software token is left untouched, its
+    /// `UserLastModifiedDate` included: there was nothing to delete.
+    pub fn delete_software_token(&mut self, now: SystemTime) -> bool {
+        if !self.holds_software_token() {
+            return false;
+        }
+        self.software_token_registered = false;
+        self.software_token_key = None;
+        self.software_token_authenticated_step = None;
+        self.mfa_setting_list
+            .retain(|setting| setting != SOFTWARE_TOKEN_MFA_SETTING);
+        if self.preferred_mfa_setting.as_deref() == Some(SOFTWARE_TOKEN_MFA_SETTING) {
+            self.preferred_mfa_setting = None;
+        }
+        // The user record itself changed: it holds one fewer MFA delivery
+        // configuration than before.
+        self.user_last_modified_date = now;
+        true
+    }
 }
 
 impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
