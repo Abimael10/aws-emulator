@@ -50,7 +50,10 @@ const REGION: &str = "us-east-1";
 const ACCOUNT: &str = "000000000000";
 
 /// How long a test waits for the clock-owed steps of one execution.
-const WAIT: Duration = Duration::from_secs(20);
+///
+/// `pub(crate)` with the harness below: the `resolved_action_configuration` suite waits
+/// for the same execution plane on the same ceiling rather than stating a second one.
+pub(crate) const WAIT: Duration = Duration::from_secs(20);
 
 /// The `FailureType` an action carries when its declaration cannot be executed at all.
 const CONFIGURATION_ERROR: &str = "ConfigurationError";
@@ -65,12 +68,17 @@ const TERMINAL: [&str; 5] = [
 ];
 
 /// One emulator: the shared engine with CodePipeline, Amazon ECR, CodeBuild and S3 on it.
-struct Emulator {
+///
+/// `pub(crate)` with the builders and waits below: the `resolved_action_configuration`
+/// suite drives actions of several categories through THIS harness — the one place in the
+/// crate's tests where CodeBuild and Amazon ECR are mounted beside CodePipeline — rather
+/// than growing a second copy of it.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -129,7 +137,7 @@ impl Emulator {
     }
 
     /// One CodePipeline operation that must succeed.
-    async fn cp_ok(&self, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn cp_ok(&self, operation: &str, body: &Value) -> Value {
         let (status, response) = self
             .json_call("codepipeline", PIPELINE_TARGET, operation, body)
             .await;
@@ -141,7 +149,7 @@ impl Emulator {
     }
 
     /// One Amazon ECR operation that must succeed.
-    async fn ecr_ok(&self, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn ecr_ok(&self, operation: &str, body: &Value) -> Value {
         let (status, response) = self.json_call("ecr", ECR_TARGET, operation, body).await;
         assert_eq!(
             status, 200,
@@ -151,7 +159,7 @@ impl Emulator {
     }
 
     /// One CodeBuild operation.
-    async fn codebuild(&self, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn codebuild(&self, operation: &str, body: &Value) -> (u16, Value) {
         self.json_call("codebuild", CODEBUILD_TARGET, operation, body)
             .await
     }
@@ -176,7 +184,7 @@ impl Emulator {
     }
 
     /// Create a bucket.
-    async fn bucket(&self, name: &str) {
+    pub(crate) async fn bucket(&self, name: &str) {
         let (status, body) = self.s3("PUT", &format!("/{name}"), b"").await;
         assert_eq!(
             status,
@@ -192,7 +200,7 @@ impl Emulator {
     }
 
     /// Push one image manifest into `repository` under `tag`, and answer its digest.
-    async fn push(&self, repository: &str, manifest: &str, tag: &str) -> String {
+    pub(crate) async fn push(&self, repository: &str, manifest: &str, tag: &str) -> String {
         let pushed = self
             .ecr_ok(
                 "PutImage",
@@ -212,7 +220,7 @@ impl Emulator {
 
 /// A `Source` stage reading the image of `repository`, at `tag` when the row states one,
 /// producing `artifact`.
-fn ecr_source(repository: &str, tag: Option<&str>, artifact: &str) -> Value {
+pub(crate) fn ecr_source(repository: &str, tag: Option<&str>, artifact: &str) -> Value {
     let mut configuration = json!({ "RepositoryName": repository });
     if let Some(tag) = tag {
         configuration["ImageTag"] = Value::String(tag.to_string());
@@ -233,7 +241,7 @@ fn ecr_source(repository: &str, tag: Option<&str>, artifact: &str) -> Value {
 
 /// A `Build` stage whose action builds `project`, with the environment variables `declared`
 /// when the row states any.
-fn codebuild_build(project: &str, artifact: &str, declared: Option<&str>) -> Value {
+pub(crate) fn codebuild_build(project: &str, artifact: &str, declared: Option<&str>) -> Value {
     let mut configuration = json!({ "ProjectName": project });
     if let Some(declared) = declared {
         configuration["EnvironmentVariables"] = Value::String(declared.to_string());
@@ -253,7 +261,7 @@ fn codebuild_build(project: &str, artifact: &str, declared: Option<&str>) -> Val
 
 /// A `Deploy` stage delivering `artifact` to `bucket` under `key`, so the bytes the source
 /// action produced are readable as one object.
-fn s3_deploy(artifact: &str, bucket: &str, key: &str) -> Value {
+pub(crate) fn s3_deploy(artifact: &str, bucket: &str, key: &str) -> Value {
     json!({
         "name": "Deploy",
         "actions": [{
@@ -282,7 +290,7 @@ fn approval_gate() -> Value {
 }
 
 /// A pipeline declaration named `name`, writing its artifacts to `artifact_store`.
-fn declaration(name: &str, artifact_store: &str, stages: Vec<Value>) -> Value {
+pub(crate) fn declaration(name: &str, artifact_store: &str, stages: Vec<Value>) -> Value {
     json!({"pipeline": {
         "name": name,
         "roleArn": ROLE_ARN,
@@ -292,13 +300,13 @@ fn declaration(name: &str, artifact_store: &str, stages: Vec<Value>) -> Value {
 }
 
 /// A manifest whose bytes — and so whose digest — are the case's own.
-fn manifest_of(marker: &str) -> String {
+pub(crate) fn manifest_of(marker: &str) -> String {
     json!({"schemaVersion": 2, "marker": marker}).to_string()
 }
 
 /// Poll until the pipeline's newest execution reaches a terminal status, and answer its
 /// summary.
-async fn wait_for_terminal(emulator: &Emulator, pipeline: &str) -> Value {
+pub(crate) async fn wait_for_terminal(emulator: &Emulator, pipeline: &str) -> Value {
     let deadline = Instant::now() + WAIT;
     loop {
         let listed = emulator
@@ -321,7 +329,12 @@ async fn wait_for_terminal(emulator: &Emulator, pipeline: &str) -> Value {
 }
 
 /// The state of one action of one stage, as `GetPipelineState` reports it.
-async fn action_state(emulator: &Emulator, pipeline: &str, stage: &str, action: &str) -> Value {
+pub(crate) async fn action_state(
+    emulator: &Emulator,
+    pipeline: &str,
+    stage: &str,
+    action: &str,
+) -> Value {
     let state = emulator.cp_ok("GetPipelineState", &json!({"name": pipeline})).await;
     state["stageStates"]
         .as_array()

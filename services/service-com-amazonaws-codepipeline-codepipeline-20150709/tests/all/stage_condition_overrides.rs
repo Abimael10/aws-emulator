@@ -39,10 +39,13 @@ const SOURCE_BUCKET: &str = "condition-source";
 const SOURCE_KEY: &str = "source.zip";
 
 /// The bucket the gated stage delivers into.
-const DEPLOY_BUCKET: &str = "condition-deploy";
+///
+/// `pub(crate)` with the builders below: the `skipped_stage_condition_overrides` suite
+/// reads the same delivery to see that a gated stage performed nothing.
+pub(crate) const DEPLOY_BUCKET: &str = "condition-deploy";
 
 /// The key it delivers under.
-const DEPLOY_KEY: &str = "gated.zip";
+pub(crate) const DEPLOY_KEY: &str = "gated.zip";
 
 /// The artifact the source action produces.
 const ARTIFACT: &str = "SourceArtifact";
@@ -66,7 +69,7 @@ const REFUSAL_STATUS: u16 = 400;
 /// EXECUTION's own state, so it is the provider a test can make reach a verdict: its
 /// configuration keys are the variable, the value and the operator (CodePipeline's rule
 /// reference for that provider).
-fn variable_check(name: &str, value: &str, operator: &str) -> Value {
+pub(crate) fn variable_check(name: &str, value: &str, operator: &str) -> Value {
     json!({
         "name": name,
         "ruleTypeId": {
@@ -84,13 +87,15 @@ fn variable_check(name: &str, value: &str, operator: &str) -> Value {
 }
 
 /// A condition site carrying one `VariableCheck` condition with `result`.
-fn site(result: &str, rule: Value) -> Value {
+pub(crate) fn site(result: &str, rule: Value) -> Value {
     json!({"conditions": [{"result": result, "rules": [rule]}]})
 }
 
 /// Create a pipeline whose `Gated` stage declares `site_member` with `conditions`, and
 /// answer the id of the execution a start of it runs.
-async fn gated_pipeline(
+/// `pub(crate)` with the helpers above: the `skipped_stage_condition_overrides` suite
+/// declares its gate through this one builder rather than growing a second copy.
+pub(crate) async fn gated_pipeline(
     emulator: &Emulator,
     pipeline: &str,
     site_member: &str,
@@ -119,8 +124,30 @@ async fn gated_pipeline(
         .to_string()
 }
 
+/// The one sentence `ConditionNotOverridableException` states, spelled here rather than
+/// read from the crate: the fixed text is the service's, and the three substitutions are
+/// the request's own values. The single-quoted slot carries the PIPELINE the request named
+/// — the value the recorded refusal of this class carries there, on two independently
+/// recorded calls whose own execution id appears nowhere in the sentence.
+///
+/// `pub(crate)` with the builders above: the `skipped_stage_condition_overrides` suite
+/// reads the refusal's wording through this ONE template, so the two suites cannot drift
+/// on it.
+pub(crate) fn not_overridable_sentence(
+    condition_type: &str,
+    stage_name: &str,
+    pipeline_name: &str,
+) -> String {
+    format!(
+        "The condition type {condition_type} in stage {stage_name} cannot be overridden \
+         now. Either it contains no failed or in-progress rule, the execution \
+         '{pipeline_name}' is already superseded, or the pipeline definition has changed \
+         since the rules(s) failed."
+    )
+}
+
 /// The `StageState` `GetPipelineState` reports for one stage.
-async fn stage_state(emulator: &Emulator, pipeline: &str, stage: &str) -> Value {
+pub(crate) async fn stage_state(emulator: &Emulator, pipeline: &str, stage: &str) -> Value {
     let state = emulator
         .ok("GetPipelineState", &json!({"name": pipeline}))
         .await;
@@ -616,17 +643,7 @@ async fn the_not_overridable_refusal_states_one_sentence_over_the_request() {
             (REFUSAL_STATUS, "ConditionNotOverridableException"),
             "case {case:?}: unexpected refusal, got {status} {code} {message:?}"
         );
-        // The sentence, spelled here rather than read from the crate: the fixed text is
-        // the service's, and the three substitutions are the request's own values. The
-        // single-quoted slot carries the PIPELINE the request named — the value the
-        // recorded refusal of this class carries there, on two independently recorded
-        // calls whose own execution id appears nowhere in the sentence.
-        let expected = format!(
-            "The condition type {condition_type} in stage {stage_name} cannot be \
-             overridden now. Either it contains no failed or in-progress rule, the \
-             execution '{pipeline_name}' is already superseded, or the pipeline \
-             definition has changed since the rules(s) failed."
-        );
+        let expected = not_overridable_sentence(condition_type, stage_name, pipeline_name);
         assert_eq!(
             message, expected,
             "case {case:?}: expected the refusal's one sentence, got {message:?}"
