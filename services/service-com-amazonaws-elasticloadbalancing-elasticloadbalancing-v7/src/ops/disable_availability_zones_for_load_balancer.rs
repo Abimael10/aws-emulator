@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisableAvailabilityZonesForLoadBalancer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisableAvailabilityZonesForLoadBalancer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the requested Availability Zones from the stored load balancer's
+//! placement and answers the zone set read back from state — for a load balancer the
+//! operation applies to at all, and only while it leaves the load balancer in at least one
+//! zone. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisableAvailabilityZonesForLoadBalancer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The counterpart of `EnableAvailabilityZonesForLoadBalancer`, which this handler mirrors:
+//! one in a VPC of the account's own is placed by its subnets instead, so the call is
+//! refused for it and nothing is written.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +145,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisableAvailabilityZonesForLoadBalancer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisableAvailabilityZonesForLoadBalancerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisableAvailabilityZonesForLoadBalancer"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This service's model declares no server-fault error, and a 501 would claim
+            // "not implemented", so an unreachable store is refused instead.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the Elastic Load Balancing store is unavailable",
+            ));
+        };
+        let region = crate::state::region_from_request(ctx.parts());
+
+        // A zone-removal removes nothing unless it names a zone, and the list is
+        // caller-sized, so it is bounded before the load balancer it is about is resolved —
+        // the same ceiling every operation that writes a placement holds it to.
+        if input.availability_zones.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "AvailabilityZones must name at least one Availability Zone to remove",
+            ));
+        }
+        if input.availability_zones.len() > crate::state::MAX_PLACEMENTS_PER_LOAD_BALANCER {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "AvailabilityZones must carry at most {} entries; got {}",
+                crate::state::MAX_PLACEMENTS_PER_LOAD_BALANCER,
+                input.availability_zones.len()
+            )));
+        }
+
+        // Three steps, so this service's guard is never held while EC2's store is read:
+        // which VPC the record is in, then whether that VPC is the account's default one,
+        // then the zones the request removes.
+        let placed_in = {
+            let guard = state.lock();
+            // A load balancer is a regional resource, so the name is resolved in the region
+            // this request is signed for; a name no record holds there is this operation's
+            // not-found failure.
+            let Some(record) = guard
+                .load_balancers_in(&region)
+                .and_then(|records| records.get(&input.load_balancer_name))
+            else {
+                return Err(load_balancer_not_found(&input.load_balancer_name));
+            };
+            record.vpc_id.clone()
+        };
+        // "Removes the specified Availability Zones from the set of Availability Zones for
+        // the specified load balancer in EC2-Classic or a default VPC. For load balancers in
+        // a non-default VPC, use DetachLoadBalancerFromSubnets" — so a load balancer in a
+        // VPC of the account's own is outside what this operation does at all, exactly as it
+        // is outside what the zone-enable beside it does, and the refusal is raised BEFORE
+        // anything is written.
+        if crate::state::in_non_default_vpc(&*self.engine, &region, placed_in.as_deref()) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::DISABLE_ZONES_IN_NON_DEFAULT_VPC_MESSAGE,
+            ));
+        }
+
+        let mut guard = state.lock();
+        // Looked up again because the lock was released for the EC2 read: the load balancer
+        // may have been deleted while it ran.
+        let Some(record) = guard
+            .load_balancers_in_mut(&region)
+            .and_then(|records| records.get_mut(&input.load_balancer_name))
+        else {
+            return Err(load_balancer_not_found(&input.load_balancer_name));
+        };
+
+        // "There must be at least one Availability Zone registered with a load balancer at
+        // all times": a request that would leave this one in none is a configuration change
+        // this service cannot apply, and not one of the named zones is removed. The set is
+        // judged before anything is written, so a refusal leaves the placement exactly as it
+        // found it.
+        let named: ::std::collections::BTreeSet<&str> = input
+            .availability_zones
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let remaining = record.zones_without(&named);
+        if remaining.is_empty() && !record.zones().is_empty() {
+            return Err(
+                DisableAvailabilityZonesForLoadBalancerErrorModeled::InvalidConfigurationRequestException(
+                    InvalidConfigurationRequestException {
+                        message: Some(crate::state::disabled_every_zone_message(
+                            &input.load_balancer_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Each named zone leaves the placement. A zone the load balancer is not in removes
+        // nothing, and one named twice in the same request is removed once: the set the
+        // caller asked for is the set the load balancer ends up in either way.
+        for zone in &input.availability_zones {
+            record.disable_zone(zone);
+        }
+
+        // "The remaining Availability Zones for the load balancer" — the WHOLE set read back
+        // from the stored record, so a following `DescribeLoadBalancers` agrees with it.
+        Ok(DisableAvailabilityZonesForLoadBalancerOutput {
+            availability_zones: Some(record.zones()),
+        })
     }
+}
+
+/// The refusal a request naming a load balancer this region holds none of earns, stated the
+/// way every operation of this service that resolves a load balancer by name states it: over
+/// the name the request carried, which is what the caller has to fix.
+fn load_balancer_not_found(
+    load_balancer_name: &str,
+) -> DisableAvailabilityZonesForLoadBalancerError {
+    DisableAvailabilityZonesForLoadBalancerErrorModeled::AccessPointNotFoundException(
+        AccessPointNotFoundException {
+            message: Some(format!(
+                "There is no ACTIVE Load Balancer named '{load_balancer_name}'"
+            )),
+        },
+    )
+    .into()
 }

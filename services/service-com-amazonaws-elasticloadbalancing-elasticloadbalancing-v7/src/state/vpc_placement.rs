@@ -25,6 +25,14 @@ use ::service_com_amazonaws_ec2_amazonec2::state as ec2;
 pub const ZONES_IN_NON_DEFAULT_VPC_MESSAGE: &str =
     "You cannot enable Availability Zones for ELBs in a non default VPC";
 
+/// The sentence `DisableAvailabilityZonesForLoadBalancer` refuses a load balancer of a
+/// non-default VPC with — the other half of the same rule, worded over what that call does.
+///
+/// Entirely fixed text as well: it states which load balancers the EC2-Classic zone API
+/// applies to at all, and no part of it comes from the request.
+pub const DISABLE_ZONES_IN_NON_DEFAULT_VPC_MESSAGE: &str =
+    "You cannot disable Availability Zones for ELBs in a non default VPC";
+
 /// Whether `vpc_id` is a VPC the account holds in `region` that is NOT its default one —
 /// the placement the EC2-Classic zone API does not apply to.
 ///

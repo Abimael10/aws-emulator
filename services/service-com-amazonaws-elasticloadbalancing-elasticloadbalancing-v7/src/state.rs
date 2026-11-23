@@ -836,13 +836,29 @@ impl LoadBalancer {
     /// `DescribeLoadBalancers` reports the zones of the subnets the load balancer is
     /// attached to now — whichever operation attached or detached them.
     pub fn zones(&self) -> Vec<String> {
+        self.zones_without(&BTreeSet::new())
+    }
+
+    /// Every Availability Zone this load balancer would be in once each zone in `excluded`
+    /// that it was placed in DIRECTLY has been removed from it.
+    ///
+    /// The set a zone-removal is judged over BEFORE anything is written, so a change that
+    /// would break a placement rule leaves the stored placement exactly as it found it. A
+    /// zone one of this load balancer's subnets puts it in is not removed by naming the
+    /// zone: the SUBNET is what places it there, so that zone stays until the subnet is
+    /// detached.
+    pub fn zones_without(&self, excluded: &BTreeSet<&str>) -> Vec<String> {
         let from_subnets = self
             .subnets
             .iter()
             .filter_map(|subnet_id| self.subnet_zones.get(subnet_id));
+        let named_directly = self
+            .availability_zones
+            .iter()
+            .filter(|zone| !excluded.contains(zone.as_str()));
         let mut seen: BTreeSet<&str> = BTreeSet::new();
         let mut reported: Vec<String> = Vec::new();
-        for zone in self.availability_zones.iter().chain(from_subnets) {
+        for zone in named_directly.chain(from_subnets) {
             if seen.insert(zone.as_str()) {
                 reported.push(zone.clone());
             }
@@ -876,6 +892,16 @@ impl LoadBalancer {
             return;
         }
         self.availability_zones.push(zone.to_string());
+    }
+
+    /// Remove `zone` from the zones a request named DIRECTLY. A zone the load balancer was
+    /// not placed in directly removes nothing.
+    ///
+    /// The counterpart of [`LoadBalancer::enable_zone`]: it takes out exactly what that one
+    /// puts in, so a zone one of this load balancer's SUBNETS puts it in survives — that
+    /// placement is the subnet's, and `DetachLoadBalancerFromSubnets` is what takes it out.
+    pub fn disable_zone(&mut self, zone: &str) {
+        self.availability_zones.retain(|held| held != zone);
     }
 
     /// Detach `subnet_id`, and with it the zone it put the load balancer in. A subnet the
@@ -1098,6 +1124,21 @@ pub fn detached_every_subnet_message(load_balancer_name: &str) -> String {
         "Requested configuration change for LoadBalancer \"{load_balancer_name}\" is invalid \
          because you attempted to detach all the subnets for this LoadBalancer and a \
          LoadBalancer cannot be attached to zero subnets in VPC."
+    )
+}
+
+/// The message a zone-removal that would leave a load balancer in no Availability Zone at
+/// all is refused with.
+///
+/// Stated the way the subnet rule beside it is: `InvalidConfigurationRequest` refuses every
+/// configuration rule a load balancer has, so the message names the load balancer the
+/// request asked about and states the rule the change would have broken — "there must be at
+/// least one Availability Zone registered with a load balancer at all times".
+pub fn disabled_every_zone_message(load_balancer_name: &str) -> String {
+    format!(
+        "Requested configuration change for LoadBalancer \"{load_balancer_name}\" is invalid \
+         because you attempted to disable all the Availability Zones for this LoadBalancer \
+         and a LoadBalancer must be registered with at least one Availability Zone."
     )
 }
 
