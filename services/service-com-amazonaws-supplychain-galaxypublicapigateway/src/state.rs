@@ -1365,6 +1365,20 @@ impl ComAmazonawsSupplychainGalaxypublicapigatewayState {
         self.flows.get(&flow_key(instance_id, name))
     }
 
+    /// The stored flow `name` of instance `instance_id` for a caller that is going to
+    /// CHANGE it, or `None` when that instance holds no flow under that name.
+    ///
+    /// The one way a flow already in the store is modified in place, so an update keeps the
+    /// entry (and everything addressed through it, its runs included) and moves nothing but
+    /// the members it was asked to.
+    pub fn flow_mut(
+        &mut self,
+        instance_id: &str,
+        name: &str,
+    ) -> Option<&mut DataIntegrationFlowRecord> {
+        self.flows.get_mut(&flow_key(instance_id, name))
+    }
+
     /// How many flows `instance_id` holds — one range scan over the keys that instance's
     /// flows occupy, which is what [`MAX_FLOWS_PER_INSTANCE`] caps.
     pub fn flow_count(&self, instance_id: &str) -> usize {

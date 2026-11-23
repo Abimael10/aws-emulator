@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDataIntegrationFlow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDataIntegrationFlow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDataIntegrationFlow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +150,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDataIntegrationFlow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDataIntegrationFlowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDataIntegrationFlow"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateDataIntegrationFlowErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the supplychain data integration store is unavailable on this engine"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        // ONE lock for the whole read-modify-write, so concurrent updates of the same pair
+        // serialize and no later read observes a half-applied configuration.
+        let mut store = state.lock();
+        // The transition the clock owed at `now`, which was due whether or not anybody
+        // called this operation.
+        store.materialize_due_transitions(now);
+
+        // The gateway authorizes an instance-scoped call against the instance BEFORE it
+        // looks the addressed resource up, so an `instanceId` naming no instance of this
+        // account is an authorization failure rather than a not-found.
+        if !store.instances.contains_key(&input.instance_id) {
+            return Err(UpdateDataIntegrationFlowErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::instance_authorization_failure_message(
+                        input.instance_id.as_str(),
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let UpdateDataIntegrationFlowInput {
+            instance_id,
+            name,
+            sources,
+            transformation,
+            target,
+        } = input;
+
+        // An update addresses a flow that already exists: a name this instance holds no
+        // flow under — including one a delete has already taken — is a not-found, never a
+        // create of that name.
+        let Some(record) = store.flow_mut(&instance_id, &name) else {
+            return Err(
+                UpdateDataIntegrationFlowErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::flow_not_found_message(&name, &instance_id)),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Each end of the pipeline is optional on this request and required on the create,
+        // so one the request omits is one it asks nothing about: the stored configuration
+        // stands, and only the ends the request carries are replaced — each wholly, since a
+        // source list, a target and a transformation are each one value.
+        let sources = sources.unwrap_or_else(|| record.sources.clone());
+        let transformation = transformation.unwrap_or_else(|| record.transformation.clone());
+        let target = target.unwrap_or_else(|| record.target.clone());
+
+        // The same rule the create applies, over the configuration this flow would END UP
+        // with: a declared source, target or transformation type whose configuration is
+        // absent describes no end of the pipeline at all, so it is refused with the
+        // modelled 400 and the stored flow is left exactly as it was.
+        if let Some(problem) =
+            crate::state::flow_configuration_problem(&sources, &transformation, &target)
+        {
+            return Err(UpdateDataIntegrationFlowErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(problem),
+                },
+            )
+            .into());
+        }
+
+        record.sources = sources;
+        record.transformation = transformation;
+        record.target = target;
+        // The write this call performed is what `lastModifiedTime` reports; `createdTime`
+        // belongs to the create and never moves.
+        record.last_modified_time = now;
+
+        // Projected from the record that is now stored, so nothing in the response can
+        // differ from what a later `GetDataIntegrationFlow` reports.
+        Ok(UpdateDataIntegrationFlowOutput {
+            flow: record.to_wire(),
+        })
     }
 }

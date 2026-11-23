@@ -16,6 +16,12 @@
 //! `DeleteDataIntegrationFlow` is the other side of that pair: it TAKES the entry out of
 //! the store, so a name it has removed is a name the instance holds no flow under — every
 //! later read of it misses and the name is free to be created again.
+//!
+//! `UpdateDataIntegrationFlow` is the third: it writes the ends of an EXISTING flow's
+//! pipeline that the request carries (`sources`, `transformation`, `target`, each replaced
+//! whole), leaves every end the request omits as it was, moves `lastModifiedTime` while
+//! `createdTime` stays the create's, and is refused for a pair the store holds no flow for
+//! or a declared type whose configuration the request omits.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -162,6 +168,13 @@ impl Emulator {
         self.send("DELETE", &flow_path(instance_id, name), None)
             .await
     }
+
+    /// `UpdateDataIntegrationFlow` for one (instance, name) pair, with `request` as body —
+    /// a PATCH, as the model's `http` trait binds this operation.
+    async fn update_flow(&self, instance_id: &str, name: &str, request: Value) -> (u16, Value) {
+        self.send("PATCH", &flow_path(instance_id, name), Some(request))
+            .await
+    }
 }
 
 /// The URI every flow operation is addressed at, as the model's `http` trait spells it:
@@ -260,6 +273,51 @@ fn dataset_identifier(instance_id: &str, namespace: &str, name: &str) -> String 
         "arn:aws:scn:{REGION}:{}:instance/{instance_id}/namespaces/{namespace}/datasets/{name}",
         engine::emulator_account_id()
     )
+}
+
+/// One row of the update table: the create that establishes the flow, and the update
+/// applied to it.
+struct UpdateRow {
+    case: &'static str,
+    base: Value,
+    update: Value,
+}
+
+/// The configuration the flow is expected to END UP with: each end the update carries,
+/// falling back to the one the create stored for an end the update says nothing about.
+///
+/// This is the rule under test spelled out once, independently of the handler, and read by
+/// every row.
+fn expected_configuration(base: &Value, update: &Value) -> Value {
+    let mut expected = json!({});
+    for member in ["sources", "transformation", "target"] {
+        let value = update
+            .get(member)
+            .or_else(|| base.get(member))
+            .unwrap_or_else(|| panic!("the base create carries every end of the pipeline: {base}"));
+        expected[member] = value.clone();
+    }
+    expected
+}
+
+/// The `sources`, `transformation` and `target` of a flow payload, as
+/// [`expected_configuration`] spells them, so the two are compared member for member.
+fn configuration_of(case: &str, flow: &Value) -> Value {
+    let mut actual = json!({});
+    for member in ["sources", "transformation", "target"] {
+        let value = flow
+            .get(member)
+            .unwrap_or_else(|| panic!("case {case}: the flow carries no `{member}`: {flow}"));
+        actual[member] = value.clone();
+    }
+    actual
+}
+
+/// A timestamp member of a flow payload, in the epoch seconds restJson1 carries it as.
+fn timestamp_of(case: &str, flow: &Value, member: &str) -> f64 {
+    flow.get(member)
+        .and_then(Value::as_f64)
+        .unwrap_or_else(|| panic!("case {case}: `{member}` must be a timestamp: {flow}"))
 }
 
 /// The configuration a flow request declared a type for but did not carry: the member
@@ -1374,5 +1432,529 @@ async fn a_delete_takes_only_the_addressed_flow() {
             status, 200,
             "case {case}: a refused delete must take nothing, got {status} with {body}"
         );
+    }
+}
+
+/// RULE: `UpdateDataIntegrationFlow` writes the ends of an EXISTING flow's pipeline that
+/// the request carries — `sources`, `transformation` and `target`, each replaced whole —
+/// leaves every end the request omits as it was, answers with the stored record, and moves
+/// `lastModifiedTime` while `createdTime` stays the create's.
+#[tokio::test]
+async fn an_update_writes_the_ends_it_carries_and_leaves_the_rest() {
+    let emulator = Emulator::new();
+    let instance_id = emulator.create_instance("update").await;
+
+    let sql = json!({
+        "transformationType": "SQL",
+        "sqlTransformation": { "query": "SELECT * FROM orders" },
+    });
+    let s3_target_value = json!({
+        "targetType": "S3",
+        "s3Target": { "bucketName": "supply-exports", "prefix": "orders/" },
+    });
+    let dataset_target_value = json!({
+        "targetType": "DATASET",
+        "datasetTarget": {
+            "datasetIdentifier": dataset_identifier(&instance_id, "default", "product"),
+        },
+    });
+    let base = json!({
+        "sources": [s3_source("orders", "supply-landing", "orders/", None)],
+        "transformation": sql.clone(),
+        "target": s3_target_value.clone(),
+    });
+
+    // A flow of the same instance that no row addresses: whatever an update writes, it
+    // writes it to the ONE pair it is addressed at.
+    let bystander = "bystander";
+    let (status, body) = emulator
+        .create_flow(&instance_id, bystander, base.clone())
+        .await;
+    assert_eq!(
+        status, 200,
+        "case bystander: the untouched flow must be created, got {status} with {body}"
+    );
+    let (_, body) = emulator.get_flow(&instance_id, bystander).await;
+    let bystander_before = flow_of("bystander", &body);
+
+    // Rows spanning what the rule generalises over: which ends the request carries (one,
+    // another, all three, none), the source count (1, 2 and the modelled maximum of 40),
+    // and both modelled values of every `…Type` enum in either direction.
+    let rows = vec![
+        UpdateRow {
+            case: "the transformation alone, SQL replaced by another query",
+            base: base.clone(),
+            update: json!({
+                "transformation": {
+                    "transformationType": "SQL",
+                    "sqlTransformation": { "query": "SELECT id, total FROM orders" },
+                },
+            }),
+        },
+        UpdateRow {
+            case: "the transformation alone, SQL replaced by NONE",
+            base: base.clone(),
+            update: json!({ "transformation": { "transformationType": "NONE" } }),
+        },
+        UpdateRow {
+            case: "the transformation alone, NONE replaced by SQL",
+            base: json!({
+                "sources": [s3_source("orders", "supply-landing", "orders/", None)],
+                "transformation": { "transformationType": "NONE" },
+                "target": s3_target_value.clone(),
+            }),
+            update: json!({ "transformation": sql.clone() }),
+        },
+        UpdateRow {
+            case: "the sources alone, one S3 source replaced by two of both types",
+            base: base.clone(),
+            update: json!({
+                "sources": [
+                    s3_source("raw", "supply-landing", "raw/", None),
+                    dataset_source(
+                        "enriched",
+                        &dataset_identifier(&instance_id, "default", "enriched"),
+                        None,
+                    ),
+                ],
+            }),
+        },
+        UpdateRow {
+            case: "the sources alone, replaced by the modelled maximum of 40",
+            base: base.clone(),
+            update: json!({
+                "sources": (0..40)
+                    .map(|index| s3_source(
+                        &format!("source_{index}"),
+                        "supply-landing",
+                        &format!("part-{index}/"),
+                        None,
+                    ))
+                    .collect::<Vec<Value>>(),
+            }),
+        },
+        UpdateRow {
+            case: "the target alone, S3 replaced by DATASET",
+            base: base.clone(),
+            update: json!({ "target": dataset_target_value.clone() }),
+        },
+        UpdateRow {
+            case: "the target alone, DATASET replaced by S3",
+            base: json!({
+                "sources": [dataset_source(
+                    "product",
+                    &dataset_identifier(&instance_id, "default", "product"),
+                    None,
+                )],
+                "transformation": { "transformationType": "NONE" },
+                "target": dataset_target_value.clone(),
+            }),
+            update: json!({ "target": s3_target_value.clone() }),
+        },
+        UpdateRow {
+            case: "every end at once",
+            base: base.clone(),
+            update: json!({
+                "sources": [dataset_source(
+                    "product",
+                    &dataset_identifier(&instance_id, "default", "product"),
+                    // The last entry of the model's own load-type catalog
+                    // (`DATA_INTEGRATION_FLOW_LOAD_TYPE_VALUES`), so the row does not ride
+                    // on its first value.
+                    Some(json!({
+                        "loadType": DATA_INTEGRATION_FLOW_LOAD_TYPE_VALUES
+                            .last()
+                            .expect("the model declares at least one load type"),
+                    })),
+                )],
+                "transformation": { "transformationType": "NONE" },
+                "target": dataset_target_value.clone(),
+            }),
+        },
+        UpdateRow {
+            case: "no end at all, which asks for no change",
+            base: base.clone(),
+            update: json!({}),
+        },
+    ];
+
+    for (index, row) in rows.into_iter().enumerate() {
+        let case = row.case;
+        let name = format!("update-{index}");
+
+        let (status, body) = emulator
+            .create_flow(&instance_id, &name, row.base.clone())
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: the flow to update must be created, got {status} with {body}"
+        );
+        let (status, body) = emulator.get_flow(&instance_id, &name).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: the created flow must be readable, got {status} with {body}"
+        );
+        let before = flow_of(case, &body);
+        let created_time = timestamp_of(case, &before, "createdTime");
+
+        let (status, body) = emulator
+            .update_flow(&instance_id, &name, row.update.clone())
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: UpdateDataIntegrationFlow expected 200, got {status} with {body}"
+        );
+        let updated = flow_of(case, &body);
+
+        assert_eq!(
+            string_of(case, &updated, "instanceId"),
+            instance_id,
+            "case {case}: the updated flow must report its own instance, got {updated}"
+        );
+        assert_eq!(
+            string_of(case, &updated, "name"),
+            name,
+            "case {case}: the updated flow must report its own name, got {updated}"
+        );
+        assert_eq!(
+            configuration_of(case, &updated),
+            expected_configuration(&row.base, &row.update),
+            "case {case}: the update must write the ends it carries and leave the rest, got \
+             {updated}"
+        );
+        assert_eq!(
+            timestamp_of(case, &updated, "createdTime"),
+            created_time,
+            "case {case}: createdTime belongs to the create and must not move, got {updated}"
+        );
+        assert!(
+            timestamp_of(case, &updated, "lastModifiedTime") >= created_time,
+            "case {case}: lastModifiedTime must be the time of the write, got {updated}"
+        );
+
+        // The response is the stored record, so the read that follows answers with exactly
+        // it — the update persisted, rather than being reported and dropped.
+        let (status, body) = emulator.get_flow(&instance_id, &name).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: the updated flow must be readable, got {status} with {body}"
+        );
+        assert_eq!(
+            flow_of(case, &body),
+            updated,
+            "case {case}: the read must answer with what the update stored, got {body}"
+        );
+    }
+
+    let (status, body) = emulator.get_flow(&instance_id, bystander).await;
+    assert_eq!(
+        status, 200,
+        "case bystander: the untouched flow must still be readable, got {status} with {body}"
+    );
+    assert_eq!(
+        flow_of("bystander", &body),
+        bystander_before,
+        "case bystander: an update must change only the pair it addresses, got {body}"
+    );
+}
+
+/// RULE: an update addresses a flow that already exists, so a pair the store holds none
+/// for is refused — a name the instance holds no flow under (including one a delete has
+/// taken) with `ResourceNotFoundException` (404) carrying the not-found sentence, and an
+/// `instanceId` this account does not hold with the gateway's authorization failure (403)
+/// — and neither creates anything.
+#[tokio::test]
+async fn an_update_of_a_flow_that_does_not_exist_is_refused() {
+    let emulator = Emulator::new();
+    let instance_id = emulator.create_instance("update refusal").await;
+    let request = json!({ "transformation": { "transformationType": "NONE" } });
+    let stored = "stored-flow";
+
+    let (status, body) = emulator
+        .create_flow(
+            &instance_id,
+            stored,
+            json!({
+                "sources": [s3_source("orders", "supply-landing", "orders/", None)],
+                "transformation": { "transformationType": "NONE" },
+                "target": {
+                    "targetType": "S3",
+                    "s3Target": { "bucketName": "supply-exports", "prefix": "orders/" },
+                },
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case stored: the flow to address must be created, got {status} with {body}"
+    );
+
+    // Names this instance holds no flow under, differing in how close they are to the one
+    // it does hold.
+    for (case, name) in [
+        ("a name never created", "never-created"),
+        ("one character off a stored name", "stored-flows"),
+        ("the stored name in another case", "Stored-Flow"),
+        ("a single character", "q"),
+    ] {
+        let (status, body) = emulator
+            .update_flow(&instance_id, name, request.clone())
+            .await;
+        assert_eq!(
+            status, 404,
+            "case {case}: expected 404, got {status} with {body}"
+        );
+        assert!(
+            error_type(&body).contains("ResourceNotFoundException"),
+            "case {case}: expected a ResourceNotFoundException envelope, got {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            expected_not_found_sentence(name, &instance_id),
+            "case {case}: the refusal must name the flow and its instance, got {body}"
+        );
+
+        let (status, body) = emulator.get_flow(&instance_id, name).await;
+        assert_eq!(
+            status, 404,
+            "case {case}: a refused update must create nothing, got {status} with {body}"
+        );
+    }
+
+    // An `instanceId` of the modelled shape that names no instance of this account is the
+    // gateway's authorization failure, whatever name the update addresses; one outside the
+    // modelled UUID shape is refused before any handler runs.
+    for (case, instance, expected) in [
+        (
+            "the all-zero UUID, which no instance holds",
+            "00000000-0000-0000-0000-000000000000".to_string(),
+            403,
+        ),
+        (
+            "a UUID that no instance holds, addressing a name one does",
+            "00000000-0000-4000-8000-000000000000".to_string(),
+            403,
+        ),
+        (
+            "an instanceId outside the modelled UUID shape",
+            "not-a-uuid".to_string(),
+            400,
+        ),
+    ] {
+        let (status, body) = emulator
+            .update_flow(&instance, stored, request.clone())
+            .await;
+        assert_eq!(
+            status, expected,
+            "case {case}: expected {expected}, got {status} with {body}"
+        );
+        if expected == 403 {
+            assert!(
+                error_type(&body).contains("AccessDeniedException"),
+                "case {case}: expected an AccessDeniedException envelope, got {body}"
+            );
+            assert_eq!(
+                error_message(&body),
+                expected_authorization_failure(&instance),
+                "case {case}: the refusal must carry the gateway's authorization sentence, got \
+                 {body}"
+            );
+        }
+    }
+
+    // A flow a delete has taken is a flow the instance holds no name for, so the update
+    // that follows the delete is the same not-found and resurrects nothing.
+    let (status, body) = emulator.delete_flow(&instance_id, stored).await;
+    assert_eq!(
+        status, 200,
+        "case deleted: the delete must be served, got {status} with {body}"
+    );
+    let (status, body) = emulator
+        .update_flow(&instance_id, stored, request.clone())
+        .await;
+    assert_eq!(
+        status, 404,
+        "case deleted: expected 404, got {status} with {body}"
+    );
+    assert_eq!(
+        error_message(&body),
+        expected_not_found_sentence(stored, &instance_id),
+        "case deleted: the refusal must name the flow and its instance, got {body}"
+    );
+    let (status, body) = emulator.get_flow(&instance_id, stored).await;
+    assert_eq!(
+        status, 404,
+        "case deleted: a refused update must bring nothing back, got {status} with {body}"
+    );
+}
+
+/// RULE: the same discriminator rule the create applies holds for the configuration an
+/// update would leave the flow with, so an update that declares a source, target or
+/// transformation type and carries none of its configuration is refused
+/// `ValidationException` (400) and the stored flow is left exactly as it was; the type that
+/// is configured by nothing (`NONE`) is served.
+#[tokio::test]
+async fn an_update_declaring_a_type_without_its_configuration_is_refused() {
+    let emulator = Emulator::new();
+    let instance_id = emulator.create_instance("update configuration").await;
+    let base = json!({
+        "sources": [s3_source("orders", "supply-landing", "orders/", None)],
+        "transformation": {
+            "transformationType": "SQL",
+            "sqlTransformation": { "query": "SELECT * FROM orders" },
+        },
+        "target": {
+            "targetType": "S3",
+            "s3Target": { "bucketName": "supply-exports", "prefix": "orders/" },
+        },
+    });
+
+    // One row per (declared type, missing configuration member) pair, over every value of
+    // the three modelled enums, plus the served `NONE` row.
+    let rows: Vec<ConfigurationRow> = vec![
+        ConfigurationRow {
+            case: "S3 source without s3Source",
+            request: json!({ "sources": [{ "sourceType": "S3", "sourceName": "orders" }] }),
+            missing: Some(Missing {
+                member: "s3Source",
+                discriminator: "sourceType",
+                value: "S3",
+            }),
+        },
+        ConfigurationRow {
+            case: "DATASET source without datasetSource",
+            request: json!({ "sources": [{ "sourceType": "DATASET", "sourceName": "product" }] }),
+            missing: Some(Missing {
+                member: "datasetSource",
+                discriminator: "sourceType",
+                value: "DATASET",
+            }),
+        },
+        ConfigurationRow {
+            case: "the second of two sources missing its configuration",
+            request: json!({
+                "sources": [
+                    s3_source("orders", "supply-landing", "orders/", None),
+                    { "sourceType": "DATASET", "sourceName": "product" },
+                ],
+            }),
+            missing: Some(Missing {
+                member: "datasetSource",
+                discriminator: "sourceType",
+                value: "DATASET",
+            }),
+        },
+        ConfigurationRow {
+            case: "S3 target without s3Target",
+            request: json!({ "target": { "targetType": "S3" } }),
+            missing: Some(Missing {
+                member: "s3Target",
+                discriminator: "targetType",
+                value: "S3",
+            }),
+        },
+        ConfigurationRow {
+            case: "DATASET target without datasetTarget",
+            request: json!({ "target": { "targetType": "DATASET" } }),
+            missing: Some(Missing {
+                member: "datasetTarget",
+                discriminator: "targetType",
+                value: "DATASET",
+            }),
+        },
+        ConfigurationRow {
+            case: "SQL transformation without sqlTransformation",
+            request: json!({ "transformation": { "transformationType": "SQL" } }),
+            missing: Some(Missing {
+                member: "sqlTransformation",
+                discriminator: "transformationType",
+                value: "SQL",
+            }),
+        },
+        ConfigurationRow {
+            case: "NONE transformation, which is configured by nothing",
+            request: json!({ "transformation": { "transformationType": "NONE" } }),
+            missing: None,
+        },
+    ];
+
+    // Every value of each modelled enum is exercised by the rows above, so a value added
+    // to the model later shows up here as an uncovered one.
+    let covered: BTreeSet<&str> = rows
+        .iter()
+        .filter_map(|row| row.missing.as_ref().map(|missing| missing.value))
+        .chain(["NONE"])
+        .collect();
+    for value in DATA_INTEGRATION_FLOW_SOURCE_TYPE_VALUES
+        .iter()
+        .chain(DATA_INTEGRATION_FLOW_TARGET_TYPE_VALUES)
+        .chain(DATA_INTEGRATION_FLOW_TRANSFORMATION_TYPE_VALUES)
+    {
+        assert!(
+            covered.contains(value),
+            "case enum coverage: no row declares the {value} type, covered {covered:?}"
+        );
+    }
+
+    for (index, row) in rows.into_iter().enumerate() {
+        let case = row.case;
+        let name = format!("update-configuration-{index}");
+        let (status, body) = emulator
+            .create_flow(&instance_id, &name, base.clone())
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: the flow to update must be created, got {status} with {body}"
+        );
+        let (_, body) = emulator.get_flow(&instance_id, &name).await;
+        let before = flow_of(case, &body);
+
+        let (status, body) = emulator
+            .update_flow(&instance_id, &name, row.request.clone())
+            .await;
+        match row.missing {
+            Some(missing) => {
+                assert_eq!(
+                    status, 400,
+                    "case {case}: a declared type with no configuration must be refused, got \
+                     {status} with {body}"
+                );
+                assert!(
+                    error_type(&body).contains("ValidationException"),
+                    "case {case}: expected a ValidationException envelope, got {body}"
+                );
+                assert_eq!(
+                    error_message(&body),
+                    expected_missing_configuration_sentence(
+                        missing.member,
+                        missing.discriminator,
+                        missing.value
+                    ),
+                    "case {case}: the refusal must name the missing configuration, got {body}"
+                );
+
+                let (status, body) = emulator.get_flow(&instance_id, &name).await;
+                assert_eq!(
+                    status, 200,
+                    "case {case}: a refused update must leave the flow, got {status} with {body}"
+                );
+                assert_eq!(
+                    flow_of(case, &body),
+                    before,
+                    "case {case}: a refused update must change nothing, got {body}"
+                );
+            }
+            None => {
+                assert_eq!(
+                    status, 200,
+                    "case {case}: expected 200, got {status} with {body}"
+                );
+                assert_eq!(
+                    configuration_of(case, &flow_of(case, &body)),
+                    expected_configuration(&base, &row.request),
+                    "case {case}: the served update must write the end it carries, got {body}"
+                );
+            }
+        }
     }
 }
