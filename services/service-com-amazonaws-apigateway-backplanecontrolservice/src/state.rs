@@ -90,6 +90,22 @@ pub struct ComAmazonawsApigatewayBackplanecontrolserviceState {
     /// ([`ComAmazonawsApigatewayBackplanecontrolserviceState::forget_api_key`]), so it
     /// never grows with the request count.
     pub throttle_buckets: BTreeMap<String, ThrottleBucket>,
+    /// The token bucket each throttled method of each stage is metered against, keyed by
+    /// [`StageMethodThrottleKey`]: one bucket per `(API, stage, method path)`, because a
+    /// `methodSettings` entry's `throttlingRateLimit`/`throttlingBurstLimit` is the rate the
+    /// STAGE admits requests for the METHOD the entry applies to — whoever is calling, and
+    /// whether or not an API key meters the call. An entry keyed by the whole-stage wildcard
+    /// is the DEFAULT for every method of the stage, so each of them is metered on a bucket
+    /// of its own at that rate; see [`stage_method_throttle_key`].
+    ///
+    /// Written by the `execute-api` data plane while serving a request (see
+    /// [`crate::service::invoke`]), for the reason the usage-plan buckets above are: the rate
+    /// a method's requests are admitted at cannot be computed without recording the ones
+    /// already admitted. Bounded by the records the control plane holds and reclaimed with
+    /// the stage it meters
+    /// ([`ComAmazonawsApigatewayBackplanecontrolserviceState::stage_method_throttle_admits`]),
+    /// so it never grows with the request count.
+    pub stage_method_throttle_buckets: StageMethodThrottleBuckets,
     /// The requests each API key that has invoked a stage has sent, counted by the day
     /// each one fell on and keyed by [`metering_key`] — one log per `(usage plan, API
     /// key)` pair, for the reason the throttle buckets above are: a usage plan's quota is
@@ -3451,7 +3467,7 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
     /// walk covers every stored domain name.
     ///
     /// What the refusal of such a delete NAMES is the domain names the caller has to
-    /// remove mappings from ([`rest_api_in_use_by_base_path_mapping`]), so that is what
+    /// remove mappings from ([`stage_in_use_by_base_path_mapping`]), so that is what
     /// this reports: the records are walked in creation order, with the key breaking a
     /// tie, so one set of records always yields one list — and a domain name holding
     /// several mappings of the API appears once, because the refusal asks for "all base
@@ -4283,22 +4299,12 @@ fn in_use_by_base_path_mapping(kind: &str, identifier: &str, domain_names: &[Str
 /// what `DeleteStage` refuses while the reference stands: the shared sentence
 /// ([`in_use_by_base_path_mapping`]) over the stage, which the recorded refusal names by
 /// the common noun.
+///
+/// The API ITSELF carries no such precondition: `DeleteRestApi` removes the API and leaves
+/// a mapping that named it behind (see that handler), so this sentence is the stage's
+/// alone.
 pub fn stage_in_use_by_base_path_mapping(stage_name: &str, domain_names: &[String]) -> String {
     in_use_by_base_path_mapping("stage", stage_name, domain_names)
-}
-
-/// The `BadRequestException` message for a REST API a `BasePathMapping` still names, which
-/// is what `DeleteRestApi` refuses while the reference stands.
-///
-/// The same condition one level up: a mapping names the API as well as the stage of it, so
-/// deleting the API would leave the mapping pointing at an API that does not exist. The
-/// recorded wording of this refusal is what [`in_use_by_base_path_mapping`] states for
-/// both.
-pub fn rest_api_in_use_by_base_path_mapping(
-    rest_api_id: &str,
-    domain_names: &[String],
-) -> String {
-    in_use_by_base_path_mapping("RestApi", rest_api_id, domain_names)
 }
 
 /// The `BadRequestException` message for ANY caller-supplied value this service could
@@ -4923,6 +4929,12 @@ pub use stringified_policy::*;
 /// name as `crate::state::…`.
 mod method_settings;
 pub use method_settings::*;
+
+/// The RATE one throttled method of a stage admits requests at — the accounting the data
+/// plane keeps for a `methodSettings` entry's own throttle; re-exported whole, so a handler
+/// still reaches each name as `crate::state::…`.
+mod stage_method_throttle;
+pub use stage_method_throttle::*;
 
 /// The MODEL REFERENCES a model's schema carries, and whether they resolve to models of the
 /// API that holds the schema — what a write of a schema is validated against and what a

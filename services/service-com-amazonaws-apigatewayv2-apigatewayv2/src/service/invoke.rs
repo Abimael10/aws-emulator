@@ -43,7 +43,7 @@
 //!    by the stage segment of its path ([`resolve`]);
 //! 1b. that api's `DisableExecuteApiEndpoint` has not turned this endpoint off. While it
 //!    has, the endpoint serves nothing of the api and every request to it is answered
-//!    exactly as this endpoint answers one that serves no such api at all — `404`
+//!    exactly as this endpoint answers a path of the api that serves nothing — `404`
 //!    `{"message":"Not Found"}` ([`not_found`]) — before a stage is even looked for, and it
 //!    serves again as soon as the member is cleared
 //!    ([`super::data_plane::serves_default_endpoint`]);
@@ -614,8 +614,9 @@ pub fn claims_request<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest)
 /// emulator — the address a client keeps calling after the api behind it was deleted.
 ///
 /// AWS serves one `execute-api` endpoint space, and an endpoint whose api id resolves to no
-/// api is answered there rather than by nothing: the answer is `404`
-/// `{"message": "Not Found"}` ([`resolved`]). The endpoint space is SHARED by the two data
+/// api is answered there rather than by nothing: nothing of an api is read for such an
+/// address, so the endpoint space itself refuses it `403` `{"message": "Forbidden"}`
+/// ([`resolved`]). The endpoint space is SHARED by the two data
 /// planes of API Gateway — a REST api is reached on the same host shape, and that service's
 /// own data plane claims a request it resolves — so an id neither of them holds is claimed by
 /// exactly one of them, which is this one. The REST data plane is asked through its OWN claim
@@ -1033,20 +1034,22 @@ fn resolved<Eng: Send + Sync + 'static>(
     // Either this endpoint resolves to no api of this emulator at all — the address a client
     // keeps calling after the api behind it was deleted, which this data plane owns
     // ([`claims_an_unresolved_endpoint`]) — or the api was deleted between the claim and
-    // now, which is the same fact arriving a moment later. API Gateway answers an
-    // `execute-api` endpoint that resolves to no api `404` `{"message": "Not Found"}`, and
-    // an endpoint that resolves to nothing has no CORS configuration to decorate it with.
+    // now, which is the same fact arriving a moment later. The `execute-api` endpoint space
+    // answers an address whose api id names no api `403` `{"message": "Forbidden"}`
+    // ([`forbidden`]): nothing of an api was read for it, so it is refused by the endpoint
+    // space itself, and an endpoint that resolves to nothing has no CORS configuration to
+    // decorate it with.
     let Some(resolved) = resolve(&store, &addressed) else {
-        return Err(Box::new(not_found()));
+        return Err(Box::new(forbidden()));
     };
     // The DEFAULT endpoint this request was addressed at serves nothing while the api turned
     // it off ([`super::data_plane::serves_default_endpoint`]), so the refusal is answered
     // before any stage, deployment, route or authorization of the api is read — and with none
     // of the api's CORS decoration, since an endpoint that serves nothing answers for no part
     // of its configuration. Turning the member on is what makes the api unreachable on this
-    // endpoint, so what the endpoint answers is the SAME answer as for an endpoint that
-    // serves no such api ([`not_found`]): a client probing the default endpoint cannot tell a
-    // disabled one from one that was never there, which is the point of the member.
+    // endpoint, so what the endpoint answers is the SAME answer as for a path of the api that
+    // serves nothing ([`not_found`]): a client probing the default endpoint cannot tell a
+    // disabled one from a route the api does not carry, which is the point of the member.
     if !super::data_plane::serves_default_endpoint(resolved.api) {
         tracing::debug!(
             api_id = %resolved.api.api_id,

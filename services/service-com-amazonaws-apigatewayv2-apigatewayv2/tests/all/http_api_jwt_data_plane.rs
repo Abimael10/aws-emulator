@@ -1222,9 +1222,9 @@ async fn an_api_this_service_does_not_serve_on_that_host_is_not_claimed() {
 
     // An api that turned its OWN default endpoint off is still the api that endpoint
     // addresses, so the request is claimed and REFUSED there: the endpoint serves nothing of
-    // the api while the member is set, and it answers exactly as it answers an api id it
-    // serves no api of (the case below), so a client cannot tell the two apart. (The rule
-    // over a table of apis, stages and both protocols is `disabled_execute_api_endpoint.rs`.)
+    // the api while the member is set, and it answers exactly as it answers a path of the api
+    // that serves nothing. (The rule over a table of apis, stages and both protocols is
+    // `disabled_execute_api_endpoint.rs`.)
     answered(
         "an api that turned its own default endpoint off",
         &send(&emulator, &disabled_host, "GET", "/hello", &[]).await,
@@ -1234,8 +1234,9 @@ async fn an_api_this_service_does_not_serve_on_that_host_is_not_claimed() {
 
     // The one `execute-api` address this data plane DOES answer without holding the api:
     // an endpoint whose api id resolves to no api of this emulator — the address a client
-    // keeps calling after the api behind it was deleted — which API Gateway answers
-    // `404 {"message": "Not Found"}` rather than leaving to nothing.
+    // keeps calling after the api behind it was deleted. Nothing of an api is read for it,
+    // so the shared `execute-api` endpoint space refuses it itself, with `403`
+    // `{"message":"Forbidden"}` rather than leaving it to nothing.
     answered(
         "an execute-api host whose api id no api of this emulator has",
         &send(
@@ -1246,8 +1247,8 @@ async fn an_api_this_service_does_not_serve_on_that_host_is_not_claimed() {
             &[],
         )
         .await,
-        NOT_FOUND,
-        NOT_FOUND_MESSAGE,
+        FORBIDDEN,
+        FORBIDDEN_MESSAGE,
     );
 }
 

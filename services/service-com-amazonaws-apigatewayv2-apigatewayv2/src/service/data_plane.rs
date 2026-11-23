@@ -148,17 +148,26 @@ pub const CONTEXT_IDENTITY_SOURCES: &[&str] = &["context.", "$context."];
 
 /// `403` `{"message":"Forbidden"}` — the answer an `execute-api` endpoint gives for an api
 /// or a stage it does not serve.
+///
+/// An api id NO api of this emulator resolves to is one of those: the `execute-api` endpoint
+/// space is shared by every api, and an address in it whose api id names none — the address
+/// a client keeps calling after the api behind it was deleted — is answered here, by the
+/// endpoint space, before any api's own protocol could decide anything about it. That is a
+/// DIFFERENT fact from an api that exists and serves nothing at the address asked for, which
+/// is [`not_found`].
 pub fn forbidden() -> RtResponse {
     json_response(FORBIDDEN_STATUS, FORBIDDEN_MESSAGE, None)
 }
 
 /// `404` `{"message":"Not Found"}` — the answer an HTTP api's `execute-api` endpoint gives
-/// for a request it has nothing for: an endpoint whose api id it serves no api of, an api
-/// whose default endpoint is turned off ([`serves_default_endpoint`]), a path naming no stage
-/// of the api, a stage with no deployment released to it, and a method and path no route of a
-/// served stage matches. One function for all of them, because they are one fact to the
-/// client — this endpoint serves nothing at that address — and must not be distinguishable
-/// from each other.
+/// for a request it has nothing for: an api whose default endpoint is turned off
+/// ([`serves_default_endpoint`]), a path naming no stage of the api, a stage with no
+/// deployment released to it, and a method and path no route of a served stage matches. One
+/// function for all of them, because they are one fact to the client — this api serves
+/// nothing at that address — and must not be distinguishable from each other.
+///
+/// An address whose api id resolves to NO api is not one of them: nothing of an api was read
+/// for it, so it is the endpoint space's own [`forbidden`].
 pub fn not_found() -> RtResponse {
     json_response(NOT_FOUND_STATUS, NOT_FOUND_MESSAGE, None)
 }
@@ -192,9 +201,8 @@ pub fn bad_request() -> RtResponse {
 /// Both api data planes read the member HERE, so neither can disagree with the other about an
 /// endpoint being off: an addressing that resolves an api is still this service's to answer,
 /// since the host or path the client used is one this very service announced for the api, and
-/// each plane answers it with ITS OWN answer for an endpoint that serves no such api — the
-/// HTTP plane's [`not_found`], the WebSocket plane's [`forbidden`] — so a disabled default
-/// endpoint is indistinguishable from one that was never there.
+/// each plane answers it with ITS OWN answer for an api that serves nothing at the address
+/// asked for — the HTTP plane's [`not_found`], the WebSocket plane's [`forbidden`].
 pub fn serves_default_endpoint(api: &crate::state::Api) -> bool {
     !api.disable_execute_api_endpoint
 }

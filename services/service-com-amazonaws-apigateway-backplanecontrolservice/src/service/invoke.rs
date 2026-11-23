@@ -77,7 +77,11 @@
 //!    ([`parameters_refusal`]) and its payload ([`PendingBodyCheck::refusal`]) are checked
 //!    before the integration is reached;
 //! 8. the usage plan metering the presented API key admits the request at the plan's
-//!    throttle, or the request is shed ([`metered_refusal`]);
+//!    throttle, or the request is shed ([`metered_refusal`]); and then the STAGE's own
+//!    throttle of the method does — the `throttlingRateLimit` and `throttlingBurstLimit` of
+//!    the `methodSettings` entry in force for it, which limit the rate the stage admits
+//!    requests for that method whoever is calling
+//!    ([`crate::state::StageMethodThrottleKey`]), or the request is shed `429` as well;
 //! 9. the STAGE's own cache is consulted for the method whose settings enable caching
 //!    ([`cache_plan`]): a cluster holding an entry for this call answers it without the
 //!    integration being performed at all, until that entry's TTL passes or a flush drops
@@ -1846,10 +1850,28 @@ async fn serving<Eng: Send + Sync + 'static>(
                     throttled: refusal_response(Some(api), THROTTLED),
                     admission,
                 });
+            // The STAGE's own throttle of this method, from the `methodSettings` entry in
+            // force for it — the method's own, else the stage's whole-stage default — which
+            // limits the rate the stage admits requests for that method whoever is calling.
+            // Read here, under the lock that read the stage, and ACCOUNTED below with the
+            // metering, because recording a request needs an exclusive lock.
+            let stage_throttle = response_cache::method_settings_in_force(stage, matched_path, verb)
+                .and_then(crate::state::ThrottleLimits::of_method_setting)
+                .map(|limits| StageThrottle {
+                    key: crate::state::stage_method_throttle_key(
+                        &api.id,
+                        &stage.stage_name,
+                        matched_path,
+                        &wire_verb(verb),
+                    ),
+                    limits,
+                    throttled: refusal_response(Some(api), THROTTLED),
+                });
             Planned::Ready(Box::new(Plan {
                 integration,
                 pending_body,
                 metering,
+                stage_throttle,
                 caching,
             }))
         };
@@ -1868,6 +1890,7 @@ async fn serving<Eng: Send + Sync + 'static>(
         integration,
         pending_body,
         metering,
+        stage_throttle,
         caching,
     } = plan;
 
@@ -1880,6 +1903,29 @@ async fn serving<Eng: Send + Sync + 'static>(
             Some(Shed::Quota) => return metering.quota_exceeded,
             Some(Shed::Throttle) => return metering.throttled,
             None => {}
+        }
+    }
+
+    // Then the STAGE's own throttle of the method, in that order: API Gateway applies the
+    // limits a usage plan sets for the client first and the stage's own method-level limits
+    // after them. A request this throttle sheds is answered 429 through the api's own
+    // `THROTTLED` gateway response, with the payload unchecked and the integration never
+    // performed — the same shape as a shed metered request.
+    if let Some(throttle) = stage_throttle {
+        let mut store = state.lock();
+        if !store.stage_method_throttle_admits(
+            &throttle.key,
+            throttle.limits,
+            ::std::time::Instant::now(),
+        ) {
+            tracing::debug!(
+                api_id = %integration.api_id,
+                stage = %integration.stage,
+                path = %integration.path,
+                verb = %integration.verb,
+                "this stage's throttle for the method admits no further request"
+            );
+            return throttle.throttled;
         }
     }
 
@@ -2209,8 +2255,30 @@ struct Plan {
     /// The metering this call is subject to, and the `429`s it earns when the plans
     /// metering it have no request left for it.
     metering: Option<Metering>,
+    /// The STAGE's own throttle of the method serving this call, and the `429` it earns when
+    /// that throttle has no request left at this instant; `None` for a method whose settings
+    /// declare no throttle that limits anything.
+    stage_throttle: Option<StageThrottle>,
     /// How the stage's cache serves this call, when the method's settings cache it.
     caching: Option<CachePlan>,
+}
+
+/// The STAGE's own throttle of one method, carried out of the store so the request it
+/// records is recorded under an exclusive lock of its own.
+///
+/// `MethodSetting$throttlingRateLimit` and `MethodSetting$throttlingBurstLimit` are a limit
+/// on the METHOD at that stage — nothing about the caller is in them — so they are accounted
+/// for every request the stage serves, beside (and after) the per-key metering a usage plan
+/// asks for.
+#[derive(Debug)]
+struct StageThrottle {
+    /// What the bucket is kept under: this API, this stage and the method serving the call.
+    key: crate::state::StageMethodThrottleKey,
+    /// The limits the method's settings declare.
+    limits: crate::state::ThrottleLimits,
+    /// The `429` for a method whose throttle admits no further request at this instant,
+    /// rendered from the api's own gateway responses.
+    throttled: RtResponse,
 }
 
 /// Ask the `CUSTOM` authorizer `pending` names, and HOLD what it returned on the stage for

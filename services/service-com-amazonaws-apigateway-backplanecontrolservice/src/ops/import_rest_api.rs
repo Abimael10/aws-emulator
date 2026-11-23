@@ -181,8 +181,16 @@ const BASE_PATH_PREPEND: &str = "prepend";
 /// to, so only what follows it prefixes the imported paths.
 const BASE_PATH_SPLIT: &str = "split";
 
-/// The values [`BASE_PATH_PARAMETER`] accepts, in the order the member documents them.
-const BASE_PATH_VALUES: &[&str] = &[BASE_PATH_IGNORE, BASE_PATH_PREPEND, BASE_PATH_SPLIT];
+/// The `BadRequestException` message for a [`BASE_PATH_PARAMETER`] value that is none of
+/// the three the member documents ([`BASE_PATH_IGNORE`], [`BASE_PATH_PREPEND`],
+/// [`BASE_PATH_SPLIT`]).
+///
+/// API Gateway states one fixed sentence for this refusal and names the OPTION it did not
+/// recognise after it — the value the request supplied, taken from the request and nothing
+/// else — rather than enumerating the options it would have accepted.
+fn unrecognized_base_path_option(value: &str) -> String {
+    format!("Unrecognized base path option: {value}")
+}
 
 /// The refusal for a definition that names no API.
 ///
@@ -283,13 +291,7 @@ impl ImportParameters {
                 BASE_PATH_IGNORE => BasePathMode::Ignore,
                 BASE_PATH_PREPEND => BasePathMode::Prepend,
                 BASE_PATH_SPLIT => BasePathMode::Split,
-                other => {
-                    return Err(unsupported_parameter(
-                        BASE_PATH_PARAMETER,
-                        other,
-                        BASE_PATH_VALUES,
-                    ))
-                }
+                other => return Err(unrecognized_base_path_option(other)),
             };
         }
 

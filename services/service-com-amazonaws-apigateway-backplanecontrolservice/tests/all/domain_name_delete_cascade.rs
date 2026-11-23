@@ -13,11 +13,11 @@
 //! is accepted while mappings stand and removes them with the record, after which both the
 //! domain name's own reader and the mapping's reader resolve nothing and answer the domain
 //! name's missing-resource `NotFoundException`, and nothing of the removed record comes
-//! back when a domain name of the same name is created again. The INDEPENDENT records a
-//! mapping merely NAMES (the REST API and the stage, which `DeleteRestApi` and
-//! `DeleteStage` refuse over while a mapping names them — the sibling
-//! `base_path_mapping_references` suite) outlive the reference instead, so the cascade is
-//! what releases them.
+//! back when a domain name of the same name is created again. The INDEPENDENT record a
+//! mapping merely NAMES whose own delete that reference refuses — the STAGE, which
+//! `DeleteStage` refuses over while a mapping names it (the sibling
+//! `base_path_mapping_references` suite) — outlives the reference instead, so the cascade is
+//! what releases it.
 //!
 //! The rows span what the rule generalises over rather than repeating one recorded call:
 //! how many mappings the record holds (none, one, several), how the base path is spelled
@@ -432,23 +432,26 @@ async fn the_cascade_releases_the_rest_api_and_stage_the_removed_mappings_named(
         .await;
     }
 
-    // While the first domain name's mapping stands the API and the stage are refused: the
+    // While the first domain name's mapping stands the STAGE it names is refused: the
     // reference of an INDEPENDENT record is what refuses a delete, and the cascade below is
-    // what takes that reference away.
+    // what takes that reference away. The API ITSELF carries no such precondition — a
+    // mapping that names it is left behind by its delete, which the sibling
+    // `base_path_mapping_references` suite pins — so the API is deleted here only once
+    // every mapping has gone, after the stage.
     assert_failure(
-        &delete_api(&gateway, &api).await,
+        &delete_stage(&gateway, &api, &stage).await,
         400,
         "BadRequestException",
-        "DeleteRestApi while two mappings name it",
+        "DeleteStage while two mappings name it",
     );
 
     assert_deleted(&delete_domain(&gateway, &held).await, "the first holder");
-    // One holder left, so the API is still held.
+    // One holder left, so the stage is still held.
     assert_failure(
-        &delete_api(&gateway, &api).await,
+        &delete_stage(&gateway, &api, &stage).await,
         400,
         "BadRequestException",
-        "DeleteRestApi while one mapping names it",
+        "DeleteStage while one mapping names it",
     );
 
     assert_deleted(&delete_domain(&gateway, &other).await, "the second holder");

@@ -454,17 +454,18 @@ async fn the_listing_reports_the_stored_mappings_as_later_calls_leave_them() {
         patched.status, patched.body
     );
 
-    // Deleting the REST API a mapping points at is REFUSED while the mapping stands — the
-    // mapping names that API, so the delete would leave it pointing at an API that does
-    // not exist — and the collection still reports the record the refusal protected.
-    let refused = gateway
+    // Deleting the REST API a mapping points at is ACCEPTED while the mapping stands — a
+    // mapping is the domain name's record and merely names the API by id, which is no
+    // precondition of the API's own delete — and the collection still reports the mapping,
+    // now naming an id that resolves to nothing.
+    let deleted = gateway
         .call("DELETE", &format!("/restapis/{other_api}"), None)
         .await;
     assert_eq!(
-        refused.status, 400,
-        "case the mapped api: expected 400 from DeleteRestApi while a mapping names it, got \
+        deleted.status, 202,
+        "case the mapped api: expected 202 from DeleteRestApi while a mapping names it, got \
          {} with {:?}",
-        refused.status, refused.body
+        deleted.status, deleted.body
     );
 
     let body = page_of(&gateway, domain_name, "", "after the later calls").await;

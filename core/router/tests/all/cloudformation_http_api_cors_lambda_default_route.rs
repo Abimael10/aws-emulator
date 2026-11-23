@@ -582,9 +582,11 @@ async fn a_deployed_http_api_serves_its_default_lambda_route_with_the_apis_cors_
         );
     }
 
-    // 5. The stack is torn down, and the endpoint stops serving: an `execute-api` endpoint
-    // that resolves to no api answers 404 `{"message": "Not Found"}`, whether the api behind
-    // it was deleted or never existed at all.
+    // 5. The stack is torn down, and the endpoint stops serving: an `execute-api` address
+    // whose api id resolves to no api is refused by the endpoint space itself, with `403`
+    // `{"message": "Forbidden"}`, whether the api behind it was deleted or never existed at
+    // all — nothing of an api is read for such an address, so it is not the `404` an api
+    // answers for a route it does not carry.
     let deleted = cloudformation(&router, "DeleteStack", &[("StackName", stack)]).await;
     assert_eq!(
         deleted.status, 200,
@@ -626,16 +628,16 @@ async fn a_deployed_http_api_serves_its_default_lambda_route_with_the_apis_cors_
             let answered =
                 dispatch(&router, "GET", &gone_host, &addressed, &[], Bytes::new()).await;
             assert_eq!(
-                answered.status, 404,
-                "case {case:?}: expected HTTP 404 from GET {gone_host}{addressed}, got {} \
+                answered.status, 403,
+                "case {case:?}: expected HTTP 403 from GET {gone_host}{addressed}, got {} \
                  with {:?}",
                 answered.status,
                 answered.text()
             );
             assert_eq!(
                 answered.json(),
-                json!({ "message": "Not Found" }),
-                "case {case:?}: expected the gateway's own not-found body from GET \
+                json!({ "message": "Forbidden" }),
+                "case {case:?}: expected the endpoint space's own refusal body from GET \
                  {gone_host}{addressed}, got {:?}",
                 answered.text()
             );

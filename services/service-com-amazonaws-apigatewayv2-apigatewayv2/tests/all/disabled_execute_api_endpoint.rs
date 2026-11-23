@@ -9,7 +9,7 @@
 //! > "To require that clients use a custom domain name to invoke your API, disable the
 //! > default endpoint" (`Api$DisableExecuteApiEndpoint`) — so while an api has that member
 //! > set, its default `execute-api` endpoint serves NOTHING of the api, and a request to it
-//! > is answered exactly as that endpoint answers a request for an api it serves none of,
+//! > is answered exactly as that endpoint answers a path of the api that serves nothing,
 //! > whatever stage, deployment, route or integration the address would otherwise have
 //! > resolved: `404` `{"message":"Not Found"}` for a request to an HTTP api, and `403`
 //! > `{"message":"Forbidden"}` for an RFC 6455 opening handshake made at a WEBSOCKET api's,
@@ -17,6 +17,12 @@
 //! > again. The member is a property of the endpoint rather than of the configuration a
 //! > stage's deployment froze, so it takes effect on every stage of the api at once and needs
 //! > no redeployment.
+//!
+//! What that refusal is NOT is the answer an address whose api id resolves to no api at all
+//! earns: the api here EXISTS, so its own protocol's plane refuses the request, while an id
+//! naming no api reaches no api's plane and is refused by the shared `execute-api` endpoint
+//! space itself
+//! (`core/router/tests/all/apigateway_unresolved_execute_api_endpoint.rs`).
 //!
 //! The rows span what the rule generalises over: the api's `ProtocolType` (`HTTP` and
 //! `WEBSOCKET`), how the stage was released (a stage pinned by its own `CreateDeployment`,
@@ -39,9 +45,9 @@ use crate::websocket_transport_data_plane::handshake_at;
 const FORBIDDEN: u16 = 403;
 const FORBIDDEN_MESSAGE: &str = "Forbidden";
 
-/// The status and sentence an HTTP api's `execute-api` endpoint answers a request it serves
-/// no api for — which is what an api that turned its own default endpoint off is on that
-/// endpoint, so a client cannot tell the two apart.
+/// The status and sentence an HTTP api's `execute-api` endpoint answers a request it has
+/// nothing for — which is what an api that turned its own default endpoint off is on that
+/// endpoint, so a client cannot tell it from a route the api does not carry.
 const NOT_FOUND: u16 = 404;
 const NOT_FOUND_MESSAGE: &str = "Not Found";
 
@@ -689,8 +695,11 @@ async fn a_disabled_default_endpoint_answers_as_an_endpoint_that_serves_no_api()
         assert_refused(&case, "HTTP", &refused);
 
         // The whole point of the member: a client probing the default endpoint cannot tell
-        // the disabled api from an api id the endpoint space serves nothing for, so the two
-        // answers are compared status and body alike.
+        // the disabled api from a route the api does not carry, which the unmatched path
+        // below pins. An api id the endpoint space holds NO api for is a different fact —
+        // nothing of an api is read for it, so the space refuses it itself with its own
+        // `403` `{"message":"Forbidden"}` — and what is asserted here is that this service
+        // answers it rather than leaving it unclaimed.
         let nothing = unheld(row.stage);
         let case = format!("{} [an api id nothing serves]", row.case);
         let unserved = send(
@@ -701,13 +710,17 @@ async fn a_disabled_default_endpoint_answers_as_an_endpoint_that_serves_no_api()
             &[],
         )
         .await;
-        assert_refused(&case, "HTTP", &unserved);
+        assert_ne!(
+            unserved.error_type.as_deref(),
+            Some(UNKNOWN_SERVICE),
+            "case {case:?}: the endpoint space must answer an api id it holds no api for, got \
+             {}",
+            unserved.summary()
+        );
         assert_eq!(
-            (refused.status, refused.text.as_str()),
-            (unserved.status, unserved.text.as_str()),
-            "case {case:?}: a disabled default endpoint must answer exactly as an endpoint \
-             that serves no api, got {} against {}",
-            refused.summary(),
+            (unserved.status, message(&unserved).as_str()),
+            (FORBIDDEN, FORBIDDEN_MESSAGE),
+            "case {case:?}: expected the endpoint space's own refusal, got {}",
             unserved.summary()
         );
 

@@ -524,9 +524,12 @@ async fn assert_every_endpoint(
 }
 
 /// The whole point of the member: a client probing the default endpoint of a disabled api
-/// cannot tell it from an api id the `execute-api` endpoint space serves nothing for, so the
-/// two answers are compared status and body alike, at both addressings.
-async fn assert_indistinguishable_from_an_api_nothing_holds(
+/// cannot tell it from a route that api does not carry. An api id the `execute-api` endpoint
+/// space holds NO api for is a different fact — nothing of an api is read for it, so the
+/// space refuses it itself with `403` `{"message":"Forbidden"}`
+/// (`apigateway_unresolved_execute_api_endpoint`) — and what is asserted for it here is that
+/// the endpoint space answers it at every addressing.
+async fn assert_an_api_nothing_holds_is_refused_by_the_endpoint_space(
     router: &MultiServiceRouter,
     phase: &str,
     api_ids: &[String],
@@ -534,8 +537,8 @@ async fn assert_indistinguishable_from_an_api_nothing_holds(
 ) {
     let api_id = &api_ids[index];
     let invoke_path = DECLARED[index].invoke_path;
-    // The premise of the comparison: the id the twin is compared against is one the stack
-    // never published, so the endpoint addressed for it really serves no api of this emulator.
+    // The premise: the id compared against is one the stack never published, so the endpoint
+    // addressed for it really serves no api of this emulator.
     assert!(
         !api_ids.iter().any(|published| published == UNHELD_API_ID),
         "{phase}: {UNHELD_API_ID:?} must be an api id nothing created, but the stack published \
@@ -547,16 +550,15 @@ async fn assert_indistinguishable_from_an_api_nothing_holds(
         disabled.into_iter().zip(unheld)
     {
         let case = format!("{phase}, an api id nothing ever created [{addressing}]");
+        // The disabled twin is still the api its endpoint addresses, and still serves
+        // nothing there.
         let refused = request(router, &host, &path).await;
+        assert_serves_nothing(&case, &refused);
         let unserved = request(router, &unheld_host, &unheld_path).await;
-        assert_serves_nothing(&case, &unserved);
         assert_eq!(
-            (refused.status, refused.text()),
-            (unserved.status, unserved.text()),
-            "case {case:?}: a disabled default endpoint must answer exactly as an endpoint \
-             that serves no api, got {} {:?} against {} {:?}",
-            refused.status,
-            refused.text(),
+            (unserved.status, unserved.json()),
+            (403, json!({ "message": "Forbidden" })),
+            "case {case:?}: expected the endpoint space's own refusal, got {} {:?}",
             unserved.status,
             unserved.text()
         );
@@ -599,7 +601,7 @@ async fn a_stacks_http_api_serves_nothing_on_its_default_endpoint_while_the_memb
 
     assert_every_endpoint(&router, phase, &api_ids, CREATED_WITH).await;
     // The disabled api of this phase, at the addressings an api id travels in.
-    assert_indistinguishable_from_an_api_nothing_holds(&router, phase, &api_ids, 0).await;
+    assert_an_api_nothing_holds_is_refused_by_the_endpoint_space(&router, phase, &api_ids, 0).await;
 
     // 2. The same stack UPDATED, with every api's member stated the other way round and
     // nothing else changed: the member is no part of the deployment a stage froze, so what
@@ -628,5 +630,5 @@ async fn a_stacks_http_api_serves_nothing_on_its_default_endpoint_while_the_memb
 
     assert_every_endpoint(&router, phase, &api_ids, UPDATED_TO).await;
     // The api this phase turned off is the twin that served throughout the first one.
-    assert_indistinguishable_from_an_api_nothing_holds(&router, phase, &api_ids, 1).await;
+    assert_an_api_nothing_holds_is_refused_by_the_endpoint_space(&router, phase, &api_ids, 1).await;
 }

@@ -33,7 +33,7 @@
 use serde_json::{json, Value};
 
 use crate::base_path_mapping::{assert_refusal, create_mapping, deployed_api};
-use crate::base_path_mapping_references::{api_refusal, stage_refusal};
+use crate::base_path_mapping_references::stage_refusal;
 use crate::domain_name_collection::created_domain;
 use crate::rest_api_create_from_import::import;
 use crate::rest_api_import_model_reference_warnings::{refusal, unreadable, unresolved};
@@ -288,13 +288,6 @@ fn refusals(estate: &Estate) -> Vec<Refusal> {
             uri: format!("/restapis/{}/stages/{}", estate.api, estate.stage),
             body: None,
             message: stage_refusal(&estate.stage, &[domain]),
-        },
-        Refusal {
-            case: "the delete of a REST API a base path mapping still names".to_string(),
-            method: "DELETE",
-            uri: format!("/restapis/{}", estate.api),
-            body: None,
-            message: api_refusal(&estate.api, &[domain]),
         },
     ]
 }
