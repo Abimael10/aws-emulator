@@ -186,8 +186,15 @@ def _mount_governs(resolved):
 
 
 def _mount_bytes(resolved):
-    """The bytes the file at `resolved` holds."""
-    return _MOUNT_FILES[resolved].encode("utf-8")
+    """The bytes the file at `resolved` holds.
+
+    An entry the archive carried as TEXT is those characters encoded; one it carried as bytes
+    that are no text at all is held as the bytes themselves, which are the file.
+    """
+    held = _MOUNT_FILES[resolved]
+    if isinstance(held, bytes):
+        return held
+    return held.encode("utf-8")
 
 
 def _mount_size(resolved):
@@ -198,12 +205,16 @@ def _mount_size(resolved):
 
 
 def _mount_text(resolved):
-    """The text of the file at `resolved`, or `None` when the mounts hold no such file.
+    """The text of the file at `resolved`, or `None` when the mounts hold no such file — or
+    hold one whose bytes are no text at all, which has no text to read.
 
     How the runtime's own path processing reads a file of a mount (a path-configuration file
     of a layer's site directory), rather than going through the calls below.
     """
-    return _MOUNT_FILES.get(resolved)
+    held = _MOUNT_FILES.get(resolved)
+    if isinstance(held, bytes):
+        return None
+    return held
 
 
 def _mount_is_directory(resolved):

@@ -1595,6 +1595,114 @@ fn every_volume_bound_stops_the_work() {
     );
 }
 
+/// RULE: a program of the tree is RESOLVED the way the shell's own command search resolves
+/// one — the file a name with a slash points at, or the first directory of the session's own
+/// `PATH` holding a file of that name — and performed as a script with its operands, wherever
+/// the name was written; and a program that runs ITSELF is ended by the budget running a
+/// program spends rather than by this module's own recursion.
+///
+/// The rows differ along how the program is named (a bare name on `PATH`, an absolute path, a
+/// name inside another program), what it is given (no operand, operands it reports), and
+/// whether it can be run at all (a file naming another interpreter, a name no directory of the
+/// path holds) — a session with a machine's tree keeps a diagnostic on its console, which is
+/// where the rows that run nothing report it.
+#[test]
+fn a_program_of_the_tree_is_resolved_and_a_program_that_runs_itself_is_bounded() {
+    let statuses = Statuses::default();
+    let config = SessionConfig {
+        output: Some(OutputLimits {
+            lines: 64,
+            line_bytes: 256,
+        }),
+        ..SessionConfig::default()
+    };
+    let volume = || {
+        let mut volume = ShellVolume::default();
+        volume.put_file("/opt/bin/greet", "#!/bin/sh\necho \"hello $1\"\n");
+        volume.put_file("/opt/bin/caller", "#!/bin/sh\ngreet \"from the sibling\"\n");
+        volume.put_file("/opt/bin/native", "#!/usr/bin/env python3\nprint('hi')\n");
+        volume.put_file("/opt/bin/forever", "#!/bin/sh\nsh /opt/bin/forever\n");
+        volume
+    };
+    let variables = || BTreeMap::from([("PATH".to_string(), "/usr/bin:/opt/bin".to_string())]);
+
+    // (case, the line, the status it answers, the lines it wrote)
+    let rows: [(&str, &str, i32, &[&str]); 6] = [
+        ("a bare name on the path", "greet world", 0, &["hello world"]),
+        (
+            "the program's own path",
+            "/opt/bin/greet world",
+            0,
+            &["hello world"],
+        ),
+        (
+            "a name inside another program of the tree",
+            "caller",
+            0,
+            &["hello from the sibling"],
+        ),
+        (
+            // The program is resolved the same way as a stage of a pipeline, and what it
+            // wrote is what the stage after it reads.
+            "a stage of a pipeline",
+            "greet piped | cat",
+            0,
+            &["hello piped"],
+        ),
+        (
+            // A file asking for another interpreter needs a program this environment
+            // provides none of, so the search ends with nothing — reported for the
+            // INTERPRETER the file names — and nothing runs.
+            "a file naming another interpreter",
+            "native",
+            statuses.could_not_run,
+            &["sh: python3: command not found"],
+        ),
+        (
+            "a name no directory of the path holds",
+            "absent-program",
+            statuses.could_not_run,
+            &["sh: absent-program: command not found"],
+        ),
+    ];
+    for (case, line, expected, written) in rows {
+        let mut held = ShellSession::in_volume(variables(), config, volume());
+        let status = held.run(line);
+        assert_eq!(
+            status, expected,
+            "case {case:?}: expected the status {expected}, got {status} with {:?}",
+            held.output()
+        );
+        assert_eq!(
+            held.output(),
+            written,
+            "case {case:?}: expected {written:?} to have been written, got {:?}",
+            held.output()
+        );
+    }
+
+    // A program that runs ITSELF spends one of the programs a session may run per level, so
+    // it ends on that bound with the status a command that could not run answers — rather
+    // than driving this module's own recursion until the process has no stack left.
+    let mut held = ShellSession::in_volume(
+        variables(),
+        SessionConfig {
+            bounds: Bounds {
+                substitutions: 8,
+                substitution_depth: 4,
+                ..Bounds::default()
+            },
+            ..config
+        },
+        volume(),
+    );
+    let status = held.run("forever");
+    assert_eq!(
+        status, statuses.could_not_run,
+        "case a program that runs itself: expected the bound's own status, got {status}"
+    );
+}
+
 /// RULE: a session that was given no MACHINE's tree performs none of the forms a machine's
 /// program is written in — there is no device to write, no descriptor to report on and no
 /// storage of the machine to read — so what such a session performs is its own catalog

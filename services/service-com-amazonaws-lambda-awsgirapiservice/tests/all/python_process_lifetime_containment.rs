@@ -20,6 +20,11 @@
 //! child, and the language's own `sys.exit` — and whether the name is reached through `os` or
 //! through the module `os` is built on.
 //!
+//! Running a PROGRAM is not one of them: a child of this execution environment is performed in
+//! this process by the runtime's own child-process interface
+//! (`state::execution::guest_child_process`), so the call that starts one answers what the
+//! program came to and the process goes on serving ([`PERFORMED`]).
+//!
 //! Every row drives real HTTP requests through the router. One invocation tries them all and
 //! reports what each one did, so a name that really ended the process would take this test
 //! binary with it rather than report a passing row.
@@ -84,12 +89,20 @@ const ATTEMPTED: &[&str] = &[
     "os.fork",
     "os.execv",
     "os.system",
-    "os.popen",
     "os.spawnv",
     "posix._exit",
     "posix.abort",
     "sys.exit",
 ];
+
+/// The names that RUN a program of this execution environment rather than touching the
+/// process: a child is performed in this process, so the call answers and the run goes on
+/// (`state::execution::guest_child_process`).
+const PERFORMED: &[&str] = &["os.popen"];
+
+/// What a name of [`PERFORMED`] reports: the call answered, which is what the handler records
+/// for one that raised nothing.
+const RETURNED: &str = "returned";
 
 /// What an attempt may come to: the name is not on the surface at all, or it is there and
 /// refuses.
@@ -144,6 +157,19 @@ async fn no_guest_call_can_end_the_process_that_serves_it() {
             ALLOWED.contains(&outcome.as_str()),
             "case {name:?}: the name must be absent from the run's surface or refuse it, \
              expected one of {ALLOWED:?}, got {outcome:?}"
+        );
+    }
+    for name in PERFORMED {
+        let outcome = reported
+            .get(*name)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            outcome, RETURNED,
+            "case {name:?}: the call runs a program of this execution environment in this \
+             process, so it answers rather than touching the process, expected {RETURNED:?}, \
+             got {outcome:?}"
         );
     }
 

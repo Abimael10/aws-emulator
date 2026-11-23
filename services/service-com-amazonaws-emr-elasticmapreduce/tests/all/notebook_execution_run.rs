@@ -21,7 +21,8 @@
 //! the object is (a notebook, bytes that are no notebook, a notebook whose kernel is not a
 //! Python one), how a cell's source is spelled (one string, the list of its lines), how many
 //! code cells there are (none, one, several sharing a namespace), what the cells do (compute,
-//! import the standard library, reach for the host, raise), where and in which format the
+//! import the standard library, reach for the host, run a program of the environment, raise),
+//! where and in which format the
 //! output notebook is asked for, and whether the caller stops the execution.
 //!
 //! Amazon S3 is mounted BESIDE Amazon EMR on one engine, and every notebook is written
@@ -755,13 +756,29 @@ fn cases() -> Vec<Case> {
             ends: Ends::Failed(&[]),
         },
         Case {
-            label: "a cell starting a process, which the run does not start",
+            label: "a cell running a program of its environment, which the run performs",
             object: Some(notebook(
-                json!([code_cell("import subprocess\nsubprocess.run(['/bin/echo', 'hi'])")]),
+                json!([code_cell(
+                    "import subprocess\n\
+                     ran = subprocess.run(['/bin/echo', 'hi'], capture_output=True, text=True)\n\
+                     assert ran.returncode == 0, ran\n\
+                     assert ran.stdout == 'hi\\n', ran"
+                )]),
                 None,
             )),
             names_location: true,
-            ends: Ends::Failed(&[]),
+            ends: Ends::Finished,
+        },
+        Case {
+            label: "a cell running a program the environment does not have",
+            object: Some(notebook(
+                json!([code_cell(
+                    "import subprocess\nsubprocess.run(['no-such-program-here'])"
+                )]),
+                None,
+            )),
+            names_location: true,
+            ends: Ends::Failed(&["FileNotFoundError"]),
         },
         Case {
             label: "a cell loading a host library, which the run does not load",

@@ -995,10 +995,8 @@ async fn a_python_run_cannot_reach_the_host() {
             "import socket; socket.socket().connect(('1.1.1.1', 80))",
         ),
         ("a-raw-socket-extension", "import _socket"),
-        ("a-subprocess", "import subprocess; subprocess.run(['echo'])"),
         ("the-process-starter", "import _posixsubprocess"),
         ("a-shell-of-the-host", "import os; os.system('echo hi')"),
-        ("a-process-pipe", "import os; os.popen('echo hi')"),
         ("a-host-descriptor", "import os; os.open('/etc/hostname', 0)"),
         ("the-host-posix-stat", "import posix; posix.statvfs('/')"),
         ("a-native-library", "import ctypes"),
@@ -1020,8 +1018,18 @@ async fn a_python_run_cannot_reach_the_host() {
         ("a-host-file", "open('/etc/hostname').read()"),
     ];
 
+    // (case, the attempt that RUNS a program of the sandbox rather than reaching the host).
+    // Starting a child is not an escape: the program is one of the sandbox's own utilities,
+    // resolved and performed IN this process over the files the run was given
+    // (`…lambda…::state::execution::guest_child_process`), so no host process is started and
+    // no host path is opened for it — the call answers what the program came to.
+    let performed: Vec<(&str, &str)> = vec![
+        ("a-subprocess", "import subprocess; subprocess.run(['echo'])"),
+        ("a-process-pipe", "import os; os.popen('echo hi')"),
+    ];
+
     let mut program = String::new();
-    for (case, attempt) in &cases {
+    for (case, attempt) in cases.iter().chain(performed.iter()) {
         program.push_str(&format!(
             "try:\n    {attempt}\n    print({case:?}, 'reached')\nexcept BaseException as \
              error:\n    print({case:?}, 'refused', type(error).__name__)\n"
@@ -1041,6 +1049,13 @@ async fn a_python_run_cannot_reach_the_host() {
             stdout.contains(&format!("{case} refused")),
             "case {case:?}: the host must not be reachable from a run ({attempt}), got \
              {stdout:?} in {result}"
+        );
+    }
+    for (case, attempt) in &performed {
+        assert!(
+            stdout.contains(&format!("{case} reached")),
+            "case {case:?}: a program of the sandbox is performed in this process, so the call \
+             answers ({attempt}), got {stdout:?} in {result}"
         );
     }
 

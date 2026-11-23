@@ -28,6 +28,14 @@
 //! modules and reads back rather than imports — and are read as that ([`data_entries`]),
 //! under the same three bounds and out of what is LEFT of the budget once the modules have
 //! been read, so a package's modules are never crowded out by its data.
+//!
+//! A data entry whose bytes are not text is a file of the package all the same — a layer's
+//! archive, an image, a packed table — so it is read as the BYTES it is
+//! ([`binary_entries`]), carried as their base64 because every held entry travels to a run as
+//! text. Nothing decodes it lossily and nothing imports it: it is a file of the execution
+//! environment's filesystem, at its own path under the mount it came from.
+
+use ::base64::Engine as _;
 
 /// One module of a deployment package: the archive-relative path it was stored under and
 /// its source text.
@@ -124,6 +132,21 @@ pub fn python_resources_within(
     data_entries(zip_bytes, PYTHON_SUFFIXES, budget)
 }
 
+/// Every entry of a Python deployment package whose bytes are NOT text: the files it ships
+/// that no decoding would present as text — an archive, an image, a packed table, a compiled
+/// artefact — each carried as the BASE64 of its bytes.
+///
+/// They are files of the execution environment's filesystem like every other entry: a mount
+/// holds one at its own path, so a handler and a program it starts read it and a listing of
+/// its directory names it. Nothing imports one and nothing loads one as a library. Read out of
+/// what is LEFT of `budget` after the modules and the data above, for the reason those are.
+pub fn python_binaries_within(
+    zip_bytes: Option<&[u8]>,
+    budget: &mut ReadBudget,
+) -> Result<Vec<PackageModule>, PackageFault> {
+    binary_entries(zip_bytes, budget)
+}
+
 /// Every JavaScript (and JSON) module `zip_bytes` holds, in the archive's own order.
 ///
 /// `Ok(vec![])` is a readable archive with no loadable module in it, which is a package
@@ -148,7 +171,7 @@ fn source_modules(
     suffixes: &[&str],
     budget: &mut ReadBudget,
 ) -> Result<Vec<PackageModule>, PackageFault> {
-    entries_within(zip_bytes, &|path| named_by(path, suffixes), budget)
+    entries_within(zip_bytes, &|path| named_by(path, suffixes), Form::Text, budget)
 }
 
 /// Every entry of `zip_bytes` whose path ends in NONE of `suffixes` and whose bytes are
@@ -158,7 +181,26 @@ fn data_entries(
     suffixes: &[&str],
     budget: &mut ReadBudget,
 ) -> Result<Vec<PackageModule>, PackageFault> {
-    entries_within(zip_bytes, &|path| !named_by(path, suffixes), budget)
+    entries_within(zip_bytes, &|path| !named_by(path, suffixes), Form::Text, budget)
+}
+
+/// Every entry of `zip_bytes` whose bytes are NOT text, as the base64 of those bytes: the
+/// files of the package nothing can present as text, read under the same bounds.
+fn binary_entries(
+    zip_bytes: Option<&[u8]>,
+    budget: &mut ReadBudget,
+) -> Result<Vec<PackageModule>, PackageFault> {
+    entries_within(zip_bytes, &|_path| true, Form::Bytes, budget)
+}
+
+/// WHICH of the entries a read's predicate names it keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Form {
+    /// The ones whose bytes are text, kept as that text — a module, and a data file a program
+    /// reads as text.
+    Text,
+    /// The ones whose bytes are NOT text, kept as the base64 of those bytes.
+    Bytes,
 }
 
 /// Whether `path` ends in one of `suffixes`.
@@ -166,11 +208,12 @@ fn named_by(path: &str, suffixes: &[&str]) -> bool {
     suffixes.iter().any(|suffix| path.ends_with(suffix))
 }
 
-/// Every entry of `zip_bytes` that `kept` names and whose bytes are text, read under this
+/// Every entry of `zip_bytes` that `kept` names and that `form` keeps, read under this
 /// module's three bounds.
 fn entries_within(
     zip_bytes: Option<&[u8]>,
     kept: &dyn Fn(&str) -> bool,
+    form: Form,
     budget: &mut ReadBudget,
 ) -> Result<Vec<PackageModule>, PackageFault> {
     let Some(zip_bytes) = zip_bytes else {
@@ -206,9 +249,16 @@ fn entries_within(
             .map_err(|error| PackageFault::Unreadable(error.to_string()))?;
         budget.bytes = budget.bytes.saturating_sub(bytes.len() as u64);
         // A module that is not UTF-8 is not source an engine here can compile; it is
-        // left out rather than lossily decoded into something the caller never wrote.
-        if let Ok(source) = String::from_utf8(bytes) {
-            modules.push(PackageModule { path, source });
+        // left out of a TEXT read rather than lossily decoded into something the caller never
+        // wrote, and read as the bytes it is by the read that keeps those ([`Form::Bytes`]).
+        match (form, String::from_utf8(bytes)) {
+            (Form::Text, Ok(source)) => modules.push(PackageModule { path, source }),
+            (Form::Bytes, Err(held)) => modules.push(PackageModule {
+                path,
+                source: ::base64::engine::general_purpose::STANDARD
+                    .encode(held.as_bytes()),
+            }),
+            _ => continue,
         }
     }
     Ok(modules)

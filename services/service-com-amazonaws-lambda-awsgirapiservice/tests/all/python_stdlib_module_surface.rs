@@ -256,7 +256,7 @@ async fn the_modules_this_runtime_supplies_answer_their_own_surface(
     the_signal_interfaces_names_are_the_runtimes_own(&document, case);
     a_signal_registration_is_remembered_and_nothing_delivers_one(&document, case);
     a_call_that_needs_a_delivery_is_refused_where_it_is_asked_for(&document, case);
-    the_child_process_interface_answers_its_names_and_starts_no_child(&document, case);
+    the_child_process_interface_answers_its_names_and_runs_its_programs(&document, case);
     the_socket_interface_names_the_options_a_client_library_sets(&document, case);
     1
 }
@@ -390,21 +390,25 @@ fn a_call_that_needs_a_delivery_is_refused_where_it_is_asked_for(document: &Valu
 }
 
 /// The child-process interface answers the names a program reads off it and the pieces of it
-/// that are computation, and STARTS no child: every call that would is refused where it is
-/// asked for.
+/// that are computation, and RUNS the program every entry point is given: a child is one
+/// program of this execution environment, performed over the utilities that environment has.
 ///
 /// The rows differ along which name is read, along which computation is performed (an exit
-/// status checked, an error rendered, an argument sequence quoted) and along which call would
-/// start a child (`run`, `call`, `check_call`, `check_output`, a `Popen`, a shell).
+/// status checked, an error rendered, an argument sequence quoted) and along which entry point
+/// starts the program (`run`, `call`, `check_call`, `check_output`, a `Popen`, a shell), plus a
+/// program the environment does not have at all.
 ///
 /// Source of each expected value: `subprocess.PIPE`/`STDOUT`/`DEVNULL` are `-1`, `-2` and
 /// `-3`; `CompletedProcess.check_returncode` raises `CalledProcessError` whose message is
 /// "Command '<args>' returned non-zero exit status <status>."; `TimeoutExpired`'s message is
 /// "Command '<cmd>' timed out after <timeout> seconds"; `list2cmdline` quotes an argument
-/// holding a space; and `OSError` carrying `ENOSYS` is what a system call that is not there
-/// answers with.
+/// holding a space; `true` and `echo` are utilities of the sandbox, which exit with success and
+/// write their operands; and `ENOENT` is what a command search that found nothing answers with.
 ///
-fn the_child_process_interface_answers_its_names_and_starts_no_child(document: &Value, case: &str) {
+fn the_child_process_interface_answers_its_names_and_runs_its_programs(
+    document: &Value,
+    case: &str,
+) {
     let document = &document["process"];
     let expected = json!({
         "pipe": -1,
@@ -421,17 +425,18 @@ fn the_child_process_interface_answers_its_names_and_starts_no_child(document: &
         "output_is_stdout": "written",
         "completed_reports_what_it_was_built_with": ["['a']", 0, "out", "err"],
         "command_line": "a \"b c\" \"\"",
-        "run": ["OSError", "ENOSYS"],
-        "call": ["OSError", "ENOSYS"],
-        "check_call": ["OSError", "ENOSYS"],
-        "check_output": ["OSError", "ENOSYS"],
-        "popen": ["OSError", "ENOSYS"],
-        "shell": ["OSError", "ENOSYS"],
-        "shell_output": ["OSError", "ENOSYS"],
+        "run": 0,
+        "call": 0,
+        "check_call": 0,
+        "check_output": "out\n",
+        "popen": 0,
+        "shell": [0, ""],
+        "shell_output": "out",
+        "absent": ["FileNotFoundError", "ENOENT"],
     });
     assert_eq!(
         *document, expected,
-        "case {case}: expected the module's own names and no child started, got {document}"
+        "case {case}: expected the module's own names and the programs it ran, got {document}"
     );
 }
 
@@ -698,13 +703,18 @@ def _process(event):
             finished.stderr,
         ],
         "command_line": subprocess.list2cmdline(["a", "b c", ""]),
-        "run": _refused(lambda: subprocess.run(["true"])),
-        "call": _refused(lambda: subprocess.call(["true"])),
-        "check_call": _refused(lambda: subprocess.check_call(["true"])),
-        "check_output": _refused(lambda: subprocess.check_output(["true"])),
-        "popen": _refused(lambda: subprocess.Popen(["true"])),
-        "shell": _refused(lambda: subprocess.getstatusoutput("true")),
-        "shell_output": _refused(lambda: subprocess.getoutput("true")),
+        # Every entry point RUNS the program it was given, over the utilities the execution
+        # environment has, and reports what that program came to.
+        "run": subprocess.run(["true"]).returncode,
+        "call": subprocess.call(["true"]),
+        "check_call": subprocess.check_call(["true"]),
+        "check_output": subprocess.check_output(["echo", "out"], text=True),
+        "popen": subprocess.Popen(["true"]).wait(),
+        "shell": list(subprocess.getstatusoutput("true")),
+        "shell_output": subprocess.getoutput("echo out"),
+        # A program the environment does not have is where the command search ends with
+        # nothing.
+        "absent": _refused(lambda: subprocess.run(["absent-program"])),
     }
 
 

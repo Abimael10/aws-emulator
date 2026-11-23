@@ -21,6 +21,9 @@
 //!   the machine, so what one run wrote the next run reads;
 //! * SEALED files, which the service seeded and a program may only READ: the values a
 //!   kernel or an agent publishes to a guest rather than values the guest chose;
+//! * SEALED DIRECTORIES ([`ShellVolume::seal_directory`]), which are the same statement about
+//!   a whole subtree: a filesystem mounted READ-ONLY, where nothing under the root may be
+//!   written, created or removed however deep it lies;
 //! * DEVICES, which a program may only WRITE: a sink that keeps the lines written to it
 //!   ([`ShellVolume::device_lines`], which is how a console gets what a boot script wrote)
 //!   or one that discards them, the way `/dev/null` does;
@@ -281,6 +284,10 @@ pub struct ShellVolume {
     files: BTreeMap<String, String>,
     /// The paths of [`Self::files`] entries a program may only READ.
     sealed: BTreeSet<String>,
+    /// The roots of the subtrees a program may only READ ([`Self::seal_directory`]): every
+    /// path at or under one of them is read-only, whether or not this tree holds anything
+    /// there yet.
+    sealed_roots: BTreeSet<String>,
     /// The directories the tree has, by absolute path, always including the root.
     directories: BTreeSet<String>,
     /// The devices the tree has, by absolute path.
@@ -356,6 +363,7 @@ impl ShellVolume {
         Self {
             files: BTreeMap::new(),
             sealed: BTreeSet::new(),
+            sealed_roots: BTreeSet::new(),
             directories: BTreeSet::from([ROOT.to_string()]),
             devices: BTreeMap::new(),
             modified: BTreeMap::from([(ROOT.to_string(), SystemTime::now())]),
@@ -519,6 +527,41 @@ impl ShellVolume {
         true
     }
 
+    /// Seal the DIRECTORY `path` and everything under it: a filesystem the machine mounted
+    /// READ-ONLY, where a program may read what is there and write nothing at all.
+    ///
+    /// It is the subtree form of [`Self::seal_file`], and it is a statement about PATHS rather
+    /// than about the entries the tree holds now: a write, a creation, a removal and a
+    /// directory made at or under `path` all fail the way they fail on a read-only filesystem
+    /// ([`Self::is_read_only`]), including at a path this tree holds nothing at. The SERVICE's
+    /// own seeding is not a program's write and goes on reaching it ([`Self::put_file`],
+    /// [`Self::seal_file`]), which is what lets a caller seal the root first and then seed
+    /// what the read-only filesystem carries.
+    pub fn seal_directory(&mut self, path: &str) {
+        if let Some(resolved) = self.resolve(path) {
+            self.make_directories_in(&resolved);
+            self.sealed_roots.insert(resolved);
+        }
+    }
+
+    /// Whether `path` is one a program may not write: a sealed FILE, or a path at or under a
+    /// sealed DIRECTORY ([`Self::seal_directory`]).
+    ///
+    /// What the utility performing the write reports it as — the read-only filesystem it is,
+    /// rather than a path that is not there.
+    #[must_use]
+    pub fn is_read_only(&self, path: &str) -> bool {
+        let Some(resolved) = self.resolve(path) else {
+            return false;
+        };
+        if self.sealed.contains(&resolved) {
+            return true;
+        }
+        self.sealed_roots.iter().any(|root| {
+            resolved == *root || resolved.starts_with(&format!("{}/", root.trim_end_matches('/')))
+        })
+    }
+
     /// Add a device that KEEPS what is written to it, so the caller reads those lines back
     /// ([`Self::device_lines`]).
     pub fn add_keeping_device(&mut self, path: &str) {
@@ -541,10 +584,20 @@ impl ShellVolume {
 
     /// Make `path` a directory, with every directory above it — `mkdir -p`'s whole effect.
     ///
-    /// `false` when the tree is at [`VolumeLimits::directories`], or when a FILE already
+    /// `false` when the tree is at [`VolumeLimits::directories`], when a FILE already
     /// holds one of those paths, which is what makes the command fail rather than replace
-    /// it.
+    /// it, or when the path is one a program may not write ([`Self::is_read_only`]).
     pub fn make_directories(&mut self, path: &str) -> bool {
+        if self.is_read_only(path) {
+            return false;
+        }
+        self.make_directories_in(path)
+    }
+
+    /// [`Self::make_directories`] as the SERVICE's own seeding performs it, which a sealed
+    /// subtree does not stand in the way of: the read-only filesystem's own directories are
+    /// made by whoever mounted it.
+    fn make_directories_in(&mut self, path: &str) -> bool {
         let Some(resolved) = self.resolve(path) else {
             return false;
         };
@@ -594,7 +647,7 @@ impl ShellVolume {
     /// SERVICE performs implies them: a machine that has the file has the directories.
     fn make_directories_of(&mut self, path: &str) {
         if let Some(parent) = Self::parent_of(path) {
-            let _ = self.make_directories(&parent);
+            let _ = self.make_directories_in(&parent);
         }
     }
 
@@ -656,7 +709,8 @@ impl ShellVolume {
     /// Write `contents` at `path`, replacing what is there or APPENDING to it.
     ///
     /// `false` is a write that did not happen, which is what the command performing it
-    /// reports as its own failure: a path this tree does not accept, a sealed file, a
+    /// reports as its own failure: a path this tree does not accept, a sealed file, a path
+    /// under a sealed directory ([`Self::seal_directory`]), a
     /// directory, a path whose directory the tree does not have, or a write past
     /// [`VolumeLimits::files`] or [`VolumeLimits::bytes`]. A device takes the write as the
     /// lines it was given, up to [`VolumeLimits::device_lines`].
@@ -664,6 +718,9 @@ impl ShellVolume {
         let Some(resolved) = self.resolve(path) else {
             return false;
         };
+        if self.is_read_only(&resolved) {
+            return false;
+        }
         // A path inside a MOUNTED filesystem is written to that filesystem, under its own
         // bounds, which is what makes the write one another client of it reads.
         if let Some(wrote) =
@@ -763,6 +820,9 @@ impl ShellVolume {
         let Some(resolved) = self.resolve(path) else {
             return false;
         };
+        if self.is_read_only(&resolved) {
+            return false;
+        }
         if let Some(removed) = self.in_mount_mut(&resolved, |files, inside| {
             files.remove_file(inside)
         }) {

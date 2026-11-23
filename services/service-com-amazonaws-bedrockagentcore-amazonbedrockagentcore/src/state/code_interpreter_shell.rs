@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use ::service_common::posix_shell_session::{
-    Bounds, OutputLimits, SessionConfig, ShellSession, Statuses,
+    stream_text, Bounds, OutputLimits, SessionConfig, ShellSession, Statuses,
 };
 
 use super::{SandboxFilesystem, SandboxPrograms, MAX_SESSION_FILES, MAX_SESSION_FILE_BYTES};
@@ -123,21 +123,10 @@ pub fn run_command(command: &str, sandbox: &mut SandboxFilesystem) -> CommandRun
     }
 
     CommandRun {
-        stdout: joined(session.output()),
-        stderr: joined(session.errors()),
+        stdout: stream_text(session.output()),
+        stderr: stream_text(session.errors()),
         exit_code,
         elapsed,
         slept: session.slept(),
     }
-}
-
-/// The lines of one stream as the bytes a client reads: each line as the command wrote it,
-/// newline-terminated, and nothing at all for a stream the command wrote nothing to.
-fn joined(lines: &[String]) -> String {
-    if lines.is_empty() {
-        return String::new();
-    }
-    let mut text = lines.join("\n");
-    text.push('\n');
-    text
 }

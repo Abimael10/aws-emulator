@@ -126,6 +126,24 @@
 //! work is to carry a file somewhere reads and writes — still the one tree above, where a
 //! path is a key and no host path is reachable.
 //!
+//! # The programs the TREE holds
+//!
+//! The other half of the shell's own COMMAND SEARCH, for a session that works over a tree: a
+//! name the catalogs do not hold and the environment provides no program for is looked for IN
+//! THAT TREE ([`ShellSession::performed_tree_program`]) — the file a name carrying a slash
+//! points at, or the first directory of the session's own `PATH` holding a file of that name —
+//! and what is found is performed as a SCRIPT in this session, with the operands as its
+//! positional parameters, the way `sh FILE ARG…` is and under the same budget. That is how a
+//! program a caller's environment really ships (an executable under a Lambda layer's
+//! `/opt/bin`, a script an earlier command installed) is run by its own name, at the top level
+//! of a line and inside a nested program alike.
+//!
+//! The search is over the TREE and over nothing else: there is no host `PATH` here, no host
+//! file is opened for it, and a session given no tree resolves no program this way at all. A
+//! file whose own interpreter line names another program needs THAT interpreter, which is a
+//! program the environment has to provide like any other; where it provides none, the search
+//! ends with nothing and nothing runs.
+//!
 //! # Pipelines, and the filters that read what one wrote
 //!
 //! A pipeline CONNECTS its commands: "the standard output of the first command shall be
@@ -689,6 +707,68 @@ const COMMAND_NOT_FOUND: &str = "command not found";
 /// See [`COMMAND_NOT_FOUND`].
 const SHELL_NAME: &str = "sh";
 
+/// The variable a shell searches a command NAME in the directories of: "PATH … shall be used
+/// … to effect command interpretation". Searched over the TREE a session works over and over
+/// nothing else ([`ShellSession::performed_tree_program`]).
+const SEARCH_PATH_VARIABLE: &str = "PATH";
+
+/// The names a NESTED shell of this session is invoked under, which is also the whole of what
+/// a resolved program's interpreter line may name: a program of this environment is performed
+/// by this session, so a file asking for another interpreter asks for a program the
+/// environment has to provide.
+///
+/// Shared with the callers that resolve a program before handing a line to a session, for the
+/// reason [`command_base_name`] is.
+pub const NESTED_SHELL_NAMES: &[&str] = &["sh", "bash"];
+
+/// The last component of `path`, which is the name a program is known by.
+///
+/// Shared with the callers that resolve a program themselves before handing a line to a
+/// session (`…lambda…::state::execution::guest_child_process`), so one reading of a program's
+/// name serves both.
+#[must_use]
+pub fn command_base_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// The interpreter a script's own first line names (`#!/bin/sh`, `#!/usr/bin/env bash`), and
+/// `None` for a file that names none — which is a file a shell runs itself.
+///
+/// The program `env` RUNS the one named after it, so the name read through it is that one.
+/// Shared for the reason [`command_base_name`] is: a caller that decides whether it can run a
+/// program at all reads its interpreter line the same way the session does.
+#[must_use]
+pub fn script_interpreter(text: &str) -> Option<String> {
+    let line = text.lines().next()?.strip_prefix("#!")?.trim();
+    let mut words = line.split_whitespace();
+    let first = words.next()?;
+    if command_base_name(first) == "env" {
+        // `env NAME=VALUE … PROGRAM`: the program is the first word that is neither an
+        // assignment nor an option of `env` itself.
+        return words
+            .find(|word| !word.contains('=') && !word.starts_with('-'))
+            .map(str::to_string);
+    }
+    Some(first.to_string())
+}
+
+/// One stream of a finished session as the BYTES it wrote: the session keeps what a command
+/// wrote as the LINES of it ([`ShellSession::output`], [`ShellSession::errors`]), so the stream
+/// is those lines, each ended the way a line is ended. A session that wrote nothing wrote no
+/// bytes at all.
+///
+/// The ONE reading of that for every caller whose API reports a stream's bytes rather than its
+/// lines, so two of them cannot differ about it.
+#[must_use]
+pub fn stream_text(lines: &[String]) -> String {
+    if lines.is_empty() {
+        return String::new();
+    }
+    let mut written = lines.join("\n");
+    written.push('\n');
+    written
+}
+
 /// The statuses a session answers with, so a service whose API reports a status reports the
 /// one a shell answers for its own condition.
 #[derive(Debug, Clone, Copy)]
@@ -996,6 +1076,11 @@ pub struct ShellSession {
     /// `None` while no `break` or `continue` is in flight. Set by those built-ins and taken by
     /// the loop that honours it ([`Self::run_loop_control`]).
     loop_control: Option<LoopControl>,
+    /// The POSITIONAL PARAMETERS the program was given ([`Self::with_arguments`]): the name it
+    /// was invoked under (`$0`) and the operands after it (`$1`, `$2`, …), which is what a
+    /// caller that runs a SCRIPT with arguments hands it. Empty for a program invoked with
+    /// none, where every one of them expands to nothing.
+    positional: Vec<String>,
 }
 
 /// What a `break` or a `continue` asked for: which of the two it was, and how many enclosing
@@ -1062,8 +1147,10 @@ impl ProgramFiles for SessionFiles<'_> {
 /// the files are.
 ///
 /// A refusal is reported as the error the tree's answer stands for: this tree answers a write
-/// or a removal with whether it happened, and a path it will not take one for is the
-/// `No such file or directory` a session has always reported for it. It keeps no mode, owner
+/// or a removal with whether it happened, so a path it will not take one for is the
+/// `No such file or directory` a session has always reported for it — except a path a program
+/// may only READ, which is the read-only filesystem it is
+/// ([`super::posix_shell_volume::ShellVolume::is_read_only`]). It keeps no mode, owner
 /// or modification time, so it reports no [`posix_shell_files::FileEntry`] — which is what
 /// makes a long listing a form these sessions do not perform.
 impl ShellFiles for SessionFiles<'_> {
@@ -1074,6 +1161,8 @@ impl ShellFiles for SessionFiles<'_> {
     fn write(&mut self, path: &str, text: &str, append: bool) -> Result<(), FileRefusal> {
         if self.session.write_path(path, text, append) {
             Ok(())
+        } else if self.session.tree_is_read_only(path) {
+            Err(FileRefusal::ReadOnly)
         } else {
             Err(FileRefusal::NotFound)
         }
@@ -1082,6 +1171,8 @@ impl ShellFiles for SessionFiles<'_> {
     fn make_directories(&mut self, path: &str) -> Result<(), FileRefusal> {
         if self.session.tree_make_directories(path) {
             Ok(())
+        } else if self.session.tree_is_read_only(path) {
+            Err(FileRefusal::ReadOnly)
         } else {
             Err(FileRefusal::NotFound)
         }
@@ -1090,6 +1181,9 @@ impl ShellFiles for SessionFiles<'_> {
     fn remove_file(&mut self, path: &str) -> Result<(), FileRefusal> {
         if self.session.tree_holds_directory(path) {
             return Err(FileRefusal::IsADirectory);
+        }
+        if self.session.tree_is_read_only(path) {
+            return Err(FileRefusal::ReadOnly);
         }
         if self.session.tree_remove_file(path) {
             Ok(())
@@ -1111,9 +1205,10 @@ impl ShellFiles for SessionFiles<'_> {
     }
 
     fn writable(&self, path: &str) -> bool {
-        // This tree takes a write to any path it accepts at all, so what `-w` asks about is
-        // whether it holds it.
-        self.session.tree_holds(path)
+        // What `-w` asks is whether a write would be performed, and the write paths above
+        // refuse a read-only entry: so a path of a read-only filesystem is held and not
+        // writable, and every other path this tree accepts is both.
+        self.session.tree_holds(path) && !self.session.tree_is_read_only(path)
     }
 
     fn entry_names(&self, path: &str) -> Vec<String> {
@@ -1166,6 +1261,7 @@ impl ShellSession {
             compound_depth: 0,
             loop_depth: 0,
             loop_control: None,
+            positional: Vec::new(),
             config,
         };
         for (name, value) in variables {
@@ -1243,6 +1339,46 @@ impl ShellSession {
     #[must_use]
     pub fn with_environment_programs(mut self, programs: Box<dyn EnvironmentPrograms>) -> Self {
         self.programs = Some(programs);
+        self
+    }
+
+    /// The POSITIONAL PARAMETERS the program is given: `arguments[0]` is the name it was
+    /// invoked under, which `$0` expands to, and the operands after it are `$1`, `$2` and so
+    /// on — what a caller that runs a SCRIPT with operands hands it.
+    ///
+    /// A session given none holds none, and then every positional parameter expands to
+    /// nothing, which is what an unset parameter expands to. Field splitting is a form no
+    /// session performs, so `$@` and `$*` are both the operands joined by one space
+    /// ([`Self::expand_parameter`]).
+    #[must_use]
+    pub fn with_arguments(mut self, arguments: Vec<String>) -> Self {
+        self.positional = arguments;
+        self
+    }
+
+    /// This session with `text` as the STANDARD INPUT the program was given: the bytes the
+    /// caller handed it, which the first command that reads standard input reads.
+    ///
+    /// It is a stream, so it is consumed by whoever reads it: the first command of a pipeline
+    /// reads it ([`Self::run_pipeline`]), a command that reads none leaves it for whatever
+    /// reads next, and a command whose own input is redirected reads that file instead.
+    #[must_use]
+    pub fn with_standard_input(mut self, text: String) -> Self {
+        self.piped_input = Some(text);
+        self
+    }
+
+    /// This session with `path` as the DIRECTORY its program starts in, which is what the
+    /// paths it names without one are resolved against ([`Self::at`]) — the working directory
+    /// the caller started the program in.
+    ///
+    /// Only a session that works over a tree resolves a path against it; for one whose tree is
+    /// its own a path is a key, so there is nothing for this to change.
+    #[must_use]
+    pub fn in_directory(mut self, path: &str) -> Self {
+        if let Some(resolved) = super::posix_shell_volume::resolved_path(path) {
+            self.working_directory = resolved;
+        }
         self
     }
 
@@ -1495,10 +1631,18 @@ impl ShellSession {
                 });
             }
             // The input belongs to this one command: whatever the command around this
-            // pipeline was reading is put back after it.
-            let held_input = ::std::mem::replace(&mut self.piped_input, upstream.take());
-            status = self.run_command(command);
-            self.piped_input = held_input;
+            // pipeline was reading is put back after it. The FIRST stage is the one exception,
+            // because its standard input IS the session's own — what the caller handed the
+            // program ([`Self::with_standard_input`]), or what the command around this
+            // pipeline was reading — so that stream is left exactly where it is: a stage that
+            // reads it takes it, and one that reads none leaves it for whatever reads next.
+            if index == 0 {
+                status = self.run_command(command);
+            } else {
+                let held_input = ::std::mem::replace(&mut self.piped_input, upstream.take());
+                status = self.run_command(command);
+                self.piped_input = held_input;
+            }
             if status != self.config.statuses.success {
                 failed = Some(status);
             }
@@ -2241,6 +2385,20 @@ impl ShellSession {
         true
     }
 
+    /// Whether `path` is one the tree this session works over will let a program READ but not
+    /// WRITE: a sealed file or a path under a read-only filesystem
+    /// ([`super::posix_shell_volume::ShellVolume::is_read_only`]).
+    ///
+    /// What the utility performing a write reports the refusal as, so a write under a
+    /// read-only mount is reported as the filesystem it is rather than as a path that is not
+    /// there. A session whose tree is its own has no read-only path: a path is a key of it.
+    fn tree_is_read_only(&self, path: &str) -> bool {
+        let resolved = self.at(path);
+        self.volume
+            .as_ref()
+            .is_some_and(|volume| volume.is_read_only(&resolved))
+    }
+
     /// Whether the tree this session works over holds anything at `path` — a file, a
     /// directory, or (in a machine's tree) a device.
     fn tree_holds(&self, path: &str) -> bool {
@@ -2394,10 +2552,101 @@ impl ShellSession {
         arguments: &[String],
         redirections: &Redirections,
     ) -> i32 {
-        match self.performed_environment_program(name, arguments, redirections) {
-            Some(status) => status,
-            None => self.command_not_found(name, redirections),
+        if let Some(status) = self.performed_environment_program(name, arguments, redirections) {
+            return status;
         }
+        // The other half of the shell's own command search: a PROGRAM the tree this session
+        // works over holds at that name ([`Self::performed_tree_program`]).
+        if let Some(status) = self.performed_tree_program(name, arguments, redirections) {
+            return status;
+        }
+        self.command_not_found(name, redirections)
+    }
+
+    /// Perform the PROGRAM the tree this session works over holds for the command `name`, as
+    /// the shell's own COMMAND SEARCH resolves one — `None` when nothing resolved.
+    ///
+    /// "If the command name contains at least one slash, the shell shall execute the named
+    /// utility", resolved against the directory the session is in; a name with no slash is
+    /// searched for "using the PATH environment variable", in the order it names its
+    /// directories, and the first directory holding a FILE of that name is the one that
+    /// provides it. The search is over the TREE this session works over and over nothing else:
+    /// there is no host `PATH` here, and a session given no tree resolves no program this way
+    /// at all.
+    ///
+    /// What is found is performed as a SCRIPT in this session, with the operands as its
+    /// positional parameters — exactly as `sh FILE ARG…` is ([`Self::run_nested_program`]),
+    /// under the same budget and the same depth — because a program is run BY a shell here and
+    /// there is no process to execute one in. That is also what a shell does with a file it
+    /// could not execute itself: "the shell shall execute [it] as a shell script".
+    ///
+    /// A file whose own interpreter line names another program is a program of THAT
+    /// interpreter, and the interpreter is a program this environment has to provide like any
+    /// other: when it provides none, the search ends with nothing and that is reported for the
+    /// interpreter the file names ([`Self::command_not_found`]), because nothing ran.
+    fn performed_tree_program(
+        &mut self,
+        name: &str,
+        arguments: &[String],
+        redirections: &Redirections,
+    ) -> Option<i32> {
+        if !self.works_over_a_tree() {
+            return None;
+        }
+        let path = if name.contains('/') {
+            name.to_string()
+        } else {
+            self.searched_program_path(name)?
+        };
+        let text = self.read_path(&path)?;
+        if let Some(interpreter) = script_interpreter(&text) {
+            if !NESTED_SHELL_NAMES.contains(&command_base_name(&interpreter)) {
+                let named = interpreter.clone();
+                return Some(self.command_not_found(&named, redirections));
+            }
+        }
+        let mut named = vec![path];
+        named.extend(arguments.iter().cloned());
+        Some(self.run_script_text(&text, named))
+    }
+
+    /// The path of the first directory of this session's `PATH` that holds a FILE called
+    /// `name`, and `None` when none of them does — the shell's own path search.
+    fn searched_program_path(&self, name: &str) -> Option<String> {
+        let published = self.variable(SEARCH_PATH_VARIABLE)?.to_string();
+        published
+            .split(':')
+            .filter(|directory| !directory.is_empty())
+            .map(|directory| format!("{}/{name}", directory.trim_end_matches('/')))
+            .find(|path| self.tree_holds_file(path))
+    }
+
+    /// Perform `text` as a program of this session, with `arguments` as its positional
+    /// parameters — what a nested shell ([`Self::run_nested_program`]) and a resolved program
+    /// ([`Self::performed_tree_program`]) are both performed through, and the ONE place either
+    /// of them spends what running a program costs.
+    ///
+    /// The budget and the depth are read here and CHARGED here, around the run
+    /// ([`Bounds::substitutions`], [`Bounds::substitution_depth`]): every level of a program
+    /// that runs a program spends one of each, so a program that invokes itself — a script
+    /// running `sh` on its own path, a program of the tree whose name resolves back to itself —
+    /// is ended by that bound, with the status a command that could not run answers, rather
+    /// than by this module's own recursion.
+    fn run_script_text(&mut self, text: &str, arguments: Vec<String>) -> i32 {
+        if self.substitutions_left == 0
+            || self.nesting_depth() >= self.config.bounds.substitution_depth
+        {
+            return self.config.statuses.could_not_run;
+        }
+        self.substitutions_left = self.substitutions_left.saturating_sub(1);
+        self.nested_programs = self.nested_programs.saturating_add(1);
+        // The nested program reads ITS own operands, and the program around it reads the ones
+        // it was given once the nested one has ended.
+        let held = ::std::mem::replace(&mut self.positional, arguments);
+        let status = self.run_program(text);
+        self.positional = held;
+        self.nested_programs = self.nested_programs.saturating_sub(1);
+        status
     }
 
     /// What this session answers for a command NAME nothing resolved: no utility of its own
@@ -3354,7 +3603,10 @@ impl ShellSession {
     /// It counts against the same budget and the same DEPTH a command substitution does
     /// ([`Bounds::substitutions`], [`Bounds::substitution_depth`]): a nested shell is the
     /// other way one program can run another, so what bounds this module's own recursion has
-    /// to count both.
+    /// to count both. That accounting is [`Self::run_script_text`]'s, which is the ONE place a
+    /// program of this session runs another — it checks the budget and the depth and CHARGES
+    /// them around the run, so a program that invokes itself (a script running `sh` on its own
+    /// path) ends on that bound rather than on this module's own recursion.
     ///
     /// Any other invocation — an interactive shell, a login shell, a program read from
     /// standard input — needs something this session does not have, so it is a command that
@@ -3363,16 +3615,28 @@ impl ShellSession {
         let Some((first, rest)) = arguments.split_first() else {
             return self.config.statuses.could_not_run;
         };
-        let program = if first == "-c" {
-            match rest.first() {
-                Some(program) => program.clone(),
+        // The POSITIONAL PARAMETERS the nested program is given, which is what the operands
+        // after the program are: `sh -c PROGRAM NAME ARG…` names the program itself and then
+        // its operands, and `sh FILE ARG…` gives the script its own path as the name it was
+        // invoked under.
+        let (program, nested_arguments) = if first == "-c" {
+            match rest.split_first() {
+                Some((program, operands)) => {
+                    let mut named = vec![SHELL_NAME.to_string()];
+                    named.extend(operands.iter().cloned());
+                    (program.clone(), named)
+                }
                 None => return self.config.statuses.could_not_run,
             }
         } else if first.starts_with('-') {
             return self.config.statuses.could_not_run;
         } else {
             match self.read_path(first) {
-                Some(text) => text,
+                Some(text) => {
+                    let mut named = vec![first.clone()];
+                    named.extend(rest.iter().cloned());
+                    (text, named)
+                }
                 None => {
                     let _ = self.write_stderr(
                         &format!("sh: {first}: No such file or directory\n"),
@@ -3382,15 +3646,10 @@ impl ShellSession {
                 }
             }
         };
-        if self.substitutions_left == 0 || self.nesting_depth() >= self.config.bounds.substitution_depth
-        {
-            return self.config.statuses.could_not_run;
-        }
-        self.substitutions_left = self.substitutions_left.saturating_sub(1);
-        self.nested_programs = self.nested_programs.saturating_add(1);
-        let status = self.run_program(&program);
-        self.nested_programs = self.nested_programs.saturating_sub(1);
-        status
+        // The budget and the depth are checked and CHARGED where the nested program is run
+        // ([`Self::run_script_text`]), so there is no second reading of them here to fall out
+        // of step with it.
+        self.run_script_text(&program, nested_arguments)
     }
 
     /// `. FILE` (and its bash `source` spelling): the commands of a file the tree holds,
@@ -3599,9 +3858,13 @@ impl ShellSession {
     ///
     /// The plain form (`$NAME`, `${NAME}`) is the variable's value, empty when the session
     /// holds none, and the default-value form (`${NAME:-WORD}`) is that value or the default
-    /// the expansion names. Every other form — a substring, a replacement, a length, an
-    /// indirection, a positional or special parameter — is one this session does not
-    /// resolve.
+    /// the expansion names. A POSITIONAL parameter (`$1`, `${11}`) is the operand the program
+    /// was given at that position ([`Self::with_arguments`]), and the special parameters a
+    /// program reads its own operands through are the three that are about them: `$#` is how
+    /// many it was given, and `$@` and `$*` are those operands joined by one space, because
+    /// field splitting is a form no session performs. Every other form — a substring, a
+    /// replacement, a length, an indirection, another special parameter — is one this session
+    /// does not resolve.
     ///
     /// While [`ShellOption::NoUnset`] is on, the plain form of a variable this session holds
     /// NONE of is an error instead: "the shell shall write a message to standard error …
@@ -3625,6 +3888,16 @@ impl ShellSession {
                 }
                 None => Some(String::new()),
             },
+            // `$0` is the name the program was invoked under and `$1` onwards are its
+            // operands, which is how a script reads what it was called with.
+            ::brush_parser::word::ParameterExpr::Parameter {
+                parameter: ::brush_parser::word::Parameter::Positional(position),
+                indirect: false,
+            } => Some(self.positional_parameter(*position)),
+            ::brush_parser::word::ParameterExpr::Parameter {
+                parameter: ::brush_parser::word::Parameter::Special(special),
+                indirect: false,
+            } => self.special_parameter(special),
             ::brush_parser::word::ParameterExpr::UseDefaultValues {
                 parameter: ::brush_parser::word::Parameter::Named(name),
                 indirect: false,
@@ -3637,6 +3910,40 @@ impl ShellSession {
                 } else {
                     Some(held.to_string())
                 }
+            }
+            _ => None,
+        }
+    }
+
+    /// The operand at `position` of what this program was invoked with, empty for a position
+    /// it was given nothing at — which is what an unset parameter expands to.
+    fn positional_parameter(&self, position: u32) -> String {
+        self.positional
+            .get(position as usize)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The value of one of the SPECIAL parameters that are about the program's own operands,
+    /// and `None` for every other one — a parameter this session does not resolve, so the
+    /// command carrying it is not run.
+    ///
+    /// `$#` is "the number of positional parameters", which is the operands and not the name
+    /// the program was invoked under; `$@` and `$*` are those operands, joined by one space,
+    /// because this session performs no field splitting.
+    fn special_parameter(
+        &self,
+        special: &::brush_parser::word::SpecialParameter,
+    ) -> Option<String> {
+        match special {
+            ::brush_parser::word::SpecialParameter::PositionalParameterCount => {
+                Some(self.positional.len().saturating_sub(1).to_string())
+            }
+            ::brush_parser::word::SpecialParameter::AllPositionalParameters { .. } => {
+                Some(self.positional.iter().skip(1).cloned().collect::<Vec<_>>().join(" "))
+            }
+            ::brush_parser::word::SpecialParameter::ShellName => {
+                Some(self.positional.first().cloned().unwrap_or_default())
             }
             _ => None,
         }

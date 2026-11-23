@@ -75,6 +75,7 @@ import sys
 
 # Everything this runtime itself needs, imported once, before the handler's own work
 # begins and before the bounds that measure that work are in place.
+import base64
 import datetime
 import importlib
 import importlib.util
@@ -562,28 +563,44 @@ class _PackageLoader:
 # them: `_PackageFinder` resolves a name to `<name>.py` or `<name>/__init__.py`.
 _RESOURCE_PREFIX = "resource:"
 
+# The prefix the host keys an entry whose bytes are NO TEXT under, carrying the base64 of
+# those bytes: an archive, an image, a packed table. It is a FILE of the mount like every
+# other entry — decoded to its own bytes where the mounts are built ([_mount_entries]) — and
+# no module name resolves to one either.
+_BINARY_PREFIX = "binary:"
+
 
 def _entry_path(held):
     """The path inside the package of the held entry `held`.
 
-    A module is held under its own path and a data file under the prefix above, and both of
-    them are FILES of the package: a module's path is a file beside the others, which is
-    what a package shipping its modules and its data in one archive holds.
+    A module is held under its own path, a data file under the first prefix above and a file
+    that is no text at all under the second, and every one of them is a FILE of the package:
+    a module's path is a file beside the others, which is what a package shipping its
+    modules, its data and its assets in one archive holds.
     """
     if held.startswith(_RESOURCE_PREFIX):
         return held[len(_RESOURCE_PREFIX):]
+    if held.startswith(_BINARY_PREFIX):
+        return held[len(_BINARY_PREFIX):]
     return held
 
 
 def _mount_entries(sources):
     """The FILES one mount holds: every held entry at its own path inside the mount.
 
-    A module and a data file are both files of the mount, so the prefix a data entry is held
-    under is taken off here: what the filesystem of the execution environment serves is paths
-    ([`super::guest_mount`]), and the prefix is this runtime's own way of keeping a data entry
-    where no module name resolves to it.
+    A module, a data file and a file that is no text are all files of the mount, so the prefix
+    an entry is held under is taken off here: what the filesystem of the execution environment
+    serves is paths ([`super::guest_mount`]), and the prefixes are this runtime's own way of
+    keeping an entry where no module name resolves to it. An entry held as BYTES is decoded
+    back to them, so the mount carries the bytes the archive carried.
     """
-    return {_entry_path(held): sources[held] for held in sources}
+    entries = {}
+    for held in sources:
+        value = sources[held]
+        if held.startswith(_BINARY_PREFIX):
+            value = base64.b64decode(value)
+        entries[_entry_path(held)] = value
+    return entries
 
 
 class _PackageFile:
@@ -610,7 +627,7 @@ class _PackageFile:
 
     def _held(self):
         """The key this path's own text is held under, or `None` when none is."""
-        for key in (_RESOURCE_PREFIX + self._path, self._path):
+        for key in (_RESOURCE_PREFIX + self._path, _BINARY_PREFIX + self._path, self._path):
             if key in self._sources:
                 return key
         return None
@@ -652,6 +669,10 @@ class _PackageFile:
         held = self._held()
         if held is None:
             raise FileNotFoundError(self._root + "/" + self._path)
+        # An entry held as BYTES carries their base64, because every held entry travels as
+        # text; what the file IS is those bytes.
+        if held.startswith(_BINARY_PREFIX):
+            return base64.b64decode(self._sources[held])
         return self._sources[held].encode("utf-8")
 
     def open(self, mode="r", encoding=None, errors=None, newline=None):

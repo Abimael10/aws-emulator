@@ -62,7 +62,7 @@ const RUN_ANSWER_CEILING: Duration = Duration::from_secs(240);
 const CEILING_OUT_OF_REACH: u64 = 32_768 * 1024 * 1024;
 
 /// The names the host installs on the module a run can reach (`state::execution::python`
-/// installs `log`, `record`, `sleep`, `aws`, `db_auth_token`, `request`, `presign`,
+/// installs `log`, `record`, `sleep`, `aws`, `child`, `db_auth_token`, `request`, `presign`,
 /// `pagination`, `error_shapes`, `net`, `durable` and `library_source`), in the order a sorted
 /// reading of them answers.
 ///
@@ -71,6 +71,7 @@ const CEILING_OUT_OF_REACH: u64 = 32_768 * 1024 * 1024;
 /// list of what is forbidden.
 const SURFACE: &[&str] = &[
     "aws",
+    "child",
     "db_auth_token",
     "durable",
     "ephemeral",

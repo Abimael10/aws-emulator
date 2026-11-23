@@ -770,7 +770,7 @@ raise RuntimeError("this attempt failed after writing its object")
 /// fails on the script's own exception and no host socket, process, library or file is
 /// reached from a Glue job run.
 ///
-/// The rows are one per primitive a script could try to reach the host with — a socket, a
+/// The rows are one per primitive a script could try to reach the host with — a socket, a host
 /// process, a native library, a guest thread, the trace hook and recursion limit the bounds
 /// are spent through, the filesystem and the environment through `os`, the import machinery
 /// (`importlib` and the import builtin) and the `open` builtin that needs no import at all —
@@ -798,7 +798,7 @@ async fn a_script_reaches_nothing_of_the_host() {
         ),
         (
             "starting a host process",
-            "import subprocess\nsubprocess.run([\"/bin/ls\"])\n",
+            "import subprocess\nsubprocess.run([\"python3\", \"-c\", \"print(1)\"])\n",
             false,
         ),
         (
@@ -821,12 +821,12 @@ async fn a_script_reaches_nothing_of_the_host() {
             // through the import builtin, so the refusal is not one `import` spells alone:
             // what the runtime refuses is the call that would start a host process.
             "importing a host module through importlib",
-            "import importlib\nimportlib.import_module(\"subprocess\").run([\"/bin/ls\"])\n",
+            "import importlib\nimportlib.import_module(\"subprocess\").run([\"python3\"])\n",
             false,
         ),
         (
             "importing a host module through the import builtin",
-            "__import__(\"subprocess\").run([\"/bin/ls\"])\n",
+            "__import__(\"subprocess\").run([\"python3\"])\n",
             false,
         ),
         (

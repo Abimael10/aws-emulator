@@ -326,7 +326,7 @@ async fn a_cells_own_aws_calls_reach_this_emulator() {
 /// comes to rest in the modelled error state carrying the cell's own exception and no host
 /// socket, process, library, file or environment variable is reached from a Glue statement.
 ///
-/// The rows are one per primitive a cell could try to reach the host with — a socket, a
+/// The rows are one per primitive a cell could try to reach the host with — a socket, a host
 /// process, a native library, a guest thread, the trace hook and the recursion limit the bounds
 /// are spent through, the filesystem and the environment through `os`, the import machinery
 /// (`importlib` and the import builtin) and the `open` builtin that needs no import at all —
@@ -348,7 +348,7 @@ async fn a_cell_reaches_nothing_of_the_host() {
         ),
         (
             "starting a host process",
-            "import subprocess\nsubprocess.run([\"/bin/ls\"])\n",
+            "import subprocess\nsubprocess.run([\"python3\", \"-c\", \"print(1)\"])\n",
             false,
         ),
         (
@@ -370,12 +370,12 @@ async fn a_cell_reaches_nothing_of_the_host() {
             // The same reach made through the import machinery rather than a statement, and
             // through the import builtin, so the refusal is not one `import` spells alone.
             "importing a host module through importlib",
-            "import importlib\nimportlib.import_module(\"subprocess\").run([\"/bin/ls\"])\n",
+            "import importlib\nimportlib.import_module(\"subprocess\").run([\"python3\"])\n",
             false,
         ),
         (
             "importing a host module through the import builtin",
-            "__import__(\"subprocess\").run([\"/bin/ls\"])\n",
+            "__import__(\"subprocess\").run([\"python3\"])\n",
             false,
         ),
         (

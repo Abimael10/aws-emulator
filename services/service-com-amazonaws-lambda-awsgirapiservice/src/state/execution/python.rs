@@ -126,6 +126,16 @@ use super::run_memory::{faulted_bytes, Held};
 /// The name of the module the host functions live on, as the runtime source imports it.
 const HOST_MODULE: &str = "_lambda_host";
 
+/// How many CHILD PROCESSES one invocation may start.
+///
+/// A child is a program of the execution environment performed in this process
+/// ([`super::guest_child_process`], whose own bounds hold what one of them costs), so this is
+/// the bound on how many of them one handler may ask for — far above the handful a handler
+/// that runs a tool of its layer starts, and far below what would cost this host anything
+/// noticeable. It is held with the other per-invocation budgets, where no guest code can reach
+/// it, and every invocation an environment serves has the whole of it.
+const MAX_CHILDREN_PER_RUN: usize = 256;
+
 /// The prefix a DATA entry of the deployment package is keyed under among the entries the
 /// run is handed ([`super::package::python_resources_within`]).
 ///
@@ -146,6 +156,15 @@ pub const RESOURCE_ID_PREFIX: &str = "resource:";
 /// [`RESOURCE_ID_PREFIX`] after this one, exactly as a data entry of the deployment package
 /// carries it, so no module name resolves to one.
 pub const LAYER_ID_PREFIX: &str = "layer:";
+
+/// The prefix an entry whose bytes are NOT TEXT is keyed under among the entries the run is
+/// handed ([`super::package::python_binaries_within`]), carrying the base64 of those bytes.
+///
+/// A mount holds such an entry as the BYTES it is, decoded where the mounts are built
+/// ([`super::bootstrap`]), so a handler and a program it starts read the file the archive
+/// really carried. Nothing imports one: no module name begins with this, exactly as none
+/// begins with [`RESOURCE_ID_PREFIX`].
+pub const BINARY_ID_PREFIX: &str = "binary:";
 
 /// Every native module this interpreter registers, out of the engine's own two pools.
 ///
@@ -624,6 +643,9 @@ pub(super) struct Session {
     serving: Mutex<Serving>,
     /// How many calls into this emulator the invocation being served has made.
     calls: AtomicU64,
+    /// How many CHILD PROCESSES the invocation being served has started
+    /// ([`MAX_CHILDREN_PER_RUN`]).
+    children: AtomicU64,
     /// The CONNECTIONS the invocation being served has open, and what it has carried on them
     /// ([`super::guest_socket`]). Held by the environment, like the session itself, and given
     /// up with the invocation that opened them.
@@ -658,6 +680,7 @@ impl Session {
                 durable: durable.cloned(),
             }),
             calls: AtomicU64::new(0),
+            children: AtomicU64::new(0),
             sockets: super::guest_socket::Sockets::default(),
         })
     }
@@ -679,6 +702,9 @@ impl Session {
         serving.durable = durable.cloned();
         drop(serving);
         self.calls.store(0, Ordering::SeqCst);
+        // Nor a budget of children: how many programs one invocation may start is that
+        // invocation's own ([`MAX_CHILDREN_PER_RUN`]).
+        self.children.store(0, Ordering::SeqCst);
         // Nothing of the invocation before it is carried over on a connection either: every
         // socket it opened is closed here, and the next invocation starts with none.
         self.sockets.release();
@@ -766,6 +792,16 @@ impl Session {
     /// spends one of the calls ONE invocation is allowed ([`MAX_CALLS_PER_RUN`]).
     fn may_call(&self) -> bool {
         self.calls.fetch_add(1, Ordering::Relaxed) < MAX_CALLS_PER_RUN as u64
+    }
+
+    /// Whether the invocation being served may start another CHILD PROCESS, which spends one
+    /// of the children ONE invocation is allowed ([`MAX_CHILDREN_PER_RUN`]).
+    ///
+    /// A program is performed in process and costs this host the work its own bounds allow
+    /// ([`super::guest_child_process`]), so how many of them one invocation may ask for is a
+    /// bound of its own — held here, where no guest code can reach it.
+    fn may_start_a_child(&self) -> bool {
+        self.children.fetch_add(1, Ordering::Relaxed) < MAX_CHILDREN_PER_RUN as u64
     }
 }
 
@@ -2113,6 +2149,35 @@ fn host_module(vm: &VirtualMachine, session: &Arc<Session>) -> PyResult<PyRef<Py
                 .into())
         },
     );
+    // The ONE PROGRAM a handler starts as a CHILD. Which program the execution environment
+    // has, how it is resolved and what performing it comes to are all
+    // [`super::guest_child_process`]'s; the bound that is this run's — how many children one
+    // invocation may start — is held here, where no guest code can reach it, because a handler
+    // decides how many it asks for.
+    let starting = Arc::clone(session);
+    set_function(
+        vm,
+        &module,
+        "child",
+        move |args: FuncArgs, vm: &VirtualMachine| {
+            let document: String = args.bind(vm)?;
+            let child_bounds = starting.bounds();
+            // A run whose budget is already spent starts nothing further: the latched stop is
+            // its answer, so work it starts afterwards is work nothing will report.
+            if let Some(stop) = child_bounds.stopped() {
+                return Err(vm.new_runtime_error(stop.reason().to_owned()));
+            }
+            if !starting.may_start_a_child() {
+                return Err(vm.new_runtime_error(format!(
+                    "one invocation may start at most {MAX_CHILDREN_PER_RUN} child processes"
+                )));
+            }
+            Ok(vm
+                .ctx
+                .new_str(super::guest_child_process::answered(&document))
+                .into())
+        },
+    );
     // CHECKED, once for the whole surface: the runtime source is driven through these
     // functions, so one that did not take its place is reported here rather than left for
     // guest code to meet as a missing name.
@@ -2134,6 +2199,7 @@ const HOST_MODULE_FUNCTIONS: &[&str] = &[
     "record",
     "sleep",
     "aws",
+    "child",
     "db_auth_token",
     "request",
     "presign",
@@ -3611,6 +3677,7 @@ mod tests {
         let reachable = returned(&listed, surface);
         let expected = ::serde_json::json!([
             "aws",
+            "child",
             "db_auth_token",
             "durable",
             "ephemeral",

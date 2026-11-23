@@ -155,6 +155,10 @@ pub mod guest_signal;
 /// handler, a client library it vendors, or the frozen `asyncio` imports.
 pub mod guest_process;
 
+/// What a call of that interface PERFORMS: one program of the execution environment, resolved
+/// against its own `PATH` and mounts and run over its filesystem in this process.
+pub mod guest_child_process;
+
 /// The Amazon S3 half of that seam, whose own protocol binds a request per operation.
 mod aws_s3;
 
@@ -982,6 +986,18 @@ pub async fn run_invocation(
                 source: entry.source,
             }));
         }
+        // And the entries whose bytes are NO text at all — an archive, an image, a packed
+        // table: files of the package exactly as the ones above are, held as the bytes they
+        // are ([`python::BINARY_ID_PREFIX`]) so the mount carries the file the archive really
+        // carried rather than leaving it out of the environment.
+        if let Ok(entries) =
+            package::python_binaries_within(invocation.zip_bytes.as_deref(), &mut read_budget)
+        {
+            modules.extend(entries.into_iter().map(|entry| package::PackageModule {
+                path: format!("{}{}", python::BINARY_ID_PREFIX, entry.path),
+                source: entry.source,
+            }));
+        }
     }
     // The layers' own entries, under the prefix the runtime keys the layer root by, read
     // out of the SAME budget the deployment package was: what one invocation holds is
@@ -1023,6 +1039,21 @@ pub async fn run_invocation(
                             "{}{}{}",
                             python::LAYER_ID_PREFIX,
                             python::RESOURCE_ID_PREFIX,
+                            entry.path
+                        ),
+                        source: entry.source,
+                    }));
+                }
+                // And the layer's own entries whose bytes are no text at all, which a layer
+                // shipping a packed asset or an executable is made of.
+                if let Ok(entries) =
+                    package::python_binaries_within(Some(archive.as_slice()), &mut read_budget)
+                {
+                    modules.extend(entries.into_iter().map(|entry| package::PackageModule {
+                        path: format!(
+                            "{}{}{}",
+                            python::LAYER_ID_PREFIX,
+                            python::BINARY_ID_PREFIX,
                             entry.path
                         ),
                         source: entry.source,

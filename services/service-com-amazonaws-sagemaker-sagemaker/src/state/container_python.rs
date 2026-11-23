@@ -1206,13 +1206,16 @@ mod tests {
 
     /// RULE: the only filesystem a container program sees is the container's own storage — the
     /// files the service placed there and the ones the program wrote — so a path of the HOST
-    /// resolves to nothing, and starting a process is refused.
+    /// resolves to nothing, and a program of the HOST is not one a child of it can run.
     ///
     /// The containment itself is the ENGINE's, in host code no program can reach; this pins
     /// that a program run through this module inherits it rather than being handed a way
-    /// around it.
+    /// around it. A child process of the container's OWN environment is performed in this
+    /// process by that engine's child-process interface
+    /// (`…lambda…::state::execution::guest_child_process`), which reaches no host process
+    /// either: what is refused here is the HOST interpreter the program asks for.
     #[test]
-    fn a_program_reaches_no_host_file_and_starts_no_process() {
+    fn a_program_reaches_no_host_file_and_starts_no_host_process() {
         let source = "import os\n\
              seen = []\n\
              try:\n\
@@ -1222,10 +1225,10 @@ mod tests {
              \x20   seen.append('no-host-file')\n\
              try:\n\
              \x20   import subprocess\n\
-             \x20   subprocess.run(['/bin/sh', '-c', 'true'])\n\
-             \x20   seen.append('started-a-process')\n\
+             \x20   subprocess.run(['python3', '-c', 'print(1)'])\n\
+             \x20   seen.append('started-a-host-process')\n\
              except Exception:\n\
-             \x20   seen.append('no-process')\n\
+             \x20   seen.append('no-host-process')\n\
              os.makedirs('/opt/ml/model', exist_ok=True)\n\
              open('/opt/ml/model/probe.txt', 'w').write(','.join(seen))\n";
         let program: Vec<String> = ["python3", "-c", source]
@@ -1241,8 +1244,8 @@ mod tests {
         let held = outcome.file("/opt/ml/model/probe.txt");
         assert_eq!(
             held,
-            Some("no-host-file,no-process"),
-            "expected the host file and the process to be refused, got {held:?}"
+            Some("no-host-file,no-host-process"),
+            "expected the host file and the host process to be refused, got {held:?}"
         );
     }
 
