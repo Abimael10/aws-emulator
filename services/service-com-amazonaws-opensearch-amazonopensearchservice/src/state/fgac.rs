@@ -175,6 +175,11 @@ pub const ACTION_DELETE_DOCUMENT: &str = "indices:data/write/delete";
 /// delete-by-query API is registered under.
 pub const ACTION_DELETE_BY_QUERY: &str = "indices:data/write/delete/byquery";
 
+/// The action reading ONE task of the cluster asks for — the monitoring action the engine's
+/// own task API is registered under, which is what a client polls a by-query write it
+/// offloaded through.
+pub const ACTION_GET_TASK: &str = "cluster:monitor/task/get";
+
 /// The action creating an index asks for.
 pub const ACTION_CREATE_INDEX: &str = "indices:admin/create";
 

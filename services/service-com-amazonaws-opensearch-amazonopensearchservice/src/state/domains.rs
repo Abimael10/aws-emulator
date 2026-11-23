@@ -200,6 +200,16 @@ pub struct Domain {
     /// reports it, from THIS one record, and deleting the domain releases every
     /// index on it. Bounded by [`INDEX_QUOTA`].
     pub indexes: BTreeMap<String, Index>,
+    /// The by-query writes this domain's cluster is running in the BACKGROUND, keyed
+    /// by the `<node>:<id>` handle the cluster minted for each — the handle a client
+    /// polls the run by, so it IS the key. A `_delete_by_query` a client offloaded
+    /// with `wait_for_completion=false` writes one, the clock paces it
+    /// ([`Self::settle_by_query_tasks`]) and `_tasks/<handle>` reports it, from THIS
+    /// one record. Bounded by [`by_query_tasks::TASK_QUOTA`].
+    pub by_query_tasks: BTreeMap<String, ByQueryTask>,
+    /// The task number the next by-query write this cluster takes on is given, which
+    /// is the second half of that run's handle ([`Self::take_by_query_task_number`]).
+    pub next_by_query_task_number: u64,
     /// The packages of this account that are associated with this domain, keyed by
     /// their `PackageID` — a domain holds at most ONE association per package, so
     /// the package's id IS the key. `AssociatePackages` makes one and
@@ -761,6 +771,11 @@ impl Domain {
         // An association of a package with this domain is owed its outcome by that
         // same clock, and likewise on its own span.
         self.settle_package_associations(now);
+        // A by-query write a client OFFLOADED is owed its documents by that same clock,
+        // on the pace the request asked for: every document its throttle has made due is
+        // removed here, so what a poll of its handle reports and what a count of the
+        // index reports were decided at one instant.
+        self.settle_by_query_tasks(now);
         // An engine version upgrade is owed its completion by the same clock, on the
         // span the call that started it recorded: once that has passed the domain runs
         // the version it was upgraded to, and the advanced options that upgrade carried

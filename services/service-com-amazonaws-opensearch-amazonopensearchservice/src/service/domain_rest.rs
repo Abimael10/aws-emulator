@@ -108,7 +108,9 @@
 //! a bounded query vocabulary ([`selector`]) whose `match` is evaluated over the terms the
 //! field's own analysis chain produces, the buckets such a search groups the documents it
 //! selected into ([`aggregations`]), the documents such a query selects removed
-//! ([`delete_by_query`]), the tokens a text produces through that chain
+//! ([`delete_by_query`]) — in the call itself or, where the request asked not to wait, in
+//! the background, which is watched through the cluster's task API ([`tasks`]) — the tokens a
+//! text produces through that chain
 //! ([`analyze`]), index templates and the component templates they are composed of
 //! ([`component_templates`]), ingest pipelines (declared, simulated and applied to a write
 //! that names one), the index-management plugin's policy API, the security plugin's
@@ -208,6 +210,9 @@ mod alerting;
 
 /// The DELETE BY QUERY API: the documents a query selects, removed.
 mod delete_by_query;
+
+/// The TASK API: what a client watches work it offloaded to the cluster through.
+mod tasks;
 
 /// RUNNING one monitor: the queries its inputs ask, whether each trigger's condition holds,
 /// and what each action of a firing trigger sends.
@@ -1661,6 +1666,10 @@ fn serve_resolved(
             }
         }
         ["_cluster", "settings"] => cluster_settings_request(domain, request),
+        // ONE task of the cluster, which is what a client watches a by-query write it
+        // offloaded through ([`tasks`]). The reserved first segment names it before any
+        // index-level arm below could read it as an index name.
+        ["_tasks", task_id] => tasks::task_request(domain, request, task_id),
         // The SNAPSHOT API: the repositories this cluster has registered, the snapshots it
         // has taken into one, and the restore of one. The reserved first segment names it
         // before any index-level arm below could read it as an index name.

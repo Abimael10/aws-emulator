@@ -197,6 +197,9 @@ mod analyzers;
 pub mod analysis;
 /// An index of a domain, the schema it carries and the settings around it.
 mod indexes;
+/// The by-query writes a cluster runs in the background — the task a `_delete_by_query` a
+/// client offloaded leaves behind — and the report every by-query write is answered from.
+pub mod by_query_tasks;
 /// The rules the index-management operations share: whether a domain serves them, what a
 /// legal `IndexSchema` is, and how a read reports one.
 mod index_schema;
@@ -225,6 +228,7 @@ mod refusals;
 
 pub use analyzers::*;
 pub use application_id::*;
+pub use by_query_tasks::*;
 pub use application_ui::*;
 pub use capabilities::*;
 pub use domains::*;

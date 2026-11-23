@@ -955,6 +955,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             vpc_endpoint_access: BTreeMap::new(),
             // A new domain holds no index; `CreateIndex` is what mints one.
             indexes: BTreeMap::new(),
+            // And no by-query write is running on it: a `_delete_by_query` a client
+            // offloads is what starts one, under the first number this cluster gives.
+            by_query_tasks: BTreeMap::new(),
+            next_by_query_task_number: 1,
             // A new domain has no package associated with it; `AssociatePackages`
             // is what links one.
             package_associations: BTreeMap::new(),
