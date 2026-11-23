@@ -11,7 +11,10 @@
 //!    the request is refused naming that key attribute. It holds for every key attribute
 //!    the table DECLARES a type for, its own key schema's and its secondary indexes', and
 //!    in every member a request addresses document paths through, so the table below
-//!    crosses the key attributes with the members and the operations that carry them;
+//!    crosses the key attributes with the members and the operations that carry them. A
+//!    read's FILTER is the one member held to a narrower set — the key schema the read
+//!    ADDRESSES, the table's own plus the index the request names — because a filter is
+//!    decided over the entries that read walks;
 //! 2. two paths that step through ONE location in two different ways — by name, which
 //!    reads a map, and by index, which reads a list — cannot both be about one item, so
 //!    the pair is refused naming both paths whole, in the order the expression stated
@@ -200,13 +203,12 @@ async fn a_document_path_into_a_key_attribute_is_refused_naming_that_key() {
             stated: not_a_scalar_key("sk"),
         },
         Row {
-            case: "a query's filter reaching into a global index's key",
-            operation: "Query",
+            case: "a scan THROUGH a global index whose filter reaches into that index's key",
+            operation: "Scan",
             request: json!({"TableName": TABLE,
-                            "KeyConditionExpression": "pk = :p",
+                            "IndexName": "ByGpk",
                             "FilterExpression": "gpk.leaf = :v",
-                            "ExpressionAttributeValues": {":p": {"S": "p"},
-                                                          ":v": {"S": "x"}}}),
+                            "ExpressionAttributeValues": {":v": {"S": "x"}}}),
             stated: not_a_scalar_key("gpk"),
         },
         Row {
@@ -301,6 +303,24 @@ async fn a_document_path_into_a_key_attribute_is_refused_naming_that_key() {
             "Scan",
             json!({"TableName": TABLE, "FilterExpression": "note.leaf = :v",
                    "ExpressionAttributeValues": {":v": {"S": "n"}}}),
+        ),
+        // A filter is decided over the entries the read WALKS, so the key attributes in
+        // force are the ones of the key schema the read addresses: an attribute that is only
+        // ANOTHER index's key is an ordinary attribute of a read of the table itself.
+        (
+            "a scan's filter reaching into an index key the scan does not read through",
+            "Scan",
+            json!({"TableName": TABLE, "FilterExpression": "gpk.leaf = :v",
+                   "ExpressionAttributeValues": {":v": {"S": "x"}}}),
+        ),
+        (
+            "a query's filter reaching into an index key the query does not read through",
+            "Query",
+            json!({"TableName": TABLE,
+                   "KeyConditionExpression": "pk = :p",
+                   "FilterExpression": "gpk.leaf = :v",
+                   "ExpressionAttributeValues": {":p": {"S": "p"},
+                                                 ":v": {"S": "x"}}}),
         ),
         (
             "an update writing into a non-key attribute",

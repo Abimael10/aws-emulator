@@ -79,9 +79,13 @@ pub fn attempts_allowed(maximum_retry_attempts: Option<i32>) -> u32 {
 /// Lambda waits one minute", and two minutes before the third — because those spans put the
 /// LAST attempt of a fully retried event three minutes past the accepting call, outside the
 /// window a client waits for its own attempts and its invocation record in, which is the
-/// part of the policy that IS the contract. It stays non-zero, so a client that looks
-/// between two attempts still sees the event being delivered rather than done.
-pub const FIRST_ASYNC_RETRY_DELAY: Duration = Duration::from_secs(3);
+/// part of the policy that IS the contract. The compression is held to that same window: a
+/// client that invokes asynchronously and then watches for the attempts its budget allows
+/// sees ALL of them inside the few seconds it waits, so the whole ladder — this span plus the
+/// doubled one after it ([`SECOND_ASYNC_RETRY_DELAY`]) — stays inside a handful of seconds
+/// rather than outlasting the look. It stays non-zero, so a client that looks between two
+/// attempts still sees the event being delivered rather than done.
+pub const FIRST_ASYNC_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// How long after the SECOND delivery attempt the third one is made: twice the span above,
 /// keeping the doubling AWS's own pacing has (one minute, then two), so a client watching
@@ -89,7 +93,7 @@ pub const FIRST_ASYNC_RETRY_DELAY: Duration = Duration::from_secs(3);
 /// ([`super::metrics::ASYNC_EVENT_AGE_METRIC`]) sees the wait GROW with the attempts spent.
 /// It is the wait after every later attempt too, because the policy allows no attempt past
 /// the third ([`MAX_ASYNC_DELIVERY_ATTEMPTS`]).
-pub const SECOND_ASYNC_RETRY_DELAY: Duration = Duration::from_secs(6);
+pub const SECOND_ASYNC_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 /// The wait before the attempt that FOLLOWS the one numbered `attempts_made`; see the two
 /// spans above.

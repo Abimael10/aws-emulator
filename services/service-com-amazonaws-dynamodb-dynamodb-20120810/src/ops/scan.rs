@@ -493,7 +493,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Asked of the projection and of the filter, the two members this scan addresses
         // document paths through, before anything else is decided about them.
         crate::state::check_scalar_key_paths(table, selection.projected_paths()).map_err(lift)?;
-        crate::state::check_scalar_key_paths(table, filter.document_paths()).map_err(lift)?;
+        // The FILTER's paths are held to the key schema this scan ADDRESSES — the table's
+        // own, and the index's when the request names one — because a filter is decided over
+        // the entries the scan walks ([`crate::state::check_scalar_filter_key_paths`]).
+        crate::state::check_scalar_filter_key_paths(
+            table,
+            input.index_name.as_deref(),
+            filter.document_paths(),
+        )
+        .map_err(lift)?;
         // A table the policies in force do not let this caller read answers the denial,
         // not its items: it is decided before anything is read. A scan addresses no
         // partition of its own, and asks for the attributes its selection names. A scan

@@ -45,9 +45,12 @@
 //! key" (`ListObjectsV2Output$NextContinuationToken`), "ContinuationToken is obfuscated and
 //! is not a real bucket" (`ListBucketsOutput$ContinuationToken`). So it is base64 text in
 //! the URL-safe alphabet, it is no rendering of the position it resumes at in any spelling a
-//! caller could compute, and only a value this service minted over THIS resource names a
+//! caller could compute, and only a value this service minted for THIS LISTING names a
 //! page at all; while being a usable cursor, it resumes the listing exactly where the page
-//! stopped and is the same value for two identical reads of one unchanged listing.
+//! stopped and is the same value for two identical reads of one unchanged listing. What the
+//! cursor names is a POSITION: the object listing's token resumes at the key it was issued
+//! for in whatever bucket the next request addresses, because the resource that listing is
+//! taken over is the `Bucket` the request names.
 //!
 //! The tables span what each rule generalises over: WHICH listing answers (all four, by
 //! their four addresses), whether the request stated each echoed member, the page sizes
@@ -903,8 +906,10 @@ async fn the_object_listing_hands_back_an_opaque_token_whatever_key_it_resumes_a
             assert_token_refused(&format!("{case}/{why}"), &refused, true);
         }
 
-        // A token minted over ANOTHER bucket's listing of the same family names no page
-        // here: the cursor is scoped to the resource the listing was taken over.
+        // A token minted over ANOTHER bucket's listing of the same family names the same
+        // POSITION there: the cursor is the key the next page starts at, not a handle on the
+        // bucket it was issued over, so it resumes the listing of whatever bucket the request
+        // addresses.
         let elsewhere = format!("echoed-token-objects-{index}-elsewhere");
         bucket(&router, &elsewhere).await;
         store_keys(&router, &elsewhere, keys).await;
@@ -914,10 +919,20 @@ async fn the_object_listing_hands_back_an_opaque_token_whatever_key_it_resumes_a
             &format!("&max-keys=1&continuation-token={token}"),
         )
         .await;
-        assert_token_refused(
-            &format!("{case}/a token issued over another bucket"),
-            &foreign,
-            true,
+        assert_eq!(
+            foreign.status,
+            200,
+            "case {case:?}: a token issued over another bucket resumes this listing, got {} \
+             with body {:?}",
+            foreign.status,
+            text(&foreign)
+        );
+        assert_eq!(
+            listing_of(&foreign).keys(),
+            vec![resumed_at.clone()],
+            "case {case:?}: a token issued over another bucket resumes at {resumed_at:?}, got \
+             {:?}",
+            listing_of(&foreign).keys()
         );
 
         // And every refusal left the listing exactly as it was.
@@ -1148,5 +1163,140 @@ async fn the_annotation_listing_token_is_a_cursor_only_into_the_object_it_was_is
         )
         .await;
         assert_token_refused(&format!("ListObjectAnnotations/{why}"), &refused, false);
+    }
+}
+
+/// The keys the bucket that ISSUES the token below holds: two under one prefix and one with
+/// none, so the position a token names is not always a short name.
+const TOKEN_POSITION_KEYS: &[&str] = &["notes/april.txt", "notes/may.txt", "plain.txt"];
+
+/// One bucket an issued object-listing token is handed to, and the page that token names
+/// there.
+struct Resumed {
+    case: &'static str,
+    /// The keys the addressed bucket holds.
+    keys: &'static [&'static str],
+    /// The keys the resumed page must report, in listing order.
+    reports: &'static [&'static str],
+}
+
+/// RULE: an object listing's continuation token names the POSITION the next page starts at and
+/// not the bucket it was issued over — the resource the listing is taken over is the `Bucket`
+/// the request addresses — so a token this service issued resumes the object listing of
+/// whatever bucket the next request names, at that position.
+///
+/// The rows differ in where the issued position falls among the addressed bucket's keys
+/// (inside them, before all of them, after all of them, exactly at one) and in how many keys
+/// that bucket holds.
+#[tokio::test]
+async fn an_object_listing_token_names_a_position_and_resumes_whichever_bucket_is_addressed() {
+    let router = router();
+    let issuer = "token-position-issuer";
+    bucket(&router, issuer).await;
+    store_keys(&router, issuer, TOKEN_POSITION_KEYS).await;
+
+    let first = list_objects_v2(&router, issuer, "&max-keys=1").await;
+    let token = element(&first, "NextContinuationToken").unwrap_or_else(|| {
+        panic!(
+            "case \"the issuing bucket\": a truncated page hands back a token, got {:?}",
+            text(&first)
+        )
+    });
+    let listed = listing_of(&list_objects_v2(&router, issuer, "").await).keys();
+    let position = listed[1].clone();
+    assert_opaque("the issuing bucket", &token, &position);
+
+    let rows: &[Resumed] = &[
+        Resumed {
+            case: "a bucket holding the same keys resumes at the same key",
+            keys: &["notes/april.txt", "notes/may.txt", "plain.txt"],
+            reports: &["notes/may.txt", "plain.txt"],
+        },
+        Resumed {
+            case: "a bucket whose keys straddle the position resumes after it",
+            keys: &["aaa.txt", "notes/zulu.txt", "zzz.txt"],
+            reports: &["notes/zulu.txt", "zzz.txt"],
+        },
+        Resumed {
+            case: "a bucket every key of which sorts before the position reports no entry",
+            keys: &["aaa.txt", "notes/april.txt"],
+            reports: &[],
+        },
+        Resumed {
+            case: "a bucket every key of which sorts after the position reports all of them",
+            keys: &["zulu.txt"],
+            reports: &["zulu.txt"],
+        },
+        Resumed {
+            case: "a bucket holding one key at the position reports exactly it",
+            keys: &["notes/may.txt"],
+            reports: &["notes/may.txt"],
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let name = format!("token-position-addressed-{index}");
+        bucket(&router, &name).await;
+        store_keys(&router, &name, row.keys).await;
+        let resumed =
+            list_objects_v2(&router, &name, &format!("&continuation-token={token}")).await;
+        assert_eq!(
+            resumed.status,
+            200,
+            "case {:?}: a token this service issued resumes the addressed bucket, got {} with \
+             body {:?}",
+            row.case,
+            resumed.status,
+            text(&resumed)
+        );
+        let listing = listing_of(&resumed);
+        assert_eq!(
+            listing.keys(),
+            row.reports
+                .iter()
+                .map(|key| (*key).to_string())
+                .collect::<Vec<String>>(),
+            "case {:?}: expected the resumed page to carry {:?}, got {:?}",
+            row.case,
+            row.reports,
+            listing.keys()
+        );
+        // The resumed page is the ADDRESSED bucket's own, and it echoes the token it was
+        // given.
+        assert_eq!(
+            (
+                element(&resumed, "Name"),
+                element(&resumed, "ContinuationToken")
+            ),
+            (Some(name.clone()), Some(token.clone())),
+            "case {:?}: expected the page of {name:?} resumed from the token it was given, got \
+             {:?}",
+            row.case,
+            text(&resumed)
+        );
+    }
+
+    // The CONTROL: only a value this service minted for an object listing names a position,
+    // so what a caller could assemble for itself is still refused naming the parameter it
+    // arrived on — on the issuing bucket and on another one alike.
+    let mut forged = computable_spellings(&position);
+    forged.push((
+        "a token with its last character changed".to_string(),
+        flip_last(&token),
+    ));
+    forged.push((
+        "not an encoding at all".to_string(),
+        "not.a.token".to_string(),
+    ));
+    for (why, value) in forged {
+        for addressed in [issuer, "token-position-addressed-0"] {
+            let refused = list_objects_v2(
+                &router,
+                addressed,
+                &format!("&continuation-token={value}"),
+            )
+            .await;
+            assert_token_refused(&format!("{addressed}/{why}"), &refused, true);
+        }
     }
 }

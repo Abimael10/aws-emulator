@@ -24,6 +24,13 @@
 //! a delete, a node-count or replica-count change — drives the same pass, and none of them
 //! has to remember an interface id.
 //!
+//! A node a DELETE has taken is gone for this purpose from the call that took it, even where
+//! the record of its cluster stays readable in `deleting` while the teardown the clock owes
+//! runs: the interface is torn down with the node, and the call that begins the teardown is
+//! the last operation of this service a tearing-down client makes, so an interface held back
+//! for the record's sake would keep the subnet and the security groups of a node nothing runs
+//! for ([`node_interfaces_wanted`]).
+//!
 //! LOCK ORDER. The pass takes this store's lock, releases it, and only then takes the EC2
 //! store's: no two store locks are ever held at once, and EC2 never reaches this service, so
 //! no cycle exists.
@@ -169,6 +176,18 @@ fn node_interfaces_wanted(
 ) -> Vec<WantedInterface> {
     let mut wanted: Vec<WantedInterface> = Vec::new();
     for cluster in store.cache_clusters.values() {
+        // A node a delete has taken holds no place in the account's VPC any longer: the
+        // interface of a cache node is torn down WITH that node (its attachment carries
+        // `delete_on_termination`), so the address goes back to its subnet as soon as the
+        // delete begins the teardown. The record of a cluster a `DeleteReplicationGroup`
+        // began on stays readable in `deleting` until the clock carries its removal through
+        // (`REPLICATION_GROUP_TEARDOWN`), and is then dropped by whichever later call finds
+        // the removal due — which is no operation of this service, so an interface left
+        // standing for such a node would never be given back at all and would hold its
+        // subnet and its security groups against the caller tearing the network down.
+        if cluster.status == super::STATUS_DELETING {
+            continue;
+        }
         // No cache subnet group means no VPC placement: such a cluster has no subnet of the
         // account to sit in, so nothing is placed for it.
         let Some(group) = cluster

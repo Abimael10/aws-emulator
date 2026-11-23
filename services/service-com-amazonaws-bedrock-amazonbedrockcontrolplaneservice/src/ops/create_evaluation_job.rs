@@ -431,10 +431,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.evaluation_jobs.insert(arn.clone(), job);
 
         // Read the response back out of the STORED record, so what the caller is told is
-        // exactly what a later GetEvaluationJob will find.
-        let stored = store
-            .evaluation_job(&arn, now)
-            .expect("the evaluation job just inserted under this ARN");
+        // exactly what a later GetEvaluationJob will find. A store that does not hold it is
+        // reported as a server error rather than panicked on, so no request can take the
+        // process down.
+        let Some(stored) = store.evaluation_job(&arn, now) else {
+            return Err(CreateEvaluationJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the submitted evaluation job was not stored".to_string()),
+                },
+            )
+            .into());
+        };
         let job_arn = stored.arn.clone();
         // The RUN this create accepted, taken off the record here and performed in a task of
         // its own: an accepted job evaluates the records of every dataset its configuration

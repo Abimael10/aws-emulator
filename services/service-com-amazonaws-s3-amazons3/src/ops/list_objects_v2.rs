@@ -239,9 +239,22 @@ const MAX_KEYS_PER_PAGE: i32 = 1000;
 /// "NextContinuationToken is obfuscated and is not a real key"
 /// (`ListObjectsV2Output$NextContinuationToken`): the token is an opaque value this service
 /// mints over the position the next page resumes at — never a rendering of that key — and a
-/// value this service did not mint names no page at all. The cursor is scoped to the BUCKET
-/// the listing is taken over, so a token issued over one bucket names no page of another's.
+/// value this service did not mint names no page at all.
 const LISTING: crate::state::PagedListing = crate::state::PagedListing::Objects;
+
+/// The scope every object listing's continuation token is minted and read over: ONE scope for
+/// all of them, so the token names a position and carries no bucket of its own.
+///
+/// What the member names is where the next page starts — "the token is obfuscated and is not
+/// a real key", but it is still that key — and the resource the listing is taken over is the
+/// `Bucket` the REQUEST addresses, not something the cursor re-states. So a token this
+/// service issued resumes the object listing of whatever bucket the next request names, at
+/// the position it was issued for, and only a value no object listing issued at all names no
+/// page ([`crate::state::INVALID_CONTINUATION_TOKEN_MESSAGE`]). A bucket-configuration
+/// listing binds its own cursor to its bucket instead
+/// ([`crate::state::read_continuation_token`]), which is a different family of token and
+/// keeps that scope.
+const OBJECT_LISTING_SCOPE: &str = "";
 
 /// The `ListObjectsV2` operation.
 ///
@@ -372,12 +385,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // previous page stopped, which is at or after StartAfter. Read before the bucket is
         // looked up, so a token no listing of this service issued is answered as such
         // whatever the request goes on to address.
+        //
+        // The token names a POSITION in an object listing and nothing else: it is
+        // "obfuscated and is not a real key"
+        // (`ListObjectsV2Output$NextContinuationToken`) but it is still the key the next page
+        // starts at, not a handle on the bucket it was issued over — so it is minted and read
+        // over the SCOPE every object listing shares ([`OBJECT_LISTING_SCOPE`]) and resumes
+        // the listing of whatever bucket this request addresses.
         let resume_at = match input.continuation_token.as_deref() {
             Some(token) => Some(
                 crate::state::decode_continuation_token(
                     &page_tokens,
                     LISTING,
-                    &input.bucket,
+                    OBJECT_LISTING_SCOPE,
                     token,
                 )
                 .ok_or_else(|| {
@@ -575,7 +595,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     next_continuation_token = Some(crate::state::encode_continuation_token(
                         &page_tokens,
                         LISTING,
-                        &input.bucket,
+                        OBJECT_LISTING_SCOPE,
                         key,
                     ));
                     break;

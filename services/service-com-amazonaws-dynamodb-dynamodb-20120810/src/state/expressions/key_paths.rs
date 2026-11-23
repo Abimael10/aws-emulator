@@ -17,6 +17,12 @@
 //! exactly its key attributes, its own and its secondary indexes'
 //! ([`Table::declared_type`]), which is what makes one reading of the schema cover an
 //! index key as well as a table key.
+//!
+//! A read's FILTER is held to the key schema that read ADDRESSES instead — the table's own,
+//! plus the named index's when the request states an `IndexName`
+//! ([`check_scalar_filter_key_paths`]) — because a filter is decided over the entries the
+//! read walks, and an attribute that is only another index's key is an ordinary attribute of
+//! that walk.
 
 use super::*;
 
@@ -46,6 +52,56 @@ pub fn check_scalar_key_paths<'p>(
         }
     }
     Ok(())
+}
+
+/// Hold every document path a read's FILTER names to the key schema that read ADDRESSES:
+/// the table's own, and the named secondary index's when the read is pointed at one.
+///
+/// A filter is decided over the entries the read WALKS, so the key attributes in force are
+/// the ones of the key schema it walks — "A FilterExpression does not allow key attributes"
+/// is about exactly those (`Query$FilterExpression`). An attribute that is only ANOTHER
+/// index's key is an ordinary attribute of that walk: the read never addresses that index,
+/// so no rule of its key schema is in force, and a path reaching inside the attribute is
+/// held to nothing but the paths' own grammar.
+///
+/// `index_name` is the `IndexName` the request stated, and a name this table declares no
+/// index for contributes nothing: resolving one is that read's own refusal, stated where the
+/// index is resolved ([`resolve_index`]).
+pub fn check_scalar_filter_key_paths<'p>(
+    table: &Table,
+    index_name: Option<&str>,
+    paths: impl IntoIterator<Item = &'p DocumentPath>,
+) -> Result<(), RequestError> {
+    for path in paths {
+        if path.single_attribute().is_some() {
+            continue;
+        }
+        let attribute = path.attribute();
+        if addresses_key_attribute(table, index_name, attribute) {
+            return Err(RequestError::Validation(format!(
+                "{KEY_PATH_NOT_SCALAR_CLAUSE}{attribute}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `attribute` is a key attribute of the key schema a read of `table` through
+/// `index_name` addresses: one of the table's own key attributes — an index entry carries
+/// them too, so they are key attributes of an index read as well — or one of the named
+/// index's.
+fn addresses_key_attribute(table: &Table, index_name: Option<&str>, attribute: &str) -> bool {
+    if table.is_table_key(attribute) {
+        return true;
+    }
+    index_name.is_some_and(|name| {
+        table.secondary_index(name).is_some_and(|index| {
+            index
+                .key_schema
+                .iter()
+                .any(|element| element.attribute_name == attribute)
+        })
+    })
 }
 
 /// Hold the document paths of a conditional WRITE's `ConditionExpression` to the key

@@ -591,11 +591,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 filter.stated_member()
             )));
         }
-        // What is left of the filter's paths is then held to the key schema like the
-        // projection's above: a path reaching inside a key attribute of an INDEX this query
-        // does not read through addresses no location either
-        // ([`crate::state::check_scalar_key_paths`]).
-        crate::state::check_scalar_key_paths(table, filter.document_paths()).map_err(lift)?;
+        // What is left of the filter's paths is then held to the key schema this query
+        // ADDRESSES: the table's own and, where the request named one, the index's — which
+        // the rule above has already refused every path of, whole or dereferenced, so a path
+        // reaching inside a key attribute of an INDEX this query does not read through
+        // addresses an ordinary attribute of the walk and is served
+        // ([`crate::state::check_scalar_filter_key_paths`]).
+        crate::state::check_scalar_filter_key_paths(
+            table,
+            input.index_name.as_deref(),
+            filter.document_paths(),
+        )
+        .map_err(lift)?;
         // "If you query or scan a global secondary index, you can only request
         // attributes that are projected into the index. Global secondary index queries
         // cannot fetch attributes from the parent table" (`Query$Select`): a query of a
