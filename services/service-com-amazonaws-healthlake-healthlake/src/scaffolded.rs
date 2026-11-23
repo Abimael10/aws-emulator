@@ -185,25 +185,15 @@ impl SerializableStruct for ValidationException {
 /// its own error shape declares.
 ///
 /// HealthLake speaks `awsJson1_0` (`smithy_query(query="service_info")` ->
-/// `protocols: ["awsJson1_0"]`), and the awsJson family binds nothing to the transport:
-/// `@httpError` is an HTTP-binding trait, so an awsJson front end reports an error's
-/// FAULT instead. Every modeled CLIENT error (`@error: "client"`) is therefore HTTP 400
-/// — the body's `__type` is what distinguishes one from another — while a SERVER error
-/// keeps its 5xx status so a client's retry classifier still sees a server fault. The
-/// recorded wire confirms it: the recording answers `ResourceNotFoundException`, which
-/// this model annotates `@httpError(404)`, with HTTP 400.
-///
-/// Classified from the modeled status rather than from a list of shape names, so an
-/// error shape this service answers later is covered without touching this function:
-/// `@httpError(400)`/`(403)`/`(404)`/`(409)`/`(429)` all render as 400, and
-/// `@httpError(500)` stays 500.
-pub fn wire_http_status(modeled_status: u16) -> u16 {
-    if modeled_status >= 500 {
-        modeled_status
-    } else {
-        400
-    }
-}
+/// `protocols: ["awsJson1_0"]`), and its recorded wire answers
+/// `ResourceNotFoundException` — which this model annotates `@httpError(404)` — with
+/// HTTP 400, so this service reports an error's FAULT rather than the exact code the
+/// shape's trait names. The classification itself is the shared one
+/// ([`service_common::awsjson_fault_status::wire_http_status`]), stated once for every
+/// service whose recording shows that awsJson front end; this re-export is how the
+/// crate reads it, so `crate::scaffolded::wire_http_status` stays the name the
+/// handlers and suites here use.
+pub use service_common::awsjson_fault_status::wire_http_status;
 
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.

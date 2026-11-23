@@ -56,6 +56,10 @@
 //! * [`rpc_target`], the ONE reading of an `awsJson` `X-Amz-Target` — which service and
 //!   which operation it names — for every service whose published target prefix carries
 //!   dots of its own, which the framework's first-dot readers cannot route;
+//! * [`awsjson_fault_status`], the ONE classification of the HTTP status an `awsJson`
+//!   service answers a modelled error at — the error's FAULT rather than the exact code
+//!   its shape's `@httpError` trait names — for every service whose recorded wire shows
+//!   that front end;
 //!
 //! Beside them, ten SHARED STORES live here, each held once in the shared engine so
 //! the services on either side of a hand-off cannot hold two copies of one fact:
@@ -349,6 +353,9 @@ pub mod audited_operation;
 /// unknown-credential failure and the signature failure, each in that service's own code,
 /// so neither is collapsed into the authorization denial `AccessDenied`.
 pub mod authentication_refusal;
+/// The ONE classification of the HTTP status an `awsJson` service answers a modelled error
+/// at: the error's FAULT, not the exact code its shape's `@httpError` trait names.
+pub mod awsjson_fault_status;
 /// The ONE reading of whether a request PRESENTS a SigV4 credential at all — in either of
 /// SigV4's two presentations — and AWS's fixed sentence for one that presents none, which is
 /// a different failure class from a credential that is presented and not accepted.

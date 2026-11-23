@@ -180,24 +180,15 @@ impl SerializableStruct for ValidationException {
 /// The HTTP status this service answers a modeled error with, from the status its
 /// model declares for that error shape.
 ///
-/// Amazon EVS speaks `awsJson1_0` (`smithy_query(query="service_info")`), and an
-/// awsJson front end does not use the exact code an error shape's `@httpError` trait
-/// names: it reports the error's FAULT, so every modeled client error (`@error:
-/// "client"`) is HTTP 400 and the body's `__type` is what distinguishes one from
-/// another, while a server error keeps its 5xx status so a client's retry classifier
-/// still sees a server fault. The recorded wire confirms it: the recording answers
-/// `ResourceNotFoundException` — `@httpError(404)` in the model — with HTTP 400.
-///
-/// Classified from the modeled status rather than from a list of shape names, so a
-/// shape this service adds later is covered without touching this function:
-/// `@httpError(402)`/`(404)`/`(429)` all render as 400, `@httpError(500)` stays 500.
-pub fn wire_http_status(modeled_status: u16) -> u16 {
-    if modeled_status >= 500 {
-        modeled_status
-    } else {
-        400
-    }
-}
+/// Amazon EVS speaks `awsJson1_0` (`smithy_query(query="service_info")`), and its
+/// recorded wire answers `ResourceNotFoundException` — `@httpError(404)` in its
+/// published model — with HTTP 400, so this service reports an error's FAULT rather
+/// than the exact code the shape's trait names. The classification itself is the
+/// shared one ([`service_common::awsjson_fault_status::wire_http_status`]), stated
+/// once for every service whose recording shows that awsJson front end; this
+/// re-export is how the crate reads it, so `crate::scaffolded::wire_http_status`
+/// stays the name the handlers and suites here use.
+pub use service_common::awsjson_fault_status::wire_http_status;
 
 /// The `message` member of the tagging surface's not-found error shape.
 static TAGGING_NOT_FOUND_MESSAGE: Schema = Schema::new_member(
