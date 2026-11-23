@@ -79,7 +79,14 @@ fn services() -> Vec<Service> {
                 "DashboardsPerAccount",
                 "MetricStreamsPerAccount",
             ],
-            published: &["L-6FCAAA2E", "L-69C44FFD", "L-6300B446", "L-722EAE58"],
+            published: &[
+                "L-6FCAAA2E",
+                "L-69C44FFD",
+                "L-6300B446",
+                "L-E2310E7A",
+                "L-CA907765",
+                "L-722EAE58",
+            ],
         },
         Service {
             code: "mq",

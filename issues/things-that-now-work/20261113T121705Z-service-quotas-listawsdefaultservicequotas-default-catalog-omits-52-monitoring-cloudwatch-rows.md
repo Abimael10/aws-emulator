@@ -6,63 +6,28 @@ Issue-Corpus: simparity-wire-aws-v1
 Issue-Corpus-Kind: wire
 Issue-Trace-Ids: service-quotas-catalog-list-aws-default-service-quotas-monitoring
 Issue-Shape-Id: com.amazonaws.servicequotas#ServiceQuotasV20190624
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-05D334F0"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-0720E68F"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-0F4E28CA"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-1F0C4E0C"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-21CB40A4"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-22339239"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-25E8DC37"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-4609795C"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-4D6041CE"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-50BF3376"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-515B0B71"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-59022E75"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-5E141212"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-601618F7"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-6300B446"].Value
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-6411EBD9"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-646A917A"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-6753900D"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-68B0DFE2"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-6929DE8C"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-69C44FFD"].Value
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-7193C790"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-73547960"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-787E531D"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-7D8B1BC8"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-8445A443"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-86AA5564"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-8742A250"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-8A387C66"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-8BC498D4"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-8DCC6151"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-98B10DBA"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-9FFA42D2"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-A1710150"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-A23CEE97"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-A4883EA4"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-A64F5500"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-A6D89949"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-AB1871A7"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-B1A3FF67"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-B6C4D57E"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-C1B4557E"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-C1FE0F5C"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-C234EDB6"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-C6D91C0A"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-CA907765"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-D750D224"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-DBD11BCC"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-DFE30068"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-E1508405"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-E2310E7A"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-E82C279D"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-EE839489"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-F5FE387B"]
 Issue-Commit: 3bfb7cd772781c7f8fd33f0bb610479e140a70f3
 
 # ListAWSDefaultServiceQuotas default catalog omits 52 monitoring (CloudWatch) rows and understates two API-rate quota Values
+
+> _WHAT THIS REPORT NOW COVERS. The defect closed here is the half of the cluster whose
+> code-to-quota pairing the evidence below STATES: `L-E2310E7A` ("Rate of
+> DescribeAlarmsForMetric requests", Value 9.0, not adjustable) and `L-CA907765` ("Rate of
+> EnableAlarmActions requests", Value 3.0, not adjustable) are now published for
+> `ServiceCode` `monitoring` under AWS's own codes with every member AWS publishes with
+> them, and `L-69C44FFD` and `L-6300B446` now report the Value AWS publishes for each
+> (10.0) instead of a rate carried over from a class-wide constant. Its `Issue-Key`
+> headers are now just those four keys. The other 50 codes of the cluster — for which
+> nothing here states WHICH quota AWS publishes under WHICH code, a pairing no rule
+> derives from a quota name, and `L-C234EDB6` among them, whose name is stated but neither
+> its Value nor its adjustability — were SPLIT OUT, with their 50 replay keys, to
+> `issues/things-that-do-not-work/20261113T121705Z-service-quotas-monitoring-default-rows-without-a-citable-quotacode-pairing.md`,
+> so none of that half is recorded as working. That report also carries what this fix
+> established about it._
 
 > _Note: this issue was identified against the code base at commit `3bfb7cd772781c7f8fd33f0bb610479e140a70f3`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 

@@ -900,6 +900,8 @@ const CITED_AWS_QUOTA_CODES: &[(&str, &str)] = &[
     ("monitoring", "L-69C44FFD"),
     ("monitoring", "L-6FCAAA2E"),
     ("monitoring", "L-722EAE58"),
+    ("monitoring", "L-CA907765"),
+    ("monitoring", "L-E2310E7A"),
     ("quicksight", "L-12A1F6CA"),
     ("quicksight", "L-26532294"),
     ("quicksight", "L-39A09B2E"),

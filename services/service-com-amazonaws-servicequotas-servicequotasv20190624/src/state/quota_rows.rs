@@ -63,6 +63,7 @@ mod elasticfilesystem;
 mod elasticloadbalancing;
 mod es;
 mod kms;
+mod monitoring;
 mod quicksight;
 mod sns;
 mod sqs;
@@ -115,6 +116,7 @@ pub(super) use elasticfilesystem::elasticfilesystem_quotas;
 pub(super) use elasticloadbalancing::elasticloadbalancing_quotas;
 pub(super) use es::es_quotas;
 pub(super) use kms::kms_quotas;
+pub(super) use monitoring::monitoring_quotas;
 pub(super) use quicksight::quicksight_quotas;
 pub(super) use sns::sns_quotas;
 pub(super) use sqs::sqs_quotas;
@@ -2706,54 +2708,6 @@ pub(super) fn lambda_quotas() -> Vec<QuotaRow> {
     ]
 }
 
-/// Amazon CloudWatch's published quota catalog, under the `ServiceCode` its API
-/// endpoint uses.
-///
-/// CloudWatch publishes most of its quotas as per-API REQUEST RATES, each over a
-/// one-second window and measured with the `AWS/Usage` `CallCount` metric of the API
-/// it throttles ([`cloudwatch_request_rate`]), beside the rates it puts on the
-/// metric-math functions a `GetMetricData` request may use.
-///
-/// The rows below are the ones whose AWS code this catalog can cite TOGETHER WITH the
-/// quota that code names. A row is an IDENTITY — the code a client resolves a limit by —
-/// so the rest of the service's published rows are left to the default-quota-set gap
-/// rather than served under a code AWS does not mint or a code whose quota this catalog
-/// would be guessing at (see [`super::descriptive_quota_code`] for the rule about a
-/// row's code).
-pub(super) fn monitoring_quotas() -> Vec<QuotaRow> {
-    vec![
-        // This API states its own rate: "There is a limit of 20 transactions per second
-        // for this API" (the `GetMetricWidgetImage` documentation of the CloudWatch
-        // model), which is the limit AWS publishes the quota at.
-        cloudwatch_request_rate("GetMetricWidgetImage", 20.0).code("L-6FCAAA2E"),
-        // Two operations whose own documentation states no rate of their own: the rate
-        // the recorded listing carries for each of them
-        // ([`CLOUDWATCH_DEFAULT_REQUEST_RATE`]).
-        cloudwatch_request_rate("ListDashboards", CLOUDWATCH_DEFAULT_REQUEST_RATE)
-            .code("L-69C44FFD"),
-        cloudwatch_request_rate(
-            "DescribeAnomalyDetectors",
-            CLOUDWATCH_DEFAULT_REQUEST_RATE,
-        )
-        .code("L-6300B446"),
-        // A rate CloudWatch puts on ONE METRIC-MATH FUNCTION rather than on an API:
-        // the quota counts how often the anomaly-detection band may be computed across
-        // all `GetMetricData` requests in a second, and AWS publishes it as not
-        // adjustable. It carries no `UsageMetric`, because `AWS/Usage` publishes a
-        // `CallCount` series per API operation and no series counts one function's use
-        // inside a call of `GetMetricData`.
-        quota("Rate of ANOMALY_DETECTION_BAND usage in GetMetricData", 1000.0)
-            .code("L-722EAE58")
-            .fixed()
-            .period(1, "SECOND")
-            .describe(
-                "The maximum number of times the ANOMALY_DETECTION_BAND function can be \
-                 used in all GetMetricData requests, per second, in this account in the \
-                 current region.",
-            ),
-    ]
-}
-
 /// AWS Resource Access Manager's published default-quota catalog.
 ///
 /// SOURCE: AWS's published Service Quotas data for the `ram` service code, and the
@@ -3496,49 +3450,6 @@ pub(super) fn call_count_metric(usage_service_name: &str, api_name: &str) -> Met
     )
 }
 
-/// The `AWS/Usage` display name Amazon CloudWatch publishes its call counts under,
-/// which is the `Service` dimension of every metered CloudWatch quota.
-const CLOUDWATCH_USAGE_SERVICE: &str = "CloudWatch";
-
-/// The requests per second the rate rows this catalog cites for Amazon CloudWatch carry
-/// where the operation they throttle states no rate of its own.
-///
-/// SOURCE: the recorded default-quota listing of `monitoring`, which carries this value
-/// on the rate rows of the two such operations this catalog cites (`ListDashboards` and
-/// `DescribeAnomalyDetectors`). It is what THOSE rows are published at, not a default to
-/// fill a further operation's row from: an operation that publishes its own rate carries
-/// that one (`GetMetricWidgetImage`), and a row whose published rate nothing available
-/// here states is left unpublished rather than filled in from this constant.
-pub(super) const CLOUDWATCH_DEFAULT_REQUEST_RATE: f64 = 5.0;
-
-/// One Amazon CloudWatch API REQUEST-RATE quota: `Rate of <api> requests`, the most
-/// requests to that one operation CloudWatch serves per second.
-///
-/// CloudWatch publishes a rate quota for each of its API operations, and every member
-/// of such a row but the operation's own name and the limit is the same across the
-/// class: the `QuotaName` names the operation the rate is of, the window is one second,
-/// the usage metric is that operation's `AWS/Usage` `CallCount` ([`call_count_metric`])
-/// under the `CloudWatch` service dimension, and the `Description` is the sentence the
-/// class is published with, with the throttled operation named in it. Those are the
-/// quota's PUBLISHED members, so one constructor fills them and two rows of the class
-/// cannot drift apart.
-///
-/// SOURCE: the recorded default-quota listing of `monitoring` for the class's name
-/// form, its one-second window, the call-count metric each row carries and the sentence
-/// above. The rate is the operation's own where its documentation states one, else the
-/// rate the recording carries for that row ([`CLOUDWATCH_DEFAULT_REQUEST_RATE`]).
-pub(super) fn cloudwatch_request_rate(api_name: &str, requests_per_second: f64) -> QuotaRow {
-    quota(
-        format!("Rate of {api_name} requests"),
-        requests_per_second,
-    )
-    .period(1, "SECOND")
-    .metric(call_count_metric(CLOUDWATCH_USAGE_SERVICE, api_name))
-    .describe(&format!(
-        "The maximum number of {api_name} requests that you can make, per second, in this \
-         account in the current region."
-    ))
-}
-
 // AWS KMS's per-operation request-rate class and the rows that use it live in the `kms`
-// module beside this service's other published rows.
+// module beside this service's other published rows, and Amazon CloudWatch's in the
+// `monitoring` module beside its own.

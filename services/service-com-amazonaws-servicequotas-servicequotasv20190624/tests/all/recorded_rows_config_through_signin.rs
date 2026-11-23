@@ -153,7 +153,7 @@ fn rows() -> Vec<Row> {
             service_code: "monitoring",
             quota_code: "L-69C44FFD",
             quota_name: "Rate of ListDashboards requests",
-            value: 5.0,
+            value: 10.0,
             unit: "None",
             adjustable: true,
             description: "The maximum number of ListDashboards requests that you can make, \
@@ -170,7 +170,7 @@ fn rows() -> Vec<Row> {
             service_code: "monitoring",
             quota_code: "L-6300B446",
             quota_name: "Rate of DescribeAnomalyDetectors requests",
-            value: 5.0,
+            value: 10.0,
             unit: "None",
             adjustable: true,
             description: "The maximum number of DescribeAnomalyDetectors requests that you \
