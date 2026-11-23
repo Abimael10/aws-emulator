@@ -179,6 +179,74 @@ pub fn tags_path(arn: &str) -> String {
     format!("/tags/{}", label(arn))
 }
 
+/// `TagResource` on `arn`: `POST /tags/{arn}`, whose output shape is `Unit`, so
+/// a success carries no body for the caller to parse.
+pub async fn tag_resource(emulator: &Emulator, case: &str, arn: &str, tags: &Value) {
+    let answer = emulator
+        .ok(case, "POST", &tags_path(arn), json!({ "tags": tags }))
+        .await;
+    assert_eq!(
+        answer,
+        Value::Null,
+        "case {case:?}: TagResource answers an empty body, got {answer:?}"
+    );
+}
+
+/// The `tags` member `ListTagsForResource` reports for `arn`: `GET /tags/{arn}`,
+/// whose `arn` is the operation's only input. The member is reported on every
+/// resolved resource, as the empty map for one carrying no tags.
+pub async fn listed_tags(emulator: &Emulator, case: &str, arn: &str) -> Value {
+    let answer = emulator.ok(case, "GET", &tags_path(arn), Value::Null).await;
+    answer.get("tags").cloned().unwrap_or_else(|| {
+        panic!("case {case:?}: ListTagsForResource must report a tag set, got {answer:?}")
+    })
+}
+
+/// `CreateCase` from `template_id`, writing `field_id` as a `Text` value, as the
+/// case id it minted. `fields` is `@length(1..)`
+/// (`smithy_query(query="operation", operation="CreateCase")`), so one value is
+/// the smallest body the model accepts.
+pub async fn create_case(
+    emulator: &Emulator,
+    case: &str,
+    domain_id: &str,
+    template_id: &str,
+    field_id: &str,
+) -> String {
+    let created = emulator
+        .ok(
+            case,
+            "POST",
+            &format!("/domains/{domain_id}/cases"),
+            json!({
+                "templateId": template_id,
+                "fields": [{ "id": field_id, "value": { "stringValue": "a customer note" } }]
+            }),
+        )
+        .await;
+    string_at(&created, "caseId", case)
+}
+
+/// The `templateId` `GetCase` reports for `case_id` — the template the case was
+/// created from, read back through the case itself.
+pub async fn case_template(
+    emulator: &Emulator,
+    case: &str,
+    domain_id: &str,
+    case_id: &str,
+    field_id: &str,
+) -> String {
+    let fetched = emulator
+        .ok(
+            case,
+            "POST",
+            &format!("/domains/{domain_id}/cases/{case_id}"),
+            json!({ "fields": [{ "id": field_id }] }),
+        )
+        .await;
+    string_at(&fetched, "templateId", case)
+}
+
 pub fn string_at(json: &Value, member: &str, case: &str) -> String {
     json.get(member)
         .and_then(Value::as_str)

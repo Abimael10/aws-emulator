@@ -30,10 +30,16 @@
 //! `id` and the `arn` — so a summary that reported an identity nothing resolves
 //! would fail here.
 //!
-//! The last table crosses the projection with the PAGE the summary arrived on:
+//! A fourth table crosses the projection with the PAGE the summary arrived on:
 //! a page boundary cuts a listing, so every page size the model admits — not
 //! only the one-entry page the tables above read — has to report each element in
 //! full.
+//!
+//! The suite closes on what the projection is FOR: a listing entry is
+//! self-describing, so the last table walks the whole list-then-use chain a
+//! client performs with the identity an entry reported and nothing else — the
+//! template read, tagged and read back, a case created from it where its status
+//! admits one, the template updated and finally deleted.
 
 use std::collections::BTreeSet;
 
@@ -43,10 +49,26 @@ use service_com_amazonaws_connectcases_amazonconnectcases::ops::types::{
 };
 use service_com_amazonaws_connectcases_amazonconnectcases::state::MAX_PAGE_SIZE;
 
-use crate::harness::{domain, is_minted_id, string_at, Emulator};
+// The crate's shared harness: one emulator behind the production router, and
+// the request plumbing every suite in this target drives the lifecycle with —
+// the tagging calls and the case create and read this suite consumes a listed
+// identity through among them, rather than a copy of its own.
+use crate::harness::{
+    case_template, create_case, domain, is_minted_id, listed_tags, string_at, tag_resource,
+    Emulator,
+};
+use crate::template_update::text_field;
 
 /// The emulator's account id, as every ARN this service mints carries it.
 const ACCOUNT: &str = "000000000000";
+
+/// The `TemplateStatus` of a template a case can be created from: "A template
+/// can be either Active or Inactive, as indicated by its status. Inactive
+/// templates cannot be used to create cases"
+/// (`smithy_query(query="doc", shape="CreateTemplate")`). It is also the status
+/// a create that names none stores, which is why the expectations below read it
+/// for a row that leaves `status` out.
+const TEMPLATE_ACTIVE: &str = "Active";
 
 /// The largest number of entries a `tagMap` holds: `MutableTags` is
 /// `@length(max: 10)` (`smithy_query(query="shape",
@@ -178,18 +200,28 @@ async fn get_template(emulator: &Emulator, case: &str, domain_id: &str, template
         .await
 }
 
-/// The summary of `template_id` in a listing answer.
-fn summary_of(case: &str, answer: &Value, template_id: &str) -> Value {
+/// The summary in a listing answer whose `member` carries `value`: the ONE
+/// lookup every read below is made through, whichever member identifies the
+/// entry it wants.
+fn summary_where(case: &str, answer: &Value, member: &str, value: &str) -> Value {
     answer
         .get("templates")
         .and_then(Value::as_array)
         .unwrap_or_else(|| panic!("case {case:?}: a listing must carry templates, got {answer:?}"))
         .iter()
-        .find(|summary| summary.get("templateId").and_then(Value::as_str) == Some(template_id))
+        .find(|summary| summary.get(member).and_then(Value::as_str) == Some(value))
         .unwrap_or_else(|| {
-            panic!("case {case:?}: the listing must report template {template_id}, got {answer:?}")
+            panic!(
+                "case {case:?}: the listing must report the template whose {member} is {value}, \
+                 got {answer:?}"
+            )
         })
         .clone()
+}
+
+/// The summary of `template_id` in a listing answer.
+fn summary_of(case: &str, answer: &Value, template_id: &str) -> Value {
+    summary_where(case, answer, "templateId", template_id)
 }
 
 /// The `tagPropagationConfigurations` member of a response, which must be a
@@ -878,6 +910,204 @@ async fn every_page_of_a_cut_listing_carries_the_full_projection() {
                  what an element reports: expected what {first_case:?} reported ({first:?}), got \
                  {gathered:?}"
             ),
+        }
+    }
+}
+
+/// The entry a listing reports for the template named `name`.
+///
+/// The name is the ONLY thing the walk below knows about a template before it
+/// reads its entry: every other value it drives a call with comes out of the
+/// entry itself.
+fn summary_named(case: &str, answer: &Value, name: &str) -> Value {
+    summary_where(case, answer, "name", name)
+}
+
+/// Every identity a listing entry reports, as the ids of the templates it
+/// listed.
+fn listed_identities(case: &str, answer: &Value) -> Vec<String> {
+    answer
+        .get("templates")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("case {case:?}: a listing must carry templates, got {answer:?}"))
+        .iter()
+        .map(|summary| string_at(summary, "id", case))
+        .collect()
+}
+
+/// What the projection is FOR: an entry a listing reports is SELF-DESCRIBING,
+/// so the identity it carries — the `id` and the `arn`, under the names the
+/// entry reports them by — is on its own enough to consume that resource
+/// through every operation that takes its identity, with no second lookup to
+/// resolve the entry first.
+///
+/// One walk per row drives the whole list-then-use chain a client performs with
+/// nothing but the entry it read: the template read back through the listed id,
+/// tagged through the listed ARN and its tag set read back through it, a case
+/// created from the listed id where the template's status admits one
+/// ([`TEMPLATE_ACTIVE`]), the template updated through it (and reported under
+/// the same identity afterwards) and finally deleted through it — after which it
+/// is gone from the listing while the single-resource read still reports the
+/// record that identity addressed.
+///
+/// The rows are this suite's table — tag-propagation shape and `TemplateStatus`
+/// — each walked in two regions, so the ARN every call above is driven through
+/// is the one scoped to the caller's own region rather than a fixed string.
+#[tokio::test]
+async fn a_listed_template_is_consumed_through_the_identity_its_summary_reports() {
+    // The status a create that names none stores, and the only one a case can be
+    // created from, is one of the model's own `TemplateStatus` values.
+    assert!(
+        TEMPLATE_STATUS_VALUES.contains(&TEMPLATE_ACTIVE),
+        "expected {TEMPLATE_ACTIVE:?} among the model's TemplateStatus values, got \
+         {TEMPLATE_STATUS_VALUES:?}"
+    );
+    for region in ["us-east-1", "eu-west-1"] {
+        let emulator = Emulator::in_region(region);
+        let domain_id = domain(&emulator, "consume-domain").await;
+        let field_id = text_field(&emulator, &domain_id, "consume-field").await;
+
+        for (index, row) in rows().iter().enumerate() {
+            let name = format!("consume-template-{index:03}");
+            let case = format!("{} in {region}", row.case);
+            let case = case.as_str();
+            let status = row.status.unwrap_or(TEMPLATE_ACTIVE);
+            let (minted_id, _) = create(&emulator, case, &domain_id, &name, row).await;
+
+            // The entry, located by the name the create was given — the only
+            // thing this walk knows before it reads one.
+            let answer = list(&emulator, case, &domain_id, "").await;
+            let summary = summary_named(case, &answer, &name);
+            let listed_id = string_at(&summary, "id", case);
+            let listed_arn = string_at(&summary, "arn", case);
+            assert_summary(
+                case,
+                &summary,
+                &Stored {
+                    region,
+                    domain_id: &domain_id,
+                    template_id: &listed_id,
+                    name: &name,
+                    status,
+                    tag_propagation_configurations: &row.tag_propagation_configurations,
+                },
+            );
+            assert_eq!(
+                listed_id, minted_id,
+                "case {case:?}: the entry must report the identity the create minted \
+                 ({minted_id}), got {listed_id}"
+            );
+
+            // Read it back through the listed id.
+            let record = get_template(&emulator, case, &domain_id, &listed_id).await;
+            assert_eq!(
+                string_at(&record, "name", case),
+                name,
+                "case {case:?}: the id the entry reported must reach the template it listed, got \
+                 {record:?}"
+            );
+
+            // Tag it through the listed ARN, and read that tag set back through
+            // the same ARN and through the template itself: an ARN that
+            // addressed another record — or none — would fail here.
+            let tags = json!({ "owner": format!("row-{index}") });
+            tag_resource(&emulator, case, &listed_arn, &tags).await;
+            let reported = listed_tags(&emulator, case, &listed_arn).await;
+            assert_eq!(
+                reported, tags,
+                "case {case:?}: the ARN the entry reported must address the tag set the write \
+                 stored ({tags:?}), got {reported:?}"
+            );
+            let tagged = get_template(&emulator, case, &domain_id, &listed_id).await;
+            assert_eq!(
+                tagged.get("tags"),
+                Some(&tags),
+                "case {case:?}: the ARN the entry reported must address the template its id \
+                 names, got {tagged:?}"
+            );
+
+            // Create a case from the listed id: the case is bound to that
+            // template. Only an ACTIVE template can be used for this: "A
+            // template can be either Active or Inactive, as indicated by its
+            // status. Inactive templates cannot be used to create cases"
+            // (`smithy_query(query="doc", shape="CreateTemplate")`), so a row
+            // whose stored template is Inactive consumes its identity through
+            // the other operations only.
+            if status == TEMPLATE_ACTIVE {
+                let case_id =
+                    create_case(&emulator, case, &domain_id, &listed_id, &field_id).await;
+                let of_template =
+                    case_template(&emulator, case, &domain_id, &case_id, &field_id).await;
+                assert_eq!(
+                    of_template, listed_id,
+                    "case {case:?}: a case created from the listed id must report it, got \
+                     {of_template}"
+                );
+            }
+
+            // Update through the listed id: the next listing reports the stored
+            // template under the SAME identity, re-minting neither half of it.
+            let renamed = format!("{name}-renamed");
+            emulator
+                .ok(
+                    case,
+                    "PUT",
+                    &format!("/domains/{domain_id}/templates/{listed_id}"),
+                    json!({ "name": renamed }),
+                )
+                .await;
+            let answer = list(&emulator, case, &domain_id, "").await;
+            let after = summary_named(case, &answer, &renamed);
+            assert_summary(
+                case,
+                &after,
+                &Stored {
+                    region,
+                    domain_id: &domain_id,
+                    template_id: &listed_id,
+                    name: &renamed,
+                    status,
+                    tag_propagation_configurations: &row.tag_propagation_configurations,
+                },
+            );
+            assert_eq!(
+                string_at(&after, "arn", case),
+                listed_arn,
+                "case {case:?}: an update must leave the identity the entry reported alone, got \
+                 {after:?}"
+            );
+
+            // Delete through the listed id: the template drops out of the
+            // listing, while the single-resource read still reports the record
+            // that identity addressed.
+            emulator
+                .ok(
+                    case,
+                    "DELETE",
+                    &format!("/domains/{domain_id}/templates/{listed_id}"),
+                    json!({}),
+                )
+                .await;
+            let answer = list(&emulator, case, &domain_id, "").await;
+            let remaining = listed_identities(case, &answer);
+            assert!(
+                !remaining.contains(&listed_id),
+                "case {case:?}: a template deleted through the listed id must drop out of the \
+                 listing, got {remaining:?}"
+            );
+            let deleted = get_template(&emulator, case, &domain_id, &listed_id).await;
+            assert_eq!(
+                deleted.get("deleted"),
+                Some(&json!(true)),
+                "case {case:?}: the deleted template must still be the record the listed id \
+                 addresses, got {deleted:?}"
+            );
+            assert_eq!(
+                string_at(&deleted, "templateId", case),
+                listed_id,
+                "case {case:?}: a delete must not re-mint the identity the entry reported, got \
+                 {deleted:?}"
+            );
         }
     }
 }
