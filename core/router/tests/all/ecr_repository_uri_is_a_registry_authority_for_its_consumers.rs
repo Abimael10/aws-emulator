@@ -33,8 +33,8 @@
 //!
 //! The rows differ along what the rule generalises over: the Region (and so the partition)
 //! the stack deploys in, the address this emulator is SERVED at — an IPv4 socket, an IPv6
-//! socket, a host an operator serves it at, and one carrying no port — which is the authority
-//! the published address is anchored on, whether the template NAMES the repository or
+//! socket, a host an operator serves it at, and one carrying no port — which is the zone and
+//! the port the published address is spelled in, whether the template NAMES the repository or
 //! leaves the name to CloudFormation, whether that name carries a namespace path, and how the
 //! declaration derives the container image from the attribute (`Fn::Sub` over it, `Fn::Join`
 //! over it, and the bare `Fn::GetAtt`, which carries no tag at all).

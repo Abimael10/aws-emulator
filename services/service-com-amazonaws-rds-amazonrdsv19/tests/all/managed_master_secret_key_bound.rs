@@ -18,6 +18,12 @@
 //! is not about the value's LENGTH), and one a single character longer (refused for its
 //! length, with nothing created).
 //!
+//! The row AT the ceiling reads the length refusal by its own SENTENCE rather than by the
+//! bare ceiling number: the answer such a create does get is about the key it names, and it
+//! carries values this suite does not choose — the id of the request that was made among them
+//! — so a digit run inside one of those is no length refusal, and matching on the number alone
+//! makes the row's outcome depend on a minted id.
+//!
 //! The emulator and the Secrets Manager client are the ones `managed_master_user_password`
 //! mounts, because this drives the same path.
 
@@ -44,6 +50,9 @@ async fn held_secret_names(secrets: &aws_sdk_secretsmanager::Client) -> Vec<Stri
     names
 }
 
+/// The member these rows name, which a length refusal of it names too.
+const MEMBER: &str = "MasterUserSecretKmsKeyId";
+
 /// What a row expects of its create.
 enum Expected {
     /// Served: the cluster reports a managed secret, and one secret was minted.
@@ -61,6 +70,9 @@ async fn the_managed_secrets_kms_key_identifier_is_bounded_where_it_enters_the_s
     let longest = "k".repeat(st::MAX_FREE_FORM_LEN);
     let too_long = "k".repeat(st::MAX_FREE_FORM_LEN + 1);
     let ceiling = st::MAX_FREE_FORM_LEN.to_string();
+    // The sentence this service's own free-form guard refuses an over-long value with
+    // (`st::check_free_form`), which is the answer the row at the ceiling must not get.
+    let length_refusal = format!("{MEMBER} may be at most {ceiling} characters");
     // (case, the MasterUserSecretKmsKeyId the request names, what the create must answer)
     let rows: [(&str, Option<&str>, Expected); 3] = [
         (
@@ -89,7 +101,7 @@ async fn the_managed_secrets_kms_key_identifier_is_bounded_where_it_enters_the_s
             ("ManageMasterUserPassword", "true".to_string()),
         ];
         if let Some(key) = key {
-            params.push(("MasterUserSecretKmsKeyId", (*key).to_string()));
+            params.push((MEMBER, (*key).to_string()));
         }
         let (status, body) = call(&router, "CreateDBCluster", &params).await;
         let held_after = held_secret_names(&secrets).await;
@@ -122,9 +134,9 @@ async fn the_managed_secrets_kms_key_identifier_is_bounded_where_it_enters_the_s
                          length, got {body}"
                     );
                     assert!(
-                        !message.contains(&ceiling),
+                        !message.contains(&length_refusal),
                         "case {case:?}: a value at the ceiling must not be refused against the \
-                         ceiling, got {message:?}"
+                         ceiling ({length_refusal:?}), got {message:?}"
                     );
                 }
             }
@@ -132,7 +144,7 @@ async fn the_managed_secrets_kms_key_identifier_is_bounded_where_it_enters_the_s
                 let body = expect_error(case, (status, body), 400, "InvalidParameterValue");
                 let message = text(&body, "Message");
                 assert!(
-                    message.contains("MasterUserSecretKmsKeyId") && message.contains(&ceiling),
+                    message.contains(MEMBER) && message.contains(&ceiling),
                     "case {case:?}: the refusal must name the member and the bound it broke, \
                      got {message:?}"
                 );
