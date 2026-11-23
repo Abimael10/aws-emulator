@@ -22,11 +22,19 @@
 //! creating client reached this emulator at, and whether this process is served on a port
 //! at all — none of which may change that the published address is one this emulator
 //! answers on.
+//!
+//! A published address is a `host:port`, and nothing can be read off one, so the last suite
+//! below pins the other half of "an address a client can use": that the service answering
+//! there is RESOLVABLE — recorded under this service's own signing name in the engine-wide
+//! register of published data planes, for exactly as long as the port is open — which is
+//! what lets a consumer inside this emulator that was handed a `collectionEndpoint` sign and
+//! route a request to it.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use service_common::published_data_planes::PublishedPlanes;
 use service_com_amazonaws_opensearchserverless_opensearchserverless::service::collection_rest::serve_published;
 use service_com_amazonaws_opensearchserverless_opensearchserverless::state::service_state;
 use service_com_amazonaws_opensearchserverless_opensearchserverless::EmulatedService;
@@ -593,6 +601,176 @@ async fn each_collection_publishes_an_address_of_its_own() {
     }
 }
 
+/// RULE: every address a collection publishes is recorded, in the engine-wide register of
+/// published data planes, as an address THIS service answers at — so a consumer inside this
+/// emulator that was handed one, off whose `host:port` nothing can be read, resolves the
+/// service to route and sign a request to — and that record lasts exactly as long as the
+/// port does: it is withdrawn when the collection is purged.
+///
+/// The rows span what the rule generalises over: the collection type behind the address,
+/// several collections published at once, each of the four endpoint members a collection
+/// reports, and the addresses that resolve to nothing (a port nothing was published at, a
+/// host nothing was published at, and the address of a collection that is gone).
+#[tokio::test]
+async fn a_published_collection_address_resolves_to_this_service_until_its_port_closes() {
+    let (router, engine) = emulator_served_at(Some("https://127.0.0.1:39355"));
+    let host = format!("{SIGNING_NAME}.{REGION}.amazonaws.com");
+    let register = PublishedPlanes::of(&*engine).expect("the engine vends the register");
+
+    // One collection of each type the model names, so the rule is read on every kind of
+    // collection and one delete can be shown not to disturb the others.
+    let kinds: [(&str, &str); 3] = [
+        ("a vector collection", "VECTORSEARCH"),
+        ("a search collection", "SEARCH"),
+        ("a time-series collection", "TIMESERIES"),
+    ];
+    let mut collections: Vec<(&str, String, Value)> = Vec::new();
+    for (nth, (case, kind)) in kinds.iter().enumerate() {
+        let detail = active_collection_at(&router, &host, &format!("resolvable-{nth}"), kind).await;
+        collections.push((case, text(&detail, "id"), detail));
+    }
+
+    // Every endpoint member of every collection resolves to this service: the four members
+    // name the one address that collection is served at, and that address answers here.
+    for (case, id, detail) in &collections {
+        for (member, url) in published(detail) {
+            let authority = authority_of(&url);
+            let answering = register.answering_service(&authority);
+            assert_eq!(
+                answering.as_deref(),
+                Some(SIGNING_NAME),
+                "case {case:?} ({id}): expected {member} at {authority:?} to resolve to \
+                 {SIGNING_NAME:?}, got {answering:?}"
+            );
+        }
+    }
+
+    // Nothing resolves at an address this emulator published nothing at: the register keys
+    // one record per listener, port and all.
+    let opened: Vec<String> = collections
+        .iter()
+        .map(|(_case, _id, detail)| authority_of(&text(detail, "collectionEndpoint")))
+        .collect();
+    let first_authority = opened
+        .first()
+        .cloned()
+        .expect("the suite created collections");
+    let unpublished: [(&str, String); 2] = [
+        (
+            "a host nothing was published at",
+            "10.255.255.1:443".to_string(),
+        ),
+        (
+            "another port of the same host",
+            a_port_none_of_these_answer_on(&first_authority, &opened),
+        ),
+    ];
+    for (case, authority) in &unpublished {
+        let answering = register.answering_service(authority);
+        assert_eq!(
+            answering, None,
+            "case {case:?}: expected {authority:?} to resolve to nothing, got {answering:?}"
+        );
+    }
+
+    // The purge closes the port, so the record goes with it — and every address this service
+    // still answers on keeps resolving.
+    let (case, id, detail) = collections
+        .first()
+        .cloned()
+        .expect("the suite created collections");
+    let authority = authority_of(&text(&detail, "collectionEndpoint"));
+    let (status, deleted) = call_at(&router, &host, "DeleteCollection", json!({ "id": &id })).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: DeleteCollection({id}) expected 200, got {status} with {deleted}"
+    );
+    await_purged(&router, &host, &id).await;
+    let answering = register.answering_service(&authority);
+    assert_eq!(
+        answering, None,
+        "case {case:?}: expected the purged collection's address {authority:?} to resolve to \
+         nothing, got {answering:?}"
+    );
+    for (other_case, other_id, other_detail) in collections.iter().skip(1) {
+        let other_authority = authority_of(&text(other_detail, "collectionEndpoint"));
+        let answering = register.answering_service(&other_authority);
+        assert_eq!(
+            answering.as_deref(),
+            Some(SIGNING_NAME),
+            "case {other_case:?} ({other_id}): expected the surviving address \
+             {other_authority:?} to still resolve to {SIGNING_NAME:?}, got {answering:?}"
+        );
+    }
+}
+
+/// Poll `BatchGetCollection` until `id` answers nothing, which is when the deleted
+/// collection has been purged.
+///
+/// The purge is owed by the clock, so this looks again until the condition holds or a
+/// generous deadline passes; nothing asserts on how long it took.
+async fn await_purged(router: &MultiServiceRouter, host: &str, id: &str) {
+    /// Several times over the few seconds the `DELETING -> gone` move is owed in, so a busy
+    /// host still reaches the condition.
+    const DEADLINE: Duration = Duration::from_secs(15);
+
+    let started = tokio::time::Instant::now();
+    loop {
+        let detail = read_collection(router, host, id).await;
+        if detail.is_null() {
+            return;
+        }
+        assert!(
+            started.elapsed() < DEADLINE,
+            "case {id}: the collection was never purged, last read {detail}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The same host as `authority` at a port none of `opened` answers on — the addresses this
+/// suite itself opened being every one this engine has published, because the only planes
+/// published on this engine are the collections created above.
+///
+/// The port is walked upward rather than taken as `+1`: the operating system hands out
+/// ephemeral ports in runs, so the next port along can be a sibling listener's, and a probe
+/// that happened to name one would fail for something other than the rule under test. A port
+/// past the last one a port number can hold is skipped, so every probe stays an address a
+/// client could dial.
+fn a_port_none_of_these_answer_on(authority: &str, opened: &[String]) -> String {
+    let (host, port) = authority
+        .rsplit_once(':')
+        .unwrap_or_else(|| panic!("a published address carries a port, got {authority:?}"));
+    let port: u16 = port
+        .parse()
+        .unwrap_or_else(|_| panic!("a published address carries a numeric port, got {port:?}"));
+    // Bounded by one more than the addresses there are: each can rule out at most one port.
+    for step in 1..=(opened.len() as u16 + 1) {
+        let Some(probe_port) = port.checked_add(step) else {
+            break;
+        };
+        let probe = format!("{host}:{probe_port}");
+        if !opened.iter().any(|taken| taken.eq_ignore_ascii_case(&probe)) {
+            return probe;
+        }
+    }
+    // Every port above the published one is taken or out of range: walk DOWNWARD instead,
+    // which is the same question asked of the other side of that port.
+    for step in 1..=(opened.len() as u16 + 1) {
+        let Some(probe_port) = port.checked_sub(step) else {
+            break;
+        };
+        let probe = format!("{host}:{probe_port}");
+        if !opened.iter().any(|taken| taken.eq_ignore_ascii_case(&probe)) {
+            return probe;
+        }
+    }
+    panic!(
+        "a port none of {opened:?} answers on exists within {} steps of {authority:?}",
+        opened.len() + 1
+    )
+}
+
 /// RULE: an address is published only while the collection behind it exists — once a
 /// deleted collection is purged, the address this service announced for it serves nothing.
 #[tokio::test]
@@ -622,28 +800,15 @@ async fn a_purged_collections_address_stops_serving() {
         "case DeleteCollection({id}): expected 200, got {status} with {deleted}"
     );
 
-    // The purge is owed by the clock: look again until the collection is gone, then the
-    // address it was published on serves nothing.
-    for _ in 0..200 {
-        if read_collection(&router, &host, &id).await.is_null() {
-            let (status, answer) = through_endpoint(
-                &engine,
-                &id,
-                &endpoint,
-                "GET",
-                &format!("/{index}"),
-                None,
-            );
-            assert_eq!(
-                status, 503,
-                "case GET {endpoint}/{index} after the purge: expected 503, got {status} with \
-                 {answer}"
-            );
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("case DeleteCollection({id}): the collection was never purged");
+    // The purge is owed by the clock: wait for the collection to be gone (the suite's one
+    // purge-wait), after which the address it was published on serves nothing.
+    await_purged(&router, &host, &id).await;
+    let (status, answer) =
+        through_endpoint(&engine, &id, &endpoint, "GET", &format!("/{index}"), None);
+    assert_eq!(
+        status, 503,
+        "case GET {endpoint}/{index} after the purge: expected 503, got {status} with {answer}"
+    );
 }
 
 /// RULE: a collection keeps the address it was published at, so a client that was handed an
