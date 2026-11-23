@@ -243,6 +243,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Omitted means cross-account sharing is off for the new system.
             sharing_enabled: requested.sharing_enabled.unwrap_or(false),
             kms_key_id: requested.kms_key_id.clone(),
+            // Nothing in this slice joins an account to an organizational unit, so a
+            // created system carries none.
+            ou_id: None,
             tags: requested.tags.clone(),
             created_at: now,
             updated_at: now,

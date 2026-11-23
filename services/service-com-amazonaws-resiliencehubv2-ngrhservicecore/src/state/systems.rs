@@ -15,13 +15,14 @@
 //! (see [`SystemCreateRequest`]).
 //!
 //! Every `System` body this crate returns is projected from a record here through
-//! [`SystemRecord::to_system`], so `CreateSystem` and `GetSystem` cannot drift from one
-//! another or from what was stored.
+//! [`SystemRecord::to_system`], and every `SystemSummary` through
+//! [`SystemRecord::to_summary`], which reads that same projection — so `CreateSystem`,
+//! `GetSystem` and `ListSystems` cannot drift from one another or from what was stored.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 
-use crate::ops::types::{AssociatedSystem, System};
+use crate::ops::types::{AssociatedSystem, System, SystemSummary};
 
 use super::{
     not_found_message, tag_map_view, to_date_time, user_journey_not_found_for_system_message,
@@ -64,6 +65,11 @@ pub struct SystemRecord {
     /// this store takes of its own `sharingEnabled`.
     pub sharing_enabled: bool,
     pub kms_key_id: Option<String>,
+    /// The organizational unit this system's account sits in. Nothing in this slice sets
+    /// it; `ListSystems`' `ouId` filter compares against it and both system projections
+    /// report it — the same reading the `Service` side of this store takes of its own
+    /// `ouId` ([`super::ServiceRecord::ou_id`]).
+    pub ou_id: Option<String>,
     /// Stored ordered so a tag map reads back the same way every time.
     pub tags: BTreeMap<String, String>,
     pub created_at: SystemTime,
@@ -83,9 +89,10 @@ pub struct SystemRecord {
 impl SystemRecord {
     /// This record as the `System` shape `CreateSystem` / `GetSystem` return.
     ///
-    /// `organizationId` and `ouId` are left absent: nothing in this crate joins an
-    /// account to an organization or an organizational unit, so there is none to name —
-    /// and both members are "displayed only if caller has access".
+    /// `organizationId` is left absent: nothing in this crate joins an account to an
+    /// organization, so there is none to name — and the member is "displayed only if
+    /// caller has access". `ouId` is the record's stored value, which is likewise absent
+    /// until something sets it.
     pub fn to_system(&self) -> System {
         System {
             system_arn: self.system_arn.clone(),
@@ -96,9 +103,34 @@ impl SystemRecord {
             tags: tag_map_view(&self.tags),
             kms_key_id: self.kms_key_id.clone(),
             organization_id: None,
-            ou_id: None,
+            ou_id: self.ou_id.clone(),
             created_at: Some(to_date_time(self.created_at)),
             updated_at: Some(to_date_time(self.updated_at)),
+        }
+    }
+
+    /// This record as the `SystemSummary` shape `ListSystems` enumerates — the same stored
+    /// values the full `System` projection reads, narrowed to the summary's own members.
+    ///
+    /// `userJourneysCount` is "the number of user journeys in the system": the LENGTH of
+    /// the journeys stored on this record, so the count and the journeys it counts can
+    /// never disagree. `servicesCount` is "the number of services in the system", which is
+    /// counted from the services that reference this system rather than stored here, so it
+    /// is passed in by the store that holds both resources (see
+    /// [`ComAmazonawsResiliencehubv2NgrhservicecoreState::system_service_count`]) the way
+    /// `associatedServiceCount` is passed into the policy projection.
+    pub fn to_summary(&self, services_count: i32) -> SystemSummary {
+        let system = self.to_system();
+        SystemSummary {
+            system_id: system.system_id,
+            name: system.name,
+            system_arn: Some(system.system_arn),
+            user_journeys_count: Some(self.user_journeys.len() as i32),
+            services_count: Some(services_count),
+            organization_id: system.organization_id,
+            ou_id: system.ou_id,
+            created_at: system.created_at,
+            updated_at: system.updated_at,
         }
     }
 }
@@ -207,18 +239,31 @@ impl ComAmazonawsResiliencehubv2NgrhservicecoreState {
         None
     }
 
+    /// How many stored services are associated with `system_arn` — the services IN that
+    /// system, which is what `SystemSummary$servicesCount` reports.
+    ///
+    /// Counted at read time from the services that reference the system, so the count is
+    /// the one in force when the call ran rather than a number frozen when the system was
+    /// created.
+    pub fn system_service_count(&self, system_arn: &str) -> i32 {
+        self.services
+            .values()
+            .filter(|service| {
+                service
+                    .associated_systems
+                    .iter()
+                    .any(|entry| entry.system_arn == system_arn)
+            })
+            .count() as i32
+    }
+
     /// Whether any stored service still lists `system_arn` among its `associatedSystems`.
     ///
     /// What stands between a system and its deletion: a system a service is associated with
     /// is in use, so removing it would leave that service naming a system that is not
     /// there.
     pub fn system_is_associated(&self, system_arn: &str) -> bool {
-        self.services.values().any(|service| {
-            service
-                .associated_systems
-                .iter()
-                .any(|entry| entry.system_arn == system_arn)
-        })
+        self.system_service_count(system_arn) > 0
     }
 
     /// Remove the system stored under `system_arn`, with the two secondary indexes that
