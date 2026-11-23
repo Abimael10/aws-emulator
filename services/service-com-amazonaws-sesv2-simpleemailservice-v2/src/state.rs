@@ -76,6 +76,9 @@ mod suppression;
 /// A tenant's reputation-entity status records and its suppression preferences: what
 /// each is held as while nothing has written it, and what a read reports it as.
 mod tenant_reputation;
+/// The hold a tenant's resource associations put on the resource they name: the one gate
+/// every delete of an associable resource reads, and the sentence it refuses with.
+mod tenant_associations;
 /// The account's Virtual Deliverability Manager configuration as a gate: whether the
 /// feature is on, and how a call that can only be answered from its data is refused
 /// while it is off.
@@ -106,6 +109,7 @@ pub use minted_ids::*;
 pub use pricing::*;
 pub use suppression::*;
 pub use templates::*;
+pub use tenant_associations::*;
 pub use tenant_reputation::*;
 pub use vdm::*;
 

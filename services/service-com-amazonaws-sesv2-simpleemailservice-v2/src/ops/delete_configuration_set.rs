@@ -136,9 +136,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Request metadata is not needed: a configuration set is keyed by name within
-        // the one emulated account.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // No store at all, which is not a modelled SES state: answer the scaffold's
             // 501 rather than a modelled error that reads as one.
@@ -162,7 +159,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // its options, its tags and its event destinations — lives on the record, so
         // removing the record removes them with it.
         let mut store = state.lock();
-        if store.configuration_sets.remove(&name).is_none() {
+        if !store.configuration_sets.contains_key(&name) {
             return Err(DeleteConfigurationSetErrorModeled::NotFoundException(
                 NotFoundException {
                     message: Some(crate::state::configuration_set_not_found(&name)),
@@ -170,6 +167,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+
+        // A configuration set a tenant still holds an association to is a set that tenant
+        // goes on sending through, so it cannot be taken out from under it: the delete is
+        // refused while any association names it and the set is left exactly as it was,
+        // in the one sentence every delete of an associable resource words that condition
+        // with ([`crate::state::tenant_associations_blocking_delete`]). The refusal names
+        // the set by the ARN the association surface addresses it by, minted in the Region
+        // this call executes in.
+        let arn = crate::state::configuration_set_arn(
+            &crate::state::request_region(ctx.parts()),
+            &name,
+        );
+        if let Some(refusal) = crate::state::tenant_associations_blocking_delete(&store, &arn) {
+            return Err(DeleteConfigurationSetErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(refusal),
+                },
+            )
+            .into());
+        }
+        store.configuration_sets.remove(&name);
 
         // The delete reaches no further than that record. An email identity's default
         // configuration set is a name the client wrote onto the identity, reported back

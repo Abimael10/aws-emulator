@@ -467,6 +467,38 @@ fn reported_destinations(reported: &Value, case: &str) -> Vec<Value> {
         .clone()
 }
 
+/// Make `domain` a VERIFIED domain identity of the account, which is what a configuration
+/// set's `TrackingOptions$CustomRedirectDomain` names: SESv2 refuses a create whose tracking
+/// domain the account has not proved it owns, so the row's set-up records the identity first.
+///
+/// The identity is created through the same SESv2 surface the rest of the row drives, and then
+/// the verification transition the clock owes the record is brought into the past on the store
+/// the service reads — so the set-up neither waits a span out nor depends on how fast the host
+/// runs.
+fn verify_domain(
+    router: &MultiServiceRouter,
+    runtime: &tokio::runtime::Runtime,
+    setup: &Setup,
+    engine: &Arc<InMemoryEngine>,
+    domain: &str,
+) {
+    sesv2(
+        router,
+        runtime,
+        setup,
+        "POST",
+        "/v2/email/identities",
+        Some(&json!({ "EmailIdentity": domain })),
+    );
+    let state = engine.state::<service_com_amazonaws_sesv2_simpleemailservice_v2::state::ComAmazonawsSesv2SimpleemailserviceV2State>();
+    let past = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(1))
+        .expect("an instant before now");
+    for record in state.lock().identities.values_mut() {
+        record.verification_due_at = past;
+    }
+}
+
 #[test]
 fn the_sesv2_sns_event_destination_setup_is_served_through_the_whole_emulator() {
     std::thread::Builder::new()
@@ -474,7 +506,7 @@ fn the_sesv2_sns_event_destination_setup_is_served_through_the_whole_emulator() 
         .stack_size(BOOT_STACK_SIZE)
         .spawn(|| {
             let engine: Arc<InMemoryEngine> = Arc::new(InMemoryEngine::new());
-            let mut router = build_router(engine);
+            let mut router = build_router(Arc::clone(&engine));
             // Signature verification is the front door's concern, not this suite's: what the
             // credential scope is here for is the routing signal it carries.
             router.set_request_authentication(false);
@@ -551,6 +583,14 @@ fn the_sesv2_sns_event_destination_setup_is_served_through_the_whole_emulator() 
 
                 // ---- The configuration set the event destination hangs off: the leg the
                 // signing-name collision answered `AmbiguousService`, before any handler ran.
+                // Its custom tracking domain names a domain the account has verified.
+                verify_domain(
+                    &router,
+                    &runtime,
+                    setup,
+                    &engine,
+                    setup.custom_redirect_domain,
+                );
                 let answered = sesv2(
                     &router,
                     &runtime,

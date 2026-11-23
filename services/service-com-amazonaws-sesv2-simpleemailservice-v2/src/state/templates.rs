@@ -105,6 +105,21 @@ pub fn publish_template<Eng: Send + Sync + 'static>(engine: &Eng, name: &str) {
     }
 }
 
+/// `arn:aws:ses:<region>:<account>:template/<name>` — the ARN of an email template, which
+/// is how a refusal that must name the resource rather than the request's spelling of it
+/// names one.
+///
+/// `template/<name>` is the resource form SES addresses an email template by
+/// ([`super::TENANT_RESOURCE_TYPES`]), so the ARN minted here and the one the tenant
+/// surface reads are the same value.
+pub fn email_template_arn(region: &str, template_name: &str) -> String {
+    ::emulator_server::emulator_arn(
+        super::ARN_NAMESPACE,
+        region,
+        &format!("template/{template_name}"),
+    )
+}
+
 /// Remove the template `name` names from this account — from this service's own table and
 /// from the account registry both — so neither SES surface reports it afterwards.
 ///

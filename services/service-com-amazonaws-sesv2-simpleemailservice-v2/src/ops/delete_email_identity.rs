@@ -183,6 +183,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
+        // An identity a tenant still holds an association to is one that tenant goes on
+        // sending from, so it cannot be taken out from under it either: the delete is
+        // refused while any association names it and the identity is left exactly as it
+        // was, in the one sentence every delete of an associable resource words that
+        // condition with ([`crate::state::tenant_associations_blocking_delete`]). The
+        // refusal names the identity by its ARN, like the certificate gate above.
+        let arn =
+            crate::state::identity_arn(&crate::state::request_region(ctx.parts()), &record.name);
+        if let Some(refusal) = crate::state::tenant_associations_blocking_delete(&store, &arn) {
+            return Err(DeleteEmailIdentityErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(refusal),
+                },
+            )
+            .into());
+        }
         store.identities.remove(&key);
         // Removed from the account's identity registry as well, so the classic SES
         // surface stops listing and reporting the identity too. The registry lock is

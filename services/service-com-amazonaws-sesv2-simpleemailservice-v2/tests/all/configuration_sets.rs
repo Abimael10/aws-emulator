@@ -239,6 +239,41 @@ impl Ses {
         self.call("GET", &format!("/v2/email/configuration-sets/{name}"), None)
             .await
     }
+
+    /// Make `identity` a VERIFIED identity of the account.
+    ///
+    /// Shared with the sibling suites of this test target, so every case that needs the
+    /// account to have proved it owns a name sets it up the same way — a configuration
+    /// set's custom open- and click-tracking domain is one such name. The identity is
+    /// created over the wire, and then the verification transition the clock owes it is
+    /// moved into the past on the record every operation reads — the same seam
+    /// `grant_production_access` writes through — so the next call reports it verified and
+    /// nothing waits a span out.
+    pub(crate) async fn verify_identity(&self, identity: &str) {
+        let created = self
+            .call(
+                "POST",
+                "/v2/email/identities",
+                Some(json!({"EmailIdentity": identity})),
+            )
+            .await;
+        assert_eq!(
+            created.status,
+            200,
+            "expected HTTP 200 creating the identity {identity:?}, got {} {:?}",
+            created.status,
+            created.message()
+        );
+        let state = self
+            .engine
+            .state::<ComAmazonawsSesv2SimpleemailserviceV2State>();
+        let past = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("an instant before now");
+        for record in state.lock().identities.values_mut() {
+            record.verification_due_at = past;
+        }
+    }
 }
 
 /// One row of the create-and-read table: the request body, and the configuration a read
@@ -267,6 +302,18 @@ struct ConfigurationSetCase {
     /// list for a set created with none.
     tags: Value,
 }
+
+/// Every custom tracking domain the tables in this suite configure.
+///
+/// `TrackingOptions$CustomRedirectDomain` names a domain the ACCOUNT has verified, so a
+/// case that configures one verifies the domain identity first
+/// ([`Ses::verify_identity`]); the refusal for an unverified one is pinned by the
+/// [`crate::configuration_set_tracking_domain_verification`] suite.
+const TRACKING_DOMAINS: [&str; 3] = [
+    "click.example.com",
+    "links.example.org",
+    "track.example.net",
+];
 
 /// The rows of the create-and-read table.
 ///
@@ -511,6 +558,11 @@ fn configuration_set_cases() -> Vec<ConfigurationSetCase> {
 #[tokio::test]
 async fn create_persists_the_configuration_and_get_reads_it_back() {
     let ses = Ses::new();
+    // A custom tracking domain names a domain the account has verified, so the rows that
+    // configure one are set up with that identity first.
+    for domain in TRACKING_DOMAINS {
+        ses.verify_identity(domain).await;
+    }
     let cases = configuration_set_cases();
 
     for case in &cases {
@@ -888,6 +940,11 @@ fn enum_cases() -> Vec<EnumCase> {
 #[tokio::test]
 async fn an_enum_member_outside_its_modelled_value_set_is_refused() {
     let ses = Ses::new();
+    // The rows that carry `TrackingOptions` name a tracking domain, which the account has
+    // to have verified for the row to be about its enum member alone.
+    for domain in TRACKING_DOMAINS {
+        ses.verify_identity(domain).await;
+    }
 
     for case in enum_cases() {
         let created = ses.create_set(case.body.clone()).await;

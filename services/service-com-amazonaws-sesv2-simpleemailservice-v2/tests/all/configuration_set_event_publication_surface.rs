@@ -219,6 +219,9 @@ fn assert_modelled(case: &str, reply: &Reply, expected: &Expected) {
 #[tokio::test]
 async fn the_whole_surface_answers_its_modelled_contract() {
     let ses = Ses::new();
+    // The rows that configure a custom tracking domain name a domain the account has
+    // verified.
+    ses.verify_identity("click.example.com").await;
 
     // The set names span the form the documented rule generalises over: one
     // character, the longest allowed, digits, hyphens and underscores.

@@ -360,6 +360,9 @@ fn preferences_cases() -> Vec<PreferencesCase> {
 #[tokio::test]
 async fn writing_the_preferences_persists_them_and_get_reads_them_back() {
     let ses = Ses::new();
+    // One row configures a custom tracking domain, which names a domain the account has
+    // verified.
+    ses.verify_identity("click.example.com").await;
 
     for case in preferences_cases() {
         let created = ses.create_set(case.create.clone()).await;

@@ -284,6 +284,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
         }
+        // `TrackingOptions$CustomRedirectDomain` is the domain the set would serve its own
+        // open and click redirects from, so it names a domain the ACCOUNT has proved it
+        // owns: it is resolved against the account's verified domain identities
+        // ([`crate::state::tracking_domain_is_verified`]) and refused as input when none
+        // covers it, worded the way every write of that member words it, with nothing
+        // stored under this set's name. Read like the sending pool above — after the name
+        // this create would take is resolved, and before the slice's own ceiling — and
+        // after the store is settled, since a verification is a state the clock moves and
+        // a read of the identity table reports the statuses it owes.
+        if let Some(domain) = record
+            .tracking_options
+            .as_ref()
+            .map(|options| options.custom_redirect_domain.clone())
+        {
+            store.settle(::std::time::SystemTime::now());
+            if !crate::state::tracking_domain_is_verified(&store, &domain) {
+                return Err(bad_request(crate::state::tracking_domain_not_verified(
+                    &domain,
+                )));
+            }
+        }
         if store.configuration_sets.len() >= crate::state::MAX_CONFIGURATION_SETS {
             return Err(CreateConfigurationSetErrorModeled::LimitExceededException(
                 LimitExceededException {

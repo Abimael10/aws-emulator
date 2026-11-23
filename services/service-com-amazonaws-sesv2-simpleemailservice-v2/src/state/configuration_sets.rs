@@ -16,7 +16,11 @@
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 
-use super::{modelled_enum_value, own_state, MAX_CONFIGURATION_SET_NAME_LEN};
+use super::{
+    domain_covers, domain_key, modelled_enum_value, own_state,
+    ComAmazonawsSesv2SimpleemailserviceV2State, IdentityKind, SesStatus,
+    MAX_CONFIGURATION_SET_NAME_LEN,
+};
 
 /// The `NextToken` the configuration-set listing hands back to resume at `cursor` — the set
 /// the NEXT page starts at — and the reading of one it is handed.
@@ -705,4 +709,40 @@ pub fn checked_event_destination_definition(
         cloud_watch_destination,
         ..definition
     })
+}
+
+/// Whether the account has VERIFIED a domain identity covering `domain`, which is what a
+/// configuration set's custom open- and click-tracking domain has to be.
+///
+/// `TrackingOptions$CustomRedirectDomain` is "the domain to use for tracking open and
+/// click events": SES rewrites a tracked link to a URL under that domain and serves the
+/// redirect from it, so the account has to have proved it owns the name before a set may
+/// be configured with it — an unverified one would serve nothing. Ownership of a domain is
+/// proved by verifying a domain identity for it, and a verified domain identity speaks for
+/// that domain and every domain under it (the same reading of one that authorises a send,
+/// [`ComAmazonawsSesv2SimpleemailserviceV2State::sending_identity`]), so the most specific
+/// verified domain identity covering the tracking name is what admits it. Verification is
+/// a state the clock moves, so settle the store before reading this
+/// ([`ComAmazonawsSesv2SimpleemailserviceV2State::settle`]).
+pub fn tracking_domain_is_verified(
+    store: &ComAmazonawsSesv2SimpleemailserviceV2State,
+    domain: &str,
+) -> bool {
+    let tracked = domain_key(domain);
+    store.identities.values().any(|identity| {
+        identity.identity_kind == IdentityKind::Domain
+            && identity.verification_status == SesStatus::Success
+            && domain_covers(&domain_key(&identity.name), &tracked)
+    })
+}
+
+/// How this service words `BadRequestException` for a custom tracking domain the account
+/// has not verified ([`tracking_domain_is_verified`]).
+///
+/// Stated once for every operation that writes a configuration set's tracking options, so
+/// the refusal reads the same whichever of them the request reached. The fixed text is
+/// `Domain <` + `> is not verified under this account.`; the one variable part is the
+/// domain, as the request spelled it.
+pub fn tracking_domain_not_verified(domain: &str) -> String {
+    format!("Domain <{domain}> is not verified under this account.")
 }

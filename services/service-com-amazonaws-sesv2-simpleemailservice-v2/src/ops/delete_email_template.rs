@@ -130,18 +130,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Request metadata is not needed: a template is keyed by its name within the
-        // one emulated account.
-        let _ = ctx;
-        if crate::state::service_state(&*self.engine).is_none() {
+        let Some(state) = crate::state::service_state(&*self.engine) else {
             // No store at all, which is not a modelled SES state: answer the scaffold's
             // 501 rather than a modelled error that reads as one.
             return Err(crate::scaffolded::Scaffolded::not_implemented(
                 "DeleteEmailTemplate without the shared emulator state",
             ));
-        }
+        };
 
         let name = input.template_name;
+        // A template a tenant still holds an association to is one that tenant goes on
+        // sending with, so it cannot be taken out from under it: the delete is refused
+        // while any association names it and the template is left exactly as it was, in the
+        // one sentence every delete of an associable resource words that condition with
+        // ([`crate::state::tenant_associations_blocking_delete`]). The refusal names the
+        // template by the ARN the association surface addresses it by, minted in the Region
+        // this call executes in. A name the account holds no template for is reported
+        // missing first, below, since a resource that is not there holds nothing.
+        let arn = crate::state::email_template_arn(
+            &crate::state::request_region(ctx.parts()),
+            &name,
+        );
+        let refusal = {
+            let store = state.lock();
+            if !store.email_templates.contains_key(&name) {
+                None
+            } else {
+                crate::state::tenant_associations_blocking_delete(&store, &arn)
+            }
+        };
+        if let Some(refusal) = refusal {
+            return Err(DeleteEmailTemplateErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(refusal),
+                },
+            )
+            .into());
+        }
+
         // "Deletes an email template": the whole record — its content, its tags and the
         // instant it was created — leaves the store, so every later read, listing, render
         // and send of that name reports the template as absent and a create under the name

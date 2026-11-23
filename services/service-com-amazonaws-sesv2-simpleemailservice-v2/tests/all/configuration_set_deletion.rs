@@ -120,6 +120,9 @@ fn deletion_cases() -> Vec<DeletionCase> {
 /// identities that name the row's set, one identity on the bystander set and one on no
 /// set at all.
 async fn set_up(ses: &Ses, row: &DeletionCase) {
+    // One row configures a custom tracking domain, which names a domain the account has
+    // verified.
+    ses.verify_identity("click.example.com").await;
     let created = ses.create_set(row.create_body.clone()).await;
     assert_eq!(
         created.status,
