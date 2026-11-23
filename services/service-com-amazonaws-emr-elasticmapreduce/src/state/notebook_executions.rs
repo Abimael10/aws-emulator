@@ -62,10 +62,21 @@ pub const NOTEBOOK_EXECUTION_PROGRESSION: &[&str] = &[
 /// run reports what it came to ([`NotebookExecutionRecord::record_outcome`]), so the phase
 /// lasts as long as the notebook really runs for. This is what is added on top of that, so
 /// `RUNNING` is observable — and a stop still reaches a running execution — even for a
-/// notebook whose cells answered before the walk had got there. It is one phase of the walk
-/// like the moves around it, which is why it is one [`NOTEBOOK_PHASE_SPAN`]. Stored as a due
-/// instant — nothing sleeps.
-pub const NOTEBOOK_RUN_SPAN: Duration = NOTEBOOK_PHASE_SPAN;
+/// notebook whose cells answered before the walk had got there.
+///
+/// It is the WIDEST phase of the walk, and deliberately several moves wide rather than one:
+/// `RUNNING` is the phase a caller ACTS on. A notebook execution is consumed by polling —
+/// `DescribeNotebookExecution` is the only way to read one — and a client polls a
+/// cluster-side status seconds to tens of seconds apart, so an execution that passed through
+/// this phase in one move would be read as one that had already ended, and the
+/// `StopNotebookExecution` such a client then sends would find nothing left to stop ("an
+/// execution that has already finished, failed or stopped has nothing left to stop",
+/// [`NotebookExecutionRecord::begin_stop`]). This window is what makes the phase one a
+/// client really reaches: an execution stays stoppable for it, whatever its notebook came to.
+/// It is bounded for the same reason it exists: a few moves, so the whole walk still settles
+/// well inside the wait of a client polling for a terminal status rather than holding the
+/// execution open. Stored as a due instant — nothing sleeps.
+pub const NOTEBOOK_RUN_SPAN: Duration = NOTEBOOK_PHASE_SPAN.saturating_mul(4);
 
 /// How long the move OFF `status` takes: leaving `RUNNING` costs [`NOTEBOOK_RUN_SPAN`],
 /// every other move one [`NOTEBOOK_PHASE_SPAN`].
