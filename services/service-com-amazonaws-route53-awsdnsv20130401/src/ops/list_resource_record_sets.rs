@@ -128,16 +128,18 @@ use super::types::*;
 
 use crate::state::{
     dns_sort_key, no_such_hosted_zone, normalize_zone_id, served_page_size, RecordKey,
+    DEFAULT_PAGE_SIZE,
 };
 
-/// The most record sets one response carries, and the page size a request that
-/// names no `maxitems` is served and answered with.
+/// The most record sets one response carries, whatever `maxitems` a request asks
+/// for.
 ///
 /// The operation's own documentation: "ListResourceRecordSets returns up to 300
 /// resource record sets at a time in ASCII order, beginning at a position
-/// specified by the name and type elements." This listing therefore publishes a
-/// page size of its own, rather than taking the service-wide
-/// [`crate::state::DEFAULT_PAGE_SIZE`] its siblings are served in.
+/// specified by the name and type elements." That is a CEILING on the page a
+/// request may be served, not the page a request naming no `maxitems` asks for:
+/// an unsized request is served — and answered with — the
+/// [`DEFAULT_PAGE_SIZE`] every listing in this service pages at.
 const MAX_PAGE_SIZE: i32 = 300;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -234,13 +236,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A `maxitems` below one asks for no page at all, so it is refused rather than
-        // served.
-        let page_size = served_page_size(input.max_items, MAX_PAGE_SIZE, MAX_PAGE_SIZE)
+        // The ONE rule for the two values: the page SERVED is what the request asked
+        // for, bounded by the ceiling this listing publishes for itself
+        // (MAX_PAGE_SIZE), and the page REPORTED is what the request asked for
+        // itself — its own `maxitems`, or DEFAULT_PAGE_SIZE when it named none. The
+        // two agree for every `maxitems` up to the ceiling, which is every request
+        // the operation can serve a full page for. A `maxitems` below one asks for no
+        // page at all, so it is refused rather than served.
+        let page_size = served_page_size(input.max_items, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE)
             .map_err(ListResourceRecordSetsErrorModeled::InvalidInput)?;
-        // Route 53 echoes the `maxitems` the caller asked for; the clamped
-        // `page_size` above only bounds the work and the response size.
-        let reported_max_items = input.max_items.unwrap_or(MAX_PAGE_SIZE);
+        // "The maximum number of records you requested" — so a request that named no
+        // `maxitems` reads back the default page size it was served in, rather than a
+        // ceiling no page of it was ever as long as.
+        let reported_max_items = input.max_items.unwrap_or(DEFAULT_PAGE_SIZE);
         // "The results begin with the first resource record set in the list whose
         // name is greater than or equal to Name, and whose type is greater than
         // or equal to Type."
@@ -282,9 +290,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_record_name: next.map(|record| record.name.clone()),
             next_record_type: next.map(|record| record.r#type.clone()),
             next_record_identifier: next.and_then(|record| record.set_identifier.clone()),
-            // Route 53 echoes the `maxitems` the caller asked for, so a request
-            // outside the documented range reads its own value back while the
-            // page itself stays clamped to MAX_PAGE_SIZE.
+            // The page size the request asked for, as resolved above: a `maxitems`
+            // past MAX_PAGE_SIZE reads its own value back while the page itself
+            // stays bounded by that ceiling.
             max_items: reported_max_items,
         })
     }

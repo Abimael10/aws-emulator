@@ -28,6 +28,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::hosted_zone_records::{call, create_zone_body, create_zone_ok, router, Reply};
 use crate::record_set_validation::{change, message, submit, Rrset};
+use crate::reusable_delegation_sets::{create_set, delegation_set_element};
+use crate::vpc_associations::{bare_zone_id, create_zone, get_zone};
 
 /// The zone the answering suites query inside.
 const ZONE: &str = "example.com";
@@ -1250,4 +1252,162 @@ async fn a_record_type_outside_the_modelled_value_set_is_refused() {
         "a modelled record type must be served, got {} with body {}",
         served_type.status, served_type.body
     );
+}
+
+// ---------------------------------------------------------------------------
+// 7. The answering name server comes from the queried zone's delegation set
+// ---------------------------------------------------------------------------
+
+/// One zone the name-server table queries, and where its delegation set comes
+/// from.
+struct NameServerZone {
+    case: &'static str,
+    name: &'static str,
+    caller_reference: &'static str,
+    /// Whether the zone is created IN the reusable delegation set, so its four
+    /// name servers are that set's rather than four minted for it alone.
+    reuse_set: bool,
+}
+
+/// The zone, and the four name servers it publishes, that one row queries.
+struct DelegatedZone {
+    case: &'static str,
+    zone_id: String,
+    /// The zone's own DNS name, which the queries below are addressed inside.
+    name: &'static str,
+    /// The zone's own `DelegationSet.NameServers`, as `GetHostedZone` publishes
+    /// them.
+    published: Vec<String>,
+}
+
+#[tokio::test]
+async fn the_answering_name_server_is_one_the_queried_zone_is_delegated_to() {
+    // The rule: `Nameserver` is "the Amazon Route 53 name server used to
+    // respond to the request", so it is one of the name servers the QUERIED
+    // zone is delegated to — the set `GetHostedZone` publishes for that zone —
+    // and never a constant or another zone's. The rows span how a zone's
+    // delegation set came about (four minted for the zone alone, four shared
+    // with another zone through a reusable delegation set), and each zone is
+    // queried for every outcome a query has, because a name server answers the
+    // query either way.
+    let rows = [
+        NameServerZone {
+            case: "a zone delegated to four name servers minted for it",
+            name: "answering-one.example.com",
+            caller_reference: "ref-answering-one",
+            reuse_set: false,
+        },
+        NameServerZone {
+            case: "a second zone, with its own minted delegation set",
+            name: "answering-two.example.net",
+            caller_reference: "ref-answering-two",
+            reuse_set: false,
+        },
+        NameServerZone {
+            case: "a zone created in a reusable delegation set",
+            name: "answering-three.example.org",
+            caller_reference: "ref-answering-three",
+            reuse_set: true,
+        },
+    ];
+
+    let router = router();
+    let set = create_set(&router, "ref-answering-set", None).await;
+    assert_eq!(
+        set.status, 201,
+        "seeding a reusable delegation set: expected 201, got {} with body {}",
+        set.status, set.body
+    );
+    let set_id = set
+        .first("DelegationSet/Id")
+        .unwrap_or_else(|| {
+            panic!(
+                "the created set must carry DelegationSet/Id; body {}",
+                set.body
+            )
+        })
+        .to_string();
+
+    let mut zones: Vec<DelegatedZone> = Vec::new();
+    for row in &rows {
+        let config = if row.reuse_set {
+            delegation_set_element(&set_id)
+        } else {
+            String::new()
+        };
+        let created = create_zone(&router, row.name, row.caller_reference, &config).await;
+        assert_eq!(
+            created.status, 201,
+            "case {:?}: creating {} must answer 201, got {} with body {}",
+            row.case, row.name, created.status, created.body
+        );
+        let zone_id = bare_zone_id(&created);
+        let read_back = get_zone(&router, &zone_id).await;
+        let published: Vec<String> = read_back
+            .all("NameServers/NameServer")
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert!(
+            !published.is_empty(),
+            "case {:?}: the zone must publish the name servers it is delegated to; body {}",
+            row.case,
+            read_back.body
+        );
+        zones.push(DelegatedZone {
+            case: row.case,
+            zone_id,
+            name: row.name,
+            published,
+        });
+    }
+
+    for zone in &zones {
+        // Seed one record inside the zone, so it has a name that ANSWERS as
+        // well as names it holds nothing at.
+        let record_name = format!("www.{}", zone.name);
+        let absent_name = format!("absent.{}", zone.name);
+        seed(
+            &router,
+            &zone.zone_id,
+            &Rrset::new(&record_name, "A").ttl(60).values(&["192.0.2.1"]),
+        )
+        .await;
+
+        for (outcome, name, rr_type) in [
+            ("a name and type the zone holds", record_name.as_str(), "A"),
+            ("the zone's own apex NS record", zone.name, "NS"),
+            ("a name the zone does not hold", absent_name.as_str(), "A"),
+        ] {
+            let case = format!("{} querying {outcome}", zone.case);
+            let reply = ask_for(&router, &zone.zone_id, name, rr_type).await;
+            assert_served(&case, &reply);
+            let answering = reply.first("Nameserver").unwrap_or("").to_string();
+            assert!(
+                zone.published.contains(&answering),
+                "case {case:?}: the answering name server must be one the zone is delegated \
+                 to ({:?}), got {answering:?}",
+                zone.published
+            );
+            // And never one only ANOTHER zone is delegated to: a zone sharing a
+            // reusable set shares its name servers, a zone with its own set
+            // shares none of them.
+            for other in &zones {
+                if other
+                    .published
+                    .iter()
+                    .any(|server| zone.published.contains(server))
+                {
+                    continue;
+                }
+                assert!(
+                    !other.published.contains(&answering),
+                    "case {case:?}: the answering name server must not come from the \
+                     delegation set of {:?} ({:?}), got {answering:?}",
+                    other.case,
+                    other.published
+                );
+            }
+        }
+    }
 }

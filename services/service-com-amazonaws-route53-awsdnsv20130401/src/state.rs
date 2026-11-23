@@ -399,13 +399,14 @@ pub const MAX_VPC_AUTHORIZATIONS_PER_PAGE: i32 = 50;
 /// Route 53 pages a listing of account resources a hundred items at a time
 /// unless the caller asks for a size: the `maxitems` ceilings the individual
 /// operations publish ("Amazon Route 53 returns a maximum of 1000 items" on
-/// `ListHealthChecksRequest$MaxItems`, say) CAP what a request may ask for, they
+/// `ListHealthChecksRequest$MaxItems`, "ListResourceRecordSets returns up to 300
+/// resource record sets at a time", say) CAP what a request may ask for, they
 /// are not the size a request that asks for nothing is served. Shared by every
 /// listing in this service, so the default page size is stated once rather than
-/// reinvented per operation; a listing whose own documentation publishes a
-/// different default (`ListResourceRecordSets`' "returns up to 300 resource
-/// record sets at a time", `ListVPCAssociationAuthorizations`' 50 per page) uses
-/// the documented one instead.
+/// reinvented per operation; a listing whose own documentation names the page a
+/// request that asks for nothing is served (`ListVPCAssociationAuthorizations`'
+/// "If you don't specify a value for MaxResults, Route 53 returns up to 50 VPCs
+/// per page") uses the documented one instead.
 pub const DEFAULT_PAGE_SIZE: i32 = 100;
 
 /// The most reusable delegation sets the account may hold.

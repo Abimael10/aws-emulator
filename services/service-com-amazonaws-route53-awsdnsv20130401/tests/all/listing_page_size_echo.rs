@@ -26,18 +26,22 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_route53_awsdnsv20130401::state::DEFAULT_PAGE_SIZE;
 
 use crate::health_checks::create_health_check;
-use crate::hosted_zone_records::{call, create_zone_ok, router_holding_vpcs, Reply};
+use crate::hosted_zone_records::{
+    call, change_batch_body, create_zone_ok, router_holding_vpcs, Reply,
+};
 use crate::reusable_delegation_sets::create_set;
 use crate::traffic_policies::{create_policy, document_with_start_endpoint};
 use crate::traffic_policy_versions::create_version;
 use crate::vpc_associations::{create_private_zone, HOME_REGION};
 
-/// The page size `ListResourceRecordSets` serves and reports when the request
-/// names no `maxitems`, which this listing publishes for itself:
-/// "ListResourceRecordSets returns up to 300 resource record sets at a time in
-/// ASCII order"
+/// The CEILING `ListResourceRecordSets` bounds a page at, which this listing
+/// publishes for itself: "ListResourceRecordSets returns up to 300 resource
+/// record sets at a time in ASCII order"
 /// (smithy_query(query="doc",shape="com.amazonaws.route53#ListResourceRecordSets")).
-const RECORD_SET_PAGE_SIZE: i32 = 300;
+///
+/// It caps what a request may ask for; the page a request naming no `maxitems`
+/// is served is the service's [`DEFAULT_PAGE_SIZE`], like every other listing's.
+const RECORD_SET_PAGE_BOUND: i32 = 300;
 
 /// The VPC a private fixture zone is associated with, which the
 /// `ListHostedZonesByVPC` row addresses.
@@ -209,9 +213,10 @@ async fn seed(router: &MultiServiceRouter) -> Vec<ListingRow> {
         ListingRow {
             case: "ListResourceRecordSets",
             uri: format!("/2013-04-01/hostedzone/{first}/rrset"),
-            // This listing publishes a page size of its own.
-            default_page_size: RECORD_SET_PAGE_SIZE,
-            page_bound: RECORD_SET_PAGE_SIZE,
+            default_page_size: DEFAULT_PAGE_SIZE,
+            // "ListResourceRecordSets returns up to 300 resource record sets at
+            // a time."
+            page_bound: RECORD_SET_PAGE_BOUND,
         },
     ]
 }
@@ -293,4 +298,179 @@ async fn a_listing_asked_for_a_page_size_reports_the_one_it_was_asked_for() {
             );
         }
     }
+}
+
+/// How many record sets the paged zone below holds past one default page.
+///
+/// Enough that a default page leaves records over, so a page the service
+/// truncated can be told from one that carried everything — and small enough
+/// that one change batch seeds the zone.
+const RECORDS_PAST_A_DEFAULT_PAGE: i32 = 5;
+
+/// How many record sets `CreateHostedZone` gives a new public zone (its apex
+/// `NS` and `SOA`), which count towards the page the listing serves.
+const DEFAULT_APEX_RECORDS: i32 = 2;
+
+/// Seed a zone holding more record sets than one default page, and return its
+/// id and how many record sets it holds in all.
+async fn zone_longer_than_a_default_page(router: &MultiServiceRouter) -> (String, i32) {
+    let held = DEFAULT_PAGE_SIZE + RECORDS_PAST_A_DEFAULT_PAGE;
+    let zone_id = create_zone_ok(router, "paged-records.example.com", "paged-records").await;
+    let changes: String = (0..held - DEFAULT_APEX_RECORDS)
+        .map(|index| {
+            format!(
+                "<Change><Action>CREATE</Action><ResourceRecordSet>\
+                 <Name>r{index:04}.paged-records.example.com</Name><Type>A</Type>\
+                 <TTL>60</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.1</Value>\
+                 </ResourceRecord></ResourceRecords></ResourceRecordSet></Change>"
+            )
+        })
+        .collect();
+    let applied = call(
+        router,
+        "POST",
+        &format!("/2013-04-01/hostedzone/{zone_id}/rrset"),
+        &change_batch_body(&changes, None),
+    )
+    .await;
+    assert_eq!(
+        applied.status, 200,
+        "seeding {held} record sets: expected 200, got {} with body {}",
+        applied.status,
+        applied.body.chars().take(400).collect::<String>()
+    );
+    (zone_id, held)
+}
+
+/// The record sets one `ListResourceRecordSets` page carries.
+fn page_length(reply: &Reply) -> i32 {
+    i32::try_from(reply.all("ResourceRecordSets/ResourceRecordSet/Name").len())
+        .expect("a page carries far fewer record sets than i32 can count")
+}
+
+#[tokio::test]
+async fn the_record_set_listing_serves_the_page_size_it_reports() {
+    // The rule where a longer-than-one-page zone makes it observable: the
+    // reported `MaxItems` is the page size the request asked for — its own
+    // `maxitems`, or the default page size when it named none — and the page
+    // actually served, together with `IsTruncated` and `NextRecordName`, agrees
+    // with it. The rows span page sizes that differ in magnitude: none at all,
+    // the smallest, the default, exactly the population, this listing's
+    // published ceiling and one past it.
+    let router = router();
+    let (zone_id, held) = zone_longer_than_a_default_page(&router).await;
+    let uri = format!("/2013-04-01/hostedzone/{zone_id}/rrset");
+
+    for requested in [
+        None,
+        Some(1),
+        Some(DEFAULT_PAGE_SIZE),
+        Some(held),
+        Some(RECORD_SET_PAGE_BOUND),
+        Some(RECORD_SET_PAGE_BOUND + 1),
+    ] {
+        let case = format!("maxitems={requested:?}");
+        let reply = listing(&router, &case, &with_max_items(&uri, requested)).await;
+        // What the request asked for: its own value, or the default page size.
+        let asked_for = requested.unwrap_or(DEFAULT_PAGE_SIZE);
+        let reported = reply.first("MaxItems");
+        assert_eq!(
+            reported,
+            Some(asked_for.to_string().as_str()),
+            "case {case:?}: expected MaxItems {asked_for}, got {reported:?}; body {}",
+            reply.body.chars().take(400).collect::<String>()
+        );
+        // The page it was served: what it asked for, bounded by the ceiling and
+        // by the records the zone holds.
+        let expected = asked_for.min(RECORD_SET_PAGE_BOUND).min(held);
+        assert_eq!(
+            page_length(&reply),
+            expected,
+            "case {case:?}: expected a page of {expected} record set(s), got {}",
+            page_length(&reply)
+        );
+        let truncated = expected < held;
+        assert_eq!(
+            reply.first("IsTruncated") == Some("true"),
+            truncated,
+            "case {case:?}: expected IsTruncated {truncated}, got {:?}",
+            reply.first("IsTruncated")
+        );
+        assert_eq!(
+            reply.first("NextRecordName").is_some(),
+            truncated,
+            "case {case:?}: NextRecordName is present exactly when the page was \
+             truncated ({truncated}), got {:?}",
+            reply.first("NextRecordName")
+        );
+    }
+}
+
+#[tokio::test]
+async fn paging_the_record_set_listing_at_the_default_page_size_covers_the_zone_once() {
+    // The rule as an invariant: a client that pages with no `maxitems` at all,
+    // resuming at the `NextRecordName`/`NextRecordType` each page names, is
+    // served pages of the size reported in `MaxItems` and visits every record
+    // set the zone holds exactly once.
+    let router = router();
+    let (zone_id, held) = zone_longer_than_a_default_page(&router).await;
+    let uri = format!("/2013-04-01/hostedzone/{zone_id}/rrset");
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut resume: Option<(String, String)> = None;
+    // One page more than the zone can need, so a listing that never terminates
+    // fails rather than spins.
+    let pages = (held / DEFAULT_PAGE_SIZE) + 2;
+    for page_number in 0..pages {
+        let case = format!("page {page_number}");
+        let next = match &resume {
+            Some((name, rr_type)) => format!("{uri}?name={name}&type={rr_type}"),
+            None => uri.clone(),
+        };
+        let reply = listing(&router, &case, &next).await;
+        assert_eq!(
+            reply.first("MaxItems"),
+            Some(DEFAULT_PAGE_SIZE.to_string().as_str()),
+            "case {case:?}: a request naming no maxitems reports the default page size; \
+             body {}",
+            reply.body.chars().take(400).collect::<String>()
+        );
+        assert!(
+            page_length(&reply) <= DEFAULT_PAGE_SIZE,
+            "case {case:?}: a page must hold at most the reported {DEFAULT_PAGE_SIZE} \
+             record set(s), got {}",
+            page_length(&reply)
+        );
+        for (name, rr_type) in reply
+            .all("ResourceRecordSets/ResourceRecordSet/Name")
+            .into_iter()
+            .zip(reply.all("ResourceRecordSets/ResourceRecordSet/Type"))
+        {
+            // A name alone does not identify a record set — the apex holds both
+            // an `NS` and an `SOA` — so the pair is what must be visited once.
+            seen.push(format!("{name} {rr_type}"));
+        }
+        resume = match (reply.first("NextRecordName"), reply.first("NextRecordType")) {
+            (Some(name), Some(rr_type)) => Some((name.to_string(), rr_type.to_string())),
+            _ => None,
+        };
+        if resume.is_none() {
+            break;
+        }
+    }
+    assert!(
+        resume.is_none(),
+        "paging at the default page size did not terminate within {pages} page(s)"
+    );
+    let mut distinct = seen.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(
+        (seen.len(), distinct.len()),
+        (held as usize, held as usize),
+        "paging must cover the zone's {held} record set(s) exactly once, got {} record set(s) \
+         ({} distinct)",
+        seen.len(),
+        distinct.len()
+    );
 }
