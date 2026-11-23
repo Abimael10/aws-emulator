@@ -21,6 +21,15 @@
 //! The rows differ along what the rule generalises over: whether the template names the
 //! environment's `CNAMEPrefix` or leaves it to be generated, and the Region the stack
 //! deploys in.
+//!
+//! The second test pins the other half of the same rule: the values the completed stack
+//! PUBLISHES for that resource are the ones the owning service itself reports for it, so a
+//! client that proceeds on `CREATE_COMPLETE` and uses them reaches the same environment —
+//! and an operation that service documents as needing `Ready` ("such as update or
+//! terminate") is accepted on it straight away. Its rows differ along the published
+//! solution stack and along whether the environment runs behind a load balancer (the
+//! documented default of `aws:elasticbeanstalk:environment` / `EnvironmentType`) or as a
+//! single instance, since that is what decides what `EndpointURL` addresses.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -307,5 +316,172 @@ async fn a_stack_is_complete_only_once_its_environment_is_ready() {
                  {cname:?}"
             );
         }
+    }
+}
+
+/// The LAST row of that same published catalog, so the rows below span two of its platform
+/// families rather than one — and the one tested here is not the row the first test launches
+/// on.
+fn last_solution_stack() -> String {
+    eb::state::SOLUTION_STACKS
+        .last()
+        .expect("the service publishes at least one solution stack")
+        .name()
+}
+
+/// One row of the published-values test: the Region the stack deploys in, the solution stack
+/// its environment runs, and the `aws:elasticbeanstalk:environment` / `EnvironmentType` the
+/// template declares (`None` for a template that declares none, which runs the documented
+/// default, `LoadBalanced`).
+struct PublishedRow {
+    case: &'static str,
+    region: &'static str,
+    solution_stack: String,
+    environment_type: Option<&'static str>,
+}
+
+/// The template one published-values row deploys: an application and an environment on it,
+/// publishing the environment's `Ref` and the one attribute the type publishes
+/// (`EndpointURL`), beside the application's own `Ref`.
+fn published_template(solution_stack: &str, environment_type: Option<&str>) -> String {
+    let mut environment = json!({
+        "ApplicationName": { "Ref": "EbApplication" },
+        "SolutionStackName": solution_stack
+    });
+    if let Some(environment_type) = environment_type {
+        environment["OptionSettings"] = json!([{
+            "Namespace": "aws:elasticbeanstalk:environment",
+            "OptionName": "EnvironmentType",
+            "Value": environment_type
+        }]);
+    }
+    json!({
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "EbApplication": { "Type": "AWS::ElasticBeanstalk::Application" },
+            "EbEnvironment": {
+                "Type": "AWS::ElasticBeanstalk::Environment",
+                "Properties": environment
+            }
+        },
+        "Outputs": {
+            "AppRef": { "Value": { "Ref": "EbApplication" } },
+            "EnvRef": { "Value": { "Ref": "EbEnvironment" } },
+            "EnvEndpoint": { "Value": { "Fn::GetAtt": ["EbEnvironment", "EndpointURL"] } }
+        }
+    })
+    .to_string()
+}
+
+/// RULE: the values a `CREATE_COMPLETE` stack publishes for the environment it created are
+/// the ones Elastic Beanstalk itself reports for that environment — the application it
+/// belongs to, the solution stack it runs and the `EndpointURL` it is reached at — and the
+/// environment is in the status that service documents as available to be acted on, so an
+/// operation it documents as needing `Ready` ("such as update or terminate") is accepted on
+/// it at that instant rather than refused by a state guard.
+#[tokio::test]
+async fn a_complete_stack_publishes_what_elastic_beanstalk_reports_for_its_environment() {
+    let rows = [
+        PublishedRow {
+            case: "the catalog's first solution stack, a single instance",
+            region: "us-west-2",
+            solution_stack: first_solution_stack(),
+            environment_type: Some("SingleInstance"),
+        },
+        PublishedRow {
+            case: "the catalog's last solution stack, load balanced by default, in another \
+                   Region",
+            region: "ap-southeast-2",
+            solution_stack: last_solution_stack(),
+            environment_type: None,
+        },
+    ];
+
+    let router = build_router();
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let region = row.region;
+        let stack_name = format!("eb-published-stack-{index}");
+        let (status, body) = cloudformation(
+            &router,
+            region,
+            "CreateStack",
+            &[
+                ("StackName", &stack_name),
+                (
+                    "TemplateBody",
+                    &published_template(&row.solution_stack, row.environment_type),
+                ),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from CreateStack, got {status} with body {body}"
+        );
+
+        let described = created(&router, case, region, &stack_name).await;
+        assert_eq!(
+            opt_element(&described, "StackStatus").as_deref(),
+            Some("CREATE_COMPLETE"),
+            "case {case:?}: expected the stack to reach CREATE_COMPLETE, got {described}"
+        );
+        let outputs = outputs_of(&described);
+        let published = |key: &str| {
+            outputs
+                .get(key)
+                .unwrap_or_else(|| panic!("case {case:?}: no {key} output in {described}"))
+                .clone()
+        };
+        let application = published("AppRef");
+        let environment = published("EnvRef");
+        let endpoint = published("EnvEndpoint");
+
+        // The independent read: everything the stack published for the environment is what
+        // the service that owns it reports, at the instant the stack says it is created.
+        let environments = elasticbeanstalk(
+            &router,
+            case,
+            region,
+            "DescribeEnvironments",
+            &[("EnvironmentNames.member.1", &environment)],
+        )
+        .await;
+        for (member, expected) in [
+            ("EnvironmentName", environment.clone()),
+            ("ApplicationName", application.clone()),
+            ("SolutionStackName", row.solution_stack.clone()),
+            ("EndpointURL", endpoint.clone()),
+            ("Status", eb::state::STATUS_READY.to_string()),
+        ] {
+            assert_eq!(
+                opt_element(&environments, member),
+                Some(expected.clone()),
+                "case {case:?}: expected the environment's {member} to be {expected:?}, got \
+                 {environments}"
+            );
+        }
+
+        // And the environment really is available to be acted on: `UpdateEnvironment` is
+        // refused unless the environment is `Ready`, so its being accepted here — and the
+        // environment reporting the update in progress afterwards — is what makes
+        // `CREATE_COMPLETE` a usable guarantee.
+        let updated = elasticbeanstalk(
+            &router,
+            case,
+            region,
+            "UpdateEnvironment",
+            &[
+                ("EnvironmentName", &environment),
+                ("Description", "updated straight after CREATE_COMPLETE"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            opt_element(&updated, "Status").as_deref(),
+            Some("Updating"),
+            "case {case:?}: an update accepted on a ready environment must report it \
+             updating, got {updated}"
+        );
     }
 }
