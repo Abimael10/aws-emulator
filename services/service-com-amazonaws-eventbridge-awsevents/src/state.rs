@@ -3123,7 +3123,8 @@ fn target_invocation_condition_context(rule_arn: &str) -> Vec<(String, String)> 
 /// WHICH of the two refusals it was is deliberately not reported to the caller of
 /// a delivery: the target's service does not tell EventBridge either, and what
 /// EventBridge reports for a delivery it could not make is the answer that
-/// service gave it (see [`queue_access_refusal`]).
+/// service gave it, which is one authorization refusal however the document
+/// withheld the call (see [`queue_access_refusal`]).
 pub fn target_policy_decision(
     policy: &str,
     attempt: &DeliveryAttempt<'_>,

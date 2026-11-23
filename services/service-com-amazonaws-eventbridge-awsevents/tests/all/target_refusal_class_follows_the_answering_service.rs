@@ -12,7 +12,7 @@
 //! dead letter's `ERROR_CODE` is EventBridge's classification of the ANSWER that
 //! target's service gave the withheld call — so the class follows the refusal the
 //! service really answers, and is NOT one verdict this service reaches for every
-//! target whose document granted nothing:
+//! failed delivery:
 //!
 //! * Amazon SQS answers a send the queue's own document does not permit with the code
 //!   and status AWS answers an unauthorized call with (HTTP 403, `AccessDenied`),

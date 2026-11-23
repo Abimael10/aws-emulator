@@ -646,8 +646,7 @@ enum Refused {
 /// on, how many matching events the round publishes, and the CONDITION the parked
 /// copy carries — EventBridge's own classification of the answer the target's
 /// service gave the invocation, which is `NO_PERMISSIONS` for a target that is
-/// there and withheld the grant from this principal and `NO_RESOURCE` for a target
-/// whose service answers that it is not there at all.
+/// there and withheld the grant from this principal, whichever service it lives in.
 struct Row {
     case: &'static str,
     refused: Refused,
