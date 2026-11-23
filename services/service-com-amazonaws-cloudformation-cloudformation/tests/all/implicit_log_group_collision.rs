@@ -493,7 +493,11 @@ async fn validation_results(
 
 /// The wire error code and message of a refused answer, as a restJson1 error envelope carries
 /// them.
-fn refusal(body: &Value) -> (String, String) {
+///
+/// `pub(crate)` because more than one suite of this target asserts WHICH refusal AWS Lambda
+/// answered a read of a function it does not hold with, and there is one reading of that
+/// envelope: `refused_deployment_leaves_nothing_behind.rs` reads it through this one.
+pub(crate) fn refusal(body: &Value) -> (String, String) {
     let code = body
         .get("__type")
         .and_then(Value::as_str)
