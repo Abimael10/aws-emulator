@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The EBS root volume a LAUNCH creates for the instance it stores.
+//! The EBS volumes a LAUNCH creates for the instance it stores: its root device, and every
+//! other Amazon EBS device its block device mapping names.
 //!
 //! "When you launch an instance, the root device volume […] contains the image used to boot
 //! the instance": launching from an EBS-backed AMI creates a volume, restored from the
 //! snapshot that image's root block device mapping names (`Image$BlockDeviceMappings`,
-//! `Image$RootDeviceName`, `Image$RootDeviceType`'s `ebs`). So the volume is a resource the
-//! LAUNCH creates, which is why it is minted from
+//! `Image$RootDeviceName`, `Image$RootDeviceType`'s `ebs`). "The block device mapping, which
+//! defines the EBS volumes and instance store volumes to attach to the instance at launch"
+//! (`RunInstancesRequest$BlockDeviceMappings`) says the same of the launch's OWN devices: a
+//! mapping naming an Amazon EBS device other than the root one creates that volume too, and
+//! the instance holds it at that device from the moment the launch carried it up. So both are
+//! resources the LAUNCH creates, which is why both are minted from
 //! [`ComAmazonawsEc2Amazonec2State::insert_instance`] — the one place every launch path
 //! stores its instance — rather than inside one operation's handler: the account's volume
 //! store is then the single place "which volumes does this instance have" is answered, for
@@ -28,9 +33,10 @@ use crate::ops::types::{
 
 use super::{
     ComAmazonawsEc2Amazonec2State, DEFAULT_GP3_IOPS, DEFAULT_GP3_THROUGHPUT, DEFAULT_VOLUME_TYPE,
-    IMAGE_ROOT_DEVICE_TYPE_EBS, ImageSpec, MAX_STORED_VOLUMES, THROUGHPUT_VOLUME_TYPE,
-    TRANSITION_DELAY, VOLUME_ATTACHMENT_STATE_ATTACHED, VOLUME_ID_PREFIX, VolumeRecord, VolumeView,
-    region_of_zone_name, system_time_to_date_time, unmanaged_operator, zone_id_for_zone_name,
+    IMAGE_ROOT_DEVICE_TYPE_EBS, ImageSpec, MAX_BLOCK_DEVICE_MAPPINGS, MAX_STORED_VOLUMES,
+    THROUGHPUT_VOLUME_TYPE, TRANSITION_DELAY, VOLUME_ATTACHMENT_STATE_ATTACHED, VOLUME_ID_PREFIX,
+    VolumeRecord, VolumeView, region_of_zone_name, system_time_to_date_time, unmanaged_operator,
+    zone_id_for_zone_name,
 };
 
 impl ComAmazonawsEc2Amazonec2State {
@@ -161,6 +167,48 @@ impl ComAmazonawsEc2Amazonec2State {
         Some((device_name, self.encrypted_by_default_in(ebs, region)))
     }
 
+    /// The OTHER Amazon EBS devices the launch of an instance from `image_id` creates, as
+    /// `(device name, device)`: one entry per `BlockDeviceMappings` entry naming an Amazon EBS
+    /// device that is not the root one, in the order the launch named them.
+    ///
+    /// "The block device mapping, which defines the EBS volumes and instance store volumes to
+    /// attach to the instance at launch" (`RunInstancesRequest$BlockDeviceMappings`): an entry
+    /// carrying an `Ebs` member is a volume the launch creates and attaches at its
+    /// `DeviceName`, so each one is resolved here and stored on the instance for the one
+    /// writer of a launched instance to mint ([`Self::mint_launched_data_volumes`]). An entry
+    /// for the image's ROOT device is not among them — that device is the root volume's, read
+    /// through [`Self::launch_root_block_device`] — and neither is one that maps an instance
+    /// store volume (`BlockDeviceMapping$VirtualName`), which is no volume of the account, nor
+    /// one that SUPPRESSES a device the AMI maps (`$NoDevice`), which creates nothing.
+    ///
+    /// Encrypted whenever `region` has EBS encryption on by default, by the same reading the
+    /// root device is given ([`Self::encrypted_by_default_in`]), and bounded by the block
+    /// device mappings one launch may name ([`MAX_BLOCK_DEVICE_MAPPINGS`]), so a launch path
+    /// that does not hold its request to that count still cannot create more.
+    pub fn launch_data_block_devices(
+        &self,
+        image_id: Option<&str>,
+        mappings: &[BlockDeviceMapping],
+        region: &str,
+    ) -> Vec<(String, EbsBlockDevice)> {
+        let root_device_name = self
+            .launched_root_device(image_id)
+            .map(|(device_name, _)| device_name);
+        mappings
+            .iter()
+            .take(MAX_BLOCK_DEVICE_MAPPINGS)
+            .filter(|mapping| mapping.virtual_name.is_none() && mapping.no_device.is_none())
+            .filter_map(|mapping| {
+                let device_name = mapping.device_name.clone()?;
+                if root_device_name.as_deref() == Some(device_name.as_str()) {
+                    return None;
+                }
+                let ebs = mapping.ebs.clone()?;
+                Some((device_name, self.encrypted_by_default_in(ebs, region)))
+            })
+            .collect()
+    }
+
     /// The root block device the launch of an instance from the launch-template version
     /// `data` creates, as [`Self::launch_root_block_device`] resolves it from the mappings
     /// that version carries.
@@ -248,19 +296,68 @@ impl ComAmazonawsEc2Amazonec2State {
         let Some((device_name, image_device)) = self.launched_root_device(Some(&image_id)) else {
             return;
         };
+        self.store_launched_volume(
+            instance_id,
+            &zone_name,
+            &device_name,
+            requested_root.unwrap_or(image_device),
+        );
+    }
+
+    /// Give the instance `instance_id` the OTHER Amazon EBS volumes its launch creates — one
+    /// per device its block device mapping named beside the root one
+    /// ([`InstanceRecord::data_block_devices`]).
+    ///
+    /// "The block device mapping, which defines the EBS volumes […] to attach to the instance
+    /// at launch" (`RunInstancesRequest$BlockDeviceMappings`): each named device is a volume
+    /// the launch creates and the instance holds at that device, so it is minted here beside
+    /// the root one and by the same body — one volume of the account, in the instance's own
+    /// zone, attached at the device the mapping names. A launch that named no such device
+    /// creates none.
+    pub(super) fn mint_launched_data_volumes(&mut self, instance_id: &str) {
+        let Some(instance) = self.instances.get(instance_id) else {
+            return;
+        };
+        let zone_name = instance.placement_az.clone();
+        let devices = instance.data_block_devices.clone();
+        for (device_name, ebs) in devices {
+            self.store_launched_volume(instance_id, &zone_name, &device_name, ebs);
+        }
+    }
+
+    /// Store ONE volume a launch creates for the instance `instance_id`: the device `ebs`
+    /// describes, in the zone `zone_name`, attached at `device_name`.
+    ///
+    /// The ONE body both of a launch's volume paths go through, so the root volume and a
+    /// volume the launch's own mapping names are the same kind of record: a volume of this
+    /// account in the instance's zone, with the size, type, IOPS, throughput, encryption state
+    /// and key its block device states, restoring the snapshot it names, held by the instance
+    /// at its device from the moment the launch carried it up, and with the same clock-owed
+    /// `creating` -> `available` span every volume this store mints has. The Region's own EBS
+    /// encryption default is applied here ([`Self::encrypted_by_default_in`]), so no launch
+    /// form can store an unencrypted volume in a Region whose every new volume is encrypted.
+    ///
+    /// Nothing is stored when the volume store is already full ([`MAX_STORED_VOLUMES`]) — the
+    /// instance is still stored in that case, exactly as it was before.
+    fn store_launched_volume(
+        &mut self,
+        instance_id: &str,
+        zone_name: &str,
+        device_name: &str,
+        ebs: EbsBlockDevice,
+    ) {
         if self.volumes.len() >= MAX_STORED_VOLUMES {
             return;
         }
-
         let volume_id = self.next_id(VOLUME_ID_PREFIX);
         // The Region the volume's ARN names is the one its Availability Zone belongs to —
         // read off the zone name through the ONE reading of that ([`region_of_zone_name`]),
         // so the volume and the instance that holds it can never be placed in two Regions.
-        let region = region_of_zone_name(&zone_name).to_string();
+        let region = region_of_zone_name(zone_name).to_string();
         // The device the volume is created from, as this Region's EBS encryption default
         // leaves it: the launch path that resolved one has already been through the same
         // reading, so applying it again changes nothing there.
-        let ebs = self.encrypted_by_default_in(requested_root.unwrap_or(image_device), &region);
+        let ebs = self.encrypted_by_default_in(ebs, &region);
         let volume_type = ebs
             .volume_type
             .clone()
@@ -274,8 +371,8 @@ impl ComAmazonawsEc2Amazonec2State {
                 &format!("volume/{volume_id}"),
             )),
             owner_id: Some(::engine::emulator_account_id().to_string()),
-            availability_zone: Some(zone_name.clone()),
-            availability_zone_id: zone_id_for_zone_name(&zone_name),
+            availability_zone: Some(zone_name.to_string()),
+            availability_zone_id: zone_id_for_zone_name(zone_name),
             create_time: Some(system_time_to_date_time(now)),
             size: ebs.volume_size,
             // "The number of I/O operations per second (IOPS)" and "the throughput that the
@@ -303,8 +400,8 @@ impl ComAmazonawsEc2Amazonec2State {
             // record here.
             tags: Some(Vec::new()),
             // "The snapshot from which the volume was created, if applicable"
-            // (`Volume$SnapshotId`): the root device snapshot of the AMI the instance was
-            // launched from, which is exactly what this volume restores.
+            // (`Volume$SnapshotId`): the snapshot this device restores, which for the root
+            // device is the root device snapshot of the AMI the instance was launched from.
             snapshot_id: ebs.snapshot_id.clone(),
             source_volume_id: None,
             // "Indicates whether the volume was created using fast snapshot restore"
@@ -317,23 +414,23 @@ impl ComAmazonawsEc2Amazonec2State {
             volume_initialization_rate: None,
             // Derived from `available_at` on every read.
             state: None,
-            // "The device name" the volume is attached at is the image's root device, and
-            // the instance holds it from the moment it is launched.
+            // "The device name" the volume is attached at is the device the launch mapped it
+            // to, and the instance holds it from the moment it is launched.
             attachments: Some(vec![AttachVolumeOutput {
                 volume_id: Some(volume_id.clone()),
                 instance_id: Some(instance_id.to_string()),
-                device: Some(device_name),
+                device: Some(device_name.to_string()),
                 state: Some(VOLUME_ATTACHMENT_STATE_ATTACHED.to_string()),
                 attach_time: Some(system_time_to_date_time(now)),
                 // "Indicates whether the volume is deleted on instance termination"
                 // (`EbsBlockDevice$DeleteOnTermination`), whose own documented default for
-                // a root volume is `true`.
+                // a volume a launch creates is `true`.
                 delete_on_termination: Some(ebs.delete_on_termination.unwrap_or(true)),
                 // An instance's own attachment, not one to an Amazon Web
                 // Services-managed resource.
                 associated_resource: None,
                 instance_owning_service: None,
-                ebs_card_index: Some(0),
+                ebs_card_index: ebs.ebs_card_index.or(Some(0)),
             }]),
         };
         self.volumes.insert(

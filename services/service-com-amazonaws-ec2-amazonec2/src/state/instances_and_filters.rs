@@ -241,6 +241,9 @@ impl ComAmazonawsEc2Amazonec2State {
             self.take_capacity_reservation_capacity(&capacity_reservation_id);
         }
         self.mint_launched_root_volume(&instance_id);
+        // And the other Amazon EBS volumes the launch's own block device mapping names, by
+        // the same rule and in the same place ([`Self::mint_launched_data_volumes`]).
+        self.mint_launched_data_volumes(&instance_id);
         if interfaces.is_empty() {
             self.mint_launched_primary_interface(&instance_id);
             return true;
@@ -3212,6 +3215,13 @@ pub fn instance_payload_bytes(record: &InstanceRecord) -> usize {
             .map_or(0, String::len)
         + tag_bytes(&record.tags)
         + root_block_device_bytes(record.root_block_device.as_ref())
+        // The other Amazon EBS devices the launch resolved count the same way: each is a
+        // device the REQUEST named, cloned onto every instance the launch mints.
+        + record
+            .data_block_devices
+            .iter()
+            .map(|(device_name, ebs)| device_name.len() + root_block_device_bytes(Some(ebs)))
+            .sum::<usize>()
         + record
             .security_groups
             .iter()

@@ -521,6 +521,13 @@ impl ComAmazonawsEc2Amazonec2State {
                     spec.region,
                 )
                 .map(|(_, ebs)| ebs),
+            // And the devices that specification names beside the root one, read through
+            // the one resolution of those.
+            data_block_devices: self.launch_data_block_devices(
+                launch.image_id.as_deref(),
+                launch.block_device_mappings.as_deref().unwrap_or_default(),
+                spec.region,
+            ),
             disable_api_termination: false,
             tags: spec.tags,
             client_token: None,

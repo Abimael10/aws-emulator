@@ -649,6 +649,9 @@ pub fn launch_host_instance<Eng: Send + Sync + 'static>(
         // The launch names no block device mapping, so the host's root device is the one
         // its image carries: there is nothing of a launch's own to override it with.
         root_block_device: None,
+        // …and it names no other Amazon EBS device either, so the launch creates no volume
+        // beside that root one.
+        data_block_devices: Vec::new(),
         disable_api_termination: false,
         // The environment's tags tag the ENVIRONMENT; nothing tags the instance.
         tags: ::std::collections::BTreeMap::new(),

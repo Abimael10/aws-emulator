@@ -819,7 +819,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the launch's entry for that device overlaid, read through the ONE resolution of it —
         // so the volume stored below, the prerequisite asked of it and the key asked about are
         // the same device.
-        let (image_id, root_block_device) = {
+        let (image_id, root_block_device, data_block_devices) = {
             let state = require_service_state(&*self.engine)?;
             let mut store = state.lock();
             store.materialize_due_transitions();
@@ -844,7 +844,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &region,
                 )
                 .map(|(_, ebs)| ebs);
-            (image_id, root_block_device)
+            // And the devices the mapping names BESIDE the root one, read through the one
+            // resolution of those: each is a volume this launch creates for every instance
+            // it mints.
+            let data_block_devices = store.launch_data_block_devices(
+                Some(&image_id),
+                input.block_device_mappings.as_deref().unwrap_or_default(),
+                &region,
+            );
+            (image_id, root_block_device, data_block_devices)
         };
 
         // WHETHER THE VOLUMES THIS LAUNCH WOULD CREATE CAN EXIST AT ALL under the keys they
@@ -1675,6 +1683,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // once above against the AMI's own mapping and this Region's encryption
                 // default.
                 root_block_device: root_block_device.clone(),
+                // And every other Amazon EBS device the launch's mapping names, resolved
+                // once above by the same reading: each is a volume this launch creates and
+                // the instance holds at that device.
+                data_block_devices: data_block_devices.clone(),
                 disable_api_termination: input.disable_api_termination.unwrap_or(false),
                 tags: tags.clone(),
                 client_token: input.client_token.clone(),

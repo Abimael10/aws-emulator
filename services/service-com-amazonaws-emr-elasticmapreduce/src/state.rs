@@ -92,6 +92,24 @@ pub use master_node::*;
 mod cluster_instances;
 pub use cluster_instances::*;
 
+/// The Amazon EBS volumes a cluster's NODES are given — created in the service that OWNS
+/// volumes, attached once the clock brings a node up, and reported as `Instance$EbsVolumes` —
+/// split out of this root as its own concern and re-exported the same way.
+mod instance_ebs_volumes;
+pub use instance_ebs_volumes::*;
+
+/// The capacity each of a cluster's COLLECTIONS asks for against the instances it is
+/// holding, and the launching and releasing that settles the difference — split out of this
+/// root as its own concern and re-exported the same way.
+mod collection_capacity;
+pub use collection_capacity::*;
+
+/// The MANAGED SCALING activity of a cluster — the core and task capacity its managed
+/// scaling policy keeps it at — split out of this root as its own concern and re-exported
+/// the same way.
+mod managed_scaling;
+pub use managed_scaling::*;
+
 /// How many instances ONE instance group may be asked for, the sibling of the instance
 /// fleet's own ceiling; split out and re-exported the same way.
 mod instance_group_capacity;
@@ -2987,6 +3005,10 @@ pub struct ClusterRecord {
     /// `PutManagedScalingPolicy`, and `None` once `RemoveManagedScalingPolicy` has taken
     /// it off. `GetManagedScalingPolicy` reports exactly this.
     pub managed_scaling_policy: Option<ManagedScalingPolicy>,
+    /// When the next managed scaling activity that policy owes comes due
+    /// ([`MANAGED_SCALING_EVALUATION_SPAN`]), and `None` for a cluster carrying no policy or
+    /// one that has none left to perform ([`ClusterRecord::apply_due_managed_scaling`]).
+    pub managed_scaling_due_at: Option<SystemTime>,
     /// The auto-termination policy attached to this cluster, by `RunJobFlow` or by
     /// `PutAutoTerminationPolicy`, and `None` once `RemoveAutoTerminationPolicy` has
     /// taken it off. `GetAutoTerminationPolicy` reports exactly this.
@@ -3135,6 +3157,12 @@ impl ClusterRecord {
         // that has just taken a step or that is shutting down for its own queue is not also
         // shut down for having been idle ([`ClusterRecord::idle_since`]).
         self.stop_once_idle_timeout_elapsed(now);
+        // The managed scaling activity an attached policy owes is applied last, so a cluster
+        // that is shutting down for its queue or for having been idle is not also scaled
+        // ([`ClusterRecord::apply_due_managed_scaling`]). It moves a collection's TARGET; the
+        // instances that target asks for are provisioned by the one settling of capacity
+        // every target move goes through ([`settle_cluster_capacity`]).
+        self.apply_due_managed_scaling(now);
     }
 
     /// The instant the shutdown a cluster that does not stay up is owed comes due, or

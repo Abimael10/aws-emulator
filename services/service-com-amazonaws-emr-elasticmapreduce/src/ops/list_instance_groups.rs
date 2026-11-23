@@ -140,7 +140,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::LIST_INSTANCE_GROUPS_PAGE_SIZE;
 
-        let _ = ctx;
         let now = ::std::time::SystemTime::now();
 
         // The SHAPE of the cluster id is settled BEFORE any cluster is resolved: a value
@@ -161,6 +160,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // Reporting only, and before this service's store is taken: a group whose target
+        // moved — by a resize, or by a managed scaling activity the clock already made due
+        // (`crate::state::managed_scaling`) — is OWED the instances that target asks for from
+        // that instant, and a call into the service that owns instances may not be made under
+        // this service's lock. What the group REPORTS as running is the capacity it asks for,
+        // so the two are settled before the listing is built.
+        crate::state::settle_cluster_capacity(
+            &*self.engine,
+            ctx,
+            &crate::state::request_region(ctx.parts()),
+            &input.cluster_id,
+            now,
+        )
+        .await;
         let mut store = state.lock();
 
         // A listing reports group state, so every transition the clock already made due

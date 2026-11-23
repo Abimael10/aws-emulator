@@ -207,12 +207,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // The same reading for the instances a modification names for termination: "the
+        // Amazon EC2 InstanceIds to terminate" names instances of ONE group, and no cluster
+        // of this service holds more than `MAX_INSTANCES_PER_CLUSTER` instance records, so a
+        // longer list cannot name that many distinct live instances of one — and the
+        // resolution below is capped by the same number.
+        for modification in &modifications {
+            let named = modification
+                .ec2_instance_ids_to_terminate
+                .as_ref()
+                .map_or(0, Vec::len);
+            if named > crate::state::MAX_INSTANCES_PER_CLUSTER {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "EC2InstanceIdsToTerminate names {named} instances; a cluster holds at \
+                     most {} Amazon EC2 instances",
+                    crate::state::MAX_INSTANCES_PER_CLUSTER
+                )));
+            }
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ModifyInstanceGroupsErrorModeled::InternalServerError(
                 InternalServerError {},
             )
             .into());
         };
+        // The whole modification is applied while this service's store is held, and the
+        // guard is given up with the block — the settling of capacity below is a call into
+        // the service that owns instances and may not be made under it.
+        let (cluster_id, terminated) = {
         let mut store = state.lock();
 
         // "The ID of the cluster to which the instance group belongs"
@@ -272,6 +295,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // what the cluster carries only once all of them hold. A refused request leaves
         // the stored groups untouched.
         let mut groups: Vec<InstanceGroupRecord> = cluster.groups.clone();
+        // The instances the request names for termination, as `(group, instance record)`:
+        // resolved while every modification is being checked, and released below once all of
+        // them hold.
+        let mut released: Vec<(String, String)> = Vec::new();
         for modification in &modifications {
             let Some(group) = groups
                 .iter_mut()
@@ -282,18 +309,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
             };
 
-            // "The Amazon EC2 InstanceIds to terminate" — this emulator launches no
-            // Amazon EC2 instances, so an id named here belongs to no instance of the
-            // group, and terminating it is refused rather than answered as done.
-            if let Some(instance_id) = modification
-                .ec2_instance_ids_to_terminate
-                .iter()
-                .flatten()
-                .next()
-            {
-                return Err(crate::scaffolded::Scaffolded::validation(
-                    crate::state::unknown_ec2_instance_message(instance_id),
-                ));
+            // "The Amazon EC2 InstanceIds to terminate" (`InstanceGroupModifyConfig$
+            // EC2InstanceIdsToTerminate` doc): an id has to name an instance THIS group is
+            // still holding, so one that names no live instance of it is refused rather than
+            // answered as done; the ones that do are released once every modification holds.
+            //
+            // The instances the group holds are read ONCE per modification, so resolving the
+            // named ids is a lookup each rather than a walk each, and a repeated id resolves
+            // to the one instance it names rather than to another unit of work.
+            if let Some(named_ids) = modification.ec2_instance_ids_to_terminate.as_ref() {
+                let held: ::std::collections::BTreeMap<&str, &str> = cluster
+                    .ec2_instances
+                    .iter()
+                    .filter(|instance| {
+                        instance.is_live()
+                            && instance.instance_group_id.as_deref() == Some(group.id.as_str())
+                    })
+                    .map(|instance| {
+                        (instance.ec2_instance_id.as_str(), instance.id.as_str())
+                    })
+                    .collect();
+                for instance_id in named_ids {
+                    match held.get(instance_id.as_str()) {
+                        Some(record) => {
+                            released.push((group.id.clone(), (*record).to_string()));
+                        }
+                        None => {
+                            return Err(crate::scaffolded::Scaffolded::validation(
+                                crate::state::unknown_ec2_instance_message(instance_id),
+                            ))
+                        }
+                    }
+                }
             }
 
             // "Policy for customizing shrink operations" (`InstanceGroupModifyConfig$
@@ -342,6 +389,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         "InstanceCount {target} is below 0"
                     )));
                 }
+                // Bounded ABOVE by the instances Amazon EMR provisions for ONE instance group
+                // ([`crate::state::MAX_INSTANCES_PER_GROUP`]) — the same ceiling, with the
+                // same sentence, every path that persists an `InstanceGroupConfig` holds its
+                // count to ([`crate::state::validate_instance_group_config`]): the target is
+                // what the group is then provisioned up to, so a resize may not ask for a
+                // count a launch could not.
+                if let Some(refusal) = crate::state::instance_group_count_violation(target) {
+                    return Err(crate::scaffolded::Scaffolded::validation(refusal));
+                }
                 // "The master node cannot be scaled after initial configuration."
                 // (`ComputeLimits` doc, Smithy model.) The role of a group IS its type,
                 // so the group that runs the primary node keeps the size it launched
@@ -366,7 +422,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         cluster.groups = groups;
+        // "After you terminate the instances, the instance group will not return to its
+        // original requested size" (`InstanceGroupModifyConfig$EC2InstanceIdsToTerminate`
+        // doc): each named instance is released and its group then asks for what it still
+        // holds, so the capacity settling below provisions no replacement for it. The
+        // instances are terminated in the service that owns them once this guard is given up.
+        //
+        // ONE pass over the cluster's instances releases them all, and one more per group
+        // reads what that group is left holding — so the work is the instances plus the ids
+        // rather than their product.
+        let released_records: Vec<String> = released
+            .iter()
+            .map(|(_, instance_id)| instance_id.clone())
+            .collect();
+        let terminated = cluster.release_instances(&released_records, now);
+        let mut resized: Vec<String> = Vec::new();
+        for (group_id, _) in &released {
+            if resized.contains(group_id) {
+                continue;
+            }
+            resized.push(group_id.clone());
+            let held = i32::try_from(cluster.live_group_instances(group_id).len())
+                .unwrap_or(i32::MAX);
+            if let Some(group) = cluster.group_mut(group_id) {
+                if group.config.instance_count > held {
+                    group.begin_resize(held, now);
+                }
+            }
+        }
         drop(store);
+        (cluster_id, terminated)
+        };
+
+        crate::state::terminate_cluster_instances(
+            ctx,
+            &crate::state::request_region(ctx.parts()),
+            &terminated,
+        )
+        .await;
+
+        // "ModifyInstanceGroups modifies the NUMBER OF NODES … of an instance group" (this
+        // operation's doc): a group whose target moved is then provisioned up to it, or
+        // released down to it, in the service that owns instances — the one settling of
+        // capacity every target move of this service goes through
+        // ([`crate::state::settle_cluster_capacity`]), made with no store guard held.
+        crate::state::settle_cluster_capacity(
+            &*self.engine,
+            ctx,
+            &crate::state::request_region(ctx.parts()),
+            &cluster_id,
+            now,
+        )
+        .await;
 
         Ok(ModifyInstanceGroupsOutput)
     }

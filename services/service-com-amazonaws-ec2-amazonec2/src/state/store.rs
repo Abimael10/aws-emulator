@@ -683,6 +683,17 @@ pub struct InstanceRecord {
     /// launched instance ([`ComAmazonawsEc2Amazonec2State::mint_launched_root_volume`]), so
     /// this is what carries the launch's own answer to it.
     pub root_block_device: Option<EbsBlockDevice>,
+    /// The OTHER Amazon EBS devices this instance's launch resolved for it, as
+    /// `(device name, device)`: one entry per `BlockDeviceMappings` entry of the launch that
+    /// names an Amazon EBS device other than the root one, read by
+    /// [`ComAmazonawsEc2Amazonec2State::launch_data_block_devices`].
+    ///
+    /// "The block device mapping, which defines the EBS volumes and instance store volumes to
+    /// attach to the instance at launch" (`RunInstancesRequest$BlockDeviceMappings`): those
+    /// volumes are created BY the launch, so they are held on the record for the same reason
+    /// the root device is — the store's one writer of a launched instance mints them
+    /// ([`ComAmazonawsEc2Amazonec2State::mint_launched_data_volumes`]).
+    pub data_block_devices: Vec<(String, EbsBlockDevice)>,
     pub disable_api_termination: bool,
     pub tags: BTreeMap<String, String>,
     pub client_token: Option<String>,

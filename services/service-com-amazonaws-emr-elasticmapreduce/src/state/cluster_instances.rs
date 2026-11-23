@@ -116,6 +116,11 @@ pub struct ClusterInstanceRecord {
     pub state: String,
     /// Why it is in that state, for the one state something moved it to.
     pub state_change_reason: Option<StateChangeReasonRecord>,
+    /// The Amazon EBS volumes this instance was given, one per block device its collection
+    /// asks every one of its instances for ([`super::InstanceEbsVolume`]) — each a volume
+    /// Amazon EC2 itself minted, which is what makes `Instance$EbsVolumes` a list of volumes
+    /// that exist.
+    pub ebs_volumes: Vec<InstanceEbsVolume>,
 }
 
 impl ClusterInstanceRecord {
@@ -140,7 +145,30 @@ impl ClusterInstanceRecord {
             end_date_time: None,
             state: instance_state::PROVISIONING.to_string(),
             state_change_reason: None,
+            ebs_volumes: launched.ebs_volumes,
         }
+    }
+
+    /// Whether this instance is one the cluster still holds: an instance that has not been
+    /// terminated, which is what makes it part of its collection's capacity.
+    pub fn is_live(&self) -> bool {
+        self.state != instance_state::TERMINATED
+    }
+
+    /// Release this instance at `at`, because the collection it belongs to was resized below
+    /// the capacity it was holding.
+    ///
+    /// "TERMINATED — The instance was terminated" (`InstanceState`), which is the same end
+    /// [`Self::end_at`] records for an instance that went with its cluster. NO state change
+    /// reason is reported beside it: `InstanceStateChangeReasonCode` names no reason for a
+    /// resize, and a code this service cannot ground is not one it reports.
+    pub fn release_at(&mut self, at: SystemTime) {
+        if self.state == instance_state::TERMINATED {
+            return;
+        }
+        self.state = instance_state::TERMINATED.to_string();
+        self.ready_due_at = None;
+        self.end_date_time = Some(at);
     }
 
     /// Materialise the transition the clock already made due, and nothing else: an instance
@@ -199,9 +227,13 @@ impl ClusterInstanceRecord {
     ///
     /// No public address is reported for an instance of this emulator: no address of this
     /// process is reachable from outside it, so none is announced as one — the same reading
-    /// a cluster's own master node address is given ([`super::master_node`]). The Amazon EBS
-    /// volumes member is left absent for the same reason it is left out of a group that
-    /// configured none: nothing here attaches a volume to these instances.
+    /// a cluster's own master node address is given ([`super::master_node`]).
+    ///
+    /// "The list of Amazon EBS volumes that are attached to this instance"
+    /// (`Instance$EbsVolumes` doc) is one entry per volume this instance was given
+    /// ([`super::InstanceEbsVolume`]), and the member is left absent for an instance whose
+    /// collection asks for no Amazon EBS volume at all — the same reading
+    /// `InstanceGroup$EbsBlockDevices` is given for a collection that configured none.
     pub fn to_instance(&self) -> Instance {
         Instance {
             id: Some(self.id.clone()),
@@ -215,7 +247,13 @@ impl ClusterInstanceRecord {
             instance_fleet_id: self.instance_fleet_id.clone(),
             market: Some(self.market.clone()),
             instance_type: Some(self.instance_type.clone()),
-            ebs_volumes: None,
+            ebs_volumes: optional_list(
+                &self
+                    .ebs_volumes
+                    .iter()
+                    .map(InstanceEbsVolume::to_ebs_volume)
+                    .collect::<Vec<_>>(),
+            ),
         }
     }
 }
@@ -233,6 +271,17 @@ pub struct InstanceLaunch {
     pub instance_type: String,
     pub market: String,
     pub count: i32,
+    /// The Amazon EBS block devices the collection maps onto EVERY one of its instances
+    /// ([`super::ebs_block_devices`]): "the block device mapping, which defines the EBS
+    /// volumes … to attach to the instance at launch"
+    /// (`RunInstancesRequest$BlockDeviceMappings` doc, Amazon EC2 model) is what the launch
+    /// states them as, so each instance holds the volumes its collection asked for from the
+    /// moment Amazon EC2 launched it.
+    pub ebs_devices: Vec<EbsBlockDevice>,
+    /// "Indicates whether an Amazon EBS volume is EBS-optimized"
+    /// (`EbsConfiguration$EbsOptimized` doc) as the collection configured it, and `None` for
+    /// one that configured nothing — which leaves the launch stating none.
+    pub ebs_optimized: Option<bool>,
 }
 
 /// One instance Amazon EC2 launched, as this service keeps it.
@@ -245,6 +294,15 @@ pub struct LaunchedInstance {
     pub market: String,
     pub private_ip_address: Option<String>,
     pub private_dns_name: Option<String>,
+    /// The Availability Zone Amazon EC2 launched it in, read off its own answer — which is
+    /// where the Amazon EBS volumes this instance is given have to be created, since "the
+    /// volume and instance must be within the same Availability Zone"
+    /// (`AttachVolumeRequest$VolumeId` doc, Amazon EC2 model).
+    pub availability_zone: Option<String>,
+    /// The Amazon EBS volumes Amazon EC2 created for this instance at the devices its
+    /// collection mapped, read off the service that owns volumes as part of the launch
+    /// ([`launch_ebs_volumes`]) — which is what `Instance$EbsVolumes` reports.
+    pub ebs_volumes: Vec<InstanceEbsVolume>,
 }
 
 /// The instances the instance GROUP `group` asks for: "the target number of instances for
@@ -259,7 +317,32 @@ pub fn group_launch(group: &InstanceGroupRecord) -> Option<InstanceLaunch> {
         instance_type: group.config.instance_type.clone(),
         market: group.market().to_string(),
         count,
+        ebs_devices: ebs_block_devices(group.config.ebs_configuration.as_ref()),
+        ebs_optimized: group
+            .config
+            .ebs_configuration
+            .as_ref()
+            .and_then(|configuration| configuration.ebs_optimized),
     })
+}
+
+/// The units ONE instance the instance type configuration `config` provisions supplies toward
+/// a fleet's target capacities.
+///
+/// "The number of units that a provisioned instance of this type provides toward fulfilling
+/// the target capacities" (`InstanceTypeConfig$WeightedCapacity` doc, Smithy model). A
+/// configuration that states no weight, and a collection that states no configuration at all,
+/// supplies one unit per instance ([`DEFAULT_WEIGHTED_CAPACITY`]); a weight of zero would
+/// fulfil no capacity however many instances were provisioned, so one is the floor.
+///
+/// The ONE reading of that weight, so the instances a target needs
+/// ([`fleet_launches`]) and the units a managed scaling activity adds for one instance
+/// ([`super::managed_scaling`]) cannot disagree about one fleet.
+pub fn provisioned_weighted_capacity(config: Option<&InstanceTypeConfig>) -> i32 {
+    config
+        .and_then(|config| config.weighted_capacity)
+        .unwrap_or(DEFAULT_WEIGHTED_CAPACITY)
+        .max(1)
 }
 
 /// The instances the instance FLEET `fleet` asks for, one launch per market it targets.
@@ -278,15 +361,17 @@ pub fn fleet_launches(fleet: &InstanceFleetRecord) -> Vec<InstanceLaunch> {
     let Some(chosen) = configs.first() else {
         return Vec::new();
     };
-    let weight = chosen
-        .weighted_capacity
-        .unwrap_or(DEFAULT_WEIGHTED_CAPACITY)
-        .max(1);
+    let weight = provisioned_weighted_capacity(Some(chosen));
     let instances_for = |target: Option<i32>| -> i32 {
         let units = target.unwrap_or(0).max(0);
         // Units are covered, so the division rounds UP: a target the chosen type cannot
-        // divide exactly still gets an instance for the remainder.
-        units.saturating_add(weight - 1) / weight
+        // divide exactly still gets an instance for the remainder. The divisor is the units
+        // ONE instance supplies, which is never zero ([`provisioned_weighted_capacity`]), and
+        // a division by one that was is answered with no instance rather than performed.
+        units
+            .saturating_add(weight.saturating_sub(1))
+            .checked_div(weight)
+            .unwrap_or_default()
     };
     [
         (
@@ -307,6 +392,14 @@ pub fn fleet_launches(fleet: &InstanceFleetRecord) -> Vec<InstanceLaunch> {
         instance_type: chosen.instance_type.clone(),
         market: market.to_string(),
         count,
+        // The devices the CHOSEN instance type maps onto each of its instances, by the one
+        // rule both collection types name their devices by
+        // ([`super::fleet_ebs_block_devices`]).
+        ebs_devices: fleet_ebs_block_devices(chosen),
+        ebs_optimized: chosen
+            .ebs_configuration
+            .as_ref()
+            .and_then(|configuration| configuration.ebs_optimized),
     })
     .collect()
 }
@@ -367,6 +460,15 @@ pub struct LaunchPlacement {
     /// (`InstanceGroupConfig$CustomAmiId`) as the cluster states it
     /// (`RunJobFlow$CustomAmiId`), and `None` for a cluster that named none.
     pub custom_ami_id: Option<String>,
+    /// "The size, in GiB, of the Amazon EBS root device volume of the Linux AMI that is used
+    /// for each Amazon EC2 instance" (`RunJobFlow$EbsRootVolumeSize` doc), beside the IOPS
+    /// and the throughput of that same device (`$EbsRootVolumeIops`,
+    /// `$EbsRootVolumeThroughput`) — what the launch asked for the ROOT device of every one
+    /// of the cluster's instances, as against the devices a collection's `EbsConfiguration`
+    /// asks for. `None` leaves that device exactly as the image carries it.
+    pub ebs_root_volume_size: Option<i32>,
+    pub ebs_root_volume_iops: Option<i32>,
+    pub ebs_root_volume_throughput: Option<i32>,
     /// The cluster the instances belong to, which is what the Amazon EC2 placement group
     /// they are launched into is named after ([`Self::placement_group_name_for`]).
     pub cluster_id: String,
@@ -390,7 +492,7 @@ pub struct LaunchPlacement {
 /// (Amazon EMR Management Guide, "Tagging Amazon EMR clusters"), and the resources Amazon
 /// EMR creates for a cluster carry the cluster's identity the same way — which is how a
 /// client finds the Amazon EC2 resources of one cluster.
-const CLUSTER_ID_TAG: &str = "aws:elasticmapreduce:job-flow-id";
+pub(super) const CLUSTER_ID_TAG: &str = "aws:elasticmapreduce:job-flow-id";
 
 /// The service-managed tag naming the role an instance fills in its cluster, by the same
 /// rule: `MASTER`, `CORE` or `TASK`.
@@ -425,6 +527,9 @@ impl LaunchPlacement {
             key_name: cluster.instances.ec2_key_name.clone(),
             instance_profile: cluster.job_flow_role.clone(),
             custom_ami_id: cluster.custom_ami_id.clone(),
+            ebs_root_volume_size: cluster.ebs_root_volume_size,
+            ebs_root_volume_iops: cluster.ebs_root_volume_iops,
+            ebs_root_volume_throughput: cluster.ebs_root_volume_throughput,
             cluster_id: cluster.id.clone(),
             placement_groups: Self::effective_placement_groups(cluster),
             tags: cluster
@@ -528,6 +633,17 @@ impl LaunchPlacement {
 /// the instance reports the AMI the account's own catalogue holds.
 const DEFAULT_CLUSTER_IMAGE: &str =
     "resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64";
+
+/// The device a cluster's instances hold their ROOT volume at.
+///
+/// "Amazon EMR releases are based on Amazon Linux" (Amazon EMR Management Guide, "Amazon
+/// Linux release versions") and the root device of an Amazon Linux AMI is `/dev/xvda` (Amazon
+/// EC2 User Guide, "Device names on Linux instances" — "the root device name for an instance
+/// launched from a paravirtual or HVM Amazon Linux AMI"), so it is the device a cluster's
+/// launch states what it asks of its root volume at. A cluster launched from a custom AMI
+/// whose root device is some other name leaves that mapping naming a device the image does not
+/// carry, which is the same thing the launch would state to Amazon EC2 directly.
+const CLUSTER_ROOT_DEVICE_NAME: &str = "/dev/xvda";
 
 /// Ask Amazon EC2 to delete the placement groups `group_names` names, because the cluster
 /// they were created for is shutting down.
@@ -675,7 +791,7 @@ const PLACEMENT_GROUP_ALREADY_HELD: &str = "InvalidPlacementGroup.Duplicate";
 /// Amazon EC2 on the hop Amazon EMR makes rather than on anything a caller sent. A refusal is
 /// recorded and otherwise left alone — the resources exist and the cluster reports them; only
 /// the tags are missing.
-async fn tag_cluster_resources(
+pub(super) async fn tag_cluster_resources(
     client: &::aws_sdk_ec2::Client,
     resource_ids: &[String],
     tags: &[(String, String)],
@@ -779,6 +895,67 @@ pub async fn launch_cluster_instances(
                     .build(),
             );
         }
+        // The ROOT device of this cluster's instances, where the launch asked for one of its
+        // own: "the size, in GiB, of the Amazon EBS root device volume of the Linux AMI that
+        // is used for each Amazon EC2 instance" (`RunJobFlow$EbsRootVolumeSize` doc), with
+        // the IOPS and throughput of that same device. It is stated as the launch's mapping
+        // for the root device of the Amazon Linux image a cluster's instances run
+        // ([`CLUSTER_ROOT_DEVICE_NAME`]), which is how a launch states what it wants of a
+        // device the image already carries; the members the launch does not state are left as
+        // the image carries them.
+        if placement.ebs_root_volume_size.is_some()
+            || placement.ebs_root_volume_iops.is_some()
+            || placement.ebs_root_volume_throughput.is_some()
+        {
+            request = request.block_device_mappings(
+                ::aws_sdk_ec2::types::BlockDeviceMapping::builder()
+                    .device_name(CLUSTER_ROOT_DEVICE_NAME)
+                    .ebs(
+                        ::aws_sdk_ec2::types::EbsBlockDevice::builder()
+                            .set_volume_size(placement.ebs_root_volume_size)
+                            .set_iops(placement.ebs_root_volume_iops)
+                            .set_throughput(placement.ebs_root_volume_throughput)
+                            .build(),
+                    )
+                    .build(),
+            );
+        }
+        // The STORAGE this collection asks every one of its instances for: "the block device
+        // mapping, which defines the EBS volumes … to attach to the instance at launch"
+        // (`RunInstancesRequest$BlockDeviceMappings` doc, Amazon EC2 model) — so the volumes
+        // an `EbsConfiguration` asks for are created by the launch itself and the instance
+        // holds each one at the device Amazon EMR maps it to, rather than being attached
+        // afterwards. Each device states exactly what its `VolumeSpecification` asks for:
+        // "EBS volume specifications such as volume type, IOPS, size (GiB) and throughput
+        // (MiB/s) that are requested for the EBS volume attached to an Amazon EC2 instance in
+        // the cluster" (`VolumeSpecification` doc). They go with the instance, the way the
+        // cluster's own storage does.
+        for device in &launch.ebs_devices {
+            let (Some(device_name), Some(specification)) =
+                (device.device.as_deref(), device.volume_specification.as_ref())
+            else {
+                continue;
+            };
+            request = request.block_device_mappings(
+                ::aws_sdk_ec2::types::BlockDeviceMapping::builder()
+                    .device_name(device_name)
+                    .ebs(
+                        ::aws_sdk_ec2::types::EbsBlockDevice::builder()
+                            .volume_size(specification.size_in_gb)
+                            .volume_type(::aws_sdk_ec2::types::VolumeType::from(
+                                specification.volume_type.as_str(),
+                            ))
+                            .set_iops(specification.iops)
+                            .set_throughput(specification.throughput)
+                            .delete_on_termination(true)
+                            .build(),
+                    )
+                    .build(),
+            );
+        }
+        if let Some(ebs_optimized) = launch.ebs_optimized {
+            request = request.ebs_optimized(ebs_optimized);
+        }
         let answer = match request.send().await {
             Ok(answer) => answer,
             Err(error) => {
@@ -791,12 +968,13 @@ pub async fn launch_cluster_instances(
             }
         };
         let mut minted: Vec<String> = Vec::new();
+        let mut from_this_launch: Vec<LaunchedInstance> = Vec::new();
         for instance in answer.instances() {
             let Some(ec2_instance_id) = instance.instance_id() else {
                 continue;
             };
             minted.push(ec2_instance_id.to_string());
-            launched.push(LaunchedInstance {
+            from_this_launch.push(LaunchedInstance {
                 ec2_instance_id: ec2_instance_id.to_string(),
                 instance_group_id: launch.instance_group_id.clone(),
                 instance_fleet_id: launch.instance_fleet_id.clone(),
@@ -809,16 +987,120 @@ pub async fn launch_cluster_instances(
                 market: launch.market.clone(),
                 private_ip_address: instance.private_ip_address().map(str::to_string),
                 private_dns_name: instance.private_dns_name().map(str::to_string),
+                availability_zone: instance
+                    .placement()
+                    .and_then(|placement| placement.availability_zone())
+                    .map(str::to_string),
+                // Filled in from Amazon EC2's own answer below.
+                ebs_volumes: Vec::new(),
             });
         }
-        // The instances Amazon EMR just launched carry the cluster they belong to and the
-        // role they fill, plus the cluster's own tags it propagates to them.
+        // WHICH volume Amazon EC2 created for each device this launch mapped, asked of the
+        // service that owns volumes right where the launch that asked for them was made (see
+        // [`launch_ebs_volumes`]). The ids it answers are what `Instance$EbsVolumes` reports,
+        // so no volume is reported that Amazon EC2 does not hold.
+        let volumes = launch_ebs_volumes(&client, &minted, &launch.ebs_devices).await;
+        let mut volume_ids: Vec<String> = Vec::new();
+        for instance in &mut from_this_launch {
+            instance.ebs_volumes = volumes
+                .get(&instance.ec2_instance_id)
+                .cloned()
+                .unwrap_or_default();
+            volume_ids.extend(instance.ebs_volumes.iter().map(|volume| volume.volume_id.clone()));
+        }
+        launched.extend(from_this_launch);
+        // The instances Amazon EMR just launched — and the volumes the launch created for
+        // them — carry the cluster they belong to and the role they fill, plus the cluster's
+        // own tags it propagates to them.
         let mut instance_tags = vec![
             (CLUSTER_ID_TAG.to_string(), placement.cluster_id.clone()),
             (INSTANCE_ROLE_TAG.to_string(), launch.role.clone()),
         ];
         instance_tags.extend(placement.tags.iter().cloned());
-        tag_cluster_resources(&client, &minted, &instance_tags).await;
+        let mut tagged = minted;
+        tagged.extend(volume_ids);
+        tag_cluster_resources(&client, &tagged, &instance_tags).await;
     }
     launched
 }
+
+/// The Amazon EBS volumes Amazon EC2 created for the instances `ec2_instance_ids` at the
+/// devices `devices` maps, as `instance id -> volumes in device order`.
+///
+/// The launch asked Amazon EC2 for one volume per mapped device, so this asks Amazon EC2 which
+/// volume it created for each: ONE read of the volumes attached to those instances —
+/// "attachment.instance-id - The ID of the instance the volume is attached to"
+/// (`DescribeVolumes$Filters` doc, Amazon EC2 model) — filtered to the devices the collection
+/// mapped, so the cluster's own root volume, which no `EbsConfiguration` asked for, is not
+/// among them. A device Amazon EC2 reports no volume at contributes NONE, which is what keeps
+/// every `VolumeId` this service reports a volume `DescribeVolumes` resolves; so does a launch
+/// that mapped no device at all, which is not asked about.
+///
+/// `client` is the client the launch itself was made with: the in-process callback every
+/// emulated service reaches another through, which this module's header states the reading of
+/// — no socket is opened, nothing outside this process is reachable, and the credentials are
+/// the emulator's own.
+async fn launch_ebs_volumes(
+    client: &::aws_sdk_ec2::Client,
+    ec2_instance_ids: &[String],
+    devices: &[EbsBlockDevice],
+) -> ::std::collections::BTreeMap<String, Vec<InstanceEbsVolume>> {
+    let mut held: ::std::collections::BTreeMap<String, Vec<InstanceEbsVolume>> =
+        ::std::collections::BTreeMap::new();
+    let mapped: Vec<&str> = devices
+        .iter()
+        .filter_map(|device| device.device.as_deref())
+        .collect();
+    if mapped.is_empty() || ec2_instance_ids.is_empty() {
+        return held;
+    }
+    let answer = client
+        .describe_volumes()
+        .filters(
+            ::aws_sdk_ec2::types::Filter::builder()
+                .name(VOLUME_ATTACHMENT_INSTANCE_FILTER)
+                .set_values(Some(ec2_instance_ids.to_vec()))
+                .build(),
+        )
+        .send()
+        .await;
+    let answer = match answer {
+        Ok(answer) => answer,
+        Err(error) => {
+            ::tracing::debug!(
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "Amazon EC2 reported no Amazon EBS volumes for this collection's instances"
+            );
+            return held;
+        }
+    };
+    for ec2_instance_id in ec2_instance_ids {
+        // One entry per device the collection mapped, in the collection's own device order,
+        // which is the order the devices are exposed on the node.
+        let volumes: Vec<InstanceEbsVolume> = mapped
+            .iter()
+            .filter_map(|device_name| {
+                let volume_id = answer.volumes().iter().find_map(|volume| {
+                    let attached_here = volume.attachments().iter().any(|attachment| {
+                        attachment.instance_id() == Some(ec2_instance_id.as_str())
+                            && attachment.device() == Some(*device_name)
+                    });
+                    attached_here.then(|| volume.volume_id()).flatten()
+                })?;
+                Some(InstanceEbsVolume {
+                    device: (*device_name).to_string(),
+                    volume_id: volume_id.to_string(),
+                })
+            })
+            .collect();
+        if !volumes.is_empty() {
+            held.insert(ec2_instance_id.clone(), volumes);
+        }
+    }
+    held
+}
+
+/// The Amazon EC2 volume filter naming the instance a volume is attached to:
+/// "attachment.instance-id - The ID of the instance the volume is attached to"
+/// (`DescribeVolumes$Filters` doc, Amazon EC2 model).
+const VOLUME_ATTACHMENT_INSTANCE_FILTER: &str = "attachment.instance-id";

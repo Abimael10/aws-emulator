@@ -365,6 +365,11 @@ pub fn launch<Eng: Send + Sync + 'static>(
             // the one its AMI carries (Amazon EC2 applies the Region's EBS encryption default
             // to it where that is on).
             root_block_device: parameters.root_block_device.clone(),
+            // A capacity change resolves the ROOT device of the version it launches from and
+            // no other: the Amazon EBS devices a version names beside it are this launch
+            // path's own gap, the same one that leaves a launch CONFIGURATION with no root
+            // device of its own.
+            data_block_devices: Vec::new(),
             disable_api_termination: parameters.disable_api_termination,
             tags: tags.clone(),
             // No client token: this launch is not a caller's request to replay.

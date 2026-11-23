@@ -831,6 +831,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             monitoring_configuration: input.monitoring_configuration,
             instances,
             managed_scaling_policy: input.managed_scaling_policy,
+            // The first managed scaling activity a policy the launch attached owes is
+            // scheduled by the activity itself, a span after the clock first reaches it
+            // (`crate::state::managed_scaling`), so a launch schedules none here.
+            managed_scaling_due_at: None,
             // "An auto-termination policy for an Amazon EMR cluster."
             // (RunJobFlow$AutoTerminationPolicy doc.) A policy attached at creation is
             // the same attachment `PutAutoTerminationPolicy` makes, so it is persisted
@@ -902,21 +906,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             None => Vec::new(),
         };
-        {
-            let mut launched_store = state.lock();
-            let instance_ids: Vec<String> = (0..launched.len())
-                .map(|_| launched_store.mint_cluster_instance_id())
-                .collect();
-            if let Some(cluster) = launched_store.clusters.get_mut(&id) {
-                cluster.ec2_instances = instance_ids
-                    .into_iter()
-                    .zip(launched)
-                    .map(|(instance_id, launched)| {
-                        crate::state::ClusterInstanceRecord::launched(instance_id, launched, now)
-                    })
-                    .collect();
-            }
-        }
+        // Every instance Amazon EC2 launched becomes a record of this cluster, with the
+        // Amazon EBS volumes its own collection asks for created in the service that owns
+        // volumes first — the ONE path a launched instance is recorded through
+        // ([`crate::state::record_launched_instances`]).
+        crate::state::record_launched_instances(&*self.engine, &id, launched, now).await;
 
         // The cluster is persisted: the record names the id it was minted under, which is
         // what attributes the change after the fact.

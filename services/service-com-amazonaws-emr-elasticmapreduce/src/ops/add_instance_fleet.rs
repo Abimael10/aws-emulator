@@ -318,21 +318,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             None => Vec::new(),
         };
-        {
-            let mut launched_store = state.lock();
-            // Every instance Amazon EC2 launched is recorded: the plan it was asked for was
-            // already cut to the room this cluster has, so nothing it minted is dropped here.
-            let instance_ids: Vec<String> = (0..launched.len())
-                .map(|_| launched_store.mint_cluster_instance_id())
-                .collect();
-            if let Some(cluster) = launched_store.clusters.get_mut(&input.cluster_id) {
-                for (instance_id, launched) in instance_ids.into_iter().zip(launched) {
-                    cluster.ec2_instances.push(
-                        crate::state::ClusterInstanceRecord::launched(instance_id, launched, now),
-                    );
-                }
-            }
-        }
+        // Every instance Amazon EC2 launched becomes a record of this cluster, carrying the
+        // Amazon EBS volumes the launch created for it: the plan it was asked for was already
+        // cut to the room this cluster has, so nothing it minted is dropped
+        // ([`crate::state::record_launched_instances`]).
+        crate::state::record_launched_instances(&*self.engine, &input.cluster_id, launched, now)
+            .await;
 
         Ok(AddInstanceFleetOutput {
             cluster_id: Some(input.cluster_id),

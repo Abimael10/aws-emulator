@@ -189,6 +189,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // The whole modification is applied while this service's store is held, and the
+        // guard is given up with the block — the settling of capacity below is a call into
+        // the service that owns instances and may not be made under it.
+        {
         let mut store = state.lock();
 
         // A resize changes fleet state, so every transition the clock already made due is
@@ -290,6 +294,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is the whole modification.
         fleet.apply_modification(&input.instance_fleet);
         drop(store);
+        }
+
+        // A fleet whose target capacities moved is then provisioned up to them, or released
+        // down to them, in the service that owns instances — the one settling of capacity
+        // every target move of this service goes through
+        // ([`crate::state::settle_cluster_capacity`]), made with no store guard held.
+        crate::state::settle_cluster_capacity(
+            &*self.engine,
+            ctx,
+            &crate::state::request_region(ctx.parts()),
+            &input.cluster_id,
+            now,
+        )
+        .await;
 
         Ok(ModifyInstanceFleetOutput)
     }

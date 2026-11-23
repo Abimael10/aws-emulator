@@ -111,15 +111,15 @@ fn fleet_normalized_units(fleet: &InstanceFleetRecord) -> i64 {
     else {
         return 0;
     };
-    let weight = i64::from(
-        specification
-            .weighted_capacity
-            .unwrap_or(DEFAULT_WEIGHTED_CAPACITY)
-            .max(1),
-    );
+    let weight = i64::from(provisioned_weighted_capacity(Some(specification)));
+    // The weight is the units ONE instance supplies, which is never zero — one is the floor
+    // [`provisioned_weighted_capacity`] holds it to, since an instance supplying no unit would
+    // fulfil no capacity however many were provisioned — and a division by one that was is
+    // answered with no instance rather than performed.
     let instances = capacity
         .saturating_add(weight.saturating_sub(1))
-        .saturating_div(weight);
+        .checked_div(weight)
+        .unwrap_or_default();
     instances.saturating_mul(normalization_factor(&specification.instance_type))
 }
 
