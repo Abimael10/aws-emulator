@@ -79,6 +79,17 @@
 //! identity-based document, over a target whose own policy grants it nothing, grants
 //! nothing, which is the implicit deny every identity starts from.
 //!
+//! That last reading is the INVOKED SERVICE's: a `Task` state's call is a call to
+//! another service, which decides the same request itself when the call reaches its own
+//! front door, so the gate standing in for that answer reads the documents the way that
+//! service does. ONE decision of this module is not such a call — the child workflow
+//! executions a Distributed Map state starts, which Step Functions makes itself, on the
+//! state machine the Map Run belongs to — and it rests on [`Evidence::HeldDocuments`]:
+//! no other authority answers it and it fails the whole run before its first item, so a
+//! role this account holds no identity-based document for shows nothing about it, as an
+//! unreadable attachment does. RECORDED: a Map Run whose execution role carries no such
+//! document in this emulator runs its children and reports SUCCEEDED.
+//!
 //! ## Assuming the role at all
 //!
 //! Acting as the role is itself a call this service makes, BEFORE any of the above:
@@ -392,6 +403,28 @@ fn denied_answer(api: &Api, denied: Option<Denied>) -> (&'static str, u16) {
     )
 }
 
+/// What a decision about what the execution role may do is allowed to rest on.
+///
+/// The documents this account holds decide every call either way; the two readings
+/// differ only about a role the account holds NO identity-based document for, which is a
+/// role whose permissions were written outside this emulator exactly as the role itself
+/// may have been ([`unassumable_role`]'s deploy-time/run-time split, and
+/// [`super::execution_role_session::role_session`], which mints no session for such a
+/// role rather than refusing its calls).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Evidence {
+    /// Every document, and the IMPLICIT DENY a role carrying none starts from: the
+    /// reading the INVOKED service takes of the same request when a `Task` state's call
+    /// reaches its own front door, which is what the gate standing in for that answer
+    /// has to read.
+    Documents,
+    /// Only what this account HOLDS: a role it holds no identity-based document for
+    /// shows nothing about the call, as an attachment whose document it does not hold
+    /// does. The reading for a decision NO other authority answers — the child workflow
+    /// executions Step Functions itself starts for a Map Run.
+    HeldDocuments,
+}
+
 /// What decides whether the role `role_arn` may make the calls of one walk, or `None`
 /// when there is nothing to decide them against — an engine with no IAM store, or an
 /// execution carrying no role at all.
@@ -413,6 +446,11 @@ fn denied_answer(api: &Api, denied: Option<Denied>) -> (&'static str, u16) {
 /// assume would have minted. It is therefore answered before the policies in force on
 /// the role are read at all.
 ///
+/// `evidence` is what the gate's decisions may rest on ([`Evidence`]), which is why one
+/// walk is handed TWO gates: the calls it makes to other services read the documents as
+/// those services do, and the child workflow starts this service makes itself read what
+/// the account holds.
+///
 /// Apart from that, the gate is consulted once per call the walk asks for, so a
 /// statement withdrawn between two states of one execution stops granting from the
 /// next call: nothing is read in advance and nothing is cached.
@@ -422,6 +460,7 @@ pub fn role_gate<Eng: Send + Sync + 'static>(
     role_arn: &str,
     unassumable: Option<Failed>,
     session_name: &str,
+    evidence: Evidence,
 ) -> Option<RoleGate> {
     if role_arn.is_empty() {
         return None;
@@ -482,6 +521,7 @@ pub fn role_gate<Eng: Send + Sync + 'static>(
                     code,
                     status,
                 },
+                evidence,
             ) {
                 // The refusal reaches the state as the error the invoked OPERATION models
                 // for an unauthorized call, where it models one; an operation that models
@@ -539,6 +579,11 @@ fn iam_state<Eng: Send + Sync + 'static>(
 pub struct Acting {
     /// What decides whether the execution role may make a call ([`role_gate`]).
     pub role: Option<RoleGate>,
+    /// What decides whether the execution role may have the CHILD WORKFLOW EXECUTIONS
+    /// of a Distributed Map state started for it: the same gate over the same documents,
+    /// on the evidence a decision no invoked service answers may rest on
+    /// ([`Evidence::HeldDocuments`]).
+    pub child_starts: Option<RoleGate>,
     /// What resolves the connection an HTTP Task names
     /// ([`super::http_task::connections`]).
     pub connections: Option<super::http_task::Connections>,
@@ -576,6 +621,7 @@ impl ::std::fmt::Debug for Acting {
         formatter
             .debug_struct("Acting")
             .field("role", &self.role.is_some())
+            .field("child_starts", &self.child_starts.is_some())
             .field("connections", &self.connections.is_some())
             .field("handovers", &self.handovers.is_some())
             .field("map_runs", &self.map_runs.is_some())
@@ -623,7 +669,25 @@ pub fn acting<Eng: Send + Sync + 'static>(
         .as_ref()
         .map_or_else(new_session_name, |session| session.session_name.clone());
     Acting {
-        role: role_gate(engine, region, role_arn, unassumable, &session_name),
+        role: role_gate(
+            engine,
+            region,
+            role_arn,
+            unassumable.clone(),
+            &session_name,
+            Evidence::Documents,
+        ),
+        // The SAME gate over the same documents, for the one decision no invoked service
+        // answers: the child workflow executions a Distributed Map state starts
+        // ([`Evidence::HeldDocuments`]).
+        child_starts: role_gate(
+            engine,
+            region,
+            role_arn,
+            unassumable,
+            &session_name,
+            Evidence::HeldDocuments,
+        ),
         connections: super::http_task::connections(engine),
         handovers: super::callbacks::handovers(engine),
         // A walk that BEGINS an attempt runs every item of every Map state it enters,
@@ -686,6 +750,9 @@ pub fn job_report_denial<Eng: Send + Sync + 'static>(
             code,
             status,
         },
+        // The reporting call is a call to the invoked service, which answers the same
+        // request itself: the documents are read as that service reads them.
+        Evidence::Documents,
     )?;
     Some(Failed {
         error: TASK_FAILED_ERROR.to_string(),
@@ -745,6 +812,10 @@ pub fn role_is_denied<Eng: Send + Sync + 'static>(
             action,
             resource,
             target_policy.as_deref(),
+            // The capability is one the role's documents have to state: this reading
+            // answers a call this service makes to another service's API on the role's
+            // behalf, so a role carrying no document states nothing that allows it.
+            Evidence::Documents,
         )
         .is_some()
     })
@@ -787,8 +858,9 @@ fn refusal(
     resource: &str,
     target_policy: Option<&str>,
     answered: Answered<'_>,
+    evidence: Evidence,
 ) -> Option<String> {
-    let sentence = not_authorized(iam, acts, action, resource, target_policy)?;
+    let sentence = not_authorized(iam, acts, action, resource, target_policy, evidence)?;
     Some(super::integration::sdk_exception_message(
         answered.api,
         answered.family,
@@ -830,8 +902,9 @@ fn not_authorized(
     action: &str,
     resource: &str,
     target_policy: Option<&str>,
+    evidence: Evidence,
 ) -> Option<String> {
-    let because = withheld(iam, acts, action, resource, target_policy)?;
+    let because = withheld(iam, acts, action, resource, target_policy, evidence)?;
     let principal = acting_principal(acts.role_arn, acts.session_name);
     Some(format!(
         "User: {principal} is not authorized to perform: {action} on resource: {resource} \
@@ -851,12 +924,17 @@ fn not_authorized(
 /// The ONE decision about a state machine's role in this crate: whatever the refusal is
 /// then reported AS — an invoked service's SDK exception ([`refusal`]), or a sentence
 /// this service words itself — the documents are read here, in this order.
+///
+/// `evidence` is what the decision may rest on ([`Evidence`]): every caller but the
+/// service's own child-workflow start reads the documents as the INVOKED service does,
+/// implicit deny included.
 fn withheld(
     iam: &IamState,
     acts: Acts<'_>,
     action: &str,
     resource: &str,
     target_policy: Option<&str>,
+    evidence: Evidence,
 ) -> Option<String> {
     let role_arn = acts.role_arn;
     iam.roles.values().find(|role| role.arn == role_arn)?;
@@ -903,11 +981,16 @@ fn withheld(
     // Whether the documents in force grant the call at all. Nothing stated is IAM's
     // implicit deny, so a role carrying NO identity-based document grants nothing: a
     // grant has to come from a document, which is how IAM's own gate over this same
-    // store reads the identity it holds. An attachment whose document this account does
-    // not hold is the one grant this emulator cannot read, so it cannot be the basis of
-    // a refusal — but it cannot overturn one either: an explicit `Deny` in a document
-    // that IS held wins over every grant, including one whose content is unknown here.
-    let granted = iam::is_allowed(stated, Decision::NotStated) || !policies.uncarried.is_empty();
+    // store reads the identity it holds — except where the decision rests on what this
+    // account HOLDS alone ([`Evidence::HeldDocuments`]), and there a role it holds no
+    // document for shows nothing rather than denying. An attachment whose document this
+    // account does not hold is the grant this emulator cannot read either way, so it
+    // cannot be the basis of a refusal — but neither can overturn one: an explicit `Deny`
+    // in a document that IS held wins over every grant, including one whose content is
+    // unknown here.
+    let unreadable = !policies.uncarried.is_empty()
+        || (evidence == Evidence::HeldDocuments && policies.documents.is_empty());
+    let granted = iam::is_allowed(stated, Decision::NotStated) || unreadable;
     // "A permissions boundary sets the maximum permissions that an identity-based
     // policy can grant to an entity": the boundary CAPS what those policies grant and
     // grants nothing itself, so a call it does not allow is refused even where they

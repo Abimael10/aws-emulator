@@ -3601,6 +3601,11 @@ impl Interpreter<'_> {
     /// be made, which is neither retried nor caught — and it carries the refusal the
     /// start came back with, so an operator reads which principal was denied which
     /// action on which state machine.
+    ///
+    /// The start is Step Functions' OWN, so no invoked service answers it: it is decided
+    /// on what the account HOLDS about the role ([`Tasks::authorize_child_start`])
+    /// rather than on the reading an invoked service's front door takes of a call made
+    /// as that role.
     pub(super) fn child_start_denial(&self) -> Option<Failure> {
         let call = match super::super::integration::read(CHILD_START_RESOURCE) {
             Ok(call) => call,
@@ -3617,7 +3622,7 @@ impl Interpreter<'_> {
             }
         };
         let request = serde_json::json!({ "StateMachineArn": self.state_machine_arn() });
-        let denied = self.tasks.authorize(&call, &request)?;
+        let denied = self.tasks.authorize_child_start(&call, &request)?;
         Some(runtime(denied.cause))
     }
 

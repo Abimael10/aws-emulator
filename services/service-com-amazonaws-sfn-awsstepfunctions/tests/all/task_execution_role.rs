@@ -164,6 +164,17 @@ impl Chain {
 
     /// Call one Step Functions operation, requiring a 200.
     pub(crate) async fn sfn(&self, operation: &str, body: &Value) -> Value {
+        let (status, parsed) = self.call(operation, body).await;
+        assert_eq!(
+            status, 200,
+            "case {operation}: expected 200, got {status} with body {parsed:?}"
+        );
+        parsed
+    }
+
+    /// Call one Step Functions operation and answer the status it came back with beside
+    /// the body, for a suite whose rows expect a REFUSAL as well as a 200.
+    pub(crate) async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
         let authorization = format!(
             "AWS4-HMAC-SHA256 Credential={ACCOUNT_KEY}/20260101/{REGION}/states/aws4_request, \
              SignedHeaders=host;x-amz-target, Signature=0123456789abcdef"
@@ -183,11 +194,7 @@ impl Chain {
         let status = response.status().as_u16();
         let bytes = response.into_body();
         let parsed: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-        assert_eq!(
-            status, 200,
-            "case {operation}: expected 200, got {status} with body {parsed:?}"
-        );
-        parsed
+        (status, parsed)
     }
 
     /// One awsQuery call to IAM, signed with the same credential.

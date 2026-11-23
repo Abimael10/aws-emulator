@@ -2107,6 +2107,21 @@ pub trait Tasks: Send + Sync {
         None
     }
 
+    /// Why the execution role this walk runs as may NOT have the CHILD WORKFLOW
+    /// EXECUTIONS of a Distributed Map state started for it, or `None` when nothing of
+    /// the kind can be shown.
+    ///
+    /// Step Functions starts those executions ITSELF, on the state machine the Map Run
+    /// belongs to, so no invoked service answers this one and it fails the whole run
+    /// before its first item: it is therefore decided on what the account HOLDS about
+    /// the role ([`super::task_authorization::Evidence::HeldDocuments`]) rather than on
+    /// the implicit deny an invoked service's own front door would apply to a call made
+    /// as that role ([`Tasks::authorize`]). The default shows nothing, for a walk with
+    /// no role to judge the start against.
+    fn authorize_child_start(&self, _call: &Call, _request: &Value) -> Option<Failed> {
+        None
+    }
+
     /// The Map Run the Distributed Map state labelled `label` is ALREADY running
     /// ([`ResumedMapRun`]), for the `occurrence`-th entry this walk makes into a state
     /// with that label — one Distributed Map nested inside another is entered once per
@@ -2954,6 +2969,11 @@ struct Dispatcher {
     /// when the call that started the walk could resolve that role; `None` leaves
     /// every call unjudged, which is what a walk with no role to ask about does.
     role: Option<RoleGate>,
+    /// What decides whether the CHILD WORKFLOW EXECUTIONS of a Distributed Map state of
+    /// this walk may be started for the execution role
+    /// ([`super::task_authorization::Evidence::HeldDocuments`]); `None` leaves them
+    /// unjudged, which is what a walk with no role to ask about does.
+    child_starts: Option<RoleGate>,
     /// Where the handover of a callback token is recorded and its answer read back
     /// ([`CallbackHandovers`]); `None` for a walk with no store to record one in.
     handovers: Option<Handovers>,
@@ -3185,6 +3205,10 @@ impl Tasks for Dispatcher {
         self.role.as_ref()?(call, request)
     }
 
+    fn authorize_child_start(&self, call: &Call, request: &Value) -> Option<Failed> {
+        self.child_starts.as_ref()?(call, request)
+    }
+
     fn hand_over(&self, token: &str, execution_arn: &str, state_name: &str) {
         if let Some(handovers) = &self.handovers {
             handovers.handed_over(token, execution_arn, state_name);
@@ -3271,6 +3295,7 @@ where
     let (calls, mut handovers) =
         ::tokio::sync::mpsc::channel::<Handover>(MAX_CALLS_IN_FLIGHT + 1);
     let role = acting.role;
+    let child_starts = acting.child_starts;
     let connections = acting.connections;
     let handed = acting.handovers;
     let resumed_map_runs = acting.map_runs;
@@ -3288,6 +3313,7 @@ where
             calls,
             depth,
             role,
+            child_starts,
             handovers: handed,
             map_runs: resumed_map_runs,
             activities: known_activities,
