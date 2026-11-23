@@ -322,7 +322,7 @@ async fn a_named_parameter_of_each_engine_reports_its_published_domain() {
         &'static str,
         bool,
     );
-    let rows: [Row; 8] = [
+    let rows: [Row; 9] = [
         (
             "the PostgreSQL planner GUC the recorded case read",
             "postgres17",
@@ -374,12 +374,24 @@ async fn a_named_parameter_of_each_engine_reports_its_published_domain() {
             true,
         ),
         (
-            "a MySQL parameter whose domain is an enumeration",
+            "a MySQL parameter whose domain is an enumeration of values",
+            "mysql8.0",
+            "binlog_format",
+            APPLY_TYPE_DYNAMIC,
+            "string",
+            "ROW,STATEMENT,MIXED",
+            "MIXED",
+            true,
+        ),
+        (
+            // A three-valued integer setting: its domain is the RUN from 0 to 2, which the
+            // published list writes as that range rather than as an enumeration.
+            "a MySQL integer parameter whose domain is a short run",
             "mysql8.0",
             "innodb_flush_log_at_trx_commit",
             APPLY_TYPE_DYNAMIC,
             "integer",
-            "0,1,2",
+            "0-2",
             "1",
             true,
         ),
@@ -464,7 +476,7 @@ async fn a_value_outside_a_parameters_published_domain_is_refused_naming_that_do
     let router = emulator();
 
     // (case, family, parameter, published domain, an admitted value, a refused value)
-    let rows: [(&str, &str, &str, &str, &str, &str); 6] = [
+    let rows: [(&str, &str, &str, &str, &str, &str); 7] = [
         (
             "below the low bound of a PostgreSQL range",
             "postgres17",
@@ -498,10 +510,18 @@ async fn a_value_outside_a_parameters_published_domain_is_refused_naming_that_do
             "2",
         ),
         (
-            "outside a MySQL enumeration",
+            "outside a MySQL enumeration of values",
+            "mysql8.0",
+            "binlog_format",
+            "ROW,STATEMENT,MIXED",
+            "ROW",
+            "BINARY",
+        ),
+        (
+            "outside a MySQL integer run published as a range",
             "mysql8.0",
             "innodb_flush_log_at_trx_commit",
-            "0,1,2",
+            "0-2",
             "2",
             "3",
         ),

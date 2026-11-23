@@ -402,12 +402,12 @@ async fn every_page_of_a_groups_parameter_report_carries_the_catalogue_record() 
 /// test rather than moving with it.
 ///
 /// `(parameter, apply type, data type, allowed values, description)`. The values are the
-/// records the MySQL engine's own configuration documentation publishes for these parameters,
-/// which is what Amazon RDS reports as `Parameter$ApplyType` / `$DataType` / `$AllowedValues` /
-/// `$Description` for the `mysql8.0` family. `host_cache_size`, `innodb_compression_level` and
-/// `innodb_fill_factor` are the parameters the recorded case read; `completion_type`,
-/// `div_precision_increment` and `innodb_change_buffer_max_size` are parameters it never
-/// mentioned.
+/// records the published parameter list of the `mysql8.0` family carries for these
+/// parameters, which is what Amazon RDS reports as `Parameter$ApplyType` / `$DataType` /
+/// `$AllowedValues` / `$Description` for that family. `host_cache_size`,
+/// `innodb_compression_level` and `innodb_fill_factor` are the parameters the recorded case
+/// read; `completion_type`, `div_precision_increment` and `innodb_change_buffer_max_size`
+/// are parameters it never mentioned.
 type Row = (
     &'static str,
     &'static str,
@@ -422,8 +422,8 @@ const NAMED_ROWS: [Row; 6] = [
         "completion_type",
         "dynamic",
         "integer",
-        "0,1,2",
-        "The transaction completion type.",
+        "0-2",
+        "The transaction completion type (0 - default, 1 - chain, 2 - release)",
     ),
     (
         "div_precision_increment",
@@ -453,8 +453,8 @@ const NAMED_ROWS: [Row; 6] = [
         "dynamic",
         "integer",
         "0-9",
-        "Specifies the level of zlib compression to use for InnoDB compressed tables and \
-         indexes.",
+        "Sets the cutoff point at which MySQL begins adding padding within compressed pages \
+         to avoid expensive compression failures.",
     ),
     (
         "innodb_fill_factor",

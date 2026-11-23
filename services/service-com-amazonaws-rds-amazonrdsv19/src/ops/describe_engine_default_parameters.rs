@@ -744,6 +744,18 @@ const ENGINES_NUMBERED_INDEPENDENTLY: [&str; 1] = ["mariadb"];
 /// value, whether a caller may modify it, the engine version it was introduced in, and
 /// the description the API reports for it. One argument per member of the record it
 /// builds, which is what lets the tables below be read as rows of published data.
+///
+/// `allowed_values` is the published domain in the FORM the published list writes it, since
+/// that string is what `Parameter$AllowedValues` reports and what a client parses to decide
+/// whether a candidate value is legal: a numeric parameter whose domain is the whole run
+/// between two bounds is written as the hyphenated range `<low>-<high>` — `0-2` for a
+/// three-valued integer setting, never the enumeration `0,1,2` — and a domain that is a SET
+/// of values rather than a run is written as the comma-separated list of them, which is the
+/// form a boolean's two values (`0,1`) and a string parameter's value list take. The two
+/// forms are also what the refusal of an out-of-domain write is worded by
+/// (`service_common::rds_cluster_parameters::validate_known_setting`), so writing a run as a
+/// list would both report a domain the service never reports and refuse a value in the
+/// wrong sentence.
 #[allow(clippy::too_many_arguments)]
 pub(crate) const fn parameter(
     name: &'static str,
@@ -1174,25 +1186,27 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         crate::state::APPLY_TYPE_DYNAMIC,
         "integer",
         // The engine numbers the three completion behaviours 0, 1 and 2 (`NO_CHAIN`, `CHAIN`
-        // and `RELEASE`), and the published list enumerates the numbers.
-        "0,1,2",
+        // and `RELEASE`), which is the whole run from 0 to 2 and so is published as that
+        // range (see [`parameter`]).
+        "0-2",
         "0",
         true,
         "",
-        "The transaction completion type.",
+        // The published text names the three behaviours beside their numbers, and ends
+        // without a period, as the list writes it.
+        "The transaction completion type (0 - default, 1 - chain, 2 - release)",
     ),
     parameter(
         "concurrent_insert",
         crate::state::APPLY_TYPE_DYNAMIC,
         "integer",
-        // `NEVER`, `AUTO` and `ALWAYS` as the engine numbers them.
-        "0,1,2",
+        // `NEVER`, `AUTO` and `ALWAYS` as the engine numbers them: the run from 0 to 2.
+        "0-2",
         "1",
         true,
         "",
-        "If AUTO (the default), MySQL permits INSERT and SELECT statements to run \
-         concurrently for MyISAM tables that have no free blocks in the middle of the data \
-         file.",
+        "Allows INSERT and SELECT statements to run concurrently for MyISAM tables that \
+         have no free blocks in the middle of the data file.",
     ),
     parameter(
         "connect_timeout",
@@ -1305,7 +1319,8 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "86400",
         true,
         "8.0.0",
-        "The period of time before cached table statistics expire.",
+        "The number of seconds after which mysqld server will fetch data from storage \
+         engine and replace the data in cache.",
     ),
     parameter(
         "innodb_adaptive_flushing_lwm",
@@ -1315,8 +1330,8 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "10",
         true,
         "",
-        "Defines the low water mark representing percentage of redo log capacity at which \
-         adaptive flushing is enabled.",
+        "Low water mark representing percentage of redo log capacity at which adaptive \
+         flushing is enabled.",
     ),
     parameter(
         "innodb_autoextend_increment",
@@ -1326,8 +1341,10 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "64",
         true,
         "",
-        "The increment size (in MB) for extending the size of an auto-extending InnoDB \
-         system tablespace file when it becomes full.",
+        // As the published list writes it: an auto-extending tablespace file, and no
+        // trailing period.
+        "The increment size (in MB) for extending the size of an auto-extending tablespace \
+         file when it becomes full",
     ),
     parameter(
         "innodb_buffer_pool_dump_pct",
@@ -1382,8 +1399,13 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "6",
         true,
         "",
-        "Specifies the level of zlib compression to use for InnoDB compressed tables and \
-         indexes.",
+        // The published list gives this entry the same sentence it gives the compression
+        // failure threshold above, so that is the text the API reports for it: a
+        // description is the catalog's value for the parameter NAME, and reporting the
+        // sentence the engine's own manual writes for the variable instead would report a
+        // `Parameter$Description` the service never reports.
+        "Sets the cutoff point at which MySQL begins adding padding within compressed pages \
+         to avoid expensive compression failures.",
     ),
     parameter(
         "innodb_compression_pad_pct_max",
@@ -1423,7 +1445,8 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "innodb_flush_log_at_trx_commit",
         crate::state::APPLY_TYPE_DYNAMIC,
         "integer",
-        "0,1,2",
+        // The run from 0 to 2, published as that range (see [`parameter`]).
+        "0-2",
         "1",
         true,
         "",
@@ -1434,8 +1457,9 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "innodb_flush_neighbors",
         crate::state::APPLY_TYPE_DYNAMIC,
         "integer",
-        // Off, the same extent, or the whole contiguous block of dirty pages.
-        "0,1,2",
+        // Off, the same extent, or the whole contiguous block of dirty pages: the run from
+        // 0 to 2.
+        "0-2",
         "0",
         true,
         "",
@@ -1450,7 +1474,9 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "50",
         true,
         "",
-        "The time in seconds an InnoDB transaction waits for a row lock before giving up.",
+        // As the published list writes it, lower-cased engine name and no trailing period
+        // included.
+        "Timeout in seconds an innodb transaction may wait for a row lock before giving up",
     ),
     parameter(
         "innodb_print_all_deadlocks",

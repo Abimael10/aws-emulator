@@ -471,11 +471,21 @@ const DOMAIN_ROWS: &[DomainRow] = &[
         refused: "not_a_valid_enum_value",
     },
     DomainRow {
-        case: "a MySQL value list of integers",
+        case: "a MySQL value list",
+        cluster_level: false,
+        family: "mysql8.0",
+        parameter: "binlog_checksum",
+        domain: "NONE,CRC32",
+        refused: "ADLER32",
+    },
+    DomainRow {
+        // A three-valued integer setting: the published domain is the RUN from 0 to 2, so it
+        // takes the range form and the refusal takes the range wording with it.
+        case: "a MySQL integer run published as a range",
         cluster_level: false,
         family: "mysql8.0",
         parameter: "innodb_flush_log_at_trx_commit",
-        domain: "0,1,2",
+        domain: "0-2",
         refused: "3",
     },
     DomainRow {
