@@ -48,3 +48,48 @@ Note on values: the bucket name, queue names/URLs/ARNs, the object key and the p
 5. Drain Q_removed over a hold window and expect zero real (non-TestEvent) records.
 6. s3:DeleteObject(B, "route-me.txt"); expect one message on Q_removed with Records[0].eventName starting with "ObjectRemoved", and zero real records on Q_created over a hold window.
 7. Re-replay check id events__s3__sqs.s3-multi-event-type-routing-sqs to confirm the fix.
+
+## Resolution
+
+No emulator change was needed: the per-event-class routing this report is about is served, and
+the replay's timeout is the check's OWN long polling rather than a withheld delivery.
+
+What the emulator does for exactly the configuration this report describes — a container with
+one `QueueConfiguration` scoped to `s3:ObjectCreated:*` on one queue and one scoped to
+`s3:ObjectRemoved:*` on another, each queue granting `s3.amazonaws.com` `sqs:SendMessage`
+narrowed by `aws:SourceArn` to the bucket:
+
+* `PUT /<bucket>?notification` is accepted (200) and each newly attached queue is handed exactly
+  one `{"Service":"Amazon S3","Event":"s3:TestEvent",...}` body, carrying no `Records`;
+* a `PUT` of an object publishes exactly ONE `Records` message to the created-class queue, whose
+  `Records[0].eventName` is `ObjectCreated:Put` and whose `Records[0].s3.configurationId` is that
+  entry's `Id`, and NOTHING to the removed-class queue;
+* a `DELETE` of that key publishes exactly ONE `Records` message to the removed-class queue,
+  whose `eventName` is `ObjectRemoved:Delete` and whose `configurationId` is that entry's `Id`,
+  and NOTHING to the created-class queue.
+
+The check is nonetheless cut off, because its own client-side long polls spend the whole replay
+budget: every `ReceiveMessage` it makes carries `WaitTimeSeconds=5`, and a poll that finds the
+queue empty — the one each drain and each hold-window look ends on — is 5 s of waiting the
+emulator MUST honour ("the duration (in seconds) for which the call waits for a message to
+arrive in the queue before returning", `ReceiveMessageRequest$WaitTimeSeconds`), against a 60 s
+replay cap while the check's own budget is far larger. Nothing the emulator can answer shortens
+those windows, so the replay unit still ends `Check timed out after 60.0s` and remains
+UNVERIFIED by the replay: the harness budget, not the emulator, is what stops it, and what
+stands in its place is the coverage below. The sibling report
+`issues/things-that-now-work/20261114T203940Z-events-s3-sqs-the-post-object-vs-putobject.md`
+records the same shape of replay timeout for the same reason.
+
+What the fix commits is the coverage that was missing for this configuration:
+
+* `core/router/tests/all/s3_notification_routes_each_event_type_to_its_own_queue.rs` drives a
+  TABLE of containers over an assembled router — two entries by wildcard, the same two in the
+  opposite container order, three entries on literal event values (two of them details of one
+  type), an entry scoped to a class no mutation of the row performs, and a mutation no entry is
+  notified of — across `PutObject`, `CopyObject`, `DeleteObject`, `PutObjectTagging` and
+  `DeleteObjectTagging`, asserting each queue's whole record sequence and its single handshake;
+* `core/router/tests/all/s3_notification_routes_event_types_to_their_own_queues_on_a_started_emulator.rs`
+  drives the report's own two-queue scenario against the emulator a client STARTS — the built
+  binary, its own port, request authentication on, TLS, long-polling consumers — as a LEG of
+  `core/router/tests/all/cfn_deployed_pipeline_on_a_started_emulator.rs`, on the emulator that
+  suite already starts rather than starting a second binary.

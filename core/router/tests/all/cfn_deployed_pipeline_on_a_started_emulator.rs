@@ -746,4 +746,11 @@ fn a_deployed_pipeline_runs_on_the_emulator_a_client_starts() {
     // received.
     crate::s3_form_post_reason_rules_on_a_started_emulator::
         reason_scoped_rules_split_the_creation_paths(&emulator);
+
+    // The seventh leg, on this same started emulator: one bucket fanning its object events out
+    // to a queue per event class, drained by long-polling consumers — which needs a started
+    // emulator because each publication is signed with the credentials THAT process vends and
+    // is made from a task that outlives the write that produced it.
+    crate::s3_notification_routes_event_types_to_their_own_queues_on_a_started_emulator::
+        per_event_class_entries_route_independently(&emulator);
 }
