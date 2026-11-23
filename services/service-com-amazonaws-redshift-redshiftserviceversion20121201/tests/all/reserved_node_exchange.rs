@@ -243,6 +243,7 @@ fn seed_ds2(emulator: &Emulator, cluster_identifier: &str) -> String {
         endpoint_plane: None,
         issued_credentials: Vec::new(),
         lakehouse_idc_application_arn: None,
+        lakehouse_registration: None,
     });
     store.reserved_nodes.push(state::StoredReservedNode {
         node: ReservedNode {

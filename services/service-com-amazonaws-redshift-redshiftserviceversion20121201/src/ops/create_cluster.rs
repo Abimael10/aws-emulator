@@ -876,6 +876,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateCluster<Eng
             // created.
             issued_credentials: Vec::new(),
             lakehouse_idc_application_arn: None,
+            // A create that names a catalog registers the cluster as it
+            // provisions it, so there is no registration change left in flight
+            // once the cluster is allocated.
+            lakehouse_registration: None,
         });
 
         Ok((

@@ -22,8 +22,18 @@
 //!   [`crate::state::RedshiftIdcApplicationNotExistsWording`]).
 //!
 //! A `DryRun` request "validates the request without actually modifying the
-//! lakehouse configuration", so it takes every check above and then reports the
-//! configuration the cluster carries NOW, leaving the record untouched.
+//! lakehouse configuration", so it takes every check above and then answers the
+//! outcome of that validation: nothing is written and the call is REFUSED with
+//! the dry-run error code and its fixed sentence
+//! ([`crate::state::DRY_RUN_WOULD_HAVE_SUCCEEDED`]), which is what tells a probe
+//! that the request would have succeeded. A dry run a precondition refuses keeps
+//! that precondition's own fault, so the two answers stay distinguishable.
+//!
+//! Registering a cluster with Amazon Redshift federated permissions, and
+//! withdrawing that registration, is ASYNCHRONOUS: the call reports the
+//! transient status the change starts in and the registration settles on its
+//! terminal one when the clock owes it, which is the status a client polls a
+//! cluster read for (see [`crate::state::PendingLakehouseRegistration`]).
 //!
 //! ## Shape of an operation
 //!
@@ -218,8 +228,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = st::request_region(ctx);
 
+        let now = ::service_common::clock::now(&*self.engine);
         let mut store = state.lock();
-        store.settle(::service_common::clock::now(&*self.engine));
+        store.settle(now);
 
         // The cluster first: every other member of this request describes a
         // configuration OF it.
@@ -283,27 +294,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "A boolean value that, if true, validates the request without actually
-        // modifying the lakehouse configuration": every check above has run, so
-        // the request is valid, and the configuration reported is the one the
-        // cluster carries now.
+        // modifying the lakehouse configuration": every check above has run and
+        // none of them refused, so the request WOULD have succeeded — which is
+        // reported as the dry-run refusal rather than as a configuration, and
+        // nothing is written.
         if input.dry_run.unwrap_or(false) {
-            return Ok(store.lakehouse_configuration(position));
+            return Err(crate::scaffolded::Scaffolded::dry_run_operation(
+                st::DRY_RUN_WOULD_HAVE_SUCCEEDED,
+            ));
         }
 
         let stored = &mut store.clusters[position];
         // Each member the request carries changes the part of the configuration
         // it names and no other, so a call that names only the Identity Center
         // registration leaves the catalog and the registration status as they
-        // stand.
+        // stand. A registration — or its withdrawal — is made asynchronously, so
+        // what this call stores is the transient status and the instant the
+        // terminal one falls due.
         if let Some(registration) = input.lakehouse_registration.as_deref() {
-            stored.cluster.lakehouse_registration_status = Some(
-                if registration == st::LAKEHOUSE_REGISTER {
-                    st::LAKEHOUSE_REGISTRATION_REGISTERED
-                } else {
-                    st::LAKEHOUSE_REGISTRATION_DEREGISTERED
-                }
-                .to_string(),
-            );
+            stored.start_lakehouse_registration(registration, now);
         }
         // The catalog is a resource of Glue, named under that service's own
         // namespace through the one rule every path that reports a `CatalogArn`

@@ -606,8 +606,12 @@ const QUERY_TEXT_LENGTH: usize = 4_000;
 /// (`slice`, `tbl`, `col`, `blocknum`). What this engine really holds is what is
 /// reported: the tables its catalog holds, the columns each of them declares and
 /// the values each column holds (`num_values`), on the single slice this engine
-/// runs ([`SINGLE_SLICE`]). A table holding no row occupies no block, so it has
-/// no row here.
+/// runs ([`SINGLE_SLICE`]). A table the catalog holds has a row for each of its
+/// columns whether or not it holds a row of data: the reference publishes the
+/// minimum size of a table as one block per column per slice, so a block is
+/// occupied from the moment the table exists and `num_values` is what counts the
+/// values in it. Beside the columns a table declares it carries the ones Amazon
+/// Redshift appends to every table ([`HIDDEN_COLUMNS`]).
 ///
 /// The columns that describe how a CLUSTER lays a block out on disk — where its
 /// super block sits, which disk it prefers, whether it is pinned, on disk,
@@ -655,10 +659,7 @@ fn materialise_blocklist(
                 row.get(0)
             })
             .unwrap_or_default();
-        if rows == 0 {
-            continue;
-        }
-        blocks.push((log.table_id(&name), columns, rows));
+        blocks.push((log.table_id(&name), columns + HIDDEN_COLUMNS, rows));
     }
     let mut insert = connection.prepare(
         "INSERT INTO temp.stv_blocklist (slice, col, tbl, blocknum, num_values, \
@@ -701,6 +702,14 @@ fn materialise_blocklist(
 /// The `blocknum` of a column's first block, which is the only one this engine
 /// reports: the reference numbers a block from zero.
 const FIRST_BLOCK: i64 = 0;
+
+/// How many columns a stored table carries BEYOND the ones it declares.
+///
+/// Source: the *System tables and views reference*, `STV_BLOCKLIST` — "every
+/// table you create has three hidden columns appended to it: INSERT_XID,
+/// DELETE_XID, ROW_ID (OID)". They occupy blocks of their own and are reported
+/// under the column indexes past the declared ones.
+const HIDDEN_COLUMNS: usize = 3;
 
 /// Create one system table EMPTY on the connection's temporary schema,
 /// replacing the one a previous statement left there.

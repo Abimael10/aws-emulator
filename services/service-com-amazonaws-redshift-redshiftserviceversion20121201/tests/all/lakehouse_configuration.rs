@@ -12,10 +12,14 @@
 //! generalises over rather than one recorded request:
 //!
 //! 1. The configuration is a RECORD of the cluster: each member of the request
-//!    changes the part it names and no other, a `DryRun` changes nothing, and
-//!    what is stored is what a cluster read reports back
-//!    (`Cluster$LakehouseRegistrationStatus` and `$CatalogArn` are members of the
-//!    cluster itself).
+//!    changes the part it names and no other, and what is stored is what a
+//!    cluster read reports back (`Cluster$LakehouseRegistrationStatus` and
+//!    `$CatalogArn` are members of the cluster itself). Registering the cluster,
+//!    and withdrawing that registration, is ASYNCHRONOUS: the call reports the
+//!    transient status and the registration settles on its terminal one when the
+//!    clock owes it, both spelled in the upper-case vocabulary a client's poll
+//!    loop compares against. A `DryRun` writes nothing at all and is answered by
+//!    the dry-run refusal rather than by a configuration.
 //! 2. Each dependency the request names is resolved against the state that holds
 //!    it, and each answers its OWN fault, worded with the precondition THIS
 //!    operation enforces: a cluster this account does not hold is
@@ -25,7 +29,8 @@
 //!    onboarding has not finished, so it can propagate no identity yet — is
 //!    `RedshiftIdcApplicationNotExists` (404) with a sentence naming both of
 //!    those failure modes, which is not the sentence the operations that only
-//!    dereference an application answer.
+//!    dereference an application answer. A dry run takes every one of them, so a
+//!    request a precondition refuses keeps that precondition's fault.
 
 use service_com_amazonaws_redshift_redshiftserviceversion20121201::state;
 
@@ -64,10 +69,12 @@ async fn describe(emulator: &Emulator, identifier: &str) -> Answer {
 }
 
 /// One row of the configuration table: the case name, the parameters the call
-/// carries, and the registration status and catalog the cluster must then carry.
+/// carries, the registration status the call itself reports, the status the
+/// registration then settles on, and the catalog the cluster must carry.
 type ConfigurationCase = (
     &'static str,
     Vec<(&'static str, &'static str)>,
+    Option<&'static str>,
     Option<&'static str>,
     Option<&'static str>,
 );
@@ -76,10 +83,15 @@ type ConfigurationCase = (
 async fn a_registration_is_stored_on_the_cluster_and_read_back() {
     let emulator = Emulator::new();
     available_cluster(&emulator, "lakehouse-cluster").await;
+    // The clock is STOPPED from here on, so the transient side of every
+    // registration below stays open however long the host takes over the calls
+    // inside it and the advance past the span is what settles it.
+    emulator.stop_clock();
 
     // The rows differ along what the rule generalises over: which part of the
-    // configuration the request names, and the catalog name's form (the
-    // characters the member's own pattern admits).
+    // configuration the request names, which direction the registration moves
+    // in, and the catalog name's form (the characters the member's own pattern
+    // admits).
     let rows: Vec<ConfigurationCase> = vec![
         (
             "a registration naming a catalog",
@@ -88,6 +100,7 @@ async fn a_registration_is_stored_on_the_cluster_and_read_back() {
                 ("LakehouseRegistration", "Register"),
                 ("CatalogName", "analytics"),
             ],
+            Some(state::LAKEHOUSE_REGISTRATION_REQUESTED),
             Some(state::LAKEHOUSE_REGISTRATION_REGISTERED),
             Some("analytics"),
         ),
@@ -98,6 +111,7 @@ async fn a_registration_is_stored_on_the_cluster_and_read_back() {
                 ("LakehouseRegistration", "Register"),
                 ("CatalogName", "my-catalog_01"),
             ],
+            Some(state::LAKEHOUSE_REGISTRATION_REQUESTED),
             Some(state::LAKEHOUSE_REGISTRATION_REGISTERED),
             Some("my-catalog_01"),
         ),
@@ -107,6 +121,7 @@ async fn a_registration_is_stored_on_the_cluster_and_read_back() {
                 ("ClusterIdentifier", "lakehouse-cluster"),
                 ("LakehouseRegistration", "Register"),
             ],
+            Some(state::LAKEHOUSE_REGISTRATION_REQUESTED),
             Some(state::LAKEHOUSE_REGISTRATION_REGISTERED),
             Some("my-catalog_01"),
         ),
@@ -117,6 +132,7 @@ async fn a_registration_is_stored_on_the_cluster_and_read_back() {
                 ("CatalogName", "warehouse"),
             ],
             Some(state::LAKEHOUSE_REGISTRATION_REGISTERED),
+            Some(state::LAKEHOUSE_REGISTRATION_REGISTERED),
             Some("warehouse"),
         ),
         (
@@ -125,12 +141,23 @@ async fn a_registration_is_stored_on_the_cluster_and_read_back() {
                 ("ClusterIdentifier", "lakehouse-cluster"),
                 ("LakehouseRegistration", "Deregister"),
             ],
+            Some(state::LAKEHOUSE_DEREGISTRATION_REQUESTED),
             Some(state::LAKEHOUSE_REGISTRATION_DEREGISTERED),
+            Some("warehouse"),
+        ),
+        (
+            "the registration made again after it was withdrawn",
+            vec![
+                ("ClusterIdentifier", "lakehouse-cluster"),
+                ("LakehouseRegistration", "Register"),
+            ],
+            Some(state::LAKEHOUSE_REGISTRATION_REQUESTED),
+            Some(state::LAKEHOUSE_REGISTRATION_REGISTERED),
             Some("warehouse"),
         ),
     ];
 
-    for (case, params, expected_status, expected_catalog) in rows {
+    for (case, params, reported_status, settled_status, expected_catalog) in rows {
         let answered = modify(&emulator, &params).await;
         assert_eq!(
             answered.status, 200,
@@ -147,7 +174,7 @@ async fn a_registration_is_stored_on_the_cluster_and_read_back() {
             ),
             (
                 Some("lakehouse-cluster".to_string()),
-                expected_status.map(str::to_string),
+                reported_status.map(str::to_string),
                 expected_catalog_arn.clone(),
             ),
             "case {case:?}: expected the configuration the request asked for, got body {}",
@@ -155,22 +182,96 @@ async fn a_registration_is_stored_on_the_cluster_and_read_back() {
         );
 
         // ROUND TRIP: both values are members of the CLUSTER, so a cluster read
-        // reports exactly what this write stored.
+        // reports exactly what this write stored — the transient status
+        // included, which is what a client polling for the terminal one sees
+        // first.
         let read = describe(&emulator, "lakehouse-cluster").await;
         assert_eq!(
             (
                 read.text("LakehouseRegistrationStatus"),
                 read.text("CatalogArn"),
             ),
-            (expected_status.map(str::to_string), expected_catalog_arn),
+            (
+                reported_status.map(str::to_string),
+                expected_catalog_arn.clone()
+            ),
             "case {case:?}: expected a cluster read to report the stored configuration, got body {}",
             read.body
+        );
+
+        // Past the span the registration settles on its terminal status, with no
+        // mutating call in between.
+        emulator.advance_clock(state::LAKEHOUSE_REGISTRATION_SPAN);
+        let settled = describe(&emulator, "lakehouse-cluster").await;
+        assert_eq!(
+            (
+                settled.text("LakehouseRegistrationStatus"),
+                settled.text("CatalogArn"),
+            ),
+            (settled_status.map(str::to_string), expected_catalog_arn),
+            "case {case:?}: expected the registration settled past its span, got body {}",
+            settled.body
         );
     }
 }
 
+/// The status vocabulary is the client-visible one: upper case, words joined by
+/// underscores, as a client's poll loop compares it. Written out here so a
+/// casing or spelling change is caught whatever the handler does with it.
 #[tokio::test]
-async fn a_dry_run_validates_and_changes_nothing() {
+async fn the_registration_status_is_reported_in_the_published_vocabulary() {
+    assert_eq!(
+        [
+            state::LAKEHOUSE_REGISTRATION_REQUESTED,
+            state::LAKEHOUSE_REGISTRATION_REGISTERED,
+            state::LAKEHOUSE_DEREGISTRATION_REQUESTED,
+            state::LAKEHOUSE_REGISTRATION_DEREGISTERED,
+        ],
+        [
+            "REGISTRATION_REQUESTED",
+            "REGISTERED",
+            "DEREGISTRATION_REQUESTED",
+            "DEREGISTERED",
+        ],
+        "case the published status vocabulary: expected the upper-case tokens a client polls for"
+    );
+
+    // And the wire carries exactly those: a registration polled to its terminal
+    // status on a RUNNING clock reaches it with no mutating call in the loop.
+    let emulator = Emulator::new();
+    available_cluster(&emulator, "vocabulary-cluster").await;
+    let answered = modify(
+        &emulator,
+        &[
+            ("ClusterIdentifier", "vocabulary-cluster"),
+            ("LakehouseRegistration", "Register"),
+            ("CatalogName", "vocabulary"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        answered.status, 200,
+        "case seed the registration: expected 200, got {} with body {}",
+        answered.status, answered.body
+    );
+    let (settled, _polls) = emulator
+        .poll_until(
+            "a registration polled to its terminal status",
+            "DescribeClusters",
+            &[("ClusterIdentifier", "vocabulary-cluster")],
+            |answer| answer.text("LakehouseRegistrationStatus").as_deref() == Some("REGISTERED"),
+        )
+        .await;
+    assert_eq!(
+        settled.text("LakehouseRegistrationStatus").as_deref(),
+        Some("REGISTERED"),
+        "case a registration polled to its terminal status: expected REGISTERED, got body {}",
+        settled.body
+    );
+}
+
+#[tokio::test]
+async fn a_dry_run_validates_and_is_answered_by_the_dry_run_refusal() {
     let emulator = Emulator::new();
     available_cluster(&emulator, "dryrun-cluster").await;
 
@@ -188,54 +289,100 @@ async fn a_dry_run_validates_and_changes_nothing() {
         "case seed the registration: expected 200, got {} with body {}",
         registered.status, registered.body
     );
-    let before = describe(&emulator, "dryrun-cluster").await;
+    let (before, _polls) = emulator
+        .poll_until(
+            "seed the registration",
+            "DescribeClusters",
+            &[("ClusterIdentifier", "dryrun-cluster")],
+            |answer| {
+                answer.text("LakehouseRegistrationStatus").as_deref()
+                    == Some(state::LAKEHOUSE_REGISTRATION_REGISTERED)
+            },
+        )
+        .await;
 
     // A dry run of a request that WOULD change the configuration takes every
-    // check and reports the configuration the cluster carries now.
-    let dry = modify(
-        &emulator,
-        &[
-            ("ClusterIdentifier", "dryrun-cluster"),
-            ("LakehouseRegistration", "Deregister"),
-            ("CatalogName", "replaced"),
-            ("DryRun", "true"),
-        ],
-    )
-    .await;
-    assert_eq!(
-        dry.status, 200,
-        "case a dry run: expected 200, got {} with body {}",
-        dry.status, dry.body
-    );
-    assert_eq!(
+    // check, writes nothing and answers the dry-run refusal. The rows differ
+    // along what the rule generalises over: which part of the configuration the
+    // request would have changed.
+    let rows: Vec<(&str, Vec<(&str, &str)>)> = vec![
         (
-            dry.text("LakehouseRegistrationStatus"),
-            dry.text("CatalogArn")
+            "a dry run of a withdrawal",
+            vec![
+                ("ClusterIdentifier", "dryrun-cluster"),
+                ("LakehouseRegistration", "Deregister"),
+                ("CatalogName", "replaced"),
+                ("DryRun", "true"),
+            ],
         ),
         (
-            before.text("LakehouseRegistrationStatus"),
-            before.text("CatalogArn")
+            "a dry run of a registration",
+            vec![
+                ("ClusterIdentifier", "dryrun-cluster"),
+                ("LakehouseRegistration", "Register"),
+                ("DryRun", "true"),
+            ],
         ),
-        "case a dry run: expected the configuration as it stands, got body {}",
-        dry.body
-    );
+        (
+            "a dry run naming only a catalog",
+            vec![
+                ("ClusterIdentifier", "dryrun-cluster"),
+                ("CatalogName", "replaced"),
+                ("DryRun", "true"),
+            ],
+        ),
+        (
+            "a dry run naming nothing to change",
+            vec![
+                ("ClusterIdentifier", "dryrun-cluster"),
+                ("DryRun", "true"),
+            ],
+        ),
+    ];
 
-    let after = describe(&emulator, "dryrun-cluster").await;
-    assert_eq!(
-        (
-            after.text("LakehouseRegistrationStatus"),
-            after.text("CatalogArn")
-        ),
-        (
-            before.text("LakehouseRegistrationStatus"),
-            before.text("CatalogArn")
-        ),
-        "case a dry run: expected the cluster unchanged, got body {}",
-        after.body
-    );
+    for (case, params) in rows {
+        let dry = modify(&emulator, &params).await;
+        assert_eq!(
+            (dry.status, dry.error_code().as_deref()),
+            (412, Some("DryRunOperation")),
+            "case {case:?}: expected 412 DryRunOperation, got {} / {:?} with body {}",
+            dry.status,
+            dry.error_code(),
+            dry.body
+        );
+        // Fixed text with no variable part: it names neither the cluster nor
+        // the configuration the request described.
+        assert_eq!(
+            dry.text("Message").as_deref(),
+            Some("Request would have succeeded, but DryRun flag is set."),
+            "case {case:?}: expected the dry-run sentence, got {:?}",
+            dry.text("Message")
+        );
+        assert_eq!(
+            dry.text("Message").as_deref(),
+            Some(state::DRY_RUN_WOULD_HAVE_SUCCEEDED),
+            "case {case:?}: expected the catalog's wording, got {:?}",
+            dry.text("Message")
+        );
 
-    // And a dry run of a request that would be REFUSED is refused too: it
-    // validates the request rather than skipping the checks.
+        let after = describe(&emulator, "dryrun-cluster").await;
+        assert_eq!(
+            (
+                after.text("LakehouseRegistrationStatus"),
+                after.text("CatalogArn")
+            ),
+            (
+                before.text("LakehouseRegistrationStatus"),
+                before.text("CatalogArn")
+            ),
+            "case {case:?}: expected the cluster unchanged, got body {}",
+            after.body
+        );
+    }
+
+    // And a dry run of a request that would be REFUSED keeps that refusal: it
+    // validates the request rather than skipping the checks, so the two answers
+    // stay distinguishable.
     let refused = modify(
         &emulator,
         &[
@@ -253,6 +400,31 @@ async fn a_dry_run_validates_and_changes_nothing() {
         refused.status,
         refused.error_code(),
         refused.body
+    );
+    let unknown_application = modify(
+        &emulator,
+        &[
+            ("ClusterIdentifier", "dryrun-cluster"),
+            ("LakehouseIdcRegistration", "Associate"),
+            (
+                "LakehouseIdcApplicationArn",
+                "arn:aws:redshift:us-west-2:000000000000:redshiftidcapplication:absent",
+            ),
+            ("DryRun", "true"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        (
+            unknown_application.status,
+            unknown_application.error_code().as_deref()
+        ),
+        (404, Some("RedshiftIdcApplicationNotExists")),
+        "case a dry run naming no application of this account: expected 404 \
+         RedshiftIdcApplicationNotExists, got {} / {:?} with body {}",
+        unknown_application.status,
+        unknown_application.error_code(),
+        unknown_application.body
     );
 }
 
@@ -348,7 +520,19 @@ async fn an_identity_center_application_this_account_did_not_register_is_refused
     );
 
     // Disassociating leaves the cluster with no application to propagate an
-    // identity from, and leaves the registration itself alone.
+    // identity from, and leaves the registration itself alone — which by then
+    // has settled on its terminal status, polled for rather than assumed.
+    let (_settled, _polls) = emulator
+        .poll_until(
+            "the registration the association carried",
+            "DescribeClusters",
+            &[("ClusterIdentifier", "idc-cluster")],
+            |answer| {
+                answer.text("LakehouseRegistrationStatus").as_deref()
+                    == Some(state::LAKEHOUSE_REGISTRATION_REGISTERED)
+            },
+        )
+        .await;
     let disassociated = modify(
         &emulator,
         &[

@@ -23,6 +23,10 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             // cluster's database stops authenticating a login at its
             // `Expiration`, which passed whether or not anybody called.
             stored.expire_database_credentials(now);
+            // A lakehouse registration the service is still making — or
+            // withdrawing — reaches its terminal status once that change's span
+            // has passed, whether or not anybody called.
+            stored.settle_lakehouse_registration(now);
             // A cluster the service is still working on — bringing it up,
             // applying a change to it, restarting it, or rotating its encryption
             // keys — is available again once that work's span has passed, whether

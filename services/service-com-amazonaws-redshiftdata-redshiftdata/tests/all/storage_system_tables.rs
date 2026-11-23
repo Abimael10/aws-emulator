@@ -10,8 +10,12 @@
 //! answers rows about this database. `STV_BLOCKLIST` is "the number of 1 MB
 //! disk blocks used by each slice, table, or column in a database", one row per
 //! block of one column of one table — so it reports the tables this database
-//! holds, the columns each of them declares and the values each column holds,
-//! and nothing for a table that holds no row.
+//! holds, the columns each of them carries and the values each column holds. A
+//! table occupies a block per column from the moment it exists, whether or not
+//! it holds a row (the published minimum size of a table is one block for each
+//! of its columns on each slice), and the columns it carries are the ones it
+//! declares plus the three Amazon Redshift appends to every table it stores
+//! (`INSERT_XID`, `DELETE_XID`, `ROW_ID`).
 //!
 //! It is asserted over a TABLE of relations rather than one case: the rows
 //! differ in how many columns a table declares and in how many rows it holds,
@@ -69,13 +73,26 @@ struct Relation {
     create: &'static str,
     /// The statement that fills it, if the case fills it at all.
     fill: Option<&'static str>,
-    /// How many columns it declares, which is how many blocks of it are
-    /// reported.
+    /// How many columns it DECLARES; the blocks reported for it are one per
+    /// declared column plus one per hidden column ([`HIDDEN_COLUMNS`]).
     columns: i64,
     /// How many rows it holds, which is the `num_values` each of those blocks
     /// carries.
     rows: i64,
 }
+
+impl Relation {
+    /// How many blocks `STV_BLOCKLIST` reports for this table: one per column it
+    /// carries, on the single slice this engine runs.
+    fn blocks(&self) -> i64 {
+        self.columns + HIDDEN_COLUMNS
+    }
+}
+
+/// The columns Amazon Redshift appends to every table it stores beyond the ones
+/// the table declares: `INSERT_XID`, `DELETE_XID` and `ROW_ID`, which the
+/// `STV_BLOCKLIST` reference names as the three hidden columns of every table.
+const HIDDEN_COLUMNS: i64 = 3;
 
 const RELATIONS: &[Relation] = &[
     Relation {
@@ -108,11 +125,11 @@ const RELATIONS: &[Relation] = &[
     },
 ];
 
-/// `STV_BLOCKLIST` reports one block per column of every table that holds a
-/// row, on the single slice this engine runs, and none for a table that holds
-/// no row.
+/// `STV_BLOCKLIST` reports one block per column of every table the database
+/// holds — the declared columns and the hidden ones — on the single slice this
+/// engine runs, including for a table that holds no row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_block_list_reports_a_block_per_column_of_every_table_that_holds_rows() {
+async fn the_block_list_reports_a_block_per_column_of_every_table() {
     let case = "the block list";
     let emulator = Emulator::new();
     for relation in RELATIONS {
@@ -136,20 +153,13 @@ async fn the_block_list_reports_a_block_per_column_of_every_table_that_holds_row
             ),
         )
         .await;
-        let expected = if relation.rows == 0 {
-            0
-        } else {
-            relation.columns
-        };
+        let expected = relation.blocks();
         assert_eq!(
             blocks, expected,
-            "case {case}: {} holds {} rows in {} columns, so {expected} blocks are reported, got \
-             {blocks}",
+            "case {case}: {} holds {} rows in {} declared columns, so {expected} blocks are \
+             reported, got {blocks}",
             relation.table, relation.rows, relation.columns
         );
-        if relation.rows == 0 {
-            continue;
-        }
 
         // Each of them is a block of one of that table's columns, numbered from
         // zero, on the one slice this engine runs, and carries the values that
@@ -161,15 +171,20 @@ async fn the_block_list_reports_a_block_per_column_of_every_table_that_holds_row
                 "SELECT count(*) FROM stv_blocklist b JOIN svv_table_info t ON t.table_id = b.tbl \
                  WHERE t.\"table\" = '{}' AND b.slice = 0 AND b.blocknum = 0 AND b.num_values = \
                  {} AND b.col >= 0 AND b.col < {}",
-                relation.table, relation.rows, relation.columns
+                relation.table,
+                relation.rows,
+                relation.blocks()
             ),
         )
         .await;
         assert_eq!(
-            described, relation.columns,
+            described,
+            relation.blocks(),
             "case {case}: every block of {} is one of its {} columns' and carries its {} values, \
              got {described} such blocks",
-            relation.table, relation.columns, relation.rows
+            relation.table,
+            relation.blocks(),
+            relation.rows
         );
         let columns = number(
             &emulator,
@@ -182,10 +197,12 @@ async fn the_block_list_reports_a_block_per_column_of_every_table_that_holds_row
         )
         .await;
         assert_eq!(
-            columns, relation.columns,
+            columns,
+            relation.blocks(),
             "case {case}: {} has one block per column, so its blocks name {} distinct columns, \
              got {columns}",
-            relation.table, relation.columns
+            relation.table,
+            relation.blocks()
         );
     }
 }
@@ -206,11 +223,7 @@ async fn the_block_list_is_read_like_any_other_relation() {
 
     // Every block the table reports belongs to a table of this database, so the
     // whole list is what the rows above account for.
-    let total: i64 = RELATIONS
-        .iter()
-        .filter(|relation| relation.rows > 0)
-        .map(|relation| relation.columns)
-        .sum();
+    let total: i64 = RELATIONS.iter().map(Relation::blocks).sum();
     let reported = number(&emulator, case, "SELECT count(*) FROM stv_blocklist").await;
     assert_eq!(
         reported, total,
@@ -219,19 +232,24 @@ async fn the_block_list_is_read_like_any_other_relation() {
     );
 
     // And it is a relation a statement can select out of into a table of its
-    // own, bounded by a `LIMIT`.
+    // own, bounded by a `LIMIT`. The rows differ in the bound: one row, several,
+    // and a bound a database holding only a couple of tables still satisfies —
+    // the block list of a table that has just been created is not empty.
     finished(&emulator, case, "CREATE TABLE copied (n INT)").await;
-    let limit = total.min(2);
-    finished(
-        &emulator,
-        case,
-        &format!("INSERT INTO copied SELECT 1 FROM stv_blocklist LIMIT {limit}"),
-    )
-    .await;
-    let copied = number(&emulator, case, "SELECT count(*) FROM copied").await;
-    assert_eq!(
-        copied, limit,
-        "case {case}: a bounded read of the block list inserts the rows it answered: expected \
-         {limit}, got {copied}"
-    );
+    for limit in [1_i64, 2, 5] {
+        let before = number(&emulator, case, "SELECT count(*) FROM copied").await;
+        finished(
+            &emulator,
+            case,
+            &format!("INSERT INTO copied SELECT 1 FROM stv_blocklist LIMIT {limit}"),
+        )
+        .await;
+        let copied = number(&emulator, case, "SELECT count(*) FROM copied").await;
+        assert_eq!(
+            copied - before,
+            limit,
+            "case {case} with LIMIT {limit}: a bounded read of the block list inserts the rows it \
+             answered: expected {limit} more than {before}, got {copied}"
+        );
+    }
 }

@@ -46,14 +46,118 @@ pub const LAKEHOUSE_IDC_DISASSOCIATE: &str = "Disassociate";
 /// The member is "the current status of the lakehouse registration. Indicates
 /// whether the cluster is successfully registered with the lakehouse"
 /// (`smithy_query(query="shape", shape="LakehouseConfiguration")`) and the model
-/// publishes no value list for it, so the status is the state the registration
-/// reached, spelled as the past participle of the `LakehouseRegistration` that
-/// asked for it ([`LAKEHOUSE_REGISTER`]).
-pub const LAKEHOUSE_REGISTRATION_REGISTERED: &str = "Registered";
+/// publishes no value list for it, so the vocabulary is the recorded one: a
+/// state token spelled in upper case with words joined by underscores, which is
+/// what a client's poll loop compares against. This is the TERMINAL status of a
+/// registration ([`LAKEHOUSE_REGISTER`]).
+pub const LAKEHOUSE_REGISTRATION_REGISTERED: &str = "REGISTERED";
+
+/// `Cluster$LakehouseRegistrationStatus` while the registration a
+/// [`LAKEHOUSE_REGISTER`] asked for is still being made.
+///
+/// The registration is not immediate: the status moves through this transient
+/// value and settles on [`LAKEHOUSE_REGISTRATION_REGISTERED`] once
+/// [`LAKEHOUSE_REGISTRATION_SPAN`] has passed, which is what a client polling
+/// for the terminal status waits out.
+pub const LAKEHOUSE_REGISTRATION_REQUESTED: &str = "REGISTRATION_REQUESTED";
 
 /// `Cluster$LakehouseRegistrationStatus` of a cluster whose registration has been
 /// withdrawn. See [`LAKEHOUSE_REGISTRATION_REGISTERED`].
-pub const LAKEHOUSE_REGISTRATION_DEREGISTERED: &str = "Deregistered";
+pub const LAKEHOUSE_REGISTRATION_DEREGISTERED: &str = "DEREGISTERED";
+
+/// `Cluster$LakehouseRegistrationStatus` while the withdrawal a
+/// [`LAKEHOUSE_DEREGISTER`] asked for is still being made, spelled in the same
+/// vocabulary as [`LAKEHOUSE_REGISTRATION_REQUESTED`] because it is the same
+/// kind of token for the other direction.
+pub const LAKEHOUSE_DEREGISTRATION_REQUESTED: &str = "DEREGISTRATION_REQUESTED";
+
+/// How long after the call that asks for it a lakehouse registration — or its
+/// withdrawal — falls due.
+///
+/// The registration is made asynchronously, so the span is the same one every
+/// other transition of this service is compressed into ([`PROVISIONING_SPAN`]):
+/// Amazon Redshift documents no duration for it, the span is deliberately
+/// non-zero so the caller still observes the transient status its own call
+/// reports, and the due instant is STORED rather than slept for.
+pub const LAKEHOUSE_REGISTRATION_SPAN: Duration = PROVISIONING_SPAN;
+
+/// What a `DryRun` request that would have succeeded is refused with.
+///
+/// `ModifyLakehouseConfigurationMessage$DryRun` is "a boolean value that, if
+/// true, validates the request without actually modifying the lakehouse
+/// configuration. Use this to check for errors before making changes", and the
+/// model declares no error for it: the validated outcome is signalled as a
+/// REFUSAL carrying the error code every Amazon Web Services dry run is refused
+/// with ([`crate::scaffolded::Scaffolded::dry_run_operation`]) and this fixed
+/// sentence, which has no variable part — so a probe can tell a request that
+/// would have succeeded from one a precondition refuses.
+pub const DRY_RUN_WOULD_HAVE_SUCCEEDED: &str =
+    "Request would have succeeded, but DryRun flag is set.";
+
+/// The lakehouse registration change a `ModifyLakehouseConfiguration` started
+/// and the clock has not finished yet.
+///
+/// Held on the cluster the change is against
+/// ([`StoredCluster::lakehouse_registration`]) so the status a read reports is
+/// the one the clock already owes — see
+/// [`StoredCluster::settle_lakehouse_registration`].
+#[derive(Debug, Clone)]
+pub struct PendingLakehouseRegistration {
+    /// When the move to [`PendingLakehouseRegistration::settles_to`] falls due.
+    pub settles_at: Instant,
+    /// The terminal `LakehouseRegistrationStatus` this change settles on:
+    /// [`LAKEHOUSE_REGISTRATION_REGISTERED`] or
+    /// [`LAKEHOUSE_REGISTRATION_DEREGISTERED`].
+    pub settles_to: String,
+}
+
+impl StoredCluster {
+    /// Start the lakehouse registration change `registration` asks for, at
+    /// `now`.
+    ///
+    /// The cluster reports the TRANSIENT status from this instant — which is
+    /// what the call that asked for the change answers — and the terminal one
+    /// from [`LAKEHOUSE_REGISTRATION_SPAN`] later, whether or not anybody calls
+    /// again.
+    pub fn start_lakehouse_registration(&mut self, registration: &str, now: Instant) {
+        let registering = registration == LAKEHOUSE_REGISTER;
+        self.cluster.lakehouse_registration_status = Some(
+            if registering {
+                LAKEHOUSE_REGISTRATION_REQUESTED
+            } else {
+                LAKEHOUSE_DEREGISTRATION_REQUESTED
+            }
+            .to_string(),
+        );
+        self.lakehouse_registration = Some(PendingLakehouseRegistration {
+            settles_at: now + LAKEHOUSE_REGISTRATION_SPAN,
+            settles_to: if registering {
+                LAKEHOUSE_REGISTRATION_REGISTERED
+            } else {
+                LAKEHOUSE_REGISTRATION_DEREGISTERED
+            }
+            .to_string(),
+        });
+    }
+
+    /// Materialise the lakehouse registration change the clock already owes at
+    /// `now`.
+    ///
+    /// Called by the store's settle, so every read of the cluster reports the
+    /// status the registration has reached by the instant it is read and no
+    /// caller has to ask twice for a change that was already due.
+    pub fn settle_lakehouse_registration(&mut self, now: Instant) {
+        let Some(pending) = self.lakehouse_registration.as_ref() else {
+            return;
+        };
+        if now < pending.settles_at {
+            return;
+        }
+        let settled = pending.settles_to.clone();
+        self.lakehouse_registration = None;
+        self.cluster.lakehouse_registration_status = Some(settled);
+    }
+}
 
 /// The ARN namespace of the Glue data catalog a lakehouse registration is
 /// against.

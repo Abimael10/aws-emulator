@@ -2672,6 +2672,18 @@ pub struct StoredCluster {
     /// catalog of the same configuration, which ARE `Cluster` members
     /// (`$LakehouseRegistrationStatus`, `$CatalogArn`) and so live there.
     pub lakehouse_idc_application_arn: Option<String>,
+    /// The lakehouse registration change this cluster has in flight, and `None`
+    /// for a cluster whose registration status is the one it has settled on.
+    ///
+    /// Registering a cluster with Amazon Redshift federated permissions — or
+    /// withdrawing that registration — is asynchronous, so the status moves
+    /// through a transient value and settles on its terminal one when this
+    /// record's instant falls due (see
+    /// [`PendingLakehouseRegistration`] and
+    /// [`StoredCluster::settle_lakehouse_registration`]). Held here rather than
+    /// on [`StoredCluster::cluster`] because the due instant is not a modelled
+    /// member of anything.
+    pub lakehouse_registration: Option<PendingLakehouseRegistration>,
 }
 
 impl StoredCluster {

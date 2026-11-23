@@ -162,18 +162,24 @@ async fn a_statement_that_would_never_finish_is_still_stopped() {
 ///
 /// The rows differ along what the rule generalises over: how many columns a
 /// table declares and how many rows it holds, including a table that holds none
-/// and so occupies no block at all.
+/// — which still occupies a block per column, because the published minimum size
+/// of a table is one block for each of its columns on each slice.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_blocks_a_warehouse_reports_are_the_columns_of_the_tables_it_holds() {
     let emulator = Emulator::new();
-    // (case, the table, how many columns it declares, how many rows it holds,
-    //  how many blocks it occupies)
+    // The three columns Amazon Redshift appends to every table it stores
+    // (`INSERT_XID`, `DELETE_XID`, `ROW_ID`), which the `STV_BLOCKLIST`
+    // reference names as its hidden columns: they occupy blocks beside the
+    // declared ones.
+    const HIDDEN_COLUMNS: i64 = 3;
+    // (case, the table, how many columns it declares, how many rows it holds)
     let rows = [
-        ("one column, three rows", "blocks_one", 1, 3, 1),
-        ("two columns, no rows", "blocks_empty", 2, 0, 0),
-        ("three columns, five rows", "blocks_three", 3, 5, 3),
+        ("one column, three rows", "blocks_one", 1, 3),
+        ("two columns, no rows", "blocks_empty", 2, 0),
+        ("three columns, five rows", "blocks_three", 3, 5),
     ];
-    for (case, table, columns, held, expected_blocks) in rows {
+    for (case, table, columns, held) in rows {
+        let expected_blocks = columns + HIDDEN_COLUMNS;
         let declared = (0..columns)
             .map(|index| format!("c{index} INTEGER"))
             .collect::<Vec<String>>()
@@ -203,9 +209,6 @@ async fn the_blocks_a_warehouse_reports_are_the_columns_of_the_tables_it_holds()
             expected_blocks.to_string(),
             "case {case}: expected {expected_blocks} block(s) for {table}, got {counted}"
         );
-        if expected_blocks == 0 {
-            continue;
-        }
         // The values each block carries are the table's own rows, and the
         // columns are numbered from zero.
         let values = first_value(
@@ -239,7 +242,7 @@ async fn the_blocks_a_warehouse_reports_are_the_columns_of_the_tables_it_holds()
         .await;
         assert_eq!(
             highest,
-            (columns - 1).to_string(),
+            (expected_blocks - 1).to_string(),
             "case {case}: expected the columns of {table} numbered from zero, got {highest}"
         );
     }

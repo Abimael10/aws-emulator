@@ -1204,6 +1204,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RestoreFromCluste
             // built.
             issued_credentials: Vec::new(),
             lakehouse_idc_application_arn: None,
+            // A restore registers nothing with the lakehouse, so the cluster it
+            // builds has no registration change in flight either.
+            lakehouse_registration: None,
         });
 
         // The snapshot this cluster was built from, as the event naming it

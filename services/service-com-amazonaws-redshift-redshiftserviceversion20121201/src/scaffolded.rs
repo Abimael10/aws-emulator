@@ -269,6 +269,37 @@ pub static INTERNAL_FAILURE_SCHEMA: Schema = Schema::new_struct(
     &[&INTERNAL_FAILURE_MESSAGE],
 );
 
+/// The `message` member of the synthetic `DryRunOperation` error shape.
+static DRY_RUN_OPERATION_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#DryRunOperation$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic `DryRunOperation` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as the shapes above:
+/// it is in no service model, so it must not collide with a modeled shape. It
+/// exists because a request that asks only for a modification to be VALIDATED is
+/// not answered with a response body at all — a dry run that would have
+/// succeeded is signalled as a refusal under the error code `DryRunOperation`,
+/// which is what a probing client branches on.
+pub static DRY_RUN_OPERATION_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#DryRunOperation",
+        "smithy.framework",
+        "DryRunOperation",
+    ),
+    ShapeType::Structure,
+    &[&DRY_RUN_OPERATION_MESSAGE],
+);
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -307,6 +338,13 @@ pub enum Scaffolded<E> {
     /// is the same single `message` member; only the wire code and the status
     /// differ from [`Scaffolded::InvalidParameterValue`].
     InternalFailure(ValidationException),
+    /// The request asked only for the modification to be VALIDATED and every
+    /// precondition passed, so nothing was written and the call is refused with
+    /// the error code `DryRunOperation` — the outcome a dry run reports instead
+    /// of a response body. The payload is the same single `message` member; only
+    /// the wire code and the status differ from
+    /// [`Scaffolded::InvalidParameterValue`].
+    DryRunOperation(ValidationException),
 }
 
 impl<E> Scaffolded<E> {
@@ -366,6 +404,18 @@ impl<E> Scaffolded<E> {
     pub fn internal_failure(message: impl Into<String>) -> Self {
         Self::InternalFailure(ValidationException::new(message))
     }
+
+    /// Refuse the call with HTTP 412 `DryRunOperation`.
+    ///
+    /// The refusal a request carrying a `DryRun` that WOULD have succeeded is
+    /// answered with: the flag asks for the request to be validated without the
+    /// change being made, and the validated outcome is reported as this error
+    /// rather than as a response body, so a probe can tell it from a precondition
+    /// that refuses the call. Reach for it only once every precondition of the
+    /// modification has passed and nothing has been written.
+    pub fn dry_run_operation(message: impl Into<String>) -> Self {
+        Self::DryRunOperation(ValidationException::new(message))
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -377,6 +427,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::InvalidParameterValue(e) => write!(f, "{e}"),
             Self::InvalidParameterCombination(e) => write!(f, "{e}"),
             Self::InternalFailure(e) => write!(f, "{e}"),
+            Self::DryRunOperation(e) => write!(f, "{e}"),
         }
     }
 }
@@ -392,6 +443,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::InvalidParameterValue(e) => e.source(),
             Self::InvalidParameterCombination(e) => e.source(),
             Self::InternalFailure(e) => e.source(),
+            Self::DryRunOperation(e) => e.source(),
         }
     }
 }
@@ -409,6 +461,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::InvalidParameterValue(e) => e,
             Self::InvalidParameterCombination(e) => e,
             Self::InternalFailure(e) => e,
+            Self::DryRunOperation(e) => e,
         }
     }
 
@@ -420,6 +473,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::InvalidParameterValue(_) => &INVALID_PARAMETER_VALUE_SCHEMA,
             Self::InvalidParameterCombination(_) => &INVALID_PARAMETER_COMBINATION_SCHEMA,
             Self::InternalFailure(_) => &INTERNAL_FAILURE_SCHEMA,
+            Self::DryRunOperation(_) => &DRY_RUN_OPERATION_SCHEMA,
         }
     }
 
@@ -435,6 +489,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::InvalidParameterValue(_) => "InvalidParameterValue",
             Self::InvalidParameterCombination(_) => "InvalidParameterCombination",
             Self::InternalFailure(_) => "InternalFailure",
+            Self::DryRunOperation(_) => "DryRunOperation",
         }
     }
 
@@ -451,6 +506,12 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::InvalidParameterCombination(_) => 400,
             // The status the common AWS `InternalFailure` error carries.
             Self::InternalFailure(_) => 500,
+            // The status a dry run that would have succeeded is refused under:
+            // the request was not performed because a condition the CALLER set
+            // on it — the `DryRun` flag — says not to, which is what 412 states,
+            // and it is the status every other Amazon Web Services dry-run
+            // refusal carries.
+            Self::DryRunOperation(_) => 412,
         }
     }
 
@@ -472,6 +533,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // Same reason again; `<Code>InternalFailure</Code>` comes from
             // `shape_name` above, which is already the code AWS answers with.
             Self::InternalFailure(_) => None,
+            // Same reason again; `<Code>DryRunOperation</Code>` comes from
+            // `shape_name` above, which is already the code AWS answers with.
+            Self::DryRunOperation(_) => None,
         }
     }
 }
