@@ -29,7 +29,12 @@
 //!
 //! Either refusal is Glue's OWN sentence for a store a crawl cannot read, not that store's
 //! authorization answer: its one variable part is the target the request carried, and it names
-//! neither the identity the crawl would run as nor which of IAM's rules withheld the grant.
+//! neither the identity the crawl would run as nor which of IAM's rules withheld the grant. So
+//! no clause of an identity-authorization answer may appear in it
+//! ([`assert_discloses_no_decision`], asserted on every refusal here): not the acting
+//! principal, not the calling principal, not the policy class a decision is reached on, and
+//! not the explicit-deny clause — and the sentence reads the same whichever of them decided
+//! it, so a client keyed on Glue's wording matches every one of those readings.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -42,16 +47,22 @@ use service_com_amazonaws_iam_awsidentitymanagementv20100508::state::{
     InlinePolicy, DEFAULT_PATH,
 };
 
-use crate::wire::{call, emulator_on, error_code, error_message, ok, ACCOUNT_ID, REGION};
+use crate::wire::{
+    call, emulator_on, error_code, error_message, ok, ACCOUNT_ID, CALLER_PRINCIPAL, REGION,
+};
 
 /// The queue an S3 target is crawled from in these tests.
-fn queue_arn(name: &str) -> String {
+pub(crate) fn queue_arn(name: &str) -> String {
     format!("arn:aws:sqs:{REGION}:{ACCOUNT_ID}:{name}")
 }
 
 /// Seed `role_name` into the shared engine's IAM store, carrying `documents` as its
 /// inline policies — the records `CreateRole` and `PutRolePolicy` write.
-fn seed_role(engine: &Arc<engine::InMemoryEngine>, role_name: &str, documents: &[Value]) -> String {
+pub(crate) fn seed_role(
+    engine: &Arc<engine::InMemoryEngine>,
+    role_name: &str,
+    documents: &[Value],
+) -> String {
     let state = engine.state::<IamState>();
     let mut store = state.lock();
     let arn = role_arn(DEFAULT_PATH, role_name);
@@ -107,13 +118,86 @@ fn allow(actions: &[&str], resource: &str) -> Value {
     })
 }
 
+/// An identity policy document DENYING `actions` on `resource` — the rule class an
+/// authorization answer reports as an explicit deny, which is one of the ways a decision goes
+/// against the role and none of which may surface in what Glue answers.
+fn deny(actions: &[&str], resource: &str) -> Value {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{ "Effect": "Deny", "Action": actions, "Resource": resource }],
+    })
+}
+
+/// The Amazon S3 bucket every S3 target in these suites is pointed at, so a grant written for
+/// the data behind a target and the target's own `Path` name the one bucket.
+pub(crate) const TARGET_BUCKET: &str = "crawler-bucket";
+
+/// A document granting the crawl's own object-store reads on the data behind an S3 target of
+/// `bucket`, and nothing about the store that target is reached THROUGH: the grant the role of
+/// a crawler pointed at a queue it may not consume routinely carries.
+pub(crate) fn data_read_grant(bucket: &str) -> Value {
+    allow(
+        &["s3:ListBucket", "s3:GetObject"],
+        &format!("arn:aws:s3:::{bucket}/*"),
+    )
+}
+
+/// The clauses an identity-based authorization answer is worded with, none of which may appear
+/// in what Glue answers: the acting principal's clause, the action clause, the two policy
+/// classes a decision is reached on, and the explicit-deny clause.
+///
+/// Source: the refusal the tree's shared identity authorization is worded with, as every
+/// service that answers one words it — `User: <principal> is not authorized to perform:
+/// <action> on resource: <resource> because no identity-based policy allows the <action>
+/// action`, beside its resource-policy and explicit-deny variants (see
+/// `services/service-com-amazonaws-backupsearch-cryobackupsearchservice/src/service/authorization.rs`).
+/// Spelled out here rather than imported, because what these entries are for is to be the
+/// wording a Glue refusal must NOT drift into: a rewording of that shared refusal belongs in
+/// this list beside the spellings already here, which keep failing a Glue refusal that relays
+/// any of them.
+const AUTHORIZATION_CLAUSES: [&str; 5] = [
+    "User: ",
+    "is not authorized to perform",
+    "no identity-based policy",
+    "resource-based policy",
+    "explicit deny",
+];
+
+/// Assert that `message` states Glue's own refusal and no part of the authorization decision
+/// Glue reached to make it: it carries no clause of that answer, does not name the role the
+/// crawl would run as (by ARN or by name) and does not name the principal that called.
+///
+/// Every refusal in this suite is decided by READING the role's identity policies, so each
+/// could have been reported as that reading's own answer — which is the one thing a Glue
+/// control-plane refusal may not be, whichever way the reading came out.
+pub(crate) fn assert_discloses_no_decision(
+    case: &str,
+    message: &str,
+    role_arn: &str,
+    role_name: &str,
+) {
+    for clause in AUTHORIZATION_CLAUSES {
+        assert!(
+            !message.contains(clause),
+            "case {case:?}: a Glue refusal must carry no clause of the authorization answer, \
+             but it carries {clause:?}: got {message:?}"
+        );
+    }
+    for identity in [role_arn, role_name, CALLER_PRINCIPAL] {
+        assert!(
+            !message.contains(identity),
+            "case {case:?}: the refusal must not disclose {identity:?}, got {message:?}"
+        );
+    }
+}
+
 /// The sentence Glue refuses an event-mode create with when the role is shown nothing about
 /// the queue a target names: the queue ARN as the request supplied it, inside fixed text that
 /// conflates the queue's absence with the role's access to it, and no queue call named.
 ///
 /// Spelled out here rather than built from the service's own constructor, so the wording this
 /// suite pins is the test's and not the code's.
-fn expected_inaccessible(queue_arn: &str) -> String {
+pub(crate) fn expected_inaccessible(queue_arn: &str) -> String {
     format!("SQS queue {queue_arn} does not exist or the role provided does not have access to it.")
 }
 
@@ -153,12 +237,15 @@ impl Expected {
 }
 
 /// A `CreateCrawler` body whose single S3 target is crawled from `queue`, in event mode.
-fn event_mode_crawler(name: &str, role: &str, queue: &str) -> Value {
+pub(crate) fn event_mode_crawler(name: &str, role: &str, queue: &str) -> Value {
     json!({
         "Name": name,
         "Role": role,
         "Targets": {
-            "S3Targets": [{ "Path": "s3://crawler-bucket/data/", "EventQueueArn": queue }],
+            "S3Targets": [{
+                "Path": format!("s3://{TARGET_BUCKET}/data/"),
+                "EventQueueArn": queue,
+            }],
         },
         "RecrawlPolicy": { "RecrawlBehavior": "CRAWL_EVENT_MODE" },
     })
@@ -172,8 +259,10 @@ type Row = (String, Vec<Value>, Expected);
 /// event-mode crawler, and the identically-shaped request whose role does admit them is
 /// created.
 ///
-/// The rows differ along WHAT the role's policies grant: nothing at all, the queue
-/// operations on another queue, another service's action on the queue's own ARN, one unrelated
+/// The rows differ along WHAT the role's policies grant: nothing at all, the crawl's own
+/// object-store reads on the data behind the target and nothing on the queue, the queue
+/// operations on another queue, on another ACCOUNT's queue of the same name, on a queue whose
+/// name extends the target's, another service's action on the queue's own ARN, one unrelated
 /// call on the queue, the queue's management calls without any of the crawl's, a subset of the
 /// crawl's calls (one row per action the crawl makes, each missing in turn), a `Deny` beside
 /// an `Allow` of all, and the full grant — written as the exact ARN, through a wildcard, and
@@ -192,13 +281,6 @@ async fn an_event_mode_crawler_needs_its_role_to_consume_the_event_queue() {
     // refused at.
     let first_action = EVENT_QUEUE_ACTIONS[0];
     let last_action = EVENT_QUEUE_ACTIONS[EVENT_QUEUE_ACTIONS.len() - 1];
-    // A document DENYING `actions` on the queue, whatever else is granted.
-    let deny = |actions: &[&str]| {
-        json!({
-            "Version": "2012-10-17",
-            "Statement": [{ "Effect": "Deny", "Action": actions, "Resource": queue }],
-        })
-    };
 
     // (case, the documents the role carries, what they earn the create)
     let mut rows: Vec<Row> = vec![
@@ -208,8 +290,26 @@ async fn an_event_mode_crawler_needs_its_role_to_consume_the_event_queue() {
             Expected::Inaccessible,
         ),
         (
+            "the crawl's reads on the data bucket, and nothing on the queue".to_string(),
+            vec![data_read_grant(TARGET_BUCKET)],
+            Expected::Inaccessible,
+        ),
+        (
             "the queue operations on another queue".to_string(),
             vec![allow(&every_action, &queue_arn("some-other-queue"))],
+            Expected::Inaccessible,
+        ),
+        (
+            "the queue operations on another ACCOUNT's queue of the same name".to_string(),
+            vec![allow(
+                &every_action,
+                &format!("arn:aws:sqs:{REGION}:111122223333:glue-crawler-events"),
+            )],
+            Expected::Inaccessible,
+        ),
+        (
+            "the queue operations on a queue whose name EXTENDS this one's".to_string(),
+            vec![allow(&every_action, &queue_arn("glue-crawler-events-replay"))],
             Expected::Inaccessible,
         ),
         (
@@ -255,17 +355,17 @@ async fn an_event_mode_crawler_needs_its_role_to_consume_the_event_queue() {
         ),
         (
             "an explicit deny of the first operation beside the grant".to_string(),
-            vec![allow(&every_action, &queue), deny(&[first_action])],
+            vec![allow(&every_action, &queue), deny(&[first_action], &queue)],
             Expected::GrantMissing,
         ),
         (
             "an explicit deny of the last operation beside the grant".to_string(),
-            vec![allow(&every_action, &queue), deny(&[last_action])],
+            vec![allow(&every_action, &queue), deny(&[last_action], &queue)],
             Expected::GrantMissing,
         ),
         (
             "a deny of every queue call beside the grant".to_string(),
-            vec![allow(&every_action, &queue), deny(&["sqs:*"])],
+            vec![allow(&every_action, &queue), deny(&["sqs:*"], &queue)],
             Expected::Inaccessible,
         ),
     ];
@@ -317,6 +417,10 @@ async fn an_event_mode_crawler_needs_its_role_to_consume_the_event_queue() {
             error_code(&body)
         );
         let message = error_message(&body);
+        // Glue states its OWN refusal: whichever way the reading of the role's policies came
+        // out — no grant at all, a grant pointing elsewhere, an explicit deny — none of that
+        // reading reaches the caller.
+        assert_discloses_no_decision(case, &message, &role, &role_name);
         assert_eq!(
             message, expected_message,
             "case {case:?}: expected the {expected:?} refusal naming {queue}, got {message:?}"
@@ -343,11 +447,13 @@ async fn the_refusal_is_worded_from_the_request() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let router = emulator_on(engine.clone());
     // A role granted nothing at all, so nothing is shown about any queue.
-    let silent_arn = seed_role(&engine, "worded-role", &[]);
+    let silent_name = "worded-role";
+    let silent_arn = seed_role(&engine, silent_name, &[]);
     // ... and one granted ONE queue call on every queue of this account, so it may touch each
     // of them and consume none.
     let one_call = allow(&["sqs:GetQueueUrl"], &format!("{}*", queue_arn("")));
-    let reaching_arn = seed_role(&engine, "reaching-role", &[one_call]);
+    let reaching_name = "reaching-role";
+    let reaching_arn = seed_role(&engine, reaching_name, &[one_call]);
 
     // (case, the `Role` the request carries, the queue the target names, what it earns)
     let rows = [
@@ -359,7 +465,7 @@ async fn the_refusal_is_worded_from_the_request() {
         ),
         (
             "the role's bare NAME and another queue",
-            "worded-role".to_string(),
+            silent_name.to_string(),
             queue_arn("worded-events-2.fifo"),
             Expected::Inaccessible,
         ),
@@ -371,7 +477,7 @@ async fn the_refusal_is_worded_from_the_request() {
         ),
         (
             "a reaching role's bare NAME and another queue",
-            "reaching-role".to_string(),
+            reaching_name.to_string(),
             queue_arn("worded-events-4.fifo"),
             Expected::GrantMissing,
         ),
@@ -390,6 +496,11 @@ async fn the_refusal_is_worded_from_the_request() {
             "case {case:?}: expected 400, got {status} with {body}"
         );
         let message = error_message(&body);
+        // Glue words its own refusal, so neither the identity the crawl would run as nor any
+        // part of the authorization reading that decided the refusal is in it.
+        for (role_arn, role_name) in [(&silent_arn, silent_name), (&reaching_arn, reaching_name)] {
+            assert_discloses_no_decision(case, &message, role_arn, role_name);
+        }
         assert_eq!(
             message,
             expected
@@ -398,13 +509,6 @@ async fn the_refusal_is_worded_from_the_request() {
             "case {case:?}: the refusal must name the queue the request carried, got \
              {message:?}"
         );
-        // Glue words its own refusal, so the identity the crawl would run as is not in it.
-        for role_arn in [&silent_arn, &reaching_arn] {
-            assert!(
-                !message.contains(role_arn),
-                "case {case:?}: the refusal must not disclose the role, got {message:?}"
-            );
-        }
     }
 }
 
@@ -463,7 +567,8 @@ async fn the_refusal_names_the_grant_only_when_the_role_may_touch_the_queue() {
     }
 
     for (index, (case, documents, reachable)) in rows.iter().enumerate() {
-        let role = seed_role(&engine, &format!("told-apart-{index}"), documents);
+        let role_name = format!("told-apart-{index}");
+        let role = seed_role(&engine, &role_name, documents);
         let (status, body) = call(
             &router,
             "CreateCrawler",
@@ -475,6 +580,10 @@ async fn the_refusal_names_the_grant_only_when_the_role_may_touch_the_queue() {
             "case {case:?}: expected 400, got {status} with {body}"
         );
         let message = error_message(&body);
+        // Whichever of the two refusals it is, and whichever call the role's documents
+        // admitted on the queue, Glue states its own sentence and no part of the reading that
+        // decided it.
+        assert_discloses_no_decision(case, &message, &role, &role_name);
         // The clause that conflates an absent queue with one the role may not reach is in
         // BOTH refusals, naming the queue the target carried.
         assert!(
@@ -766,7 +875,7 @@ fn table_arn(table: &str) -> String {
 /// it refused. Written out here rather than read from the crate's own constructor, so the
 /// wording this suite pins is the test's and not the code's; the request id is the clause's
 /// one per-run field, so it is matched by [`without_request_id`] instead.
-fn expected_table_grant_missing(table: &str) -> String {
+pub(crate) fn expected_table_grant_missing(table: &str) -> String {
     format!(
         "DynamoDB table {table} does not exist or the role provided does not have access to \
          it. Please make sure the role has dynamodb:DescribeTable and dynamodb:Scan \
@@ -781,7 +890,7 @@ fn expected_table_grant_missing(table: &str) -> String {
 /// The id is asserted to be there and to have the form this emulator's refusals report an id
 /// in (`service_common::query_error_envelope::is_request_id`, the 8-4-4-4-12 form), and only
 /// then taken out of the comparison.
-fn without_request_id(case: &str, message: &str) -> String {
+pub(crate) fn without_request_id(case: &str, message: &str) -> String {
     let Some((head, tail)) = message.split_once("Request ID: ") else {
         panic!("case {case:?}: the refusal must name the request it answers, got {message:?}");
     };
@@ -797,7 +906,7 @@ fn without_request_id(case: &str, message: &str) -> String {
 }
 
 /// A `CreateCrawler` body whose single target is the DynamoDB table `table`.
-fn dynamodb_crawler(name: &str, role: &str, table: &str) -> Value {
+pub(crate) fn dynamodb_crawler(name: &str, role: &str, table: &str) -> Value {
     json!({
         "Name": name,
         "Role": role,
@@ -827,12 +936,6 @@ async fn a_dynamodb_target_needs_its_role_to_read_the_table() {
         service_com_amazonaws_glue_awsglue::state::DYNAMODB_TARGET_ACTIONS.to_vec();
     let first_action = every_action[0];
     let last_action = every_action[every_action.len() - 1];
-    let deny = |actions: &[&str]| {
-        json!({
-            "Version": "2012-10-17",
-            "Statement": [{ "Effect": "Deny", "Action": actions, "Resource": arn }],
-        })
-    };
 
     // (case, the documents the role carries, whether they admit the whole crawl)
     let mut rows: Vec<(String, Vec<Value>, bool)> = vec![
@@ -840,6 +943,11 @@ async fn a_dynamodb_target_needs_its_role_to_read_the_table() {
         // grounds no refusal — the reading the crawl's own read authorization makes of the
         // same records.
         ("no policy at all".to_string(), Vec::new(), true),
+        (
+            "the crawl's reads on the data bucket, and nothing on the table".to_string(),
+            vec![data_read_grant(TARGET_BUCKET)],
+            false,
+        ),
         (
             "the table reads on another table".to_string(),
             vec![allow(&every_action, &table_arn("some-other-table"))],
@@ -875,12 +983,12 @@ async fn a_dynamodb_target_needs_its_role_to_read_the_table() {
         ),
         (
             "an explicit deny of the first read beside the grant".to_string(),
-            vec![allow(&every_action, &arn), deny(&[first_action])],
+            vec![allow(&every_action, &arn), deny(&[first_action], &arn)],
             false,
         ),
         (
             "an explicit deny of the last read beside the grant".to_string(),
-            vec![allow(&every_action, &arn), deny(&[last_action])],
+            vec![allow(&every_action, &arn), deny(&[last_action], &arn)],
             false,
         ),
     ];
@@ -900,7 +1008,8 @@ async fn a_dynamodb_target_needs_its_role_to_read_the_table() {
     }
 
     for (index, (case, documents, admitted)) in rows.iter().enumerate() {
-        let role = seed_role(&engine, &format!("ddb-crawler-role-{index}"), documents);
+        let role_name = format!("ddb-crawler-role-{index}");
+        let role = seed_role(&engine, &role_name, documents);
         let crawler = format!("ddb-crawler-{index}");
         let (status, body) = call(
             &router,
@@ -934,16 +1043,15 @@ async fn a_dynamodb_target_needs_its_role_to_read_the_table() {
             error_code(&body)
         );
         let message = error_message(&body);
+        // Glue states its own refusal about the other store a target is read through too, so
+        // no part of the reading that decided it — the identity, the policy class, the
+        // explicit deny — is in it either.
+        assert_discloses_no_decision(case, &message, &role, &role_name);
         assert_eq!(
             without_request_id(case, &message),
             expected_table_grant_missing(table),
             "case {case:?}: expected the refusal naming the table {table} and the grant the \
              crawl needs, got {message:?}"
-        );
-        // Glue words its own refusal, so the identity the crawl would run as is not in it.
-        assert!(
-            !message.contains(&role),
-            "case {case:?}: the refusal must not disclose the role, got {message:?}"
         );
         // No crawler was stored: the refused create left nothing behind.
         let (status, body) = call(&router, "GetCrawler", &json!({ "Name": crawler })).await;
