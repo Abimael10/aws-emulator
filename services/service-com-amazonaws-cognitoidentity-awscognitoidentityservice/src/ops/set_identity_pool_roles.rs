@@ -7,10 +7,12 @@
 //! configuration is gone rather than merged into.
 //!
 //! A role the pool is configured with is a role the caller PASSES to Amazon Cognito, so it
-//! has to be a role of the caller's own account: a value naming another account's role, or
-//! naming no role at all, is refused `NotAuthorizedException` (HTTP 403) — the pass is
-//! decided about the value as the role of an account that is not this one rather than
-//! parsed as a parameter ([`crate::state::names_an_assumable_role`]). A role MAPPING keyed
+//! has to be a role of the caller's own account, and the two ways a value is not one are two
+//! refusals ([`crate::state::passed_role_refusal`]): a well-formed IAM role ARN of ANOTHER
+//! account is a pass this account may not make, the AWS-common `AccessDeniedException`
+//! carrying the pass-role sentence, while a value that names no IAM role at all reaches no
+//! role to pass, the modelled `NotAuthorizedException` (HTTP 403) naming the value the
+//! request supplied. A role MAPPING keyed
 //! by a provider the pool is not configured with, and one that does not carry what the model
 //! documents as required for its `Type`, are each a bad input parameter,
 //! `InvalidParameterException` (HTTP 400). A `Roles` KEY outside the constraints
@@ -401,8 +403,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> SetIdentityPoolRo
 /// at all only because the validating walk ahead of it treats a map's key as a path segment
 /// rather than as a constrained leaf. A VALUE satisfies every constraint the model states
 /// (`ARNString` bounds only the length), so what is asked of it is not its form but whether
-/// Amazon Cognito may be passed it: a value that names no role of this account is refused
-/// `NotAuthorizedException` ([`not_authorized`]).
+/// Amazon Cognito may be passed it, in the two classes that question is refused in
+/// ([`refused_pass_role`]).
 fn validated_roles(
     roles: &::std::collections::HashMap<String, String>,
 ) -> Result<::std::collections::BTreeMap<String, String>, SetIdentityPoolRolesError> {
@@ -423,8 +425,8 @@ fn validated_roles(
                 ),
             ));
         }
-        if !crate::state::names_an_assumable_role(role_arn) {
-            return Err(not_authorized());
+        if let Some(refused) = refused_pass_role(role_arn) {
+            return Err(refused);
         }
     }
     // Every key and value was admitted, so the map as submitted is the map as stored.
@@ -499,13 +501,12 @@ fn validated_role_mappings(
                 )));
             }
             // A role a RULE resolves to is as much a role this pool would be passed as one
-            // of its two plain roles, so the same question is asked of it.
-            if configuration
-                .rules
-                .iter()
-                .any(|rule| !crate::state::names_an_assumable_role(&rule.role_arn))
-            {
-                return Err(not_authorized());
+            // of its two plain roles, so the same question is asked of it, and the answer is
+            // classified the same way.
+            for rule in &configuration.rules {
+                if let Some(refused) = refused_pass_role(&rule.role_arn) {
+                    return Err(refused);
+                }
             }
         }
         validated.insert(provider.clone(), mapping.clone());
@@ -513,14 +514,28 @@ fn validated_role_mappings(
     Ok(validated)
 }
 
-/// The modelled refusal for a role Amazon Cognito may not be passed (HTTP 403): a value
-/// that names no IAM role of this account, in the one sentence that rule is worded with
-/// ([`crate::state::CROSS_ACCOUNT_PASS_ROLE_MESSAGE`]).
-fn not_authorized() -> SetIdentityPoolRolesError {
-    SetIdentityPoolRolesErrorModeled::NotAuthorizedException(NotAuthorizedException {
-        message: Some(crate::state::CROSS_ACCOUNT_PASS_ROLE_MESSAGE.to_string()),
-    })
-    .into()
+/// The refusal for a role value Amazon Cognito may not be passed, or `None` for one it may
+/// ([`crate::state::passed_role_refusal`]).
+///
+/// The two classes are different ERRORS, because a caller fixes them in different places: a
+/// well-formed role ARN of another account is a pass-role denial — the AWS-common
+/// `AccessDeniedException`, which this service's model declares no shape of, so it travels
+/// through the error channel's own variant — and a value that names no IAM role at all is
+/// this operation's modelled `NotAuthorizedException` over the value the request supplied.
+fn refused_pass_role(role_arn: &str) -> Option<SetIdentityPoolRolesError> {
+    match crate::state::passed_role_refusal(role_arn)? {
+        crate::state::PassedRoleRefusal::CrossAccount => Some(
+            crate::scaffolded::Scaffolded::access_denied(
+                crate::state::CROSS_ACCOUNT_PASS_ROLE_MESSAGE,
+            ),
+        ),
+        crate::state::PassedRoleRefusal::NotARole => Some(
+            SetIdentityPoolRolesErrorModeled::NotAuthorizedException(NotAuthorizedException {
+                message: Some(crate::state::forbidden_role_message(role_arn)),
+            })
+            .into(),
+        ),
+    }
 }
 
 /// The modelled refusal for a bad input parameter (HTTP 400), carrying what was wrong

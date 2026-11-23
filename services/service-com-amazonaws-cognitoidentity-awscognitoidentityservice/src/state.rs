@@ -3247,11 +3247,10 @@ fn is_region_like(region: &str) -> bool {
 /// question this service asks of a role it is handed for an identity pool to assume.
 ///
 /// A role an identity pool is configured with is a role the caller PASSES to Amazon
-/// Cognito, and a service can only be passed a role of the account it is acting for: a
-/// value naming another account's role, and a value naming no role at all, are the same
-/// answer here, because the pass is decided about the value as the role of some account
-/// that is not this one rather than parsed as a parameter. What the refusal then says is
-/// [`CROSS_ACCOUNT_PASS_ROLE_MESSAGE`].
+/// Cognito, and a service can only be passed a role of the account it is acting for, so a
+/// value naming another account's role and a value naming no role at all are both refused.
+/// WHICH refusal each is, is [`passed_role_refusal`]: the pass of another account's role and
+/// a value that names no role are different faults, fixed in different places.
 ///
 /// The reading is `service_common::iam_role::role_name`, the tree's one resolution of a
 /// caller-supplied IAM ARN onto an entity of this account (the `iam` vendor, no Region, this
@@ -3261,14 +3260,87 @@ pub fn names_an_assumable_role(role_arn: &str) -> bool {
     ::service_common::iam_role::role_name(role_arn).is_some()
 }
 
-/// How AWS words the refusal of a role a service may not be passed: a value that names no
-/// role of the caller's own account.
+/// How AWS words the refusal of a role a service may not be passed: a value that names
+/// ANOTHER account's role.
 ///
 /// Fixed text with no request- or state-derived part — the value is the caller's own input
 /// and the refusal adds nothing by echoing it — and the sentence every emulated service
 /// that authorizes a pass of a caller-supplied role answers with, so a client reads one
 /// wording for one rule.
 pub const CROSS_ACCOUNT_PASS_ROLE_MESSAGE: &str = "Cross-account pass role is not allowed.";
+
+/// How AWS words the refusal of a role value that names no IAM role AT ALL: access to the
+/// role the request named is forbidden.
+///
+/// The one part taken from the request is the value it carried, which the caller sent
+/// itself, so the refusal discloses nothing the caller did not already hold; the rest is
+/// fixed text. Worded as [`forbidden_identity_message`] is, the two being the same
+/// sentence over the resource each names: this service states a resource a call may not
+/// reach that way.
+pub fn forbidden_role_message(role_arn: &str) -> String {
+    format!("Access to Role '{role_arn}' is forbidden.")
+}
+
+/// Why a role value a caller hands this service is not one Amazon Cognito may be passed —
+/// the two CLASSES such a refusal comes in.
+///
+/// A pass of a caller-supplied role fails for one of two different reasons, and each is its
+/// own error class, because each is fixed somewhere else: a value that IS an IAM role ARN
+/// but names a role of another account is a pass this account may not make, which is the
+/// pass-role denial ([`CROSS_ACCOUNT_PASS_ROLE_MESSAGE`]) a caller fixes in IAM; a value
+/// that names no IAM role at all reaches no role this service could be passed, which is a
+/// refusal about the value the request supplied ([`forbidden_role_message`]) and is fixed in
+/// the request. Collapsing them would point a caller at the wrong one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassedRoleRefusal {
+    /// A well-formed IAM role ARN naming an account that is not the one this emulator
+    /// serves.
+    CrossAccount,
+    /// A value that names no IAM role of any account.
+    NotARole,
+}
+
+/// Why `role_arn` is not a role Amazon Cognito may be passed, or `None` when it names an
+/// IAM role of this account ([`names_an_assumable_role`]) and so is one it may.
+///
+/// Asked of EVERY caller-supplied role value this service is handed, whichever member
+/// carries it, so one rule decides them all.
+pub fn passed_role_refusal(role_arn: &str) -> Option<PassedRoleRefusal> {
+    if names_an_assumable_role(role_arn) {
+        return None;
+    }
+    if names_another_accounts_role(role_arn) {
+        return Some(PassedRoleRefusal::CrossAccount);
+    }
+    Some(PassedRoleRefusal::NotARole)
+}
+
+/// Whether `role_arn` is a WELL-FORMED IAM role ARN whose account is not the one this
+/// emulator serves: an `iam` ARN carrying no Region (an IAM ARN is partition-global), a
+/// twelve-digit account id that is not this account's, and a `role/<path><name>` resource
+/// whose name is not empty.
+///
+/// Read through [`::service_common::arn`], the tree's one ARN parse — the same six fields
+/// [`names_an_assumable_role`]'s reading resolves — so the two readings of one value cannot
+/// disagree about what an IAM role ARN is.
+fn names_another_accounts_role(role_arn: &str) -> bool {
+    let Some(arn) = ::service_common::arn::parse_of(role_arn, "iam") else {
+        return false;
+    };
+    if !arn.region.is_empty()
+        || !::service_common::arn::is_account_id(arn.account)
+        || arn.account == ::engine::emulator_account_id()
+    {
+        return false;
+    }
+    arn.resource
+        .strip_prefix(&format!("{IAM_ROLE_RESOURCE_TYPE}/"))
+        .and_then(|path_and_name| path_and_name.split('/').next_back())
+        .is_some_and(|role_name| !role_name.is_empty())
+}
+
+/// The IAM resource type a role ARN names, as IAM spells it in the resource field.
+const IAM_ROLE_RESOURCE_TYPE: &str = "role";
 
 /// This service's ARN namespace, from the model's own `aws.api#service` trait
 /// (`smithy_query(query="service_info")`: `arnNamespace: cognito-identity`). It is the

@@ -19,7 +19,8 @@
 //! * a configuration naming more Amazon Cognito user pool providers than the account's
 //!   published quota admits is refused `LimitExceededException`;
 //! * a role the pool is configured with is a role the caller PASSES to Amazon Cognito, so a
-//!   value naming no IAM role of this account is refused `NotAuthorizedException`;
+//!   value naming no IAM role of this account is refused — `AccessDeniedException` for
+//!   another account's role and `NotAuthorizedException` for a value that names no role;
 //! * a pool is reconfigured as a whole, so a write that meets another write of the same pool
 //!   already in flight is refused `ConcurrentModificationException`, naming the resource
 //!   TYPE only one request of which is processed at a time, and stores nothing.
@@ -30,7 +31,10 @@
 //! `MultiServiceRouter` the production router builds.
 
 use serde_json::{json, Map, Value};
-use service_com_amazonaws_cognitoidentity_awscognitoidentityservice::state::identity_pool_arn;
+use service_com_amazonaws_cognitoidentity_awscognitoidentityservice::scaffolded::ACCESS_DENIED_STATUS;
+use service_com_amazonaws_cognitoidentity_awscognitoidentityservice::state::{
+    forbidden_role_message, identity_pool_arn, CROSS_ACCOUNT_PASS_ROLE_MESSAGE,
+};
 use service_com_amazonaws_cognitoidentity_awscognitoidentityservice::state::pool_configuration::{
     INVALID_TAG_CHARACTERS_MESSAGE, MAX_USER_POOL_PROVIDERS_PER_IDENTITY_POOL,
 };
@@ -586,10 +590,18 @@ async fn a_configuration_past_the_user_pool_provider_quota_is_refused() {
     }
 }
 
+/// One row of the pass-role table: the case, the role value it sends, and the refusal that
+/// value draws — the status, the error code and the message — or `None` where the value is
+/// admitted.
+type PassRoleRow = (&'static str, String, Option<(u16, &'static str, String)>);
+
 /// RULE: a role an identity pool is configured with is a role the caller PASSES to Amazon
-/// Cognito, so it has to name an IAM role of the caller's own account; a value that names
-/// another account's role, or no role at all, is refused `NotAuthorizedException` in the one
-/// sentence that rule is worded with, and the pool keeps the configuration it had.
+/// Cognito, so it has to name an IAM role of the caller's own account — and WHICH refusal a
+/// value that does not is follows what the value names: a well-formed IAM role ARN of
+/// another account is the pass-role denial, `AccessDeniedException` with the fixed
+/// cross-account sentence, while a value that names no IAM role at all is
+/// `NotAuthorizedException` naming the value the request supplied. Either way the pool keeps
+/// the configuration it had.
 ///
 /// The rows span both places a configuration names a role — the `Roles` map and a mapping
 /// rule's `RoleARN` — and the ways a value can fail to name one of this account's roles.
@@ -601,38 +613,74 @@ async fn a_role_the_account_does_not_own_is_refused_as_a_pass_role() {
         .await;
     let own = |name: &str| format!("arn:aws:iam::{}:role/{name}", engine::emulator_account_id());
 
-    // (case, the role value, admitted?)
-    let rows: Vec<(&str, String, bool)> = vec![
-        ("a role of this account", own("pool-auth"), true),
-        ("a role of this account under a path", own("service-role/pool-auth"), true),
+    // (case, the role value, the refusal it draws: `None` where the value is admitted)
+    let rows: Vec<PassRoleRow> = vec![
+        ("a role of this account", own("pool-auth"), None),
+        (
+            "a role of this account under a path",
+            own("service-role/pool-auth"),
+            None,
+        ),
         (
             "another account's role",
             "arn:aws:iam::123456789012:role/pool-auth".to_string(),
-            false,
+            Some((
+                ACCESS_DENIED_STATUS,
+                "AccessDeniedException",
+                CROSS_ACCOUNT_PASS_ROLE_MESSAGE.to_string(),
+            )),
+        ),
+        (
+            "another account's role under a path",
+            "arn:aws:iam::123456789012:role/service-role/pool-auth".to_string(),
+            Some((
+                ACCESS_DENIED_STATUS,
+                "AccessDeniedException",
+                CROSS_ACCOUNT_PASS_ROLE_MESSAGE.to_string(),
+            )),
         ),
         (
             "an account id that is not twelve digits",
             "arn:aws:iam::1234:role/pool-auth".to_string(),
-            false,
+            Some((
+                CLIENT_ERROR_STATUS,
+                "NotAuthorizedException",
+                forbidden_role_message("arn:aws:iam::1234:role/pool-auth"),
+            )),
         ),
         (
             "an IAM user of this account",
             format!("arn:aws:iam::{}:user/alice", engine::emulator_account_id()),
-            false,
+            Some((
+                CLIENT_ERROR_STATUS,
+                "NotAuthorizedException",
+                forbidden_role_message(&format!(
+                    "arn:aws:iam::{}:user/alice",
+                    engine::emulator_account_id()
+                )),
+            )),
         ),
         (
             "another service's resource",
             "arn:aws:s3:::a-bucket-named-like-this".to_string(),
-            false,
+            Some((
+                CLIENT_ERROR_STATUS,
+                "NotAuthorizedException",
+                forbidden_role_message("arn:aws:s3:::a-bucket-named-like-this"),
+            )),
         ),
         (
             "a value that is no ARN at all",
             "not-an-arn-but-long-enough".to_string(),
-            false,
+            Some((
+                CLIENT_ERROR_STATUS,
+                "NotAuthorizedException",
+                forbidden_role_message("not-an-arn-but-long-enough"),
+            )),
         ),
     ];
 
-    for (case, role_arn, admitted) in rows {
+    for (case, role_arn, refusal) in rows {
         // The same value in both places a configuration names a role.
         let requests = [
             (
@@ -665,24 +713,24 @@ async fn a_role_the_account_does_not_own_is_refused_as_a_pass_role() {
 
         for (member_named, request) in requests {
             let (status, body) = emulator.call("SetIdentityPoolRoles", &request).await;
-            if admitted {
+            let Some((expected_status, expected_code, expected_message)) = &refusal else {
                 assert_eq!(
                     status, 200,
                     "case {case:?} at {member_named}: expected the configuration to be \
                      stored, got {status} with {body}"
                 );
                 continue;
-            }
+            };
             assert_eq!(
                 (status, error_code(&body).as_str()),
-                (CLIENT_ERROR_STATUS, "NotAuthorizedException"),
+                (*expected_status, *expected_code),
                 "case {case:?} at {member_named}: expected the pass-role refusal, got \
                  {status} with {body}"
             );
             assert_eq!(
-                error_message(&body),
-                "Cross-account pass role is not allowed.",
-                "case {case:?} at {member_named}: expected the pass-role sentence, got {body}"
+                &error_message(&body),
+                expected_message,
+                "case {case:?} at {member_named}: expected {expected_message:?}, got {body}"
             );
         }
     }

@@ -351,8 +351,9 @@ async fn roles_of_a_pool_that_is_not_stored_are_not_found() {
 /// and the error code.
 type RefusedConfiguration = (&'static str, Value, Option<Value>, (u16, &'static str));
 
-/// RULE: a configuration naming a role Amazon Cognito may not be passed — a value that
-/// names no IAM role of this account — is refused `NotAuthorizedException` (HTTP 403),
+/// RULE: a configuration naming a role Amazon Cognito may not be passed is refused in the
+/// class of what the value NAMES — `AccessDeniedException` for a well-formed role ARN of
+/// another account, `NotAuthorizedException` for a value that names no IAM role at all —
 /// while one whose role MAPPING is missing what the model documents as required for its
 /// `Type` is refused `InvalidParameterException` (HTTP 400); either way the pool keeps the
 /// configuration it already had.
@@ -375,20 +376,23 @@ async fn an_incomplete_or_non_role_configuration_is_refused_and_changes_nothing(
         )
         .await;
 
-    /// The refusal a role a service may not be passed earns: the code of
-    /// `NotAuthorizedException`, which is what a value naming no role of this account is,
-    /// at the status this service answers every client error with
+    /// The refusal a value that names NO IAM role at all earns: the code of
+    /// `NotAuthorizedException`, at the status this service answers every client error with
     /// (`crate::service::modeled_error_status`).
     const PASS_ROLE: (u16, &str) = (400, "NotAuthorizedException");
+    /// The refusal a well-formed role ARN of ANOTHER account earns: the AWS-common
+    /// `AccessDeniedException`, which this service's model declares no shape of, at the
+    /// status that refusal carries.
+    const CROSS_ACCOUNT: (u16, &str) = (403, "AccessDeniedException");
     /// The refusal a bad input parameter earns.
     const BAD_PARAMETER: (u16, &str) = (400, "InvalidParameterException");
 
     let refusals: Vec<RefusedConfiguration> = vec![
         // A role value that is long enough to satisfy `ARNString` (len 20..2048) but names
         // no IAM role of this account: a user, another service's resource, another
-        // account's role, a role with no name at all, and a value that is no ARN. Every one
-        // of them is the same answer, because the pass is decided about the value as the
-        // role of an account that is not this one rather than parsed as a parameter.
+        // account's role, a role with no name at all, and a value that is no ARN. Which
+        // refusal each earns follows what it names — another account's role is a pass this
+        // account may not make, anything else names no role to pass at all.
         (
             "a user ARN where a role belongs",
             json!({"authenticated": format!("arn:aws:iam::{}:user/alice", engine::emulator_account_id())}),
@@ -405,7 +409,7 @@ async fn an_incomplete_or_non_role_configuration_is_refused_and_changes_nothing(
             "another account's role",
             json!({"unauthenticated": "arn:aws:iam::123456789012:role/Cognito_poolUnauth_Role"}),
             None,
-            PASS_ROLE,
+            CROSS_ACCOUNT,
         ),
         (
             "an account id that is not twelve digits",

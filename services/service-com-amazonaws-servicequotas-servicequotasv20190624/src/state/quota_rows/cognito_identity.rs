@@ -31,14 +31,25 @@ fn cognito_identity_request_rate(code: &str, api_name: &str, requests_per_second
 /// and the recorded default-quota listing of that code for which `QuotaCode` names which
 /// operation's rate and at how many requests per second it is served
 /// ([`cognito_identity_request_rate`]): this service publishes a request-rate quota per
-/// identity-pool API operation. The remaining codes that listing reports name operations
-/// no source available here states, and a code identifies ONE quota, so those rows are
-/// left to the default-quota-set gap rather than published under a binding this catalog
-/// would be guessing at (see [`crate::state::descriptive_quota_code`]).
+/// identity-pool API operation, and beside those the RESOURCE COUNT of the Amazon Cognito
+/// user pool providers one identity pool may be configured with — the quota the identity
+/// service enforces as `MAX_USER_POOL_PROVIDERS_PER_IDENTITY_POOL`
+/// (`services/service-com-amazonaws-cognitoidentity-awscognitoidentityservice/src/state/pool_configuration.rs`),
+/// published here under the one `L-` code that listing reports for this service code and
+/// the five further resource rows of it do not name. A count is not a rate, so it carries
+/// neither a window nor a usage metric, and no `Description`: the sentence AWS publishes
+/// for it is not one any source available here states, and a row carries the quota's own
+/// published text or none.
+///
+/// The remaining codes that listing reports name quotas no source available here states,
+/// and a code identifies ONE quota, so those rows are left to the default-quota-set gap
+/// rather than published under a binding this catalog would be guessing at (see
+/// [`crate::state::descriptive_quota_code`]).
 pub(in crate::state) fn cognito_identity_quotas() -> Vec<QuotaRow> {
     vec![
         cognito_identity_request_rate("L-0BF99E8D", "GetOpenIdTokenForDeveloperIdentity", 50.0),
         cognito_identity_request_rate("L-0D31D6D2", "UntagResource", 5.0),
+        quota("Amazon Cognito user pool providers per identity pool", 50.0).code("L-14403AD5"),
         cognito_identity_request_rate("L-50C9AAB8", "ListTagsForResource", 10.0),
         cognito_identity_request_rate("L-5AE9F13D", "GetCredentialsForIdentity", 200.0),
         cognito_identity_request_rate("L-A38ADA84", "GetId", 25.0),

@@ -80,15 +80,18 @@ pub fn action_for(operation: &str) -> String {
 }
 
 /// The resource an operation that names NO single identity pool is decided against and
-/// refused about: every identity pool of this account in `region`, spelled with IAM's own
-/// resource wildcard. A listing of the account's pools, and a create whose id this service
-/// has not minted yet, address no one pool — so a statement scoped to one pool cannot
-/// allow them, while one covering the account's pools can.
-pub fn any_identity_pool_arn(region: &str) -> String {
+/// refused about: this service's identity-pool resource of `region` with an EMPTY pool id.
+/// A listing of the account's pools, and a create whose id this service has not minted yet,
+/// address no one pool — so the id segment of the ARN the decision is taken over is empty,
+/// which is what AWS's refusal of such an action names as the resource. The empty segment is
+/// the ARN of a request that addresses no instance; a `*` there would be a policy PATTERN
+/// reported as the resource that was evaluated, which it never is. A statement scoped to one
+/// pool therefore cannot allow such an action, while one covering the account's pools can.
+pub fn empty_identity_pool_arn(region: &str) -> String {
     ::engine::emulator_arn(
         super::ARN_NAMESPACE,
         region,
-        &format!("{}/*", super::IDENTITY_POOL_RESOURCE_TYPE),
+        &format!("{}/", super::IDENTITY_POOL_RESOURCE_TYPE),
     )
 }
 
@@ -136,7 +139,7 @@ fn not_authorized(principal: &str, action: &str, resource: &str, explicit: bool)
 ///
 /// `resource` is the ARN the request addresses, computed before anything is looked up so
 /// the decision does not depend on whether that resource exists, or `None` for a request
-/// that addresses no single pool (see [`any_identity_pool_arn`]).
+/// that addresses no single pool (see [`empty_identity_pool_arn`]).
 pub fn refusal<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
@@ -147,7 +150,7 @@ pub fn refusal<Eng: Send + Sync + 'static>(
     let caller = caller(engine, ctx);
     let fallback = resource
         .is_none()
-        .then(|| any_identity_pool_arn(&super::request_region(ctx.parts())));
+        .then(|| empty_identity_pool_arn(&super::request_region(ctx.parts())));
     let resource = resource.or(fallback.as_deref()).unwrap_or_default();
     if caller.identity_is_unbounded() {
         return None;
@@ -405,7 +408,7 @@ mod tests {
             (
                 "the granted action with no single pool named",
                 "DeleteIdentityPool",
-                &any_identity_pool_arn("us-east-1"),
+                &empty_identity_pool_arn("us-east-1"),
                 false,
             ),
         ];

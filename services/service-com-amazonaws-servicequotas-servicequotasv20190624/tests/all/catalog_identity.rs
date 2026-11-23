@@ -473,6 +473,7 @@ const CITED_AWS_QUOTA_CODES: &[(&str, &str)] = &[
     ("codepipeline", "L-FE939BB2"),
     ("cognito-identity", "L-0BF99E8D"),
     ("cognito-identity", "L-0D31D6D2"),
+    ("cognito-identity", "L-14403AD5"),
     ("cognito-identity", "L-50C9AAB8"),
     ("cognito-identity", "L-5AE9F13D"),
     ("cognito-identity", "L-A38ADA84"),

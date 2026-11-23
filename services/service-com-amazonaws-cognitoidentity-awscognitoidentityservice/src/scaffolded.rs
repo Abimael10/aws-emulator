@@ -348,8 +348,11 @@ impl<E> Scaffolded<E> {
     /// Refuse the request as unauthorized, with [`ACCESS_DENIED_STATUS`]
     /// `AccessDeniedException` and `message`.
     ///
-    /// Reach for this only through [`crate::state::authorization`], which decides it from
-    /// the policies the IAM store holds for the calling principal and words the refusal.
+    /// Reach for this for a refusal AWS answers with that code: the identity-based decision
+    /// [`crate::state::authorization`] takes from the policies the IAM store holds for the
+    /// calling principal, and the denial of a pass of a role that belongs to another account
+    /// (`crate::ops::set_identity_pool_roles`). Each words its own refusal; neither is a
+    /// shape this service's model declares.
     pub fn access_denied(message: impl Into<String>) -> Self {
         Self::AccessDenied(AccessDeniedException::new(message))
     }

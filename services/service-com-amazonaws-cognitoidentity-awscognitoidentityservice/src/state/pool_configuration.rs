@@ -147,13 +147,15 @@ pub fn tag_charset_refusal(tags: &[(&str, &str)]) -> Option<&'static str> {
 /// emulator's own ceilings are [`super::MAX_IDENTITY_POOLS`] and its siblings).
 pub const MAX_USER_POOL_PROVIDERS_PER_IDENTITY_POOL: usize = 50;
 
-/// How this service words the refusal of a configuration naming more user pool providers
-/// than [`MAX_USER_POOL_PROVIDERS_PER_IDENTITY_POOL`]: it names the quota that was reached,
-/// which is the one thing the caller has to act on, and nothing else of the request.
+/// How AWS words the refusal of a configuration naming more user pool providers than
+/// [`MAX_USER_POOL_PROVIDERS_PER_IDENTITY_POOL`]: it names the LIMIT that was reached, which
+/// is the one thing the caller has to act on, and nothing else of the request. "Cognito Sign
+/// In Providers" is the name AWS's own refusal gives the `CognitoIdentityProviders` a pool is
+/// configured with.
 pub fn too_many_user_pool_providers_message() -> String {
     format!(
-        "The maximum number of user pool providers per identity pool \
-         ({MAX_USER_POOL_PROVIDERS_PER_IDENTITY_POOL}) has been reached."
+        "Cognito Sign In Providers per Identity pool limit of \
+         {MAX_USER_POOL_PROVIDERS_PER_IDENTITY_POOL} reached."
     )
 }
 

@@ -134,6 +134,21 @@ const ROWS: &[Row] = &[
     Row {
         service_code: "cognito-identity",
         service_name: "Amazon Cognito Federated Identities",
+        quota_code: "L-14403AD5",
+        quota_name: "Amazon Cognito user pool providers per identity pool",
+        value: 50.0,
+        unit: "None",
+        adjustable: true,
+        // The sentence AWS publishes for this count is not one this catalog can cite, so
+        // the row publishes no `Description` member at all.
+        description: "",
+        period: None,
+        metric: Metric::None,
+        context: None,
+    },
+    Row {
+        service_code: "cognito-identity",
+        service_name: "Amazon Cognito Federated Identities",
         quota_code: "L-50C9AAB8",
         quota_name: "Rate of ListTagsForResource requests",
         value: 10.0,

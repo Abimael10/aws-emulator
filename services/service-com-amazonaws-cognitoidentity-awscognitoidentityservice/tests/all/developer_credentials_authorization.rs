@@ -7,8 +7,8 @@
 //! signature for is a developer-credentials call, and such a call is served only to a
 //! caller whose identity-based IAM policies allow THAT operation's own action
 //! (`cognito-identity:<OperationName>`) on the resource the request names — the identity
-//! pool's ARN, or the account's identity pools in the request's region for a call that
-//! names no single pool. Every other caller is refused with the AWS-common
+//! pool's ARN, or that same ARN form with an EMPTY pool-id segment for a call that names no
+//! single pool. Every other caller is refused with the AWS-common
 //! `AccessDeniedException` (HTTP 403) BEFORE the operation reads or writes anything, so a
 //! refused caller learns nothing about what the account holds and a refused mutation
 //! changes nothing. The operations the model marks `@optionalAuth` — the unauthenticated
@@ -385,9 +385,23 @@ fn action_of(operation: &str) -> String {
     format!("{ARN_NAMESPACE}:{operation}")
 }
 
-/// The resource a call that names no single pool is decided against: the account's identity
-/// pools in [`REGION`].
-fn any_pool_arn() -> String {
+/// The resource a call that names no single pool is DECIDED AGAINST and refused about:
+/// this service's identity-pool resource in [`REGION`] with an EMPTY pool-id segment, since
+/// such a call addresses no one pool. It is the ARN of a request that names no instance, not
+/// a policy pattern: a `*` there would report a wildcard that was never evaluated.
+fn pool_less_resource() -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        REGION,
+        &format!("{IDENTITY_POOL_RESOURCE_TYPE}/"),
+    )
+}
+
+/// The resource ELEMENT a policy covering every identity pool of the account in [`REGION`]
+/// is written with: IAM's own resource wildcard, which is a pattern a document states rather
+/// than a resource a request addresses — so it covers the pool-less resource
+/// ([`pool_less_resource`]) as well as every named pool.
+fn account_pools_pattern() -> String {
     ::engine::emulator_arn(
         ARN_NAMESPACE,
         REGION,
@@ -458,12 +472,12 @@ fn operation_rows(pool_id: &str) -> Vec<OperationRow> {
                 "IdentityPoolName": "authorization-probe-create",
                 "AllowUnauthenticatedIdentities": true,
             }),
-            resource: any_pool_arn(),
+            resource: pool_less_resource(),
         },
         OperationRow {
             operation: "ListIdentityPools",
             request: json!({ "MaxResults": 10 }),
-            resource: any_pool_arn(),
+            resource: pool_less_resource(),
         },
         named("DescribeIdentityPool", json!({ "IdentityPoolId": pool_id })),
         named(
@@ -541,11 +555,12 @@ fn operation_rows(pool_id: &str) -> Vec<OperationRow> {
         },
         OperationRow {
             // A batch of identities names no single pool — an `IdentityId` carries none —
-            // so the decision is made about the account's identity pools. The id named is
+            // so the decision is made about this service's pool resource with no pool id in
+            // it. The id named is
             // well-formed and names no identity, so the authorized call deletes nothing.
             operation: "DeleteIdentities",
             request: json!({ "IdentityIdsToDelete": [ABSENT_IDENTITY_ID] }),
-            resource: any_pool_arn(),
+            resource: pool_less_resource(),
         },
         named("DeleteIdentityPool", json!({ "IdentityPoolId": pool_id })),
     ]
@@ -988,7 +1003,7 @@ const ABSENT_IDENTITY_ID: &str = "us-east-1:44444444-4444-4444-4444-444444444444
 
 /// `DescribeIdentity` is a developer-credentials call like every row of the table above,
 /// and the resource its decision is made against is the pool of the IDENTITY the request
-/// names — the account's identity pools in the request's region when this service holds no
+/// names — that ARN form with an empty pool-id segment when this service holds no
 /// such identity, so a caller no policy allows is refused BEFORE the identity is read and
 /// learns nothing about whether it exists.
 ///
@@ -1038,7 +1053,7 @@ async fn describe_identity_is_authorized_on_the_pool_its_identity_belongs_to() {
     let account_wide = emulator
         .user(
             "cognito-authz-describe-account-wide",
-            Some(&allow(&action, &any_pool_arn())),
+            Some(&allow(&action, &account_pools_pattern())),
         )
         .await;
 
@@ -1082,7 +1097,7 @@ async fn describe_identity_is_authorized_on_the_pool_its_identity_belongs_to() {
             "a principal holding no policy at all, on an identity nothing minted",
             &bare,
             ABSENT_IDENTITY_ID,
-            Some(any_pool_arn()),
+            Some(pool_less_resource()),
         ),
     ];
 

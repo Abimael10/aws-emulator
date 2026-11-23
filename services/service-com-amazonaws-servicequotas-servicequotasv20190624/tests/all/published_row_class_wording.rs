@@ -196,11 +196,21 @@ const CLASSES: &[Class] = &[
 /// and a count whose text drifts fails too.
 ///
 /// SOURCE: AWS's published Service Quotas data for the service code, as
-/// `src/state/quota_rows/cognito_idp.rs` carries it: Amazon Cognito User Pools publishes
+/// `src/state/quota_rows/cognito_idp.rs` and `src/state/quota_rows/cognito_identity.rs`
+/// carry it: Amazon Cognito User Pools publishes
 /// a count of the account's user pools and a count of one pool's resource servers beside
-/// its category rates, each with the sentence the service publishes for that count — a
-/// count's text is the quota's own rather than a class template's.
+/// its category rates, and Amazon Cognito Federated Identities a count of one identity
+/// pool's user pool providers beside its API rates — each with the sentence the service
+/// publishes for that count, a count's text being the quota's own rather than a class
+/// template's. An EMPTY sentence is a count whose published text this catalog cites no
+/// source for, which publishes no `Description` member at all rather than wording authored
+/// here.
 const COUNT_ROWS: &[(&str, &str, &str)] = &[
+    (
+        "cognito-identity",
+        "Amazon Cognito user pool providers per identity pool",
+        "",
+    ),
     (
         "cognito-idp",
         "Resource servers per user pool",
@@ -467,9 +477,14 @@ async fn a_class_service_publishes_no_row_outside_its_classes() {
                 );
                 assert_eq!(
                     row["Description"],
-                    json!(sentence),
+                    if sentence.is_empty() {
+                        Value::Null
+                    } else {
+                        json!(sentence)
+                    },
                     "case {service_code}/{code}: a count carries the text the service \
-                     publishes for that quota, got {row}"
+                     publishes for that quota, and none where this catalog cites none, got \
+                     {row}"
                 );
                 assert!(
                     row.get("Period").is_none_or(Value::is_null)
