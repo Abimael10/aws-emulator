@@ -9,11 +9,17 @@
 //! `ConnectionInput$ConnectionType`. A name outside that set names no connection type at
 //! all, and a read of it is refused rather than answered.
 //!
-//! What a type is configured WITH is read off that type's connectivity FAMILY
-//! ([`ConnectionFamily`]) instead of being recorded type by type: the properties a
-//! relational engine is reached by are the same properties whichever engine it is, and the
-//! model's own key spaces state which keys they are — a connection's properties are keyed
-//! by `ConnectionPropertyKey` (the key of the `ConnectionProperties` map `CreateConnection`
+//! What a type is configured with is the CATALOG ENTRY recorded for that type
+//! ([`ConnectionTypeEntry`], in [`entries`]): the entry carries the type's own data — the
+//! data source it reaches and the authentication types a connection of it may be created
+//! with — so two types reached the same way still answer differently where the service
+//! publishes different things about them, and a name with no entry is no connection type at
+//! all.
+//!
+//! The DESCRIPTORS of an entry's properties follow the connectivity FAMILY the entry names
+//! ([`ConnectionFamily`]), because the model's own key spaces state those per way of
+//! reaching a source rather than per product: a connection's properties are keyed by
+//! `ConnectionPropertyKey` (the key of the `ConnectionProperties` map `CreateConnection`
 //! takes), its physical requirements by the members of `PhysicalConnectionRequirements`,
 //! and its authentication by the members of `AuthenticationConfigurationInput` and the
 //! structures beneath it. The per-compute-environment configuration is derived from the
@@ -29,8 +35,11 @@ use std::collections::HashMap;
 use super::{AUTHENTICATION_TYPE_BASIC, AUTHENTICATION_TYPE_CUSTOM, AUTHENTICATION_TYPE_OAUTH2};
 use crate::ops::types::{
     AllowedValue, AuthConfiguration, Capabilities, ComputeEnvironmentConfiguration, Property,
-    CONNECTION_TYPE_VALUES,
 };
+
+mod entries;
+
+pub use entries::*;
 
 /// The `AuthenticationType` whose credentials are the caller's own IAM identity, so the
 /// connection carries none: the fourth of the modelled `AuthenticationType` values, beside
@@ -59,12 +68,17 @@ const PROPERTY_TYPE_SECRET: &str = "SECRET";
 /// A property that is either a credential or a plain value; see
 /// [`PROPERTY_TYPE_USER_INPUT`].
 const PROPERTY_TYPE_SECRET_OR_USER_INPUT: &str = "SECRET_OR_USER_INPUT";
+/// A property the service itself supplies, which the caller reads rather than sets; see
+/// [`PROPERTY_TYPE_USER_INPUT`].
+const PROPERTY_TYPE_READ_ONLY: &str = "READ_ONLY";
 
 /// How a connection of some type REACHES its data source. Every connection type the
-/// service serves belongs to exactly one family, and the family decides the properties,
-/// the options, the authentication and the compute environments the type is described
-/// with — the per-source connectors differ in which source they talk to, not in how a
-/// caller configures them.
+/// service serves belongs to exactly one family, and the family decides the property,
+/// option and physical-placement descriptors the type is described with, together with the
+/// compute environments that can use it — two engines reached over JDBC are configured with
+/// the same keys. What the family does NOT decide is the type's own catalog data: the
+/// source it reaches and the credentials it takes come from the type's
+/// [`ConnectionTypeEntry`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionFamily {
     /// A data store reached over JDBC by a JDBC URL the caller writes out: the legacy
@@ -96,33 +110,11 @@ pub enum ConnectionFamily {
     ViewValidationAthena,
 }
 
-/// The family `connection_type` belongs to, or `None` when it is no connection type this
-/// service serves.
-///
-/// The exceptions are named one by one and every other value of the modelled enum is a
-/// REST source, because that is what the bulk of the per-source connectors are: a SaaS
-/// application Glue reads through its own API.
+/// The family `connection_type` is reached by, or `None` when it is no connection type this
+/// service serves — read off that type's catalog entry
+/// ([`connection_type_entry`]), which is the only place a type is recorded.
 pub fn connection_type_family(connection_type: &str) -> Option<ConnectionFamily> {
-    if !CONNECTION_TYPE_VALUES.contains(&connection_type) {
-        return None;
-    }
-    Some(match connection_type {
-        "JDBC" => ConnectionFamily::GenericJdbc,
-        "MYSQL" | "POSTGRESQL" | "ORACLE" | "SQLSERVER" | "SAPHANA" | "TERADATA"
-        | "TERADATANOS" | "VERTICA" | "DB2" | "DB2AS400" | "SYNAPSE" | "AZURESQL"
-        | "CLOUDERAHIVE" | "CLOUDERAIMPALA" | "HBASE" | "TPCDS" => ConnectionFamily::Relational,
-        "MONGODB" | "DOCUMENTDB" | "AZURECOSMOS" => ConnectionFamily::DocumentStore,
-        "KAFKA" => ConnectionFamily::Stream,
-        "SFTP" => ConnectionFamily::FileTransfer,
-        "DYNAMODB" | "CLOUDWATCH" | "CLOUDWATCHMETRICS" | "TIMESTREAM" => {
-            ConnectionFamily::AwsService
-        }
-        "NETWORK" => ConnectionFamily::Network,
-        "MARKETPLACE" | "CUSTOM" => ConnectionFamily::Connector,
-        "VIEW_VALIDATION_REDSHIFT" => ConnectionFamily::ViewValidationRedshift,
-        "VIEW_VALIDATION_ATHENA" => ConnectionFamily::ViewValidationAthena,
-        _ => ConnectionFamily::RestSource,
-    })
+    connection_type_entry(connection_type).map(|entry| entry.family)
 }
 
 /// Everything `DescribeConnectionType` reports about one connection type.
@@ -142,106 +134,98 @@ pub struct ConnectionTypeDetails {
     pub authentication_configuration: Option<AuthConfiguration>,
     /// One entry per compute environment the type supports.
     pub compute_environment_configurations: HashMap<String, ComputeEnvironmentConfiguration>,
-    /// Where in a VPC the connection sits, for a type that is reached inside one.
-    pub physical_connection_requirements: Option<HashMap<String, Property>>,
+    /// Where in a VPC the connection sits: the placement every connection may state.
+    pub physical_connection_requirements: HashMap<String, Property>,
 }
 
 /// Everything the service knows about `connection_type`, or `None` when it serves no such
-/// connection type.
+/// connection type: the catalog entry recorded for that type, with the descriptors the way
+/// it reaches its source carries.
 pub fn describe_connection_type(connection_type: &str) -> Option<ConnectionTypeDetails> {
-    let family = connection_type_family(connection_type)?;
-    let capabilities = family.capabilities();
+    let entry = connection_type_entry(connection_type)?;
+    let family = entry.family;
+    let capabilities = entry.capabilities();
     let connection_options = family.connection_options();
     let compute_environment_configurations =
         family.compute_environment_configurations(&capabilities, &connection_options);
     Some(ConnectionTypeDetails {
-        connection_type: connection_type.to_string(),
-        description: family.describe(connection_type),
+        connection_type: entry.connection_type.to_string(),
+        description: family.describe(entry.source),
         capabilities,
-        connection_properties: family.connection_properties(),
+        connection_properties: family
+            .connection_properties(takes_stored_credentials(entry.authentication_types)),
         connection_options,
-        authentication_configuration: family.authentication_configuration(),
+        authentication_configuration: authentication_configuration(entry.authentication_types),
         compute_environment_configurations,
         physical_connection_requirements: family.physical_connection_requirements(),
     })
 }
 
-impl ConnectionFamily {
-    /// What a connection of this family connects to, naming the type it was asked about:
-    /// the family states the shape of the source and the type states which source it is.
-    pub fn describe(self, connection_type: &str) -> String {
-        match self {
-            Self::GenericJdbc => "A connection to a data store reached over JDBC, configured \
-                 with the JDBC connection URL of that store."
-                .to_string(),
-            Self::Relational => format!(
-                "A connection to a {connection_type} database, reached over JDBC by host, port \
-                 and database name."
-            ),
-            Self::DocumentStore => format!(
-                "A connection to a {connection_type} document store, reached by its connection \
-                 URL."
-            ),
-            Self::Stream => format!(
-                "A connection to a {connection_type} record stream, reached by its bootstrap \
-                 servers."
-            ),
-            Self::FileTransfer => format!(
-                "A connection to a {connection_type} file transfer endpoint, reached by host and \
-                 port."
-            ),
-            Self::AwsService => format!(
-                "A connection to {connection_type}, reached with the identity the caller's \
-                 credentials speak for."
-            ),
-            Self::Network => "A connection to the resources of a VPC, carrying no data source of \
-                 its own: what it configures is the subnet and the security groups a job reaches \
-                 them through."
-                .to_string(),
-            Self::Connector => format!(
-                "A connection to a data store served by a {connection_type} connector, which \
-                 brings the driver the store is read and written through."
-            ),
-            Self::RestSource => format!(
-                "A connection to the {connection_type} data source, read through its own REST \
-                 API."
-            ),
-            Self::ViewValidationRedshift => {
-                "A connection used to validate the Amazon Redshift dialect of a catalog view's \
-                 SQL against the cluster or workgroup that runs it."
-                    .to_string()
-            }
-            Self::ViewValidationAthena => {
-                "A connection used to validate the Athena dialect of a catalog view's SQL against \
-                 the workgroup that runs it."
-                    .to_string()
-            }
+impl ConnectionTypeEntry {
+    /// The capabilities of a connection of this type, as `DescribeConnectionType` and
+    /// `ListConnectionTypes` both report them: the credentials this type takes come from its
+    /// own entry, and what a job may do with it and which runtimes can use it from the way it
+    /// reaches its source.
+    pub fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            supported_authentication_types: self
+                .authentication_types
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            supported_data_operations: self.family.supported_data_operations(),
+            supported_compute_environments: self.family.supported_compute_environments(),
         }
     }
+}
 
-    /// The authentication types a connection of this family may be configured with, in the
-    /// order the model declares them. A family whose source carries no credentials at all
-    /// supports none.
-    pub fn supported_authentication_types(self) -> Vec<String> {
-        let types: &[&str] = match self {
-            Self::GenericJdbc | Self::Relational | Self::DocumentStore | Self::FileTransfer => {
-                &[AUTHENTICATION_TYPE_BASIC]
+impl ConnectionFamily {
+    /// What a connection of this family connects to, naming the data source the catalog
+    /// entry records: the family states the shape of the source and the entry states which
+    /// source it is.
+    pub fn describe(self, source: &str) -> String {
+        match self {
+            Self::GenericJdbc => format!(
+                "A connection to a data store reached over {source}, configured with the \
+                 {source} connection URL of that store."
+            ),
+            Self::Relational => format!(
+                "A connection to {source}, a database reached over JDBC by host, port and \
+                 database name."
+            ),
+            Self::DocumentStore => {
+                format!("A connection to {source}, a document store reached by its connection URL.")
             }
-            Self::Stream | Self::Connector => &[
-                AUTHENTICATION_TYPE_BASIC,
-                AUTHENTICATION_TYPE_CUSTOM,
-                AUTHENTICATION_TYPE_IAM,
-            ],
-            Self::AwsService | Self::ViewValidationAthena => &[AUTHENTICATION_TYPE_IAM],
-            Self::ViewValidationRedshift => &[AUTHENTICATION_TYPE_BASIC, AUTHENTICATION_TYPE_IAM],
-            Self::RestSource => &[
-                AUTHENTICATION_TYPE_BASIC,
-                AUTHENTICATION_TYPE_OAUTH2,
-                AUTHENTICATION_TYPE_CUSTOM,
-            ],
-            Self::Network => &[],
-        };
-        types.iter().map(|value| value.to_string()).collect()
+            Self::Stream => format!(
+                "A connection to {source}, a record stream reached by its bootstrap servers."
+            ),
+            Self::FileTransfer => format!(
+                "A connection to {source}, a file transfer endpoint reached by host and port."
+            ),
+            Self::AwsService => format!(
+                "A connection to {source}, reached with the identity the caller's credentials \
+                 speak for."
+            ),
+            Self::Network => format!(
+                "A connection to {source}, carrying no data source of its own: what it \
+                 configures is the subnet and the security groups a job reaches them through."
+            ),
+            Self::Connector => format!(
+                "A connection to a data store served by {source}, which brings the driver the \
+                 store is read and written through."
+            ),
+            Self::RestSource => {
+                format!("A connection to the {source} data source, read through its own REST API.")
+            }
+            Self::ViewValidationRedshift => format!(
+                "A connection used to validate the {source} dialect of a catalog view's SQL \
+                 against the cluster or workgroup that runs it."
+            ),
+            Self::ViewValidationAthena => format!(
+                "A connection used to validate the {source} dialect of a catalog view's SQL \
+                 against the workgroup that runs it."
+            ),
+        }
     }
 
     /// The data operations a job may run against a source of this family. A REST source is
@@ -289,20 +273,14 @@ impl ConnectionFamily {
         environments.iter().map(|value| value.to_string()).collect()
     }
 
-    /// The capabilities of a connection of this family, as `DescribeConnectionType` and
-    /// `ListConnectionTypes` both report them.
-    pub fn capabilities(self) -> Capabilities {
-        Capabilities {
-            supported_authentication_types: self.supported_authentication_types(),
-            supported_data_operations: self.supported_data_operations(),
-            supported_compute_environments: self.supported_compute_environments(),
-        }
-    }
-
     /// The properties a create of a connection of this family sets, keyed as the create
     /// keys them: by a value of the modelled `ConnectionPropertyKey` enum, which is the key
     /// of `ConnectionInput$ConnectionProperties`.
-    pub fn connection_properties(self) -> HashMap<String, Property> {
+    ///
+    /// `takes_stored_credentials` says whether the credentials the TYPE takes may be held
+    /// in a Secrets Manager secret instead of on the connection, which is one more property
+    /// of the create wherever that is so.
+    pub fn connection_properties(self, takes_stored_credentials: bool) -> HashMap<String, Property> {
         let mut properties = match self {
             Self::GenericJdbc => vec![
                 required_input(
@@ -435,9 +413,7 @@ impl ConnectionFamily {
                 ),
             ],
         };
-        // Credentials this family takes may be held in Secrets Manager instead of on the
-        // connection, which is one more property of the create wherever that is so.
-        if self.takes_stored_credentials() {
+        if takes_stored_credentials {
             properties.push(optional_input(
                 "SECRET_ID",
                 "The name or ARN of the Secrets Manager secret holding this connection's \
@@ -518,60 +494,6 @@ impl ConnectionFamily {
         property_map(options)
     }
 
-    /// Whether credentials of a family this supports may be held in a Secrets Manager
-    /// secret: the two credential kinds the model documents a `SecretArn` as an alternative
-    /// to ("for supplying basic auth credentials when NOT providing a `SecretArn` value" —
-    /// `BasicAuthenticationCredentials`), and the OAuth2 credentials stored the same way. A
-    /// family authenticated by IAM alone holds no credential to store.
-    fn takes_stored_credentials(self) -> bool {
-        let supported = self.supported_authentication_types();
-        [
-            AUTHENTICATION_TYPE_BASIC,
-            AUTHENTICATION_TYPE_OAUTH2,
-            AUTHENTICATION_TYPE_CUSTOM,
-        ]
-        .iter()
-        .any(|kind| supported.iter().any(|value| value == kind))
-    }
-
-    /// How a connection of this family supplies credentials, keyed by the members of the
-    /// modelled `AuthenticationConfigurationInput` and the structures beneath it, or `None`
-    /// for a family that takes no credentials at all.
-    pub fn authentication_configuration(self) -> Option<AuthConfiguration> {
-        let supported = self.supported_authentication_types();
-        if supported.is_empty() {
-            return None;
-        }
-        let supports = |kind: &str| supported.iter().any(|value| value == kind);
-
-        let authentication_type = allowing(
-            required_input(
-                "AuthenticationType",
-                "The kind of credentials this connection authenticates with.",
-            ),
-            &supported
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<&str>>(),
-        );
-
-        Some(AuthConfiguration {
-            authentication_type,
-            secret_arn: self.takes_stored_credentials().then(|| {
-                optional_input(
-                    "SecretArn",
-                    "The ARN of the Secrets Manager secret holding this connection's \
-                     credentials.",
-                )
-            }),
-            o_auth2_properties: supports(AUTHENTICATION_TYPE_OAUTH2).then(oauth2_properties),
-            basic_authentication_properties: supports(AUTHENTICATION_TYPE_BASIC)
-                .then(basic_authentication_properties),
-            custom_authentication_properties: supports(AUTHENTICATION_TYPE_CUSTOM)
-                .then(custom_authentication_properties),
-        })
-    }
-
     /// One configuration per compute environment the family supports, each carrying that
     /// environment's own options. The families here override no property or option name per
     /// environment, so the override maps are empty rather than absent: an empty override is
@@ -598,39 +520,28 @@ impl ConnectionFamily {
                         connection_property_name_overrides: HashMap::new(),
                         connection_option_name_overrides: HashMap::new(),
                         connection_properties_required_overrides: Vec::new(),
-                        physical_connection_properties_required: self
-                            .physical_placement_required(),
+                        physical_connection_properties_required: Some(
+                            self.physical_placement_required(),
+                        ),
                     },
                 )
             })
             .collect()
     }
 
-    /// Whether a create of this family MUST state where in a VPC the connection sits, or
-    /// `None` for a family reached over the public API of its source, which sits in no VPC
-    /// of the caller's and so states no placement at all. A VPC path is nothing BUT its
-    /// placement, where a source that can also be reached without one leaves it optional.
-    fn physical_placement_required(self) -> Option<bool> {
-        match self {
-            Self::Network => Some(true),
-            Self::GenericJdbc
-            | Self::Relational
-            | Self::DocumentStore
-            | Self::Stream
-            | Self::FileTransfer
-            | Self::Connector => Some(false),
-            Self::AwsService
-            | Self::RestSource
-            | Self::ViewValidationRedshift
-            | Self::ViewValidationAthena => None,
-        }
+    /// Whether a create of this family MUST state where in a VPC the connection sits. A VPC
+    /// path is nothing BUT its placement, where a source that can also be reached over the
+    /// public API of its own endpoint leaves it optional.
+    fn physical_placement_required(self) -> bool {
+        matches!(self, Self::Network)
     }
 
-    /// Where in a VPC a connection of this family sits, keyed by the members of the
-    /// modelled `PhysicalConnectionRequirements` structure, or `None` for a family that
-    /// states no placement ([`Self::physical_placement_required`]).
-    pub fn physical_connection_requirements(self) -> Option<HashMap<String, Property>> {
-        let required = self.physical_placement_required()?;
+    /// Where in a VPC a connection of this family sits, keyed by the members of the modelled
+    /// `PhysicalConnectionRequirements` structure — the placement every connection may state,
+    /// required only where the connection is nothing but that placement
+    /// ([`Self::physical_placement_required`]).
+    pub fn physical_connection_requirements(self) -> HashMap<String, Property> {
+        let required = self.physical_placement_required();
         let describe = |name: &str, description: &str| {
             if required {
                 required_input(name, description)
@@ -638,7 +549,7 @@ impl ConnectionFamily {
                 optional_input(name, description)
             }
         };
-        Some(property_map(vec![
+        property_map(vec![
             describe("SubnetId", "The subnet the connection is reached through."),
             describe(
                 "SecurityGroupIdList",
@@ -648,7 +559,93 @@ impl ConnectionFamily {
                 "AvailabilityZone",
                 "The Availability Zone the connection is reached in.",
             ),
-        ]))
+        ])
+    }
+}
+
+/// Whether credentials of one of these authentication types may be held in a Secrets
+/// Manager secret: the two credential kinds the model documents a `SecretArn` as an
+/// alternative to ("for supplying basic auth credentials when NOT providing a `SecretArn`
+/// value" — `BasicAuthenticationCredentials`), and the OAuth2 credentials stored the same
+/// way. A connection type authenticated by IAM alone holds no credential to store.
+pub fn takes_stored_credentials(authentication_types: &[&str]) -> bool {
+    authentication_types.iter().any(|kind| {
+        [
+            AUTHENTICATION_TYPE_BASIC,
+            AUTHENTICATION_TYPE_OAUTH2,
+            AUTHENTICATION_TYPE_CUSTOM,
+        ]
+        .contains(kind)
+    })
+}
+
+/// How a connection that supports these authentication types supplies its credentials,
+/// keyed by the members of the modelled `AuthenticationConfigurationInput` and the
+/// structures beneath it, or `None` for a type that takes no credentials at all.
+///
+/// The descriptors reported are exactly the ones the supported types call for: the
+/// authentication type itself admits those types and nothing else, and each kind's own
+/// properties are reported only where that kind is one of them.
+pub fn authentication_configuration(authentication_types: &[&str]) -> Option<AuthConfiguration> {
+    if authentication_types.is_empty() {
+        return None;
+    }
+    let supports = |kind: &str| authentication_types.contains(&kind);
+
+    // Each admitted authentication type describes itself, as the modelled
+    // `AllowedValue$Description` is for.
+    let mut authentication_type = required_input(
+        "AuthenticationType",
+        "The kind of credentials this connection authenticates with.",
+    );
+    authentication_type.allowed_values = Some(
+        authentication_types
+            .iter()
+            .map(|kind| AllowedValue {
+                description: Some(authentication_type_description(kind).to_string()),
+                value: (*kind).to_string(),
+            })
+            .collect(),
+    );
+
+    Some(AuthConfiguration {
+        authentication_type,
+        secret_arn: takes_stored_credentials(authentication_types).then(|| {
+            optional_input(
+                "SecretArn",
+                "The ARN of the Secrets Manager secret holding this connection's credentials.",
+            )
+        }),
+        o_auth2_properties: supports(AUTHENTICATION_TYPE_OAUTH2).then(oauth2_properties),
+        basic_authentication_properties: supports(AUTHENTICATION_TYPE_BASIC)
+            .then(basic_authentication_properties),
+        custom_authentication_properties: supports(AUTHENTICATION_TYPE_CUSTOM)
+            .then(custom_authentication_properties),
+    })
+}
+
+/// What the authentication type named here is, as the value describes itself where a
+/// connection type admits it.
+fn authentication_type_description(kind: &str) -> &'static str {
+    match kind {
+        AUTHENTICATION_TYPE_BASIC => {
+            "Authentication with the user name and password the data source is reached as."
+        }
+        AUTHENTICATION_TYPE_OAUTH2 => {
+            "Authentication with an access token obtained from the provider's OAuth2 \
+             authorization server."
+        }
+        AUTHENTICATION_TYPE_CUSTOM => {
+            "Authentication with the credentials the connector itself defines the keys of."
+        }
+        AUTHENTICATION_TYPE_IAM => {
+            "Authentication with the identity the caller's own credentials speak for, so the \
+             connection holds none."
+        }
+        // Every value here comes from a catalog entry's own list, so no other kind can reach
+        // this; a value the model adds later describes itself as authentication in general
+        // rather than as one of the four above.
+        _ => "Authentication with the credentials this kind calls for.",
     }
 }
 
@@ -674,9 +671,16 @@ fn compute_environment_description(environment: &str) -> &'static str {
     }
 }
 
-/// The OAuth2 configuration of a family that authenticates that way, keyed by the members
-/// of the modelled `OAuth2PropertiesInput`, `OAuth2ClientApplication` and
-/// `OAuth2Credentials`.
+/// The OAuth2 configuration of a connection type that authenticates that way, keyed by the
+/// members of the modelled `OAuth2PropertiesInput`, `OAuth2ClientApplication`,
+/// `AuthorizationCodeProperties` and `OAuth2Credentials` — the properties a create of an
+/// OAuth2 connection sets — beside the two the service itself supplies for the
+/// authorization-code leg: the URL the user is sent to, and the scope the access token is
+/// asked for.
+///
+/// A property only the AUTHORIZATION_CODE grant calls for is reported as one the caller may
+/// supply, naming the grant it belongs to, because requiredness here is conditional on the
+/// grant rather than on the type.
 fn oauth2_properties() -> HashMap<String, Property> {
     property_map(vec![
         allowing(
@@ -696,13 +700,37 @@ fn oauth2_properties() -> HashMap<String, Property> {
             "TokenUrl",
             "The URL of the provider's authentication server, where a token is obtained.",
         ),
+        read_only_property(
+            "AuthorizationCodeUrl",
+            "The URL of the provider's authorization server the user is sent to, to issue an \
+             authorization code for the AUTHORIZATION_CODE grant.",
+        ),
+        optional_secret(
+            "AuthorizationCode",
+            "The single-use authorization code the authorization server issued, exchanged for \
+             an access token by the AUTHORIZATION_CODE grant.",
+        ),
+        optional_input(
+            "RedirectUri",
+            "The URI the authorization server returns the user to with the authorization code, \
+             used again when that code is exchanged for an access token.",
+        ),
+        optional_input(
+            "Scope",
+            "The scopes the access token is requested with, as the provider names them.",
+        ),
         optional_input(
             "UserManagedClientApplicationClientId",
             "The client id of the client application, when the caller manages it.",
         ),
-        secret_property(
+        optional_secret(
             "UserManagedClientApplicationClientSecret",
             "The client secret of the client application, when the caller manages it.",
+        ),
+        read_only_property(
+            "AWSManagedClientApplicationReference",
+            "The reference to the client application registered with the provider on this \
+             service's side, used when the caller manages none of its own.",
         ),
     ])
 }
@@ -745,6 +773,20 @@ fn secret_property(name: &str, description: &str) -> Property {
         .property_types
         .push(PROPERTY_TYPE_SECRET_OR_USER_INPUT.to_string());
     property
+}
+
+/// The same credential, where supplying it is conditional rather than required: the caller
+/// supplies it only for the grant or the client application it belongs to.
+fn optional_secret(name: &str, description: &str) -> Property {
+    let mut property = secret_property(name, description);
+    property.required = false;
+    property
+}
+
+/// A property the SERVICE supplies and the caller only reads
+/// ([`PROPERTY_TYPE_READ_ONLY`]).
+fn read_only_property(name: &str, description: &str) -> Property {
+    property(name, description, false, PROPERTY_TYPE_READ_ONLY)
 }
 
 /// The `JDBC_ENFORCE_SSL` property, which both JDBC-reached families carry.

@@ -17,6 +17,10 @@
 //! path, a supplied connector, a REST source, a view validation), and — for the refusal —
 //! the value, length, casing and character set of a name no connection type has.
 //!
+//! What the service publishes about one type as opposed to another — its data source and
+//! the credentials it takes — is the subject of `connection_type_catalog`; the rows here
+//! are about the way a type reaches its source.
+//!
 //! The enum value lists the suites read (`CONNECTION_TYPE_VALUES`,
 //! `CONNECTION_PROPERTY_KEY_VALUES`, `AUTHENTICATION_TYPE_VALUES`, `DATA_OPERATION_VALUES`,
 //! `COMPUTE_ENVIRONMENT_VALUES`, `PROPERTY_TYPE_VALUES`, `O_AUTH2_GRANT_TYPE_VALUES`) are
@@ -41,7 +45,10 @@ const EXPECTED_REFUSAL: &str = "The connection type is not available.";
 
 /// The keys of a response's map member, or an empty set when the member is absent — an
 /// awsJson map with nothing in it and an absent map say the same thing.
-fn map_keys(body: &Value, member: &str) -> BTreeSet<String> {
+///
+/// Shared with `crate::connection_type_catalog`, which reads the same member of the same
+/// response, so the two suites keep one reading of it.
+pub(crate) fn map_keys(body: &Value, member: &str) -> BTreeSet<String> {
     body.get(member)
         .and_then(Value::as_object)
         .map(|map| map.keys().cloned().collect())
@@ -194,6 +201,19 @@ fn assert_description(connection_type: &str, body: &Value) {
     assert_properties(case, "ConnectionProperties", body, true);
     assert_properties(case, "ConnectionOptions", body, false);
     assert_properties(case, "PhysicalConnectionRequirements", body, false);
+
+    // Every connection may state where in a VPC it sits, so every type reports that
+    // placement's descriptors — the members of the modelled `PhysicalConnectionRequirements`
+    // structure (`smithy_query shape=PhysicalConnectionRequirements`).
+    assert_eq!(
+        map_keys(body, "PhysicalConnectionRequirements"),
+        ["AvailabilityZone", "SecurityGroupIdList", "SubnetId"]
+            .iter()
+            .map(|key| (*key).to_string())
+            .collect::<BTreeSet<String>>(),
+        "case {case}: every description must report where in a VPC the connection sits, got \
+         {body}"
+    );
 
     // One configuration per environment the type supports, and no configuration for an
     // environment it does not.
@@ -350,8 +370,9 @@ struct FamilyRow {
     data_operations: &'static [&'static str],
     /// The compute environments that can use it.
     compute_environments: &'static [&'static str],
-    /// Whether it is reached inside a VPC, so its physical placement is reported.
-    in_vpc: bool,
+    /// Whether a create of it MUST state where in a VPC it sits, because it is nothing but
+    /// that placement.
+    placement_required: bool,
 }
 
 /// One row per way of reaching a data source, plus a second row of two of those ways.
@@ -362,7 +383,7 @@ const FAMILY_ROWS: &[FamilyRow] = &[
         authentication_types: &["BASIC"],
         data_operations: &["READ", "WRITE"],
         compute_environments: &["SPARK", "PYTHON", "ATHENA"],
-        in_vpc: true,
+        placement_required: false,
     },
     FamilyRow {
         connection_type: "POSTGRESQL",
@@ -370,7 +391,7 @@ const FAMILY_ROWS: &[FamilyRow] = &[
         authentication_types: &["BASIC"],
         data_operations: &["READ", "WRITE"],
         compute_environments: &["SPARK", "PYTHON", "ATHENA"],
-        in_vpc: true,
+        placement_required: false,
     },
     FamilyRow {
         connection_type: "JDBC",
@@ -378,7 +399,7 @@ const FAMILY_ROWS: &[FamilyRow] = &[
         authentication_types: &["BASIC"],
         data_operations: &["READ", "WRITE"],
         compute_environments: &["SPARK", "PYTHON"],
-        in_vpc: true,
+        placement_required: false,
     },
     FamilyRow {
         connection_type: "MONGODB",
@@ -386,7 +407,7 @@ const FAMILY_ROWS: &[FamilyRow] = &[
         authentication_types: &["BASIC"],
         data_operations: &["READ", "WRITE"],
         compute_environments: &["SPARK"],
-        in_vpc: true,
+        placement_required: false,
     },
     FamilyRow {
         connection_type: "KAFKA",
@@ -394,7 +415,7 @@ const FAMILY_ROWS: &[FamilyRow] = &[
         authentication_types: &["BASIC", "CUSTOM", "IAM"],
         data_operations: &["READ", "WRITE"],
         compute_environments: &["SPARK"],
-        in_vpc: true,
+        placement_required: false,
     },
     FamilyRow {
         connection_type: "SFTP",
@@ -402,7 +423,7 @@ const FAMILY_ROWS: &[FamilyRow] = &[
         authentication_types: &["BASIC"],
         data_operations: &["READ", "WRITE"],
         compute_environments: &["SPARK"],
-        in_vpc: true,
+        placement_required: false,
     },
     FamilyRow {
         connection_type: "DYNAMODB",
@@ -410,7 +431,7 @@ const FAMILY_ROWS: &[FamilyRow] = &[
         authentication_types: &["IAM"],
         data_operations: &["READ", "WRITE"],
         compute_environments: &["SPARK", "PYTHON", "ATHENA"],
-        in_vpc: false,
+        placement_required: false,
     },
     FamilyRow {
         connection_type: "NETWORK",
@@ -418,7 +439,7 @@ const FAMILY_ROWS: &[FamilyRow] = &[
         authentication_types: &[],
         data_operations: &[],
         compute_environments: &["SPARK", "PYTHON"],
-        in_vpc: true,
+        placement_required: true,
     },
     FamilyRow {
         connection_type: "MARKETPLACE",
@@ -426,23 +447,23 @@ const FAMILY_ROWS: &[FamilyRow] = &[
         authentication_types: &["BASIC", "CUSTOM", "IAM"],
         data_operations: &["READ", "WRITE"],
         compute_environments: &["SPARK", "PYTHON", "ATHENA"],
-        in_vpc: true,
+        placement_required: false,
     },
     FamilyRow {
         connection_type: "SALESFORCE",
         required_properties: &["ENDPOINT"],
-        authentication_types: &["BASIC", "OAUTH2", "CUSTOM"],
+        authentication_types: &["OAUTH2"],
         data_operations: &["READ"],
         compute_environments: &["SPARK", "PYTHON"],
-        in_vpc: false,
+        placement_required: false,
     },
     FamilyRow {
         connection_type: "HUBSPOT",
         required_properties: &["ENDPOINT"],
-        authentication_types: &["BASIC", "OAUTH2", "CUSTOM"],
+        authentication_types: &["OAUTH2"],
         data_operations: &["READ"],
         compute_environments: &["SPARK", "PYTHON"],
-        in_vpc: false,
+        placement_required: false,
     },
     FamilyRow {
         connection_type: "VIEW_VALIDATION_ATHENA",
@@ -450,7 +471,7 @@ const FAMILY_ROWS: &[FamilyRow] = &[
         authentication_types: &["IAM"],
         data_operations: &["READ"],
         compute_environments: &["ATHENA"],
-        in_vpc: false,
+        placement_required: false,
     },
     FamilyRow {
         connection_type: "VIEW_VALIDATION_REDSHIFT",
@@ -458,13 +479,14 @@ const FAMILY_ROWS: &[FamilyRow] = &[
         authentication_types: &["BASIC", "IAM"],
         data_operations: &["READ"],
         compute_environments: &[],
-        in_vpc: false,
+        placement_required: false,
     },
 ];
 
 /// What each WAY of reaching a data source is configured with, one row per family: the
 /// properties a create of that type must carry, the credentials it takes, what a job may do
-/// with it, which compute environments can use it, and whether it sits inside a VPC.
+/// with it, which compute environments can use it, and whether its physical placement is
+/// required.
 ///
 /// The rows name types the issue did not cite (`POSTGRESQL`, `HUBSPOT`, `SFTP`,
 /// `VIEW_VALIDATION_ATHENA`, …) beside one per remaining family, and two rows of the same
@@ -507,28 +529,19 @@ async fn each_connection_type_is_described_with_the_way_it_reaches_its_source() 
             row.compute_environments,
             "case {connection_type}: which compute environments use this type, got {body}"
         );
-        assert_eq!(
-            body.get("PhysicalConnectionRequirements").is_some(),
-            row.in_vpc,
-            "case {connection_type}: a type reached inside a VPC reports where it sits, got \
-             {body}"
-        );
         // A VPC path is nothing BUT its placement, so every physical requirement of it is
-        // required; a source that can also be reached without one leaves them optional.
-        if row.in_vpc {
-            let required = required_keys(&body, "PhysicalConnectionRequirements");
-            let all = map_keys(&body, "PhysicalConnectionRequirements");
-            let expected = if connection_type == "NETWORK" {
-                all.clone()
-            } else {
-                BTreeSet::new()
-            };
-            assert_eq!(
-                required, expected,
-                "case {connection_type}: the physical requirements a create must carry, got \
-                 {body}"
-            );
-        }
+        // required; a source that can also be reached over its own endpoint leaves them
+        // optional.
+        let required = required_keys(&body, "PhysicalConnectionRequirements");
+        let expected = if row.placement_required {
+            map_keys(&body, "PhysicalConnectionRequirements")
+        } else {
+            BTreeSet::new()
+        };
+        assert_eq!(
+            required, expected,
+            "case {connection_type}: the physical requirements a create must carry, got {body}"
+        );
     }
 }
 

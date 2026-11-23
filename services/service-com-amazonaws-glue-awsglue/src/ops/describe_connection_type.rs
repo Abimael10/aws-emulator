@@ -4,11 +4,14 @@
 //! IMPLEMENTED: answers the full set of options of ONE connection type — the connector
 //! kinds this service serves are the values of the modelled `ConnectionType` enum, which is
 //! the key space of `ConnectionInput$ConnectionType`, so a type a connection can be created
-//! with is a type this read describes. What each one is configured with is read off the
-//! catalogue in [`crate::state::describe_connection_type`]: the capabilities, the create's
-//! connection properties, the Spark script's connection options, the authentication
-//! configuration, one configuration per compute environment, and the physical placement of
-//! a connection reached inside a VPC.
+//! with is a type this read describes. What each one is configured with is the CATALOG
+//! ENTRY recorded for that type in [`crate::state::describe_connection_type`]: the entry's
+//! own data (the data source it reaches, which its description names, and the
+//! authentication types a connection of it takes, which its capabilities and authentication
+//! configuration report) together with the descriptors the way it reaches that source
+//! carries — the create's connection properties, the Spark script's connection options, one
+//! configuration per compute environment, and the placement every connection may state,
+//! required only where the connection is nothing but that placement.
 //!
 //! A name that is no connection type this service serves is refused with the modelled
 //! `InvalidInputException`. This read reports what the service itself ships, which is the
@@ -207,7 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             connection_options: Some(details.connection_options),
             authentication_configuration: details.authentication_configuration,
             compute_environment_configurations: Some(details.compute_environment_configurations),
-            physical_connection_requirements: details.physical_connection_requirements,
+            physical_connection_requirements: Some(details.physical_connection_requirements),
             // See the module docs: the per-compute-environment property maps and the REST
             // configuration carry what a connection type holds beyond this catalogue.
             athena_connection_properties: None,
