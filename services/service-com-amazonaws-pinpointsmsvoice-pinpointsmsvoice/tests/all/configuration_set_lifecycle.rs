@@ -788,9 +788,10 @@ async fn invalid_pagination_arguments_are_bad_requests() {
         assert_eq!(harness.create_set(name).await.status, 200);
     }
 
-    // PageSize rows: zero, negative, fractional, non-numeric, and one past the
-    // representable range.
-    for page_size in ["0", "-1", "1.5", "two", "99999999999999999999999999"] {
+    // PageSize rows: zero, negative, fractional and non-numeric — the forms that are not
+    // a decimal count at all. A count ABOVE the server maximum, however large, is clamped
+    // rather than refused (see `the_server_bounds_a_page_even_when_the_caller_does_not`).
+    for page_size in ["0", "-1", "1.5", "two"] {
         let answer = harness.list_sets(&format!("?PageSize={page_size}")).await;
         assert_eq!(
             answer.status, 400,

@@ -33,6 +33,8 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Declares one module per `tests/all/<name>.rs` suite in the single `all` test target.
+automod = { workspace = true }
 
 [lints]
 workspace = true

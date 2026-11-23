@@ -139,7 +139,7 @@ struct Case {
 const EXISTING_SET: &str = "detail-member-set";
 
 /// Every row is one refusal of an ENTITLED account, so each reaches its own error class
-/// rather than the authorization refusal. Seven `PageSize` forms carry no sentence; the rest
+/// rather than the authorization refusal. Six `PageSize` forms carry no sentence; the rest
 /// carry one, across three modelled classes, four operations and three HTTP methods.
 const ENTITLED_CASES: &[Case] = &[
     // ---- the one class that produces NO sentence, over the forms of an unreadable bound --
@@ -183,15 +183,6 @@ const ENTITLED_CASES: &[Case] = &[
         name: "ListConfigurationSets with a PageSize in exponent notation",
         method: "GET",
         path: "/v1/sms-voice/configuration-sets?PageSize=1e3",
-        body: None,
-        status: 400,
-        code: "BadRequestException",
-        detail: Detail::NoSentence,
-    },
-    Case {
-        name: "ListConfigurationSets with a PageSize no count can hold",
-        method: "GET",
-        path: "/v1/sms-voice/configuration-sets?PageSize=99999999999999999999999999",
         body: None,
         status: 400,
         code: "BadRequestException",
@@ -414,8 +405,10 @@ async fn an_unmodelled_refusal_keeps_its_own_sentence() {
 /// read as a page bound is no refusal at all — the listing answers 200 with its
 /// `ConfigurationSets` member, so the rows above pin a refusal and not a broken path.
 ///
-/// The rows differ in the bound asked for, including one below and one above the number of
-/// sets stored, so the control is not tied to one page.
+/// The rows differ in the bound asked for, including one below, one equal to and two above
+/// the number of sets stored — the last of them a count larger than any the machine holds,
+/// which is a bound to clamp and not a value to refuse — so the control is not tied to one
+/// page.
 #[tokio::test]
 async fn a_page_size_this_service_can_read_is_served() {
     let harness = Harness::new(true);
@@ -438,6 +431,11 @@ async fn a_page_size_this_service_can_read_is_served() {
         ("a bound below what is stored", "1", vec!["alpha"]),
         ("a bound equal to what is stored", "2", vec!["alpha", "beta"]),
         ("a bound above what is stored", "5", vec!["alpha", "beta"]),
+        (
+            "a bound larger than any count the machine holds",
+            "99999999999999999999999999",
+            vec!["alpha", "beta"],
+        ),
     ] {
         let listed = harness
             .call(

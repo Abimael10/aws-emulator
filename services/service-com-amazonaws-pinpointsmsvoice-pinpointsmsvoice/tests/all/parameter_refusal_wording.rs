@@ -895,8 +895,12 @@ const SEVERAL_UNUSABLE_CASES: &[Several] = &[
         body: None,
         message: Some(INVALID_NEXT_TOKEN),
     },
+    // ---- one unusable query parameter beside a usable one, which contributes no name ----
     Several {
-        name: "ListConfigurationSets with an unminted NextToken and a PageSize no count holds",
+        name: "ListConfigurationSets with an unminted NextToken beside a clamped PageSize",
+        // The `PageSize` here is a count larger than any the machine holds, so it is a
+        // bound the server clamps and not a parameter it cannot use: the refusal is the
+        // `NextToken`'s alone, and it carries that parameter's sentence.
         method: "GET",
         path: "/v1/sms-voice/configuration-sets\
                ?NextToken=not-a-token&PageSize=99999999999999999999999999",

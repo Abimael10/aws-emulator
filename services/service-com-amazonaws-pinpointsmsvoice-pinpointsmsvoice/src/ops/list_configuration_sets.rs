@@ -271,6 +271,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// clamped rather than refused: the caller asked for at most that many, and it gets a
 /// `NextToken` for the remainder.
 ///
+/// "Above the maximum" is decided by the DIGITS the caller wrote, never by what this
+/// build's `usize` can hold: a count is read digit by digit, and one too large for the
+/// machine is by construction larger than [`MAX_PAGE_SIZE`], so it is clamped like any
+/// other count above that bound. Handing the decision to `str::parse` alone would refuse
+/// such a count, and would put the line between a clamped and a refused value at the
+/// host's pointer width, so one request would be answered differently on a 32-bit and a
+/// 64-bit build.
+///
 /// The refusal carries NO detail text of its own — it is this service's one
 /// `refusal_wording::Unusable::Unworded` class. `BadRequestException$Message` is optional in
 /// the model (`smithy_query(query="shape",shape="BadRequestException",model_path="services/service-com-amazonaws-pinpointsmsvoice-pinpointsmsvoice/smithy-model/com-amazonaws-pinpointsmsvoice-pinpointsmsvoice.json")`)
@@ -284,9 +292,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// which this service mints and therefore names — is answered with that sentence (see the
 /// caller).
 fn parse_page_size(raw: &str) -> Option<usize> {
-    match raw.parse::<usize>() {
-        Ok(size) if size > 0 => Some(size.min(MAX_PAGE_SIZE)),
-        _ => None,
+    // What makes a value a count is how it is written: one optional `+` and then nothing
+    // but ASCII decimal digits. Everything else — empty, negative, fractional, exponent
+    // notation, a digit of another script, plain text — is not a count and is refused,
+    // whatever magnitude it was meant to denote.
+    let digits = raw.strip_prefix('+').unwrap_or(raw);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+
+    // A count this build can hold is clamped by `min`; one it cannot hold is already past
+    // every bound the clamp could apply, so it clamps to the maximum rather than being
+    // refused. Zero is the one count refused: a page of nothing would make a paginating
+    // client loop forever.
+    match digits.parse::<usize>() {
+        Ok(0) => None,
+        Ok(size) => Some(size.min(MAX_PAGE_SIZE)),
+        Err(_) => Some(MAX_PAGE_SIZE),
     }
 }
 
