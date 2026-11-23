@@ -89,7 +89,11 @@
 //!
 //! A session credential the store reports as expired speaks for nobody: it is not a valid
 //! credential, so it is refused as one ([`Refusal::InvalidCredential`]) before any policy is
-//! looked at.
+//! looked at. A LONG-TERM key the account holds with a status other than active is in the
+//! same position and refused the same way: the stored status of a key is what decides whether
+//! it authenticates a request at all, so a key that is still listed but deactivated speaks
+//! for no principal — asked of the IAM store's own accessor for that question, never read off
+//! the record, which answers only WHO a usable key speaks for.
 //!
 //! Resolving the caller goes through STS's own `resolve_caller`, which materialises the
 //! session expiries the clock has already made due before it answers: that write is owed at
@@ -480,6 +484,17 @@ pub fn caller<Eng: Send + Sync + 'static>(
         return Ok(caller);
     };
     let store = iam.lock();
+    // Step one of the gate for a LONG-TERM key: whether the identity store holds the credential
+    // as valid at all. The account's own records own that answer — the stored status of a key
+    // is what decides whether it authenticates a request, and a key whose status has been moved
+    // off active stays listed but cannot be used — so the question is put to the accessor that
+    // holds the rule rather than decided from the record here, which is the same question every
+    // other service puts to that store. A key id the store holds no record of is not an IAM
+    // user's key at all, and that accessor answers for it too: nothing there refuses it, and it
+    // resolves below to the account's own published credential.
+    if !store.access_key_is_usable(&access_key_id) {
+        return Err(InvalidCredential);
+    }
     // A LONG-TERM access key: STS's store holds SESSIONS, so its answer for a key it never
     // minted is the account's ambient identity — but IAM's store maps an access key id to the
     // user that holds it (`access_keys`, the map `iam:GetUser` resolves a caller through), so

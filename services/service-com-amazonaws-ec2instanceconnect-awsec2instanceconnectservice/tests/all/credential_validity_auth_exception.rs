@@ -12,9 +12,11 @@
 //! and the document that withheld the grant. A credential the store DOES hold as valid is
 //! decided by that principal's policies exactly as before, which is the second table here.
 //!
-//! The invalid credential this emulator can hold is a session whose validity window has run
-//! out: STS's own store answers `resolve_caller` with the expired record while it keeps it
-//! (`EXPIRED_SESSION_RETENTION`).
+//! Two credentials this emulator can hold are not valid ones: a session whose validity window
+//! has run out — STS's own store answers `resolve_caller` with the expired record while it
+//! keeps it (`EXPIRED_SESSION_RETENTION`) — and an IAM user's long-term access key whose stored
+//! status the account holds as anything but `Active`, which stays listed but cannot be used
+//! for API calls. The first two tables below are the session, the last two the long-term key.
 //!
 //! Nothing is poked into IAM's store by hand: every user, role, policy and long-term key is
 //! made through IAM's own API, and every session credential is minted through STS's own
@@ -255,33 +257,15 @@ impl Emulator {
     async fn session_credential(&self, case: &str, kind: Credential, grant: Grant) -> Principal {
         match kind {
             Credential::UserSessionToken => {
-                self.iam(case, "CreateUser", &[("UserName", PROBE_USER)])
-                    .await;
-                if let Some(document) = grant.document() {
-                    self.iam(
-                        case,
-                        "PutUserPolicy",
-                        &[
-                            ("UserName", PROBE_USER),
-                            ("PolicyName", INLINE_POLICY_NAME),
-                            ("PolicyDocument", &document),
-                        ],
-                    )
-                    .await;
-                }
-                let minted = self
-                    .iam(case, "CreateAccessKey", &[("UserName", PROBE_USER)])
-                    .await;
-                let long_term = member(case, &minted, "AccessKeyId");
+                let user = self.long_term_credential(case, grant).await;
                 // The user's own long-term key is what `GetSessionToken` must be called with
                 // ("the long-term Amazon Web Services security credentials of an IAM user").
-                let session = self.sts(case, &long_term, "GetSessionToken", &[]).await;
+                let session = self
+                    .sts(case, &user.access_key_id, "GetSessionToken", &[])
+                    .await;
                 Principal {
                     access_key_id: member(case, &session, "AccessKeyId"),
-                    arn: format!(
-                        "arn:aws:iam::{}:user/{PROBE_USER}",
-                        engine::EMULATOR_ACCOUNT_ID
-                    ),
+                    arn: user.arn,
                 }
             }
             Credential::AssumedRole => {
@@ -327,6 +311,62 @@ impl Emulator {
                 }
             }
         }
+    }
+
+    /// Create an IAM user carrying `grant` and one LONG-TERM access key of its own, through
+    /// IAM's own API, and answer that key plus the principal a request signed with it speaks
+    /// for.
+    async fn long_term_credential(&self, case: &str, grant: Grant) -> Principal {
+        self.iam(case, "CreateUser", &[("UserName", PROBE_USER)])
+            .await;
+        if let Some(document) = grant.document() {
+            self.iam(
+                case,
+                "PutUserPolicy",
+                &[
+                    ("UserName", PROBE_USER),
+                    ("PolicyName", INLINE_POLICY_NAME),
+                    ("PolicyDocument", &document),
+                ],
+            )
+            .await;
+        }
+        let minted = self
+            .iam(case, "CreateAccessKey", &[("UserName", PROBE_USER)])
+            .await;
+        Principal {
+            access_key_id: member(case, &minted, "AccessKeyId"),
+            arn: format!(
+                "arn:aws:iam::{}:user/{PROBE_USER}",
+                engine::EMULATOR_ACCOUNT_ID
+            ),
+        }
+    }
+
+    /// Move the stored status of `access_key_id` to `status` through IAM's own
+    /// `UpdateAccessKey`, the API that owns that value — nothing is poked into IAM's store.
+    async fn set_key_status(&self, case: &str, access_key_id: &str, status: &str) {
+        self.iam(
+            case,
+            "UpdateAccessKey",
+            &[
+                ("UserName", PROBE_USER),
+                ("AccessKeyId", access_key_id),
+                ("Status", status),
+            ],
+        )
+        .await;
+    }
+
+    /// Whether IAM still lists `access_key_id` for the probe user, and the status it reports
+    /// for it — so a row can tell a key moved off `Active` from one that was deleted.
+    async fn listed_key_status(&self, case: &str, access_key_id: &str) -> Option<String> {
+        let listed = self
+            .iam(case, "ListAccessKeys", &[("UserName", PROBE_USER)])
+            .await;
+        listed
+            .contains(access_key_id)
+            .then(|| member(case, &listed, "Status"))
     }
 
     /// Move the expiry of the session `access_key_id` names into the past, in STS's own
@@ -690,5 +730,261 @@ async fn a_valid_session_credential_is_still_decided_by_the_principals_policies(
                 );
             }
         }
+    }
+}
+
+/// The access-key status that authenticates a request, and the ones that do not: the whole
+/// value set `statusType` admits (`smithy_query(query="shape",shape="statusType")` against
+/// IAM's model — `Active | Inactive | Expired`), split by what `UpdateAccessKey$Status`
+/// documents the stored value to mean ("Active means that the key can be used for
+/// programmatic calls to Amazon Web Services, while Inactive means that the key cannot be
+/// used").
+const ACTIVE_STATUS: &str = "Active";
+
+/// One row of the deactivated-long-term-key table.
+struct DeactivatedRow {
+    case: &'static str,
+    /// The status `UpdateAccessKey` moves the key to — one of `statusType`'s values that is
+    /// not `Active`.
+    status: &'static str,
+    grant: Grant,
+    target: &'static str,
+    instance_id: &'static str,
+}
+
+/// RULE (the same rule, on the other credential kind this emulator holds): a long-term access
+/// key the account holds with a status other than `Active` is not a valid credential, so a
+/// request signed with it speaks for no principal, no identity-based policy is consulted and
+/// the push is refused with the modelled `AuthException` and the sentence the model documents
+/// for it — whatever that user's policies allow.
+#[tokio::test]
+async fn a_long_term_key_the_account_holds_as_unusable_is_refused_as_the_modelled_auth_exception()
+{
+    let rows = [
+        DeactivatedRow {
+            case: "deactivated, the user allowed everything, the SSH push",
+            status: "Inactive",
+            grant: Grant::Everything,
+            target: SEND_SSH,
+            instance_id: INSTANCE_ID,
+        },
+        DeactivatedRow {
+            case: "deactivated, the user allowed everything, the serial-console push",
+            status: "Inactive",
+            grant: Grant::Everything,
+            target: SEND_SERIAL,
+            instance_id: INSTANCE_ID,
+        },
+        // Nothing allows the push either, and the answer is still the credential's failure:
+        // no policy was consulted, so the refusal is not the policy refusal.
+        DeactivatedRow {
+            case: "deactivated, the user carrying no policy at all",
+            status: "Inactive",
+            grant: Grant::Nothing,
+            target: SEND_SSH,
+            instance_id: INSTANCE_ID,
+        },
+        // The other value `statusType` admits that is not `Active`: likewise not usable.
+        DeactivatedRow {
+            case: "held expired, the user allowed everything, the serial-console push",
+            status: "Expired",
+            grant: Grant::Everything,
+            target: SEND_SERIAL,
+            instance_id: INSTANCE_ID,
+        },
+        DeactivatedRow {
+            case: "held expired, the user allowed everything, the SSH push",
+            status: "Expired",
+            grant: Grant::Everything,
+            target: SEND_SSH,
+            instance_id: INSTANCE_ID,
+        },
+        // The credential is decided before anything about the instance is reported, so an id
+        // nothing holds is still the credential's failure rather than a lookup's.
+        DeactivatedRow {
+            case: "deactivated, an instance nothing holds",
+            status: "Inactive",
+            grant: Grant::Everything,
+            target: SEND_SSH,
+            instance_id: ABSENT_INSTANCE_ID,
+        },
+    ];
+
+    for row in rows {
+        let DeactivatedRow {
+            case,
+            status,
+            grant,
+            target,
+            instance_id,
+        } = row;
+        let case = format!("{case} ({status}, {grant:?}, {target})");
+        let emulator = Emulator::new();
+        emulator.register_the_instance();
+        let principal = emulator.long_term_credential(&case, grant).await;
+        emulator
+            .set_key_status(&case, &principal.access_key_id, status)
+            .await;
+        // The key is withdrawn, not deleted: the account still lists it, carrying the status
+        // it was moved to — so what refuses the push below is that status alone.
+        assert_eq!(
+            emulator
+                .listed_key_status(&case, &principal.access_key_id)
+                .await
+                .as_deref(),
+            Some(status),
+            "case {case:?}: IAM must still list the key, holding it as {status}"
+        );
+
+        let (http_status, body) = emulator
+            .push(
+                &principal.access_key_id,
+                target,
+                instance_id,
+                &ssh_key("withdrawn"),
+            )
+            .await;
+
+        assert_eq!(
+            error_code(&body),
+            "AuthException",
+            "case {case:?}: expected the modelled AuthException, got {http_status} {body}"
+        );
+        assert_eq!(
+            message(&body),
+            AUTH_EXCEPTION_MESSAGE,
+            "case {case:?}: expected the sentence the model documents for AuthException, got \
+             {body}"
+        );
+        // `AuthException` is a `client` shape, and this service answers every client error
+        // with HTTP 400 whatever `@httpError` the shape carries.
+        assert_eq!(
+            http_status, 400,
+            "case {case:?}: expected HTTP 400, got {http_status} {body}"
+        );
+        // Nothing of the policy refusal: no principal was resolved and no document was read,
+        // so neither may be blamed — and the credential is not quoted back either.
+        assert!(
+            !message(&body).contains("not authorized")
+                && !message(&body).contains(&action_for(target))
+                && !message(&body).contains(&principal.access_key_id)
+                && !message(&body).contains(&principal.arn),
+            "case {case:?}: the refusal must blame no principal, action, resource or \
+             credential, got {body}"
+        );
+        assert_eq!(
+            emulator.stored_key_count(),
+            0,
+            "case {case:?}: a refused push stores no key, state holds {}",
+            emulator.stored_key_count()
+        );
+    }
+}
+
+/// RULE (the other side of it, for a long-term key): the STORED STATUS is what decides, and
+/// the gate only reads it — a key held `Active` is judged on its user's policies exactly as
+/// before, moving it off `Active` cuts the credential off, and moving it back makes the very
+/// next request work again.
+#[tokio::test]
+async fn a_long_term_keys_stored_status_is_what_decides_and_moving_it_back_restores_the_push() {
+    // (case, the operation, what the user is allowed)
+    let rows = [
+        ("the SSH push, allowed everything", SEND_SSH, Grant::Everything),
+        (
+            "the serial-console push, allowed everything",
+            SEND_SERIAL,
+            Grant::Everything,
+        ),
+        ("the SSH push, allowed nothing", SEND_SSH, Grant::Nothing),
+    ];
+
+    for (case, target, grant) in rows {
+        let case = format!("{case} ({grant:?}, {target})");
+        let emulator = Emulator::new();
+        emulator.register_the_instance();
+        let principal = emulator.long_term_credential(&case, grant).await;
+
+        // Held `Active`: the user's policies decide, and nothing about the credential does.
+        let (status, body) = emulator
+            .push(&principal.access_key_id, target, INSTANCE_ID, &ssh_key("active"))
+            .await;
+        let action = action_for(target);
+        let allowed_answer = match grant {
+            Grant::Everything => (200, String::new()),
+            Grant::Nothing => (403, "AccessDeniedException".to_string()),
+        };
+        assert_eq!(
+            (status, error_code(&body)),
+            allowed_answer,
+            "case {case:?}: an active key must be decided by the user's policies, got {status} \
+             {body}"
+        );
+        if grant == Grant::Nothing {
+            assert_eq!(
+                message(&body),
+                format!(
+                    "User: {} is not authorized to perform: {action} on resource: {} because \
+                     no identity-based policy allows the {action} action",
+                    principal.arn,
+                    instance_arn(INSTANCE_ID)
+                ),
+                "case {case:?}: expected AWS's refusal sentence, got {body}"
+            );
+        }
+        let stored_while_active = emulator.stored_key_count();
+        assert_eq!(
+            stored_while_active,
+            usize::from(grant == Grant::Everything),
+            "case {case:?}: an allowed push stores its key and a refused one stores none, \
+             state holds {stored_while_active}"
+        );
+
+        // Moved off `Active`: the same request, the same policies, refused as a credential
+        // that is not valid — and no key stored by it.
+        emulator
+            .set_key_status(&case, &principal.access_key_id, "Inactive")
+            .await;
+        let (status, body) = emulator
+            .push(
+                &principal.access_key_id,
+                target,
+                INSTANCE_ID,
+                &ssh_key("deactivated"),
+            )
+            .await;
+        assert_eq!(
+            (status, error_code(&body).as_str(), message(&body).as_str()),
+            (400, "AuthException", AUTH_EXCEPTION_MESSAGE),
+            "case {case:?}: a deactivated key must be refused as the modelled AuthException, \
+             got {status} {body}"
+        );
+        assert_eq!(
+            emulator.stored_key_count(),
+            stored_while_active,
+            "case {case:?}: the refused push must store nothing, state holds {} and held {} \
+             before it",
+            emulator.stored_key_count(),
+            stored_while_active
+        );
+
+        // Moved back to `Active`: nothing was torn down to refuse it, so the very next
+        // request is decided by the user's policies again.
+        emulator
+            .set_key_status(&case, &principal.access_key_id, ACTIVE_STATUS)
+            .await;
+        let (status, body) = emulator
+            .push(
+                &principal.access_key_id,
+                target,
+                INSTANCE_ID,
+                &ssh_key("reactivated"),
+            )
+            .await;
+        assert_eq!(
+            (status, error_code(&body)),
+            allowed_answer,
+            "case {case:?}: a key moved back to {ACTIVE_STATUS} must be decided by the user's \
+             policies again, got {status} {body}"
+        );
     }
 }
