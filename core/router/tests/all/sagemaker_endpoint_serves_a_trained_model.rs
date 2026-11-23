@@ -446,7 +446,7 @@ async fn trained_and_deployed(
 
 /// Deploy a model carrying `artifact` (when it names one) behind `endpoint` on `variant`, and
 /// answer once the endpoint is `InService`.
-async fn deploy(
+pub(crate) async fn deploy(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,

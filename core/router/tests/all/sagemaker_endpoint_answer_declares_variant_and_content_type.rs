@@ -38,13 +38,13 @@ use crate::sagemaker_endpoint_serves_a_trained_model::{
 /// The coefficients the deployed artifact's model carries, one per feature, and the bias it adds.
 /// Every expectation below is computed from these rather than from another run of the
 /// implementation.
-const COEFFICIENTS: [f64; 3] = [2.0, -1.5, 0.25];
+pub(crate) const COEFFICIENTS: [f64; 3] = [2.0, -1.5, 0.25];
 const BIAS: f64 = 4.0;
 
 /// A serialized LINEAR booster carrying [`COEFFICIENTS`] and [`BIAS`] — the form a boosting
 /// container uploads as its model file: the learner's parameters, its objective, and the
 /// booster's weights, one per feature and then the bias.
-fn artifact_document() -> String {
+pub(crate) fn artifact_document() -> String {
     let mut weights: Vec<f64> = COEFFICIENTS.to_vec();
     weights.push(BIAS);
     json!({
@@ -64,7 +64,7 @@ fn artifact_document() -> String {
 
 /// What the model that artifact holds answers for one record: its coefficients against the
 /// record plus its bias, through the identity link its objective declares.
-fn expected_prediction(record: &[f64]) -> f64 {
+pub(crate) fn expected_prediction(record: &[f64]) -> f64 {
     BIAS + COEFFICIENTS
         .iter()
         .zip(record)
@@ -163,7 +163,7 @@ fn rows() -> Vec<Row> {
 }
 
 /// One row's payload: a JSON list of records, or one comma-separated record per line.
-fn payload(records: &[Vec<f64>], json_payload: bool) -> String {
+pub(crate) fn payload(records: &[Vec<f64>], json_payload: bool) -> String {
     if json_payload {
         return json!(records).to_string();
     }
