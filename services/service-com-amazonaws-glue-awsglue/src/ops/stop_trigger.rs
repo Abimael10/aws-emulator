@@ -11,12 +11,17 @@
 //! under that name, because a trigger is served only through the endpoint that created
 //! it.
 //!
-//! Stopping takes no account of the state the trigger was in and is idempotent: whatever
-//! that state was, the trigger is stopped once the call returns, and the definition it
-//! holds — its type, schedule, predicate and actions — is untouched, so a later start
-//! moves the same trigger back to [`crate::state::TRIGGER_STATE_ACTIVATED`]. A stop ends
-//! no run already begun: what a firing recorded is a run of a workflow, which has its own
-//! lifecycle.
+//! A stop is the transition OUT of the started state, so it is served only for a trigger
+//! that is IN that state ([`crate::state::TRIGGER_STATE_ACTIVATED`]): a trigger in any
+//! other `TriggerState` — one nothing has started yet, one a stop already deactivated, one
+//! that waits on nothing but a caller and so has no armed state at all — is refused with
+//! `InvalidInputException` naming the state it is in, and that refusal leaves its state
+//! exactly where it was.
+//!
+//! The stop moves the state alone: the definition the trigger holds — its type, schedule,
+//! predicate and actions — is untouched, so a later start moves the same trigger back to
+//! [`crate::state::TRIGGER_STATE_ACTIVATED`]. A stop ends no run already begun: what a
+//! firing recorded is a run of a workflow, which has its own lifecycle.
 //!
 //! ## Shape of an operation
 //!
@@ -183,15 +188,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A stop is the transition out of the started state, so the states it is defined
+        // from are the ones a trigger is STARTED in
+        // ([`crate::state::TriggerEntry::is_started`]). A trigger in any other
+        // `TriggerState` has no start for this call to undo, so the call is refused with
+        // this operation's own modelled `InvalidInputException` naming the state the store
+        // holds the trigger in, and NOTHING is written: the refused stop leaves the
+        // trigger's state and its arming exactly as this call found them.
+        if !trigger.is_started() {
+            let state = trigger.state.clone();
+            return Err(StopTriggerErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::messages::trigger_state_not_allowed(&state)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
         // "Stops a specified trigger": the trigger this call stopped is in the modelled
         // state of a stopped trigger, which every later read of it reports. A steady
         // state, so the clock owes it nothing further, and the write leaves the rest of
         // the definition — type, schedule, predicate, actions — exactly as it was, so a
         // later start activates the same trigger again.
-        let was = ::std::mem::replace(
-            &mut trigger.state,
-            crate::state::TRIGGER_STATE_DEACTIVATED.to_string(),
-        );
+        let was = trigger.stop();
         // A stopped trigger fires on nothing, so a stopped SCHEDULED trigger is on no
         // schedule either: the firing the clock owed it is taken away with the arming, and a
         // later start arms the schedule afresh

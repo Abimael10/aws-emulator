@@ -6,14 +6,16 @@
 //! Every call goes over the wire through the shared [`crate::wire`] harness, so what is
 //! asserted is HTTP behaviour and not a direct call into a handler.
 //!
-//! The rule under test: a stop addresses a trigger by name in the Region that holds it
-//! and leaves it in the one modelled `TriggerState` of a stopped trigger (`DEACTIVATED`),
-//! which every later read of that trigger reports, whatever state it was in before and
-//! however often the stop is repeated; the rest of the stored definition — type, schedule,
-//! predicate, actions — is untouched, so a later start takes the same trigger out of the
-//! stopped state again, and a run a firing already began is left to its own lifecycle. A
-//! stop for a name the request's Region holds no trigger under is refused with
-//! `EntityNotFoundException`.
+//! The rule under test: a stop addresses a trigger by name in the Region that holds it and
+//! is the transition OUT of the one `TriggerState` of a started trigger (`ACTIVATED`), so
+//! it is served only for a trigger that is IN that state — it leaves such a trigger in the
+//! one stopped state (`DEACTIVATED`), which every later read reports, and touches no other
+//! part of the stored definition, so a later start takes the same trigger out of the
+//! stopped state again. A stop for a trigger in any OTHER state is refused with
+//! `InvalidInputException` naming the state the trigger is in, and the refusal writes
+//! nothing: the trigger keeps that state and its arming. A run a firing already began is
+//! left to its own lifecycle, and a stop for a name the request's Region holds no trigger
+//! under is refused with `EntityNotFoundException`.
 //!
 //! The tables are rows along what the rule generalises over: the trigger's type (each of
 //! the four modelled `TriggerType` values), the state the trigger was in when the stop
@@ -47,10 +49,12 @@ struct StopCase {
     /// Whether a `StartTrigger` call precedes the stop. A create that already started the
     /// trigger (`StartOnCreation`) needs none.
     start_first: bool,
-    /// The `TriggerState` a read reports for this row before the stop.
+    /// The `TriggerState` a read reports for this row before the stop. A row whose trigger
+    /// is in the started state is one the stop is SERVED for; every other row is one the
+    /// stop is refused for.
     state_before: &'static str,
-    /// The `TriggerState` a read reports after the stop is undone by a later start: the
-    /// state a start leaves a trigger of this type in.
+    /// The `TriggerState` a read reports once the trigger has been started again: the state
+    /// a start leaves a trigger of this type in.
     state_after_restart: &'static str,
 }
 
@@ -77,7 +81,7 @@ fn stop_cases() -> Vec<StopCase> {
             }),
             start_first: true,
             // An on-demand trigger has no armed state: the start FIRED it and left it in
-            // the state it waits in.
+            // the state it waits in, so there is no start for a stop to undo.
             state_before: TRIGGER_STATE_CREATED,
             state_after_restart: TRIGGER_STATE_CREATED,
         },
@@ -198,6 +202,25 @@ async fn stop_trigger(router: &MultiServiceRouter, trigger: &str) -> (u16, Value
     call_in_region(router, REGION, "StopTrigger", &json!({ "Name": trigger })).await
 }
 
+/// Assert the stop of a trigger in `state` is refused for the one reason a state refuses
+/// it, and that the trigger is left in that very state.
+async fn assert_stop_refused(router: &MultiServiceRouter, case: &str, trigger: &str, state: &str) {
+    assert_refusal(
+        router,
+        case,
+        "StopTrigger",
+        &json!({ "Name": trigger }),
+        "InvalidInputException",
+        &messages::trigger_state_not_allowed(state),
+    )
+    .await;
+    let after = trigger_state(router, trigger).await;
+    assert_eq!(
+        after, state,
+        "case {case:?}: the refused stop must leave the trigger in {state:?}, got {after:?}"
+    );
+}
+
 /// The `Trigger` `GetTrigger` reports for `trigger`, with `State` removed: the part of the
 /// definition a stop must leave exactly as it was.
 async fn trigger_definition(router: &MultiServiceRouter, trigger: &str) -> Value {
@@ -213,11 +236,11 @@ async fn trigger_definition(router: &MultiServiceRouter, trigger: &str) -> Value
 // Stop, then read back
 // ---------------------------------------------------------------------------
 
-/// A stop answers 200 with the trigger's name and leaves the trigger in the stopped state
-/// a later read reports, whatever state it was in before, leaving the rest of its
-/// definition untouched.
+/// A stop of a STARTED trigger answers 200 with the trigger's name and leaves it in the
+/// stopped state a later read reports, leaving the rest of its definition untouched; a stop
+/// of a trigger in any other state is refused naming that state and writes nothing at all.
 #[tokio::test]
-async fn a_stop_deactivates_the_trigger_whatever_state_it_was_in() {
+async fn a_stop_deactivates_a_started_trigger_and_is_refused_for_any_other_state() {
     let (router, _engine) = emulator_with_engine();
     register_targets(&router).await;
 
@@ -233,23 +256,29 @@ async fn a_stop_deactivates_the_trigger_whatever_state_it_was_in() {
         );
         let definition_before = trigger_definition(&router, &trigger).await;
 
-        let (status, body) = stop_trigger(&router, &trigger).await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: StopTrigger must answer 200, got {status} with {body}"
-        );
-        assert_eq!(
-            body.get("Name").and_then(Value::as_str),
-            Some(trigger.as_str()),
-            "case {case:?}: the stop answers the name of the trigger it stopped, got {body}"
-        );
+        if row.state_before == TRIGGER_STATE_ACTIVATED {
+            let (status, body) = stop_trigger(&router, &trigger).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: StopTrigger must answer 200, got {status} with {body}"
+            );
+            assert_eq!(
+                body.get("Name").and_then(Value::as_str),
+                Some(trigger.as_str()),
+                "case {case:?}: the stop answers the name of the trigger it stopped, got \
+                 {body}"
+            );
 
-        let after = trigger_state(&router, &trigger).await;
-        assert_eq!(
-            after, TRIGGER_STATE_DEACTIVATED,
-            "case {case:?}: a stopped trigger is in {TRIGGER_STATE_DEACTIVATED}, got \
-             {after:?}"
-        );
+            let after = trigger_state(&router, &trigger).await;
+            assert_eq!(
+                after, TRIGGER_STATE_DEACTIVATED,
+                "case {case:?}: a stopped trigger is in {TRIGGER_STATE_DEACTIVATED}, got \
+                 {after:?}"
+            );
+        } else {
+            assert_stop_refused(&router, case, &trigger, row.state_before).await;
+        }
+
         let definition_after = trigger_definition(&router, &trigger).await;
         assert_eq!(
             definition_after, definition_before,
@@ -259,12 +288,12 @@ async fn a_stop_deactivates_the_trigger_whatever_state_it_was_in() {
     }
 }
 
-/// Stopping is idempotent — a second stop answers 200 and reports the same state — and the
-/// stop is not a one-way door: a later start takes the trigger out of the stopped state and
-/// into the state a start leaves a trigger of its type in, and stopping it once more
-/// deactivates it again.
+/// Stopping is not repeatable and not a one-way door: the stop that deactivated a trigger
+/// leaves it in a state the NEXT stop is refused from, and a later start takes the trigger
+/// out of the stopped state and into the state a start leaves a trigger of its type in —
+/// from where a trigger that has an armed state is stoppable once more.
 #[tokio::test]
-async fn stopping_is_idempotent_and_a_later_start_undoes_it() {
+async fn a_second_stop_is_refused_and_a_restart_makes_a_started_trigger_stoppable_again() {
     let (router, _engine) = emulator_with_engine();
     register_targets(&router).await;
 
@@ -272,47 +301,63 @@ async fn stopping_is_idempotent_and_a_later_start_undoes_it() {
         let case = row.case;
         let (_workflow, trigger) = register_case(&router, index, row).await;
 
-        // Repeat the stop: each one answers 200 and leaves the same state, including the
-        // row where the trigger was already stopped by the previous round.
-        for stop in 1..=3 {
+        // The first stop is served only from the started state; from any other state it is
+        // refused and the trigger stays where it was, however often it is repeated.
+        if row.state_before == TRIGGER_STATE_ACTIVATED {
             let (status, body) = stop_trigger(&router, &trigger).await;
             assert_eq!(
                 status, 200,
-                "case {case:?}: stop {stop} must answer 200, got {status} with {body}"
-            );
-            let state = trigger_state(&router, &trigger).await;
-            assert_eq!(
-                state, TRIGGER_STATE_DEACTIVATED,
-                "case {case:?}: after stop {stop} the trigger is in \
-                 {TRIGGER_STATE_DEACTIVATED}, got {state:?}"
+                "case {case:?}: the stop of a started trigger must answer 200, got {status} \
+                 with {body}"
             );
         }
+        // Whatever the row started from, the trigger is now in a state no stop is defined
+        // from: the stopped state for the rows the stop was served for, and the state the
+        // row arrived in for the others.
+        let settled = if row.state_before == TRIGGER_STATE_ACTIVATED {
+            TRIGGER_STATE_DEACTIVATED
+        } else {
+            row.state_before
+        };
+        for repeat in 1..=3 {
+            let repeated = format!("{case}: stop {repeat} from {settled}");
+            assert_stop_refused(&router, &repeated, &trigger, settled).await;
+        }
 
+        // The stop is no one-way door: a start takes the trigger out of that state.
         ok(&router, "StartTrigger", &json!({ "Name": trigger })).await;
         let restarted = trigger_state(&router, &trigger).await;
         assert_eq!(
             restarted, row.state_after_restart,
-            "case {case:?}: a stopped trigger starts again into {:?}, got {restarted:?}",
+            "case {case:?}: starting the trigger again leaves it in {:?}, got {restarted:?}",
             row.state_after_restart
         );
 
-        let (status, body) = stop_trigger(&router, &trigger).await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: the stop after the restart must answer 200, got {status} with \
-             {body}"
-        );
-        let state = trigger_state(&router, &trigger).await;
-        assert_eq!(
-            state, TRIGGER_STATE_DEACTIVATED,
-            "case {case:?}: the restarted trigger stops again into \
-             {TRIGGER_STATE_DEACTIVATED}, got {state:?}"
-        );
+        if row.state_after_restart == TRIGGER_STATE_ACTIVATED {
+            let (status, body) = stop_trigger(&router, &trigger).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the stop after the restart must answer 200, got {status} \
+                 with {body}"
+            );
+            let state = trigger_state(&router, &trigger).await;
+            assert_eq!(
+                state, TRIGGER_STATE_DEACTIVATED,
+                "case {case:?}: the restarted trigger stops again into \
+                 {TRIGGER_STATE_DEACTIVATED}, got {state:?}"
+            );
+        } else {
+            // A trigger with no armed state is in none after the start either, so the stop
+            // is refused from the state it waits in.
+            let case = format!("{case}: after the restart");
+            assert_stop_refused(&router, &case, &trigger, row.state_after_restart).await;
+        }
     }
 }
 
-/// A stop ends no workflow run a firing already began: the run keeps the status its own
-/// lifecycle gives it, and the workflow keeps the runs it had.
+/// A stop ends no workflow run a firing already began — neither the stop that is served nor
+/// the one a state refuses: the runs keep the status their own lifecycle gives them, and the
+/// workflow keeps the runs it had.
 #[tokio::test]
 async fn a_stop_leaves_the_runs_a_firing_already_began_alone() {
     let (router, engine) = emulator_with_engine();
@@ -334,31 +379,59 @@ async fn a_stop_leaves_the_runs_a_firing_already_began_alone() {
             &json!({ "Name": workflow, "MaxConcurrentRuns": 10 }),
         )
         .await;
-        let trigger = format!("stop-run-trigger-{index}");
+        // The trigger whose firings begin the runs: an on-demand trigger is fired by its
+        // caller, and a firing leaves it in the state it waits in rather than an armed one.
+        let firing_trigger = format!("stop-run-trigger-{index}");
         ok(
             &router,
             "CreateTrigger",
             &json!({
-                "Name": trigger,
+                "Name": firing_trigger,
                 "WorkflowName": workflow,
                 "Type": "ON_DEMAND",
                 "Actions": [{ "JobName": JOB }],
             }),
         )
         .await;
+        // A second trigger of the same workflow, started by its create, so this row drives
+        // a stop that is SERVED beside the one a state refuses.
+        let armed_trigger = format!("stop-run-armed-{index}");
+        ok(
+            &router,
+            "CreateTrigger",
+            &json!({
+                "Name": armed_trigger,
+                "WorkflowName": workflow,
+                "Type": "SCHEDULED",
+                "Schedule": "cron(0 12 * * ? *)",
+                "StartOnCreation": true,
+                "Actions": [{ "JobName": JOB }],
+            }),
+        )
+        .await;
 
         for _ in 0..firings {
-            ok(&router, "StartTrigger", &json!({ "Name": trigger })).await;
+            ok(&router, "StartTrigger", &json!({ "Name": firing_trigger })).await;
             // Hold every run the firings began in flight, so what is asserted after the
             // stop is what the stop did and not what the clock settled.
             set_workflow_due_instant(&engine, &workflow, far_future());
         }
         let before = stored_run_ids(&engine, &workflow);
 
-        let (status, body) = stop_trigger(&router, &trigger).await;
+        // The stop the fired trigger's state refuses, and the stop its armed sibling is
+        // served: neither touches a run already begun.
+        assert_stop_refused(
+            &router,
+            case,
+            &firing_trigger,
+            TRIGGER_STATE_CREATED,
+        )
+        .await;
+        let (status, body) = stop_trigger(&router, &armed_trigger).await;
         assert_eq!(
             status, 200,
-            "case {case:?}: StopTrigger must answer 200, got {status} with {body}"
+            "case {case:?}: the stop of the started trigger must answer 200, got {status} \
+             with {body}"
         );
 
         let after = stored_run_ids(&engine, &workflow);
@@ -386,6 +459,8 @@ async fn a_stop_leaves_the_runs_a_firing_already_began_alone() {
 /// A stop for a name the request's Region holds no trigger under is refused with the
 /// modelled `EntityNotFoundException` naming what was asked for: a trigger is served only
 /// through the endpoint that created it, so a trigger of another Region is such a name.
+/// The miss is answered BEFORE the state gate, so a name nothing created is never reported
+/// as a state.
 #[tokio::test]
 async fn a_stop_for_a_trigger_this_region_does_not_hold_is_refused() {
     let (router, _engine) = emulator_with_engine();
@@ -395,7 +470,9 @@ async fn a_stop_for_a_trigger_this_region_does_not_hold_is_refused() {
         "CreateTrigger",
         &json!({
             "Name": "elsewhere-stop-trigger",
-            "Type": "ON_DEMAND",
+            "Type": "SCHEDULED",
+            "Schedule": "cron(0 12 * * ? *)",
+            "StartOnCreation": true,
             "Actions": [{ "JobName": JOB }],
         }),
     )
@@ -438,7 +515,7 @@ async fn a_stop_for_a_trigger_this_region_does_not_hold_is_refused() {
     );
     let state = trigger_state(&router, "elsewhere-stop-trigger").await;
     assert_eq!(
-        state, TRIGGER_STATE_CREATED,
+        state, TRIGGER_STATE_ACTIVATED,
         "the refused stop in another Region must not move this Region's trigger, got \
          {state:?}"
     );

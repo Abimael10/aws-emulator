@@ -16,8 +16,10 @@
 //! stored definition in the `TriggerState` a create leaves a trigger in (`CREATED`), a start
 //! answers the name it started and leaves a trigger that waits on something outside the
 //! caller in the one armed state (`ACTIVATED`), an update overwrites the definition and
-//! answers the resulting `Trigger` without moving that state, and a stop answers the name it
-//! stopped and leaves the trigger in the one stopped state (`DEACTIVATED`).
+//! answers the resulting `Trigger` without moving that state, and a stop — the transition
+//! out of that armed state — answers the name it stopped and leaves the trigger in the one
+//! stopped state (`DEACTIVATED`) where the start armed it, and is refused naming the state
+//! the trigger is in where the start FIRED it instead, moving nothing.
 //!
 //! The rows differ along what the rule generalises over: the trigger's `Type` (each of the
 //! four modelled `TriggerType` values), the member its type waits on (a cron `Schedule`, a
@@ -31,10 +33,11 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::{
-    TRIGGER_STATE_ACTIVATED, TRIGGER_STATE_CREATED, TRIGGER_STATE_DEACTIVATED,
+    messages, TRIGGER_STATE_ACTIVATED, TRIGGER_STATE_CREATED, TRIGGER_STATE_DEACTIVATED,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::error_messages::assert_refusal;
 use crate::wire::{assert_echoed, call, emulator, ok};
 
 /// A job name no call in this suite registers: the dangling reference the whole lifecycle is
@@ -319,18 +322,36 @@ async fn the_whole_lifecycle_is_served_for_a_trigger_created_ahead_of_its_job() 
              {read_back} for {updated}"
         );
 
-        // 5. The stop answers the name it stopped and deactivates the trigger.
-        let stopped = served(&router, case, "StopTrigger", &json!({ "Name": name })).await;
-        assert_eq!(
-            stopped.get("Name").and_then(Value::as_str),
-            Some(name.as_str()),
-            "case {case:?}: the stop answers the name of the trigger it stopped, got {stopped}"
-        );
+        // 5. The stop is the transition OUT of the armed state: a trigger the start armed
+        // is stopped and answers the name it stopped, while one the start FIRED was left in
+        // no armed state at all, so the stop of it is refused naming the state it is in and
+        // leaves that state where it was.
+        let state_after_stop = if row.state_after_start == TRIGGER_STATE_ACTIVATED {
+            let stopped = served(&router, case, "StopTrigger", &json!({ "Name": name })).await;
+            assert_eq!(
+                stopped.get("Name").and_then(Value::as_str),
+                Some(name.as_str()),
+                "case {case:?}: the stop answers the name of the trigger it stopped, got \
+                 {stopped}"
+            );
+            TRIGGER_STATE_DEACTIVATED
+        } else {
+            assert_refusal(
+                &router,
+                case,
+                "StopTrigger",
+                &json!({ "Name": name }),
+                "InvalidInputException",
+                &messages::trigger_state_not_allowed(row.state_after_start),
+            )
+            .await;
+            row.state_after_start
+        };
         let deactivated = get_trigger(&router, case, &name).await;
         assert_eq!(
             deactivated.get("State").and_then(Value::as_str),
-            Some(TRIGGER_STATE_DEACTIVATED),
-            "case {case:?}: a stopped trigger is in {TRIGGER_STATE_DEACTIVATED}, got \
+            Some(state_after_stop),
+            "case {case:?}: after the stop the trigger is in {state_after_stop}, got \
              {deactivated}"
         );
         // Only the state moved: the definition the update left is still the stored one.
@@ -360,15 +381,41 @@ async fn reading_the_trigger_at_each_stage_moves_nothing() {
         // outside any workflow, so no read can be answered from a run a firing began.
         served(&router, case, "CreateTrigger", &create).await;
 
+        // A stop is served only from the armed state, so the stage a stop reaches is the
+        // stopped state for a trigger the start armed and the state it was already in for
+        // one the start fired instead.
+        let stoppable = row.state_after_start == TRIGGER_STATE_ACTIVATED;
+        let state_after_stop = if stoppable {
+            TRIGGER_STATE_DEACTIVATED
+        } else {
+            row.state_after_start
+        };
+
         // (the stage, the call that reaches it, the state every read of it must report)
         let stages: [(&str, Option<&str>, &str); 3] = [
             ("after the create", None, TRIGGER_STATE_CREATED),
             ("after the start", Some("StartTrigger"), row.state_after_start),
-            ("after the stop", Some("StopTrigger"), TRIGGER_STATE_DEACTIVATED),
+            ("after the stop", Some("StopTrigger"), state_after_stop),
         ];
         for (stage, reached_by, expected) in stages {
-            if let Some(operation) = reached_by {
-                served(&router, case, operation, &json!({ "Name": name })).await;
+            match reached_by {
+                // The stop this row's state refuses is still the call that reaches the
+                // stage: what the reads must report is the state it left untouched.
+                Some("StopTrigger") if !stoppable => {
+                    assert_refusal(
+                        &router,
+                        case,
+                        "StopTrigger",
+                        &json!({ "Name": name }),
+                        "InvalidInputException",
+                        &messages::trigger_state_not_allowed(row.state_after_start),
+                    )
+                    .await;
+                }
+                Some(operation) => {
+                    served(&router, case, operation, &json!({ "Name": name })).await;
+                }
+                None => {}
             }
 
             let first = get_trigger(&router, case, &name).await;

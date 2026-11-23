@@ -440,16 +440,37 @@ async fn the_batch_follows_the_store() {
     );
 
     // A state the service moved is reported too: the batch is a read of the live record.
-    ok(&router, "StopTrigger", &json!({ "Name": "transient" })).await;
-    let stopped = only_trigger(&router, "stopped").await;
+    // A stop is the transition out of the started state, so the trigger it moves is a
+    // STARTED one — here a scheduled trigger its own create started.
+    ok(
+        &router,
+        "CreateTrigger",
+        &json!({
+            "Name": "transient-armed",
+            "Type": "SCHEDULED",
+            "Schedule": "cron(0 12 * * ? *)",
+            "StartOnCreation": true,
+            "Description": "trigger transient-armed",
+            "Actions": [{ "JobName": JOB }],
+        }),
+    )
+    .await;
+    ok(&router, "StopTrigger", &json!({ "Name": "transient-armed" })).await;
+    let batched = ok(
+        &router,
+        "BatchGetTriggers",
+        &json!({ "TriggerNames": ["transient-armed"] }),
+    )
+    .await;
+    let stopped = batched["Triggers"][0].clone();
     // "DEACTIVATED" is the modelled `TriggerState` of a stopped trigger (source:
     // `smithy_query(query="shape",shape="TriggerState")`).
     assert_eq!(
         stopped["State"].as_str(),
         Some("DEACTIVATED"),
-        "case \"stopped\": the state must come from the store, got {stopped}"
+        "case \"stopped\": the state must come from the store, got {batched}"
     );
-    let after_stop = ok(&router, "GetTrigger", &json!({ "Name": "transient" })).await;
+    let after_stop = ok(&router, "GetTrigger", &json!({ "Name": "transient-armed" })).await;
     assert_eq!(
         after_stop["Trigger"], stopped,
         "case \"stopped\": the batch and GetTrigger must report one record, got {after_stop}"

@@ -53,8 +53,9 @@ struct Row {
     definition: Value,
     /// Whether the trigger belongs to [`WORKFLOW`].
     in_workflow: bool,
-    /// The lifecycle call made before the delete, if any.
-    lifecycle: Option<&'static str>,
+    /// The lifecycle calls made before the delete, in order: a stop is served only from
+    /// the started state, so a row that stops its trigger starts it first.
+    lifecycle: &'static [&'static str],
     /// The `TriggerState` a read reports when the delete arrives.
     state_before: &'static str,
 }
@@ -70,7 +71,7 @@ fn rows() -> Vec<Row> {
                 "Actions": [{ "JobName": JOB }],
             }),
             in_workflow: true,
-            lifecycle: None,
+            lifecycle: &[],
             state_before: TRIGGER_STATE_CREATED,
         },
         Row {
@@ -87,7 +88,7 @@ fn rows() -> Vec<Row> {
                 "Actions": [{ "JobName": JOB }, { "CrawlerName": CRAWLER }],
             }),
             in_workflow: true,
-            lifecycle: None,
+            lifecycle: &[],
             state_before: TRIGGER_STATE_ACTIVATED,
         },
         Row {
@@ -108,12 +109,12 @@ fn rows() -> Vec<Row> {
                 "Actions": [{ "JobName": JOB }],
             }),
             in_workflow: false,
-            lifecycle: Some("StartTrigger"),
+            lifecycle: &["StartTrigger"],
             state_before: TRIGGER_STATE_ACTIVATED,
         },
         Row {
             // "Batch condition that must be met … before EventBridge event trigger fires."
-            case: "event, stopped before the delete",
+            case: "event, started and then stopped before the delete",
             name: "event-delete".to_string(),
             definition: json!({
                 "Type": "EVENT",
@@ -121,7 +122,7 @@ fn rows() -> Vec<Row> {
                 "Actions": [{ "JobName": OTHER_JOB }],
             }),
             in_workflow: true,
-            lifecycle: Some("StopTrigger"),
+            lifecycle: &["StartTrigger", "StopTrigger"],
             state_before: TRIGGER_STATE_DEACTIVATED,
         },
         Row {
@@ -134,7 +135,7 @@ fn rows() -> Vec<Row> {
                 "Actions": [{ "CrawlerName": CRAWLER }],
             }),
             in_workflow: true,
-            lifecycle: None,
+            lifecycle: &[],
             state_before: TRIGGER_STATE_CREATED,
         },
         Row {
@@ -146,7 +147,7 @@ fn rows() -> Vec<Row> {
                 "Actions": [{ "JobName": JOB }],
             }),
             in_workflow: false,
-            lifecycle: Some("StartTrigger"),
+            lifecycle: &["StartTrigger"],
             state_before: TRIGGER_STATE_CREATED,
         },
         Row {
@@ -162,7 +163,7 @@ fn rows() -> Vec<Row> {
                 ],
             }),
             in_workflow: true,
-            lifecycle: Some("StartTrigger"),
+            lifecycle: &["StartTrigger"],
             state_before: TRIGGER_STATE_ACTIVATED,
         },
     ]
@@ -193,7 +194,7 @@ async fn register_row(router: &MultiServiceRouter, row: &Row) {
         body["WorkflowName"] = json!(WORKFLOW);
     }
     ok(router, "CreateTrigger", &body).await;
-    if let Some(operation) = row.lifecycle {
+    for operation in row.lifecycle {
         ok(router, operation, &json!({ "Name": row.name })).await;
     }
 }

@@ -302,9 +302,16 @@ async fn a_delivery_a_workflow_cannot_receive_starts_no_run() {
     );
 
     // A workflow whose EVENT trigger has been stopped: the delivery is accepted and
-    // nothing fires.
+    // nothing fires. A stop is served from the started state, so the trigger is started
+    // first.
     let workflow = "wf-stopped";
     given_event_trigger(&router, workflow, Some(json!({ "BatchSize": 1 }))).await;
+    ok(
+        &router,
+        "StartTrigger",
+        &json!({ "Name": format!("{workflow}-evt") }),
+    )
+    .await;
     let stopped = ok(
         &router,
         "StopTrigger",

@@ -176,6 +176,29 @@ impl TriggerEntry {
         };
     }
 
+    /// Whether this trigger is STARTED, i.e. whether it is in the one `TriggerState` a
+    /// started trigger is in ([`TRIGGER_STATE_ACTIVATED`]).
+    ///
+    /// A stop is the transition OUT of that state ("Stops a specified trigger",
+    /// `StopTrigger`), so it is the state a stop is defined from: a trigger nothing has
+    /// armed is in [`TRIGGER_STATE_CREATED`] and one a stop already deactivated is in
+    /// [`TRIGGER_STATE_DEACTIVATED`], and neither has a start to be undone. A trigger that
+    /// waits on nothing but a caller is never in this state at all — a start of one is a
+    /// firing that leaves it in the state it waits in ([`Self::start`]) — so there is
+    /// nothing of it to stop either.
+    pub fn is_started(&self) -> bool {
+        self.state == TRIGGER_STATE_ACTIVATED
+    }
+
+    /// Move this trigger into the state a stop leaves it in
+    /// ([`TRIGGER_STATE_DEACTIVATED`]), answering the state it was in before.
+    ///
+    /// Only the state moves: the definition the record holds — its type, schedule,
+    /// predicate and actions — is untouched, so a later start arms the same trigger again.
+    pub fn stop(&mut self) -> String {
+        ::std::mem::replace(&mut self.state, TRIGGER_STATE_DEACTIVATED.to_string())
+    }
+
     /// Replace the stored DEFINITION with the one a `TriggerUpdate` carries: "this object
     /// updates the previous trigger definition by overwriting it completely"
     /// (`TriggerUpdate`), so a member the update omits is left with no value rather than

@@ -434,6 +434,19 @@ pub fn not_authorized_on_catalog(action: &str, catalog_arn: &str) -> String {
 /// addresses a trigger by name reports the miss with this one sentence.
 pub const TRIGGER_NOT_FOUND: &str = "Trigger not found.";
 
+/// A trigger lifecycle call whose transition is not defined from the `TriggerState` the
+/// addressed trigger is in — `StopTrigger` for a trigger that is not started
+/// ([`super::TRIGGER_STATE_ACTIVATED`]).
+///
+/// RECORDED template: the fixed text is the whole sentence up to and including the colon,
+/// and the one variable part is the state the trigger is in AT THE TIME OF THE CALL, read
+/// off the stored record rather than off the request. Neither the trigger's name nor the
+/// operation is part of the sentence, so the refusal discloses nothing beyond the
+/// lifecycle position the caller can already read with `GetTrigger`.
+pub fn trigger_state_not_allowed(state: &str) -> String {
+    format!("The operation is not allowed when trigger is in state: {state}")
+}
+
 /// `CreateTrigger` for a name the request's Region already holds a trigger under, where
 /// the definition submitted is the stored one. NOT
 /// recorded: inferred from the recorded `CreateDatabase` duplicate, like
