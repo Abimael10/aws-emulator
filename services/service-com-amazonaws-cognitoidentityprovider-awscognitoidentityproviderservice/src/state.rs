@@ -1181,13 +1181,23 @@ pub const NO_SUCH_DOMAIN_MESSAGE: &str = "No such domain or user pool exists.";
 /// so it discloses nothing about the pool that does hold the domain.
 pub const DOMAIN_OF_OTHER_POOL_MESSAGE: &str = "The domain is not configured for this user pool.";
 
-/// The message `CreateUserPoolDomain` carries when the `Domain` the request asks
-/// for is one some pool already holds.
+/// The message `CreateUserPoolDomain` carries when the domain configuration the
+/// request would add is one the pool it NAMES already has — the same domain
+/// string again, or a second domain of the same kind.
 ///
-/// Fixed text in full, with no variable part: the refusal reports that the name
-/// is taken and names neither the domain nor the pool holding it, so it
-/// discloses nothing about a pool the caller may not own.
+/// Fixed text in full, with no variable part: the request already carries the
+/// `UserPoolId` and the `Domain` that collided, so the refusal repeats neither.
 pub const DOMAIN_EXISTS_MESSAGE: &str = "Domain already exists.";
+
+/// The message `CreateUserPoolDomain` carries when the `Domain` the request asks
+/// for is one ANOTHER user pool already holds.
+///
+/// A domain string resolves to one pool, so the name is not free — but it is the
+/// configuration of a pool the caller may not own. The sentence is fixed text in
+/// full: it reports only that the name is held elsewhere, and names neither the
+/// domain nor the pool holding it, so it discloses nothing about that pool.
+pub const DOMAIN_OF_ANOTHER_POOL_EXISTS_MESSAGE: &str =
+    "Domain already associated with another user pool.";
 
 // ---------------------------------------------------------------------------
 // User pool replicas
@@ -2714,6 +2724,18 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
 /// its `ManagedLoginBrandingId`, so the readers and the writers cannot disagree
 /// about what a missing style is.
 pub const BRANDING_NOT_FOUND_MESSAGE: &str = "ManagedLoginBranding does not exist.";
+
+/// The message a managed login branding request that asks for the
+/// service-managed default style AND supplies customizations of its own is
+/// refused with: "When you specify true for this option, you must also omit
+/// values for Settings and Assets in the request"
+/// (`UseCognitoProvidedValues`), so the two are mutually exclusive.
+///
+/// Fixed text in full, naming the members in the lowerCamelCase the service
+/// words this refusal in. Shared by every operation that takes the pair, so a
+/// create and an update cannot disagree about what the conflict is.
+pub const COGNITO_PROVIDED_VALUES_CONFLICT_MESSAGE: &str =
+    "useCognitoProvidedValues or settings should be specified (but not both)";
 
 /// AWS's refusal message for an app client that has no managed login branding
 /// style assigned, naming the app client from the request.

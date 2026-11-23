@@ -311,13 +311,12 @@ fn branding_exists(client_id: &str) -> CreateManagedLoginBrandingError {
 }
 
 /// This operation's `InvalidParameterException` for a request that asks for the
-/// Cognito-managed default style and supplies customizations as well.
+/// Cognito-managed default style and supplies customizations as well, carrying
+/// the one sentence the service words that conflict with
+/// ([`crate::state::COGNITO_PROVIDED_VALUES_CONFLICT_MESSAGE`]).
 fn cognito_provided_values_conflict() -> CreateManagedLoginBrandingError {
     CreateManagedLoginBrandingErrorModeled::InvalidParameterException(InvalidParameterException {
-        message: Some(
-            "Settings and Assets must be omitted when UseCognitoProvidedValues is true."
-                .to_string(),
-        ),
+        message: Some(crate::state::COGNITO_PROVIDED_VALUES_CONFLICT_MESSAGE.to_string()),
         reason_code: None,
     })
     .into()

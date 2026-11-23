@@ -280,12 +280,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A domain string resolves to one pool (`DescribeUserPoolDomain` takes
         // `Domain` alone), so a name any pool already holds is not free. This
         // spans the whole store, so it is checked before the pool this create
-        // writes to is borrowed mutably. The refusal is
-        // [`crate::state::DOMAIN_EXISTS_MESSAGE`]: it reports only that the name
-        // is taken, so it discloses nothing about a pool the caller may not own.
-        if guard.domain(&input.domain).is_some() {
+        // writes to is borrowed mutably. WHOSE configuration the name collides
+        // with is what the refusal reports: a name the pool this request names
+        // already holds is its own duplicate
+        // ([`crate::state::DOMAIN_EXISTS_MESSAGE`]), and a name another pool
+        // holds is [`crate::state::DOMAIN_OF_ANOTHER_POOL_EXISTS_MESSAGE`],
+        // which discloses nothing about a pool the caller may not own.
+        if let Some(stored) = guard.domain(&input.domain) {
             return Err(invalid_parameter(
-                crate::state::DOMAIN_EXISTS_MESSAGE.to_string(),
+                if stored.user_pool_id == input.user_pool_id {
+                    crate::state::DOMAIN_EXISTS_MESSAGE
+                } else {
+                    crate::state::DOMAIN_OF_ANOTHER_POOL_EXISTS_MESSAGE
+                }
+                .to_string(),
             ));
         }
 
@@ -320,19 +328,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `UserPoolType.Domain` and `UserPoolType.CustomDomain` are single
         // values, so a pool holds at most one prefix domain and at most one
-        // custom domain, and a second of either kind is refused.
+        // custom domain, and a second of either kind is refused. The pool's own
+        // configuration is what the name collides with, so this carries the same
+        // sentence as the same name asked for twice
+        // ([`crate::state::DOMAIN_EXISTS_MESSAGE`]).
         let occupied = if custom {
             pool.custom_domain.as_ref()
         } else {
             pool.domain.as_ref()
         };
-        if let Some(occupied) = occupied {
-            return Err(invalid_parameter(format!(
-                "User pool {} already has the {} domain {}.",
-                pool.id,
-                if custom { "custom" } else { "prefix" },
-                occupied.domain
-            )));
+        if occupied.is_some() {
+            return Err(invalid_parameter(
+                crate::state::DOMAIN_EXISTS_MESSAGE.to_string(),
+            ));
         }
 
         if custom {

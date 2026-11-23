@@ -349,9 +349,11 @@ fn missing_parameter(parameter: &str) -> UpdateManagedLoginBrandingError {
 }
 
 /// This operation's `InvalidParameterException` for a request that reverts the
-/// style to the service's defaults and supplies customizations as well.
+/// style to the service's defaults and supplies customizations as well, carrying
+/// the one sentence the service words that conflict with
+/// ([`crate::state::COGNITO_PROVIDED_VALUES_CONFLICT_MESSAGE`]).
 fn cognito_provided_values_conflict() -> UpdateManagedLoginBrandingError {
-    invalid_parameter("Settings and Assets must be omitted when UseCognitoProvidedValues is true.")
+    invalid_parameter(crate::state::COGNITO_PROVIDED_VALUES_CONFLICT_MESSAGE)
 }
 
 /// This operation's refusal of a request whose settings and image files exceed

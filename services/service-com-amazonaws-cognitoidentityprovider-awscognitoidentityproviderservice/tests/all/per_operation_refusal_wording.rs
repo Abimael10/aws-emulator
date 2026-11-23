@@ -57,8 +57,8 @@ const APP_CLIENT_NOT_FOUND: &str = "User pool client does not exist.";
 /// a stored pool and a domain name another stored pool holds.
 const DOMAIN_OF_OTHER_POOL: &str = "The domain is not configured for this user pool.";
 
-/// The sentence `CreateUserPoolDomain` answers for a name some pool already holds.
-const DOMAIN_EXISTS: &str = "Domain already exists.";
+/// The sentence `CreateUserPoolDomain` answers for a name ANOTHER pool holds.
+const DOMAIN_OF_ANOTHER_POOL_EXISTS: &str = "Domain already associated with another user pool.";
 
 /// The sentence `DeleteUserPoolDomain` answers for a pair that resolves nothing.
 const NO_SUCH_DOMAIN: &str = "No such domain or user pool exists.";
@@ -501,11 +501,11 @@ async fn a_domain_of_another_pool_is_a_parameter_mismatch_not_a_missing_resource
         // (what the claimant asks, the refusal it owes)
         let rows: &[(&str, &str, Value, &str, &str)] = &[
             (
-                "taking a name a pool already holds",
+                "taking a name another pool already holds",
                 "CreateUserPoolDomain",
                 json!({ "UserPoolId": claimant, "Domain": domain }),
                 "InvalidParameterException",
-                DOMAIN_EXISTS,
+                DOMAIN_OF_ANOTHER_POOL_EXISTS,
             ),
             (
                 "removing a name another pool holds",

@@ -710,14 +710,18 @@ async fn a_schema_attribute_name_already_declared_is_refused_with_the_structured
 }
 
 // ---------------------------------------------------------------------------
-// A domain another pool already holds
+// A domain the asking pool, or another pool, already holds
 // ---------------------------------------------------------------------------
 
-/// The one sentence the refusal of an already-taken domain carries.
-const DOMAIN_ALREADY_ASSOCIATED: &str = "Domain already exists.";
+/// The one sentence the refusal of a domain ANOTHER user pool holds carries.
+const DOMAIN_OF_ANOTHER_POOL: &str = "Domain already associated with another user pool.";
+
+/// The one sentence the refusal of a domain the pool the request NAMES already
+/// has carries — the same name again, or a second domain of the same kind.
+const DOMAIN_ALREADY_EXISTS: &str = "Domain already exists.";
 
 #[tokio::test]
-async fn a_domain_another_pool_holds_is_refused_without_naming_that_pool() {
+async fn a_taken_domain_is_refused_with_the_sentence_for_whose_configuration_it_is() {
     let router = router();
 
     // The domains span what `DomainType` admits (length 1..63, pattern
@@ -733,7 +737,7 @@ async fn a_domain_another_pool_holds_is_refused_without_naming_that_pool() {
         ("a hyphenated prefix", "login-2-example".to_string()),
     ];
 
-    for (index, (case, domain)) in domains.iter().enumerate() {
+    for (index, (domain_case, domain)) in domains.iter().enumerate() {
         let holder = pool(&router, &format!("domain-holder-{index}"), json!({})).await;
         let claimant = pool(&router, &format!("domain-claimant-{index}"), json!({})).await;
         ok(
@@ -743,42 +747,71 @@ async fn a_domain_another_pool_holds_is_refused_without_naming_that_pool() {
         )
         .await;
 
-        let (status, payload) = call(
-            &router,
-            "CreateUserPoolDomain",
-            &json!({ "UserPoolId": claimant, "Domain": domain }),
-        )
-        .await;
-        assert_eq!(
-            (status, error_code(&payload)),
-            (400, "InvalidParameterException"),
-            "case {case:?}: expected a 400 InvalidParameterException, got {status} with {payload}"
-        );
-        let message = error_message(&payload);
-        assert_eq!(
-            message, DOMAIN_ALREADY_ASSOCIATED,
-            "case {case:?}: expected {DOMAIN_ALREADY_ASSOCIATED:?}, got {message:?}"
-        );
-        // The fixed text above is what proves the sentence interpolates
-        // nothing; these name the values it must not disclose. A domain of one
-        // or two characters can occur inside an ordinary English word, so the
-        // substring check is made for the rows whose domain cannot.
-        let mut forbidden = vec![
-            ("the pool holding it", holder.as_str()),
-            ("the pool that asked", claimant.as_str()),
+        // The rows differ along WHOSE domain configuration the requested name
+        // collides with: another pool's, or the asking pool's own — by the same
+        // name again, or by a second prefix domain of a different name.
+        let second = format!("second-prefix-{index}");
+        let rows: &[(&str, &str, &str, &str)] = &[
+            (
+                "another pool asking for a name this one holds",
+                claimant.as_str(),
+                domain.as_str(),
+                DOMAIN_OF_ANOTHER_POOL,
+            ),
+            (
+                "the holding pool asking for the same name again",
+                holder.as_str(),
+                domain.as_str(),
+                DOMAIN_ALREADY_EXISTS,
+            ),
+            (
+                "the holding pool asking for a second prefix domain",
+                holder.as_str(),
+                second.as_str(),
+                DOMAIN_ALREADY_EXISTS,
+            ),
         ];
-        if domain.len() > 3 {
-            forbidden.push(("the domain", domain.as_str()));
-        }
-        for (what, value) in forbidden {
-            assert!(
-                !message.contains(value),
-                "case {case:?}: the refusal must not name {what} ({value:?}), got {message:?}"
+
+        for (row, asking_pool, asked_domain, expected) in rows {
+            let case = format!("{domain_case}: {row}");
+            let (status, payload) = call(
+                &router,
+                "CreateUserPoolDomain",
+                &json!({ "UserPoolId": asking_pool, "Domain": asked_domain }),
+            )
+            .await;
+            assert_eq!(
+                (status, error_code(&payload)),
+                (400, "InvalidParameterException"),
+                "case {case:?}: expected a 400 InvalidParameterException, got {status} with \
+                 {payload}"
             );
+            let message = error_message(&payload);
+            assert_eq!(
+                message, *expected,
+                "case {case:?}: expected {expected:?}, got {message:?}"
+            );
+            // The fixed text above is what proves the sentence interpolates
+            // nothing; these name the values it must not disclose. A domain of
+            // one or two characters can occur inside an ordinary English word,
+            // so the substring check is made for the rows whose domain cannot.
+            let mut forbidden = vec![
+                ("the pool holding it", holder.as_str()),
+                ("the pool that asked", claimant.as_str()),
+            ];
+            if asked_domain.len() > 3 {
+                forbidden.push(("the domain", asked_domain));
+            }
+            for (what, value) in forbidden {
+                assert!(
+                    !message.contains(value),
+                    "case {case:?}: the refusal must not name {what} ({value:?}), got {message:?}"
+                );
+            }
         }
 
-        // The domain still belongs to the pool that took it: the refusal moved
-        // nothing.
+        // The domain still belongs to the pool that took it, and no refused
+        // request claimed a name: the refusals stored nothing.
         let read = ok(
             &router,
             "DescribeUserPoolDomain",
@@ -788,8 +821,23 @@ async fn a_domain_another_pool_holds_is_refused_without_naming_that_pool() {
         assert_eq!(
             read["DomainDescription"]["UserPoolId"],
             json!(holder),
-            "case {case:?}: the stored domain must still belong to the pool that took it, got \
-             {read}"
+            "case {domain_case:?}: the stored domain must still belong to the pool that took it, \
+             got {read}"
+        );
+        // A refused create claimed no name: the second prefix the holder asked
+        // for is stored nowhere, which this reader reports by binding no member
+        // of the description.
+        let unclaimed = ok(
+            &router,
+            "DescribeUserPoolDomain",
+            &json!({ "Domain": second }),
+        )
+        .await;
+        assert_eq!(
+            unclaimed["DomainDescription"].get("Domain"),
+            None,
+            "case {domain_case:?}: the refused second prefix must be stored nowhere, got \
+             {unclaimed}"
         );
     }
 }

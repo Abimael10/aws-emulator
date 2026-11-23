@@ -756,8 +756,7 @@ async fn an_update_outside_the_rules_is_refused_and_changes_nothing() {
             "a revert to the service's defaults that supplies settings as well",
             400,
             "InvalidParameterException",
-            "Settings and Assets must be omitted when UseCognitoProvidedValues is true."
-                .to_string(),
+            "useCognitoProvidedValues or settings should be specified (but not both)".to_string(),
             json!({
                 "UserPoolId": user_pool_id,
                 "ManagedLoginBrandingId": branding_id,
@@ -769,8 +768,7 @@ async fn an_update_outside_the_rules_is_refused_and_changes_nothing() {
             "a revert to the service's defaults that supplies an image file as well",
             400,
             "InvalidParameterException",
-            "Settings and Assets must be omitted when UseCognitoProvidedValues is true."
-                .to_string(),
+            "useCognitoProvidedValues or settings should be specified (but not both)".to_string(),
             json!({
                 "UserPoolId": user_pool_id,
                 "ManagedLoginBrandingId": branding_id,
