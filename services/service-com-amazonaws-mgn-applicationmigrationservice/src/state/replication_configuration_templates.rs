@@ -139,6 +139,20 @@ impl ComAmazonawsMgnApplicationmigrationserviceState {
             .filter(|template| template.account_id == account_id)
     }
 
+    /// Mutable access to the template `template_id` names within `account_id`, or
+    /// `None` — a template of another account is no more writable from this one than it
+    /// is readable, so the account key is required here exactly as it is on the read
+    /// accessor above.
+    pub fn replication_configuration_template_of_mut(
+        &mut self,
+        account_id: &str,
+        template_id: &str,
+    ) -> Option<&mut ReplicationConfigurationTemplate> {
+        self.replication_configuration_templates
+            .get_mut(template_id)
+            .filter(|template| template.account_id == account_id)
+    }
+
     /// A fresh `replicationConfigurationTemplateID` no stored template holds.
     pub fn mint_replication_configuration_template_id(&self) -> String {
         loop {

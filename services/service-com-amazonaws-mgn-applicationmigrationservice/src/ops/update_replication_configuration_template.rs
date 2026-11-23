@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateReplicationConfigurationTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateReplicationConfigurationTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mutates the stored replication configuration template the request's
+//! `replicationConfigurationTemplateID` names — only the settings the request carries —
+//! and answers the whole updated record, the same record
+//! `DescribeReplicationConfigurationTemplates` reports afterwards.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateReplicationConfigurationTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A setting the request OMITS keeps the value the template already holds, so an update
+//! is a patch rather than a replacement; `bandwidthThrottling` carries the model's
+//! `@default` of 0, so it arrives on every request and is always applied.
+//!
+//! `tags` is not a member of this request: a template's tags are maintained through
+//! `TagResource` / `UntagResource`, so this operation reports the tags the record holds
+//! and changes none of them. The request's `arn` member is not applied either — a
+//! template's ARN is derived from the id the service minted for it at create time, so it
+//! is an identity of the record rather than one of its settings.
+//!
+//! The checks run in the order the service decides them, each one ahead of anything
+//! being written: the caller's IAM authorization (`crate::service::authorization`, the
+//! modelled `AccessDeniedException` (403), judged against the template ARN the request's
+//! own id names), then the account-initialization gate (`UninitializedAccountException`
+//! (400), since mgn is account-scoped), then the lookup of the template itself
+//! (`ResourceNotFoundException` (404) for an id the account holds no record of).
 //!
 //! ## Shape of an operation
 //!
@@ -152,13 +164,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-mgn-applicationmigratio
 // here — hence the `UpdateReplicationConfigurationTemplateError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mgn#UpdateReplicationConfigurationTemplate")]
+// `extra_errors` widens the accepted set with a shape the SERVICE models but this
+// operation does not list: `InternalServerException` (HTTP 500) is the only honest
+// answer when the engine carries no store for this service.
+#[smithy_macros::operation_error(
+    "com.amazonaws.mgn#UpdateReplicationConfigurationTemplate",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum UpdateReplicationConfigurationTemplateErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ResourceNotFoundException(ResourceNotFoundException),
     UninitializedAccountException(UninitializedAccountException),
     ValidationException(ValidationException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -212,18 +231,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateReplicationConfigurationTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateReplicationConfigurationTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateReplicationConfigurationTemplate"))
+        // IAM decides authorization ahead of this service's own state, so it is decided
+        // first, against the template ARN the request's own id names: an identity whose
+        // policies do not allow this action is refused rather than told whether that
+        // template exists, and nothing is written for it.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::replication_configuration_template_arn(
+                &crate::state::request_region(ctx.parts()),
+                &input.replication_configuration_template_id,
+            ),
+        )
+        .map_err(UpdateReplicationConfigurationTemplateErrorModeled::AccessDeniedException)?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateReplicationConfigurationTemplateErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+        // This operation carries no `accountID` member, so it updates only the templates
+        // of the account the request was signed for.
+        let account = crate::state::account_key(None);
+        let template_id = input.replication_configuration_template_id.clone();
+        let mut store = state.lock();
+
+        // The account gate is evaluated ahead of the per-resource lookup, so an
+        // uninitialized account is told so even for an id nothing holds.
+        if !store.is_initialized(&account) {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &account,
+                &template_id,
+                "refused: UninitializedAccountException",
+            );
+            return Err(
+                UpdateReplicationConfigurationTemplateErrorModeled::UninitializedAccountException(
+                    crate::state::uninitialized_account(),
+                )
+                .into(),
+            );
+        }
+
+        let Some(template) = store.replication_configuration_template_of_mut(&account, &template_id)
+        else {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &account,
+                &template_id,
+                "refused: ResourceNotFoundException",
+            );
+            return Err(
+                UpdateReplicationConfigurationTemplateErrorModeled::ResourceNotFoundException(
+                    crate::state::replication_configuration_template_not_found(&template_id),
+                )
+                .into(),
+            );
+        };
+
+        // Every setting the request CARRIES replaces the stored one; every setting it
+        // OMITS keeps the value the template already holds, so a request naming only the
+        // id leaves the record as it was. `bandwidthThrottling` is the one exception the
+        // MODEL makes: it carries a `@default` of 0, so the member is always present on
+        // the deserialized request and is always applied.
+        if let Some(staging_area_subnet_id) = input.staging_area_subnet_id {
+            template.staging_area_subnet_id = Some(staging_area_subnet_id);
+        }
+        if let Some(associate_default_security_group) = input.associate_default_security_group {
+            template.associate_default_security_group = Some(associate_default_security_group);
+        }
+        if let Some(security_groups) = input.replication_servers_security_groups_i_ds {
+            template.replication_servers_security_groups_ids = security_groups;
+        }
+        if let Some(replication_server_instance_type) = input.replication_server_instance_type {
+            template.replication_server_instance_type = Some(replication_server_instance_type);
+        }
+        if let Some(use_dedicated_replication_server) = input.use_dedicated_replication_server {
+            template.use_dedicated_replication_server = Some(use_dedicated_replication_server);
+        }
+        if let Some(default_large_staging_disk_type) = input.default_large_staging_disk_type {
+            template.default_large_staging_disk_type = Some(default_large_staging_disk_type);
+        }
+        if let Some(ebs_encryption) = input.ebs_encryption {
+            template.ebs_encryption = Some(ebs_encryption);
+        }
+        if let Some(ebs_encryption_key_arn) = input.ebs_encryption_key_arn {
+            template.ebs_encryption_key_arn = Some(ebs_encryption_key_arn);
+        }
+        template.bandwidth_throttling = input.bandwidth_throttling;
+        if let Some(data_plane_routing) = input.data_plane_routing {
+            template.data_plane_routing = Some(data_plane_routing);
+        }
+        if let Some(create_public_ip) = input.create_public_ip {
+            template.create_public_ip = Some(create_public_ip);
+        }
+        if let Some(staging_area_tags) = input.staging_area_tags {
+            // Stored sorted, exactly as the create stores them, so the entries a read
+            // reports are in one stable order.
+            template.staging_area_tags = staging_area_tags.into_iter().collect();
+        }
+        if let Some(use_fips_endpoint) = input.use_fips_endpoint {
+            template.use_fips_endpoint = Some(use_fips_endpoint);
+        }
+        if let Some(internet_protocol) = input.internet_protocol {
+            template.internet_protocol = Some(internet_protocol);
+        }
+        if let Some(store_snapshot_on_local_zone) = input.store_snapshot_on_local_zone {
+            template.store_snapshot_on_local_zone = Some(store_snapshot_on_local_zone);
+        }
+        if let Some(storage_configuration) = input.storage_configuration {
+            template.storage_configuration = Some(storage_configuration);
+        }
+
+        // The stored record, member for member: what this update left is what a later
+        // read reports.
+        let updated = template.to_shape();
+        crate::state::audit(ctx.parts(), Self::NAME, &account, &template_id, "updated");
+        Ok(UpdateReplicationConfigurationTemplateOutput {
+            replication_configuration_template_id: updated.replication_configuration_template_id,
+            arn: updated.arn,
+            staging_area_subnet_id: updated.staging_area_subnet_id,
+            associate_default_security_group: updated.associate_default_security_group,
+            replication_servers_security_groups_i_ds: updated
+                .replication_servers_security_groups_i_ds,
+            replication_server_instance_type: updated.replication_server_instance_type,
+            use_dedicated_replication_server: updated.use_dedicated_replication_server,
+            default_large_staging_disk_type: updated.default_large_staging_disk_type,
+            ebs_encryption: updated.ebs_encryption,
+            ebs_encryption_key_arn: updated.ebs_encryption_key_arn,
+            bandwidth_throttling: updated.bandwidth_throttling,
+            data_plane_routing: updated.data_plane_routing,
+            create_public_ip: updated.create_public_ip,
+            staging_area_tags: updated.staging_area_tags,
+            use_fips_endpoint: updated.use_fips_endpoint,
+            tags: updated.tags,
+            internet_protocol: updated.internet_protocol,
+            store_snapshot_on_local_zone: updated.store_snapshot_on_local_zone,
+            storage_configuration: updated.storage_configuration,
+        })
     }
 }

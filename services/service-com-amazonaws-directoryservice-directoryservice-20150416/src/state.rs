@@ -88,8 +88,8 @@ pub mod ca_enrollment_policy;
 /// two modelled absences that resolution reports. Re-exported below, so both operations
 /// reach one decision as `crate::state::<name>`.
 mod certificate_lookup;
-/// The teardown `DeleteDirectory` performs, which is complete when the delete answers.
-/// Re-exported below, so what it hands back is reached as `crate::state::<name>`.
+/// The teardown `DeleteDirectory` starts, which the clock finishes. Re-exported below, so
+/// what it hands back is reached as `crate::state::<name>`.
 mod directory_deletion;
 pub mod directory_network;
 pub mod directory_servers;
