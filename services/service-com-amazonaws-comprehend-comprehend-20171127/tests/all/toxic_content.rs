@@ -9,7 +9,8 @@
 //! `single_document_conventions.rs`), and its `Toxicity` the confidence that the
 //! string carries toxic content of any type — so a string the engine places nothing
 //! in scores strictly below one it does. A type the engine PLACED content of is one
-//! whose entry scores above zero, which is what the helpers below read.
+//! whose entry clears the placement floor below, the rest of the vector carrying the
+//! weak material the string touches on and the residual a finite reading leaves.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_comprehend_comprehend_20171127::ops::types::{
@@ -111,10 +112,22 @@ fn request(texts: &[&str]) -> Value {
     })
 }
 
+/// What a reported `Score` has to clear to be a PLACEMENT rather than the weak
+/// material a segment merely touches on and the residual confidence a finite reading
+/// of it leaves.
+///
+/// A tenth of the scale: below the weakest single placement the analysers weigh (a
+/// mild reading, a sixth of the scale) and orders above what a segment nothing was
+/// placed in keeps. Shared with the other suites that read the per-type score vector
+/// (`toxic_content_conduct`, `single_document_conventions`, `zz_probe`), so the
+/// threshold they gate on is stated once.
+pub(crate) const PLACEMENT_FLOOR: f64 = 0.1;
+
 /// Every `(Name, Score)` pair of one `ResultList` entry the analysers PLACED content
-/// of: the entries of the per-type score vector scoring above zero. The vector
-/// carries every modelled type whatever the string says, so "placed" is a non-zero
-/// score rather than a present member.
+/// of: the entries of the per-type score vector scoring above [`PLACEMENT_FLOOR`].
+/// The vector carries every modelled type whatever the string says, each with a
+/// confidence of its own, so "placed" is a score that clears that floor rather than a
+/// present member.
 fn labels_of(case: &str, entry: &Value) -> Vec<(String, f64)> {
     entry["Labels"]
         .as_array()
@@ -130,7 +143,7 @@ fn labels_of(case: &str, entry: &Value) -> Vec<(String, f64)> {
                 .unwrap_or_else(|| panic!("case {case:?}: expected Labels[].Score, got {label}"));
             (name, score)
         })
-        .filter(|(_, score)| *score > 0.0)
+        .filter(|(_, score)| *score > PLACEMENT_FLOOR)
         .collect()
 }
 
@@ -166,9 +179,27 @@ async fn every_result_entry_is_a_well_formed_toxicity_verdict_for_its_string() {
         let labels = labels_of(case, &results[0]);
         let toxicity = toxicity_of(case, &results[0]);
 
+        // The vector carries EVERY modelled type, each with a confidence of its own:
+        // the analysers read a finite string, so a type they placed nothing of is
+        // reported as a negligible possibility rather than as a certainty no analysis
+        // produced.
+        let vector = results[0]["Labels"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for label in &vector {
+            let score = label["Score"].as_f64().unwrap_or(f64::NAN);
+            assert!(
+                score > 0.0 && score <= 1.0,
+                "case {case:?}: expected a Score strictly inside (0, 1] for {}, got \
+                 {score}",
+                label["Name"]
+            );
+        }
+
         // Every placed name is a modelled `ToxicContentType`, reported at most once,
-        // with a confidence in (0, 1] — a type the engine placed nothing of scores
-        // zero in the vector, which the helper above leaves out.
+        // with a confidence in (0, 1] — a type the engine placed nothing of stays
+        // below the placement floor, which the helper above leaves out.
         let mut seen: Vec<&str> = Vec::new();
         for (name, score) in &labels {
             assert!(
@@ -192,13 +223,22 @@ async fn every_result_entry_is_a_well_formed_toxicity_verdict_for_its_string() {
         );
 
         // `Toxicity` is the confidence that the string carries toxic content of ANY
-        // type: the complement of the product of the per-type complements.
-        let expected_toxicity =
-            1.0 - labels.iter().map(|(_, score)| 1.0 - score).product::<f64>();
+        // type: every placement is independent evidence for it, so it is at least as
+        // large as the strongest single type and never larger than the whole vector
+        // combined.
+        let strongest = vector
+            .iter()
+            .map(|label| label["Score"].as_f64().unwrap_or(f64::NAN))
+            .fold(0.0f64, f64::max);
+        let combined = 1.0
+            - vector
+                .iter()
+                .map(|label| 1.0 - label["Score"].as_f64().unwrap_or(f64::NAN))
+                .product::<f64>();
         assert!(
-            (toxicity - expected_toxicity).abs() < 1e-6,
-            "case {case:?}: expected Toxicity {expected_toxicity} from the labels \
-             {labels:?}, got {toxicity}"
+            toxicity + 1e-6 >= strongest && toxicity <= combined + 1e-6,
+            "case {case:?}: expected a Toxicity between the strongest type {strongest} \
+             and the combined vector {combined}, got {toxicity}"
         );
 
         if let Some(expected_label) = expected_label {
@@ -209,16 +249,22 @@ async fn every_result_entry_is_a_well_formed_toxicity_verdict_for_its_string() {
         }
 
         // A string the engine places content in carries at least one label and a
-        // toxicity above zero; one it places nothing in carries neither.
+        // toxicity a moderation gate acts on; one it places nothing in carries
+        // neither, and keeps only the residual a finite reading leaves.
         assert_eq!(
             !labels.is_empty(),
             *toxic,
             "case {case:?}: expected toxic={toxic}, got labels {labels:?}"
         );
         assert_eq!(
-            toxicity > 0.0,
+            toxicity > PLACEMENT_FLOOR,
             *toxic,
             "case {case:?}: expected toxic={toxic}, got Toxicity {toxicity}"
+        );
+        assert!(
+            toxicity > 0.0,
+            "case {case:?}: the analysers read a finite string, so Toxicity is never a \
+             flat zero, got {toxicity}"
         );
     }
 }
@@ -252,15 +298,16 @@ async fn a_string_the_engine_places_toxic_content_in_scores_above_one_it_does_no
             let benign_entry = &benign_output["ResultList"][0];
             let benign_score = toxicity_of(benign_case, benign_entry);
 
-            assert_eq!(
-                benign_score, 0.0,
+            assert!(
+                benign_score > 0.0 && benign_score < PLACEMENT_FLOOR,
                 "case {benign_case:?}: the engine places no toxic content, so the \
-                 Toxicity is zero, got {benign_score} with {benign_entry}"
+                 Toxicity is the residual a finite reading leaves — inside \
+                 (0, {PLACEMENT_FLOOR}) — got {benign_score} with {benign_entry}"
             );
             assert!(
                 labels_of(benign_case, benign_entry).is_empty(),
                 "case {benign_case:?}: the engine places no toxic content, so no type \
-                 may score above zero, got {benign_entry}"
+                 may clear the placement floor, got {benign_entry}"
             );
             assert!(
                 toxic_score > benign_score,
@@ -306,6 +353,141 @@ async fn one_call_scores_each_of_its_strings_independently_and_in_order() {
             );
         }
     }
+}
+
+/// A segment the analysers placed nothing in is not a segment proved to carry
+/// nothing: `ToxicContent$Score` is "model confidence in the detected content type"
+/// and `ToxicLabels$Toxicity` the "overall toxicity score for the string", and a model
+/// reading a finite string answers neither with a certainty — so every content type
+/// keeps the room that reading leaves, and a client that normalises by `Toxicity`
+/// never divides by zero.
+///
+/// The rows differ along what the rule generalises over: how much benign material the
+/// segment carries (one word, a clause, a paragraph) — what is left open follows the
+/// material read — and whether the segment merely TOUCHES ON a category's vocabulary
+/// without carrying its conduct, which is evidence about the segment and still not a
+/// placement.
+#[tokio::test]
+async fn a_category_nothing_was_placed_of_keeps_the_room_the_reading_leaves() {
+    let comprehend = Comprehend::new();
+
+    let rows = [
+        ("one benign word", "Attached."),
+        (
+            "a benign clause",
+            "The quarterly report is attached for review.",
+        ),
+        (
+            "a benign paragraph",
+            "The quarterly report is attached for review, and the investor relations \
+             page carries the same figures beside the filing from the previous quarter \
+             for anyone who wants to compare them line by line.",
+        ),
+    ];
+
+    let mut residual_of: Vec<(&str, f64)> = Vec::new();
+    for (case, text) in rows {
+        let output = comprehend.ok("DetectToxicContent", &request(&[text])).await;
+        let entry = &output["ResultList"][0];
+        let vector: Vec<f64> = entry["Labels"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a Labels array, got {output}"))
+            .iter()
+            .map(|label| label["Score"].as_f64().unwrap_or(f64::NAN))
+            .collect();
+
+        for score in &vector {
+            assert!(
+                *score > 0.0 && *score < PLACEMENT_FLOOR,
+                "case {case:?}: nothing was placed in the segment, so every content type \
+                 keeps only the room a finite reading leaves — inside \
+                 (0, {PLACEMENT_FLOOR}) — got {vector:?}"
+            );
+        }
+        let toxicity = toxicity_of(case, entry);
+        assert!(
+            toxicity > 0.0 && toxicity < PLACEMENT_FLOOR,
+            "case {case:?}: expected a Toxicity inside (0, {PLACEMENT_FLOOR}), got \
+             {toxicity}"
+        );
+        residual_of.push((case, toxicity));
+    }
+
+    // The more of the segment the analysers read without placing anything, the less
+    // room is left for the hypothesis that it carries something.
+    for pair in residual_of.windows(2) {
+        let (longer_case, longer) = pair[1];
+        let (shorter_case, shorter) = pair[0];
+        assert!(
+            longer < shorter,
+            "case {longer_case:?} vs {shorter_case:?}: expected the longer benign \
+             segment to leave less room, got {longer} against {shorter}"
+        );
+    }
+
+    // Material that bears on a category without carrying its conduct raises that
+    // category above the room a segment with none of it leaves, and still falls short
+    // of a placement: `break` in `break the build` is not a threat.
+    let touched = comprehend
+        .ok(
+            "DetectToxicContent",
+            &request(&["The migration will break the build if it lands today."]),
+        )
+        .await;
+    let score_of = |output: &Value, wanted: &str| -> f64 {
+        output["ResultList"][0]["Labels"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .find(|label| label["Name"].as_str() == Some(wanted))
+            .and_then(|label| label["Score"].as_f64())
+            .unwrap_or_else(|| panic!("no {wanted} label in {output}"))
+    };
+    let threat = score_of(&touched, "VIOLENCE_OR_THREAT");
+    let untouched = score_of(&touched, "SEXUAL");
+    assert!(
+        threat > untouched,
+        "expected the category whose vocabulary the segment uses to score above one it \
+         does not touch on at all, got {threat} against {untouched}"
+    );
+    assert!(
+        threat < PLACEMENT_FLOOR,
+        "expected vocabulary without the conduct its rules read to fall short of a \
+         placement, got {threat}"
+    );
+
+    // However MUCH of that vocabulary a benign segment happens to carry, weak material
+    // is capped: a client gating a category on the placement floor must not see it fire
+    // on an ordinary engineering or medical sentence.
+    let crowded = comprehend
+        .ok(
+            "DetectToxicContent",
+            &request(&[
+                "The migration will break the build, the garbage collector will attack \
+                 the heap, and nobody will harm the release.",
+            ]),
+        )
+        .await;
+    for label in crowded["ResultList"][0]["Labels"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+    {
+        let score = label["Score"].as_f64().unwrap_or(f64::NAN);
+        assert!(
+            score > 0.0 && score < PLACEMENT_FLOOR,
+            "case \"five vocabulary words and no conduct\": expected every type below \
+             the placement floor, got {score} for {}",
+            label["Name"]
+        );
+    }
+    let overall = toxicity_of("five vocabulary words and no conduct", &crowded["ResultList"][0]);
+    assert!(
+        overall > 0.0 && overall < PLACEMENT_FLOOR,
+        "case \"five vocabulary words and no conduct\": expected a Toxicity inside \
+         (0, {PLACEMENT_FLOOR}), got {overall}"
+    );
 }
 
 #[tokio::test]

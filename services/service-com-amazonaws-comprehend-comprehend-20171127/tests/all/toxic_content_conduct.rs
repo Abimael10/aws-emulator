@@ -16,12 +16,14 @@
 //! Value range is zero to one, where one is the highest confidence"
 //! (`smithy_query(query="shape",shape="ToxicLabels")`), so a moderation client's
 //! customary 0.5 gate is a class boundary over that range: a segment carrying an
-//! explicit threat sits above it, a benign one at zero.
+//! explicit threat sits above it, a benign one at the residual a finite reading
+//! leaves.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_comprehend_comprehend_20171127::ops::types::TOXIC_CONTENT_TYPE_VALUES;
 
 use crate::comprehend_client::Comprehend;
+use crate::toxic_content::PLACEMENT_FLOOR;
 
 /// The gate a moderation client reads `Toxicity` against: the midpoint of the
 /// modelled zero-to-one range, which is the class boundary between a segment that
@@ -153,9 +155,10 @@ fn request(texts: &[&str]) -> Value {
 }
 
 /// The `(Name, Score)` pairs of the first `ResultList` entry the analysers PLACED
-/// content of: the entries of the per-type score vector scoring above zero. The
-/// vector carries every modelled type whatever the segment says, so "placed" is a
-/// non-zero score rather than a present member.
+/// content of: the entries of the per-type score vector clearing
+/// [`PLACEMENT_FLOOR`], the threshold `toxic_content.rs` owns. The vector carries
+/// every modelled type whatever the segment says, each with a confidence of its own,
+/// so "placed" is a score that clears that floor rather than a present member.
 fn labels(case: &str, output: &Value) -> Vec<(String, f64)> {
     output["ResultList"][0]["Labels"]
         .as_array()
@@ -167,7 +170,7 @@ fn labels(case: &str, output: &Value) -> Vec<(String, f64)> {
                 label["Score"].as_f64().unwrap_or(f64::NAN),
             )
         })
-        .filter(|(_, score)| *score > 0.0)
+        .filter(|(_, score)| *score > PLACEMENT_FLOOR)
         .collect()
 }
 
@@ -238,10 +241,16 @@ async fn each_published_form_places_its_own_content_type() {
             row.case
         );
         assert_eq!(
-            overall > 0.0,
+            overall > PLACEMENT_FLOOR,
             !placed.is_empty(),
-            "case {:?}: a segment nothing was placed in scores zero and carries no label, \
-             got {overall} with {placed:?}",
+            "case {:?}: a segment nothing was placed in keeps only the residual a finite \
+             reading leaves and carries no label, got {overall} with {placed:?}",
+            row.case
+        );
+        assert!(
+            overall > 0.0,
+            "case {:?}: the analysers read a finite segment, so Toxicity is never a flat \
+             zero, got {overall}",
             row.case
         );
     }

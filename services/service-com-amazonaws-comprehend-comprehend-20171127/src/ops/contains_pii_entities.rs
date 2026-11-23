@@ -15,10 +15,15 @@
 //! verdict nothing computed.
 //!
 //! [`detect_pii_spans`] is that recognizer, and it is the ONE place the entity rules
-//! live. It returns the spans (type, confidence, begin/end offset) so the
-//! `DetectPiiEntities` operation projects the same spans into `PiiEntity` values and
-//! agrees with this operation by construction. `ContainsPiiEntities` projects them
-//! into the distinct set of types.
+//! live. The kinds with no closed form of their own — a personal name, the place name
+//! an address is written with — come from the service's own recogniser of what a
+//! document names (`crate::ops::detect_entities::pii_bearing_spans`), so this family
+//! and `DetectEntities` cannot disagree. Each span carries the confidence ITS OWN
+//! evidence leaves, never a constant of the rule class that found it, and this
+//! operation combines the spans of one type into the confidence that the document
+//! CONTAINS that type ([`labels_of`]), which is the detection its `Labels` are about.
+//! `DetectPiiEntities` projects the same spans into `PiiEntity` values, so the two
+//! operations agree by construction.
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +92,7 @@ use std::time::Duration;
 
 use regex::Regex;
 
+use crate::ops::detect_entities::Reading;
 use crate::state::{
     enum_value_set_refusal, text_size_refusal, LANGUAGE_CODE_PATH, PII_TEXT_QUOTA_BYTES,
 };
@@ -122,16 +128,14 @@ const MAX_TEXT_BYTES: usize = PII_TEXT_QUOTA_BYTES;
 /// [`MAX_MATCHES_PER_RULE`] caps what any one rule collects from the rest.
 const RECOGNITION_TIME_BUDGET: Duration = Duration::from_secs(5);
 
-/// How a rule established that a matched value is PII, and therefore how much
-/// confidence the match carries.
+/// How a rule established that a matched value is PII, and so what ONE CHARACTER of
+/// the value it matched weighs for the reading.
 ///
-/// The three classes are this emulator's own calibration — AWS publishes no score
-/// for a rule, because its detector is a model, not a rule set — but they are
-/// EVIDENCE classes, not decoration: which class a label comes back with says what
-/// the recognizer actually verified about the value it found. A returned `Score` is
-/// therefore the CONSTANT of the evidence class that found the value, not a
-/// per-match probability: a client can read it as "how the recognizer knows", and
-/// two values found the same way carry the same score.
+/// The classes are what the recognizer VERIFIED about the value it found; the
+/// confidence a detection is reported with is not read off the class, it is tallied
+/// from the detection itself ([`PiiEvidence`]) — the characters the rule accounted
+/// for, the document's own label beside them, and the further writings of the same
+/// value the document carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Evidence {
     /// The value carries its own check and that check passed: a checksum the
@@ -149,14 +153,105 @@ pub enum Evidence {
 }
 
 impl Evidence {
-    /// The confidence a match of this evidence class carries, in (0, 1].
-    pub fn score(self) -> f32 {
+    /// What one character of the matched value weighs FOR the reading.
+    ///
+    /// A character a published check digit confirms is the strongest reading this
+    /// recognizer has: the value says of itself that it is one of its kind. A
+    /// character a distinctive form fixes says the same thing without the
+    /// confirmation. A character of a value whose own form is ambiguous says little —
+    /// what admits such a value is the label the document writes beside it
+    /// ([`EVIDENCE_PER_LABEL_CHAR`]), not the value.
+    fn per_value_char(self) -> f64 {
         match self {
-            Self::Validated => 0.99,
-            Self::Format => 0.90,
-            Self::Context => 0.75,
+            Self::Validated => EVIDENCE_PER_VERIFIED_CHAR,
+            Self::Format => EVIDENCE_PER_FORM_CHAR,
+            Self::Context => EVIDENCE_PER_LABELLED_CHAR,
         }
     }
+
+    /// What one character of the matched value weighs AGAINST the reading: the
+    /// competing reading in which the characters are a value of another kind
+    /// altogether.
+    ///
+    /// Open only for a value whose own form is ambiguous — a short digit run, a word
+    /// — which is exactly the value a check digit or a distinctive form closes that
+    /// reading off for.
+    fn competing_per_value_char(self) -> f64 {
+        match self {
+            Self::Validated | Self::Format => 0.0,
+            Self::Context => READING_ANOTHER_VALUE_PER_CHAR,
+        }
+    }
+}
+
+/// Evidence one character of a value a published check confirmed holds: a Luhn digit,
+/// an ISO 13616 mod-97 check, an ISO 3779 check digit, an ABA checksum, an NHS mod-11
+/// check or a successful parse by a standard parser. The longer the confirmed value,
+/// the less likely the match is a coincidence, so the evidence is weighed over the
+/// value's characters rather than fixed per rule.
+const EVIDENCE_PER_VERIFIED_CHAR: f64 = 1.5;
+
+/// Evidence one character of a value a distinctive published FORM fixes holds, with
+/// no check digit to confirm it: an e-mail address, a MAC address, an access key id.
+/// Below [`EVIDENCE_PER_VERIFIED_CHAR`], because the form says what the characters
+/// look like and the check says that the value is one.
+const EVIDENCE_PER_FORM_CHAR: f64 = 0.75;
+
+/// Evidence one character of a value whose own form is ambiguous holds — a short
+/// digit run, a word — admitted only because the document names what it is. The
+/// weakest reader here: these characters are as much some other value as this one,
+/// which is why the competing reading stays open for them.
+const EVIDENCE_PER_LABELLED_CHAR: f64 = 0.3;
+
+/// Evidence one character of the document's own LABEL holds: the keyword and
+/// separator a contextual rule matched around the value (`social security number:`).
+/// The label is evidence about THIS value rather than about values of a kind, so a
+/// value the document spells the kind of out is read with more confidence than the
+/// same value under a bare abbreviation.
+const EVIDENCE_PER_LABEL_CHAR: f64 = 0.6;
+
+/// The weight, per character of the value, of the reading in which an ambiguous form
+/// is a value of a different kind: the digits of a labelled account number are a
+/// telephone number in another document.
+const READING_ANOTHER_VALUE_PER_CHAR: f64 = 0.3;
+
+/// Evidence one FURTHER writing of the same value, read the same way, holds: a
+/// document that writes an identifier again corroborates the reading. The evidence is
+/// a property of the document, so every writing of the value carries it and the
+/// confidence does not depend on which occurrence a caller looks at.
+const EVIDENCE_PER_CORROBORATING_OCCURRENCE: f64 = 1.25;
+
+/// The weight of the reading in which the matched characters are not PII at all, on
+/// the scale the evidence above is tallied in: the reading nothing closes off
+/// (`crate::ops::detect_entities::Reading::never_excluded`).
+///
+/// Always open, because no rule-and-checksum recognizer excludes it: this is what
+/// keeps every reported confidence strictly below 1. Its size is what puts the tally
+/// on the scale a confidence is read on — a value whose own check digit accounts for
+/// every one of its characters is an unambiguous detection and leaves a residual in
+/// the third decimal place, which is where a confidence a redaction client gates on
+/// has to sit, while a value admitted by a bare label keeps the weight of what is
+/// left open and lands materially below it.
+const READING_NOT_PII: f64 = 0.04;
+
+/// What one detection's own evidence weighs, for and against the reading it is
+/// reported with: the service's one tally
+/// (`crate::ops::detect_entities::Reading`), with the weights this recognizer reads a
+/// value by.
+///
+/// The confidence FOLLOWS the detection: what the rule verified, how many characters
+/// it accounted for, what the document says beside them, and what else those
+/// characters could have been. Two values found by the same rule are therefore
+/// reported differently when the document gives them different support.
+fn reading_of(evidence: Evidence, value: &str, label_chars: usize) -> Reading {
+    let mut reading = Reading::over(
+        value,
+        evidence.per_value_char(),
+        evidence.competing_per_value_char(),
+        READING_NOT_PII,
+    );
+    reading.support += label_chars as f64 * EVIDENCE_PER_LABEL_CHAR;
+    reading
 }
 
 /// One PII entity the recognizer placed in a document.
@@ -170,7 +265,7 @@ pub struct PiiSpan {
     pub entity_type: &'static str,
     /// What the rule that found this span verified.
     pub evidence: Evidence,
-    /// [`Evidence::score`] of [`Self::evidence`].
+    /// The confidence this detection's OWN evidence leaves the reading, in (0, 1).
     pub score: f32,
     pub begin: usize,
     pub end: usize,
@@ -606,6 +701,13 @@ struct ByteSpan {
     evidence: Evidence,
     begin: usize,
     end: usize,
+    /// Characters of the document's own label for the value that the rule's match
+    /// spanned beside it: zero for a rule whose pattern IS the value.
+    label_chars: usize,
+    /// The confidence the service's own entity recogniser already computed for this
+    /// span, for a mention IT placed rather than a rule here. One recognition, one
+    /// confidence: a name is reported with the confidence it was recognised with.
+    recognised: Option<f32>,
 }
 
 /// Place every PII entity this service's recognizer can find in `text`.
@@ -655,25 +757,41 @@ pub fn detect_pii_spans(text: &str) -> Vec<PiiSpan> {
                 evidence: rule.evidence,
                 begin: found.start(),
                 end: found.end(),
+                // What the rule matched AROUND the value: for a contextual rule
+                // that is the document's own label for it, which is evidence about
+                // this value. A rule whose pattern is the value itself spans
+                // nothing else, so it carries none.
+                label_chars: captures
+                    .get(0)
+                    .map_or(0, |whole| whole.as_str().chars().count())
+                    .saturating_sub(found.as_str().chars().count()),
+                recognised: None,
             });
         }
     }
 
-    // A personal NAME the document does not introduce with a courtesy title or a name
-    // field: the modelled type is "an individual's name", however the document writes
-    // it, and a name standing in running text ("Contact John Smith at …") is one. It
-    // has no closed form to match, so what places it is the service's ONE person-name
-    // recogniser (`crate::ops::detect_entities::person_name_spans`) — the same
-    // evidence `DetectEntities` types a PERSON on — rather than a narrower rule here,
-    // so the two operations cannot disagree about who a document names. The evidence
-    // class is `Context` for the reason the rule above carries it: what admits the
-    // value is the text around it, not a form or a check digit of its own.
-    for span in crate::ops::detect_entities::person_name_spans(text) {
+    // A mention of a kind that has no closed form to match: a personal NAME the
+    // document does not introduce with a courtesy title or a name field ("Contact
+    // John Smith at …"), and a place name, which the modelled `ADDRESS` type covers
+    // as a component of a physical address ("can include a street, building,
+    // location, city, state, country, county, zip, precinct, neighborhood"). What
+    // places either is the service's ONE recogniser of the things a document names
+    // (`crate::ops::detect_entities::pii_bearing_spans`) — the same evidence
+    // `DetectEntities` types a PERSON or a LOCATION on — rather than a narrower rule
+    // here, so the two operations cannot disagree about what a document names, and
+    // each is reported with the confidence THAT recognition carries. The evidence
+    // class is `Context` for the reason the rules above carry it: what admits the
+    // value is the text around it, not a form or a check digit of its own. Where a
+    // rule above claimed a wider span over the same characters — the street-address
+    // rule over the whole address line — the overlap sweep below keeps the wider one.
+    for (span, entity_type, confidence) in crate::ops::detect_entities::pii_bearing_spans(text) {
         matched.push(ByteSpan {
-            entity_type: "NAME",
+            entity_type,
             evidence: Evidence::Context,
             begin: span.start,
             end: span.end,
+            label_chars: 0,
+            recognised: Some(confidence),
         });
     }
 
@@ -752,13 +870,38 @@ pub fn detect_pii_spans(text: &str) -> Vec<PiiSpan> {
             .map_or(byte_offset, |index| character_offsets[index])
     };
 
+    // What the REST of the document says about each detection: a value the document
+    // writes again, read the same way, corroborates the reading. Counted in one pass
+    // over the surviving spans, so the weighing stays linear in the number of
+    // detections however many a document carries, and the count is a property of the
+    // document — every writing of the value carries the same one.
+    let mut writings: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+    for span in &kept {
+        *writings
+            .entry((&text[span.begin..span.end], span.entity_type))
+            .or_default() += 1;
+    }
+
     kept.into_iter()
-        .map(|span| PiiSpan {
-            entity_type: span.entity_type,
-            evidence: span.evidence,
-            score: span.evidence.score(),
-            begin: translate(span.begin),
-            end: translate(span.end),
+        .map(|span| {
+            let value = &text[span.begin..span.end];
+            let repeats = writings
+                .get(&(value, span.entity_type))
+                .copied()
+                .unwrap_or(1)
+                .saturating_sub(1);
+            let score = span.recognised.unwrap_or_else(|| {
+                let mut reading = reading_of(span.evidence, value, span.label_chars);
+                reading.support += EVIDENCE_PER_CORROBORATING_OCCURRENCE * repeats as f64;
+                reading.confidence()
+            });
+            PiiSpan {
+                entity_type: span.entity_type,
+                evidence: span.evidence,
+                score,
+                begin: translate(span.begin),
+                end: translate(span.end),
+            }
         })
         .collect()
 }
@@ -1046,17 +1189,33 @@ impl<Eng> ContainsPiiEntities<Eng> {
     }
 }
 
-/// The distinct entity types `spans` carry, each with the highest confidence any
-/// span of that type was found with, ordered by descending confidence and then by
-/// type name so repeating a call returns the same list.
+/// The distinct entity types `spans` carry, each with the confidence the detections
+/// supporting it add up to, ordered by descending confidence and then by type name so
+/// repeating a call returns the same list.
+///
+/// The modelled `EntityLabel$Score` is "the level of confidence that Amazon Comprehend
+/// has in the accuracy of the detection" — of the detection that the document CONTAINS
+/// that type, which is a different question from any one span's. Each span of the type
+/// is its own evidence for it, so the label's confidence is the complement of the
+/// product of their complements: it is at least as high as the best single span and
+/// rises with every further one, so a document writing a type once is reported below
+/// one writing it three times, and a document that spells a category out
+/// unambiguously is reported at the top of the scale. It is a function of the
+/// detections, never a constant of the type.
 fn labels_of(spans: &[PiiSpan]) -> Vec<EntityLabel> {
-    let mut best: Vec<(&'static str, f32)> = Vec::new();
+    let mut combined: Vec<(&'static str, f32)> = Vec::new();
     for span in spans {
-        match best.iter_mut().find(|(name, _)| *name == span.entity_type) {
-            Some((_, score)) => *score = score.max(span.score),
-            None => best.push((span.entity_type, span.score)),
+        match combined.iter_mut().find(|(name, _)| *name == span.entity_type) {
+            // Independent evidence for the same type: the confidence that none of
+            // the spans is a detection of it is the product of their complements.
+            Some((_, absent)) => *absent *= 1.0 - span.score,
+            None => combined.push((span.entity_type, 1.0 - span.score)),
         }
     }
+    let mut best: Vec<(&'static str, f32)> = combined
+        .into_iter()
+        .map(|(name, absent)| (name, (1.0 - absent).clamp(0.0, 1.0)))
+        .collect();
     best.sort_by(|(left_name, left_score), (right_name, right_score)| {
         right_score
             .partial_cmp(left_score)

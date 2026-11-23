@@ -19,6 +19,7 @@
 use serde_json::json;
 
 use crate::comprehend_client::Comprehend;
+use crate::toxic_content::PLACEMENT_FLOOR;
 
 /// One document carrying a company name followed by a product of its own, a nominal
 /// compound, a relative clause, a personal name standing in running text after an
@@ -192,16 +193,35 @@ async fn the_whole_answer_for_one_document_is_pinned_across_the_six_analysers() 
         .iter()
         .map(|label| label["Score"].as_f64().unwrap_or(f64::NAN))
         .collect();
+    // The document carries no toxic content, so no content type is PLACED: each keeps
+    // only the room a finite reading of the segment leaves, which is the same room for
+    // every type (nothing was read against any of them) and strictly inside (0, the
+    // gate a moderation client reads the vector against).
     assert_eq!(
-        scores,
-        vec![0.0; 7],
-        "case \"toxicity baseline\": the document carries no toxic content, so every \
-         content type scores zero, got {scores:?}"
+        scores.len(),
+        7,
+        "case \"toxicity baseline\": expected one score per modelled content type, got \
+         {scores:?}"
     );
+    for score in &scores {
+        assert!(
+            *score > 0.0 && *score < PLACEMENT_FLOOR,
+            "case \"toxicity baseline\": the document carries no toxic content, so every \
+             content type keeps only the residual a finite reading leaves, got {scores:?}"
+        );
+        assert_eq!(
+            *score, scores[0],
+            "case \"toxicity baseline\": nothing was placed, so every content type keeps \
+             the same room, got {scores:?}"
+        );
+    }
+    let overall = toxicity["ResultList"][0]["Toxicity"]
+        .as_f64()
+        .unwrap_or(f64::NAN);
     assert_eq!(
-        toxicity["ResultList"][0]["Toxicity"].as_f64(),
-        Some(0.0),
-        "case \"toxicity baseline\": expected an overall Toxicity of zero, got {toxicity}"
+        overall, scores[0],
+        "case \"toxicity baseline\": with nothing placed, the overall Toxicity is that \
+         same room, got {toxicity}"
     );
 
     let syntax = comprehend.ok("DetectSyntax", &request()).await;

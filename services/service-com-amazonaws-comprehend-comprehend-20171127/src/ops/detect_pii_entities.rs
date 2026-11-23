@@ -12,12 +12,17 @@
 //! Through [`crate::ops::contains_pii_entities::detect_pii_spans`], the ONE PII
 //! recognizer of Comprehend's PII family: it matches the published FORM of each
 //! entity type and, where the defining standard gives the value a check digit,
-//! verifies it. This operation PROJECTS the spans it returns into `PiiEntity` values
-//! and `ContainsPiiEntities` projects the same spans into the distinct set of types,
-//! so the two operations cannot disagree about what a document carries. Nothing is
-//! matched out of the request's shape and no entity is guessed: a document with no
-//! recognisable PII answers an empty `Entities` list rather than a detection nothing
-//! found.
+//! verifies it, and it reads the kinds with no closed form of their own — a personal
+//! name, the place name an address is written with — from the service's own recogniser
+//! of what a document names. Each span's `Score` is the confidence THAT detection's
+//! evidence leaves: what the rule verified, how many of the value's characters it
+//! accounts for, the label the document writes beside it and how often the document
+//! writes the value — never a constant of the rule class. This operation PROJECTS the
+//! spans into `PiiEntity` values and `ContainsPiiEntities` projects the same spans
+//! into the distinct set of types, so the two operations cannot disagree about what a
+//! document carries. Nothing is matched out of the request's shape and no entity is
+//! guessed: a document with no recognisable PII answers an empty `Entities` list
+//! rather than a detection nothing found.
 //!
 //! ## Shape of an operation
 //!

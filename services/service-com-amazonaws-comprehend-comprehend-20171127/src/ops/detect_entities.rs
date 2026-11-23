@@ -299,7 +299,7 @@ const EVIDENCE_PER_NAME_SHAPE_CHAR: f64 = 0.6;
 /// running English text a capital marks a name, which is weak on its own,
 /// corroborates every rule above, and says less about a short token — an
 /// abbreviation, a sentence's first word — than about a long one.
-const EVIDENCE_PER_CAPITALIZED_CHAR: f64 = 0.25;
+pub(crate) const EVIDENCE_PER_CAPITALIZED_CHAR: f64 = 0.25;
 
 /// Evidence one character of the document's own FRAMING of the mention holds: a
 /// character the document writes AROUND the span that bears on the reading reported
@@ -406,7 +406,57 @@ impl Evidence {
     /// partly accounts for, or one two rules read two ways, keeps the weight of what
     /// is left open and lands materially below it.
     fn confidence(&self) -> f32 {
-        let total = self.support + self.competing + READING_NOT_AN_ENTITY;
+        Reading {
+            support: self.support,
+            competing: self.competing,
+            never_excluded: READING_NOT_AN_ENTITY,
+        }
+        .confidence()
+    }
+}
+
+/// What ONE reading's evidence weighs, for and against it, on the scale a confidence
+/// is reported and read on.
+///
+/// The one tally of this service's rule-based scorers. A confidence they report is
+/// the supported reading's share of everything the evidence leaves open, weighed
+/// against the one reading no evidence closes off, so it FOLLOWS the detection: the
+/// cues that fired on it, how much of the detection's own characters they account
+/// for, and what else those characters could have been. Every operation that scores a
+/// detection it placed from cues tallies it here — `DetectEntities`' own [`Evidence`]
+/// above, the PII recognizer's spans (`crate::ops::contains_pii_entities`) and the
+/// targeted-sentiment mention and grouping rules
+/// (`crate::ops::detect_targeted_sentiment`) — so the scorers cannot drift apart;
+/// what each of them chooses is the WEIGHTS, which is what differs between reading a
+/// name, a published identifier and a co-reference link.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct Reading {
+    /// Total weight of the evidence FOR the reading reported.
+    pub support: f64,
+    /// Total weight of the readings that evidence does not close off.
+    pub competing: f64,
+    /// The weight of the reading no evidence closes off, which is what puts the tally
+    /// on the scale a confidence is read on and keeps every reported value strictly
+    /// below 1.
+    pub never_excluded: f64,
+}
+
+impl Reading {
+    /// The tally in which every character of `text` carries `support` for the reading
+    /// and leaves `competing` against it.
+    pub fn over(text: &str, support: f64, competing: f64, never_excluded: f64) -> Self {
+        let chars = text.chars().count() as f64;
+        Self {
+            support: chars * support,
+            competing: chars * competing,
+            never_excluded,
+        }
+    }
+
+    /// The confidence reported: strictly inside `(0, 1)` for any reading carrying
+    /// evidence.
+    pub fn confidence(&self) -> f32 {
+        let total = self.support + self.competing + self.never_excluded;
         (self.support / total.max(f64::MIN_POSITIVE)) as f32
     }
 }
@@ -2243,10 +2293,10 @@ pub(crate) type Recognition = (Range<usize>, &'static str, f32);
 /// document order.
 ///
 /// The one recognition pass of this service: [`detect_entities`] is this list with the
-/// spans translated to the character offsets the modelled members carry, and
-/// `DetectTargetedSentiment` types and scores its mentions from it, so no two
-/// operations can disagree about what a document names or about how well evidenced
-/// each name is.
+/// spans translated to the character offsets the modelled members carry,
+/// `DetectTargetedSentiment` types and scores its mentions from it, and the PII family
+/// reads [`pii_bearing_spans`] off it, so no two operations can disagree about what a
+/// document names or about how well evidenced each name is.
 pub(crate) fn recognised_spans(text: &str) -> Vec<Recognition> {
     let mut found = pattern_entities(text);
     found.extend(phrase_entities(text));
@@ -2273,6 +2323,7 @@ pub(crate) fn recognised_spans(text: &str) -> Vec<Recognition> {
 /// passes included, and drops what they produce: they weigh `Evidence` and never move
 /// a span, so the spans are the same either way, and one pass that every caller shares
 /// is what keeps the recognition from forking into two that can disagree.
+#[allow(dead_code)]
 pub(crate) fn entity_spans(text: &str) -> Vec<(Range<usize>, &'static str)> {
     recognised_spans(text)
         .into_iter()
@@ -2280,26 +2331,43 @@ pub(crate) fn entity_spans(text: &str) -> Vec<(Range<usize>, &'static str)> {
         .collect()
 }
 
-/// Every PERSON mention the entity recogniser places in `text`, as BYTE offsets into
-/// it.
+/// Every mention of a kind the PII family reports, as its BYTE span, the modelled
+/// `PiiEntityType` that kind is reported under, and the confidence the recogniser's
+/// own evidence leaves the reading.
 ///
-/// The ONE person-name recogniser of this service, read by the PII family: a personal
-/// name carries no closed form, so what places one is the name's shape and the
-/// syntactic position it stands in ([`person_name_shape`],
-/// [`person_bearing_position`]) together with the honorifics and the person-lexicon
-/// entries beside it — exactly the evidence `DetectEntities` types a `PERSON` on. A
-/// document's names cannot depend on which operation asks for them, so
-/// `ContainsPiiEntities` and `DetectPiiEntities` place their `NAME` entities from this
-/// list rather than from a second, narrower recogniser of their own.
+/// The ONE recogniser of the things a document NAMES, read by the PII family: a
+/// personal name and a place name carry no closed form, so what places one is the
+/// name's shape and the syntactic position it stands in ([`person_name_shape`],
+/// [`person_bearing_position`]) together with the honorifics, the geographic cues and
+/// the lexicon entries beside it — exactly the evidence `DetectEntities` types a
+/// `PERSON` or a `LOCATION` on. A document's names cannot depend on which operation
+/// asks for them, so `ContainsPiiEntities` and `DetectPiiEntities` place these
+/// entities from this list rather than from a second, narrower recogniser of their
+/// own, and report each with the confidence the recognition carries.
+///
+/// The two kinds, and why each is PII:
+/// * a `PERSON` is the modelled `NAME`, "an individual's name";
+/// * a `LOCATION` is a component of the modelled `ADDRESS`, documented as a physical
+///   address, which "can include a street, building, location, city, state, country,
+///   county, zip, precinct, neighborhood" — so a place name the document writes is an
+///   address component whether or not a street line stands beside it. Where one does,
+///   the PII recognizer's own street-address rule claims the whole line and the
+///   overlap sweep drops this narrower span.
 ///
 /// Byte offsets, because that is the scale the PII recognizer resolves overlaps on
 /// before translating the surviving spans to the character offsets the modelled
 /// members carry.
-pub(crate) fn person_name_spans(text: &str) -> Vec<Range<usize>> {
-    entity_spans(text)
+pub(crate) fn pii_bearing_spans(text: &str) -> Vec<(Range<usize>, &'static str, f32)> {
+    recognised_spans(text)
         .into_iter()
-        .filter(|(_, entity_type)| *entity_type == TYPE_PERSON)
-        .map(|(span, _)| span)
+        .filter_map(|(span, entity_type, confidence)| {
+            let pii_type = match entity_type {
+                TYPE_PERSON => "NAME",
+                TYPE_LOCATION => "ADDRESS",
+                _ => return None,
+            };
+            Some((span, pii_type, confidence))
+        })
         .collect()
 }
 

@@ -122,6 +122,7 @@ use super::types::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
 
+use crate::ops::detect_entities::{Reading, EVIDENCE_PER_CAPITALIZED_CHAR};
 use crate::ops::detect_sentiment::score_sentiment;
 
 /// The largest `Text` this operation accepts, in UTF-8 bytes.
@@ -142,50 +143,139 @@ const MAX_TEXT_BYTES: usize = 5 * 1024;
 /// language AWS supports but this emulator's engine cannot read.
 const ANALYSABLE_LANGUAGES: &[&str] = &["en"];
 
-/// `Score` — "model confidence that the entity is relevant" — for a mention this
-/// service's entity recogniser placed NOTHING on, one value per placing rule.
+/// `Score` — "model confidence that the entity is relevant" — as the tally of what
+/// placed THIS mention.
 ///
-/// A mention a recognition typed is reported with that recognition's OWN confidence,
-/// computed from the evidence the recogniser weighed for that mention's characters
-/// ([`crate::ops::detect_entities::recognised_spans`]), so two mentions the document
-/// evidences differently are reported differently. These are the fallback for the
-/// mentions the recogniser places nothing on — a pronoun, a determiner-headed common
-/// noun, a capitalised run it did not type — where the only evidence there is is
-/// WHICH rule fired, so the value is that rule's precision rank and nothing more: a
-/// closed-class pronoun is certain, a span carrying a typing cue (an honorific, a
-/// legal-entity suffix, a calendar name, a numeral) comes next, bare capitalisation
-/// next, and a determiner-headed common noun last — it is the rule most easily fooled
-/// by an adjective.
-const SCORE_PRONOUN: f32 = 0.99;
-/// The score of a span a typing CUE recognised. See [`SCORE_PRONOUN`].
-const SCORE_TYPED_SPAN: f32 = 0.95;
-/// The score of a span placed by capitalisation alone. See [`SCORE_PRONOUN`].
-const SCORE_PROPER_NOUN: f32 = 0.9;
-/// The score of a determiner-headed common noun. See [`SCORE_PRONOUN`].
-const SCORE_COMMON_NOUN: f32 = 0.75;
+/// A mention this service's entity recogniser placed is reported with the confidence
+/// THAT recognition carries ([`mention_score`] takes it from
+/// `crate::ops::detect_entities::recognised_spans`), so one mention has one confidence
+/// whichever operation reports it. A mention no recognition placed is tallied here,
+/// from the cue that placed it weighed over the mention's own characters: a cue that
+/// accounts for a longer mention is less likely to have been a coincidence, so two
+/// mentions placed by the same rule are reported differently when the document gives
+/// them different support.
+///
+/// What one character of the mention weighs, by what read it:
+/// a closed-class word the lexicon spells out (a pronoun) names the whole mention and
+/// is the strongest reading here.
+const EVIDENCE_PER_CLOSED_CLASS_CHAR: f64 = 1.5;
 
-/// `GroupScore` — "the confidence that all the entities mentioned in the group relate
-/// to the same entity" — which is the confidence of the LINK that placed a mention in
-/// its group: what has to be right for the group to be one entity is the link, so
-/// this is a property of the link and not of the mention. A mention whose surface
-/// form is identical to one the group already holds, and the mention that opened a
-/// group, carry this one: a group of one, or of one repeated form, relates to one
-/// entity by construction.
+/// A typing cue standing inside the mention or in front of it — an honorific, a
+/// legal-entity suffix, a calendar name, the closed form of a figure — says WHAT KIND
+/// of thing is named there without spelling the mention out. See
+/// [`EVIDENCE_PER_CLOSED_CLASS_CHAR`].
+const EVIDENCE_PER_TYPING_CUE_CHAR: f64 = 1.0;
+
+// Bare capitalisation: in running English text a capital marks a name, which is weak
+// on its own and says less about a short token than a long one. The weight is the
+// recogniser's own (`crate::ops::detect_entities::EVIDENCE_PER_CAPITALIZED_CHAR`,
+// imported above), since it is the same orthographic evidence read about the same
+// characters.
+
+/// The head of a determiner-headed noun phrase: the position says something is named
+/// there and the noun says what, which is the reading most easily fooled by an
+/// adjective. See [`EVIDENCE_PER_CLOSED_CLASS_CHAR`].
+const EVIDENCE_PER_PHRASE_HEAD_CHAR: f64 = 0.2;
+
+/// The weight, per character, of the reading in which a capital is orthography rather
+/// than a name: a sentence's first word and an abbreviation carry one too.
+const READING_CAPITAL_EXPLAINED_PER_CHAR: f64 = 0.1;
+
+/// The weight, per character, of the reading in which a common noun names no entity
+/// at all — the generic reading of `the service`, which the phrase rule cannot tell
+/// from a mention of one.
+const READING_NO_ENTITY_NAMED_PER_CHAR: f64 = 0.3;
+
+/// The weight of the reading in which the span is not a relevant entity at all, on
+/// the scale the evidence above is tallied in. Always open, so no mention is reported
+/// as certain, and its size is what puts the tally on the scale a confidence is read
+/// on.
+const READING_NOT_A_TARGET: f64 = 0.04;
+
+/// Evidence one character of an identical surface form holds for the grouping: a
+/// document that writes the same name again is writing about the same entity, and the
+/// longer the spelling the two mentions share the less likely the agreement is a
+/// coincidence.
+const EVIDENCE_PER_SHARED_FORM_CHAR: f64 = 1.5;
+
+/// Evidence one character that two names DISAGREE on weighs against the grouping:
+/// `Lennox` joining `Alice Lennox` leaves the given name unaccounted for.
+const READING_ANOTHER_ENTITY_PER_CHAR: f64 = 0.4;
+
+/// Evidence a pronoun's antecedent holds for the grouping, for the sentence the
+/// pronoun stands in: English resolves a pronoun to the nearest admissible referent,
+/// so the link rests on the antecedent being the most recent one.
+const EVIDENCE_PER_NEAREST_ANTECEDENT: f64 = 3.0;
+
+/// How much of that evidence is left for each further sentence between the pronoun and
+/// its antecedent's last mention: the further back the referent was last written, the
+/// more room there is for another one in between, so the confidence of the link decays
+/// with the distance rather than stopping at a fixed floor.
+const ANTECEDENT_DISTANCE_DECAY: f64 = 0.5;
+
+/// The weight of the reading in which the mentions grouped together name DIFFERENT
+/// entities, on the scale the grouping evidence is tallied in. Always open, so no
+/// grouping of two mentions is reported as certain.
+const READING_DIFFERENT_ENTITIES: f64 = 0.04;
+
+/// The `GroupScore` of a mention that opened its own group.
 ///
-/// How well EVIDENCED the mention itself is, is the `Score` member beside it, which
-/// [`mention_score`] takes from the recogniser.
-const LINK_SAME_FORM: f32 = 1.0;
-/// The link of a name that shares every word with a name already in the group
-/// ("Lennox" joining "Alice Lennox"): likely, not certain.
-const LINK_PARTIAL_NAME: f32 = 0.85;
-/// The link of a pronoun resolved to an earlier group, before the distance penalty:
-/// the nearer the antecedent, the more confident the link.
-const LINK_PRONOUN: f32 = 0.9;
-/// How much [`LINK_PRONOUN`] drops per sentence between the pronoun and its
-/// antecedent's last mention, and the floor it stops at.
-const LINK_DISTANCE_PENALTY: f32 = 0.1;
-/// The floor of the pronoun-resolution link. See [`LINK_PRONOUN`].
-const LINK_FLOOR: f32 = 0.5;
+/// `GroupScore` is "the confidence that all the entities mentioned in the group relate
+/// to the same entity". A group of one relates its mention to nothing else, so there
+/// is no grouping claim that could be wrong: the confidence is a certainty, and it
+/// stays one for every further mention whose surface form the group already holds only
+/// because that agreement is itself tallied ([`EVIDENCE_PER_SHARED_FORM_CHAR`]).
+const GROUP_OF_ONE: f32 = 1.0;
+
+// The confidences below are tallied with the service's ONE reading tally
+// (`crate::ops::detect_entities::Reading`): a confidence is the supported reading's
+// share of everything the evidence leaves open, weighed against the one reading
+// nothing closes off, so the value FOLLOWS the detection instead of naming the rule
+// that made it. What these rules choose is the WEIGHTS below.
+
+/// The confidence a mention a closed-class lexicon entry placed is reported with.
+fn closed_class_confidence(mention: &str) -> f32 {
+    Reading::over(
+        mention,
+        EVIDENCE_PER_CLOSED_CLASS_CHAR,
+        0.0,
+        READING_NOT_A_TARGET,
+    )
+    .confidence()
+}
+
+/// The confidence a mention a typing cue placed is reported with.
+fn typing_cue_confidence(mention: &str) -> f32 {
+    Reading::over(
+        mention,
+        EVIDENCE_PER_TYPING_CUE_CHAR,
+        0.0,
+        READING_NOT_A_TARGET,
+    )
+    .confidence()
+}
+
+/// The confidence a mention bare capitalisation placed is reported with.
+fn capitalisation_confidence(mention: &str) -> f32 {
+    Reading::over(
+        mention,
+        EVIDENCE_PER_CAPITALIZED_CHAR,
+        READING_CAPITAL_EXPLAINED_PER_CHAR,
+        READING_NOT_A_TARGET,
+    )
+    .confidence()
+}
+
+/// The confidence a determiner-headed common noun is reported with.
+fn phrase_head_confidence(mention: &str) -> f32 {
+    Reading::over(
+        mention,
+        EVIDENCE_PER_PHRASE_HEAD_CHAR,
+        READING_NO_ENTITY_NAMED_PER_CHAR,
+        READING_NOT_A_TARGET,
+    )
+    .confidence()
+}
 
 /// The most words a determiner-headed noun phrase may span before its head.
 ///
@@ -546,7 +636,7 @@ fn capitalised_span(text: &str, words: &[Word<'_>], from: usize) -> Option<usize
 /// The type a proper-noun span carries, from the typing cues its words show.
 ///
 /// The LAST resort: what types a name here is this service's own entity recogniser
-/// ([`named_entity_types`]), which reads the whole document rather than the cues
+/// ([`recognised_entities`]), which reads the whole document rather than the cues
 /// inside one span. These cues answer a span that recogniser placed nothing on.
 fn proper_noun_type(span: &[Word<'_>]) -> &'static str {
     let last = span
@@ -666,10 +756,11 @@ fn noun_phrase_head<'a>(
 
 /// The confidence a mention is reported with: the recogniser's own confidence for the
 /// recognition that reached the mention's FIRST word — the part of a name that says
-/// what is named — and `rank`, the placing rule's precision rank, where it reached
-/// none. See [`SCORE_PRONOUN`].
-fn mention_score(entities: &[Recognition], word: &Word<'_>, rank: f32) -> f32 {
-    placed_entity(entities, word.start, word.end).map_or(rank, |(_, _, confidence)| confidence)
+/// what is named — and `tallied`, what the cue that placed the mention accounts for of
+/// its own characters ([`EVIDENCE_PER_CLOSED_CLASS_CHAR`] and the weights beside it),
+/// where it reached none.
+fn mention_score(entities: &[Recognition], word: &Word<'_>, tallied: f32) -> f32 {
+    placed_entity(entities, word.start, word.end).map_or(tallied, |(_, _, confidence)| confidence)
 }
 
 /// One mention the recogniser placed, before it is grouped.
@@ -750,7 +841,7 @@ fn place_mentions(text: &str, words: &[Word<'_>], entities: &[Recognition]) -> V
                 word.end,
                 Kind::ProperNoun,
                 "PERSONAL_TITLE",
-                mention_score(entities, &word, SCORE_TYPED_SPAN),
+                mention_score(entities, &word, typing_cue_confidence(word.text)),
                 word.sentence,
                 None,
             ));
@@ -763,12 +854,14 @@ fn place_mentions(text: &str, words: &[Word<'_>], entities: &[Recognition]) -> V
                 // The honorific IS the evidence that the span after it names a
                 // person, so the typing is the grammar's; how confident the mention
                 // is, is still the recogniser's where it placed a recognition on
-                // those characters.
-                let score = words
-                    .get(index)
-                    .map_or(SCORE_TYPED_SPAN, |first| {
-                        mention_score(entities, first, SCORE_TYPED_SPAN)
-                    });
+                // those characters, and otherwise the tally of what the honorific
+                // accounts for.
+                let score = words.get(index).map_or_else(
+                    || typing_cue_confidence(&text[start..end]),
+                    |first| {
+                        mention_score(entities, first, typing_cue_confidence(&text[start..end]))
+                    },
+                );
                 found.push(Mention::new(
                     text,
                     start,
@@ -797,7 +890,7 @@ fn place_mentions(text: &str, words: &[Word<'_>], entities: &[Recognition]) -> V
                 word.end,
                 Kind::Pronoun,
                 entity_type,
-                mention_score(entities, &word, SCORE_PRONOUN),
+                mention_score(entities, &word, closed_class_confidence(word.text)),
                 word.sentence,
                 Some(class),
             ));
@@ -810,7 +903,7 @@ fn place_mentions(text: &str, words: &[Word<'_>], entities: &[Recognition]) -> V
                         head.end,
                         Kind::CommonNoun,
                         "OTHER",
-                        mention_score(entities, &head, SCORE_COMMON_NOUN),
+                        mention_score(entities, &head, phrase_head_confidence(head.text)),
                         head.sentence,
                         None,
                     ));
@@ -869,10 +962,12 @@ fn place_mentions(text: &str, words: &[Word<'_>], entities: &[Recognition]) -> V
                 Some((_, entity_type, confidence)) => (*entity_type, *confidence),
                 None => {
                     let entity_type = proper_noun_type(span);
+                    // A run no recognition reached rests on what this rule read: a
+                    // typing cue inside the span, or the capital alone.
                     let score = if entity_type == "OTHER" {
-                        SCORE_PROPER_NOUN
+                        capitalisation_confidence(&text[begin..end])
                     } else {
-                        SCORE_TYPED_SPAN
+                        typing_cue_confidence(&text[begin..end])
                     };
                     (entity_type, score)
                 }
@@ -919,7 +1014,7 @@ fn place_mentions(text: &str, words: &[Word<'_>], entities: &[Recognition]) -> V
                     head.end,
                     Kind::CommonNoun,
                     "OTHER",
-                    mention_score(entities, &head, SCORE_COMMON_NOUN),
+                    mention_score(entities, &head, phrase_head_confidence(head.text)),
                     head.sentence,
                     None,
                 ));
@@ -936,7 +1031,7 @@ fn place_mentions(text: &str, words: &[Word<'_>], entities: &[Recognition]) -> V
                 word.end,
                 Kind::CommonNoun,
                 "QUANTITY",
-                mention_score(entities, &word, SCORE_TYPED_SPAN),
+                mention_score(entities, &word, typing_cue_confidence(word.text)),
                 word.sentence,
                 None,
             ));
@@ -1038,10 +1133,13 @@ fn most_recent(groups: &[Group], accept: impl Fn(&Group) -> bool) -> Option<usiz
 }
 
 /// Group the mentions that name one entity, and give every mention the `GroupScore`
-/// of the link that placed it. See [`LINK_SAME_FORM`].
+/// of the link that placed it: the confidence that link's OWN evidence leaves — the
+/// characters two forms share, the words they differ on, the sentences between a
+/// pronoun and its antecedent — or [`GROUP_OF_ONE`] for a mention that opened its own
+/// group.
 fn group_mentions(mentions: &[Mention]) -> (Vec<Group>, Vec<f32>) {
     let mut groups: Vec<Group> = Vec::new();
-    let mut group_scores = vec![LINK_SAME_FORM; mentions.len()];
+    let mut group_scores = vec![GROUP_OF_ONE; mentions.len()];
 
     for (order, mention) in mentions.iter().enumerate() {
         let canonical = normalise(&mention.text);
@@ -1114,7 +1212,10 @@ fn resolve_pronoun(
         PronounClass::Speaker | PronounClass::SpeakerGroup | PronounClass::Addressee => groups
             .iter()
             .position(|group| group.speaker == Some(class))
-            .map(|index| (index, LINK_SAME_FORM)),
+            // Every writing of `I` in a document is the same writer: the pronoun's
+            // own class is what the group is keyed on, so the link is the same
+            // agreement of surface forms a repeated name carries.
+            .map(|index| (index, closed_class_confidence(&mention.text))),
         PronounClass::PersonAnaphor | PronounClass::ThingAnaphor | PronounClass::PluralAnaphor => {
             let index = most_recent(groups, |group| {
                 group.speaker.is_none()
@@ -1129,10 +1230,19 @@ fn resolve_pronoun(
                         _ => true,
                     }
             })?;
-            let distance = mention.sentence.saturating_sub(groups[index].last_sentence) as f32;
-            let link =
-                (LINK_PRONOUN - LINK_DISTANCE_PENALTY * distance).clamp(LINK_FLOOR, LINK_PRONOUN);
-            Some((index, link))
+            // What the link rests on: the antecedent being the nearest admissible
+            // referent. Each further sentence between the two leaves room for another
+            // referent in between, so the evidence decays with the distance instead of
+            // stopping at a fixed floor.
+            let distance = mention.sentence.saturating_sub(groups[index].last_sentence) as f64;
+            let score = Reading {
+                support: EVIDENCE_PER_NEAREST_ANTECEDENT
+                    * ANTECEDENT_DISTANCE_DECAY.powf(distance),
+                competing: 0.0,
+                never_excluded: READING_DIFFERENT_ENTITIES,
+            }
+            .confidence();
+            Some((index, score))
         }
     }
 }
@@ -1148,7 +1258,18 @@ fn resolve_name(groups: &[Group], mention: &Mention, canonical: &str) -> Option<
     if let Some(index) = most_recent(groups, |group| {
         group.speaker.is_none() && group.canonical == canonical
     }) {
-        return Some((index, LINK_SAME_FORM));
+        // The two mentions agree character for character: the longer the spelling
+        // they share, the less likely the agreement is a coincidence.
+        return Some((
+            index,
+            Reading::over(
+                canonical,
+                EVIDENCE_PER_SHARED_FORM_CHAR,
+                0.0,
+                READING_DIFFERENT_ENTITIES,
+            )
+            .confidence(),
+        ));
     }
     if mention.kind != Kind::ProperNoun {
         return None;
@@ -1168,7 +1289,28 @@ fn resolve_name(groups: &[Group], mention: &Mention, canonical: &str) -> Option<
                     .iter()
                     .all(|word| words.contains(word)))
     })?;
-    Some((index, LINK_PARTIAL_NAME))
+    // A partial name: the words the two names share support the link and the words
+    // only one of them writes are what it leaves open, so `Lennox` joining
+    // `Alice Lennox` is read with the confidence the shared surname leaves against
+    // the given name nothing accounted for.
+    let shared: usize = words
+        .iter()
+        .filter(|word| groups[index].canonical_words.contains(word))
+        .map(|word| word.chars().count())
+        .sum();
+    let differing: usize = groups[index]
+        .canonical_words
+        .iter()
+        .filter(|word| !words.contains(word))
+        .map(|word| word.chars().count())
+        .sum();
+    let score = Reading {
+        support: shared as f64 * EVIDENCE_PER_SHARED_FORM_CHAR,
+        competing: differing as f64 * READING_ANOTHER_ENTITY_PER_CHAR,
+        never_excluded: READING_DIFFERENT_ENTITIES,
+    }
+    .confidence();
+    Some((index, score))
 }
 
 /// Whether a group still admits a name the recogniser typed: the two agree, or the

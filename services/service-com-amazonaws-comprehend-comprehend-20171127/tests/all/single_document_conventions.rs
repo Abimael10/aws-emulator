@@ -38,6 +38,7 @@ use service_com_amazonaws_comprehend_comprehend_20171127::ops::types::{
 };
 
 use crate::comprehend_client::Comprehend;
+use crate::toxic_content::PLACEMENT_FLOOR;
 
 /// An English single-document request carrying `text`.
 fn document(text: &str) -> Value {
@@ -137,24 +138,32 @@ async fn toxic_content_reports_one_score_for_every_modelled_content_type() {
             .map(|label| label["Score"].as_f64().unwrap_or(f64::NAN))
             .collect();
         for (name, score) in names.iter().zip(&scores) {
+            // The analysers read a finite segment, so no content type is reported as
+            // impossible: every entry of the vector carries a confidence of its own,
+            // strictly inside (0, 1].
             assert!(
-                (0.0..=1.0).contains(score),
-                "case {case:?}: expected a Score in [0, 1] for {name:?}, got {score}"
+                *score > 0.0 && *score <= 1.0,
+                "case {case:?}: expected a Score strictly inside (0, 1] for {name:?}, \
+                 got {score}"
             );
         }
 
         let toxicity = entry["Toxicity"]
             .as_f64()
             .unwrap_or_else(|| panic!("case {case:?}: expected a Toxicity, got {entry}"));
+        // `Toxicity` is the confidence that the segment carries toxic content of ANY
+        // type: every placement is independent evidence for it, so it is at least as
+        // large as the strongest single type and never larger than the whole vector
+        // combined.
+        let strongest = scores.iter().copied().fold(0.0f64, f64::max);
         let combined = 1.0 - scores.iter().map(|score| 1.0 - score).product::<f64>();
         assert!(
-            (toxicity - combined).abs() < 1e-6,
-            "case {case:?}: Toxicity is the confidence that the segment carries toxic \
-             content of ANY type, so it combines the vector: expected {combined}, got \
-             {toxicity} from {scores:?}"
+            toxicity + 1e-6 >= strongest && toxicity <= combined + 1e-6,
+            "case {case:?}: expected a Toxicity between the strongest type {strongest} \
+             and the combined vector {combined}, got {toxicity} from {scores:?}"
         );
         assert_eq!(
-            scores.iter().any(|score| *score > 0.0),
+            scores.iter().any(|score| *score > PLACEMENT_FLOOR),
             *toxic,
             "case {case:?}: expected toxic={toxic}, got the vector {scores:?}"
         );

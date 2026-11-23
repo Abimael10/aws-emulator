@@ -156,12 +156,62 @@ const REPORTED_CONTENT_TYPES: [&str; 7] = [
 /// in thirds — weakly placed (0, 1/3], placed (1/3, 2/3], strongly placed (2/3, 1] —
 /// and reported as the midpoint of its third. These are the weights of ONE piece of
 /// evidence, not the values the operation can answer: a reported `Score` combines
-/// every placement of its type ([`combined_confidence`]), and `Toxicity` combines
+/// every placement of its type ([`confidence_of`]), and `Toxicity` combines
 /// every placement of every type, so both rise with how much toxic content the
 /// segment actually carries rather than snapping to one of three rungs.
 const MILD_SCORE: f32 = 1.0 / 6.0;
 const MODERATE_SCORE: f32 = 0.5;
 const SEVERE_SCORE: f32 = 5.0 / 6.0;
+
+/// The confidence ONE piece of WEAK evidence carries: material the segment holds that
+/// bears on a category without placing it.
+///
+/// A word the engine reads as a category out of its context, where the segment as a
+/// whole does not carry it, and a category's own vocabulary standing in a sentence
+/// without the rest of what its rule reads (the act with no target, the imagery with
+/// no predicate) are both evidence about the segment — a moderation model does not
+/// read `break` and `blood` as it reads `attached` and `review` — and neither is a
+/// placement. So one piece of it weighs a fraction of the weakest single placement,
+/// and all of it together is capped at [`WEAK_MATERIAL_CEILING`], which keeps a
+/// client's block threshold firing on content that was placed and not on content that
+/// was merely touched on.
+const WEAK_SIGNAL_SCORE: f32 = MILD_SCORE / 4.0;
+
+/// The most all the weak material of a segment can amount to for one category, and
+/// for the segment as a whole.
+///
+/// Weak material is not a placement, however much of it a segment carries, and the
+/// words it is read from are common ones (`break`, `harm`, `attack`, `trash`,
+/// `blood`): a long benign business or medical segment can hold several, and
+/// combining them without a ceiling would eventually report one as the weakest
+/// placement. Half the weakest single placement, so that no segment nothing was
+/// placed in can reach the rung a mild reading carries, and a client gating on a
+/// category sees it fire only on content an analyser placed.
+const WEAK_MATERIAL_CEILING: f32 = MILD_SCORE / 2.0;
+
+/// The confidence a category keeps that the analysers placed NOTHING of, for a segment
+/// one word long.
+///
+/// The analysers read a finite amount of text, so a segment they placed nothing in is
+/// not a segment proved to carry nothing: `ToxicContent$Score` is "model confidence in
+/// the detected content type" and `ToxicLabels$Toxicity` the "overall toxicity score
+/// for the string", and a model answers neither with a certainty. What is left open is
+/// a function of the SEGMENT — every further word read without placing the category is
+/// a further observation against it, so the room it keeps shrinks with the words read
+/// ([`absence_residual`]) — which is why a long benign segment is reported with less
+/// residual confidence than a three-word one, and why a client that normalises by
+/// `Toxicity` never divides by zero.
+///
+/// Orders below [`WEAK_SIGNAL_SCORE`], so a category nothing was placed or even
+/// touched on stays below every threshold a moderation client sets.
+const ABSENCE_RESIDUAL_PER_WORD: f32 = 0.05;
+
+/// The confidence a category the analysers placed nothing of keeps for `text`: the
+/// room [`ABSENCE_RESIDUAL_PER_WORD`] describes, divided by the material the
+/// analysers read without placing it.
+fn absence_residual(text: &str) -> f32 {
+    ABSENCE_RESIDUAL_PER_WORD / (1.0 + text.split_whitespace().count() as f32)
+}
 
 /// The modelled `ToxicContentType` values the profanity/abuse engine classifies,
 /// each paired with the engine category that detects it.
@@ -353,12 +403,18 @@ fn conduct_rules() -> &'static [CategoryRule] {
     })
 }
 
-/// One piece of toxic content an analyser placed in a segment: the modelled
-/// `ToxicContentType` it belongs to, and the confidence THAT placement carries.
+/// One piece of evidence an analyser read in a segment: the modelled
+/// `ToxicContentType` it bears on, the confidence it carries, and whether it is a
+/// PLACEMENT of that category or the weak material described on
+/// [`WEAK_SIGNAL_SCORE`].
 #[derive(Debug)]
 struct Placement {
     name: &'static str,
     confidence: f32,
+    /// Weak material: evidence about the segment that places nothing. Capped as a
+    /// whole at [`WEAK_MATERIAL_CEILING`], so no amount of it is reported as a
+    /// placement.
+    weak: bool,
 }
 
 /// The confidence the engine's verdict places on `category`, or `None` when it placed
@@ -375,15 +431,23 @@ fn category_score(analysis: Type, category: Type) -> Option<f32> {
     }
 }
 
-/// Every piece of toxic content the two analysers place in `text`.
+/// Every piece of toxic content the two analysers place in `text`, and the weak
+/// material they read beside it.
 ///
 /// The profanity/abuse engine is asked about the whole segment, which is what decides
-/// WHETHER one of its categories is present at all, and then about each word of it:
+/// WHETHER one of its categories is placed at all, and then about each word of it:
 /// a word the engine places that category in is one more piece of that category in
 /// the segment, so a segment carrying several of them is read with more confidence
-/// than one carrying a single word. A category the whole-segment verdict does not
-/// place is not reported at all, whatever a word reads as out of its context. The
-/// conduct recognizer contributes one placement per match of each of its rules.
+/// than one carrying a single word. The conduct recognizer contributes one placement
+/// per match of each of its rules.
+///
+/// A category the whole-segment verdict does not place, and a conduct category no
+/// rule of it matched, are not PLACED — but a word the engine reads as that category
+/// out of its context, and the category's own vocabulary standing without the rest of
+/// what its rules read, are still evidence about this segment, so each is marked
+/// [`Placement::weak`]. Weak material raises a category's confidence a little and
+/// never reaches a placement: [`analyse_segment`] caps what all of it together can
+/// amount to ([`WEAK_MATERIAL_CEILING`]).
 ///
 /// Both passes are bounded by the per-string byte quota the operation refuses an
 /// oversized segment with before any analysis: every rule pattern is compiled once
@@ -399,6 +463,19 @@ fn placements(text: &str) -> Vec<Placement> {
     let mut placements: Vec<Placement> = Vec::new();
     for (name, category) in ENGINE_CATEGORIES {
         let Some(segment_score) = category_score(analysis, category) else {
+            // The segment as a whole does not carry the category. A single word the
+            // engine reads as it out of its context is not a placement — the
+            // whole-segment verdict is what places a category — but it is evidence
+            // about this segment, so it is weighed as weak material.
+            for word in &word_analyses {
+                if category_score(*word, category).is_some() {
+                    placements.push(Placement {
+                        name,
+                        confidence: WEAK_SIGNAL_SCORE,
+                        weak: true,
+                    });
+                }
+            }
             continue;
         };
         let before = placements.len();
@@ -407,6 +484,7 @@ fn placements(text: &str) -> Vec<Placement> {
                 placements.push(Placement {
                     name,
                     confidence: score,
+                    weak: false,
                 });
             }
         }
@@ -416,6 +494,7 @@ fn placements(text: &str) -> Vec<Placement> {
             placements.push(Placement {
                 name,
                 confidence: segment_score,
+                weak: false,
             });
         }
     }
@@ -425,62 +504,121 @@ fn placements(text: &str) -> Vec<Placement> {
             placements.push(Placement {
                 name: rule.category,
                 confidence: rule.confidence,
+                weak: false,
+            });
+        }
+    }
+
+    // The vocabulary a conduct category is written with, standing WITHOUT the rest of
+    // what its rules read: weak material rather than a placement. A category one of
+    // those rules already placed is left alone — the rule read this same vocabulary
+    // together with the act's target, the stated intention or the predicate that makes
+    // a depiction graphic, so counting the words again would weigh one piece of
+    // evidence twice.
+    for rule in vocabulary_rules() {
+        if placements
+            .iter()
+            .any(|placement| placement.name == rule.category && !placement.weak)
+        {
+            continue;
+        }
+        for _ in rule.pattern.find_iter(text) {
+            placements.push(Placement {
+                name: rule.category,
+                confidence: rule.confidence,
+                weak: true,
             });
         }
     }
     placements
 }
 
-/// The confidence a set of independent placements adds up to, or `None` when there
-/// are none.
+/// The vocabulary each conduct category is written WITH, one pattern per category.
 ///
-/// Each placement is its own evidence that the content is present, so the combined
-/// confidence is the complement of the product of their complements: it is at least
-/// as large as the strongest single placement and rises with every further one, which
-/// is what makes a reported score a continuous confidence rather than one of the
-/// rungs a single placement weighs.
-fn combined_confidence(confidences: impl Iterator<Item = f32>) -> Option<f32> {
-    let mut not_present = 1.0f32;
-    let mut any = false;
-    for confidence in confidences {
-        not_present *= 1.0 - confidence;
-        any = true;
+/// A match is WEAK evidence ([`WEAK_SIGNAL_SCORE`]): what places one of these
+/// categories is a [`conduct_rules`] rule, which reads the act together with its
+/// target, the speaker's stated intention or the predicate that makes a depiction
+/// graphic. The vocabulary alone leaves all of that out — `break` in `break the
+/// build`, `blood` in `blood test` — so it raises the category's confidence a little
+/// and places nothing. The word lists are the rules' own, so a category's weak
+/// material and its placements can never be read off different vocabularies.
+fn vocabulary_rules() -> &'static [CategoryRule] {
+    static RULES: OnceLock<Vec<CategoryRule>> = OnceLock::new();
+    RULES.get_or_init(|| {
+        let rule = |category: &'static str, pattern: String| CategoryRule {
+            category,
+            confidence: WEAK_SIGNAL_SCORE,
+            pattern: Regex::new(&pattern).expect("a vocabulary rule is a valid regex"),
+        };
+        vec![
+            rule(
+                "VIOLENCE_OR_THREAT",
+                format!(r"(?i)\b{VIOLENT_ACT}\b"),
+            ),
+            rule("HARASSMENT_OR_ABUSE", format!(r"(?i)\b{DEMEANING}\b")),
+            rule("GRAPHIC", format!(r"(?i)\b{GORE}\b")),
+        ]
+    })
+}
+
+/// The confidence a set of evidence about ONE question adds up to.
+///
+/// The placements combine: each is its own evidence that the content is present, so
+/// the combined confidence is the complement of the product of their complements — at
+/// least as large as the strongest single placement and rising with every further
+/// one, which is what makes a reported score a continuous confidence rather than one
+/// of the rungs a single placement weighs. The weak material combines the same way
+/// among itself and is then CAPPED at [`WEAK_MATERIAL_CEILING`], so no amount of it
+/// reaches a placement. The room a finite reading leaves is the FLOOR: it is one
+/// observation about this segment rather than one more piece of evidence, so it is
+/// never combined with itself.
+fn confidence_of<'a>(
+    evidence: impl Iterator<Item = &'a Placement>,
+    residual: f32,
+) -> f32 {
+    let (mut placed, mut touched) = (1.0f32, 1.0f32);
+    for piece in evidence {
+        if piece.weak {
+            touched *= 1.0 - piece.confidence;
+        } else {
+            placed *= 1.0 - piece.confidence;
+        }
     }
-    any.then(|| (1.0 - not_present).clamp(0.0, 1.0))
+    let weak = (1.0 - touched).clamp(0.0, WEAK_MATERIAL_CEILING);
+    let confidence = 1.0 - placed * (1.0 - weak);
+    confidence.clamp(residual, 1.0)
 }
 
 /// Analyse one text segment into the modelled per-string result.
 ///
 /// `Labels` is the per-type score vector [`REPORTED_CONTENT_TYPES`] describes: one
-/// entry for EVERY modelled content type, in that order, carrying the confidence
-/// everything the analysers placed of that type adds up to — zero for a type they
-/// placed nothing of, which is a confidence the modelled range admits ("value range
-/// is zero to one") and not a missing member. `Toxicity` is the overall confidence
-/// that the string carries toxic content of ANY type: the same combination over
-/// every type's confidence. That makes it at least as large as the strongest single
-/// type, larger when several types are placed, and zero for a string nothing was
-/// placed in.
+/// entry for EVERY modelled content type, in that order, carrying what everything the
+/// analysers placed of that type and the weak material they read beside it adds up to
+/// ([`confidence_of`]), and never less than the room a finite reading of the segment
+/// leaves ([`absence_residual`]). Every entry is therefore strictly inside (0, 1] —
+/// "value range is zero to one" — and a type nothing was placed of is reported as the
+/// negligible possibility it is rather than as a certainty no analysis produced.
+///
+/// `Toxicity` is the overall confidence that the string carries toxic content of ANY
+/// type: every placement, of whatever type, is independent evidence for it, so they
+/// combine, which makes it at least as large as the strongest single type and larger
+/// when several types are placed.
 fn analyse_segment(text: &str) -> ToxicLabels {
     let placed = placements(text);
+    let residual = absence_residual(text);
 
     let labels: Vec<ToxicContent> = REPORTED_CONTENT_TYPES
         .iter()
         .map(|name| ToxicContent {
             name: Some((*name).to_string()),
-            score: Some(
-                combined_confidence(
-                    placed
-                        .iter()
-                        .filter(|placement| placement.name == *name)
-                        .map(|placement| placement.confidence),
-                )
-                .unwrap_or(0.0),
-            ),
+            score: Some(confidence_of(
+                placed.iter().filter(|placement| placement.name == *name),
+                residual,
+            )),
         })
         .collect();
 
-    let toxicity =
-        combined_confidence(labels.iter().filter_map(|label| label.score)).unwrap_or(0.0);
+    let toxicity = confidence_of(placed.iter(), residual);
 
     ToxicLabels {
         labels: Some(labels),

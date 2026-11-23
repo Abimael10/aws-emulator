@@ -758,6 +758,205 @@ async fn a_mention_carries_one_distribution_concentrated_on_its_label() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Score and GroupScore are the confidences the mention's and the grouping's own
+// evidence leaves
+// ---------------------------------------------------------------------------
+
+/// `TargetedSentimentMention$Score` is "model confidence that the entity is relevant"
+/// and `$GroupScore` "the confidence that all the entities mentioned in the group
+/// relate to the same entity" — both about THIS mention and THIS grouping, so both
+/// follow what placed them: the cue, how much of the mention's characters it accounts
+/// for, and for the grouping how much of the two forms agree and how far apart they
+/// stand.
+///
+/// The rows differ along what the rule generalises over: which cue places the mention
+/// (a recognised name, an honorific, bare capitalisation, a determiner-headed common
+/// noun, a pronoun, a numeral), the LENGTH of the mention, and what links a second
+/// mention to the first (the same form, a shared surname, a pronoun one sentence away
+/// and the same pronoun three sentences away). A confidence read off a table of
+/// per-rule constants would repeat across rows that carry plainly different evidence.
+#[tokio::test]
+async fn a_mention_confidence_follows_the_evidence_that_placed_it() {
+    let comprehend = Comprehend::new();
+
+    let rows = [
+        ("a recognised company name", "Amazon refunded the fee."),
+        (
+            "a longer recognised company name",
+            "Bank of America refunded the fee.",
+        ),
+        ("an honorific and a name", "Dr Okonkwo explained it."),
+        (
+            "a capitalised span no lexicon names",
+            "Zyrtex Qualmon shipped it.",
+        ),
+        (
+            "a determiner-headed common noun",
+            "The service was available.",
+        ),
+        ("a pronoun", "Maria wrote it. She shipped it."),
+        (
+            "a pronoun three sentences on",
+            "Maria wrote it. The build ran. The parcel arrived. She shipped it.",
+        ),
+        (
+            "the same name written twice",
+            "Amazon refunded the fee. Amazon apologised.",
+        ),
+        (
+            "a surname joining a full name",
+            "Alice Lennox filed it. Lennox signed it.",
+        ),
+    ];
+
+    /// One mention, as the members this suite reads of it.
+    #[derive(Debug, Clone)]
+    struct Read {
+        case: &'static str,
+        text: String,
+        score: f64,
+        group_score: f64,
+    }
+
+    let mut read: Vec<Read> = Vec::new();
+    for (case, text) in rows {
+        let output = analyse(&comprehend, text).await;
+        assert_invariants(case, text, &output);
+        for entity in output["Entities"].as_array().cloned().unwrap_or_default() {
+            for mention in entity["Mentions"].as_array().cloned().unwrap_or_default() {
+                let score = mention["Score"].as_f64().unwrap_or(f64::NAN);
+                let group_score = mention["GroupScore"].as_f64().unwrap_or(f64::NAN);
+                assert!(
+                    score > 0.0 && score < 1.0,
+                    "case {case:?}: expected a Score strictly inside (0, 1), got {score} \
+                     in {mention}"
+                );
+                assert!(
+                    group_score > 0.0 && group_score <= 1.0,
+                    "case {case:?}: expected a GroupScore in (0, 1], got {group_score} \
+                     in {mention}"
+                );
+                read.push(Read {
+                    case,
+                    text: mention["Text"].as_str().unwrap_or_default().to_string(),
+                    score,
+                    group_score,
+                });
+            }
+        }
+    }
+
+    // No ladder: four per-rule constants would collapse every mention of the table
+    // onto four values, and two more onto every grouping.
+    let scores = crate::batch_inference_calibration::distinct(read.iter().map(|one| one.score));
+    assert!(
+        scores >= 6,
+        "expected the mention confidences to follow each mention's own evidence, got \
+         {scores} distinct values across {} mentions: {read:?}",
+        read.len()
+    );
+
+    let mention = |case: &str, wanted: &str| -> Read {
+        read.iter()
+            .find(|one| one.case == case && one.text == wanted)
+            .cloned()
+            .unwrap_or_else(|| panic!("no mention {wanted:?} for case {case:?} in {read:?}"))
+    };
+
+    // More evidence, more confidence — each pair differs in exactly one thing about
+    // the evidence that placed the mention.
+    for (stronger, weaker, why) in [
+        (
+            mention("a longer recognised company name", "Bank of America"),
+            mention("a recognised company name", "Amazon"),
+            "a lexicon naming more of the mention's characters is less likely to be a \
+             coincidence",
+        ),
+        (
+            mention("an honorific and a name", "Okonkwo"),
+            mention("a capitalised span no lexicon names", "Zyrtex Qualmon"),
+            "an honorific says what kind of thing is named there; a capital alone does \
+             not",
+        ),
+        (
+            mention("a pronoun", "She"),
+            mention("a determiner-headed common noun", "service"),
+            "a closed-class word the lexicon spells out names the whole mention, where \
+             a common noun under a determiner is as much the generic reading",
+        ),
+    ] {
+        assert!(
+            stronger.score > weaker.score,
+            "case {:?} vs {:?}: {why}, so expected a higher Score, got {} against {}",
+            stronger.case,
+            weaker.case,
+            stronger.score,
+            weaker.score
+        );
+    }
+
+    // The grouping link follows ITS own evidence: an identical form agrees character
+    // for character, a shared surname leaves the given name unaccounted for, and a
+    // pronoun's link decays with the sentences between it and its antecedent.
+    let same_form = mention("the same name written twice", "Amazon").group_score;
+    let partial_name = mention("a surname joining a full name", "Lennox").group_score;
+    let near_pronoun = mention("a pronoun", "She").group_score;
+    let far_pronoun = mention("a pronoun three sentences on", "She").group_score;
+    assert!(
+        same_form > partial_name,
+        "expected an identical form to group more confidently than a shared surname, \
+         got {same_form} against {partial_name}"
+    );
+    assert!(
+        near_pronoun > far_pronoun,
+        "expected a pronoun's link to its antecedent to weaken with the sentences \
+         between them, got {near_pronoun} against {far_pronoun}"
+    );
+    assert!(
+        far_pronoun > 0.0,
+        "expected a distant antecedent to stay a possible reading, got {far_pronoun}"
+    );
+
+    // One recognition, one confidence: a mention this service's entity recogniser
+    // placed is reported with the very confidence `DetectEntities` reports for the
+    // same span, so the two operations cannot disagree about how sure the service is.
+    for (case, text, name) in [
+        ("a recognised company name", "Amazon refunded the fee.", "Amazon"),
+        (
+            "a longer recognised company name",
+            "Bank of America refunded the fee.",
+            "Bank of America",
+        ),
+        (
+            "a surname joining a full name",
+            "Alice Lennox filed it. Lennox signed it.",
+            "Alice Lennox",
+        ),
+    ] {
+        let entities = comprehend
+            .ok(
+                "DetectEntities",
+                &json!({ "Text": text, "LanguageCode": "en" }),
+            )
+            .await;
+        let recognised = entities["Entities"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .find(|entity| entity["Text"].as_str() == Some(name))
+            .and_then(|entity| entity["Score"].as_f64())
+            .unwrap_or_else(|| panic!("case {case:?}: no {name:?} entity in {entities}"));
+        let targeted = mention(case, name).score;
+        assert!(
+            (recognised - targeted).abs() < 1e-9,
+            "case {case:?}: expected the mention of {name:?} to carry the confidence the \
+             recogniser read it with ({recognised}), got {targeted}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_document_with_no_word_reports_no_entity() {
     let comprehend = Comprehend::new();

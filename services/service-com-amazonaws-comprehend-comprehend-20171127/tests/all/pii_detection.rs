@@ -191,6 +191,11 @@ const DOCUMENTS: &[(&str, &str, &[&str])] = &[
     ("voter id", "voter id ABC1234567", &["IN_VOTER_NUMBER"]),
     ("nrega job card", "NREGA job card number UP1234567", &["IN_NREGA"]),
     (
+        "a place name written without a street line",
+        "The parcel went to Portland last week.",
+        &["ADDRESS"],
+    ),
+    (
         "several categories at once",
         "My name is Jane Roe, write to jane.roe@example.com or call 206-555-0147; \
          the file lists 123-45-6789.",
@@ -631,4 +636,260 @@ async fn an_absent_or_empty_text_is_refused_by_the_modelled_length_floor() {
             "case {case:?}: expected 400, got {status}: {response}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The confidence a PII detection carries is the one ITS OWN evidence leaves
+// ---------------------------------------------------------------------------
+
+/// `(case, document, the modelled PiiEntityType, what the detection rests on)`.
+///
+/// `PiiEntity$Score` and `EntityLabel$Score` are both documented as "the level of
+/// confidence that Amazon Comprehend has in the accuracy of the detection", so the
+/// value belongs to the DETECTION: what the recognizer verified about the value, how
+/// many of its characters that accounts for, what the document writes beside it, and
+/// how often the document writes it. The rows differ along each of those in turn —
+/// the kind of verification (a published check digit, a distinctive form, the
+/// document's own label), the length of the value, and the number of writings — so a
+/// confidence read off a table of per-class constants would repeat across rows that
+/// carry plainly different evidence.
+///
+/// Every value is written in the form its defining authority publishes and none is a
+/// value the issue cited.
+const CONFIDENCES: &[(&str, &str, &str, &str)] = &[
+    (
+        "a card number its Luhn check digit confirms",
+        "Charge the card 4111111111111111 for the balance.",
+        "CREDIT_DEBIT_NUMBER",
+        "ISO/IEC 7812-1 check digit over sixteen characters",
+    ),
+    (
+        "an iban its mod-97 check confirms",
+        "Send it to GB82WEST12345698765432 before Friday.",
+        "INTERNATIONAL_BANK_ACCOUNT_NUMBER",
+        "ISO 13616 check over twenty-two characters",
+    ),
+    (
+        "a short e-mail address its form fixes",
+        "Write to jo@ex.com today.",
+        "EMAIL",
+        "an RFC 5322 addr-spec of nine characters",
+    ),
+    (
+        "a longer e-mail address its form fixes",
+        "Write to jane.roe@example.co.uk today.",
+        "EMAIL",
+        "an RFC 5322 addr-spec of twenty-four characters",
+    ),
+    (
+        "the same e-mail address written twice",
+        "Write to jane.roe@example.co.uk today, then to jane.roe@example.co.uk again.",
+        "EMAIL",
+        "the same form, corroborated by a second writing",
+    ),
+    (
+        "a card security code the document labels",
+        "The CVV is 123 on the back.",
+        "CREDIT_DEBIT_CVV",
+        "three ambiguous digits admitted by a short label",
+    ),
+    (
+        "an account number the document labels at length",
+        "The bank account number is 123456789 on file.",
+        "BANK_ACCOUNT_NUMBER",
+        "nine ambiguous digits admitted by a spelled-out label",
+    ),
+    (
+        "a name standing in running text",
+        "Contact John Smith at the office.",
+        "NAME",
+        "the shape of a personal name in a person-bearing position",
+    ),
+];
+
+/// The `Score` of the one entity of `entity_type` the document carries.
+async fn score_of(comprehend: &Comprehend, case: &str, text: &str, entity_type: &str) -> f64 {
+    let output = comprehend
+        .ok(
+            "DetectPiiEntities",
+            &json!({ "Text": text, "LanguageCode": "en" }),
+        )
+        .await;
+    let found: Vec<f64> = output["Entities"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case:?}: expected Entities, got {output}"))
+        .iter()
+        .filter(|entity| entity["Type"].as_str() == Some(entity_type))
+        .map(|entity| entity["Score"].as_f64().unwrap_or(f64::NAN))
+        .collect();
+    assert!(
+        !found.is_empty(),
+        "case {case:?}: expected a {entity_type} entity, got {output}"
+    );
+    for score in &found {
+        assert!(
+            *score > 0.0 && *score < 1.0,
+            "case {case:?}: expected a Score strictly inside (0, 1) for {entity_type}, \
+             got {score} in {output}"
+        );
+    }
+    // Where the document writes the value more than once, every writing carries the
+    // same evidence, so the confidence does not depend on which one a caller reads.
+    found.iter().copied().fold(0.0, f64::max)
+}
+
+#[tokio::test]
+async fn a_pii_score_is_the_confidence_the_detections_own_evidence_leaves() {
+    let comprehend = Comprehend::new();
+    let mut scored: Vec<(&str, f64)> = Vec::new();
+    for (case, text, entity_type, _) in CONFIDENCES {
+        scored.push((case, score_of(&comprehend, case, text, entity_type).await));
+    }
+
+    // No ladder: the rows differ in what their detections rest on, so the confidences
+    // differ too. Three constants — one per evidence class — would collapse these
+    // eight rows onto three values.
+    let spread = crate::batch_inference_calibration::distinct(
+        scored.iter().map(|(_, score)| *score),
+    );
+    assert!(
+        spread >= 6,
+        "expected the confidences to follow each detection's own evidence, got {spread} \
+         distinct values across {} rows: {scored:?}",
+        scored.len()
+    );
+
+    let score = |wanted: &str| -> f64 {
+        scored
+            .iter()
+            .find(|(case, _)| *case == wanted)
+            .map(|(_, score)| *score)
+            .unwrap_or_else(|| panic!("no score for case {wanted:?}"))
+    };
+
+    // More evidence, more confidence — each pair below differs in exactly one thing
+    // about the evidence.
+    for (stronger, weaker, why) in [
+        (
+            "a card number its Luhn check digit confirms",
+            "a card security code the document labels",
+            "a value its own check digit confirms is a surer detection than ambiguous \
+             digits a label admits",
+        ),
+        (
+            "a longer e-mail address its form fixes",
+            "a short e-mail address its form fixes",
+            "the same form fixing more characters is less likely to be a coincidence",
+        ),
+        (
+            "the same e-mail address written twice",
+            "a longer e-mail address its form fixes",
+            "a document that writes the value again corroborates the reading",
+        ),
+        (
+            "an account number the document labels at length",
+            "a card security code the document labels",
+            "a label that spells out what the value is says more than an abbreviation \
+             beside three digits",
+        ),
+    ] {
+        assert!(
+            score(stronger) > score(weaker),
+            "case {stronger:?} vs {weaker:?}: {why}, so expected a higher confidence, \
+             got {} against {}",
+            score(stronger),
+            score(weaker)
+        );
+    }
+
+    // A detection whose own check digit accounts for every character of the value is
+    // an unambiguous one, which is where a redaction client's gate sits; one admitted
+    // by a bare label stays materially below it.
+    assert!(
+        score("an iban its mod-97 check confirms") > 0.99,
+        "expected a checksum-confirmed value near certainty, got {}",
+        score("an iban its mod-97 check confirms")
+    );
+    assert!(
+        score("a card security code the document labels") < 0.95,
+        "expected three ambiguous digits under a short label below a near-certain gate, \
+         got {}",
+        score("a card security code the document labels")
+    );
+}
+
+#[tokio::test]
+async fn a_label_confidence_combines_the_detections_that_support_it() {
+    let comprehend = Comprehend::new();
+
+    // The rows differ in how many detections of the one type the document carries:
+    // each is its own evidence that the document CONTAINS that type, which is the
+    // detection `EntityLabel$Score` is about.
+    let rows = [
+        (
+            "one e-mail address",
+            "Write to jane.roe@example.co.uk today.",
+            1usize,
+        ),
+        (
+            "two e-mail addresses",
+            "Write to jane.roe@example.co.uk and to john.doe@example.co.uk today.",
+            2,
+        ),
+        (
+            "three e-mail addresses",
+            "Write to jane.roe@example.co.uk, to john.doe@example.co.uk or to \
+             ada.k@example.co.uk today.",
+            3,
+        ),
+    ];
+
+    let mut by_count: Vec<(&str, usize, f64)> = Vec::new();
+    for (case, text, count) in rows {
+        let output = comprehend
+            .ok(
+                "ContainsPiiEntities",
+                &json!({ "Text": text, "LanguageCode": "en" }),
+            )
+            .await;
+        let label = output["Labels"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: expected Labels, got {output}"))
+            .iter()
+            .find(|label| label["Name"].as_str() == Some("EMAIL"))
+            .cloned()
+            .unwrap_or_else(|| panic!("case {case:?}: expected an EMAIL label, got {output}"));
+        let score = label["Score"].as_f64().unwrap_or(f64::NAN);
+
+        // The label's confidence is at least as high as the best single detection of
+        // the type: every further detection is further evidence for the same claim.
+        let strongest = score_of(&comprehend, case, text, "EMAIL").await;
+        assert!(
+            score + 1e-9 >= strongest && score < 1.0 + f64::EPSILON,
+            "case {case:?}: expected a label confidence at or above the strongest \
+             detection {strongest}, got {score}"
+        );
+        by_count.push((case, count, score));
+    }
+
+    for pair in by_count.windows(2) {
+        let (weaker_case, weaker_count, weaker) = pair[0];
+        let (stronger_case, stronger_count, stronger) = pair[1];
+        assert!(
+            stronger > weaker,
+            "case {stronger_case:?} vs {weaker_case:?}: {stronger_count} detections are \
+             more evidence that the document contains the type than {weaker_count}, so \
+             expected a higher confidence, got {stronger} against {weaker}"
+        );
+    }
+
+    // A document that spells the category out several times leaves the detection all
+    // but certain, which is where the cheap pre-filter in front of redaction has to
+    // sit for a client's threshold to route the document at all.
+    let (case, _, saturated) = by_count[by_count.len() - 1];
+    assert!(
+        saturated > 0.999,
+        "case {case:?}: expected an unambiguous document to saturate the label \
+         confidence, got {saturated}"
+    );
 }
