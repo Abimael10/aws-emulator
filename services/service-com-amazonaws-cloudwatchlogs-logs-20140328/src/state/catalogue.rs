@@ -675,17 +675,26 @@ pub const MAX_IMPORT_TASKS: usize = 1_000;
 pub const IMPORT_SOURCE_NOT_ACTIVE_MESSAGE: &str =
     "The specified source must be in an ACTIVE state.";
 
-/// The refusal `CreateImportTask` answers when the `importSourceArn` it is given resolves to
-/// no CloudTrail Lake event data store — a value that is no event data store ARN at all as
-/// much as one no store answers to.
+/// The refusal `CreateImportTask` answers when the `importSourceArn` it is given is in no
+/// form a CloudTrail Lake event data store is named by: an ARN of another resource kind or
+/// another service, a value that is not an ARN at all, or an event data store ARN whose
+/// resource suffix is no identifier that service mints.
 ///
 /// CloudWatch Logs reads that member as an event data store ARN and states what it could not
 /// make of the value handed to it, so the refusal is about the REQUEST's parameter: the text
 /// is fixed for the condition and the one value it interpolates is the caller's own
-/// `importSourceArn`, echoed verbatim, so an operator can see which ARN was rejected.
+/// `importSourceArn`, echoed verbatim, so an operator can see which ARN was rejected. A
+/// WELL-FORMED ARN no store answers to is a missing resource rather than a bad value, and is
+/// refused as one ([`EVENT_DATA_STORE_RESOURCE_KIND`]).
 pub fn invalid_event_data_store_arn_message(source_arn: &str) -> String {
     format!("Invalid Event Data Store ARN: {source_arn}")
 }
+
+/// The resource kind `CreateImportTask` names in the missing-resource refusal it answers when
+/// the well-formed `importSourceArn` it is given resolves to no event data store the owning
+/// service holds ([`super::resource_not_found_message`]) — the resource the import would have
+/// read its events from, which is what the caller has to create for the import to start.
+pub const EVENT_DATA_STORE_RESOURCE_KIND: &str = "event data store";
 
 /// The refusal `CreateImportTask` answers when the `importFilter` it is given bounds the
 /// event time at both ends in the wrong order: the operation documents the constraint as a

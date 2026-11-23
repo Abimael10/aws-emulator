@@ -10,10 +10,12 @@
 //! CloudWatch Logs.
 //!
 //! The rule under test: `CreateImportTask` starts an import only from a data source the
-//! service that OWNS it holds in a state it can be read from — an `importSourceArn` that
-//! resolves to no event data store is a defect in that parameter
-//! (`InvalidParameterException`, `Invalid Event Data Store ARN: <the value sent>`), a store
-//! queued for deletion is `InvalidOperationException` — and an accepted create persists the
+//! service that OWNS it holds in a state it can be read from, and each way that can fail is
+//! refused as the condition it is — an `importSourceArn` in no form an event data store is
+//! named by is a defect in that parameter (`InvalidParameterException`, `Invalid Event Data
+//! Store ARN: <the value sent>`), a well-formed one no store answers to is a missing resource
+//! (`ResourceNotFoundException`), a store queued for deletion is `InvalidOperationException`
+//! — and an accepted create persists the
 //! import `IN_PROGRESS`
 //! with the managed destination log group it reports, so every value it hands back
 //! (`importId`, `importDestinationArn`, `creationTime`) is read back through
@@ -26,10 +28,12 @@
 //!
 //! The table spans what the rule generalises over rather than one request: each form an
 //! `importFilter` takes (absent, one bound, both bounds, both equal), several sources, a role
-//! ARN of either form, and — for the refusals — a source ARN that names no store, one that
-//! names another resource kind of the owning service, one that names a resource of another
-//! service, one that names a resource of this service, one carrying no store id at all, one
-//! that is not an ARN at all, an empty one, and a store that is on its way out.
+//! ARN of either form, and — for the refusals — a well-formed source ARN that names no store
+//! in this account and Region and one that names none in another, a source ARN whose id is no
+//! identifier the owning service mints and one whose id is a UUID in another spelling, one
+//! that names another resource kind of the owning service, one that names a resource of
+//! another service, one that names a resource of this service, one carrying no store id at
+//! all, one that is not an ARN at all, an empty one, and a store that is on its way out.
 
 use std::sync::Arc;
 
@@ -475,6 +479,90 @@ async fn two_imports_from_one_source_share_the_managed_destination() {
     );
 }
 
+/// `id` with every hexadecimal digit rotated to the next one and every other character left
+/// where it is: another identifier of exactly the same form, which is how a case names a store
+/// that does not exist without writing a value of a different shape.
+fn another_id(id: &str) -> String {
+    id.chars()
+        .map(|character| match character.to_digit(16) {
+            Some(digit) => ::std::char::from_digit((digit + 1) % 16, 16).unwrap_or(character),
+            None => character,
+        })
+        .collect()
+}
+
+/// Which of the two refusals a source carries is decided by what is wrong with it, over ONE
+/// store's ARN varied three ways: the ARN of a store the owning service really holds starts
+/// the import, that same ARN carrying another identifier of the same form names no store and
+/// is the missing-resource refusal, and that identifier written in a form the owning service
+/// never mints is the parameter refusal.
+///
+/// Nothing here is a value this suite invented: each refused ARN is the accepted one varied in
+/// the one respect its class turns on.
+#[tokio::test]
+async fn a_source_is_refused_as_absent_or_as_malformed_by_what_is_wrong_with_it() {
+    let case = "one store's ARN, varied";
+    let emulator = Emulator::new();
+    let source = emulator
+        .event_data_store(case, "lake-store-classified", true)
+        .await;
+    let id = store_id(&source).to_string();
+
+    // The store CloudTrail holds: the import starts from it.
+    let created = emulator
+        .logs_ok(
+            case,
+            OP,
+            &json!({"importSourceArn": source, "importRoleArn": ROLE_ARN}),
+        )
+        .await;
+    assert!(
+        created.get("importId").and_then(Value::as_str).is_some(),
+        "case {case:?}: the store's own ARN starts an import, got {created}"
+    );
+
+    // The same ARN naming another store of the same form — one the owning service holds
+    // nothing under.
+    let absent = source.replace(&id, &another_id(&id));
+    assert_ne!(
+        absent, source,
+        "case {case:?}: the varied ARN names another store, got {absent:?}"
+    );
+    let (code, message) = emulator
+        .logs_refusal(
+            case,
+            OP,
+            &json!({"importSourceArn": absent, "importRoleArn": ROLE_ARN}),
+        )
+        .await;
+    assert_eq!(
+        (code.as_str(), message.as_str()),
+        ("ResourceNotFoundException", SOURCE_ABSENT),
+        "case {case:?}: a well-formed ARN no store answers to is the missing-resource \
+         refusal, got {code:?}: {message:?}"
+    );
+
+    // The same identifier in a spelling the owning service never mints: the value itself is
+    // not one of its event data store ARNs.
+    let malformed = source.replace(&id, &id.to_uppercase());
+    let (code, message) = emulator
+        .logs_refusal(
+            case,
+            OP,
+            &json!({"importSourceArn": malformed, "importRoleArn": ROLE_ARN}),
+        )
+        .await;
+    assert_eq!(
+        (code.as_str(), message.as_str()),
+        (
+            "InvalidParameterException",
+            invalid_source(&malformed).as_str()
+        ),
+        "case {case:?}: an ARN in no form a store is named by is the parameter refusal, \
+         got {code:?}: {message:?}"
+    );
+}
+
 /// One refused-create case: the request it sends, and the error code and message it must be
 /// refused with.
 struct Refused {
@@ -484,13 +572,20 @@ struct Refused {
     message: String,
 }
 
-/// The refusal an `importSourceArn` that resolves to no CloudTrail Lake event data store
-/// carries: the fixed sentence CloudWatch Logs states an unusable event data store ARN in,
-/// with the caller's own value echoed verbatim. Spelled out here rather than read from the
-/// crate, so the wording is pinned by the test.
+/// The refusal an `importSourceArn` in no form an event data store is named by carries: the
+/// fixed sentence CloudWatch Logs states an unusable event data store ARN in, with the
+/// caller's own value echoed verbatim. Spelled out here rather than read from the crate, so
+/// the wording is pinned by the test.
 fn invalid_source(source_arn: &str) -> String {
     format!("Invalid Event Data Store ARN: {source_arn}")
 }
+
+/// The refusal a WELL-FORMED `importSourceArn` no event data store answers to carries: the
+/// service states the kind of resource that is missing, in the sentence form the model
+/// documents for `ResourceNotFoundException` ("The specified resource does not exist.").
+/// Spelled out for the same reason as [`invalid_source`], and carrying none of the request:
+/// what is missing is the resource, not a value to echo.
+const SOURCE_ABSENT: &str = "The specified event data store does not exist.";
 
 /// The refusal a member that is not an ARN at all carries, which is the validation-error
 /// template this service refuses an unparsable ARN with.
@@ -510,6 +605,9 @@ async fn a_create_the_service_cannot_start_is_refused_and_persists_nothing() {
         .await;
 
     let cases = vec![
+        // The two rows the MISSING RESOURCE is: an ARN in the form the owning service names
+        // one of its event data stores by, which it holds no store under. Nothing about the
+        // value is wrong, so a caller that creates that store can start the import.
         Refused {
             case: "a well-formed event data store ARN no store answers to",
             request: json!({
@@ -518,22 +616,46 @@ async fn a_create_the_service_cannot_start_is_refused_and_persists_nothing() {
                      11111111-1111-1111-1111-111111111111",
                 "importRoleArn": ROLE_ARN,
             }),
-            code: "InvalidParameterException",
-            message: invalid_source(
-                "arn:aws:cloudtrail:eu-west-2:123456789012:eventdatastore/\
-                 11111111-1111-1111-1111-111111111111",
-            ),
+            code: "ResourceNotFoundException",
+            message: SOURCE_ABSENT.to_string(),
         },
         Refused {
             case: "an event data store ARN of another account and Region no store answers to",
             request: json!({
                 "importSourceArn":
-                    "arn:aws:cloudtrail:ap-southeast-1:210987654321:eventdatastore/elsewhere",
+                    "arn:aws:cloudtrail:ap-southeast-1:210987654321:eventdatastore/\
+                     f1d45bff-d0e3-4868-b5d9-2eb678aa32fb",
+                "importRoleArn": ROLE_ARN,
+            }),
+            code: "ResourceNotFoundException",
+            message: SOURCE_ABSENT.to_string(),
+        },
+        // Every row below is a value in NO FORM an event data store is named by, which is the
+        // other class: no store could ever answer to it.
+        Refused {
+            case: "an event data store ARN whose id is no identifier the owning service mints",
+            request: json!({
+                "importSourceArn":
+                    "arn:aws:cloudtrail:eu-west-2:123456789012:eventdatastore/lake-store-present",
                 "importRoleArn": ROLE_ARN,
             }),
             code: "InvalidParameterException",
             message: invalid_source(
-                "arn:aws:cloudtrail:ap-southeast-1:210987654321:eventdatastore/elsewhere",
+                "arn:aws:cloudtrail:eu-west-2:123456789012:eventdatastore/lake-store-present",
+            ),
+        },
+        Refused {
+            case: "an event data store ARN whose id is a UUID in another spelling",
+            request: json!({
+                "importSourceArn":
+                    "arn:aws:cloudtrail:eu-west-2:123456789012:eventdatastore/\
+                     F1D45BFF-D0E3-4868-B5D9-2EB678AA32FB",
+                "importRoleArn": ROLE_ARN,
+            }),
+            code: "InvalidParameterException",
+            message: invalid_source(
+                "arn:aws:cloudtrail:eu-west-2:123456789012:eventdatastore/\
+                 F1D45BFF-D0E3-4868-B5D9-2EB678AA32FB",
             ),
         },
         Refused {

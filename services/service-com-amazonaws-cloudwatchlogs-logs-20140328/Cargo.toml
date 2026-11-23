@@ -99,6 +99,10 @@ aws-sdk-cloudfront = { version = "1", default-features = false, features = ["rt-
 # source its `importSourceArn` names where CloudTrail holds it, with the `GetEventDataStore`
 # this client generates, over the same in-process callback.
 aws-sdk-cloudtrail = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# `uuid`: the resource suffix of an `importSourceArn` has to be an identifier CloudTrail gives
+# an event data store — the UUID its published ARN format carries — so the form is read by this
+# maintained parser rather than laid out here (`state::import_source`).
+uuid = "1"
 # A syslog configuration ingests through a VPC endpoint, and VPC endpoints are Amazon EC2's
 # records: the `vpcEndpointId` a `PutSyslogConfiguration` carries is resolved against that
 # service over the same in-process callback, with the `DescribeVpcEndpoints` this client
