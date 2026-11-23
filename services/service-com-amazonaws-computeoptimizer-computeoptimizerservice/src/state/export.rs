@@ -29,7 +29,9 @@
 //!   that names no member of the surface's recommendation at all. Where a surface's
 //!   recommendation carries members the shared findings-catalog row does not — the Amazon EC2
 //!   instance surface, whose options carry an instance type, the Aurora and RDS database
-//!   surface, whose catalog row records the database's own configuration, and the Amazon ECS
+//!   surface, whose catalog row records the database's own configuration, the Amazon EBS volume
+//!   surface, whose recommendation carries the volume's own configuration, the utilization
+//!   observed on it and the configuration its option would move it to, and the Amazon ECS
 //!   service surface, whose recommendation is computed from the Amazon ECS inventory and the
 //!   utilization published for it rather than recorded in that catalog at all — the row is built
 //!   from the observation the reader reports the recommendation from rather than from that
@@ -71,16 +73,17 @@ use super::{
     percentage_of, round_hundredths, stated_architectures, AnalysedResource, AnalyzedAutoScalingGroup,
     ComAmazonawsComputeoptimizerComputeoptimizerserviceState, EffectivePreferences, ExportJob,
     GroupConfiguration, IdleResourceAnalysis, InstanceConfiguration, ObservedInstance,
-    ObservedLicensedInstance, CURRENCY_USD, IDLE_FALSE, IDLE_TRUE,
+    ObservedLicensedInstance, ObservedVolume, CURRENCY_USD, IDLE_FALSE, IDLE_TRUE,
     RESOURCE_TYPE_AUTO_SCALING_GROUP, RESOURCE_TYPE_EBS_VOLUME, RESOURCE_TYPE_EC2_INSTANCE,
     RESOURCE_TYPE_ECS_SERVICE, RESOURCE_TYPE_IDLE, RESOURCE_TYPE_LAMBDA_FUNCTION,
     RESOURCE_TYPE_LICENSE, RESOURCE_TYPE_RDS_DB_INSTANCE, SAVINGS_ESTIMATION_SOURCE,
 };
 use crate::ops::types::{
-    DBStorageConfiguration, ECSServiceRecommendation, MemorySizeConfiguration,
-    RDSDBRecommendation, RDSDBUtilizationMetric, SavingsOpportunity,
-    EXPORTABLE_AUTO_SCALING_GROUP_FIELD_VALUES, EXPORTABLE_IDLE_FIELD_VALUES,
-    EXPORTABLE_INSTANCE_FIELD_VALUES, EXPORTABLE_R_D_S_D_B_FIELD_VALUES,
+    DBStorageConfiguration, EBSUtilizationMetric, ECSServiceRecommendation,
+    MemorySizeConfiguration, RDSDBRecommendation, RDSDBUtilizationMetric, SavingsOpportunity, Tag,
+    VolumeConfiguration, VolumeRecommendation, EXPORTABLE_AUTO_SCALING_GROUP_FIELD_VALUES,
+    EXPORTABLE_IDLE_FIELD_VALUES, EXPORTABLE_INSTANCE_FIELD_VALUES,
+    EXPORTABLE_R_D_S_D_B_FIELD_VALUES, EXPORTABLE_VOLUME_FIELD_VALUES,
     EXPORTABLE_E_C_S_SERVICE_FIELD_VALUES,
 };
 
@@ -211,11 +214,15 @@ pub struct ExportPlan {
     /// type's export, which no Amazon ECS service row belongs to.
     pub analysed_ecs_services: Vec<ECSServiceRecommendation>,
     /// The Amazon EBS volumes the account held an analysis for when the export was created
-    /// ([`super::analysed_volumes`]): the volumes of its own Amazon EC2 inventory. They are
-    /// resolved with the plan, for the same reason the databases are, so an exported file holds
-    /// exactly the volumes `GetEBSVolumeRecommendations` reported at that moment. Empty for
-    /// every other resource type's export, which no volume row belongs to.
-    pub analysed_volumes: Vec<AnalysedResource>,
+    /// ([`super::analysed_volumes`]): the volumes of its own Amazon EC2 inventory, each with the
+    /// configuration and the utilization samples a recommendation for it is computed from. They
+    /// are resolved with the plan, for the same reason the databases are, so an exported file
+    /// holds exactly the volumes `GetEBSVolumeRecommendations` reported at that moment. The
+    /// OBSERVATION is held rather than the findings-catalog projection of it, because a volume's
+    /// recommendation carries members that catalog row does not
+    /// ([`ObservedVolume::to_recommendation`]). Empty for every other resource type's export,
+    /// which no volume row belongs to.
+    pub analysed_volumes: Vec<ObservedVolume>,
     /// The Lambda function versions the account held an analysis for when the export was
     /// created ([`super::analysed_functions`]): the versions of its own AWS Lambda inventory.
     /// They are resolved with the plan, for the same reason the databases are, so an exported
@@ -621,14 +628,12 @@ pub fn create_export_job<Eng: Send + Sync + 'static, F: ExportFilter>(
             Vec::new()
         },
         // The volumes the account holds an analysis for, resolved through the ONE rule every
-        // EBS volume surface of this service reads them by, under the look-back period in
-        // force for them — so an export and a read of the same moment cannot differ on which
-        // volumes the account has or on what each one's analysis found.
+        // EBS volume surface of this service reads them by — so an export and a read of the
+        // same moment cannot differ on which volumes the account has or on what each one's
+        // analysis found. Each volume's recommendation is derived from the observation when the
+        // rows are built ([`ObservedVolume::to_recommendation`]), under the look-back period in
+        // force, exactly as the reader derives it.
         analysed_volumes: if request.resource_type == RESOURCE_TYPE_EBS_VOLUME {
-            let look_back_period = guard.effective_look_back_period(
-                RESOURCE_TYPE_EBS_VOLUME,
-                ::engine::emulator_account_id(),
-            );
             super::analysed_volumes(
                 &**engine,
                 &guard,
@@ -636,9 +641,6 @@ pub fn create_export_job<Eng: Send + Sync + 'static, F: ExportFilter>(
                 ::engine::emulator_account_id(),
                 now,
             )
-            .iter()
-            .map(|volume| volume.to_analysed_resource(&look_back_period))
-            .collect()
         } else {
             Vec::new()
         },
@@ -1083,15 +1085,13 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
                 &plan.cpu_vendor_architectures,
                 last_refresh,
             ),
-            // The account's analysed volumes, which the plan resolved: a volume row carries the
-            // columns the findings-catalog row records, exactly as a row of a resource type the
-            // catalog does hold rows for does.
-            RESOURCE_TYPE_EBS_VOLUME => self.rows_of_analysed_resources(
-                &plan.analysed_volumes.iter().collect::<Vec<_>>(),
-                RESOURCE_TYPE_EBS_VOLUME,
-                &plan.region,
-                last_refresh,
-            ),
+            // The account's analysed volumes, which the plan resolved: a volume's recommendation
+            // carries its own configuration, the utilization observed on it and the
+            // configuration its option would move it to — none of which is a column of the
+            // findings-catalog row — so the rows are built from that recommendation.
+            RESOURCE_TYPE_EBS_VOLUME => {
+                self.volume_export_rows(&plan.analysed_volumes, &plan.region, last_refresh)
+            }
             // The account's analysed function versions, which the plan resolved: a function
             // row carries the columns the findings-catalog row records, exactly as a row of a
             // resource type the catalog does hold rows for does.
@@ -1308,6 +1308,40 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
                 let recommendation =
                     self.rds_recommendation(resource, region, Some(requested_architectures));
                 rds_database_row(&recommendation, last_refresh)
+            })
+            .collect()
+    }
+
+    /// The export rows of the Amazon EBS volume analysis: one per analysed volume, carrying the
+    /// members `GetEBSVolumeRecommendations` reports for it ([`volume_row`]).
+    ///
+    /// A volume's recommendation carries the volume's own configuration, the utilization
+    /// observed on it, the configuration and performance risk of the option the analysis would
+    /// move it to and the volume's tags — none of which is a column of the findings-catalog row
+    /// every other findings reader shares, so this surface builds its rows from the
+    /// recommendation itself rather than from that row.
+    ///
+    /// `volumes` are the observed volumes the plan resolved ([`ExportPlan::analysed_volumes`]),
+    /// which is the SAME selection `GetEBSVolumeRecommendations` reads, and each recommendation
+    /// is derived under the look-back period in force for the account's volumes — the one that
+    /// reader resolves — so a file and a read of that moment hold the same volumes with the same
+    /// analysis behind every cell.
+    fn volume_export_rows(
+        &self,
+        volumes: &[ObservedVolume],
+        region: &str,
+        last_refresh: Option<f64>,
+    ) -> Vec<ExportRow> {
+        let account_id = ::engine::emulator_account_id();
+        let look_back_period =
+            self.effective_look_back_period(RESOURCE_TYPE_EBS_VOLUME, account_id);
+        let last_refresh_timestamp = last_refresh.map(::aws_smithy_types::DateTime::from_secs_f64);
+        volumes
+            .iter()
+            .map(|volume| {
+                let recommendation =
+                    volume.to_recommendation(region, &look_back_period, last_refresh_timestamp);
+                volume_row(&recommendation, last_refresh)
             })
             .collect()
     }
@@ -2012,19 +2046,7 @@ fn rds_database_row(recommendation: &RDSDBRecommendation, last_refresh: Option<f
         "LookbackPeriodInDays",
         recommendation.lookback_period_in_days,
     );
-    let tags: Vec<String> = recommendation
-        .tags
-        .iter()
-        .flatten()
-        .map(|tag| {
-            format!(
-                "{}={}",
-                tag.key.clone().unwrap_or_default(),
-                tag.value.clone().unwrap_or_default()
-            )
-        })
-        .collect();
-    put_list(&mut row, "Tags", &tags);
+    put_modelled_tags(&mut row, recommendation.tags.as_deref());
     // "The timestamp of when the DB instance recommendation was last generated": the instant
     // the recommendation reports where the analysis recorded one, and otherwise the instant
     // this account's analysis was last refreshed, which is what every other export file of
@@ -2148,6 +2170,242 @@ fn put_utilization_metrics(row: &mut ExportRow, prefix: &str, metrics: &[RDSDBUt
             metric.value,
         );
     }
+}
+
+/// One Amazon EBS volume recommendation as an export row: the value of every
+/// `ExportableVolumeField` the recommendation carries, taken from the member that field names.
+///
+/// `recommendation` is the one `GetEBSVolumeRecommendations` reports for the same observed
+/// volume, so an exported row and that reader's response cannot disagree about any column —
+/// including the look-back period in force, which decides the finding, the risks and the
+/// option.
+///
+/// The two PRICE columns name no member of a `VolumeRecommendation`: the recommendation reports
+/// what adopting its option saves rather than what either configuration costs, so each price is
+/// the monthly cost of that configuration under the one price table the savings themselves are
+/// computed from ([`super::volume_monthly_cost`]), and is empty for a volume type that table
+/// holds no price for — the same volume whose option then carries no savings figure.
+fn volume_row(recommendation: &VolumeRecommendation, last_refresh: Option<f64>) -> ExportRow {
+    let text = |member: &Option<String>| member.clone().unwrap_or_default();
+    let mut row = ExportRow::new();
+    put(&mut row, ACCOUNT_ID_COLUMN, text(&recommendation.account_id));
+    put(
+        &mut row,
+        arn_field_of(RESOURCE_TYPE_EBS_VOLUME),
+        text(&recommendation.volume_arn),
+    );
+    put(&mut row, "Finding", text(&recommendation.finding));
+    put(
+        &mut row,
+        "CurrentPerformanceRisk",
+        text(&recommendation.current_performance_risk),
+    );
+    put_number(
+        &mut row,
+        "LookbackPeriodInDays",
+        recommendation.look_back_period_in_days,
+    );
+    // The volume's own configuration, and whether it is the root volume of the instance it is
+    // attached to — which the field set names both as a column of that configuration and on its
+    // own, two columns the one member fills.
+    if let Some(configuration) = &recommendation.current_configuration {
+        put_volume_configuration(&mut row, CURRENT_VOLUME_CONFIGURATION, configuration);
+        if let Some(root) = configuration.root_volume {
+            put(&mut row, "RootVolume", root.to_string());
+            put(
+                &mut row,
+                &format!("{CURRENT_VOLUME_CONFIGURATION}RootVolume"),
+                root.to_string(),
+            );
+        }
+        put(
+            &mut row,
+            "CurrentMonthlyPrice",
+            monthly_price(configuration),
+        );
+    }
+    put_volume_utilization(
+        &mut row,
+        recommendation
+            .utilization_metrics
+            .as_deref()
+            .unwrap_or_default(),
+    );
+
+    // The volume option: the configuration the analysis would move the volume to, the risk it
+    // then runs and what adopting it saves. Each `RecommendationOptions*` field names ONE
+    // option, and this analysis reports one option per volume, so its columns go in the row of
+    // the volume it is of.
+    if let Some(option) = recommendation
+        .volume_recommendation_options
+        .iter()
+        .flatten()
+        .next()
+    {
+        if let Some(configuration) = &option.configuration {
+            put_volume_configuration(&mut row, VOLUME_OPTION_CONFIGURATION, configuration);
+            put(
+                &mut row,
+                "RecommendationOptionsMonthlyPrice",
+                monthly_price(configuration),
+            );
+        }
+        put_number(
+            &mut row,
+            "RecommendationOptionsPerformanceRisk",
+            option.performance_risk,
+        );
+        put_savings(&mut row, VOLUME_OPTION, option.savings_opportunity.as_ref());
+        if let Some(after) = &option.savings_opportunity_after_discounts {
+            put_savings_after_discounts(
+                &mut row,
+                VOLUME_OPTION,
+                after.savings_opportunity_percentage,
+                after
+                    .estimated_monthly_savings
+                    .as_ref()
+                    .map(|savings| (savings.currency.clone().unwrap_or_default(), savings.value)),
+            );
+        }
+    }
+
+    // The preferences the recommendation was generated under, as the recommendation itself
+    // reports them. The volume field set declares a column for each member an
+    // `EBSEffectiveRecommendationPreferences` carries.
+    if let Some(preferences) = &recommendation.effective_recommendation_preferences {
+        put(
+            &mut row,
+            "EffectiveRecommendationPreferencesLookBackPeriod",
+            text(&preferences.look_back_period),
+        );
+        put(
+            &mut row,
+            "EffectiveRecommendationPreferencesSavingsEstimationMode",
+            preferences
+                .savings_estimation_mode
+                .as_ref()
+                .map(|mode| text(&mode.source))
+                .unwrap_or_default(),
+        );
+    }
+    put_modelled_tags(&mut row, recommendation.tags.as_deref());
+    // "The timestamp of when the volume recommendation was last generated": the instant the
+    // recommendation reports where the analysis recorded one, and otherwise the instant this
+    // account's analysis was last refreshed, which is what every other export file of this
+    // service states.
+    let refreshed = recommendation
+        .last_refresh_timestamp
+        .map(|at| at.as_secs_f64())
+        .or(last_refresh);
+    if let Some(at) = refreshed {
+        put(&mut row, "LastRefreshTimestamp", timestamp(at));
+    }
+    row
+}
+
+/// The `ExportableVolumeField` prefix the columns of the volume's OWN configuration carry.
+const CURRENT_VOLUME_CONFIGURATION: &str = "CurrentConfiguration";
+
+/// The `ExportableVolumeField` prefix the columns of the configuration ONE recommendation option
+/// would move the volume to carry.
+const VOLUME_OPTION_CONFIGURATION: &str = "RecommendationOptionsConfiguration";
+
+/// The `ExportableVolumeField` prefix the columns of ONE volume recommendation option carry,
+/// named for the member of `VolumeRecommendation` that option is reported in.
+const VOLUME_OPTION: &str = "RecommendationOptions";
+
+/// What one month of a volume with this configuration costs, as a price column states it, or the
+/// empty cell for a volume type this service holds no price for ([`super::volume_monthly_cost`])
+/// — whose recommendation carries no savings figure either.
+fn monthly_price(configuration: &VolumeConfiguration) -> String {
+    super::volume_monthly_cost(configuration)
+        .map(|price| round_hundredths(price).to_string())
+        .unwrap_or_default()
+}
+
+/// The columns one `VolumeConfiguration` fills, under the `prefix` the field set names that
+/// configuration with ([`CURRENT_VOLUME_CONFIGURATION`] for the volume's own,
+/// [`VOLUME_OPTION_CONFIGURATION`] for the one its option would move it to): the type, the size
+/// and the baseline and burst performance that configuration delivers.
+///
+/// `rootVolume` is not among them: it is a property of the volume rather than of a
+/// configuration, so the field set declares a column for it only beside the volume's own
+/// configuration, which is where [`volume_row`] states it.
+fn put_volume_configuration(
+    row: &mut ExportRow,
+    prefix: &str,
+    configuration: &VolumeConfiguration,
+) {
+    put(
+        row,
+        &format!("{prefix}VolumeType"),
+        configuration.volume_type.clone().unwrap_or_default(),
+    );
+    put(
+        row,
+        &format!("{prefix}VolumeSize"),
+        configuration.volume_size.to_string(),
+    );
+    put(
+        row,
+        &format!("{prefix}VolumeBaselineIOPS"),
+        configuration.volume_baseline_iops.to_string(),
+    );
+    put(
+        row,
+        &format!("{prefix}VolumeBaselineThroughput"),
+        configuration.volume_baseline_throughput.to_string(),
+    );
+    put(
+        row,
+        &format!("{prefix}VolumeBurstIOPS"),
+        configuration.volume_burst_iops.to_string(),
+    );
+    put(
+        row,
+        &format!("{prefix}VolumeBurstThroughput"),
+        configuration.volume_burst_throughput.to_string(),
+    );
+}
+
+/// The utilization columns of a volume's observed metrics: each metric under the field that
+/// names it and the statistic it was measured with ([`utilization_field`]).
+fn put_volume_utilization(row: &mut ExportRow, metrics: &[EBSUtilizationMetric]) {
+    for metric in metrics {
+        let (Some(name), Some(statistic)) = (metric.name.as_deref(), metric.statistic.as_deref())
+        else {
+            continue;
+        };
+        put_number(
+            row,
+            &utilization_field(
+                EXPORTABLE_VOLUME_FIELD_VALUES,
+                "UtilizationMetrics",
+                name,
+                statistic,
+            ),
+            metric.value,
+        );
+    }
+}
+
+/// The `Tags` column of a row whose recommendation reports the resource's tags as the modelled
+/// `Tags` list: the tags as `key=value` pairs in one cell ([`LIST_SEPARATOR`]), so one
+/// exportable field is still one column. ONE spelling for every surface that reports that list,
+/// so no two export files state a resource's tags differently.
+fn put_modelled_tags(row: &mut ExportRow, tags: Option<&[Tag]>) {
+    let pairs: Vec<String> = tags
+        .unwrap_or_default()
+        .iter()
+        .map(|tag| {
+            format!(
+                "{}={}",
+                tag.key.clone().unwrap_or_default(),
+                tag.value.clone().unwrap_or_default()
+            )
+        })
+        .collect();
+    put_list(row, "Tags", &pairs);
 }
 
 /// One commercial software license recommendation as an export row: the members
@@ -2500,19 +2758,7 @@ fn ecs_service_row(
                 .unwrap_or_default(),
         );
     }
-    let tags: Vec<String> = recommendation
-        .tags
-        .iter()
-        .flatten()
-        .map(|tag| {
-            format!(
-                "{}={}",
-                tag.key.clone().unwrap_or_default(),
-                tag.value.clone().unwrap_or_default()
-            )
-        })
-        .collect();
-    put_list(&mut row, "Tags", &tags);
+    put_modelled_tags(&mut row, recommendation.tags.as_deref());
     // "The timestamp of when the Amazon ECS service recommendation was last generated": the
     // instant the recommendation reports — the newest observation it was computed from — and
     // otherwise the instant this account's analysis was last refreshed, which is what every

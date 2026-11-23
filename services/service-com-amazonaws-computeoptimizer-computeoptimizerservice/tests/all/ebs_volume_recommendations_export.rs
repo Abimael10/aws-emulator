@@ -13,19 +13,35 @@
 //! over the same `EBSFilters` vocabulary `GetEBSVolumeRecommendations` selects with. Each is
 //! checked over a TABLE of inputs rather than one call.
 //!
+//! What the exported FILE holds is asserted here too
+//! ([`the_export_file_states_what_the_reader_reports_for_every_volume`]): every cell of a
+//! volume's row is the value `GetEBSVolumeRecommendations` reports for the member that column
+//! names, under the look-back period in force, so a file and a read of the same analysis cannot
+//! disagree. The reader is the ORACLE there, so nothing restates a volume type, a figure or a
+//! tag this analysis happens to hold.
+//!
 //! The reader of what these calls record, `DescribeRecommendationExportJobs`, has its own
 //! suite (`recommendation_export_jobs.rs`); it is used here only to read a created job back.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use aws_smithy_types::date_time::Format;
+use aws_smithy_types::DateTime;
 use serde_json::{json, Value};
+use service_com_amazonaws_computeoptimizer_computeoptimizerservice::ops::types::{
+    EXPORTABLE_VOLUME_FIELD_VALUES, LOOK_BACK_PERIOD_PREFERENCE_VALUES,
+};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
     EXPORT_JOB_STEP, JOB_STATUS_COMPLETE, JOB_STATUS_IN_PROGRESS, JOB_STATUS_QUEUED,
     RESOURCE_TYPE_EBS_VOLUME,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{call, call_in_region, create_bucket, emulator, error_code, opt_in, ACCOUNT};
+use crate::harness::{
+    analysed_emulator, assert_figure, call, call_in_region, cell, create_bucket, emulator,
+    error_code, exported_recommendation_rows, metrics, opt_in, put_preference, ACCOUNT,
+};
 
 /// The operation under test.
 const EXPORT: &str = "ExportEBSVolumeRecommendations";
@@ -648,4 +664,404 @@ async fn the_export_and_the_reader_admit_the_same_filters() {
             );
         }
     }
+}
+
+/// How a cell holding several values separates them, so one exportable field is still one
+/// column.
+const LIST_SEPARATOR: &str = "|";
+
+/// The column a volume's own ARN lands in (`ExportableVolumeField$VolumeArn`).
+const ARN_COLUMN: &str = "VolumeArn";
+
+/// The column naming the baseline IOPS the exported recommendation option would provision,
+/// which is what shows the look-back period in force reached the file: a longer period reveals
+/// a higher peak, and the option has to carry it.
+const OPTION_IOPS_COLUMN: &str = "RecommendationOptionsConfigurationVolumeBaselineIOPS";
+
+/// Each member of a `VolumeConfiguration` the reader reports, with the `ExportableVolumeField`
+/// suffix the column naming it carries and whether its value is a figure
+/// (`smithy_query query="shape" shape="VolumeConfiguration,ExportableVolumeField"`). The
+/// prefixes are the two the field set declares a configuration under:
+/// `CurrentConfiguration…` for the volume's own and `RecommendationOptionsConfiguration…` for
+/// the one its option would move it to.
+const CONFIGURATION_MEMBERS: &[(&str, &str, bool)] = &[
+    ("volumeType", "VolumeType", false),
+    ("volumeSize", "VolumeSize", true),
+    ("volumeBaselineIOPS", "VolumeBaselineIOPS", true),
+    ("volumeBurstIOPS", "VolumeBurstIOPS", true),
+    ("volumeBaselineThroughput", "VolumeBaselineThroughput", true),
+    ("volumeBurstThroughput", "VolumeBurstThroughput", true),
+];
+
+/// The figure an export cell states for a value the reader reports unrounded: every derived
+/// figure in a file is rounded to two decimal places, so a comparison against the reader rounds
+/// its value the same way.
+fn rounded(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
+}
+
+/// The volume recommendations the READER reports, keyed by volume ARN — the oracle every
+/// assertion about the exported file is made against.
+async fn reported_volumes(
+    router: &MultiServiceRouter,
+    case: &str,
+) -> BTreeMap<String, Value> {
+    let request = json!({"maxResults": 100});
+    let (status, body) = call(router, "GetEBSVolumeRecommendations", request.clone()).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: reading {request} answered {status}: {body}"
+    );
+    let recommendations = body["volumeRecommendations"].as_array().unwrap_or_else(|| {
+        panic!("case {case:?}: the reader answers a recommendation list, got {body}")
+    });
+    assert!(
+        !recommendations.is_empty(),
+        "case {case:?}: the analysis holds volume recommendations, or the comparison proves \
+         nothing, got {body}"
+    );
+    recommendations
+        .iter()
+        .map(|recommendation| {
+            let arn = recommendation["volumeArn"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: every recommendation carries volumeArn, got {recommendation}")
+                })
+                .to_string();
+            (arn, recommendation.clone())
+        })
+        .collect()
+}
+
+/// Assert the cells of one configuration — the volume's own or its option's — against the
+/// members the reader reports for it.
+fn assert_configuration(
+    case: &str,
+    header: &[String],
+    row: &[String],
+    prefix: &str,
+    reported: &Value,
+) {
+    for (member, suffix, is_figure) in CONFIGURATION_MEMBERS {
+        let column = format!("{prefix}{suffix}");
+        let value = &reported[*member];
+        if *is_figure {
+            let expected = value.as_f64().unwrap_or_else(|| {
+                panic!("case {case:?}: the reader reports {member} as a figure, got {reported}")
+            });
+            assert_figure(case, header, row, &column, expected);
+        } else {
+            let expected = value.as_str().unwrap_or_default();
+            assert_eq!(
+                cell(header, row, &column),
+                expected,
+                "case {case:?}: {column} must state the {member} the reader reports, got {row:?}"
+            );
+        }
+    }
+}
+
+/// Every cell of a volume's exported row is the value `GetEBSVolumeRecommendations` reports for
+/// the member that column names — the volume's own configuration, the utilization observed on
+/// it, the one option the analysis has with its configuration, risk and savings, its tags, the
+/// preferences the recommendation was generated under and when it was generated — so a file and
+/// a read of the same analysis cannot disagree.
+///
+/// The table spans the look-back preference the rule generalises over: none at all, and each
+/// `LookBackPeriodPreference` the model declares. A longer period analyses samples a shorter one
+/// left out, so it changes the option a volume gets — which is what proves the exported row is
+/// computed under the period in force rather than frozen at the default.
+#[tokio::test]
+async fn the_export_file_states_what_the_reader_reports_for_every_volume() {
+    // (case, the `lookBackPeriod` the preference asks for, or none at all)
+    let mut rows: Vec<(String, Option<&str>)> = vec![("no preference at all".to_string(), None)];
+    rows.extend(
+        LOOK_BACK_PERIOD_PREFERENCE_VALUES
+            .iter()
+            .map(|period| (format!("a {period} look-back preference"), Some(*period))),
+    );
+
+    // What each case exported for one volume's option, so the table is shown to prove that the
+    // preference reaches the file.
+    let mut option_iops: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+
+    for (case, look_back_period) in rows {
+        // A fresh emulator per row: one volume export job runs per Region at a time, so each row
+        // gets its own store rather than waiting on the previous row's job.
+        let router = analysed_emulator().await;
+        create_bucket(&router, BUCKET).await;
+        if let Some(look_back_period) = look_back_period {
+            put_preference(
+                &router,
+                &json!({"resourceType": RESOURCE_TYPE_EBS_VOLUME,
+                        "lookBackPeriod": look_back_period}),
+            )
+            .await;
+        }
+
+        let reported = reported_volumes(&router, &case).await;
+        let exported = exported_recommendation_rows(
+            &router,
+            &case,
+            EXPORT,
+            BUCKET,
+            EXPORTABLE_VOLUME_FIELD_VALUES,
+        )
+        .await;
+        let (header, data) = exported
+            .split_first()
+            .unwrap_or_else(|| panic!("case {case:?}: the export file carries a header row"));
+        assert_eq!(
+            header.len(),
+            EXPORTABLE_VOLUME_FIELD_VALUES.len(),
+            "case {case:?}: the header holds the field the request asked for, got {header:?}"
+        );
+
+        // The file names exactly the volumes the reader reports, one row each: this analysis
+        // holds one recommendation option per volume, and each `RecommendationOptions*` field
+        // names ONE option.
+        let exported_arns: BTreeSet<&str> =
+            data.iter().map(|row| cell(header, row, ARN_COLUMN)).collect();
+        let reported_arns: BTreeSet<&str> = reported.keys().map(String::as_str).collect();
+        assert_eq!(
+            exported_arns, reported_arns,
+            "case {case:?}: the export names the volumes the reader reports, got {exported:?}"
+        );
+        assert_eq!(
+            data.len(),
+            reported.len(),
+            "case {case:?}: one row per reported volume, got {exported:?}"
+        );
+
+        for (arn, recommendation) in &reported {
+            let row = data
+                .iter()
+                .find(|row| cell(header, row, ARN_COLUMN) == arn)
+                .unwrap_or_else(|| panic!("case {case:?}: {arn} has a row, got {exported:?}"));
+
+            for (column, reported_member) in [
+                ("AccountId", "accountId"),
+                ("Finding", "finding"),
+                ("CurrentPerformanceRisk", "currentPerformanceRisk"),
+            ] {
+                let expected = recommendation[reported_member].as_str().unwrap_or_default();
+                assert_eq!(
+                    cell(header, row, column),
+                    expected,
+                    "case {case:?}: {column} of {arn} must state the {reported_member} the \
+                     reader reports, got {row:?}"
+                );
+            }
+
+            // The period analysed, and the preferences the recommendation was generated under.
+            assert_figure(
+                &case,
+                header,
+                row,
+                "LookbackPeriodInDays",
+                recommendation["lookBackPeriodInDays"]
+                    .as_f64()
+                    .unwrap_or_default(),
+            );
+            let preferences = &recommendation["effectiveRecommendationPreferences"];
+            assert_eq!(
+                cell(header, row, "EffectiveRecommendationPreferencesLookBackPeriod"),
+                preferences["lookBackPeriod"].as_str().unwrap_or_default(),
+                "case {case:?}: the row of {arn} states the look-back period the reader \
+                 reports, got {row:?}"
+            );
+            assert_eq!(
+                cell(
+                    header,
+                    row,
+                    "EffectiveRecommendationPreferencesSavingsEstimationMode"
+                ),
+                preferences["savingsEstimationMode"]["source"]
+                    .as_str()
+                    .unwrap_or_default(),
+                "case {case:?}: the row of {arn} states the savings estimation mode the reader \
+                 reports, got {row:?}"
+            );
+
+            // The volume's own configuration, and whether it is a root volume — which the field
+            // set names both beside that configuration and on its own.
+            let current = &recommendation["currentConfiguration"];
+            assert_configuration(&case, header, row, "CurrentConfiguration", current);
+            let root_volume = current["rootVolume"].as_bool().unwrap_or_else(|| {
+                panic!("case {case:?}: the reader reports rootVolume for {arn}, got {current}")
+            });
+            for column in ["RootVolume", "CurrentConfigurationRootVolume"] {
+                assert_eq!(
+                    cell(header, row, column),
+                    root_volume.to_string(),
+                    "case {case:?}: {column} of {arn} must state whether the reader reports it a \
+                     root volume, got {row:?}"
+                );
+            }
+
+            // The utilization observed on the volume: each metric under the field naming it and
+            // the one statistic this API reports metrics with.
+            let observed = metrics(&recommendation["utilizationMetrics"]);
+            assert!(
+                !observed.is_empty(),
+                "case {case:?}: the reader reports utilization for {arn}, got {recommendation}"
+            );
+            for (metric, value) in &observed {
+                let column = format!("UtilizationMetrics{metric}Maximum");
+                assert!(
+                    EXPORTABLE_VOLUME_FIELD_VALUES.contains(&column.as_str()),
+                    "case {case:?}: {column} must be a field the model declares"
+                );
+                assert_figure(&case, header, row, &column, *value);
+            }
+
+            // The one option the analysis has: its configuration, the risk it runs and what
+            // adopting it saves.
+            let option = &recommendation["volumeRecommendationOptions"][0];
+            assert!(
+                option.is_object(),
+                "case {case:?}: the reader reports an option for {arn}, got {recommendation}"
+            );
+            assert_configuration(
+                &case,
+                header,
+                row,
+                "RecommendationOptionsConfiguration",
+                &option["configuration"],
+            );
+            assert_figure(
+                &case,
+                header,
+                row,
+                "RecommendationOptionsPerformanceRisk",
+                rounded(option["performanceRisk"].as_f64().unwrap_or_default()),
+            );
+            let savings = &option["savingsOpportunity"];
+            let percentage = savings["savingsOpportunityPercentage"]
+                .as_f64()
+                .unwrap_or_default();
+            let value = savings["estimatedMonthlySavings"]["value"]
+                .as_f64()
+                .unwrap_or_default();
+            let currency = savings["estimatedMonthlySavings"]["currency"]
+                .as_str()
+                .unwrap_or_default();
+            let after = &option["savingsOpportunityAfterDiscounts"];
+            for (column, expected) in [
+                ("RecommendationOptionsSavingsOpportunityPercentage", percentage),
+                ("RecommendationOptionsEstimatedMonthlySavingsValue", value),
+                (
+                    "RecommendationOptionsSavingsOpportunityAfterDiscountsPercentage",
+                    after["savingsOpportunityPercentage"].as_f64().unwrap_or_default(),
+                ),
+                (
+                    "RecommendationOptionsEstimatedMonthlySavingsValueAfterDiscounts",
+                    after["estimatedMonthlySavings"]["value"].as_f64().unwrap_or_default(),
+                ),
+            ] {
+                assert_figure(&case, header, row, column, expected);
+            }
+            for (column, expected) in [
+                ("RecommendationOptionsEstimatedMonthlySavingsCurrency", currency),
+                (
+                    "RecommendationOptionsEstimatedMonthlySavingsCurrencyAfterDiscounts",
+                    after["estimatedMonthlySavings"]["currency"]
+                        .as_str()
+                        .unwrap_or_default(),
+                ),
+            ] {
+                assert_eq!(
+                    cell(header, row, column),
+                    expected,
+                    "case {case:?}: {column} of {arn} must state the currency the reader \
+                     reports, got {row:?}"
+                );
+            }
+
+            // The two price columns name no member of a `VolumeRecommendation`, so they are
+            // asserted against the saving the reader DOES report: what the volume costs today
+            // less what its option costs is exactly that saving, and that saving is that
+            // percentage of today's cost.
+            let price = |column: &str| -> f64 {
+                let held = cell(header, row, column);
+                held.parse().unwrap_or_else(|_| {
+                    panic!("case {case:?}: {column} of {arn} holds a price, got {held:?} in {row:?}")
+                })
+            };
+            let current_price = price("CurrentMonthlyPrice");
+            let option_price = price("RecommendationOptionsMonthlyPrice");
+            assert!(
+                current_price > 0.0 && option_price > 0.0,
+                "case {case:?}: both price columns of {arn} state a cost, got {current_price} \
+                 and {option_price} in {row:?}"
+            );
+            assert!(
+                ((current_price - option_price).max(0.0) - value).abs() < 0.011,
+                "case {case:?}: the prices of {arn} must agree with the {value} saving the \
+                 reader reports, got {current_price} - {option_price} in {row:?}"
+            );
+            assert!(
+                (rounded((current_price - option_price).max(0.0) / current_price * 100.0)
+                    - percentage)
+                    .abs()
+                    < 0.011,
+                "case {case:?}: the prices of {arn} must agree with the {percentage}% the \
+                 reader reports, got {current_price} - {option_price} in {row:?}"
+            );
+
+            // The volume's tags, as the reader reports them, in one cell.
+            let tags: Vec<String> = recommendation["tags"]
+                .as_array()
+                .map(|tags| {
+                    tags.iter()
+                        .map(|tag| {
+                            format!(
+                                "{}={}",
+                                tag["key"].as_str().unwrap_or_default(),
+                                tag["value"].as_str().unwrap_or_default()
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                cell(header, row, "Tags"),
+                tags.join(LIST_SEPARATOR),
+                "case {case:?}: the Tags cell of {arn} must state the tags the reader reports, \
+                 got {row:?}"
+            );
+
+            // When the recommendation was generated, as the reader reports it.
+            let refreshed = recommendation["lastRefreshTimestamp"]
+                .as_f64()
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: the reader reports a refresh instant, got {recommendation}")
+                });
+            let stated = DateTime::from_secs_f64(refreshed)
+                .fmt(Format::DateTime)
+                .unwrap_or_else(|error| panic!("case {case:?}: {refreshed} is an instant: {error}"));
+            assert_eq!(
+                cell(header, row, "LastRefreshTimestamp"),
+                stated,
+                "case {case:?}: LastRefreshTimestamp of {arn} must state the instant the reader \
+                 reports, got {row:?}"
+            );
+
+            option_iops
+                .entry(arn.clone())
+                .or_default()
+                .insert(case.clone(), cell(header, row, OPTION_IOPS_COLUMN).to_string());
+        }
+    }
+
+    // The table has to span a volume whose option CHANGED with the look-back period, or it
+    // proves nothing about the period reaching the file.
+    assert!(
+        option_iops.values().any(|per_case| {
+            per_case.values().collect::<BTreeSet<&String>>().len() > 1
+        }),
+        "a longer look-back preference has to change the option a volume's row states, got \
+         {option_iops:?}"
+    );
 }
