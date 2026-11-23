@@ -30,6 +30,19 @@ pub const DEFAULT_SCHEDULE_EXPRESSION: &str = "cron(0 5 ? * * *)";
 /// schedule really runs in.
 pub const DEFAULT_SCHEDULE_EXPRESSION_TIMEZONE: &str = "Etc/UTC";
 
+/// The zone a STORED schedule is read in: the stated one, or
+/// [`DEFAULT_SCHEDULE_EXPRESSION_TIMEZONE`] where the request stated none.
+///
+/// The ONE materialisation of that default, shared by every resource of this
+/// service whose body carries a `ScheduleExpressionTimezone` — a plan's rules
+/// (`super::stored_backup_rule`) and a restore testing plan
+/// (`super::RestoreTestingPlanRecord`) — so the zone a schedule really runs in
+/// is what is stored and read back whichever resource carries it.
+#[must_use]
+pub fn stored_schedule_expression_timezone(timezone: Option<String>) -> String {
+    timezone.unwrap_or_else(|| DEFAULT_SCHEDULE_EXPRESSION_TIMEZONE.to_string())
+}
+
 /// How many whitespace-separated fields a rule's cron expression carries: the
 /// minute, hour, day-of-month, month, day-of-week and year of an Amazon Web
 /// Services cron expression (the model's own examples for

@@ -23,8 +23,9 @@
 //!
 //! The body is stored as submitted, with the members the model gives a default
 //! for filled in where the request states none
-//! ([`crate::state::stored_start_window_hours`] and
-//! [`crate::state::stored_restore_testing_recovery_point_selection`]), and the
+//! ([`crate::state::stored_start_window_hours`],
+//! [`crate::state::stored_restore_testing_recovery_point_selection`] and
+//! [`crate::state::schedule::stored_schedule_expression_timezone`]), and the
 //! documented rules on it are `crate::state`'s
 //! ([`crate::state::rejected_restore_testing_plan_body`]), shared with every
 //! other operation that stores a plan body.
@@ -246,18 +247,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let record = crate::state::RestoreTestingPlanRecord {
-            arn: crate::state::restore_testing_plan_arn(&region, &plan.restore_testing_plan_name),
+            // The ARN "uniquely identifies a restore testing plan" (model doc for
+            // the member), so it carries a uniquifier only this service mints
+            // beside the name, and it is STORED: every later read of the plan
+            // reports the ARN this create reported, and a plan created again
+            // under a name a deleted one held is a different resource with a
+            // different ARN.
+            arn: crate::state::restore_testing_plan_arn(
+                &region,
+                &plan.restore_testing_plan_name,
+                &store.next_id(now),
+            ),
             name: plan.restore_testing_plan_name,
             recovery_point_selection: selection,
             schedule_expression: plan.schedule_expression,
-            schedule_expression_timezone: plan.schedule_expression_timezone,
+            schedule_expression_timezone: crate::state::schedule::stored_schedule_expression_timezone(
+                plan.schedule_expression_timezone,
+            ),
             start_window_hours,
             creator_request_id: input.creator_request_id,
             creation_time: now,
-            // Nothing has updated this plan yet, and no restore test has run
-            // with it, so there is neither an update nor an execution instant to
-            // report.
-            last_update_time: None,
+            // The create is what last wrote this plan until an update rewrites
+            // it, so that is the instant a read reports as its last update; no
+            // restore test has run with it yet, so there is no execution instant
+            // to report.
+            last_update_time: now,
             last_execution_time: None,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
         };

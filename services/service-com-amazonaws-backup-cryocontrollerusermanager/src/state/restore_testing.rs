@@ -15,19 +15,25 @@
 //! * a name the account holds no plan under is the not-found condition
 //!   ([`super::restore_testing_plan_not_found`]), which every read of a plan
 //!   answers;
-//! * the plan body a create carries is stored as submitted, except for the three
+//! * the plan body a create carries is stored as submitted, except for the
 //!   members the model gives a default for, which the service fills where the
 //!   request states none ([`DEFAULT_START_WINDOW_HOURS`],
-//!   [`DEFAULT_SELECTION_WINDOW_DAYS`] and an empty `ExcludeVaults`), and is
+//!   [`DEFAULT_SELECTION_WINDOW_DAYS`], an empty `ExcludeVaults` and the zone a
+//!   schedule is read in,
+//!   [`super::schedule::DEFAULT_SCHEDULE_EXPRESSION_TIMEZONE`]), and is
 //!   reported back through the ONE read projection below, so the plan a create
-//!   stored and the plan a read reports can never differ.
+//!   stored and the plan a read reports can never differ;
+//! * a plan carries the instant it was last written — the create that stored it
+//!   until an update rewrites it — so a read reports when its configuration last
+//!   changed, and an update rewrites only the members its body states
+//!   ([`RestoreTestingPlanRecord::apply_update`]).
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use super::ComAmazonawsBackupCryocontrollerusermanagerState;
 use crate::ops::types::{
-    InvalidParameterValueException, RestoreTestingPlanForGet,
+    InvalidParameterValueException, RestoreTestingPlanForGet, RestoreTestingPlanForUpdate,
     RestoreTestingRecoveryPointSelection,
 };
 
@@ -69,8 +75,8 @@ pub const MAX_RESTORE_TESTING_PLAN_NAME_LENGTH: usize = 50;
 ///
 /// The body is kept as the create submitted it, so a read reports what was
 /// stored rather than a value recomputed per call; the two instants only this
-/// service can know — when the plan was stored, and when an update last rewrote
-/// it — are its own members.
+/// service can know — when the plan was last written, and when a restore test
+/// last ran with it — are its own members.
 #[derive(Debug, Clone)]
 pub struct RestoreTestingPlanRecord {
     pub name: String,
@@ -80,14 +86,16 @@ pub struct RestoreTestingPlanRecord {
     pub recovery_point_selection: RestoreTestingRecoveryPointSelection,
     /// The cron expression a run of this plan is initiated by.
     pub schedule_expression: String,
-    /// The zone that expression is read in; `None` leaves it in UTC, which is
-    /// what the model documents for an absent one.
-    pub schedule_expression_timezone: Option<String>,
+    /// The zone that expression is read in, materialised where the request
+    /// stated none ([`super::schedule::DEFAULT_SCHEDULE_EXPRESSION_TIMEZONE`]),
+    /// so the zone the plan really runs in is what every read reports.
+    pub schedule_expression_timezone: String,
     pub start_window_hours: i32,
     pub creator_request_id: Option<String>,
     pub creation_time: SystemTime,
-    /// When an update last rewrote this plan; `None` until one has.
-    pub last_update_time: Option<SystemTime>,
+    /// When this plan was last written: the instant the create stored it until
+    /// an update rewrites it.
+    pub last_update_time: SystemTime,
     /// When a restore test last ran with this plan; `None` until one has.
     pub last_execution_time: Option<SystemTime>,
     pub tags: BTreeMap<String, String>,
@@ -102,15 +110,48 @@ impl RestoreTestingPlanRecord {
             restore_testing_plan_arn: self.arn.clone(),
             recovery_point_selection: self.recovery_point_selection.clone(),
             schedule_expression: self.schedule_expression.clone(),
-            schedule_expression_timezone: self.schedule_expression_timezone.clone(),
+            schedule_expression_timezone: Some(self.schedule_expression_timezone.clone()),
             start_window_hours: self.start_window_hours,
             creator_request_id: self.creator_request_id.clone(),
             creation_time: super::modelled_timestamp(self.creation_time),
-            last_update_time: self.last_update_time.map(super::modelled_timestamp),
+            last_update_time: Some(super::modelled_timestamp(self.last_update_time)),
             last_execution_time: self
                 .last_execution_time
                 .map(super::modelled_timestamp),
         }
+    }
+
+    /// Rewrite the members an update may change, and record the instant it
+    /// changed them.
+    ///
+    /// `RestoreTestingPlanName` "cannot be updated after it is created" (the
+    /// update's model doc) and the ARN and the creation instant are the
+    /// identifiers minted from it, so the body an update carries — the recovery
+    /// point selection, the schedule, its zone and the start window — is all
+    /// this rewrites. A member the update states NOTHING for keeps the value the
+    /// plan already held; a submitted selection is completed exactly as a create
+    /// completes one
+    /// ([`stored_restore_testing_recovery_point_selection`]), so a plan an
+    /// update rewrote and a plan a create stored read back the same way.
+    pub fn apply_update(&mut self, body: RestoreTestingPlanForUpdate, now: SystemTime) {
+        if let Some(selection) = body.recovery_point_selection {
+            self.recovery_point_selection =
+                stored_restore_testing_recovery_point_selection(selection);
+        }
+        if let Some(schedule_expression) = body.schedule_expression {
+            self.schedule_expression = schedule_expression;
+        }
+        if let Some(timezone) = body.schedule_expression_timezone {
+            self.schedule_expression_timezone = timezone;
+        }
+        // A start window the update states nothing for reaches this service as
+        // the modelled default of its integer member (`0`), which is outside the
+        // member's documented range: it states no new window, so the stored one
+        // stands.
+        if body.start_window_hours != 0 {
+            self.start_window_hours = body.start_window_hours;
+        }
+        self.last_update_time = now;
     }
 }
 
@@ -225,6 +266,18 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
     ) -> Result<&RestoreTestingPlanRecord, crate::ops::types::ResourceNotFoundException> {
         self.restore_testing_plans
             .get(name)
+            .ok_or_else(super::restore_testing_plan_not_found)
+    }
+
+    /// Resolve the restore testing plan a `RestoreTestingPlanName` addresses FOR
+    /// WRITING, or the modelled refusal for one this account does not hold — the
+    /// same resolution, and so the same refusal, every read of a plan answers.
+    pub fn stored_restore_testing_plan_mut(
+        &mut self,
+        name: &str,
+    ) -> Result<&mut RestoreTestingPlanRecord, crate::ops::types::ResourceNotFoundException> {
+        self.restore_testing_plans
+            .get_mut(name)
             .ok_or_else(super::restore_testing_plan_not_found)
     }
 

@@ -687,18 +687,22 @@ pub fn tiering_configuration_arn(region: &str, name: &str) -> String {
 }
 
 /// The ARN of a restore testing plan:
-/// `arn:aws:backup:<region>:<account>:restore-testing-plan:<name>`.
+/// `arn:aws:backup:<region>:<account>:restore-testing-plan:<name>-<uniquifier>`.
 ///
-/// A restore testing plan is addressed by NAME — the name "cannot be changed
-/// after creation" (model doc for `RestoreTestingPlanName`) and is unique to the
-/// account — so the name is what its ARN carries, spelled with the resource type
-/// separated by `:` as [`backup_vault_arn`] spells `backup-vault` and
-/// [`tiering_configuration_arn`] spells `tiering-configuration`.
-pub fn restore_testing_plan_arn(region: &str, name: &str) -> String {
+/// The ARN "uniquely identifies a restore testing plan" (model doc for
+/// `RestoreTestingPlanForGet$RestoreTestingPlanArn`), and the name alone does
+/// not: it "cannot be changed after creation" (model doc for
+/// `RestoreTestingPlanName`) but a deleted plan's name can be taken again, so
+/// the ARN AWS mints for one carries a uniquifier after the name, as
+/// [`framework_arn`] does for a framework; `uniquifier` is a value only this
+/// service mints ([`ComAmazonawsBackupCryocontrollerusermanagerState::next_id`])
+/// and it is stored with the plan, so every read of the plan reports the one ARN
+/// its create reported.
+pub fn restore_testing_plan_arn(region: &str, name: &str, uniquifier: &str) -> String {
     ::engine::emulator_arn(
         ARN_NAMESPACE,
         region,
-        &format!("restore-testing-plan:{name}"),
+        &format!("restore-testing-plan:{name}-{uniquifier}"),
     )
 }
 
@@ -3529,10 +3533,9 @@ pub fn stored_backup_rule(rule: BackupRuleInput, rule_id: String) -> BackupRule 
         // ScheduleExpressions are in UTC" (model doc for the member): a rule
         // that names no zone is scheduled in the service's default one, so the
         // zone it really runs in is what is stored and read back.
-        schedule_expression_timezone: Some(
-            rule.schedule_expression_timezone
-                .unwrap_or_else(|| schedule::DEFAULT_SCHEDULE_EXPRESSION_TIMEZONE.to_string()),
-        ),
+        schedule_expression_timezone: Some(schedule::stored_schedule_expression_timezone(
+            rule.schedule_expression_timezone,
+        )),
         index_actions: rule.index_actions,
         scan_actions: rule.scan_actions,
     }

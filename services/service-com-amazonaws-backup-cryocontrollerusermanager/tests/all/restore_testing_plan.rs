@@ -6,10 +6,15 @@
 //! The rules under test:
 //!
 //! * a restore testing plan is a STORED resource addressed by name: the body a
-//!   create submits is what every later read of that name reports, with the two
+//!   create submits is what every later read of that name reports, with the
 //!   members the model gives a default for filled in where the create stated
-//!   neither (`StartWindowHours` 24, `SelectionWindowDays` 30, and an empty
-//!   `ExcludeVaults`);
+//!   none (`StartWindowHours` 24, `SelectionWindowDays` 30, an empty
+//!   `ExcludeVaults` and the `Etc/UTC` zone its schedule is read in);
+//! * the ARN a create mints "uniquely identifies a restore testing plan", so it
+//!   carries a uniquifier after the plan's name, and the read reports the same
+//!   one;
+//! * a plan reports the instant it was last written — the create that stored it,
+//!   until an update rewrites it;
 //! * the name identifies one plan of the account, so however many creates of one
 //!   name arrive together exactly ONE stores a plan and every other is refused as
 //!   already existing — and the survivor is what the read reports;
@@ -33,7 +38,7 @@ use crate::vault_and_backup_job::{call, error_code, router, string_at, ACCOUNT, 
 
 /// The sentence this service states for "the restore testing plan asked about is
 /// not one this account holds" — fixed text, naming no part of the request.
-const NOT_FOUND: &str = "Restore testing plan does not exist.";
+pub(crate) const NOT_FOUND: &str = "Restore testing plan does not exist.";
 
 /// The sentence this service states for a create naming a plan the account
 /// already holds: the name the request carried and the account the call was made
@@ -45,27 +50,32 @@ fn already_exists(name: &str) -> String {
 /// The windows a stored plan carries when its create states neither:
 /// "Defaults to 24 hours" (model doc for `StartWindowHours`) and "If not
 /// included, the value defaults to 30" (model doc for `SelectionWindowDays`).
-const DEFAULT_START_WINDOW_HOURS: i64 = 24;
-const DEFAULT_SELECTION_WINDOW_DAYS: i64 = 30;
+pub(crate) const DEFAULT_START_WINDOW_HOURS: i64 = 24;
+pub(crate) const DEFAULT_SELECTION_WINDOW_DAYS: i64 = 30;
+
+/// The zone a stored plan's schedule is read in when its create names none: "By
+/// default, ScheduleExpressions are in UTC" (model doc for
+/// `ScheduleExpressionTimezone`), named as the IANA zone UTC is published under.
+pub(crate) const DEFAULT_TIMEZONE: &str = "Etc/UTC";
 
 /// The published bounds of a STATED start window — "a maximum value of 168 hours
 /// (one week)" (model doc for `StartWindowHours`) — and of a stated selection
 /// window — "integers from 1 to 365" (model doc for `SelectionWindowDays`).
-const MAX_START_WINDOW_HOURS: i64 = 168;
-const MIN_SELECTION_WINDOW_DAYS: i64 = 1;
-const MAX_SELECTION_WINDOW_DAYS: i64 = 365;
+pub(crate) const MAX_START_WINDOW_HOURS: i64 = 168;
+pub(crate) const MIN_SELECTION_WINDOW_DAYS: i64 = 1;
+pub(crate) const MAX_SELECTION_WINDOW_DAYS: i64 = 365;
 
 /// The most characters a `RestoreTestingPlanName` may carry: "Maximum length is
 /// 50" (model doc for the member).
 const MAX_NAME_LENGTH: usize = 50;
 
 /// `PUT /restore-testing/plans`, as the model binds the create.
-async fn create_plan(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
+pub(crate) async fn create_plan(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
     call(router, "PUT", "/restore-testing/plans", Some(&body.to_string())).await
 }
 
 /// `GET /restore-testing/plans/{RestoreTestingPlanName}`.
-async fn get_plan(router: &MultiServiceRouter, name: &str) -> (u16, Value) {
+pub(crate) async fn get_plan(router: &MultiServiceRouter, name: &str) -> (u16, Value) {
     call(
         router,
         "GET",
@@ -76,13 +86,13 @@ async fn get_plan(router: &MultiServiceRouter, name: &str) -> (u16, Value) {
 }
 
 /// A create body carrying `plan` as its `RestoreTestingPlan`.
-fn create_body(plan: Value) -> Value {
+pub(crate) fn create_body(plan: Value) -> Value {
     json!({ "RestoreTestingPlan": plan })
 }
 
 /// The smallest plan body the model admits: a name, a schedule and a selection
 /// naming the vaults recovery points may come from.
-fn minimal_plan(name: &str) -> Value {
+pub(crate) fn minimal_plan(name: &str) -> Value {
     json!({
         "RestoreTestingPlanName": name,
         "ScheduleExpression": "cron(0 5 ? * * *)",
@@ -95,13 +105,13 @@ fn minimal_plan(name: &str) -> Value {
 }
 
 /// The plan body a read reports (`RestoreTestingPlan`), or `Value::Null`.
-fn read_plan(body: &Value) -> Value {
+pub(crate) fn read_plan(body: &Value) -> Value {
     body.get("RestoreTestingPlan").cloned().unwrap_or(Value::Null)
 }
 
 /// An integer member of a body, or `i64::MIN` when it is absent — so an absent
 /// member can never read as a value the service might legitimately report.
-fn int_at(body: &Value, member: &str) -> i64 {
+pub(crate) fn int_at(body: &Value, member: &str) -> i64 {
     body.get(member).and_then(Value::as_i64).unwrap_or(i64::MIN)
 }
 
@@ -113,6 +123,25 @@ fn name_of_length(length: usize) -> String {
     (0..length)
         .map(|i| char::from(ALPHABET[(i * 7 + length) % ALPHABET.len()]))
         .collect()
+}
+
+/// The prefix of the ARN a plan of `name` carries:
+/// `arn:aws:backup:<region>:<account>:restore-testing-plan:<name>-`, which the
+/// per-plan uniquifier follows — the ARN "uniquely identifies a restore testing
+/// plan" (model doc for `RestoreTestingPlanArn`), so the name alone is not all
+/// of it.
+pub(crate) fn plan_arn_prefix(name: &str) -> String {
+    format!("arn:aws:backup:{REGION}:{ACCOUNT}:restore-testing-plan:{name}-")
+}
+
+/// Assert `arn` is the ARN AWS's shape gives a plan of `name`: the resource
+/// type, the plan's name and a non-empty uniquifier after it.
+pub(crate) fn assert_plan_arn_shape(case: &str, name: &str, arn: &str) {
+    let prefix = plan_arn_prefix(name);
+    assert!(
+        arn.starts_with(&prefix) && arn.len() > prefix.len(),
+        "case {case:?}: expected an ARN of the form {prefix}<uniquifier>, got {arn:?}"
+    );
 }
 
 /// A created plan round-trips: the read reports the body that was stored, with
@@ -188,14 +217,11 @@ async fn a_created_restore_testing_plan_round_trips_through_the_read() {
             (201, "<none>"),
             "case {case:?}: expected CreateRestoreTestingPlan 201, got {status} {created:?}"
         );
-        let expected_arn =
-            format!("arn:aws:backup:{REGION}:{ACCOUNT}:restore-testing-plan:{name}");
+        let created_arn = string_at(&created, "RestoreTestingPlanArn");
+        assert_plan_arn_shape(case, &name, &created_arn);
         assert_eq!(
-            (
-                string_at(&created, "RestoreTestingPlanName"),
-                string_at(&created, "RestoreTestingPlanArn")
-            ),
-            (name.clone(), expected_arn.clone()),
+            string_at(&created, "RestoreTestingPlanName"),
+            name.clone(),
             "case {case:?}: the create must answer with the plan it stored, got {created:?}"
         );
         assert!(
@@ -215,20 +241,21 @@ async fn a_created_restore_testing_plan_round_trips_through_the_read() {
                 string_at(&stored, "RestoreTestingPlanName"),
                 string_at(&stored, "RestoreTestingPlanArn"),
                 string_at(&stored, "ScheduleExpression"),
-                string_at(&stored, "CreationTime"),
             ),
             (
                 name.clone(),
-                expected_arn.clone(),
+                created_arn.clone(),
                 string_at(&plan, "ScheduleExpression"),
-                string_at(&created, "CreationTime"),
             ),
             "case {case:?}: the read must report what the create stored, got {read:?}"
         );
         assert_eq!(
-            stored.get("ScheduleExpressionTimezone").cloned(),
-            plan.get("ScheduleExpressionTimezone").cloned(),
-            "case {case:?}: the stated timezone is stored as submitted, got {stored:?}"
+            string_at(&stored, "ScheduleExpressionTimezone"),
+            plan.get("ScheduleExpressionTimezone")
+                .and_then(Value::as_str)
+                .unwrap_or(DEFAULT_TIMEZONE),
+            "case {case:?}: a stated timezone is stored as submitted and an absent one defaults, \
+             got {stored:?}"
         );
         assert_eq!(
             int_at(&stored, "StartWindowHours"),
@@ -279,12 +306,70 @@ async fn a_created_restore_testing_plan_round_trips_through_the_read() {
             "case {case:?}: a stated selection window is kept and an absent one defaults, got \
              {selection:?}"
         );
-        assert!(
-            stored.get("LastUpdateTime").is_none() && stored.get("LastExecutionTime").is_none(),
-            "case {case:?}: a plan nothing has updated or run reports neither instant, got \
-             {stored:?}"
+        assert_eq!(
+            (
+                stored.get("CreationTime").cloned(),
+                stored.get("LastUpdateTime").cloned(),
+                stored.get("LastExecutionTime").cloned()
+            ),
+            (
+                created.get("CreationTime").cloned(),
+                created.get("CreationTime").cloned(),
+                None
+            ),
+            "case {case:?}: the create is what last wrote the plan, and no restore test has run \
+             with it, got {stored:?}"
         );
     }
+}
+
+/// The ARN a create mints "uniquely identifies a restore testing plan" (model
+/// doc for `RestoreTestingPlanArn`), so it is NOT derivable from the plan's
+/// name: beyond the name it carries a per-plan uniquifier, every read of the
+/// plan reports the same one, and two plans — of one name in separate stores, or
+/// of different names in one — never share an ARN.
+///
+/// The rows differ in the name the plan carries, including the shortest and the
+/// longest the model admits, so the rule is asserted over the whole alphabet
+/// rather than one spelling.
+#[tokio::test]
+async fn a_plans_arn_carries_a_uniquifier_beyond_its_name() {
+    let names = [
+        "plan_arn_shape".to_string(),
+        name_of_length(1),
+        name_of_length(MAX_NAME_LENGTH),
+    ];
+    let mut minted: Vec<String> = Vec::new();
+    for name in &names {
+        // The same name created in two separate stores: the ARNs must differ,
+        // which a value derived from the name alone could never do.
+        for store in ["first store", "second store"] {
+            let case = format!("{name} in the {store}");
+            let router = router();
+            let (status, created) =
+                create_plan(&router, &create_body(minimal_plan(name))).await;
+            assert_eq!(
+                status, 201,
+                "case {case:?}: the create should succeed, got {status} {created:?}"
+            );
+            let arn = string_at(&created, "RestoreTestingPlanArn");
+            assert_plan_arn_shape(&case, name, &arn);
+
+            let (status, read) = get_plan(&router, name).await;
+            assert_eq!(
+                (status, string_at(&read_plan(&read), "RestoreTestingPlanArn")),
+                (200, arn.clone()),
+                "case {case:?}: every read must report the ARN the create reported, got {read:?}"
+            );
+            minted.push(arn);
+        }
+    }
+    let distinct: std::collections::BTreeSet<&String> = minted.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        minted.len(),
+        "no two plans may share an ARN, got {minted:?}"
+    );
 }
 
 /// However many creates of ONE name arrive together, exactly one stores a plan:
