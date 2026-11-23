@@ -179,7 +179,16 @@ async fn assert_tearing_down(emulator: &Emulator, region: &str, case: &str, doma
 }
 
 /// Poll `DescribeDomain` in `region` until it refuses `domain_id`, answering the refusal.
-async fn poll_until_gone(emulator: &Emulator, region: &str, case: &str, domain_id: &str) -> Value {
+///
+/// Shared with the suites that wait for the same condition
+/// (`studio_domain_teardown_releases_the_account`), so the one way a test waits for a
+/// domain's removal cannot drift into two.
+pub(crate) async fn poll_until_gone(
+    emulator: &Emulator,
+    region: &str,
+    case: &str,
+    domain_id: &str,
+) -> Value {
     let describe = json!({ "DomainId": domain_id });
     // Wait for the CONDITION, not for a fixed time.
     let deadline = Instant::now() + SETTLE_DEADLINE;
