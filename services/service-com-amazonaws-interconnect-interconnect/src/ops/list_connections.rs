@@ -105,6 +105,18 @@ impl From<ListConnectionsErrorModeled> for ListConnectionsError {
     }
 }
 
+/// Which variant of this operation's error channel the page-cursor refusal travels in.
+/// WHICH refusal a verdict about a `nextToken` calls for, and how it is worded, is
+/// `crate::state::judge_cursor`'s to say.
+impl crate::state::CursorRefusal for ListConnectionsError {
+    fn cursor_not_issued(message: String) -> Self {
+        ListConnectionsErrorModeled::InterconnectValidationException(
+            InterconnectValidationException { message },
+        )
+        .into()
+    }
+}
+
 /// The `ListConnections` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -244,25 +256,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A cursor this operation did not issue is refused, rather than answered
         // with an empty page the caller cannot tell from "no more results" — or with a
-        // silently restarted walk. The position a cursor names travels INSIDE the token,
-        // so what tells one this endpoint issued from one a caller assembled is the
-        // authenticator over it, computed under the secret this store drew and never
-        // reveals: a token whose shape merely looks right names no position at all.
+        // silently restarted walk. That verdict is the one every listing of this service
+        // shares (`crate::state::judge_cursor`), which also decides the class and the
+        // wording it travels in, so this handler supplies only the scope the cursors of
+        // this sequence are minted under: this operation and the Region whose endpoint
+        // answered.
         let scope = crate::state::connection_cursor_scope(&region);
-        let cursor = match input.next_token.as_deref() {
-            Some(token) => {
-                let Some(key) = crate::state::decode_cursor(&token_key, token, &scope) else {
-                    return Err(ListConnectionsErrorModeled::InterconnectValidationException(
-                        InterconnectValidationException {
-                            message: crate::state::cursor_not_issued_message("ListConnections"),
-                        },
-                    )
-                    .into());
-                };
-                Some(key)
-            }
-            None => None,
-        };
+        let cursor = crate::state::judge_cursor::<ListConnectionsError>(
+            &token_key,
+            input.next_token.as_deref(),
+            Self::NAME,
+            &scope,
+        )?;
 
         let (connections, next_token) = crate::state::paginate(
             matching,

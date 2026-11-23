@@ -104,6 +104,18 @@ impl From<ListAttachPointsErrorModeled> for ListAttachPointsError {
     }
 }
 
+/// Which variant of this operation's error channel the page-cursor refusal travels in.
+/// WHICH refusal a verdict about a `nextToken` calls for, and how it is worded, is
+/// `crate::state::judge_cursor`'s to say.
+impl crate::state::CursorRefusal for ListAttachPointsError {
+    fn cursor_not_issued(message: String) -> Self {
+        ListAttachPointsErrorModeled::InterconnectValidationException(
+            InterconnectValidationException { message },
+        )
+        .into()
+    }
+}
+
 /// The `ListAttachPoints` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -162,28 +174,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // A cursor this operation did not issue is refused, rather than answered
         // with an empty page the caller cannot tell from "no more results" — or with a
-        // silently restarted walk. The position travels INSIDE the token, so what tells
-        // one this endpoint issued from one a caller assembled is the authenticator over
-        // it, computed under the secret this store drew and never reveals. The scope the
-        // authenticator covers names this operation, the Region it answered in and the
-        // Environment the listing was scoped by, because those three decide the sequence
-        // a cursor names a position in — and all three are read off the REQUEST, so this
-        // verdict needs nothing the request names to have been resolved first.
+        // silently restarted walk. That verdict is the one every listing of this service
+        // shares (`crate::state::judge_cursor`), which also decides the class and the
+        // wording it travels in, so this handler supplies only the scope the cursors of
+        // this sequence are minted under: this operation, the Region it answered in and
+        // the Environment the listing was scoped by, because those three decide the
+        // sequence a cursor names a position in — and all three are read off the REQUEST,
+        // so this verdict needs nothing the request names to have been resolved first.
         let scope = crate::state::attach_point_cursor_scope(&region, &input.environment_id);
-        let cursor = match input.next_token.as_deref() {
-            Some(token) => {
-                let Some(key) = crate::state::decode_cursor(&token_key, token, &scope) else {
-                    return Err(ListAttachPointsErrorModeled::InterconnectValidationException(
-                        InterconnectValidationException {
-                            message: crate::state::cursor_not_issued_message("ListAttachPoints"),
-                        },
-                    )
-                    .into());
-                };
-                Some(key)
-            }
-            None => None,
-        };
+        let cursor = crate::state::judge_cursor::<ListAttachPointsError>(
+            &token_key,
+            input.next_token.as_deref(),
+            Self::NAME,
+            &scope,
+        )?;
 
         // The attach points are listed FOR an Environment, so the catalog record the
         // `environmentId` names is what the listing is scoped by — looked up in the

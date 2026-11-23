@@ -100,6 +100,18 @@ impl From<ListEnvironmentsErrorModeled> for ListEnvironmentsError {
     }
 }
 
+/// Which variant of this operation's error channel the page-cursor refusal travels in.
+/// WHICH refusal a verdict about a `nextToken` calls for, and how it is worded, is
+/// `crate::state::judge_cursor`'s to say.
+impl crate::state::CursorRefusal for ListEnvironmentsError {
+    fn cursor_not_issued(message: String) -> Self {
+        ListEnvironmentsErrorModeled::InterconnectValidationException(
+            InterconnectValidationException { message },
+        )
+        .into()
+    }
+}
+
 /// The `ListEnvironments` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -212,27 +224,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A cursor this operation did not issue is refused, rather than answered
         // with an empty page the caller cannot tell from "no more results" — or with a
-        // silently restarted walk. The position travels INSIDE the token, so what tells
-        // one this endpoint issued from one a caller assembled is the authenticator over
-        // it, computed under the secret this store drew and never reveals. The scope the
-        // authenticator covers names this operation AND the Region it answered in,
-        // because the sequence a cursor names a position in is this Region's own
-        // catalog: a cursor another Region's endpoint issued is not one this one did.
+        // silently restarted walk. That verdict is the one every listing of this service
+        // shares (`crate::state::judge_cursor`), which also decides the class and the
+        // wording it travels in, so this handler supplies only the scope the cursors of
+        // this sequence are minted under: this operation AND the Region it answered in,
+        // because the sequence a cursor names a position in is this Region's own catalog
+        // — a cursor another Region's endpoint issued is not one this one did.
         let scope = crate::state::environment_cursor_scope(&region);
-        let cursor = match input.next_token.as_deref() {
-            Some(token) => {
-                let Some(key) = crate::state::decode_cursor(&token_key, token, &scope) else {
-                    return Err(ListEnvironmentsErrorModeled::InterconnectValidationException(
-                        InterconnectValidationException {
-                            message: crate::state::cursor_not_issued_message("ListEnvironments"),
-                        },
-                    )
-                    .into());
-                };
-                Some(key)
-            }
-            None => None,
-        };
+        let cursor = crate::state::judge_cursor::<ListEnvironmentsError>(
+            &token_key,
+            input.next_token.as_deref(),
+            Self::NAME,
+            &scope,
+        )?;
 
         let (environments, next_token) = crate::state::paginate(
             matching,

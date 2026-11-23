@@ -2082,6 +2082,50 @@ pub fn cursor_not_issued_message(operation: &str) -> String {
     format!("{REFUSAL_ENVELOPE}nextToken is not a pagination token issued by {operation}")
 }
 
+/// The refusal a PAGE-CURSOR verdict can call for, in the error channel of the listing
+/// that asked for it.
+///
+/// Every operation of this service carries its own modelled error enum, so the rule
+/// deciding WHICH refusal a verdict about a `nextToken` calls for and what it says lives
+/// once — in [`judge_cursor`] — and a paginated operation supplies only this: which
+/// variant of its own channel that refusal travels in. A listing therefore cannot
+/// classify or word this refusal differently from its neighbour.
+pub trait CursorRefusal: Sized {
+    /// The `nextToken` the request carried is not one THAT listing issued
+    /// ([`decode_cursor`] answering `None`), so the request's own value is at fault and
+    /// no page is cut for it: the modelled `InterconnectValidationException` (HTTP 400),
+    /// worded by [`cursor_not_issued_message`].
+    fn cursor_not_issued(message: String) -> Self;
+}
+
+/// Judge the `next_token` a paginated operation was called with, answering the key its
+/// page resumes after — `Ok(None)` when the request names no position at all, so the
+/// walk starts at the head of the sequence.
+///
+/// The ONE judgement every listing of this service applies to a page cursor, so what a
+/// caller may resume from does not depend on which listing it called. The position a
+/// cursor names travels INSIDE the token, so what tells one this endpoint issued from one
+/// a caller assembled is the authenticator over it under the secret this store drew and
+/// never reveals ([`decode_cursor`]); `scope` is the listing, the endpoint and anything
+/// else that decides WHICH sequence a cursor names a position in. Every other value is
+/// refused — rather than answered with an empty page the caller cannot tell from "no more
+/// results", or with a silently restarted walk — in the one class and the one wording
+/// this service gives that fault, naming `operation`, the listing whose cursors the token
+/// would have had to be one of.
+pub fn judge_cursor<E: CursorRefusal>(
+    token_key: &PageTokenKey,
+    next_token: Option<&str>,
+    operation: &str,
+    scope: &str,
+) -> Result<Option<String>, E> {
+    match next_token {
+        Some(token) => decode_cursor(token_key, token, scope)
+            .map(Some)
+            .ok_or_else(|| E::cursor_not_issued(cursor_not_issued_message(operation))),
+        None => Ok(None),
+    }
+}
+
 /// Cut one page out of an ordered, already-filtered sequence of keyed items.
 ///
 /// `items` must be in ascending key order (both stores are `BTreeMap`s, so
