@@ -94,6 +94,11 @@ aws-sdk-kinesis = { version = "1", default-features = false }
 # Percent-encodes the three characters a tab-delimited, single-line real-time log record's
 # framing owns, so no field value can carry one.
 percent-encoding = "2"
+# Reads and writes the `application/x-www-form-urlencoded` body a field-level encryption
+# content type-profile designates fields of, so which field of a request body is encrypted —
+# and how the ciphertext is written back into it — is decided by the crate that owns that
+# format rather than by splitting text (`service::edge::field_level_encryption`).
+form_urlencoded = "1"
 
 # `rquickjs` is the QuickJS JavaScript engine, embedded in this process, which is what RUNS a
 # CloudFront function: `TestFunction` answers with "the function's result (the modified event

@@ -26,6 +26,31 @@
 /// to be, so material whose envelope and header are right but whose key is not a readable RSA
 /// key is no more an RSA public key than material with no envelope at all.
 pub fn rsa_public_key_bits(encoded_key: &str) -> Option<Vec<u8>> {
+    decoded_rsa_public_key(encoded_key).map(|decoded| decoded.pkcs1_der)
+}
+
+/// The same RSA public key as the X.509 `SubjectPublicKeyInfo` DER an ENCRYPTION takes — the
+/// structure the PEM envelope carries as its own contents — or `None` when the material is not
+/// an RSA public key at all.
+///
+/// The same single reading as [`rsa_public_key_bits`], handed over in the other encoding: the
+/// field-level encryption of a request body encrypts under this key
+/// (`crate::service::edge::field_level_encryption`), so the material a create ADMITTED is the
+/// material an encryption uses.
+pub fn rsa_public_key_spki_der(encoded_key: &str) -> Option<Vec<u8>> {
+    decoded_rsa_public_key(encoded_key).map(|decoded| decoded.spki_der)
+}
+
+/// One decoded `EncodedKey`, in the two encodings this crate's uses of a public key take.
+struct DecodedRsaPublicKey {
+    /// The X.509 `SubjectPublicKeyInfo` DER the PEM envelope carried.
+    spki_der: Vec<u8>,
+    /// The PKCS#1 `RSAPublicKey` DER inside it.
+    pkcs1_der: Vec<u8>,
+}
+
+/// `encoded_key` decoded, or `None` when it is not an RSA public key at all.
+fn decoded_rsa_public_key(encoded_key: &str) -> Option<DecodedRsaPublicKey> {
     use ::x509_cert::der::Decode as _;
 
     let block = ::pem::parse(encoded_key).ok()?;
@@ -35,7 +60,10 @@ pub fn rsa_public_key_bits(encoded_key: &str) -> Option<Vec<u8>> {
     }
     let bits = info.subject_public_key.raw_bytes();
     ::pkcs1::RsaPublicKey::from_der(bits).ok()?;
-    Some(bits.to_vec())
+    Some(DecodedRsaPublicKey {
+        spki_der: block.contents().to_vec(),
+        pkcs1_der: bits.to_vec(),
+    })
 }
 
 /// Whether `encoded_key` is the RSA public key `EncodedKey` is documented to carry.

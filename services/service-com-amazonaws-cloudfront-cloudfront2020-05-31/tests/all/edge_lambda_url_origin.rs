@@ -1125,17 +1125,34 @@ const TLS_DIAL_DEADLINE: Duration = Duration::from_secs(30);
 /// distribution's `DomainName` does: a stock TLS client that does not verify this emulator's
 /// self-signed certificate. Answers the status and the body.
 ///
+/// `sending` is the `(content type, body)` a viewer that SUBMITS one carries, and `None` is a
+/// plain read.
+///
 /// The request runs on a blocking thread, so the listener it addresses — a task of this same
 /// runtime — is served while this call waits for the answer.
-async fn dial_over_tls(case: &str, url: String) -> (u16, String) {
+///
+/// `pub(crate)` so every suite whose viewer dials the published address over TLS uses this one
+/// client rather than carrying its own copy of it.
+pub(crate) async fn dial_over_tls(
+    case: &str,
+    url: String,
+    sending: Option<(&str, String)>,
+) -> (u16, String) {
+    let sending = sending.map(|(content_type, body)| (content_type.to_string(), body));
     ::tokio::task::spawn_blocking(move || {
         let client = ::reqwest::blocking::Client::builder()
             .danger_accept_invalid_certs(true)
             .timeout(TLS_DIAL_DEADLINE)
             .build()
             .expect("a TLS client");
-        let answered = client
-            .get(&url)
+        let request = match sending {
+            Some((content_type, body)) => client
+                .post(&url)
+                .header("content-type", content_type)
+                .body(body),
+            None => client.get(&url),
+        };
+        let answered = request
             .send()
             .unwrap_or_else(|error| panic!("the published address did not answer {url}: {error}"));
         let status = answered.status().as_u16();
@@ -1158,7 +1175,7 @@ async fn the_published_domain_serves_the_https_a_viewer_dials() {
         .deployed_distribution(case, "edge-lambda-url-tls", &origin, "")
         .await;
 
-    let (status, body) = dial_over_tls(case, format!("https://{domain}{OPEN_PATH}")).await;
+    let (status, body) = dial_over_tls(case, format!("https://{domain}{OPEN_PATH}"), None).await;
     assert_eq!(
         status, 200,
         "case {case:?}: expected the published address to serve the origin's answer over TLS, \
@@ -1971,7 +1988,8 @@ async fn the_origin_sees_its_origin_path_ahead_of_the_viewer_path_and_the_edges_
     // same path over the `https://` half of that one published address is reported as `https`,
     // and is asked of the origin under the same `OriginPath`.
     let tls_case = "the same viewer path dialled over TLS";
-    let (status, body) = dial_over_tls(tls_case, format!("https://{domain}{OPEN_PATH}")).await;
+    let (status, body) =
+        dial_over_tls(tls_case, format!("https://{domain}{OPEN_PATH}"), None).await;
     assert_eq!(
         status, 200,
         "case {tls_case:?}: expected the origin's answer over TLS, got {status} with {body:?}"

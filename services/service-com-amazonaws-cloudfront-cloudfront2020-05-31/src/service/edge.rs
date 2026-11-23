@@ -129,6 +129,14 @@
 //! travels unsigned, so the origin answers it as it answers any caller presenting no
 //! credential, and whatever it answers is what the edge serves.
 //!
+//! One origin request is not the viewer's request byte for byte in one further way: where the
+//! matched behaviour names a FIELD-LEVEL ENCRYPTION configuration, the fields of the viewer's
+//! body that configuration's profile designates travel to the origin as ciphertext under the
+//! profile's public key, and the rest of the body as the viewer sent it
+//! ([`field_level_encryption`]) — so an origin reached through such a behaviour never holds the
+//! plaintext of a designated field. A request whose fields the configuration could not encrypt
+//! is refused by CloudFront itself, where its own flags say such a request is not forwarded.
+//!
 //! # Addressing
 //!
 //! A client on the machine this emulator runs on cannot reach `d<label>.cloudfront.net`
@@ -178,6 +186,9 @@ pub mod continuous_deployment;
 /// The CUSTOM ERROR RESPONSES the distribution states: what a viewer receives when the answer
 /// the edge reached for its request is an error, and how long that error is held.
 pub mod custom_errors;
+/// WHICH fields of a viewer request body the edge encrypts before it forwards the request to
+/// the origin, and under whose key.
+pub mod field_level_encryption;
 /// WHICH headers, cookies and query strings the behaviour's policies key on and forward.
 pub mod forwarding;
 /// The CLOUDFRONT FUNCTION the matched behaviour associates, run on the viewer event it
@@ -404,6 +415,12 @@ const LAMBDA_FAILED_DETAIL: &str =
 /// The detail line CloudFront's generated page carries for a request it refused.
 const BAD_REQUEST_DETAIL: &str = "Bad request.";
 
+/// The status a viewer request gets when CloudFront will not forward it to the origin at all:
+/// the matched behaviour names a field-level encryption configuration whose own flags state
+/// that a request it cannot encrypt is not forwarded, so "an error is returned"
+/// ([`field_level_encryption`]) rather than the origin being sent the fields.
+const BAD_REQUEST: u16 = 400;
+
 /// The detail line CloudFront's generated page carries when it could not reach the
 /// origin, from CloudFront's own troubleshooting of a 502.
 const NO_ORIGIN_DETAIL: &str = "CloudFront wasn't able to connect to the origin.";
@@ -555,6 +572,9 @@ const COOKIE: &str = "cookie";
 
 /// The response (and request) header naming the media type of a body.
 const CONTENT_TYPE: &str = "content-type";
+
+/// The request (and response) header naming how many bytes of body travel on one hop.
+const CONTENT_LENGTH: &str = "content-length";
 
 /// The request header naming the host the request is addressed to, which an origin request
 /// carries as [`origin_request_host`] decides.
@@ -931,6 +951,11 @@ struct Behavior {
     /// `ResponseHeadersPolicyId` — the policy whose header groups the edge applies to the
     /// answer it serves this request ([`response_headers`]).
     response_headers_policy_id: Option<String>,
+    /// `FieldLevelEncryptionId` — "the value of `ID` for the field-level encryption
+    /// configuration that you want CloudFront to use for encrypting specific fields of data for
+    /// this cache behavior", which decides which fields of a request body reach the origin as
+    /// ciphertext ([`field_level_encryption`]).
+    field_level_encryption_id: Option<String>,
     /// `FunctionAssociations` — "a list of CloudFront functions that are associated with a
     /// cache behavior", each naming the viewer event its function runs on ([`functions`]).
     function_associations: Option<FunctionAssociations>,
@@ -958,6 +983,7 @@ impl Behavior {
             max_ttl: behavior.max_ttl,
             forwarded_values: behavior.forwarded_values.clone(),
             response_headers_policy_id: behavior.response_headers_policy_id.clone(),
+            field_level_encryption_id: behavior.field_level_encryption_id.clone(),
             function_associations: behavior.function_associations.clone(),
             lambda_function_associations: behavior.lambda_function_associations.clone(),
         }
@@ -980,6 +1006,7 @@ impl Behavior {
             max_ttl: behavior.max_ttl,
             forwarded_values: behavior.forwarded_values.clone(),
             response_headers_policy_id: behavior.response_headers_policy_id.clone(),
+            field_level_encryption_id: behavior.field_level_encryption_id.clone(),
             function_associations: behavior.function_associations.clone(),
             lambda_function_associations: behavior.lambda_function_associations.clone(),
         }
@@ -1313,6 +1340,11 @@ struct OriginFetch {
     /// The coding the edge compresses the origin's answer with, when the behaviour asks for
     /// compression and this viewer accepts one ([`compression`]).
     encode: Option<Encoding>,
+    /// The body the ORIGIN is asked with, when that is not the viewer's own: the request body
+    /// whose designated fields the edge replaced with ciphertext under the behaviour's
+    /// field-level encryption configuration ([`field_level_encryption`]). `None` leaves the
+    /// origin request carrying the viewer's own body.
+    body: Option<Vec<u8>>,
     /// The viewer path, which an invalidation is matched against.
     viewer_path: String,
     /// `DistributionConfig$CustomErrorResponses`, which decide how long an answer that is an
@@ -2300,6 +2332,37 @@ fn plan_resolved(
         );
         return Plan::Refused { refusal };
     }
+    // What the behaviour's FIELD-LEVEL ENCRYPTION configuration makes of this request's body,
+    // decided HERE — before any origin request exists — because it decides what the origin is
+    // asked WITH, and because a request the configuration will not have forwarded unencrypted
+    // is one CloudFront refuses itself ([`field_level_encryption`]). The records the decision
+    // reads are this store's, so the fields designated are the ones the profile designates now.
+    let field_level_encryption = field_level_encryption::applied(
+        store,
+        behavior.field_level_encryption_id.as_deref(),
+        &field_level_encryption::Submitted {
+            content_type: req.headers().get(CONTENT_TYPE).unwrap_or_default(),
+            query: addressed.query,
+            body: req.body().bytes().unwrap_or_default(),
+        },
+    );
+    let encrypted_body = match field_level_encryption {
+        Some(field_level_encryption::Forwarded::Refused) => {
+            ::tracing::debug!(
+                distribution = %distribution_id,
+                path_pattern = ?behavior.path_pattern,
+                "this behaviour's field-level encryption configuration does not forward a \
+                 request whose fields it cannot encrypt, so the edge refuses it and makes no \
+                 origin request"
+            );
+            return Plan::Generated {
+                status: BAD_REQUEST,
+                detail: BAD_REQUEST_DETAIL,
+            };
+        }
+        Some(field_level_encryption::Forwarded::Body(body)) => Some(body),
+        None => None,
+    };
     let ttl = cache_ttl(store, &behavior);
     let min_ttl = cache_min_ttl(store, &behavior);
     // What the behaviour's POLICIES make of this request: which of its parts take part in
@@ -2378,6 +2441,13 @@ fn plan_resolved(
         // own `Host` sends the origin ([`origin_request_host`]).
         viewer_host(addressed, resolved),
     );
+    // A body the edge ENCRYPTED fields of is a different length from the one the viewer sent, so
+    // the origin request states its own: `Content-Length` describes the bytes that travel on
+    // this hop, and the viewer's value describes the plaintext body it sent.
+    let mut headers = headers;
+    if let Some(body) = encrypted_body.as_ref() {
+        restate_content_length(&mut headers, body.len());
+    }
     // A REQUEST LOOP: the origin is a host the edge itself serves, or this request has
     // already been through an edge (its `Via` names CloudFront). Either way, fetching it
     // would hand the request back to the edge it came from, so the fetch is not made and
@@ -2449,10 +2519,27 @@ fn plan_resolved(
             min_ttl,
         }),
         encode,
+        body: encrypted_body,
         viewer_path,
         custom_error_responses: custom_errors::of_config(&resolved.distribution.config),
     };
     Plan::Fetch(Box::new(fetch))
+}
+
+/// State `length` as the `Content-Length` of an origin request whose body the edge produced.
+///
+/// The header describes the bytes that travel on this hop, so a body the edge replaced states
+/// its own length rather than the one the viewer stated for the body it sent; a request that
+/// carried no `Content-Length` is given one, the body being known in full here.
+fn restate_content_length(headers: &mut Vec<(String, String)>, length: usize) {
+    let restated = length.to_string();
+    for (name, value) in headers.iter_mut() {
+        if name == CONTENT_LENGTH {
+            *value = restated;
+            return;
+        }
+    }
+    headers.push((CONTENT_LENGTH.to_string(), restated));
 }
 
 /// The query string the ORIGIN is asked for: the viewer's own parameters that either policy
@@ -2910,7 +2997,7 @@ fn origin_request_headers(
         }
         // The body's own description travels with the body, whatever the policies say
         // about the viewer's other headers.
-        let carries_body = name == CONTENT_TYPE || name == "content-length";
+        let carries_body = name == CONTENT_TYPE || name == CONTENT_LENGTH;
         if carries_body
             || keyed.headers.contains_header(&name)
             || forwarded.headers.contains_header(&name)
@@ -3057,7 +3144,14 @@ async fn fetch_origin<Eng: Send + Sync + 'static>(
     req: &RtRequest,
     received: Instant,
 ) -> Fetched {
-    let body = req.body().bytes().map(<[u8]>::to_vec).unwrap_or_default();
+    let mut fetch = fetch;
+    let body = match fetch.body.take() {
+        // The body the edge produced for the origin: the viewer's own, with the fields the
+        // behaviour's field-level encryption configuration designates replaced by ciphertext
+        // ([`field_level_encryption`]).
+        Some(body) => body,
+        None => req.body().bytes().map(<[u8]>::to_vec).unwrap_or_default(),
+    };
     let mut builder = ::http::Request::builder()
         .method(req.method())
         .uri(&fetch.uri);
@@ -4147,6 +4241,7 @@ mod tests {
                 max_ttl: None,
                 forwarded_values: None,
                 response_headers_policy_id: None,
+                field_level_encryption_id: None,
                 function_associations: None,
                 lambda_function_associations: None,
             };
@@ -4268,6 +4363,7 @@ mod tests {
                 max_ttl: None,
                 forwarded_values,
                 response_headers_policy_id: None,
+                field_level_encryption_id: None,
                 function_associations: None,
                 lambda_function_associations: None,
             };
@@ -4561,6 +4657,7 @@ mod tests {
             max_ttl: None,
             forwarded_values: None,
             response_headers_policy_id: None,
+            field_level_encryption_id: None,
             function_associations: None,
             lambda_function_associations: None,
         }
