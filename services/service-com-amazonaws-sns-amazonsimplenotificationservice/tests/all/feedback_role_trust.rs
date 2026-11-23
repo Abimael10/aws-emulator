@@ -31,6 +31,7 @@ use std::sync::Arc;
 use serde_json::json;
 use smithy_server_runtime::MultiServiceRouter;
 
+use super::create_platform_application::{attribute_params, credentials};
 use super::topics_subscriptions_publish::{attribute_map, percent_encode, Answer};
 
 /// The Region every call below is signed for.
@@ -61,6 +62,23 @@ const FEEDBACK_ROLE_ATTRIBUTES: &[&str] = &[
     "SQSFailureFeedbackRoleArn",
     "SQSSuccessFeedbackRoleArn",
 ];
+
+/// Every attribute of a PLATFORM APPLICATION that names a delivery-status feedback role: the
+/// pair `SetPlatformApplicationAttributesInput$Attributes` documents with the same sentence the
+/// topic's attributes carry ("`SuccessFeedbackRoleArn` – IAM role ARN used to give Amazon SNS
+/// write access to use CloudWatch Logs on your behalf", and the same for
+/// `FailureFeedbackRoleArn`). The application's names carry no protocol prefix: the
+/// application IS the kind of delivery they are about.
+const APPLICATION_FEEDBACK_ROLE_ATTRIBUTES: &[&str] =
+    &["FailureFeedbackRoleArn", "SuccessFeedbackRoleArn"];
+
+/// The push platform the applications registered here are for, whose documented credential
+/// material the sibling suite's fixture builds.
+const PLATFORM: &str = "GCM";
+
+/// Another service's principal, which a role names instead of this service's: it is THIS
+/// service's principal, and not merely some service principal, that decides the assume.
+const OTHER_SERVICE_PRINCIPAL: &str = "ec2.amazonaws.com";
 
 /// The emulator under test: one shared engine carrying SNS beside the IAM service the feedback
 /// roles are made with.
@@ -207,6 +225,83 @@ impl Emulator {
             ],
         )
         .await
+    }
+
+    /// Register a platform application of [`PLATFORM`] under `name`, carrying the credential
+    /// material that platform documents and the attribute `extra` when a case names one;
+    /// answers the response as it came back.
+    async fn create_application_with(
+        &self,
+        name: &str,
+        extra: Option<(&str, &str)>,
+    ) -> Answer {
+        let mut attributes = credentials(PLATFORM);
+        if let Some((attribute, value)) = extra {
+            attributes.push((attribute.to_string(), value.to_string()));
+        }
+        let encoded = attribute_params(&attributes);
+        let mut params: Vec<(&str, &str)> = vec![("Name", name), ("Platform", PLATFORM)];
+        params.extend(
+            encoded
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+        );
+        self.sns("CreatePlatformApplication", &params).await
+    }
+
+    /// A registered platform application, with its ARN.
+    async fn platform_application(&self, name: &str) -> String {
+        let answer = self.create_application_with(name, None).await;
+        assert_eq!(
+            answer.status, 200,
+            "the fixture CreatePlatformApplication {name} must succeed, got {} / {}",
+            answer.status, answer.body
+        );
+        answer
+            .element("PlatformApplicationArn")
+            .unwrap_or_else(|| {
+                panic!(
+                    "CreatePlatformApplication {name} answers a PlatformApplicationArn, got {}",
+                    answer.body
+                )
+            })
+    }
+
+    /// Write ONE attribute of a platform application.
+    async fn set_application_attribute(
+        &self,
+        application: &str,
+        name: &str,
+        value: &str,
+    ) -> Answer {
+        self.sns(
+            "SetPlatformApplicationAttributes",
+            &[
+                ("PlatformApplicationArn", application),
+                ("Attributes.entry.1.key", name),
+                ("Attributes.entry.1.value", value),
+            ],
+        )
+        .await
+    }
+
+    /// The attribute map a platform application reports.
+    async fn application_attributes(
+        &self,
+        application: &str,
+    ) -> std::collections::HashMap<String, String> {
+        let answer = self
+            .sns(
+                "GetPlatformApplicationAttributes",
+                &[("PlatformApplicationArn", application)],
+            )
+            .await;
+        assert_eq!(
+            answer.status, 200,
+            "GetPlatformApplicationAttributes {application} must succeed, got {} / {}",
+            answer.status, answer.body
+        );
+        attribute_map(&answer)
     }
 }
 
@@ -766,6 +861,113 @@ async fn a_role_scoped_to_one_topic_takes_no_write_on_a_sibling() {
         read.code(),
         "NotFound",
         "case {case:?}: a refused create must leave no topic, got {} / {}",
+        read.status,
+        read.body
+    );
+}
+
+/// RULE, on the OTHER resource whose attributes name a delivery-status feedback role: a platform
+/// application's `SuccessFeedbackRoleArn` / `FailureFeedbackRoleArn` ("IAM role ARN used to give
+/// Amazon SNS write access to use CloudWatch Logs on your behalf",
+/// `SetPlatformApplicationAttributesInput$Attributes` doc) names a role Amazon SNS has to assume
+/// FOR THAT APPLICATION, so the write is answered from the trust document this account's IAM
+/// holds for the role exactly as a topic's is — accepted and read back when the document grants
+/// this service the assume, refused `400 InvalidParameter` with the service's own logging-role
+/// sentence otherwise, and the application reads back carrying no such attribute. The rule is the
+/// same whichever call carried the write, so the registration that names the same value is
+/// refused too and leaves no application behind.
+///
+/// The rows differ along which of the pair the write carried, what the role's trust document
+/// says (this service, another service, and a role IAM holds nothing under, which is no evidence
+/// about a role provisioned out of band), and which call wrote it.
+#[tokio::test]
+async fn a_platform_applications_feedback_role_is_held_to_the_same_trust_policy() {
+    let emulator = Emulator::new();
+    let trusted = emulator
+        .role(
+            "sns-app-logs-trusted",
+            &trusts(json!({"Service": SNS_PRINCIPAL}), json!("sts:AssumeRole")),
+        )
+        .await;
+    let account = account_of(&trusted);
+    let untrusted = emulator
+        .role(
+            "sns-app-logs-other-service",
+            &trusts(
+                json!({"Service": OTHER_SERVICE_PRINCIPAL}),
+                json!("sts:AssumeRole"),
+            ),
+        )
+        .await;
+    // A role this account's IAM holds nothing under: a logging role is routinely provisioned
+    // out of band, so it is no evidence about the role the caller named and is not refused.
+    let unheld = format!("arn:aws:iam::{account}:role/sns-app-logs-provisioned-elsewhere");
+
+    let application = emulator
+        .platform_application("feedback-role-application")
+        .await;
+
+    for attribute in APPLICATION_FEEDBACK_ROLE_ATTRIBUTES {
+        let case = format!("{attribute} naming a role that trusts another service");
+        let answer = emulator
+            .set_application_attribute(&application, attribute, &untrusted)
+            .await;
+        assert_refused(&case, &answer, attribute, &untrusted);
+        let held = emulator.application_attributes(&application).await;
+        assert!(
+            !held.contains_key(*attribute),
+            "case {case:?}: a refused write must leave the application carrying no \
+             {attribute}, got {held:?}"
+        );
+
+        let case = format!("{attribute} naming a role IAM holds nothing under");
+        let answer = emulator
+            .set_application_attribute(&application, attribute, &unheld)
+            .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: expected 200, got {} / {}",
+            answer.status, answer.body
+        );
+
+        let case = format!("{attribute} naming a role that trusts this service");
+        let answer = emulator
+            .set_application_attribute(&application, attribute, &trusted)
+            .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: expected 200, got {} / {}",
+            answer.status, answer.body
+        );
+        let held = emulator.application_attributes(&application).await;
+        assert_eq!(
+            held.get(*attribute).map(String::as_str),
+            Some(trusted.as_str()),
+            "case {case:?}: the accepted role must read back, got {held:?}"
+        );
+    }
+
+    // The REGISTRATION is the other path the same attribute is written by, and the same rule
+    // decides it: nothing is registered under a configuration this service could not honour.
+    let case = "a registration naming a role that trusts another service";
+    let name = "feedback-role-application-refused";
+    let created = emulator
+        .create_application_with(name, Some(("SuccessFeedbackRoleArn", &untrusted)))
+        .await;
+    assert_refused(case, &created, "SuccessFeedbackRoleArn", &untrusted);
+    let read = emulator
+        .sns(
+            "GetPlatformApplicationAttributes",
+            &[(
+                "PlatformApplicationArn",
+                &format!("arn:aws:sns:{REGION}:{account}:app/{PLATFORM}/{name}"),
+            )],
+        )
+        .await;
+    assert_eq!(
+        read.code(),
+        "NotFound",
+        "case {case:?}: a refused registration must leave no application, got {} / {}",
         read.status,
         read.body
     );

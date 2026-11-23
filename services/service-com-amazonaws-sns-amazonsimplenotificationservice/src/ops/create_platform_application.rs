@@ -228,6 +228,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = state::request_region(ctx.parts());
         let arn = state::platform_application_arn(&region, platform, &input.name);
 
+        // A delivery-status feedback role this create names is held to the SAME trust
+        // relationship a write through `SetPlatformApplicationAttributes` is: SNS has to
+        // assume that role to write the records the attribute asks for, for the application
+        // being registered, so a role whose trust policy withholds that assume takes no
+        // create either, and no application is left behind carrying it. It is resolved
+        // before the store is locked: the resolution is an in-process call into another
+        // service's store, which must not run under this one's lock.
+        if let Some(message) =
+            state::feedback_role::untrusted_roles_refusal(ctx, &region, &arn, &input.attributes)
+                .await
+        {
+            return Err(refuse(message));
+        }
+
         let mut store = store.lock();
         let held_records = store.platform_applications.len();
         // ONE lookup decides both branches. Either way the map the record WOULD hold is

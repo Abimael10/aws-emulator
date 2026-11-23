@@ -234,6 +234,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+        // The record the write addresses is resolved under the store's lock, which is
+        // RELEASED before the roles the write names are resolved: that resolution is an
+        // in-process call into another service's store, which must not run under this
+        // one's lock.
+        if !store
+            .lock()
+            .platform_applications
+            .contains_key(&input.platform_application_arn)
+        {
+            return Err(
+                SetPlatformApplicationAttributesErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(state::PLATFORM_APPLICATION_DOES_NOT_EXIST.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+        // A delivery-status feedback role is a role SNS has to ASSUME to write the records
+        // the attribute asks for, FOR THIS APPLICATION ("IAM role ARN used to give Amazon SNS
+        // write access to use CloudWatch Logs on your behalf",
+        // `SetPlatformApplicationAttributesInput$Attributes` doc), so the role is resolved in
+        // the account's own IAM records and refused here when its trust policy withholds that
+        // assume — the conditions a trust statement narrows the grant by included. It is the
+        // same rule, and the same sentence, a write of a TOPIC's feedback role is held to
+        // ([`state::feedback_role`]): the attribute never lands, and the application does not
+        // read back as configured for logging that could never happen.
+        if let Some(message) = state::feedback_role::untrusted_roles_refusal(
+            ctx,
+            &region,
+            &input.platform_application_arn,
+            &input.attributes,
+        )
+        .await
+        {
+            return Err(invalid_parameter(message));
+        }
         let mut store = store.lock();
 
         let Some(application) = store
