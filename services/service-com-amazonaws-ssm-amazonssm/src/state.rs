@@ -424,6 +424,10 @@ pub mod agent_releases;
 /// projected as.
 pub mod node_listing;
 
+/// The node SUMMARY of the same experience: the counts `ListNodesSummary` groups those nodes
+/// into, and the aggregations it can make.
+pub mod node_summary;
+
 /// The Session Manager sessions this endpoint holds: the record a start persists, what
 /// ends one, and how a report filters and pages them.
 pub mod sessions;
@@ -692,6 +696,14 @@ pub const POLICY_TYPES: &[&str] = &[
     POLICY_TYPE_NO_CHANGE_NOTIFICATION,
 ];
 
+/// What a `Policies` document carrying a policy of a type Parameter Store does not support is
+/// refused with: the sentence the service words that refusal with, naming the type the request
+/// asked for and nothing else of it — the supported types are what the modelled
+/// `InvalidPolicyTypeException` states ([`POLICY_TYPES`]), not what the refusal lists.
+pub fn unsupported_policy_type_message(policy_type: &str) -> String {
+    format!("Policy type {policy_type} is not supported.")
+}
+
 /// What a `Policies` document whose policies cannot stand together is refused with.
 ///
 /// Each sentence is fixed text naming the policy TYPES in conflict, in the prose spelling
@@ -705,16 +717,33 @@ pub fn duplicate_policy_message(policy_type: &str) -> String {
     )
 }
 
+/// Whether a parameter may carry MORE THAN ONE policy of `policy_type`.
+///
+/// An [`POLICY_TYPE_EXPIRATION`] policy sets the ONE time the parameter expires, so a second
+/// one configures that time twice over: "You can't, for example, specify two Expiration
+/// policies for a parameter" (the `IncompatiblePolicyException` doc). A NOTIFICATION policy
+/// configures one notification about an event, and a parameter may be notified about that
+/// event more than once — several leads before the same expiration, several periods without a
+/// change — so those types repeat, and a document carrying two of them is a document
+/// configuring two notifications rather than one configuration stated twice.
+pub fn policy_type_may_repeat(policy_type: &str) -> bool {
+    policy_type != POLICY_TYPE_EXPIRATION
+}
+
 /// The missing-dependency form of [`duplicate_policy_message`]: a notification ABOUT an
 /// expiration is measured from the time an [`POLICY_TYPE_EXPIRATION`] policy sets, so it
 /// cannot be the only policy of the set.
+///
+/// The sentence is the service's own wording for that conflict and carries nothing of the
+/// request: it states the policy KINDS that cannot stand apart, not how many of them the
+/// document carried or what they were addressed to.
 pub fn notification_requires_expiration_message() -> String {
     let mut sentence = policy_type_in_prose(POLICY_TYPE_EXPIRATION_NOTIFICATION);
     if let Some(first) = sentence.get_mut(0..1) {
         first.make_ascii_uppercase();
     }
     format!(
-        "{sentence} policy requires an {} policy",
+        "{sentence} policies are missing {} policy",
         policy_type_in_prose(POLICY_TYPE_EXPIRATION)
     )
 }
@@ -1038,13 +1067,11 @@ pub const RESTRICTED_PARAMETER_MESSAGE: &str =
     "Cannot access/update data for the restricted parameter.";
 
 /// What a `Policies` document carrying more policies than a parameter may hold is refused
-/// with: the sentence the modelled `PoliciesLimitExceededException` states, carrying the
-/// published maximum ([`MAX_POLICIES`]) and nothing of the request.
+/// with: the sentence the service words that quota with, carrying the published maximum
+/// ([`MAX_POLICIES`]) and nothing of the request — not how many policies the document
+/// carried, and not the parameter it addressed.
 pub fn policies_limit_message() -> String {
-    format!(
-        "You specified more than the maximum number of allowed policies for the parameter. \
-         The maximum is {MAX_POLICIES}."
-    )
+    format!("Number of policies attached to a parameter cannot exceed {MAX_POLICIES}")
 }
 
 /// What a call addressed to a reserved name AWS publishes nothing under is refused with.

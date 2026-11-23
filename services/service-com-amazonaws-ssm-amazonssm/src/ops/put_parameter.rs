@@ -381,8 +381,10 @@ enum PolicyRejection {
 /// [`crate::state::MAX_POLICIES`] of them (`PoliciesLimitExceededException`), and an
 /// `Attributes` value that is a policy attribute map
 /// (`InvalidPolicyAttributeException`) — plus the two ways a SET of policies conflicts
-/// with itself, which `IncompatiblePolicyException` reports: two policies of one type
-/// ("You can't, for example, specify two Expiration policies for a parameter"), and a
+/// with itself, which `IncompatiblePolicyException` reports: a type that configures ONE
+/// thing about the parameter stated twice ("You can't, for example, specify two Expiration
+/// policies for a parameter", [`crate::state::policy_type_may_repeat`] — a notification
+/// type repeats, because a parameter may be notified about one event more than once), and a
 /// notification about an expiration with no expiration to notify about — an
 /// `ExpirationNotification` is "notification before or after the expiration time is
 /// reached", and only an `Expiration` policy sets that time, so the two stand or fall
@@ -430,10 +432,9 @@ fn policy_count(policies: Option<&str>) -> Result<usize, PolicyRejection> {
             ));
         };
         if !crate::state::POLICY_TYPES.contains(&policy_type) {
-            return Err(PolicyRejection::Type(format!(
-                "Policy type '{policy_type}' isn't supported; the supported policy types are {}",
-                crate::state::POLICY_TYPES.join(", ")
-            )));
+            return Err(PolicyRejection::Type(
+                crate::state::unsupported_policy_type_message(policy_type),
+            ));
         }
         if policy
             .get("Attributes")
@@ -443,7 +444,12 @@ fn policy_count(policies: Option<&str>) -> Result<usize, PolicyRejection> {
                 "the Attributes of the {policy_type} policy is not a policy attribute map"
             )));
         }
-        if seen.contains(&policy_type) {
+        // A type that may not repeat configures ONE thing about the parameter, so a second
+        // policy of it configures that thing twice over ("You can't, for example, specify two
+        // Expiration policies for a parameter"); a notification type may repeat, because a
+        // parameter may be notified about one event more than once
+        // ([`crate::state::policy_type_may_repeat`]).
+        if !crate::state::policy_type_may_repeat(policy_type) && seen.contains(&policy_type) {
             return Err(PolicyRejection::Incompatible(
                 crate::state::duplicate_policy_message(policy_type),
             ));

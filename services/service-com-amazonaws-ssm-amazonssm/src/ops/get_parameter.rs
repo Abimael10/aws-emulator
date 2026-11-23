@@ -63,6 +63,15 @@
 //! resolves it: a field an ARN leaves EMPTY names no account and no Region at all, so it
 //! constrains nothing ([`crate::state::arn_names_this_endpoint`]).
 //!
+//! That hierarchy is also GATED for this read exactly as it is for the write: a name under a
+//! publisher level this endpoint bears no namespace of addresses no published data and no
+//! parameter of the account's, so it is refused `AccessDeniedException` (HTTP 400) carrying
+//! the reserved-name sentence
+//! ([`crate::state::public_parameters::reserved_read_denial_message`]) rather than reported
+//! as a name nothing is stored under — the namespace is closed, not empty, so a read of it
+//! discloses no more than a write of it does. Inside a namespace this endpoint DOES serve, a
+//! name nothing is published under is the ordinary miss.
+//!
 //! ## Secrets, read through Parameter Store
 //!
 //! One hierarchy of that same AWS-owned namespace is reserved for Amazon Web Services
@@ -159,7 +168,8 @@
 //! * `AccessDeniedException` (HTTP 400) — widened in through `extra_errors` (see below):
 //!   "The requester doesn't have permissions to perform the requested operation", which is
 //!   what a `WithDecryption` read of a value whose KMS key does not permit the caller
-//!   `kms:Decrypt` is refused with.
+//!   `kms:Decrypt` is refused with, and what a read addressed to a name in the reserved
+//!   `/aws` hierarchy this endpoint serves no name under is refused with.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -298,6 +308,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &*self.engine,
             ctx,
             Self::NAME,
+            &region,
+            query.name,
+        ) {
+            return Err(
+                GetParameterErrorModeled::AccessDeniedException(AccessDeniedException {
+                    message,
+                })
+                .into(),
+            );
+        }
+
+        // The reserved hierarchy is gated for this read exactly as it is for the write: a
+        // name under a publisher level this endpoint bears no namespace of addresses no data
+        // at all, so it is DENIED rather than reported as a name nothing is stored under
+        // ([`crate::state::public_parameters::reserved_read_denial_message`]) — the namespace
+        // is closed, not empty. Decided before the store is read, because nothing in it could
+        // hold such a name; a name the hierarchy does serve falls through to the resolutions
+        // below.
+        if let Some(message) = crate::state::public_parameters::reserved_read_denial_message(
+            &*self.engine,
             &region,
             query.name,
         ) {

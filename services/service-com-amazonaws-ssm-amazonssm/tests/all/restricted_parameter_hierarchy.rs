@@ -16,9 +16,11 @@
 //! the sentence quotes.
 //!
 //! A READ of that hierarchy is not a change, so it is not denied for being one: a name AWS
-//! publishes resolves against the published catalog (`all/public_parameter_catalog.rs`) and
-//! a name it publishes nothing under is still the modelled miss
-//! (`all/parameter_not_found_payload.rs`). A HIERARCHY read of it does carry its own
+//! publishes resolves against the published catalog (`all/public_parameter_catalog.rs`) and a
+//! name it publishes nothing under INSIDE a namespace this endpoint serves is still the
+//! modelled miss (`all/parameter_not_found_payload.rs`). What a read IS denied is a name the
+//! reserved hierarchy serves nothing under at all — the namespace is closed rather than empty
+//! (`all/reserved_parameter_name_reads.rs`). A HIERARCHY read of it does carry its own
 //! restriction, checked here too: the reserved hierarchy is the namespaces AWS publishes in
 //! (plus the reserved reference namespace this service serves another service's secrets
 //! through), and a read reaches a namespace from either side — the levels above it, which
@@ -205,10 +207,12 @@ async fn a_change_to_the_reserved_hierarchy_is_denied() {
     );
 }
 
-/// The denial is about CHANGING the hierarchy, so a read of it is unchanged: a name AWS
-/// publishes still resolves, and a name it publishes nothing under is still the miss.
+/// The denial is about CHANGING the hierarchy, so a read inside a namespace this endpoint
+/// SERVES is unchanged: a name AWS publishes still resolves, and a name it publishes nothing
+/// under there is still the miss. (A read addressed to a name the reserved hierarchy serves
+/// nothing under at all is denied — `all/reserved_parameter_name_reads.rs`.)
 #[tokio::test]
-async fn a_read_of_the_reserved_hierarchy_is_not_denied() {
+async fn a_read_of_a_served_reserved_namespace_is_not_denied() {
     let router = emulator();
     let published = a_published_name(&router).await;
 
@@ -219,13 +223,17 @@ async fn a_read_of_the_reserved_hierarchy_is_not_denied() {
         "expected the published parameter to read back, got {status} {read}"
     );
 
-    // (case, the Name read, the code it answers with)
+    // (case, the Name read) — each inside a namespace this endpoint serves names in, where a
+    // name nothing is published under is absent rather than closed.
     let misses = [
         (
             "a leaf AWS publishes nothing under",
             format!("{AMAZON_LINUX_NAMESPACE}/no-such-published-alias"),
         ),
-        ("a namespace AWS publishes nothing in", "/aws/no/such/space".to_string()),
+        (
+            "a namespace AWS publishes nothing in, under a publisher level that bears one",
+            "/aws/service/no/such/space".to_string(),
+        ),
     ];
     for (case, name) in misses {
         for operation in ["GetParameter", "GetParameterHistory"] {

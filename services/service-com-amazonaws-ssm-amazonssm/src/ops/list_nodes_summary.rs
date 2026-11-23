@@ -1,15 +1,48 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListNodesSummary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListNodesSummary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Summarise the managed nodes of the Systems Manager INTEGRATED EXPERIENCE: the counts the
+//! request's aggregators group this account's nodes into, narrowed by its filters and served
+//! one page at a time. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListNodesSummary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The answer is computed from the node store in [`crate::state`]
+//! (`ComAmazonawsSsmAmazonssmState::managed_nodes`) — the same records `ListNodes` reports
+//! one by one and the node describes report — grouped by [`crate::state::node_summary`], so a
+//! count is of the nodes a listing of the same request would report and the two can never
+//! disagree. The one write it makes is materialising the registrations the clock already owed
+//! ([`crate::state::node_registration::settle_registrations`]): an instance that has been
+//! running long enough with a profile that lets its agent register was a managed node at that
+//! instant whether or not anybody called.
+//!
+//! ## Which requests are refused, and with which modelled error
+//!
+//! * An aggregator nested deeper than a summary row can carry is
+//!   `InvalidAggregatorException` ([`crate::state::node_summary::aggregator_rejection`]) —
+//!   the request is answered against what it ASKS for before the account is looked at. A
+//!   member outside the closed enum the model declares for it is refused by the centralized
+//!   request walk before this handler runs.
+//! * An account that has not enabled the Systems Manager integrated experience is answered
+//!   `UnsupportedOperationException` ([`crate::state::node_listing::NOT_ENABLED_MESSAGE`]),
+//!   exactly as the sibling `ListNodes` answers it: enabling the experience is what puts the
+//!   Amazon Web Services managed node resource data sync in the account, which is what the
+//!   decision is taken from — per Region, because a sync is a regional record.
+//! * A `SyncName` other than that sync's names no sync a node summary can read — "the name of
+//!   the supported resource data sync is AWS-QuickSetup-ManagedNode" — so it is
+//!   `ResourceDataSyncNotFoundException`, carrying the name and the sync type the summary
+//!   looked for ([`crate::state::resource_data_syncs::sync_not_found_message`]).
+//! * A `NextToken` this service did not hand out is `InvalidNextToken`.
+//!
+//! ## Grouping and paging
+//!
+//! Filters intersect and each filter's values union, the way the node listing applies them
+//! ([`crate::state::node_listing::matches_filter`]), and which Regions' nodes are summarised
+//! is what `SyncName` decides — the Region the request was signed for when it names no sync,
+//! and the Regions the managed node sync aggregates when it does. Each aggregator then groups
+//! the selected nodes by the attribute it names, a nested aggregator refines each group, and a
+//! page holds `MaxResults` rows (the modelled range 1..50, and up to 50 for a request naming
+//! none) with a `NextToken` carrying the row the next page resumes after
+//! ([`crate::state::node_summary::SummaryRow::position`]) — a row, not an offset into a list
+//! that may have changed.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +200,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListNodesSummary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListNodesSummaryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListNodesSummary"))
+        use crate::state::parameter_pagination::already_served;
+        use crate::state::resource_data_syncs::{sync_not_found_message, SYNC_TYPE_FROM_SOURCE};
+        use crate::state::{node_listing, node_summary};
+        use crate::state::{non_empty, request_region, INVALID_NEXT_TOKEN};
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListNodesSummaryErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some(
+                        "this service is mounted on an engine that holds no state".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // What the request ASKS for is answered first: an aggregator naming an aggregation
+        // this summary cannot make is refused whatever the account holds.
+        if let Some(why) = node_summary::aggregator_rejection(&input.aggregators) {
+            return Err(ListNodesSummaryErrorModeled::InvalidAggregatorException(
+                InvalidAggregatorException { message: Some(why) },
+            )
+            .into());
+        }
+
+        // Systems Manager is regional: whether the account has the integrated experience,
+        // and which sync aggregates the nodes, are facts of the endpoint the request was
+        // signed for.
+        let region = request_region(ctx.parts());
+        let named_sync = non_empty(input.sync_name.as_deref());
+        let (regions, page_key) = {
+            let store = state.lock();
+            // An account that has not enabled the integrated experience has no node summary
+            // at all, which is answered before anything else the request names is looked at
+            // — the refusal the sibling `ListNodes` answers such an account with.
+            if !store.has_integrated_experience(&region) {
+                return Err(ListNodesSummaryErrorModeled::UnsupportedOperationException(
+                    UnsupportedOperationException {
+                        message: Some(node_listing::NOT_ENABLED_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
+            // "The name of the supported resource data sync is AWS-QuickSetup-ManagedNode":
+            // any other name names no sync whose nodes this summary could count, so it is
+            // reported as a sync that does not exist — the sync a node summary reads
+            // aggregates data from its source, which is the `SyncFromSource` type.
+            if let Some(named) =
+                named_sync.filter(|named| *named != node_listing::MANAGED_NODE_SYNC_NAME)
+            {
+                return Err(
+                    ListNodesSummaryErrorModeled::ResourceDataSyncNotFoundException(
+                        ResourceDataSyncNotFoundException {
+                            message: Some(sync_not_found_message(named, SYNC_TYPE_FROM_SOURCE)),
+                            sync_name: Some(named.to_string()),
+                            sync_type: Some(SYNC_TYPE_FROM_SOURCE.to_string()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            (
+                store.node_listing_regions(&region, named_sync.is_some()),
+                store.page_token_key(),
+            )
+        };
+
+        let page_size = node_listing::page_size(input.max_results)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // The token carries the row the last page stopped at, behind an authenticator only
+        // this store can produce, so a value this read did not ISSUE names no position at
+        // all however exactly it is shaped like one.
+        let resume_after = match non_empty(input.next_token.as_deref()) {
+            None => None,
+            Some(token) => match node_summary::page_cursor(&page_key, token) {
+                Some(position) => Some(position),
+                None => {
+                    return Err(ListNodesSummaryErrorModeled::InvalidNextToken(
+                        InvalidNextToken {
+                            message: Some(INVALID_NEXT_TOKEN.to_string()),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        // The registration an instance of a summarised Region had already made by now was
+        // owed at the same instant whether or not anybody called, so it is materialised
+        // before the store is read — with no guard of it held.
+        for listed in &regions {
+            crate::state::node_registration::settle_registrations(&*self.engine, listed);
+        }
+
+        let filters = input.filters.as_deref().unwrap_or_default();
+        let rows = {
+            let store = state.lock();
+            node_summary::summarise(&store, &regions, filters, &input.aggregators)
+        };
+
+        let mut summary = Vec::new();
+        let mut served = None;
+        let mut next_token = None;
+        for row in &rows {
+            let position = row.position();
+            // A resume continues STRICTLY after the row its cursor names, so nothing a
+            // previous page reported is reported twice.
+            if already_served(resume_after.as_deref(), position.as_str()) {
+                continue;
+            }
+            if summary.len() == page_size {
+                // The page is full and a row is still waiting: the caller is handed the row
+                // this page stopped at, so the next request continues after it.
+                next_token = served.as_deref().map(|last| node_summary::page_token(&page_key, last));
+                break;
+            }
+            summary.push(row.to_summary());
+            served = Some(position);
+        }
+
+        Ok(ListNodesSummaryOutput {
+            summary: Some(summary),
+            next_token,
+        })
     }
 }

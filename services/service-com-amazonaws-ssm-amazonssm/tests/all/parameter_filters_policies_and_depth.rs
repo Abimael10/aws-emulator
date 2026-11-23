@@ -745,8 +745,9 @@ async fn an_update_that_sends_no_policies_preserves_them_and_an_empty_array_clea
 
 /// RULE: a policy set that cannot stand together is refused with
 /// `IncompatiblePolicyException` naming the policies in conflict, and NOTHING is written — a
-/// notification about an expiration needs the expiration whose time it is measured from,
-/// and no type may appear twice.
+/// notification about an expiration needs the expiration whose time it is measured from, and
+/// the expiration that sets the one time a parameter expires may not appear twice (a
+/// notification type may, because a parameter may be notified about one event more than once).
 #[tokio::test]
 async fn a_policy_set_that_cannot_stand_together_is_refused_and_writes_nothing() {
     let router = router();
@@ -774,12 +775,12 @@ async fn a_policy_set_that_cannot_stand_together_is_refused_and_writes_nothing()
         (
             "an expiration notification with no expiration",
             &["ExpirationNotification"],
-            Some("Expiration notification policy requires an expiration policy"),
+            Some("Expiration notification policies are missing expiration policy"),
         ),
         (
             "an expiration notification beside only a no-change notification",
             &["ExpirationNotification", "NoChangeNotification"],
-            Some("Expiration notification policy requires an expiration policy"),
+            Some("Expiration notification policies are missing expiration policy"),
         ),
         (
             "two expirations",
@@ -787,14 +788,17 @@ async fn a_policy_set_that_cannot_stand_together_is_refused_and_writes_nothing()
             Some("There can be only one expiration policy"),
         ),
         (
+            // A parameter may be notified about one expiration more than once — several leads
+            // before it — so a repeated notification configures two notifications rather than
+            // one configuration stated twice.
             "two notifications of one type",
             &["Expiration", "ExpirationNotification", "ExpirationNotification"],
-            Some("There can be only one expiration notification policy"),
+            None,
         ),
         (
-            "two no-change notifications",
+            "two no-change notifications, each its own period",
             &["NoChangeNotification", "NoChangeNotification"],
-            Some("There can be only one no change notification policy"),
+            None,
         ),
     ];
 

@@ -13,7 +13,12 @@
 //! A name in the hierarchy AWS publishes its own parameters in is resolved against THAT
 //! catalog ([`crate::state::public_parameters`]) rather than against the store, as every
 //! read of a name is: the catalog publishes one version of such a name, so its history is
-//! that one version.
+//! that one version. That hierarchy is GATED for this read exactly as it is for the write:
+//! a name under a publisher level this endpoint bears no namespace of addresses no
+//! published data and no parameter of the account's, so it is refused
+//! `AccessDeniedException` (HTTP 400) carrying the reserved-name sentence
+//! ([`crate::state::public_parameters::reserved_read_denial_message`]) rather than reported
+//! as a name nothing is stored under.
 //!
 //! ## Paging
 //!
@@ -279,6 +284,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .into(),
             );
+        }
+
+        // The reserved `/aws` hierarchy is gated for this read exactly as it is for the
+        // write: a name under a publisher level this endpoint bears no namespace of
+        // addresses no published data and no parameter of the account's, so it is DENIED
+        // rather than reported as a name nothing is stored under
+        // ([`crate::state::public_parameters::reserved_read_denial_message`]) — the
+        // namespace is closed, not empty. Decided before the store is read, because nothing
+        // in it could hold such a name.
+        if let Some(message) = crate::state::public_parameters::reserved_read_denial_message(
+            &*self.engine,
+            &region,
+            query.name,
+        ) {
+            return Err(GetParameterHistoryErrorModeled::AccessDeniedException(
+                AccessDeniedException { message },
+            )
+            .into());
         }
 
         let page_size = parameter_history_page_size(input.max_results)

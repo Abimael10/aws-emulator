@@ -138,6 +138,36 @@ pub fn reserved_name_refusal_message(
     }
 }
 
+/// What a READ addressed to `name` in the reserved hierarchy is refused with, or `None` when
+/// the hierarchy SERVES that name and the read resolves it.
+///
+/// The reserved hierarchy is gated for a read exactly as it is for a write: a name in it is
+/// never the account's, so a caller may address only what this endpoint publishes there — the
+/// namespaces AWS publishes in and the reserved namespace another service's secrets are
+/// served through ([`namespaces`]). A name under a publisher level that bears NONE of them
+/// addresses no data at all, so it is refused as the reserved NAME it is
+/// ([`super::reserved_name_denial_message`]) rather than reported as a name nothing is stored
+/// under: the refusal is about the namespace being closed, not about the name being absent,
+/// so a read of it discloses no more than a write of it does.
+///
+/// A name the hierarchy does serve a read of is resolved — against the published catalog
+/// ([`published`]) or against the service the reserved reference namespace reads
+/// ([`super::secretsmanager_reference`]) — and a name inside a served namespace that nothing
+/// is published under is the ordinary miss, exactly as a hierarchy read of such a level
+/// reports the nothing it holds ([`is_reserved_namespace`]).
+pub fn reserved_read_denial_message(
+    engine: &(impl Send + Sync + 'static),
+    region: &str,
+    name: &str,
+) -> Option<String> {
+    if !is_published_name(name) {
+        return None;
+    }
+    let published = published_records(engine, region);
+    (!names_published_data(canonical_name(name), &published))
+        .then(|| super::reserved_name_denial_message(name))
+}
+
 /// The publisher level canonical `path` lies under — the two levels `<reserved
 /// root>/<publisher>` of it — or `None` when it is the reserved root itself, which lies
 /// under none.
