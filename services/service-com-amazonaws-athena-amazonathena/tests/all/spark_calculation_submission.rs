@@ -4,16 +4,16 @@
 //! boots (awsJson1_1, `x-amz-target: AmazonAthena.StartCalculationExecution`), so every
 //! assertion is about what an SDK client observes.
 //!
-//! THE RULE UNDER TEST: a calculation is the code of a cell of the notebook a session
-//! serves, so `StartCalculationExecution` persists the submitted code block for a session
-//! that is still running AND was started for a notebook this account holds — answering with
-//! the `CalculationExecutionId` it minted and the state the calculation was created in,
-//! which `GetCalculationExecutionCode` then answers the same code out of — while every other
+//! THE RULE UNDER TEST: a calculation runs inside a session, so `StartCalculationExecution`
+//! persists the submitted code block for any session that is still running — whether that
+//! session was started in a notebook or for programmatic access — answering with the
+//! `CalculationExecutionId` it minted and the state the calculation was created in, which
+//! `GetCalculationExecutionCode` then answers the same code out of — while every other
 //! session-addressed submission (an id this account holds no session under, a session whose
-//! resources are no longer running, a session serving no notebook) is refused HTTP 400
-//! `InvalidRequestException` with the one sentence Athena states for the whole class, having
-//! persisted nothing and left the session exactly as it was. A submission that names neither
-//! code block, or both of them, is refused for that instead.
+//! resources are no longer running) is refused HTTP 400 `InvalidRequestException` with the one
+//! sentence Athena states for the whole class, having persisted nothing and left the session
+//! exactly as it was. A submission that names neither code block, or both of them, is refused
+//! for that instead.
 //!
 //! Each rule is asserted over a TABLE rather than one request: the rows differ along the
 //! CODE BLOCK (empty, a single expression, several lines, text outside ASCII, the modelled
@@ -366,16 +366,17 @@ async fn a_submission_names_exactly_one_code_block() {
     }
 }
 
-/// RULE: a session serves the notebook its start bound it to, so a session serving none runs
-/// no calculation: the submission is refused with the sentence every session-addressed
-/// request this service will not act on is refused with, nothing is persisted, and the
-/// session is left exactly as it was.
+/// RULE: a calculation runs inside the SESSION it was submitted into, so which notebook that
+/// session serves — one this account holds, one it no longer holds, or none at all — decides
+/// only which notebook the calculation is a cell of, and never whether the submission is
+/// served: that is the programmatic path AWS documents, a session started and code submitted
+/// into it with no notebook anywhere.
 #[tokio::test]
-async fn a_session_serving_no_notebook_takes_no_calculation() {
+async fn a_session_serving_no_notebook_still_takes_a_calculation() {
     let (engine, router) = engine_and_router();
     given_spark_work_group(&router).await;
-    // A notebook exists throughout, so each refusal below is about the session the request
-    // addressed rather than about this account holding no notebooks at all.
+    // A notebook exists throughout, so what each row varies is the session's binding rather
+    // than this account holding no notebooks at all.
     let notebook = given_notebook(&router, "served").await;
     let gone = state::new_notebook_id();
 
@@ -385,8 +386,12 @@ async fn a_session_serving_no_notebook_takes_no_calculation() {
             "a session bound to a notebook this account does not hold",
             Some(gone),
         ),
+        (
+            "a session serving a notebook",
+            Some(notebook.clone()),
+        ),
     ];
-    for (case, bound_to) in &rows {
+    for (index, (case, bound_to)) in rows.iter().enumerate() {
         let session = given_session(&engine, bound_to.as_deref(), Lifecycle::Running);
         let before = session_state(&router, &session).await;
         assert_eq!(
@@ -394,40 +399,33 @@ async fn a_session_serving_no_notebook_takes_no_calculation() {
             "case {case:?}: the session under test must be idle first, got {before:?}"
         );
 
-        let (status, refused) = submit(
+        let code = format!("print({index})");
+        let id = accepted(
             &router,
-            &json!({ "SessionId": session, "CodeBlock": "1" }),
+            case,
+            &json!({ "SessionId": session, "CodeBlock": code }),
         )
         .await;
-        assert_refusal(
-            case,
-            status,
-            &refused,
-            ERROR_CODE_UNAUTHORIZED,
-            SESSION_NOT_FOUND,
+        let read_back = code_of(&router, case, &id).await;
+        assert_eq!(
+            read_back, code,
+            "case {case:?}: expected the submitted code back, got {read_back:?}"
         );
         assert_eq!(
             held_calculations(&engine),
-            0,
-            "case {case:?}: a refused submission must persist nothing, got {} calculations",
+            index + 1,
+            "case {case:?}: expected {} calculations held, got {}",
+            index + 1,
             held_calculations(&engine)
         );
+        // Submitting changed nothing about the session itself: the state a later read reports
+        // is still the one the clock puts it in.
         let after = session_state(&router, &session).await;
         assert_eq!(
             after, before,
-            "case {case:?}: a refused submission starts nothing, so the session must still \
-             report {before:?}, got {after:?}"
+            "case {case:?}: the session must still report {before:?}, got {after:?}"
         );
     }
-    // The notebook-bound session of the same account still takes one, so what the rows above
-    // assert is the notebook the session serves and not this workgroup refusing everything.
-    let serving = given_session(&engine, Some(&notebook), Lifecycle::Running);
-    accepted(
-        &router,
-        "a session serving a notebook",
-        &json!({ "SessionId": serving, "CodeBlock": "1" }),
-    )
-    .await;
 }
 
 /// RULE: every session-addressed submission this service will not act on is refused the same

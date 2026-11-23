@@ -409,6 +409,22 @@ impl SessionRecord {
         self.state_at(now) == SESSION_STATE_TERMINATED
     }
 
+    /// Whether the session's resources are UP at `now`, so there is a running engine behind
+    /// it for a caller to connect to.
+    ///
+    /// The two states a started session serves work in: "IDLE - The session is able to accept
+    /// a calculation" and "BUSY - the session is processing another task". A session still
+    /// "acquiring resources" (`CREATING`), one shutting down and one whose resources are gone
+    /// have no engine behind them, which is why they are narrower than
+    /// [`Self::is_active_at`]: a listing counts a session being started as active, while a
+    /// connection to one cannot be served before its resources exist.
+    pub fn is_ready_at(&self, now: SystemTime) -> bool {
+        matches!(
+            self.state_at(now),
+            SESSION_STATE_IDLE | SESSION_STATE_BUSY
+        )
+    }
+
     /// The record as the modelled `SessionSummary` a workgroup's session listing reports it
     /// by, as of `now`.
     ///
@@ -836,7 +852,7 @@ fn epoch_millis(at: SystemTime) -> i64 {
 /// `now` plus `span`, or `now` when that instant is not representable — so a clock far
 /// enough in the future to overflow yields a transition that is already due rather than a
 /// panic.
-fn due_at(now: SystemTime, span: Duration) -> SystemTime {
+pub(crate) fn due_at(now: SystemTime, span: Duration) -> SystemTime {
     now.checked_add(span).unwrap_or(now)
 }
 

@@ -130,6 +130,22 @@ aws-sdk-eventbridge = { version = "1", default-features = false }
 # service's own state accessor rather than over `PutMetricData`, which refuses a publish into
 # a namespace the services own.
 service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+# ---------------------------------------------------------------------------
+# The EXECUTION substrate a notebook CALCULATION runs on, and the Spark runtime it finds.
+#
+# `StartCalculationExecution` submits "the code of the calculation" into a session and a later
+# read reports what that code produced, so the code has to RUN — and it is run by the
+# CONTAINED Python interpreter this workspace already embeds, in the Lambda service crate
+# (`state::execution::python`), rather than by a second engine stood up here. That crate owns
+# the native-module allow-list, the host surface compiled out of the build and the stop no
+# guest call can clear, so there is ONE sandbox in this tree and a containment fix reaches
+# every caller of it; `state::calculation_engine` is this service's seam onto it and states
+# only this service's own bounds. The `pyspark` package a calculation imports is the
+# workspace's own shared Spark runtime (`service_common::spark_runtime`), the same one every
+# other service that runs a caller-supplied Spark program supplies. Taken as a workspace
+# dependency, exactly as this crate already takes the Glue, Amazon S3 and CloudWatch crates,
+# and the same way the EMR crate takes it (`state::spark_step_run`).
+service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
 # Renders the authenticated bytes of a page token, and a binary result value, as hex.
 hex = { workspace = true }
 smithy-macros = { workspace = true }

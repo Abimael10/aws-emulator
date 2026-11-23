@@ -9,9 +9,10 @@
 //! `$AuthTokenExpirationTime` ("Expiration time of the auth token"). Three rules follow, and
 //! this module states each once:
 //!
-//! * a client connects to a session that is RUNNING, so a session whose resources are no
-//!   longer up has no connection to hand out and the call is refused
-//!   ([`SESSION_ENDPOINT_UNAVAILABLE`]);
+//! * a client connects to a session whose resources are UP, so a session still acquiring
+//!   them, one shutting down and one whose resources are gone have no connection to hand out
+//!   and the call is refused, in the sentence Athena words for that class
+//!   ([`session_endpoint_unavailable`]);
 //! * the endpoint is an address the caller then CONNECTS to, so it leads back to this
 //!   emulator ([`session_endpoint_url`]) rather than to a host AWS publishes its own
 //!   endpoints at;
@@ -43,15 +44,38 @@ pub const SESSION_ENDPOINT_AUTH_TOKEN_LIFETIME: Duration = NOTEBOOK_AUTH_TOKEN_L
 /// The path segment naming the session a connection endpoint addresses.
 const SESSIONS_PATH_SEGMENT: &str = "sessions";
 
-/// The message a request for the connection endpoint of a session that is no longer running
+/// The message a request for the connection endpoint of a session whose resources are not UP
 /// is refused with.
 ///
-/// The SAME sentence Athena refuses the other grant over a session that is not open with
-/// ([`NOTEBOOK_SESSION_NOT_OPEN`]), held under this name so each operation states where its
-/// refusal comes from: a session whose resources are gone accepts no connection, which is
-/// the same condition as its serving no notebook, and Athena words that class as fixed text
-/// carrying nothing of the request.
-pub const SESSION_ENDPOINT_UNAVAILABLE: &str = NOTEBOOK_SESSION_NOT_OPEN;
+/// RECORDED wording for that class, which carries the state the session is in as its one
+/// variable part: fixed text "Can not generate Session endpoint URL for Session in " plus the
+/// state and " state". A session that is not running has nothing to connect to, and that is
+/// what Athena says about it — so this operation words the class itself rather than borrowing
+/// the sentence the other grant over a session states ([`NOTEBOOK_SESSION_NOT_OPEN`]), which
+/// is the recorded wording of THAT operation.
+///
+/// The state is named as Athena's own session lifecycle names it, which is not always the
+/// `SessionState` the API reports ([`session_lifecycle_state`]).
+pub fn session_endpoint_unavailable(state: &str) -> String {
+    format!(
+        "Can not generate Session endpoint URL for Session in {} state",
+        session_lifecycle_state(state)
+    )
+}
+
+/// The name Athena's session LIFECYCLE gives the state a session reporting the `SessionState`
+/// `state` is in.
+///
+/// Only one differs from the API's own name, and the recording is what states it: the session
+/// whose resources are still being acquired — "CREATING - The session is being started,
+/// including acquiring resources" — is the session being PROVISIONED. Every other state is
+/// named by the API's own word for it, which is the name the lifecycle and the API share.
+fn session_lifecycle_state(state: &str) -> &str {
+    if state == SESSION_STATE_CREATING {
+        return "PROVISIONING";
+    }
+    state
+}
 
 /// The endpoint a client connects to one session at: the address THIS emulator is reached
 /// at, with the path naming the session being connected to.

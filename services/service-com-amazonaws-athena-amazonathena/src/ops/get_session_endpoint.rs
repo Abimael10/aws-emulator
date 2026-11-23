@@ -4,7 +4,7 @@
 //! IMPLEMENTED: answers with the connection endpoint of the session the request names — an
 //! address of this emulator carrying that session's own path — and a fresh authentication
 //! token for it, out of the record `StartSession` persisted; a session id this account holds
-//! none under, and a session whose resources are no longer running, are refused.
+//! none under, and a session whose resources are not up, are refused.
 //!
 //! ## Shape of an operation
 //!
@@ -166,12 +166,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::state::session_not_authorized());
         };
 
-        // A client CONNECTS to what this call reports, and only a session that is running
-        // accepts a connection: a session shutting down, one whose resources are gone and
-        // one that ended badly have no endpoint to connect to (see
-        // `crate::state::session_endpoint`).
-        if !session.is_active_at(now) {
-            return Err(invalid_request(crate::state::SESSION_ENDPOINT_UNAVAILABLE));
+        // A client CONNECTS to what this call reports, and only a session whose resources are
+        // UP has anything to connect to: a session still acquiring them, one shutting down and
+        // one whose resources are gone have no endpoint
+        // (`crate::state::SessionRecord::is_ready_at`), so each is refused in the sentence
+        // Athena words for that class, which names the state the session is in
+        // (`crate::state::session_endpoint_unavailable`).
+        if !session.is_ready_at(now) {
+            return Err(invalid_request(crate::state::session_endpoint_unavailable(
+                session.state_at(now),
+            )));
         }
 
         // A fresh token per call, so a re-issue refreshes it rather than handing back the

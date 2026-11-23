@@ -4,18 +4,25 @@
 //! (awsJson1_1, `x-amz-target: AmazonAthena.<Operation>`): it "Gets a connection endpoint and
 //! authentication token for a given session Id".
 //!
-//! THE RULE UNDER TEST: for a session this account holds that is still running, the call
+//! THE RULE UNDER TEST: for a session this account holds whose resources are UP, the call
 //! answers a grant computed from that stored session — an address of THIS emulator naming the
 //! session, a fresh authentication token only this store could have minted for it, and the
 //! instant that token expires — and asking for it changes nothing a later caller sees. A
 //! session id this account holds no session under is refused with the one sentence every
 //! session-addressed call of this service states for that miss, and a session whose resources
-//! are no longer running has no connection to hand out and is refused for that.
+//! are not up — one still being started, one shutting down, one whose resources are gone — has
+//! no connection to hand out and is refused in the sentence Athena words for that class, which
+//! names the state the session is in.
 //!
 //! The rows differ along what the rule generalises over: how many times the grant is asked
 //! for, which notebook the session was started in (one, or none at all), which session of
 //! several the request names, the shape of an id that names no session, and which
 //! non-running state the session is in.
+//!
+//! Nothing here waits for a fixed span: a test that needs a transition the clock owes POLLS
+//! for the state it is waiting on, under a deadline far above the span that transition is due
+//! after, and a session that must SIT at a point of its lifecycle is seeded with the instants
+//! that put it there.
 //!
 //! Nothing here waits for a fixed span: a test that needs a transition the clock owes POLLS
 //! for the state it is waiting on, under a deadline far above the span that transition is due
@@ -25,9 +32,10 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_athena_amazonathena::state::{
-    self, ERROR_CODE_INVALID_INPUT, ERROR_CODE_UNAUTHORIZED, NOTEBOOK_ID_CONFIG,
-    PYSPARK_ENGINE_VERSION, SESSION_ENDPOINT_UNAVAILABLE, SESSION_NOT_FOUND,
-    SESSION_STATE_TERMINATED,
+    self, session_endpoint_unavailable, SessionRecord, ERROR_CODE_INVALID_INPUT,
+    ERROR_CODE_UNAUTHORIZED, NOTEBOOK_ID_CONFIG, PYSPARK_ENGINE_VERSION, SESSION_NOT_FOUND,
+    SESSION_STATE_CREATING, SESSION_STATE_IDLE, SESSION_STATE_TERMINATED,
+    SESSION_STATE_TERMINATING,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -185,6 +193,10 @@ async fn a_running_session_answers_an_endpoint_and_a_token_of_its_own() {
     let mut endpoints: Vec<(String, String)> = Vec::new();
     for (case, notebook) in &cases {
         let session_id = given_session(&router, notebook.as_deref()).await;
+        // A session has a connection endpoint only once its resources are up, so the grant is
+        // asked for once the session reports that it is able to take work — waited on by
+        // POLLING for the state rather than by sleeping out the span it is due after.
+        settled_in(&router, &session_id, SESSION_STATE_IDLE).await;
 
         // Three issues of the grant for the same session: each is served, each carries a
         // token of its own, and each reports the same address.
@@ -286,12 +298,13 @@ async fn a_running_session_answers_an_endpoint_and_a_token_of_its_own() {
 }
 
 /// The grant is refused for a session this account holds none of, and for a session whose
-/// resources are no longer running — each with the sentence Athena words that class in.
+/// resources are not up — each with the sentence Athena words that class in.
 #[tokio::test]
 async fn the_endpoint_is_refused_for_an_unknown_and_for_a_closed_session() {
     let (_engine, router) = engine_and_router();
     given_spark_work_group(&router).await;
     let session_id = given_session(&router, None).await;
+    settled_in(&router, &session_id, SESSION_STATE_IDLE).await;
 
     // Rows differ along the shape of an id that names no session: a UUID nothing minted, a
     // single character, the longest `SessionId` the model admits, and one character away from
@@ -329,7 +342,8 @@ async fn the_endpoint_is_refused_for_an_unknown_and_for_a_closed_session() {
     );
 
     // Once it has been asked to shut down there is nothing left to connect to, from the
-    // instant the shutdown is asked for through the state it settles in.
+    // instant the shutdown is asked for through the state it settles in — and the refusal
+    // names the state the session is in.
     let (status, terminated) = call(
         &router,
         "TerminateSession",
@@ -346,7 +360,7 @@ async fn the_endpoint_is_refused_for_an_unknown_and_for_a_closed_session() {
         status,
         &refused,
         ERROR_CODE_INVALID_INPUT,
-        SESSION_ENDPOINT_UNAVAILABLE,
+        &expected_refusal(SESSION_STATE_TERMINATING),
     );
 
     settled_in(&router, &session_id, SESSION_STATE_TERMINATED).await;
@@ -356,13 +370,103 @@ async fn the_endpoint_is_refused_for_an_unknown_and_for_a_closed_session() {
         status,
         &refused,
         ERROR_CODE_INVALID_INPUT,
-        SESSION_ENDPOINT_UNAVAILABLE,
+        &expected_refusal(SESSION_STATE_TERMINATED),
     );
 
     // The two refusals are different sentences: a client branching on them can tell a session
     // it must not ask about again from one it closed itself.
     assert_ne!(
-        SESSION_NOT_FOUND, SESSION_ENDPOINT_UNAVAILABLE,
+        SESSION_NOT_FOUND,
+        expected_refusal(SESSION_STATE_TERMINATED),
         "the unknown-session and the closed-session refusals must not read alike"
     );
+}
+
+/// The sentence a session whose resources are not up is refused with, built here from the
+/// fixed text and the state it names — so a message that dropped either part fails the row,
+/// and the state a session being STARTED is named by is the one Athena's own lifecycle gives
+/// it rather than the `SessionState` a status read reports.
+fn expected_refusal(state: &str) -> String {
+    let named = if state == SESSION_STATE_CREATING {
+        "PROVISIONING"
+    } else {
+        state
+    };
+    format!("Can not generate Session endpoint URL for Session in {named} state")
+}
+
+/// RULE: a session's resources have to be UP for it to have a connection endpoint, so a
+/// session that is still being started is refused as surely as one that is shutting down —
+/// which is what a client polling for an endpoint right after `StartSession` observes.
+///
+/// Each row SEEDS a session at one point of its lifecycle, with the instants that hold it
+/// there for as long as any test run takes, so which state the row is about does not depend on
+/// how fast the host runs.
+#[tokio::test]
+async fn a_session_whose_resources_are_not_up_has_no_endpoint() {
+    let (engine, router) = engine_and_router();
+    given_spark_work_group(&router).await;
+
+    // A span long enough that a seeded instant is nowhere near due — or well past due — for as
+    // long as any test run takes.
+    const WELL_PAST_ANY_RUN: Duration = Duration::from_secs(3_600);
+
+    // (case, the state the seeded session must report)
+    let rows = [
+        ("a session being started", SESSION_STATE_CREATING),
+        ("a session shutting down", SESSION_STATE_TERMINATING),
+        (
+            "a session whose resources are gone",
+            SESSION_STATE_TERMINATED,
+        ),
+        ("a session able to take work", SESSION_STATE_IDLE),
+    ];
+    for (case, wanted) in rows {
+        let now = SystemTime::now();
+        let long_ago = now
+            .checked_sub(WELL_PAST_ANY_RUN)
+            .expect("an instant this far back exists");
+        let far_off = now
+            .checked_add(WELL_PAST_ANY_RUN)
+            .expect("an instant this far ahead exists");
+        let id = state::new_session_id();
+        let mut record =
+            SessionRecord::started(id.clone(), WORK_GROUP.to_string(), None, long_ago);
+        match wanted {
+            SESSION_STATE_CREATING => record.resources_due_at = far_off,
+            SESSION_STATE_TERMINATING => record.terminate_requested_at = Some(far_off),
+            SESSION_STATE_TERMINATED => record.terminate(long_ago),
+            _ => {}
+        }
+        let seeded = record.state_at(SystemTime::now());
+        assert_eq!(
+            seeded, wanted,
+            "case {case:?}: the seeded session must report {wanted:?}, got {seeded:?}"
+        );
+        let store = state::service_state(&*engine).expect("the Athena store is reachable");
+        store.lock().sessions.insert(record);
+
+        let (status, answered) = endpoint_of(&router, &id).await;
+        if wanted == SESSION_STATE_IDLE {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: a session able to take work must be served, got {status} with \
+                 {answered:?}"
+            );
+            continue;
+        }
+        assert_refusal(
+            case,
+            status,
+            &answered,
+            ERROR_CODE_INVALID_INPUT,
+            &expected_refusal(wanted),
+        );
+        // The service's own wording is the one asserted above, for every state a row covers.
+        assert_eq!(
+            session_endpoint_unavailable(wanted),
+            expected_refusal(wanted),
+            "case {case:?}: the service's own sentence must be the one this row asserts"
+        );
+    }
 }

@@ -138,7 +138,10 @@ pub fn notebook_at_address<Eng: Send + Sync + 'static>(
 ///
 /// RECORDED wording for that class: a session whose resources are gone serves no notebook,
 /// so there is no address to hand out, and AWS states it as fixed text carrying nothing of
-/// the request — not the session id, not the state it is in.
+/// the request — not the session id, not the state it is in. `GetSessionEndpoint` refuses a
+/// session whose resources are not up in wording of its own
+/// ([`session_endpoint_unavailable`]), which is what the recording of THAT operation carries,
+/// so neither sentence is spelled for the other's operation.
 pub const NOTEBOOK_SESSION_NOT_OPEN: &str = "Invalid Request";
 
 /// The address of the notebook the session `session_id` serves, signed for

@@ -30,9 +30,48 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 use service_com_amazonaws_athena_amazonathena::ops::types::CALCULATION_EXECUTION_STATE_VALUES;
 use service_com_amazonaws_athena_amazonathena::state::{
-    self, page_token_malformed, SessionRecord, CALCULATION_STATE_CREATED, ERROR_CODE_INVALID_INPUT,
+    self, page_token_malformed, SessionRecord, CALCULATION_STATE_CANCELED,
+    CALCULATION_STATE_COMPLETED, CALCULATION_STATE_FAILED, ERROR_CODE_INVALID_INPUT,
     ERROR_CODE_UNAUTHORIZED, PYSPARK_ENGINE_VERSION, SESSION_NOT_FOUND,
 };
+
+/// The states a calculation no longer runs in, which is when it reports a completion instant.
+const TERMINAL_CALCULATION_STATES: &[&str] = &[
+    CALCULATION_STATE_COMPLETED,
+    CALCULATION_STATE_FAILED,
+    CALCULATION_STATE_CANCELED,
+];
+
+/// How long a poll for the state a calculation settles in keeps looking, and how long it waits
+/// between looks: the CONDITION is what is waited on, under a deadline far above the span the
+/// transition is due after.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// See [`POLL_INTERVAL`].
+const POLL_LOOKS: u32 = 1_200;
+
+/// Poll the calculation `id` until it is no longer running, and answer the state it settled in.
+async fn settled_calculation(router: &MultiServiceRouter, id: &str) -> String {
+    for _ in 0..POLL_LOOKS {
+        let (status, read) = call(
+            router,
+            "GetCalculationExecutionStatus",
+            &json!({ "CalculationExecutionId": id }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "GetCalculationExecutionStatus({id}) must answer 200 while polling, got {status} \
+             with {read:?}"
+        );
+        if let Some(state) = read["Status"]["State"].as_str() {
+            if TERMINAL_CALCULATION_STATES.contains(&state) {
+                return state.to_string();
+            }
+        }
+        ::tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    panic!("the calculation {id} never settled");
+}
 use service_common::page_tokens::AUTHENTICATOR_BYTES;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -229,6 +268,17 @@ async fn a_listing_reports_a_sessions_calculations_newest_first() {
         let id = given_calculation(&router, &session, code_block, *description).await;
         submitted.push((case, *description, id));
     }
+    // Each calculation RUNS, so the listing below is read once every one of them has settled —
+    // waited on by POLLING for the state, never by sleeping out the span it is due after — and
+    // the state each entry then reports is the one its code block came to.
+    for (case, _, id) in &submitted {
+        let settled = settled_calculation(&router, id).await;
+        assert_eq!(
+            settled, CALCULATION_STATE_COMPLETED,
+            "case {case:?}: the code block runs to its end, so it must settle \
+             {CALCULATION_STATE_COMPLETED:?}, got {settled:?}"
+        );
+    }
 
     let listed = list(&router, &json!({ "SessionId": session })).await;
     let expected: Vec<String> = submitted
@@ -261,8 +311,8 @@ async fn a_listing_reports_a_sessions_calculations_newest_first() {
         );
         assert_eq!(
             entry["Status"]["State"].as_str(),
-            Some(CALCULATION_STATE_CREATED),
-            "case {case:?}: expected the state {CALCULATION_STATE_CREATED:?}, got {entry:?}"
+            Some(CALCULATION_STATE_COMPLETED),
+            "case {case:?}: expected the state {CALCULATION_STATE_COMPLETED:?}, got {entry:?}"
         );
         let submitted_at = entry["Status"]["SubmissionDateTime"].as_f64();
         assert!(
@@ -270,9 +320,9 @@ async fn a_listing_reports_a_sessions_calculations_newest_first() {
             "case {case:?}: expected the instant the calculation was submitted at, got {entry:?}"
         );
         assert!(
-            entry["Status"]["CompletionDateTime"].is_null(),
-            "case {case:?}: nothing has run the calculation, so no completion instant is \
-             reported, got {entry:?}"
+            entry["Status"]["CompletionDateTime"].as_f64().is_some(),
+            "case {case:?}: a calculation that is no longer running reports when it completed, \
+             got {entry:?}"
         );
     }
 
@@ -398,11 +448,17 @@ async fn a_state_filter_reports_only_the_calculations_in_that_state() {
         let id = given_calculation(&router, &session, &format!("{index}"), None).await;
         expected.insert(0, id);
     }
+    // Each calculation RUNS, so the rows below are read once every one of them has settled —
+    // waited on by POLLING for the state, never by sleeping out the span it is due after — and
+    // the one state they are then all in is the one the filter must report them under.
+    for id in &expected {
+        settled_calculation(&router, id).await;
+    }
 
     assert!(
-        CALCULATION_EXECUTION_STATE_VALUES.contains(&CALCULATION_STATE_CREATED),
-        "the state a submitted calculation is in must be one of the modelled states, got \
-         {CALCULATION_EXECUTION_STATE_VALUES:?}"
+        CALCULATION_EXECUTION_STATE_VALUES.contains(&CALCULATION_STATE_COMPLETED),
+        "the state a calculation that ran to its end is in must be one of the modelled states, \
+         got {CALCULATION_EXECUTION_STATE_VALUES:?}"
     );
     for state in CALCULATION_EXECUTION_STATE_VALUES {
         let listed = list(
@@ -411,7 +467,7 @@ async fn a_state_filter_reports_only_the_calculations_in_that_state() {
         )
         .await;
         let reported = calculation_ids(&listed);
-        let wanted: Vec<String> = if *state == CALCULATION_STATE_CREATED {
+        let wanted: Vec<String> = if *state == CALCULATION_STATE_COMPLETED {
             expected.clone()
         } else {
             Vec::new()

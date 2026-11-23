@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCalculationExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCalculationExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCalculationExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! One calculation as this service persists it, read out of its
+//! [`crate::state::CalculationRegistry`]: "Describes a previously submitted calculation
+//! execution" — the session it was submitted into, the description that submission carried,
+//! the working directory the session writes under, and the status the record reads as at the
+//! instant of the read ([`crate::state::CalculationRecord::to_status`]). No part of the
+//! answer is derived from the reading request.
+//!
+//! `Result` is "populated only if the calculation is completed" and `Statistics` "only when
+//! statistics are available": a calculation that ran reports the objects its run wrote under
+//! the session's working directory and the time the host measured that run taking
+//! ([`crate::state::CalculationOutcome`]), and one that is still running, was cancelled or
+//! failed reports neither — nothing claims a result for work that produced none.
+//!
+//! A `CalculationExecutionId` this account minted no calculation under names nothing this
+//! service will act on, which is a bad request rather than an empty answer
+//! ([`crate::state::CALCULATION_NOT_FOUND`]).
 //!
 //! ## Shape of an operation
 //!
@@ -151,20 +159,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCalculationExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCalculationExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCalculationExecution"))
+        // No IAM decision here, for the reason `GetSession` states: an Athena action is
+        // scoped by the WORKGROUP the request names, and a calculation is addressed inside
+        // the session it ran in, which names none.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetCalculationExecutionErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("Athena state is not reachable on this engine".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        // A read: nothing below writes the store. The status is DERIVED from the stored
+        // instants and the clock (`crate::state::CalculationRecord::state_at`), so polling a
+        // calculation neither moves it on nor holds it back.
+        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        // The id names a calculation some earlier submission minted, or it names nothing this
+        // service will act on — the one refusal stated for that
+        // (`crate::state::calculation_not_authorized`).
+        let Some(record) = store.calculations.calculation(&input.calculation_execution_id) else {
+            return Err(crate::state::calculation_not_authorized());
+        };
+
+        // "The Amazon S3 location in which calculation results are stored" is the working
+        // directory of the SESSION the calculation ran in, resolved when that session was
+        // started (`SessionConfiguration$WorkingDirectory`) — so it is read off that session
+        // rather than restated here, and a calculation whose session this account no longer
+        // holds reports none.
+        let working_directory = store
+            .sessions
+            .session(&record.session_id)
+            .and_then(|session| session.configuration.working_directory.clone());
+
+        Ok(GetCalculationExecutionOutput {
+            calculation_execution_id: Some(record.id.clone()),
+            session_id: Some(record.session_id.clone()),
+            description: record.description.clone(),
+            working_directory,
+            status: Some(record.to_status(now)),
+            // "This field is populated only when statistics are available": the measurement
+            // the HOST took of the run that was really performed
+            // (`crate::state::CalculationRecord::to_statistics`).
+            statistics: record.to_statistics(now),
+            // "This field is populated only if the calculation is completed": the objects the
+            // run wrote under the session's working directory
+            // (`crate::state::CalculationRecord::to_result`).
+            result: record.to_result(now),
+        })
     }
 }

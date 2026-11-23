@@ -8,16 +8,23 @@
 //! block the request carried, and `GetCalculationExecutionCode` answers out of that same
 //! record — so the code a later read reports is the code this call persisted.
 //!
-//! A calculation is a cell of the notebook the session serves, so a session started for no
-//! notebook runs none, and neither does one whose resources are gone: both are refused in
-//! the one sentence every session-addressed request this service will not act on is refused
-//! with ([`crate::state::SESSION_NOT_FOUND`]).
+//! A calculation runs INSIDE a session, so a session this account holds none of, and one
+//! whose resources are on their way out or gone, run none: both are refused in the one
+//! sentence every session-addressed request this service will not act on is refused with
+//! ([`crate::state::SESSION_NOT_FOUND`]). Whether that session was started in a notebook
+//! decides which notebook the calculation is a cell of and nothing else — a session started
+//! for programmatic access takes calculations exactly as a notebook's session does, which is
+//! the documented path "Submits calculations for execution within a session" names.
 //!
-//! What the submission REPORTS is what it did: "CREATED - The calculation has been created
-//! and is ready to run". Nothing here runs the code block — the Spark engine that would
-//! execute it is not part of this emulator — so no answer and no record claims a run, a
-//! result or a duration for work nothing performed, and the session the calculation was
-//! submitted into is left in the state it was in.
+//! What the submission REPORTS is the state it reached: "CREATED - The calculation has been
+//! created and is ready to run". The code block is then RUN — evaluated by the Python engine
+//! this crate embeds, bounded and contained ([`crate::state::calculation_engine`]) — and what
+//! that run produced is recorded on the calculation and saved as objects under the session's
+//! working directory ([`crate::state::calculation_result_objects`]), which is what a later
+//! read reports as the calculation's result. The states between the two are owed by the clock
+//! ([`crate::state::CalculationRecord::state_at`]), so a caller reading straight back sees
+//! the calculation still running, and the session the calculation was submitted into is left
+//! in the state it was in.
 //!
 //! ## Shape of an operation
 //!
@@ -203,94 +210,158 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        let mut store = state.lock();
         let now = ::std::time::SystemTime::now();
+        // The store is held for the SUBMISSION alone and released before the code block is
+        // run: the run is a synchronous, CPU-bound evaluation on a thread of its own, and no
+        // store of this service is held across it.
+        let (calculation_execution_id, state_reached, session_id, working_directory) = {
+            let mut store = state.lock();
 
-        // "A unique case-sensitive string used to ensure the request to create the calculation
-        // is idempotent (executes only once). If another StartCalculationExecutionRequest is
-        // received, the same response is returned and another calculation is not created. If a
-        // parameter has changed, an error is returned." A repeat under a token this store
-        // already minted a calculation for answers with THAT calculation and submits nothing
-        // further.
-        if let Some(token) = input.client_request_token.as_deref() {
-            if let Some(minted) = store.calculations.calculation_of_token(token) {
-                // The comparison itself lives on the record
-                // (`crate::state::CalculationRecord::matches_submission`), so a parameter a
-                // submission comes to persist is weighed in one place.
-                if !minted.matches_submission(
-                    &input.session_id,
-                    &code_block,
-                    input.description.as_deref(),
-                ) {
-                    return Err(invalid_request(
-                        crate::state::IDEMPOTENT_PARAMETERS_DO_NOT_MATCH,
-                    ));
+            // "A unique case-sensitive string used to ensure the request to create the
+            // calculation is idempotent (executes only once). If another
+            // StartCalculationExecutionRequest is received, the same response is returned and
+            // another calculation is not created. If a parameter has changed, an error is
+            // returned." A repeat under a token this store already minted a calculation for
+            // answers with THAT calculation and submits nothing further — and runs nothing
+            // further either.
+            if let Some(token) = input.client_request_token.as_deref() {
+                if let Some(minted) = store.calculations.calculation_of_token(token) {
+                    // The comparison itself lives on the record
+                    // (`crate::state::CalculationRecord::matches_submission`), so a parameter a
+                    // submission comes to persist is weighed in one place.
+                    if !minted.matches_submission(
+                        &input.session_id,
+                        &code_block,
+                        input.description.as_deref(),
+                    ) {
+                        return Err(invalid_request(
+                            crate::state::IDEMPOTENT_PARAMETERS_DO_NOT_MATCH,
+                        ));
+                    }
+                    return Ok(StartCalculationExecutionOutput {
+                        calculation_execution_id: Some(minted.id.clone()),
+                        // "the same response is returned": the state the calculation was
+                        // CREATED in, which is what the submission that minted it answered,
+                        // rather than the state the clock has moved it to since.
+                        state: Some(minted.state_at(minted.submitted_at).to_string()),
+                    });
                 }
-                return Ok(StartCalculationExecutionOutput {
-                    calculation_execution_id: Some(minted.id.clone()),
-                    state: Some(minted.state().to_string()),
-                });
             }
-        }
 
-        // "Submits calculations for execution WITHIN A SESSION": the id names a session this
-        // account holds, or it names nothing this service will act on — the one sentence every
-        // session-addressed operation of this service states for that
-        // (`crate::state::session_not_authorized`), which discloses nothing about which ids
-        // name sessions.
-        let Some(session) = store.sessions.session(&input.session_id) else {
-            return Err(crate::state::session_not_authorized());
+            // "Submits calculations for execution WITHIN A SESSION": the id names a session
+            // this account holds, or it names nothing this service will act on — the one
+            // sentence every session-addressed operation of this service states for that
+            // (`crate::state::session_not_authorized`), which discloses nothing about which
+            // ids name sessions.
+            let Some(session) = store.sessions.session(&input.session_id) else {
+                return Err(crate::state::session_not_authorized());
+            };
+            // A session whose resources are no longer running — one shutting down, one whose
+            // resources are gone, one that ended badly — runs nothing, so there is nothing for
+            // a calculation to be submitted into. It takes the session-addressed refusal
+            // rather than the distinct wording `CreatePresignedNotebookUrl` answers for the
+            // same condition (`crate::state::NOTEBOOK_SESSION_NOT_OPEN`), which is the message
+            // RECORDED for that operation: no recording covers this one for a session that is
+            // shutting down or gone, so the refusal stays inside the class every other
+            // session-addressed request of this operation takes.
+            if !session.is_active_at(now) {
+                return Err(crate::state::session_not_authorized());
+            }
+            // The code of a calculation is the code of a cell of the notebook the session's
+            // engine serves, and WHICH notebook that is was decided by the start that bound
+            // the session to one (`crate::state::NOTEBOOK_ID_CONFIG`). A session started for
+            // no notebook — or one whose notebook this account no longer holds — is a cell of
+            // none, and still runs the calculation: that is the programmatic path this
+            // operation documents, where a caller starts a session and submits code into it
+            // without a notebook anywhere.
+            let notebook_id = session
+                .notebook_id
+                .as_deref()
+                .filter(|notebook_id| store.notebooks.notebook(notebook_id).is_some())
+                .map(ToString::to_string);
+            let session_id = session.id.clone();
+            let work_group = session.work_group.clone();
+            // Where this calculation's output is saved: the working directory the SESSION was
+            // started under (`SessionConfiguration$WorkingDirectory`), read off the stored
+            // session rather than off this request, which carries none.
+            let working_directory = session.configuration.working_directory.clone();
+
+            // Athena hands back a calculation that has been created, and the states it walks
+            // from there are owed by the clock
+            // (`crate::state::CalculationRecord::state_at`).
+            let mut record = crate::state::CalculationRecord::submitted(
+                crate::state::new_calculation_execution_id(),
+                session_id.clone(),
+                work_group,
+                code_block.clone(),
+                now,
+            );
+            record.notebook_id = notebook_id;
+            record.description = input.description;
+            let calculation_execution_id = record.id.clone();
+            // What the submission ANSWERS is the state it created the calculation in, read off
+            // the record at the instant it was submitted: the code block is run before this
+            // call answers, so the clock may already have moved the calculation on, and what
+            // this call reports is what it did.
+            let state_reached = record.state_at(record.submitted_at).to_string();
+            store
+                .calculations
+                .insert(record, input.client_request_token);
+
+            (
+                calculation_execution_id,
+                state_reached,
+                session_id,
+                working_directory,
+            )
         };
-        // A session whose resources are no longer running — one shutting down, one whose
-        // resources are gone, one that ended badly — runs nothing, so there is nothing for a
-        // calculation to be submitted into. It takes the session-addressed refusal rather
-        // than the distinct wording `CreatePresignedNotebookUrl` answers for the same
-        // condition (`crate::state::NOTEBOOK_SESSION_NOT_OPEN`), which is the message
-        // RECORDED for that operation: no recording covers this one for a session that is
-        // shutting down or gone, so the refusal stays inside the class every other
-        // session-addressed request of this operation takes.
-        if !session.is_active_at(now) {
-            return Err(crate::state::session_not_authorized());
-        }
-        // The code of a calculation is the code of a cell of the notebook the session's engine
-        // serves, and WHICH notebook that is was decided by the start that bound the session to
-        // one (`crate::state::NOTEBOOK_ID_CONFIG`). A session started for no notebook — or one
-        // whose notebook this account no longer holds — serves none, so it runs no calculation
-        // and the submission is refused in the same sentence.
+
+        // The calculation RUNS. The code block is the REQUEST's own, so every bound it is held
+        // to is this emulator's and none of them is reachable from the code — and they are
+        // named here, where that code reaches the engine:
         //
-        // That is where the RECORDED behaviour of this operation divides: a submission into a
-        // session whose start carried the notebook key is served and runs to completion, with
-        // the code readable back afterwards, while a submission into a session started without
-        // it — same account, same Spark enabled workgroup, same engine version, the session
-        // IDLE and its dashboard readable — is refused, and the refusal starts nothing.
-        let notebook_id = session
-            .notebook_id
-            .as_deref()
-            .filter(|notebook_id| store.notebooks.notebook(notebook_id).is_some())
-            .map(ToString::to_string);
-        let Some(notebook_id) = notebook_id else {
-            return Err(crate::state::session_not_authorized());
-        };
-        let session_id = session.id.clone();
-        let work_group = session.work_group.clone();
-
-        // Athena hands back a calculation that has been created, so nothing is owed by the
-        // clock here: the record is stored in the state it reads as
-        // (`crate::state::CalculationRecord::state`).
-        let record = crate::state::CalculationRecord {
-            id: crate::state::new_calculation_execution_id(),
-            session_id,
-            work_group,
-            notebook_id,
-            description: input.description,
-            code_block,
-            submitted_at: now,
-        };
-        let calculation_execution_id = record.id.clone();
-        let state_reached = record.state().to_string();
-        store
+        // * it is evaluated by the contained interpreter this workspace embeds, whose native
+        //   surface registers no host filesystem, socket, process, native-library or
+        //   environment module at all, so the code reaches nothing of this host
+        //   (`crate::state::calculation_engine`, and the engine it names);
+        // * the RUN is bounded by the engine: a wall clock of its own
+        //   (`CALCULATION_RUN_CEILING`), a step budget, a memory ceiling, a recursion limit and
+        //   an output cap (`calculation_budget`), plus the HOST time one run may take, read
+        //   from this host's clock at every traced event and by the engine's own watch over the
+        //   run (`CALCULATION_HOST_CEILING`);
+        // * how many runs this process performs at once is bounded
+        //   (`MAX_CONCURRENT_CALCULATION_RUNS`), each permit held by the run's own thread;
+        // * and the CALL is bounded here: a submission is held for at most
+        //   `CALCULATION_CALL_CEILING`, after which the calculation reports the failure of a
+        //   run nothing answered for and the request answers.
+        //
+        // What the run produced is then recorded on the calculation and SAVED under the
+        // session's working directory, in that order — so the objects a read of a completed
+        // calculation names are already there when it first reports a terminal state, which is
+        // the order a client polling for one depends on.
+        let run = ::tokio::time::timeout(
+            crate::state::calculation_engine::CALCULATION_CALL_CEILING,
+            crate::state::calculation_engine::run(code_block, calculation_execution_id.clone()),
+        )
+        .await
+        .unwrap_or_else(|_| crate::state::calculation_engine::not_answered());
+        let (objects, outcome) = crate::state::calculation_result_objects(
+            working_directory.as_deref(),
+            &session_id,
+            &calculation_execution_id,
+            &run,
+        );
+        if let Some(held) = state
+            .lock()
             .calculations
-            .insert(record, input.client_request_token);
+            .calculation_mut(&calculation_execution_id)
+        {
+            held.report(outcome, ::std::time::SystemTime::now());
+        }
+        // The objects are stored under the destination bucket's own default encryption, as a
+        // write that asks for none is, which is the one rule the object store applies to every
+        // write another service makes into a bucket.
+        crate::state::query_results::write(&*self.engine, objects, &None);
 
         Ok(StartCalculationExecutionOutput {
             calculation_execution_id: Some(calculation_execution_id),

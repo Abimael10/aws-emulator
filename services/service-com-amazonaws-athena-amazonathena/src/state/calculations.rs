@@ -10,34 +10,99 @@
 //! records as the summaries each one projects to ([`CalculationRecord::to_summary`]), in the
 //! order they were submitted in ([`CalculationRegistry::session_summaries`]).
 //!
-//! WHICH SESSION may take one is the session's own notebook. "Submits calculations for
-//! execution within a session" (`StartCalculationExecution`) and the code block it carries
-//! is "a string that contains the code of the calculation" — the code of a cell of the
-//! notebook the session's Jupyter server serves, which is the notebook the START of the
-//! session bound it to ([`NOTEBOOK_ID_CONFIG`]). A session started for no notebook serves
-//! none ([`crate::state::notebook_url`] signs no address for it either), so it runs no
-//! calculation, and a submission addressed to one is refused in the sentence every
-//! session-addressed request this service will not act on is refused with
-//! ([`SESSION_NOT_FOUND`]).
+//! WHICH SESSION may take one is the session's own lifecycle. "Submits calculations for
+//! execution within a session" (`StartCalculationExecution`), and a session takes one while
+//! it is running — "IDLE - The session is able to accept a calculation" — so a submission
+//! addressed to a session this account holds none of, or to one whose resources are on their
+//! way out or gone, is refused in the sentence every session-addressed request this service
+//! will not act on is refused with ([`SESSION_NOT_FOUND`]). Whether that session was started
+//! in a notebook ([`NOTEBOOK_ID_CONFIG`]) decides which notebook a calculation is a cell of,
+//! and not whether the session runs calculations at all: a session started for programmatic
+//! access takes them exactly as a notebook's session does.
 //!
-//! A submitted calculation is stored COMPLETE in the state its submission reached:
-//! "CREATED - The calculation has been created and is ready to run"
-//! ([`CALCULATION_STATE_CREATED`]). Nothing here moves it on, because nothing here runs it:
-//! the Spark engine that would execute the code block is not part of this emulator yet, so
-//! no record claims a run, a result or a duration for work nothing performed.
+//! A submitted calculation RUNS: the code block is evaluated by the Python engine this crate
+//! embeds ([`crate::state::calculation_engine`]), bounded and contained, and what that run
+//! produced is stored on the record as its [`CalculationOutcome`] — the two output streams,
+//! saved as objects under the session's working directory ([`calculation_result_objects`]),
+//! and the time the host measured the run taking. So a read reports a result and a duration
+//! for work that was really performed, and a calculation whose run reported nothing stays
+//! RUNNING however long ago it was submitted.
+//!
+//! The STATES a calculation walks are the clock's: "CREATED - The calculation has been created
+//! and is ready to run" is what the submission answers, "RUNNING - The calculation is running"
+//! follows ([`CALCULATION_CREATED`]), and the terminal state its outcome names falls due at
+//! [`CALCULATION_COMPLETION`] — so every read derives the state from the stored instants
+//! rather than a reader having to move the record on.
+//!
+//! A request to cancel moves it instead: "Requests the cancellation of a calculation"
+//! (`StopCalculationExecution`) stores the instant it was asked at
+//! ([`CalculationRecord::stop`]), from which the calculation is `CANCELING` — "a request to
+//! cancel the calculation has been received and the system is working to stop it" — and then
+//! `CANCELED` once that stop is due ([`CALCULATION_CANCELLATION`]). A calculation already in a
+//! terminal state takes no cancellation, which is the "succeeds but has no effect" that
+//! operation documents.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use super::*;
 
-use crate::ops::types::{CalculationStatus, CalculationSummary};
+use crate::ops::types::{
+    CalculationResult, CalculationStatistics, CalculationStatus, CalculationSummary,
+};
 
 /// The `CalculationExecutionState` of a calculation that has been created: "CREATED - The
 /// calculation has been created and is ready to run"
 /// (`StartCalculationExecutionResponse$State`). One of
 /// `CALCULATION_EXECUTION_STATE_VALUES` in [`crate::ops::types`].
 pub const CALCULATION_STATE_CREATED: &str = "CREATED";
+
+/// The `CalculationExecutionState` of a calculation whose cancellation has been asked for:
+/// "CANCELING - A request to cancel the calculation has been received and the system is
+/// working to stop it" (`CalculationStatus$State`). See [`CALCULATION_STATE_CREATED`].
+pub const CALCULATION_STATE_CANCELING: &str = "CANCELING";
+
+/// The `CalculationExecutionState` of a calculation that was cancelled: "CANCELED - The
+/// calculation is no longer running as the result of a cancel request"
+/// (`CalculationStatus$State`). See [`CALCULATION_STATE_CREATED`].
+pub const CALCULATION_STATE_CANCELED: &str = "CANCELED";
+
+/// The `CalculationExecutionState` of a calculation that is running: "RUNNING - The
+/// calculation is running" (`CalculationStatus$State`). See [`CALCULATION_STATE_CREATED`].
+pub const CALCULATION_STATE_RUNNING: &str = "RUNNING";
+
+/// The `CalculationExecutionState` of a calculation that "has completed without error"
+/// (`CalculationStatus$State`). See [`CALCULATION_STATE_CREATED`].
+pub const CALCULATION_STATE_COMPLETED: &str = "COMPLETED";
+
+/// The `CalculationExecutionState` of a calculation that "failed and is no longer running"
+/// (`CalculationStatus$State`). See [`CALCULATION_STATE_CREATED`].
+pub const CALCULATION_STATE_FAILED: &str = "FAILED";
+
+/// How long after a calculation is submitted its completion is DUE.
+///
+/// Athena hands back a calculation in a non-terminal state and the terminal state arrives
+/// later, so this is a transition the CLOCK owes: the instant is stored on the record and
+/// every read derives the state from it. The span is this emulator's, not a duration AWS
+/// publishes (a real calculation takes as long as the Spark job it is), and it is never zero —
+/// a caller reading straight back must still observe the transient states, exactly as a
+/// submitted query's completion is owed ([`QUERY_EXECUTION_COMPLETION`]).
+pub const CALCULATION_COMPLETION: Duration = Duration::from_secs(3);
+
+/// How long a calculation stays [`CALCULATION_STATE_CREATED`] before it is
+/// [`CALCULATION_STATE_RUNNING`]: the first half of [`CALCULATION_COMPLETION`], so both
+/// non-terminal states this service reports are observable and neither is skipped — the same
+/// division a query execution's own two non-terminal states are owed under
+/// ([`QUERY_EXECUTION_QUEUED`]).
+pub const CALCULATION_CREATED: Duration = Duration::from_millis(1_500);
+
+/// How long after a calculation is asked to stop the cancellation is complete.
+///
+/// The EMULATOR's own span, the same kind [`SESSION_TERMINATION`] is: AWS publishes no
+/// duration for stopping a calculation ("Cancelling a calculation is done on a best effort
+/// basis"), and it is never zero, so the documented `CANCELING` state a cancelled calculation
+/// passes through is observable rather than skipped.
+pub const CALCULATION_CANCELLATION: Duration = Duration::from_secs(3);
 
 /// How many calculations this emulator retains for one account.
 ///
@@ -62,9 +127,10 @@ pub struct CalculationRecord {
     /// The workgroup that session runs in, held so a delete of the workgroup takes the
     /// calculations of its sessions with it.
     pub work_group: String,
-    /// The notebook the session serves, which is the notebook this calculation is a cell
-    /// of (see the module docs).
-    pub notebook_id: String,
+    /// The notebook the session serves, which is the notebook this calculation is a cell of
+    /// — `None` for a calculation submitted into a session started for programmatic access,
+    /// which is a cell of no notebook (see the module docs).
+    pub notebook_id: Option<String>,
     /// "A description of the calculation" (`StartCalculationExecutionRequest$Description`),
     /// as the submission carried it.
     pub description: Option<String>,
@@ -72,49 +138,246 @@ pub struct CalculationRecord {
     /// (`StartCalculationExecutionRequest$CodeBlock`), which is what
     /// `GetCalculationExecutionCode` answers with.
     pub code_block: String,
-    /// When the calculation was submitted.
+    /// When the calculation was submitted, reported as `CalculationStatus$
+    /// SubmissionDateTime`.
     pub submitted_at: SystemTime,
+    /// When this calculation's completion falls DUE — [`CALCULATION_COMPLETION`] after it was
+    /// submitted. It is [`CALCULATION_STATE_RUNNING`] until then and terminal from then on.
+    pub completion_due_at: SystemTime,
+    /// What RUNNING the code block produced, or `None` for a calculation whose run has
+    /// reported nothing yet — which keeps it running however long ago it was submitted.
+    pub outcome: Option<CalculationOutcome>,
+    /// When the calculation was asked to stop, if it was, from which the
+    /// [`CALCULATION_CANCELLATION`] span runs.
+    pub stop_requested_at: Option<SystemTime>,
+}
+
+/// What RUNNING one calculation produced: the reading the engine took of the run
+/// ([`crate::state::calculation_engine`]), and where the objects it wrote were saved.
+///
+/// Every field is a reading of work that was really performed: the engine ran the code block,
+/// the host measured how long it took, and the two streams were saved to the session's
+/// working directory as the objects named here. Nothing in it is derived from the submitted
+/// text.
+#[derive(Debug, Clone)]
+pub struct CalculationOutcome {
+    /// Whether the run FAILED: the code raised, or a bound this emulator holds a run to
+    /// stopped it.
+    pub failed: bool,
+    /// How long the host spent running it, which is what the DPU execution time a read
+    /// reports is measured as (see [`CalculationRecord::to_statistics`]).
+    pub run_time: Duration,
+    /// "The Amazon S3 location of the `stdout` file for the calculation"
+    /// (`CalculationResult$StdOutS3Uri`), or `None` where the run's output could not be
+    /// saved — a session with no working directory to write under.
+    pub stdout_uri: Option<String>,
+    /// "The Amazon S3 location of the `stderr` error messages file for the calculation"
+    /// (`CalculationResult$StdErrorS3Uri`); `None` for the same reason.
+    pub stderr_uri: Option<String>,
+    /// "The Amazon S3 location of the folder for the calculation results"
+    /// (`CalculationResult$ResultS3Uri`), which is the folder the two objects above were
+    /// written under; `None` for the same reason.
+    pub result_uri: Option<String>,
 }
 
 impl CalculationRecord {
-    /// The `CalculationExecutionState` this calculation reads as.
+    /// The record a submission of `id` into `session_id` at `now` registers: its completion
+    /// owed, its run not reported yet, and no cancellation asked for.
     ///
-    /// The state the submission stored, and the only one it can be in: a calculation is
-    /// created ready to run, and nothing in this service runs it (see the module docs), so
-    /// no read derives a later state from the clock.
-    pub fn state(&self) -> &'static str {
-        CALCULATION_STATE_CREATED
+    /// Everything else the submission carried is set by the caller on the record this hands
+    /// back, so one calculation is built in one place.
+    pub fn submitted(
+        id: String,
+        session_id: String,
+        work_group: String,
+        code_block: String,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            id,
+            session_id,
+            work_group,
+            notebook_id: None,
+            description: None,
+            code_block,
+            submitted_at: now,
+            completion_due_at: due_at(now, CALCULATION_COMPLETION),
+            outcome: None,
+            stop_requested_at: None,
+        }
     }
 
-    /// The `CalculationStatus` a read of this calculation reports.
+    /// When this calculation stops being [`CALCULATION_STATE_CREATED`].
+    fn running_due_at(&self) -> SystemTime {
+        self.submitted_at
+            .checked_add(CALCULATION_CREATED)
+            .unwrap_or(self.completion_due_at)
+    }
+
+    /// The `CalculationExecutionState` this calculation reads as at `now`.
+    ///
+    /// DERIVED, never written: a calculation walks CREATED, then RUNNING, then the terminal
+    /// state its stored outcome names — and stays RUNNING while its run has reported no
+    /// outcome at all, because a calculation whose work is not over has not reached a terminal
+    /// state however long ago it was submitted. A cancelled one is `CANCELING` until that stop
+    /// is due and `CANCELED` from then on. So two reads at the same instant report the same
+    /// state, and a calculation nobody polls reaches its state exactly when one that is polled
+    /// does.
+    pub fn state_at(&self, now: SystemTime) -> &'static str {
+        if let Some(requested) = self.stop_requested_at {
+            return if now < due_at(requested, CALCULATION_CANCELLATION) {
+                CALCULATION_STATE_CANCELING
+            } else {
+                CALCULATION_STATE_CANCELED
+            };
+        }
+        if now < self.running_due_at() {
+            return CALCULATION_STATE_CREATED;
+        }
+        let Some(outcome) = self.outcome.as_ref() else {
+            return CALCULATION_STATE_RUNNING;
+        };
+        if now < self.completion_due_at {
+            return CALCULATION_STATE_RUNNING;
+        }
+        if outcome.failed {
+            CALCULATION_STATE_FAILED
+        } else {
+            CALCULATION_STATE_COMPLETED
+        }
+    }
+
+    /// Whether the calculation is in a state it can no longer leave at `now`: "a
+    /// `StopCalculationExecution` call on a calculation that is already in a terminal state
+    /// […] succeeds but has no effect".
+    pub fn is_terminal_at(&self, now: SystemTime) -> bool {
+        matches!(
+            self.state_at(now),
+            CALCULATION_STATE_CANCELED | CALCULATION_STATE_COMPLETED | CALCULATION_STATE_FAILED
+        )
+    }
+
+    /// When the calculation stopped processing, or `None` while it has not: "the date and time
+    /// the calculation completed processing" (`CalculationStatus$CompletionDateTime`), which
+    /// is the instant a cancellation finished for one that was cancelled and the instant its
+    /// completion fell due for one that ran.
+    pub fn completed_at(&self, now: SystemTime) -> Option<SystemTime> {
+        if let Some(requested) = self.stop_requested_at {
+            let complete = due_at(requested, CALCULATION_CANCELLATION);
+            return (now >= complete).then_some(complete);
+        }
+        (self.outcome.is_some() && now >= self.completion_due_at).then_some(self.completion_due_at)
+    }
+
+    /// The `CalculationStatus` a read of this calculation reports at `now`.
     ///
     /// `SubmissionDateTime` is "the date and time the calculation was submitted for
-    /// processing", which is the instant the submission persisted. There is no
-    /// `CompletionDateTime` and no `StateChangeReason`: nothing has run the calculation (see
-    /// the module docs) and nothing has asked it to stop, so neither a completion instant nor
-    /// a reason for a change of state exists to report.
+    /// processing", which is the instant the submission persisted, and `CompletionDateTime`
+    /// the instant it stopped processing ([`Self::completed_at`]). There is no
+    /// `StateChangeReason`: AWS publishes no wording for the change a caller's own cancel
+    /// makes — the member's example is a calculation "canceled because the session was
+    /// terminated", which is not this change — and what a FAILED run reports is the error the
+    /// run itself produced, which is the `stderr` object its result names.
     ///
     /// Built on the record rather than in a handler, so every read of a calculation's status
     /// reports the same members out of the same record.
-    pub fn to_status(&self) -> CalculationStatus {
+    pub fn to_status(&self, now: SystemTime) -> CalculationStatus {
         CalculationStatus {
             submission_date_time: Some(reported_time(self.submitted_at)),
-            completion_date_time: None,
-            state: Some(self.state().to_string()),
+            completion_date_time: self.completed_at(now).map(reported_time),
+            state: Some(self.state_at(now).to_string()),
             state_change_reason: None,
         }
+    }
+
+    /// The `CalculationResult` a read reports at `now`: "contains result information. This
+    /// field is populated only if the calculation is COMPLETED".
+    ///
+    /// So a calculation that is still running, one that was cancelled and one that failed
+    /// report none, and a completed one reports the objects its run really wrote — the two
+    /// streams, the folder they are under, and the data format they are in: "the data format
+    /// of the calculation result" is the media type the result was saved as, which for the
+    /// output of a calculation is the text those objects hold
+    /// ([`CALCULATION_OUTPUT_CONTENT_TYPE`]), and the modelled `CalculationResultType` is a
+    /// media type (its pattern is `^\w+\/[-+.\w]+$`).
+    pub fn to_result(&self, now: SystemTime) -> Option<CalculationResult> {
+        if self.state_at(now) != CALCULATION_STATE_COMPLETED {
+            return None;
+        }
+        let outcome = self.outcome.as_ref()?;
+        Some(CalculationResult {
+            std_out_s3_uri: outcome.stdout_uri.clone(),
+            std_error_s3_uri: outcome.stderr_uri.clone(),
+            result_s3_uri: outcome.result_uri.clone(),
+            result_type: outcome
+                .result_uri
+                .as_ref()
+                .map(|_| CALCULATION_OUTPUT_CONTENT_TYPE.to_string()),
+        })
+    }
+
+    /// The `CalculationStatistics` a read reports at `now`: "contains information about the
+    /// data processing unit (DPU) execution time and progress. This field is populated only
+    /// when statistics are available".
+    ///
+    /// They are available once the run has reported and the calculation is terminal, and what
+    /// they carry is the HOST's own measurement of that run: "the data processing unit
+    /// execution time in milliseconds for the calculation" is the time the one executor a
+    /// session runs on spent on it ([`ExecutorRecord`]), which is the time the engine spent
+    /// evaluating the code block. `Progress` is not reported: AWS publishes no vocabulary for
+    /// the member, and a run that is over has no progress left to state.
+    pub fn to_statistics(&self, now: SystemTime) -> Option<CalculationStatistics> {
+        if !self.is_terminal_at(now) {
+            return None;
+        }
+        let outcome = self.outcome.as_ref()?;
+        Some(CalculationStatistics {
+            dpu_execution_in_millis: i64::try_from(outcome.run_time.as_millis()).ok(),
+            progress: None,
+        })
     }
 
     /// This calculation as the `CalculationSummary` a listing reports it as: "Summary
     /// information for a notebook calculation" — the id it was minted under, the description
     /// the submission carried (absent where it carried none, the modelled `DescriptionString`
     /// holding at least one character) and its status.
-    pub fn to_summary(&self) -> CalculationSummary {
+    pub fn to_summary(&self, now: SystemTime) -> CalculationSummary {
         CalculationSummary {
             calculation_execution_id: Some(self.id.clone()),
             description: self.description.clone(),
-            status: Some(self.to_status()),
+            status: Some(self.to_status(now)),
         }
+    }
+
+    /// Report what RUNNING this calculation produced, as of `now`.
+    ///
+    /// The one place a run's outcome is written. The completion is pushed out to
+    /// [`CALCULATION_COMPLETION`] after the instant the run REPORTED where that is later than
+    /// the instant it was already owed at: the engine runs the code block before the
+    /// submission is answered, so a run that took longer than the span the submission owed
+    /// would otherwise land a calculation in a terminal state before its caller had the id —
+    /// and a caller acting straight after the submission must still find the calculation in
+    /// flight, whatever the code block it carried made the host spend.
+    pub fn report(&mut self, outcome: CalculationOutcome, now: SystemTime) {
+        self.completion_due_at = due_at(now, CALCULATION_COMPLETION).max(self.completion_due_at);
+        self.outcome = Some(outcome);
+    }
+
+    /// Ask this calculation to stop at `now`, which is what `StopCalculationExecution`
+    /// "requests", and answer whether the cancellation was taken on.
+    ///
+    /// "A `StopCalculationExecution` call on a calculation that is already in a terminal state
+    /// (for example, STOPPED, FAILED, or COMPLETED) succeeds but has no effect": such a
+    /// calculation keeps the state it reached. One that is still CREATED or RUNNING takes the
+    /// cancellation, and a calculation already asked keeps the instant it was FIRST asked at,
+    /// so a repeat neither restarts the cancellation nor moves the instant it completed at —
+    /// the same no-op a repeated session shutdown is ([`SessionRecord::terminate`]).
+    pub fn stop(&mut self, now: SystemTime) -> bool {
+        if self.is_terminal_at(now) {
+            return false;
+        }
+        self.stop_requested_at = Some(self.stop_requested_at.unwrap_or(now));
+        true
     }
 
     /// Whether this record is the calculation a repeat of `session_id`, `code_block` and
@@ -164,6 +427,11 @@ impl CalculationRegistry {
     /// The calculation `id` names, or `None` when this account holds none.
     pub fn calculation(&self, id: &str) -> Option<&CalculationRecord> {
         self.calculations.get(id)
+    }
+
+    /// The same calculation, for a caller that is going to move it on (a cancellation).
+    pub fn calculation_mut(&mut self, id: &str) -> Option<&mut CalculationRecord> {
+        self.calculations.get_mut(id)
     }
 
     /// The calculation a `ClientRequestToken` already minted, or `None` when no submission
@@ -217,13 +485,13 @@ impl CalculationRegistry {
     /// index already records, so the walk reads that index backwards rather than re-sorting
     /// the submission instants, which two submissions inside one tick of the clock could not
     /// separate.
-    pub fn session_summaries(&self, session_id: &str) -> Vec<CalculationSummary> {
+    pub fn session_summaries(&self, session_id: &str, now: SystemTime) -> Vec<CalculationSummary> {
         self.order
             .iter()
             .rev()
             .filter_map(|id| self.calculations.get(id))
             .filter(|record| record.session_id == session_id)
-            .map(CalculationRecord::to_summary)
+            .map(|record| record.to_summary(now))
             .collect()
     }
 
@@ -284,6 +552,85 @@ impl ComAmazonawsAthenaAmazonathenaState {
 /// Minted from the maintained crate rather than laid out here.
 pub fn new_calculation_execution_id() -> String {
     ::uuid::Uuid::new_v4().as_hyphenated().to_string()
+}
+
+/// The name of the object one calculation's standard output is saved as, which is the file
+/// `CalculationResult$StdOutS3Uri` names ("the Amazon S3 location of the `stdout` file for the
+/// calculation").
+const STDOUT_OBJECT: &str = "stdout";
+
+/// The name of the object one calculation's standard error is saved as; see
+/// [`STDOUT_OBJECT`].
+const STDERR_OBJECT: &str = "stderr";
+
+/// The media type the two output objects of a calculation are saved under, which is also the
+/// "data format of the calculation result" a read reports
+/// ([`CalculationRecord::to_result`]): what a calculation wrote to a stream is text.
+pub const CALCULATION_OUTPUT_CONTENT_TYPE: &str = "text/plain";
+
+/// The folder one calculation's output objects are saved under: the session's working
+/// directory, the session, and the calculation itself.
+///
+/// The ONE place that folder is formed, as [`result_object_uri`] is the one place a query's
+/// result object key is formed — so the folder a run WRITES under and the folder a read of
+/// the calculation NAMES (`CalculationResult$ResultS3Uri`) can never be two different places.
+/// `None` for a session with no working directory to write under, which is the one case a
+/// completed calculation reports no result location rather than one that holds nothing.
+pub fn calculation_output_folder(
+    working_directory: Option<&str>,
+    session_id: &str,
+    calculation_execution_id: &str,
+) -> Option<String> {
+    // The working directory names a directory, whether or not it was written with the
+    // trailing separator, so what goes under it is joined by exactly one.
+    let directory = working_directory?.trim_end_matches('/');
+    Some(format!("{directory}/{session_id}/{calculation_execution_id}"))
+}
+
+/// What a finished RUN of the calculation `calculation_execution_id` leaves: the objects to
+/// save under the session's working directory, and the outcome to store on the record.
+///
+/// The bodies are the two streams the run produced ([`crate::state::calculation_engine`]) and
+/// nothing else, so an object a read names holds what the calculation wrote. A session with no
+/// working directory saves nothing — there is nowhere to save it to — and the outcome then
+/// names no location, which is what a read of such a calculation reports.
+pub fn calculation_result_objects(
+    working_directory: Option<&str>,
+    session_id: &str,
+    calculation_execution_id: &str,
+    run: &calculation_engine::Completion,
+) -> (Vec<query_results::ResultObject>, CalculationOutcome) {
+    let outcome = CalculationOutcome {
+        failed: run.failed,
+        run_time: run.run_time,
+        stdout_uri: None,
+        stderr_uri: None,
+        result_uri: None,
+    };
+    let Some(folder) =
+        calculation_output_folder(working_directory, session_id, calculation_execution_id)
+    else {
+        return (Vec::new(), outcome);
+    };
+    let objects = vec![
+        query_results::ResultObject {
+            uri: format!("{folder}/{STDOUT_OBJECT}"),
+            body: run.stdout.clone().into_bytes(),
+            content_type: CALCULATION_OUTPUT_CONTENT_TYPE,
+        },
+        query_results::ResultObject {
+            uri: format!("{folder}/{STDERR_OBJECT}"),
+            body: run.stderr.clone().into_bytes(),
+            content_type: CALCULATION_OUTPUT_CONTENT_TYPE,
+        },
+    ];
+    let outcome = CalculationOutcome {
+        stdout_uri: Some(format!("{folder}/{STDOUT_OBJECT}")),
+        stderr_uri: Some(format!("{folder}/{STDERR_OBJECT}")),
+        result_uri: Some(folder),
+        ..outcome
+    };
+    (objects, outcome)
 }
 
 /// The message a submission that names neither code block, or both, is refused with.

@@ -70,11 +70,14 @@
 //! resource of its own.
 //!
 //! CALCULATIONS live in the [`CalculationRegistry`] of
-//! [`ComAmazonawsAthenaAmazonathenaState::calculations`], each submitted into one notebook
-//! session: `StartCalculationExecution` writes a [`CalculationRecord`] there and
-//! `GetCalculationExecutionCode` answers out of that same record, so the code a read reports
-//! is the code a submission persisted. A session serving no notebook runs no calculation and
-//! takes none.
+//! [`ComAmazonawsAthenaAmazonathenaState::calculations`], each submitted into one session:
+//! `StartCalculationExecution` writes a [`CalculationRecord`] there, RUNS the code block it
+//! carried ([`calculation_engine`]) and records what that run produced, and
+//! `GetCalculationExecutionCode`, `GetCalculationExecution` and `GetCalculationExecutionStatus`
+//! all answer out of that same record — so the code a read reports is the code a submission
+//! persisted and the result it reports is what that run wrote. A calculation runs inside any
+//! session that can accept one; whether that session was started in a notebook decides only
+//! which notebook the calculation is a cell of.
 //!
 //! PREPARED STATEMENTS live in the [`PreparedStatementRegistry`] of
 //! [`ComAmazonawsAthenaAmazonathenaState::prepared_statements`], scoped to the workgroup
@@ -112,6 +115,9 @@
 
 /// The SQL engine a query execution runs on, and the result set it produces.
 pub mod query_engine;
+
+/// The Python engine a notebook calculation runs on, and the bounds it is held to.
+pub mod calculation_engine;
 
 /// What a submitted statement means to the AWS Glue Data Catalog, and how it is run.
 pub mod catalog_sql;
