@@ -12,6 +12,24 @@
 //! exactly as `crate::ops::associate_benefit_application_resource` answers a request
 //! naming a resource the application already carries.
 //!
+//! The operation answers in this order, which is the order its sibling write paths answer
+//! in (`crate::ops::amend_benefit_application`, and the resource writes beside it):
+//!
+//! 1. request-shape validation — the centralized walk and the bounds this service puts on
+//!    the members the model leaves unconstrained, before any stored record is read;
+//! 2. the catalog and the partner-entitlement gate;
+//! 3. the `ClientToken` replay check;
+//! 4. the application itself — one that does not exist is `ResourceNotFoundException`;
+//! 5. the application's STATUS, which refuses the write whatever the request carries;
+//! 6. optimistic concurrency — the request's `Revision` must be the current one;
+//! 7. the rules on the CONTENT this write would store, which are the application's own
+//!    benefit's.
+//!
+//! The state of the record is therefore answered before anything about the content: a
+//! request aimed at an application that admits no content change is refused with the
+//! modelled `ConflictException` (HTTP 409) even when the content it carries would also be
+//! refused, so one logical request gets ONE answer whichever write path it arrives on.
+//!
 //! An update edits the partner's own DRAFT: it is accepted only while the application is
 //! `PENDING_SUBMISSION` ([`crate::state::UPDATABLE_STATUSES`]), and from any other status
 //! — a submitted application AWS is reviewing, or a terminal one — it is refused with the
@@ -287,9 +305,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The application's own benefit governs the document this update would store, the
         // way it governs the one the create stores. The schema is read — and cloned —
-        // BEFORE the application is borrowed for writing, and judged after the retry
-        // check below, so a replay of a write that already landed still answers with what
-        // it reported.
+        // BEFORE the application is borrowed for writing, and judged after the retry check
+        // below and after the gates on the state of the record, so a replay of a write that
+        // already landed still answers with what it reported and a record that admits no
+        // content change is answered about its state.
         let benefit_schema =
             store.benefit_schema_for_application(&input.catalog, &input.identifier);
 
@@ -379,21 +398,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .require_application_mut(&input.catalog, &input.identifier)
             .map_err(UpdateBenefitApplicationErrorModeled::ResourceNotFoundException)?;
 
-        // A document this update would store has to satisfy the benefit's request schema,
-        // exactly as the create's does: one rule, applied wherever the member is written.
-        if let Some(refusal) = crate::state::benefit_schema_refusal(
-            benefit_schema.as_ref(),
-            input.benefit_application_details.as_ref(),
-        ) {
-            return Err(UpdateBenefitApplicationErrorModeled::ValidationException(refusal).into());
-        }
-
         // An update is the partner editing its own DRAFT: once the application has been
         // submitted the record is the one AWS is reviewing, and a terminal application is
         // finished with, so an update of anything but a `PENDING_SUBMISSION` application
         // is refused and NOTHING below runs — see [`crate::state::UPDATABLE_STATUSES`].
-        // Checked before the revision, because the status refuses the request whatever
-        // revision it names.
+        // Checked before the revision and before the rules on the content this write would
+        // store, because the status refuses the request whatever the request carries — the
+        // order `crate::ops::amend_benefit_application` answers the same two rules in.
         if !application.is_updatable() {
             return Err(UpdateBenefitApplicationErrorModeled::ConflictException(
                 ConflictException {
@@ -418,6 +429,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+
+        // A document this update would store has to satisfy the benefit's request schema,
+        // exactly as the create's does: one rule, applied wherever the member is written.
+        // It judges the CONTENT of the write, so it runs after the gates on the state of
+        // the record above — the place `crate::ops::amend_benefit_application` applies the
+        // same rule to the document its amendments produced.
+        if let Some(refusal) = crate::state::benefit_schema_refusal(
+            benefit_schema.as_ref(),
+            input.benefit_application_details.as_ref(),
+        ) {
+            return Err(UpdateBenefitApplicationErrorModeled::ValidationException(refusal).into());
         }
 
         // Only the members the request carried are applied, and only where the value the

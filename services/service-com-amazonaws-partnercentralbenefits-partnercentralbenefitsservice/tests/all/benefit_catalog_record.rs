@@ -34,13 +34,25 @@
 //!    amendment that wrote the refused field for the amendment, which binds no document
 //!    member at all. Rows: an update and an amendment of a declared string field (which
 //!    conform) and of a declared number field written as text (which does not).
+//! 4. **The state of the stored record is answered before the rules on its content**: a
+//!    write aimed at an application whose `BenefitApplicationStatus` admits no such change
+//!    is refused with the modelled `ConflictException` (409) even when the content it
+//!    carries also contradicts the benefit's schema, and the schema's own
+//!    `ValidationException` (400) answers only a write the status admits — the same order
+//!    on both write paths, so one logical request gets one answer whichever path it
+//!    arrives on. Rows: every modelled `BenefitApplicationStatus` of every seeded catalog,
+//!    crossed with the forms the schema violation takes (a declared number field written as
+//!    text, a declared string field written as a number, a document whose own JSON type is
+//!    not the one the schema declares).
 
 use serde_json::{json, Map, Value};
+use service_com_amazonaws_partnercentralbenefits_partnercentralbenefitsservice::ops::types::BENEFIT_APPLICATION_STATUS_VALUES;
 use service_com_amazonaws_partnercentralbenefits_partnercentralbenefitsservice::state::{
-    BENEFIT_RESOURCE, BENEFIT_STATUS_ACTIVE, DETAILS_MEMBER, SEEDED_CATALOGS,
-    VALIDATION_REASON_BUSINESS,
+    BENEFIT_RESOURCE, BENEFIT_STATUS_ACTIVE, DETAILS_MEMBER, SEEDED_CATALOGS, TERMINAL_STATUSES,
+    UPDATABLE_STATUSES, VALIDATION_REASON_BUSINESS,
 };
 
+use crate::application_status_gates::reach;
 use crate::benefit_application_lifecycle::{error_code, text, Harness, CATALOG};
 use crate::details_document_guard::MEMBER_PATH as DETAILS_PATH;
 use crate::refusal_member_path::{amendment_member_path, AMENDMENT_NEW_VALUE};
@@ -124,6 +136,50 @@ pub(crate) fn declared_fields(case: &str, schema: &Value) -> Vec<(String, String
                 });
             (field.clone(), json_type.to_string())
         })
+        .collect()
+}
+
+/// An `ACTIVE` benefit of `catalog` that declares both a `string` and a `number` field,
+/// with the `(field, declared type)` pairs it declares.
+///
+/// Two declared types are what lets one write satisfy the schema and the next contradict
+/// it at the other field; an amendment carries its `NewValue` as text, so a field declared
+/// `number` is exactly the field an amendment cannot satisfy.
+async fn two_type_benefit(harness: &Harness, catalog: &str) -> (String, Vec<(String, String)>) {
+    for benefit in catalog_benefits(harness, catalog).await {
+        if benefit.status != BENEFIT_STATUS_ACTIVE {
+            continue;
+        }
+        let Some(schema) = benefit.schema.as_ref() else {
+            continue;
+        };
+        let fields = declared_fields(&benefit.id, schema);
+        let declares = |wanted: &str| fields.iter().any(|(_, json_type)| json_type == wanted);
+        if declares("string") && declares("number") {
+            return (benefit.id.clone(), fields);
+        }
+    }
+    panic!(
+        "case {catalog:?}: the seeded catalog must hold an ACTIVE benefit declaring a string \
+         and a number field"
+    )
+}
+
+/// The first field of `fields` the schema declares of JSON type `wanted`.
+fn field_of_type(case: &str, fields: &[(String, String)], wanted: &str) -> String {
+    fields
+        .iter()
+        .find(|(_, json_type)| json_type == wanted)
+        .map(|(field, _)| field.clone())
+        .unwrap_or_else(|| panic!("case {case:?}: no {wanted} field among {fields:?}"))
+}
+
+/// A document giving every field `fields` declares a value of its declared type, so the
+/// schema accepts it as a whole.
+fn conforming_document(case: &str, fields: &[(String, String)]) -> Map<String, Value> {
+    fields
+        .iter()
+        .map(|(field, json_type)| (field.clone(), value_of_type(case, json_type)))
         .collect()
 }
 
@@ -433,41 +489,12 @@ async fn update_and_amend_judge_the_document_they_would_store_by_the_same_schema
     let harness = Harness::new();
 
     // The rule needs a benefit declaring a field of each of two types, so one write can
-    // satisfy the schema and the next contradict it at the other field. An amendment
-    // carries its `NewValue` as text, so a field declared `number` is exactly the field
-    // an amendment cannot satisfy.
-    let mut subject: Option<(String, Vec<(String, String)>)> = None;
-    for benefit in catalog_benefits(&harness, CATALOG).await {
-        if benefit.status != BENEFIT_STATUS_ACTIVE {
-            continue;
-        }
-        let Some(schema) = benefit.schema.as_ref() else {
-            continue;
-        };
-        let fields = declared_fields(&benefit.id, schema);
-        let has = |wanted: &str| fields.iter().any(|(_, json_type)| json_type == wanted);
-        if has("string") && has("number") {
-            subject = Some((benefit.id.clone(), fields));
-            break;
-        }
-    }
-    let (benefit_id, fields) = subject.expect(
-        "the seeded catalog must hold an ACTIVE benefit declaring a string and a number field",
-    );
-    let field_of = |wanted: &str| -> String {
-        fields
-            .iter()
-            .find(|(_, json_type)| json_type == wanted)
-            .map(|(field, _)| field.clone())
-            .unwrap_or_else(|| panic!("the chosen benefit declares a {wanted} field"))
-    };
-    let string_field = field_of("string");
-    let number_field = field_of("number");
+    // satisfy the schema and the next contradict it at the other field.
+    let (benefit_id, fields) = two_type_benefit(&harness, CATALOG).await;
+    let string_field = field_of_type("seed", &fields, "string");
+    let number_field = field_of_type("seed", &fields, "number");
 
-    let mut conforming = Map::new();
-    for (field, json_type) in &fields {
-        conforming.insert(field.clone(), value_of_type("seed", json_type));
-    }
+    let conforming = conforming_document("seed", &fields);
     let created = harness
         .create(
             "seed",
@@ -588,5 +615,207 @@ async fn update_and_amend_judge_the_document_they_would_store_by_the_same_schema
         harness.get(&case, &id).await,
         after_amendment,
         "case {case:?}: a refused amendment must change nothing"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Rule 4: the record's state is answered before the rules on its content
+// ---------------------------------------------------------------------------
+
+/// Assert `operation` refused `body` with the modelled `ConflictException` (409) — the
+/// answer a write to an application whose status admits no such change gets — and return
+/// the `(status, code)` pair it answered with, so the two write paths can be compared.
+async fn assert_status_conflict(
+    harness: &Harness,
+    case: &str,
+    operation: &str,
+    body: &Value,
+) -> (u16, String) {
+    let (status, out) = harness.call(operation, body).await;
+    assert_eq!(
+        status, 409,
+        "case {case:?}: expected the modelled ConflictException's 409, got {status} {out:?}"
+    );
+    let code = error_code(&out);
+    assert_eq!(
+        code, "ConflictException",
+        "case {case:?}: expected ConflictException, got {out:?}"
+    );
+    (status, code)
+}
+
+/// A write aimed at an application whose status admits no content change is answered about
+/// that status, not about the content it carries: both write paths refuse it with the
+/// modelled `ConflictException` (409) even though the document the write would store also
+/// contradicts the benefit's `BenefitRequestSchema`, while a write the status DOES admit
+/// reaches the schema and is refused with the modelled `ValidationException` (400).
+///
+/// The rows are every modelled `BenefitApplicationStatus` of every seeded catalog, crossed
+/// with the forms the schema violation takes; every refused row is read back, so neither
+/// refusal persisted anything.
+#[tokio::test]
+async fn the_application_status_is_answered_before_the_schema_rule_on_both_write_paths() {
+    let harness = Harness::new();
+    let mut conflicts = 0usize;
+    let mut validations = 0usize;
+
+    for catalog in SEEDED_CATALOGS {
+        let (benefit_id, fields) = two_type_benefit(&harness, catalog).await;
+        let string_field = field_of_type(catalog, &fields, "string");
+        let number_field = field_of_type(catalog, &fields, "number");
+        let conforming = conforming_document(catalog, &fields);
+
+        // The forms a schema violation takes on the update path: a declared field of
+        // another JSON type (both directions), and a document whose own type is not the
+        // object the schema declares. Each row carries the member path and the requirement
+        // the schema rule states for it, so a 400 row is pinned to THAT rule rather than to
+        // any 400.
+        let mut wrong_number = conforming.clone();
+        wrong_number.insert(number_field.clone(), value_of_another_type("number"));
+        let mut wrong_string = conforming.clone();
+        wrong_string.insert(string_field.clone(), value_of_another_type("string"));
+        let violations: Vec<(String, Value, String, String)> = vec![
+            (
+                format!("{number_field} written as text"),
+                Value::Object(wrong_number),
+                format!("{DETAILS_PATH}.{number_field}"),
+                "Member must be of type number".to_string(),
+            ),
+            (
+                format!("{string_field} written as a number"),
+                Value::Object(wrong_string),
+                format!("{DETAILS_PATH}.{string_field}"),
+                "Member must be of type string".to_string(),
+            ),
+            (
+                "an array where the schema declares an object".to_string(),
+                json!([1, 2, 3]),
+                DETAILS_PATH.to_string(),
+                "Member must be of type object".to_string(),
+            ),
+        ];
+
+        for (row, status) in BENEFIT_APPLICATION_STATUS_VALUES.iter().enumerate() {
+            let (violation_case, document, member, requirement) = &violations[row % violations.len()];
+            let case = format!("{status} in {catalog}, with {violation_case}");
+
+            // One fresh application per row, seeded with a document the schema accepts and
+            // then driven into the row's status.
+            let created = harness
+                .create(
+                    &case,
+                    &json!({
+                        "Catalog": catalog,
+                        "ClientToken": format!("tok-precedence-{catalog}-{row}"),
+                        "BenefitIdentifier": benefit_id,
+                        "Name": "precedence-subject",
+                        "BenefitApplicationDetails": Value::Object(conforming.clone()),
+                    }),
+                )
+                .await;
+            let id = text(&case, &created, "Id");
+            reach(&harness, &case, catalog, &id, status).await;
+
+            let before = harness.get_in(&case, catalog, &id).await;
+            let revision = text(&case, &before, "Revision");
+
+            // The update path: the request carries the application's CURRENT revision, so
+            // the answer is the status's or the schema's and not the concurrency check's.
+            let update = json!({
+                "Catalog": catalog,
+                "ClientToken": format!("tok-precedence-update-{catalog}-{row}"),
+                "Identifier": id,
+                "Revision": revision,
+                "BenefitApplicationDetails": document,
+            });
+            let update_answer = if UPDATABLE_STATUSES.contains(status) {
+                // The status admits the write, so the content rule is what answers it.
+                assert_refused(
+                    &harness,
+                    &format!("{case}, update"),
+                    "UpdateBenefitApplication",
+                    &update,
+                    member,
+                    requirement,
+                )
+                .await;
+                validations += 1;
+                (400, "ValidationException".to_string())
+            } else {
+                let answer = assert_status_conflict(
+                    &harness,
+                    &format!("{case}, update"),
+                    "UpdateBenefitApplication",
+                    &update,
+                )
+                .await;
+                conflicts += 1;
+                answer
+            };
+            assert_eq!(
+                harness.get_in(&case, catalog, &id).await,
+                before,
+                "case {case:?}: a refused update must persist nothing"
+            );
+
+            // The amend path, carrying the same content violation as an amendment that
+            // writes the declared number field as text.
+            let amend = json!({
+                "Catalog": catalog,
+                "ClientToken": format!("tok-precedence-amend-{catalog}-{row}"),
+                "Identifier": id,
+                "Revision": revision,
+                "AmendmentReason": "the partner corrected the amount",
+                "Amendments": [{
+                    "FieldPath": format!("{DETAILS_MEMBER}.{number_field}"),
+                    "NewValue": "250",
+                }],
+            });
+            let amend_answer = if TERMINAL_STATUSES.contains(status) {
+                let answer = assert_status_conflict(
+                    &harness,
+                    &format!("{case}, amend"),
+                    "AmendBenefitApplication",
+                    &amend,
+                )
+                .await;
+                conflicts += 1;
+                answer
+            } else {
+                assert_refused(
+                    &harness,
+                    &format!("{case}, amend"),
+                    "AmendBenefitApplication",
+                    &amend,
+                    &amendment_member_path(0, AMENDMENT_NEW_VALUE),
+                    "Member must be of type number",
+                )
+                .await;
+                validations += 1;
+                (400, "ValidationException".to_string())
+            };
+            assert_eq!(
+                harness.get_in(&case, catalog, &id).await,
+                before,
+                "case {case:?}: a refused amendment must persist nothing"
+            );
+
+            // A status both write paths refuse the change from gets ONE answer: the same
+            // HTTP status and the same error code on both, so a client branching on the
+            // refusal is told the same thing whichever path it used.
+            if TERMINAL_STATUSES.contains(status) {
+                assert_eq!(
+                    update_answer, amend_answer,
+                    "case {case:?}: the two write paths must answer one refused request the \
+                     same way, got {update_answer:?} and {amend_answer:?}"
+                );
+            }
+        }
+    }
+
+    assert!(
+        conflicts > 0 && validations > 0,
+        "the table must cover both sides of the rule, got {conflicts} status refusals and \
+         {validations} content refusals"
     );
 }
