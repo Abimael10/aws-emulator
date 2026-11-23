@@ -28,12 +28,15 @@ use smithy_server_runtime::MultiServiceRouter;
 const REGION: &str = "sa-east-1";
 
 /// One emulator: a router with this service mounted on its own engine.
-struct Emulator {
+///
+/// Shared with the sibling suite that pins this operation's refusal sentences
+/// (`crate::policy_version_deletion_refusals`), so the wire harness lives in one place.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -41,7 +44,7 @@ impl Emulator {
         Self { router }
     }
 
-    async fn dispatch(&self, method: &str, path: &str, body: Option<&Value>) -> Reply {
+    pub(crate) async fn dispatch(&self, method: &str, path: &str, body: Option<&Value>) -> Reply {
         let host = format!("iot.{REGION}.amazonaws.com");
         let payload = body.map_or_else(Bytes::new, |value| Bytes::from(value.to_string()));
         let request = http::Request::builder()
@@ -61,7 +64,7 @@ impl Emulator {
         Reply::of(self.router.dispatch(request).await)
     }
 
-    async fn create_policy(&self, case: &str, policy_name: &str) {
+    pub(crate) async fn create_policy(&self, case: &str, policy_name: &str) {
         let reply = self
             .dispatch(
                 "POST",
@@ -79,7 +82,13 @@ impl Emulator {
     }
 
     /// Add one version, answering the id it was given.
-    async fn create_version(&self, case: &str, policy_name: &str, index: usize, default: bool) -> String {
+    pub(crate) async fn create_version(
+        &self,
+        case: &str,
+        policy_name: &str,
+        index: usize,
+        default: bool,
+    ) -> String {
         let reply = self
             .dispatch(
                 "POST",
@@ -100,7 +109,7 @@ impl Emulator {
             .to_string()
     }
 
-    async fn delete_version(&self, policy_name: &str, version_id: &str) -> Reply {
+    pub(crate) async fn delete_version(&self, policy_name: &str, version_id: &str) -> Reply {
         self.dispatch(
             "DELETE",
             &format!("/policies/{policy_name}/version/{version_id}"),
@@ -109,7 +118,7 @@ impl Emulator {
         .await
     }
 
-    async fn get_version(&self, policy_name: &str, version_id: &str) -> Reply {
+    pub(crate) async fn get_version(&self, policy_name: &str, version_id: &str) -> Reply {
         self.dispatch(
             "GET",
             &format!("/policies/{policy_name}/version/{version_id}"),
@@ -118,7 +127,7 @@ impl Emulator {
         .await
     }
 
-    async fn list_versions(&self, policy_name: &str) -> Reply {
+    pub(crate) async fn list_versions(&self, policy_name: &str) -> Reply {
         self.dispatch("GET", &format!("/policies/{policy_name}/version"), None)
             .await
     }
@@ -130,8 +139,8 @@ impl Emulator {
 }
 
 /// A dispatched response, reduced to what the assertions read.
-struct Reply {
-    status: u16,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
     body: Bytes,
 }
 
@@ -143,16 +152,16 @@ impl Reply {
         }
     }
 
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).to_string()
     }
 
-    fn json(&self) -> Value {
+    pub(crate) fn json(&self) -> Value {
         serde_json::from_slice(&self.body)
             .unwrap_or_else(|e| panic!("response body is not JSON ({e}): {}", self.text()))
     }
 
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         self.json()["__type"]
             .as_str()
             .unwrap_or_else(|| panic!("no __type in {}", self.text()))
@@ -160,7 +169,7 @@ impl Reply {
     }
 
     /// The version ids a `ListPolicyVersions` answer carries.
-    fn version_ids(&self) -> Vec<String> {
+    pub(crate) fn version_ids(&self) -> Vec<String> {
         self.json()["policyVersions"]
             .as_array()
             .unwrap_or_else(|| panic!("no policyVersions in {}", self.text()))
