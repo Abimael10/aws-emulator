@@ -2220,19 +2220,14 @@ fn weigh_document_framing(text: &str, found: &mut [Recognised]) {
 pub fn detect_entities(text: &str) -> Vec<Entity> {
     let char_starts: Vec<usize> = text.char_indices().map(|(index, _)| index).collect();
     let char_offset = |byte: usize| char_starts.partition_point(|&start| start < byte) as i32;
-    let mut found = pattern_entities(text);
-    found.extend(phrase_entities(text));
-    let mut recognised = resolve_overlaps(found);
-    weigh_document_framing(text, &mut recognised);
-    corroborate_repeated_mentions(text, &mut recognised);
-    recognised
+    recognised_spans(text)
         .into_iter()
-        .map(|entity| Entity {
-            score: Some(entity.evidence.confidence()),
-            r#type: Some(entity.entity_type.to_string()),
-            text: Some(text[entity.start..entity.end].to_string()),
-            begin_offset: Some(char_offset(entity.start)),
-            end_offset: Some(char_offset(entity.end)),
+        .map(|(span, entity_type, confidence)| Entity {
+            score: Some(confidence),
+            r#type: Some(entity_type.to_string()),
+            text: Some(text[span.clone()].to_string()),
+            begin_offset: Some(char_offset(span.start)),
+            end_offset: Some(char_offset(span.end)),
             // Plain-text input has no blocks, so nothing to reference: the modelled
             // member documents it as "empty for plain-text input".
             block_references: None,
@@ -2240,20 +2235,48 @@ pub fn detect_entities(text: &str) -> Vec<Entity> {
         .collect()
 }
 
+/// One span the recogniser typed: its BYTE range in the document, the modelled
+/// `EntityType` it is typed as, and the confidence its own evidence earns it.
+pub(crate) type Recognition = (Range<usize>, &'static str, f32);
+
+/// Every entity the recogniser places in `text`, each as a [`Recognition`], in
+/// document order.
+///
+/// The one recognition pass of this service: [`detect_entities`] is this list with the
+/// spans translated to the character offsets the modelled members carry, and
+/// `DetectTargetedSentiment` types and scores its mentions from it, so no two
+/// operations can disagree about what a document names or about how well evidenced
+/// each name is.
+pub(crate) fn recognised_spans(text: &str) -> Vec<Recognition> {
+    let mut found = pattern_entities(text);
+    found.extend(phrase_entities(text));
+    let mut recognised = resolve_overlaps(found);
+    weigh_document_framing(text, &mut recognised);
+    corroborate_repeated_mentions(text, &mut recognised);
+    recognised
+        .into_iter()
+        .map(|entity| {
+            (
+                entity.start..entity.end,
+                entity.entity_type,
+                entity.evidence.confidence(),
+            )
+        })
+        .collect()
+}
+
 /// Every entity the recogniser places in `text`, as its BYTE span paired with the
 /// modelled `EntityType` it is typed as, in document order.
 ///
-/// The same recognition [`detect_entities`] reports, before the character-offset
-/// translation the modelled members carry — the scale a caller that works in byte
-/// offsets needs. Read by `DetectTargetedSentiment`, whose targets are the things the
-/// document NAMES: one recogniser answers what a document names, so the two
-/// operations cannot disagree about it.
+/// [`recognised_spans`] without the confidence, for a caller that only asks WHAT the
+/// document names. It runs the whole recognition pass, the two evidence-weighing
+/// passes included, and drops what they produce: they weigh `Evidence` and never move
+/// a span, so the spans are the same either way, and one pass that every caller shares
+/// is what keeps the recognition from forking into two that can disagree.
 pub(crate) fn entity_spans(text: &str) -> Vec<(Range<usize>, &'static str)> {
-    let mut found = pattern_entities(text);
-    found.extend(phrase_entities(text));
-    resolve_overlaps(found)
+    recognised_spans(text)
         .into_iter()
-        .map(|entity| (entity.start..entity.end, entity.entity_type))
+        .map(|(span, entity_type, _)| (span, entity_type))
         .collect()
 }
 

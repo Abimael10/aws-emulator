@@ -55,9 +55,13 @@ const PII_ENTITIES: &[(&str, &str)] = &[
 ];
 
 /// Every targeted-sentiment mention of [`DOCUMENT`], as `(Text, Type)`.
+///
+/// Not the same spans as [`ENTITIES`], and that is the point: the entity recogniser
+/// answers which CHARACTERS it typed and types the company name and the product name
+/// beside it separately, while a targeted-sentiment mention is the whole name the
+/// document writes, typed by the part that says what is named.
 const TARGETS: &[(&str, &str)] = &[
-    ("Amazon", "ORGANIZATION"),
-    ("Comprehend", "COMMERCIAL_ITEM"),
+    ("Amazon Comprehend", "ORGANIZATION"),
     ("service", "OTHER"),
     ("John Smith", "PERSON"),
     ("123", "QUANTITY"),

@@ -361,13 +361,22 @@ async fn the_four_sentiment_confidences_are_a_distribution_the_document_decides(
             "case {case:?}: the four confidences are a distribution, so they sum to 1, \
              got {total} from {entry}"
         );
-        // No class is impossible: a client thresholding on a member must read a small
-        // confidence where the engine found no word for it, not a flat zero.
+        // No reading the lexicon could have MISSED is impossible: a client
+        // thresholding on `Positive`, `Negative` or `Neutral` must read a small
+        // confidence where the engine found no word for it, not a flat zero. MIXED is
+        // not such a reading — it is the confidence the document carries BOTH
+        // polarities, measured from the two signed readings — so a document carrying
+        // at most one polarity reports it as the zero it measures.
         for (member, score) in &scores {
             assert!(
-                *score > 0.0 && *score < 1.0,
-                "case {case:?}: expected SentimentScore.{member} strictly inside \
-                 (0, 1), got {score} in {entry}"
+                *score >= 0.0 && *score < 1.0,
+                "case {case:?}: expected SentimentScore.{member} inside \
+                 [0, 1), got {score} in {entry}"
+            );
+            assert!(
+                *member == "Mixed" || *score > 0.0,
+                "case {case:?}: expected SentimentScore.{member}, a reading the \
+                 document leaves open, above 0, got {score} in {entry}"
             );
         }
         let winner = scores
@@ -467,6 +476,25 @@ async fn the_four_sentiment_confidences_are_a_distribution_the_document_decides(
             "case {case:?}: expected {opposite}, which the document carries no \
              evidence for, below {UNSUPPORTED_CLASS_CEILING}, got {}",
             confidence(case, opposite)
+        );
+    }
+    // MIXED is the confidence the document carries BOTH polarities, measured from the
+    // two signed readings rather than read off the document on its own, so a document
+    // the engine read as carrying at most one polarity reports it as the zero it
+    // measures and not at a floor of its own.
+    for case in [
+        "one positive word",
+        "several positive words",
+        "one negative word",
+        "several negative words",
+        "plain fact",
+    ] {
+        assert_eq!(
+            confidence(case, "Mixed"),
+            0.0,
+            "case {case:?}: the document carries at most one polarity, so nothing \
+             supports MIXED, got {}",
+            confidence(case, "Mixed")
         );
     }
 }

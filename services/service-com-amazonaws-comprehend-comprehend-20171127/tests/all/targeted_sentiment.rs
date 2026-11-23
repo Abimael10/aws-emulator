@@ -713,11 +713,22 @@ async fn a_mention_carries_one_distribution_concentrated_on_its_label() {
                 let residual = sentiment["SentimentScore"][other]
                     .as_f64()
                     .unwrap_or(f64::NAN);
+                // MIXED is the confidence the clause carries BOTH polarities, which
+                // is measured from the two signed readings rather than read off the
+                // clause on its own, so a clause carrying at most one polarity
+                // reports it as the zero it measures. The three single-polarity
+                // readings stay strictly positive: the lexicon could have missed the
+                // word that shows one.
                 assert!(
-                    residual > 0.0 && residual < 1.0 - MENTION_CONCENTRATION,
-                    "case {case:?}: expected {other} on {mention:?} strictly inside \
-                     (0, {}), got {residual} in {sentiment}",
+                    (0.0..1.0 - MENTION_CONCENTRATION).contains(&residual),
+                    "case {case:?}: expected {other} on {mention:?} inside \
+                     [0, {}), got {residual} in {sentiment}",
                     1.0 - MENTION_CONCENTRATION
+                );
+                assert!(
+                    other == "Mixed" || residual > 0.0,
+                    "case {case:?}: expected {other} on {mention:?}, a reading the \
+                     clause leaves open, above 0, got {residual} in {sentiment}"
                 );
             }
         }
@@ -869,6 +880,316 @@ async fn an_empty_absent_or_unmodelled_input_is_refused() {
         assert_eq!(
             status, 400,
             "case {case:?}: expected 400, got {status}: {response}"
+        );
+    }
+}
+
+/// Documents whose names the entity recogniser types in PARTS, or types over fewer
+/// words than the document capitalises, with the whole named mention each one writes.
+///
+/// The rows differ along how the name is written and what the recogniser can say
+/// about it: a company name carrying a product name of its own, a three-word name, a
+/// name with an ordinary capitalised word in front of it (a sentence-opening verb),
+/// a legal-entity suffix the recogniser types from, a name repeated, a name written
+/// in a non-ASCII script, and a recognition reaching past the run of name words.
+const COMPOUND_NAMES: &[(&str, &str, &str, &[&str])] = &[
+    (
+        "a company name carrying a product name of its own",
+        "Amazon Comprehend returned the analysis.",
+        "Amazon Comprehend",
+        &["Amazon", "Comprehend"],
+    ),
+    (
+        "the same compound name twice",
+        "Amazon Comprehend shipped. Amazon Comprehend improved.",
+        "Amazon Comprehend",
+        &["Amazon", "Comprehend"],
+    ),
+    (
+        "a capitalised ordinary word in front of a person name",
+        "Contact John Smith about the invoice.",
+        "John Smith",
+        &["Contact John Smith", "John", "Smith"],
+    ),
+    (
+        "a legal-entity suffix",
+        "Initech Holdings Inc. filed the report.",
+        "Initech Holdings Inc",
+        &["Initech", "Holdings", "Initech Holdings"],
+    ),
+    (
+        "a name in a non-ASCII script",
+        "Zoë Müller signed the contract.",
+        "Zoë Müller",
+        &["Zoë", "Müller"],
+    ),
+    (
+        // The other half of rule 1: a recognition that reaches PAST the run of name
+        // words takes the mention with it, rather than the run cutting it short.
+        "a recognition reaching past the run of name words",
+        "The audit closed in March 2024 and nobody objected.",
+        "March 2024",
+        &["March", "2024"],
+    ),
+];
+
+#[tokio::test]
+async fn a_named_mention_is_reported_whole_however_the_recogniser_types_its_parts() {
+    let comprehend = Comprehend::new();
+
+    for (case, text, whole, fragments) in COMPOUND_NAMES {
+        let output = analyse(&comprehend, text).await;
+        assert_invariants(case, text, &output);
+
+        let mentions: Vec<(String, String, i64)> = output["Entities"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .flat_map(mentions_of)
+            .collect();
+
+        assert!(
+            mentions.iter().any(|(mention, _, _)| mention == whole),
+            "case {case:?}: expected the whole named mention {whole:?}, got {mentions:?}"
+        );
+        for fragment in *fragments {
+            assert!(
+                !mentions.iter().any(|(mention, _, _)| mention == fragment),
+                "case {case:?}: {fragment:?} is not the whole named mention {whole:?}, so \
+                 no mention may report it, got {mentions:?}"
+            );
+        }
+        // One entity per entity: every mention of the name belongs to the one group,
+        // so no half of it opens a second one.
+        let holders = output["Entities"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter(|entity| {
+                mentions_of(entity)
+                    .iter()
+                    .any(|(mention, _, _)| mention == whole)
+            })
+            .count();
+        assert_eq!(
+            holders, 1,
+            "case {case:?}: expected {whole:?} to be mentioned by exactly one entity, got \
+             {holders} in {output}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn no_two_mentions_are_the_halves_of_one_name() {
+    let comprehend = Comprehend::new();
+
+    // Over every document either suite analyses: two mentions with nothing but
+    // whitespace between them, both opening with a capital, are one name reported
+    // twice. A `PERSONAL_TITLE` is exempt — an honorific IS its own mention, beside
+    // the name it titles.
+    let documents = DOCUMENTS
+        .iter()
+        .map(|(case, text)| (*case, *text))
+        .chain(
+            COMPOUND_NAMES
+                .iter()
+                .map(|(case, text, _, _)| (*case, *text)),
+        );
+    for (case, text) in documents {
+        let output = analyse(&comprehend, text).await;
+        let characters: Vec<char> = text.chars().collect();
+        let mut mentions: Vec<(i64, i64, String, String)> = Vec::new();
+        for entity in output["Entities"].as_array().cloned().unwrap_or_default() {
+            for mention in entity["Mentions"].as_array().cloned().unwrap_or_default() {
+                mentions.push((
+                    mention["BeginOffset"].as_i64().unwrap_or(-1),
+                    mention["EndOffset"].as_i64().unwrap_or(-1),
+                    mention["Text"].as_str().unwrap_or_default().to_string(),
+                    mention["Type"].as_str().unwrap_or_default().to_string(),
+                ));
+            }
+        }
+        mentions.sort_by_key(|(begin, _, _, _)| *begin);
+
+        for pair in mentions.windows(2) {
+            let (_, first_end, first_text, first_type) = &pair[0];
+            let (second_begin, _, second_text, second_type) = &pair[1];
+            if first_type == "PERSONAL_TITLE" || second_type == "PERSONAL_TITLE" {
+                continue;
+            }
+            let between: String = characters
+                [(*first_end).max(0) as usize..(*second_begin).max(0) as usize]
+                .iter()
+                .collect();
+            let adjacent_words = !between.is_empty()
+                && between.chars().all(char::is_whitespace)
+                && first_text
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_uppercase)
+                && second_text
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_uppercase);
+            assert!(
+                !adjacent_words,
+                "case {case:?}: {first_text:?} and {second_text:?} are adjacent words of \
+                 one name, so they are one mention, got {mentions:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_mention_carries_the_recognisers_own_confidence_for_it() {
+    let comprehend = Comprehend::new();
+
+    // Documents naming things the recogniser evidences differently: a lexicon entry, a
+    // name shape in a person-bearing position, a closed-form address, a figure, a
+    // two-letter abbreviation nothing corroborates.
+    for (case, text) in [
+        (
+            "a company, a person and an e-mail address",
+            "Amazon Comprehend reads the document. Contact John Smith at \
+             john.smith@example.com.",
+        ),
+        (
+            "an address, a figure and an abbreviation",
+            "Deliver 1,250 units to 123 Main Street, Seattle, WA 98101.",
+        ),
+    ] {
+        let body = json!({ "Text": text, "LanguageCode": "en" });
+        let recognised = comprehend.ok("DetectEntities", &body).await;
+        let entities: Vec<(i64, f64, String)> = recognised["Entities"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|entity| {
+                (
+                    entity["BeginOffset"].as_i64().unwrap_or(-1),
+                    entity["Score"].as_f64().unwrap_or(f64::NAN),
+                    entity["Text"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        assert!(
+            entities.len() > 1,
+            "case {case:?}: the document names several things, so the recogniser must \
+             place several entities, got {entities:?}"
+        );
+
+        let output = analyse(&comprehend, text).await;
+        assert_invariants(case, text, &output);
+        let mut matched = 0usize;
+        let mut scores: Vec<f64> = Vec::new();
+        for entity in output["Entities"].as_array().cloned().unwrap_or_default() {
+            for mention in entity["Mentions"].as_array().cloned().unwrap_or_default() {
+                let begin = mention["BeginOffset"].as_i64().unwrap_or(-1);
+                let score = mention["Score"].as_f64().unwrap_or(f64::NAN);
+                scores.push(score);
+                // Where the recogniser placed a recognition that opens this mention,
+                // the mention's confidence is that recognition's own — the two
+                // operations read one recogniser, so they cannot report two
+                // confidences for one piece of evidence.
+                let Some((_, recognised_score, recognised_text)) =
+                    entities.iter().find(|(at, _, _)| *at == begin)
+                else {
+                    continue;
+                };
+                matched += 1;
+                assert!(
+                    (score - recognised_score).abs() < 1e-6,
+                    "case {case:?}: the mention at {begin} carries Score {score}, where \
+                     the recogniser reports {recognised_score} for {recognised_text:?}"
+                );
+            }
+        }
+        assert!(
+            matched > 1,
+            "case {case:?}: expected several mentions the recogniser typed, got {matched}"
+        );
+        // Not one value per shape: two mentions the document evidences differently are
+        // reported differently.
+        let distinct = scores
+            .iter()
+            .map(|score| format!("{score:.9}"))
+            .collect::<BTreeSet<String>>();
+        assert!(
+            distinct.len() > 1,
+            "case {case:?}: every mention is reported at the same confidence {scores:?}, \
+             which is a constant of the shape rather than evidence for the mention"
+        );
+    }
+}
+
+/// `MIXED` is the confidence a clause carries BOTH polarities, so it is reported as
+/// measured: zero where the clause carries at most one, and the leading reading where
+/// it carries both in balance. The three single-polarity readings stay strictly
+/// positive, since the lexicon can miss the word that shows one.
+///
+/// The rows differ along how many polarities the clause the mention sits in carries:
+/// none, one of each, and both at once.
+#[tokio::test]
+async fn mention_sentiment_reports_mixed_as_measured() {
+    let comprehend = Comprehend::new();
+
+    for (case, text, mention, carries_both) in [
+        ("plain fact", "The invoice arrived on Tuesday.", "invoice", false),
+        ("one positive word", "Acme was wonderful.", "Acme", false),
+        ("one negative word", "Acme was terrible.", "Acme", false),
+        (
+            "both polarities in one clause",
+            "The Acme release was excellent and awful.",
+            "Acme",
+            true,
+        ),
+    ] {
+        let output = analyse(&comprehend, text).await;
+        assert_invariants(case, text, &output);
+
+        let scores = output["Entities"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|entity| entity["Mentions"].as_array().cloned().unwrap_or_default())
+            .find(|reported| reported["Text"].as_str() == Some(mention))
+            .map(|reported| reported["MentionSentiment"]["SentimentScore"].clone())
+            .unwrap_or_else(|| panic!("case {case:?}: no mention of {mention:?} in {output}"));
+
+        let mixed = scores["Mixed"].as_f64().unwrap_or(f64::NAN);
+        if carries_both {
+            assert!(
+                mixed > 0.0,
+                "case {case:?}: the clause carries both polarities, so MIXED is \
+                 supported, got {mixed} in {scores}"
+            );
+        } else {
+            assert_eq!(
+                mixed, 0.0,
+                "case {case:?}: the clause carries at most one polarity, so nothing \
+                 supports MIXED, got {scores}"
+            );
+        }
+        for open in ["Positive", "Negative", "Neutral"] {
+            let reported = scores[open].as_f64().unwrap_or(f64::NAN);
+            assert!(
+                reported > 0.0 && reported < 1.0,
+                "case {case:?}: {open} is a reading the clause leaves open, so it is \
+                 reported strictly inside (0, 1), got {reported} in {scores}"
+            );
+        }
+        let total: f64 = ["Positive", "Negative", "Neutral", "Mixed"]
+            .into_iter()
+            .map(|label| scores[label].as_f64().unwrap_or(f64::NAN))
+            .sum();
+        assert!(
+            (total - 1.0).abs() < 1e-5,
+            "case {case:?}: the four confidences are a distribution, so they sum to 1, \
+             got {total} from {scores}"
         );
     }
 }

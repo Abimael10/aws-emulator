@@ -18,18 +18,26 @@
 //!
 //! | rule | evidence | type |
 //! |---|---|---|
-//! | proper-noun span | a run of adjacent capitalised, non-function words | `ORGANIZATION` for a legal-entity suffix, `DATE` for a calendar name, else `OTHER` |
+//! | proper-noun span | a run of adjacent capitalised, non-function words | this service's entity recogniser's typing of the name, else `ORGANIZATION` for a legal-entity suffix, `DATE` for a calendar name, else `OTHER` |
 //! | honorific + name | `Dr`, `Ms`, … before a capitalised span | `PERSONAL_TITLE` for the honorific, `PERSON` for the span |
 //! | pronoun | a member of English's closed pronoun class | its group's type, `PERSON` for a personal pronoun |
 //! | determiner-headed noun phrase | a determiner followed by content words | `OTHER` |
 //! | numeral | a token made of digits (and `.`/`,`) | `QUANTITY` |
 //!
+//! A mention is a WHOLE named mention: the recogniser answers which CHARACTERS it
+//! typed, and its rules fire over the parts of a compound name independently, so a
+//! recognition that covers only part of the name the document writes neither cuts the
+//! mention short nor leaves the rest of that name to open a mention — or an entity
+//! group — of its own. See [`place_mentions`].
+//!
 //! The honest limits of that, which a reader of the response should know: an
 //! adjective in a noun phrase can be taken for its head, a capitalised word that is
 //! not a proper noun is taken for one, and the finer types a learned model assigns
 //! (`BRAND`, `FACILITY`, `MOVIE`, …) are reported as the modelled catch-all `OTHER`
-//! rather than guessed. `Score` is the placing rule's own precision rank, not a
-//! learned confidence, and says so here rather than pretending to be one.
+//! rather than guessed. `Score` is the recogniser's own confidence for the mention it
+//! typed, computed from the evidence it weighed over those characters; where no
+//! recognition reached the mention it is the placing rule's precision rank, which
+//! this file says rather than pretending to be a learned confidence.
 //!
 //! Offsets are CHARACTER offsets into the document, as AWS documents an entity
 //! offset ("the zero-based offset from the beginning of the source text to the first
@@ -112,7 +120,6 @@
 use super::types::*;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ops::Range;
 use std::sync::OnceLock;
 
 use crate::ops::detect_sentiment::score_sentiment;
@@ -135,16 +142,22 @@ const MAX_TEXT_BYTES: usize = 5 * 1024;
 /// language AWS supports but this emulator's engine cannot read.
 const ANALYSABLE_LANGUAGES: &[&str] = &["en"];
 
-/// `Score` — "model confidence that the entity is relevant", one value per placing
-/// rule.
+/// `Score` — "model confidence that the entity is relevant" — for a mention this
+/// service's entity recogniser placed NOTHING on, one value per placing rule.
 ///
-/// This recogniser is rule-based rather than learned, so the value is the rule's own
-/// precision rank and nothing more: a closed-class pronoun is certain, a span
-/// carrying a typing cue (an honorific, a legal-entity suffix, a calendar name, a
-/// numeral) comes next, bare capitalisation next, and a determiner-headed common
-/// noun last — it is the rule most easily fooled by an adjective.
+/// A mention a recognition typed is reported with that recognition's OWN confidence,
+/// computed from the evidence the recogniser weighed for that mention's characters
+/// ([`crate::ops::detect_entities::recognised_spans`]), so two mentions the document
+/// evidences differently are reported differently. These are the fallback for the
+/// mentions the recogniser places nothing on — a pronoun, a determiner-headed common
+/// noun, a capitalised run it did not type — where the only evidence there is is
+/// WHICH rule fired, so the value is that rule's precision rank and nothing more: a
+/// closed-class pronoun is certain, a span carrying a typing cue (an honorific, a
+/// legal-entity suffix, a calendar name, a numeral) comes next, bare capitalisation
+/// next, and a determiner-headed common noun last — it is the rule most easily fooled
+/// by an adjective.
 const SCORE_PRONOUN: f32 = 0.99;
-/// The score of a span a typing rule recognised. See [`SCORE_PRONOUN`].
+/// The score of a span a typing CUE recognised. See [`SCORE_PRONOUN`].
 const SCORE_TYPED_SPAN: f32 = 0.95;
 /// The score of a span placed by capitalisation alone. See [`SCORE_PRONOUN`].
 const SCORE_PROPER_NOUN: f32 = 0.9;
@@ -152,21 +165,27 @@ const SCORE_PROPER_NOUN: f32 = 0.9;
 const SCORE_COMMON_NOUN: f32 = 0.75;
 
 /// `GroupScore` — "the confidence that all the entities mentioned in the group relate
-/// to the same entity" — for a mention whose surface form is identical to one the
-/// group already holds, and for the mention that opened a group: a group of one, or
-/// of one repeated form, is certain.
-const GROUP_SCORE_SAME_FORM: f32 = 1.0;
-/// `GroupScore` for a name that shares every word with a name already in the group
+/// to the same entity" — which is the confidence of the LINK that placed a mention in
+/// its group: what has to be right for the group to be one entity is the link, so
+/// this is a property of the link and not of the mention. A mention whose surface
+/// form is identical to one the group already holds, and the mention that opened a
+/// group, carry this one: a group of one, or of one repeated form, relates to one
+/// entity by construction.
+///
+/// How well EVIDENCED the mention itself is, is the `Score` member beside it, which
+/// [`mention_score`] takes from the recogniser.
+const LINK_SAME_FORM: f32 = 1.0;
+/// The link of a name that shares every word with a name already in the group
 /// ("Lennox" joining "Alice Lennox"): likely, not certain.
-const GROUP_SCORE_PARTIAL_NAME: f32 = 0.85;
-/// `GroupScore` for a pronoun resolved to an earlier group, before the distance
-/// penalty: the nearer the antecedent, the more confident the link.
-const GROUP_SCORE_PRONOUN: f32 = 0.9;
-/// How much [`GROUP_SCORE_PRONOUN`] drops per sentence between the pronoun and its
+const LINK_PARTIAL_NAME: f32 = 0.85;
+/// The link of a pronoun resolved to an earlier group, before the distance penalty:
+/// the nearer the antecedent, the more confident the link.
+const LINK_PRONOUN: f32 = 0.9;
+/// How much [`LINK_PRONOUN`] drops per sentence between the pronoun and its
 /// antecedent's last mention, and the floor it stops at.
-const GROUP_SCORE_DISTANCE_PENALTY: f32 = 0.1;
-/// The floor of the pronoun-resolution confidence. See [`GROUP_SCORE_PRONOUN`].
-const GROUP_SCORE_FLOOR: f32 = 0.5;
+const LINK_DISTANCE_PENALTY: f32 = 0.1;
+/// The floor of the pronoun-resolution link. See [`LINK_PRONOUN`].
+const LINK_FLOOR: f32 = 0.5;
 
 /// The most words a determiner-headed noun phrase may span before its head.
 ///
@@ -546,20 +565,32 @@ fn proper_noun_type(span: &[Word<'_>]) -> &'static str {
     "OTHER"
 }
 
-/// Every entity this service's entity recogniser places in `text`, as its BYTE span
-/// paired with the modelled `TargetedSentimentEntityType` it is reported under.
+/// One entity this service's recogniser placed in the document, as
+/// [`crate::ops::detect_entities::Recognition`] — here the type it carries is the
+/// modelled `TargetedSentimentEntityType` this operation reports it under, which
+/// [`targeted_type_of`] maps the recogniser's `EntityType` onto.
+type Recognition = crate::ops::detect_entities::Recognition;
+
+/// Every entity this service's entity recogniser places in `text`, each as a
+/// [`Recognition`].
 ///
 /// What this operation targets is the things the document NAMES — the modelled
 /// `TargetedSentimentEntityType` values are the kinds of named thing, and the
 /// operation's own documentation is about "the sentiment … towards each entity" — so
 /// the targets are the entities `DetectEntities` places, read through
-/// [`crate::ops::detect_entities::entity_spans`]. One recogniser answers what a
-/// document names, so the two operations cannot disagree about it, and a named thing
-/// with no capital of its own (an e-mail address, a figure) is targeted too.
-fn named_entity_types(text: &str) -> Vec<(Range<usize>, &'static str)> {
-    crate::ops::detect_entities::entity_spans(text)
+/// [`crate::ops::detect_entities::recognised_spans`]. One recogniser answers what a
+/// document names and how well each name is evidenced, so the two operations cannot
+/// disagree about it, and a named thing with no capital of its own (an e-mail
+/// address, a figure) is targeted too.
+///
+/// What that recogniser answers is which CHARACTERS it typed, not where one name
+/// ends: it types the parts of a compound name separately where its rules fire
+/// separately. A mention is a whole name, so [`place_mentions`] reads these as
+/// evidence about the name it is placing rather than as the name's extent.
+fn recognised_entities(text: &str) -> Vec<Recognition> {
+    crate::ops::detect_entities::recognised_spans(text)
         .into_iter()
-        .map(|(span, entity_type)| (span, targeted_type_of(entity_type)))
+        .map(|(span, entity_type, confidence)| (span, targeted_type_of(entity_type), confidence))
         .collect()
 }
 
@@ -582,21 +613,17 @@ fn targeted_type_of(entity_type: &str) -> &'static str {
     }
 }
 
-/// The entity the recogniser placed on the name `[start, end)`, when it placed one:
-/// the typed span sharing the most characters with it.
-fn placed_entity(
-    entities: &[(Range<usize>, &'static str)],
-    start: usize,
-    end: usize,
-) -> Option<(Range<usize>, &'static str)> {
+/// The entity the recogniser placed over the characters `[start, end)`, when it placed
+/// one: the typed span sharing the most characters with them.
+fn placed_entity(entities: &[Recognition], start: usize, end: usize) -> Option<Recognition> {
     entities
         .iter()
-        .filter_map(|(span, entity_type)| {
+        .filter_map(|(span, entity_type, confidence)| {
             let overlap = end.min(span.end).saturating_sub(start.max(span.start));
-            (overlap > 0).then_some((overlap, span.clone(), *entity_type))
+            (overlap > 0).then_some((overlap, span.clone(), *entity_type, *confidence))
         })
-        .max_by_key(|(overlap, _, _)| *overlap)
-        .map(|(_, span, entity_type)| (span, entity_type))
+        .max_by_key(|(overlap, _, _, _)| *overlap)
+        .map(|(_, span, entity_type, confidence)| (span, entity_type, confidence))
 }
 
 /// The head of the noun phrase starting at `from`, and the index just past the
@@ -635,6 +662,14 @@ fn noun_phrase_head<'a>(
         }
     }
     head
+}
+
+/// The confidence a mention is reported with: the recogniser's own confidence for the
+/// recognition that reached the mention's FIRST word — the part of a name that says
+/// what is named — and `rank`, the placing rule's precision rank, where it reached
+/// none. See [`SCORE_PRONOUN`].
+fn mention_score(entities: &[Recognition], word: &Word<'_>, rank: f32) -> f32 {
+    placed_entity(entities, word.start, word.end).map_or(rank, |(_, _, confidence)| confidence)
 }
 
 /// One mention the recogniser placed, before it is grouped.
@@ -687,14 +722,18 @@ impl Mention {
 /// Place every mention the rules find, in document order and without overlap.
 ///
 /// `entities` is what this service's entity recogniser placed in the document
-/// ([`named_entity_types`]): it TYPES every name span placed here, and every entity
-/// it placed that no rule here reached is a mention of its own, so a named thing the
-/// document writes without a capital of its own is targeted as well.
-fn place_mentions(
-    text: &str,
-    words: &[Word<'_>],
-    entities: &[(Range<usize>, &'static str)],
-) -> Vec<Mention> {
+/// ([`recognised_entities`]): it TYPES and SCORES every name span placed here, and
+/// every entity it placed that no rule here reached is a mention of its own, so a
+/// named thing the document writes without a capital of its own is targeted as well.
+///
+/// A mention is a WHOLE named mention. The recogniser types characters, and the rules
+/// that type them fire over the parts of a compound name independently — a brand and
+/// the product beside it, a name and the title in front of it — so a recognition may
+/// cover only part of the name the document writes. Where that happens the name's own
+/// extent wins: the mention runs to the end of the adjacent run of name words (and
+/// further, when a recognition reaches past it), and no word inside it opens a mention
+/// or an entity group of its own.
+fn place_mentions(text: &str, words: &[Word<'_>], entities: &[Recognition]) -> Vec<Mention> {
     let tags = crate::ops::detect_syntax::tags_by_offset(text);
     let mut found: Vec<Mention> = Vec::new();
     let mut index = 0usize;
@@ -711,7 +750,7 @@ fn place_mentions(
                 word.end,
                 Kind::ProperNoun,
                 "PERSONAL_TITLE",
-                SCORE_TYPED_SPAN,
+                mention_score(entities, &word, SCORE_TYPED_SPAN),
                 word.sentence,
                 None,
             ));
@@ -721,13 +760,22 @@ fn place_mentions(
                     .get(span_end - 1)
                     .map_or(word.end, |last| last.end);
                 let start = words.get(index).map_or(word.end, |first| first.start);
+                // The honorific IS the evidence that the span after it names a
+                // person, so the typing is the grammar's; how confident the mention
+                // is, is still the recogniser's where it placed a recognition on
+                // those characters.
+                let score = words
+                    .get(index)
+                    .map_or(SCORE_TYPED_SPAN, |first| {
+                        mention_score(entities, first, SCORE_TYPED_SPAN)
+                    });
                 found.push(Mention::new(
                     text,
                     start,
                     end,
                     Kind::ProperNoun,
                     "PERSON",
-                    SCORE_TYPED_SPAN,
+                    score,
                     word.sentence,
                     None,
                 ));
@@ -749,7 +797,7 @@ fn place_mentions(
                 word.end,
                 Kind::Pronoun,
                 entity_type,
-                SCORE_PRONOUN,
+                mention_score(entities, &word, SCORE_PRONOUN),
                 word.sentence,
                 Some(class),
             ));
@@ -762,7 +810,7 @@ fn place_mentions(
                         head.end,
                         Kind::CommonNoun,
                         "OTHER",
-                        SCORE_COMMON_NOUN,
+                        mention_score(entities, &head, SCORE_COMMON_NOUN),
                         head.sentence,
                         None,
                     ));
@@ -776,27 +824,59 @@ fn place_mentions(
         if is_span_word(&word) {
             let span_end = capitalised_span(text, words, index).unwrap_or(index + 1);
             let span = &words[index..span_end];
-            let span_start = word.start;
-            let span_last = span.last().map_or(word.end, |last| last.end);
-            // What the entity recogniser placed over these characters, when it placed
-            // anything: it read the WHOLE document, so where a name starts and ends is
-            // its answer rather than the capitalised run's — `Contact John Smith` is a
-            // mention of John Smith. A span it placed nothing on keeps the run's own
-            // extent and the cue typing.
-            let placed = placed_entity(entities, span_start, span_last);
-            let entity_type = placed
+            let run_start = word.start;
+            let run_end = span.last().map_or(word.end, |last| last.end);
+            // What the entity recogniser placed over this run, when it placed
+            // anything. It typed CHARACTERS, and its rules fire over the parts of a
+            // compound name independently, so a recognition is read as evidence about
+            // the name rather than as the name's extent:
+            //
+            // * the mention OPENS at the first word of the run a recognition reached.
+            //   A leading word none of them reached is not part of the name
+            //   ("Contact John Smith" is a mention of John Smith), and the recogniser
+            //   read the whole document, so that is its answer rather than the
+            //   capitalised run's.
+            // * the mention ENDS at the end of the run, or further out when a
+            //   recognition reaches past it (a date whose year sits outside the run of
+            //   name words). A recognition that stops inside the run does NOT cut the
+            //   name short, and the words after it do not open a mention of their own.
+            // * it is TYPED and SCORED by the recognition that reached the name's
+            //   first word: a compound name is written bearer first, so the part that
+            //   opens it is the part that says what is named, and the parts after it
+            //   qualify that.
+            //
+            // A run no recognition reached keeps its own extent and the cue typing.
+            let opening = span
+                .iter()
+                .find_map(|word| placed_entity(entities, word.start, word.end));
+            // The first word a recognition reached is where the name opens, so a
+            // recognition the recogniser read as starting before this run — already
+            // reported by the mention that run opened — cannot pull the mention back
+            // over it.
+            let begin = opening
                 .as_ref()
-                .map_or_else(|| proper_noun_type(span), |(_, typed)| *typed);
-            let mut begin = placed
-                .as_ref()
-                .map_or(word.start, |(span, _)| span.start);
-            let mut end = placed.as_ref().map_or(span_last, |(span, _)| span.end);
-            // A name the recogniser read as starting before this run is already
-            // reported by the mention that run opened.
-            if begin < word.start {
-                begin = word.start;
-                end = end.max(span_last);
+                .map_or(run_start, |(span, _, _)| span.start.max(run_start));
+            let mut end = run_end;
+            if let Some(reach) = entities
+                .iter()
+                .filter(|(span, _, _)| span.start < run_end && begin < span.end)
+                .map(|(span, _, _)| span.end)
+                .max()
+            {
+                end = end.max(reach);
             }
+            let (entity_type, score) = match opening.as_ref() {
+                Some((_, entity_type, confidence)) => (*entity_type, *confidence),
+                None => {
+                    let entity_type = proper_noun_type(span);
+                    let score = if entity_type == "OTHER" {
+                        SCORE_PROPER_NOUN
+                    } else {
+                        SCORE_TYPED_SPAN
+                    };
+                    (entity_type, score)
+                }
+            };
             let mut next = span_end;
             // A numeral right after a calendar name belongs to the date it dates.
             if entity_type == "DATE" {
@@ -814,11 +894,6 @@ fn place_mentions(
             while words.get(next).is_some_and(|word| word.start < end) {
                 next += 1;
             }
-            let score = if entity_type == "OTHER" {
-                SCORE_PROPER_NOUN
-            } else {
-                SCORE_TYPED_SPAN
-            };
             let mut mention = Mention::new(
                 text,
                 begin,
@@ -829,7 +904,7 @@ fn place_mentions(
                 word.sentence,
                 None,
             );
-            mention.typed = placed.is_some();
+            mention.typed = opening.is_some();
             found.push(mention);
             index = next;
             continue;
@@ -844,7 +919,7 @@ fn place_mentions(
                     head.end,
                     Kind::CommonNoun,
                     "OTHER",
-                    SCORE_COMMON_NOUN,
+                    mention_score(entities, &head, SCORE_COMMON_NOUN),
                     head.sentence,
                     None,
                 ));
@@ -861,7 +936,7 @@ fn place_mentions(
                 word.end,
                 Kind::CommonNoun,
                 "QUANTITY",
-                SCORE_TYPED_SPAN,
+                mention_score(entities, &word, SCORE_TYPED_SPAN),
                 word.sentence,
                 None,
             ));
@@ -876,7 +951,7 @@ fn place_mentions(
     // the document writes with no capital of its own (an e-mail address, an
     // identifier) is a target too, and the operation reports the sentiment directed
     // at it like any other.
-    for (span, entity_type) in entities {
+    for (span, entity_type, confidence) in entities {
         if found
             .iter()
             .any(|mention| mention.start < span.end && span.start < mention.end)
@@ -893,7 +968,7 @@ fn place_mentions(
             span.end,
             Kind::ProperNoun,
             entity_type,
-            SCORE_TYPED_SPAN,
+            *confidence,
             sentence,
             None,
         );
@@ -963,10 +1038,10 @@ fn most_recent(groups: &[Group], accept: impl Fn(&Group) -> bool) -> Option<usiz
 }
 
 /// Group the mentions that name one entity, and give every mention the `GroupScore`
-/// of the link that placed it.
+/// of the link that placed it. See [`LINK_SAME_FORM`].
 fn group_mentions(mentions: &[Mention]) -> (Vec<Group>, Vec<f32>) {
     let mut groups: Vec<Group> = Vec::new();
-    let mut group_scores = vec![GROUP_SCORE_SAME_FORM; mentions.len()];
+    let mut group_scores = vec![LINK_SAME_FORM; mentions.len()];
 
     for (order, mention) in mentions.iter().enumerate() {
         let canonical = normalise(&mention.text);
@@ -976,8 +1051,8 @@ fn group_mentions(mentions: &[Mention]) -> (Vec<Group>, Vec<f32>) {
         };
 
         match resolved {
-            Some((index, score)) => {
-                group_scores[order] = score;
+            Some((index, link)) => {
+                group_scores[order] = link;
                 let group = &mut groups[index];
                 group.mentions.push(order);
                 group.last_order = order;
@@ -1022,7 +1097,7 @@ fn group_mentions(mentions: &[Mention]) -> (Vec<Group>, Vec<f32>) {
     (groups, group_scores)
 }
 
-/// The group a pronoun refers into, with the confidence of that link.
+/// The group a pronoun refers into, with the confidence of that LINK.
 ///
 /// A pronoun whose referent is outside the document (the writer, the reader) joins
 /// the group its own class opened, so every `I` in a document is one entity. An
@@ -1039,7 +1114,7 @@ fn resolve_pronoun(
         PronounClass::Speaker | PronounClass::SpeakerGroup | PronounClass::Addressee => groups
             .iter()
             .position(|group| group.speaker == Some(class))
-            .map(|index| (index, GROUP_SCORE_SAME_FORM)),
+            .map(|index| (index, LINK_SAME_FORM)),
         PronounClass::PersonAnaphor | PronounClass::ThingAnaphor | PronounClass::PluralAnaphor => {
             let index = most_recent(groups, |group| {
                 group.speaker.is_none()
@@ -1055,14 +1130,14 @@ fn resolve_pronoun(
                     }
             })?;
             let distance = mention.sentence.saturating_sub(groups[index].last_sentence) as f32;
-            let score = (GROUP_SCORE_PRONOUN - GROUP_SCORE_DISTANCE_PENALTY * distance)
-                .clamp(GROUP_SCORE_FLOOR, GROUP_SCORE_PRONOUN);
-            Some((index, score))
+            let link =
+                (LINK_PRONOUN - LINK_DISTANCE_PENALTY * distance).clamp(LINK_FLOOR, LINK_PRONOUN);
+            Some((index, link))
         }
     }
 }
 
-/// The group a named mention joins, with the confidence of that link: the same
+/// The group a named mention joins, with the confidence of that LINK: the same
 /// surface form is the same entity, and a name sharing every word with a name
 /// already in the group is likely to be it.
 fn resolve_name(groups: &[Group], mention: &Mention, canonical: &str) -> Option<(usize, f32)> {
@@ -1073,7 +1148,7 @@ fn resolve_name(groups: &[Group], mention: &Mention, canonical: &str) -> Option<
     if let Some(index) = most_recent(groups, |group| {
         group.speaker.is_none() && group.canonical == canonical
     }) {
-        return Some((index, GROUP_SCORE_SAME_FORM));
+        return Some((index, LINK_SAME_FORM));
     }
     if mention.kind != Kind::ProperNoun {
         return None;
@@ -1093,7 +1168,7 @@ fn resolve_name(groups: &[Group], mention: &Mention, canonical: &str) -> Option<
                     .iter()
                     .all(|word| words.contains(word)))
     })?;
-    Some((index, GROUP_SCORE_PARTIAL_NAME))
+    Some((index, LINK_PARTIAL_NAME))
 }
 
 /// Whether a group still admits a name the recogniser typed: the two agree, or the
@@ -1194,7 +1269,7 @@ fn descriptive_mention_index(order: &[usize], mentions: &[Mention]) -> Vec<i32> 
 /// it, and the sentiment of the clause it sits in.
 fn analyse(text: &str) -> Vec<TargetedSentimentEntity> {
     let (words, sentences) = segment(text);
-    let entities = named_entity_types(text);
+    let entities = recognised_entities(text);
     let mentions = place_mentions(text, &words, &entities);
     let (groups, group_scores) = group_mentions(&mentions);
     let offsets = character_offsets(text);

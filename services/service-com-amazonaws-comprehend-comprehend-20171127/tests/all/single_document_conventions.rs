@@ -223,11 +223,22 @@ async fn sentiment_follows_how_much_of_the_document_carries_sentiment() {
             "case {case:?}: the four confidences are a distribution, so they sum to 1, \
              got {total} from {output}"
         );
+        // No reading the lexicon could have MISSED is impossible: `Positive`,
+        // `Negative` and `Neutral` stay strictly positive where the engine found no
+        // word for them. MIXED is not such a reading — it is the confidence the
+        // document carries BOTH polarities, measured from the two signed readings —
+        // so a document carrying at most one polarity reports it as the zero it
+        // measures.
         for (label, score) in &by_label {
             assert!(
-                *score > 0.0 && *score < 1.0,
-                "case {case:?}: expected SentimentScore.{label} strictly inside (0, 1), \
+                *score >= 0.0 && *score < 1.0,
+                "case {case:?}: expected SentimentScore.{label} inside [0, 1), \
                  got {score}"
+            );
+            assert!(
+                *label == "Mixed" || *score > 0.0,
+                "case {case:?}: expected SentimentScore.{label}, a reading the \
+                 document leaves open, above 0, got {score}"
             );
         }
         let winner = by_label
@@ -247,6 +258,27 @@ async fn sentiment_follows_how_much_of_the_document_carries_sentiment() {
             Some(*expected),
             "case {case:?}: expected {expected:?}, got {output}"
         );
+
+        let mixed = by_label
+            .iter()
+            .find(|(label, _)| *label == "Mixed")
+            .map_or(f64::NAN, |(_, score)| *score);
+        if *expected != "MIXED" {
+            // Every row but the balanced one carries at most one polarity, and MIXED
+            // is measured from the two signed readings, so it is reported as the zero
+            // it measures rather than at a floor of its own.
+            assert_eq!(
+                mixed, 0.0,
+                "case {case:?}: the document carries at most one polarity, so nothing \
+                 supports MIXED, got {output}"
+            );
+        } else {
+            assert!(
+                mixed > 0.0,
+                "case {case:?}: the document carries both polarities, so MIXED is \
+                 supported, got {output}"
+            );
+        }
 
         let neutral = by_label
             .iter()
@@ -587,8 +619,9 @@ async fn a_company_name_and_the_name_after_it_are_two_entities() {
 #[tokio::test]
 async fn targeted_sentiment_types_every_target_from_the_entity_recogniser() {
     let comprehend = Comprehend::new();
-    // One document naming a company, a product of it, a person, and a thing with no
-    // capital of its own — the four kinds of named target the rule generalises over.
+    // One document naming a company together with a product of its own, a person, and
+    // a thing with no capital of its own — the kinds of named target the rule
+    // generalises over.
     let text = "Amazon Comprehend reads the document. Contact John Smith at \
                 john.smith@example.com.";
     let output = comprehend
@@ -625,8 +658,11 @@ async fn targeted_sentiment_types_every_target_from_the_entity_recogniser() {
     }
 
     for (entity_type, value) in [
-        ("ORGANIZATION", "Amazon"),
-        ("COMMERCIAL_ITEM", "Comprehend"),
+        // One named mention, whole: the recogniser types "Amazon" and the product
+        // name beside it separately, which is its answer about those CHARACTERS, and
+        // the name the document writes is still one mention — typed by the part that
+        // says what is named.
+        ("ORGANIZATION", "Amazon Comprehend"),
         ("PERSON", "John Smith"),
         ("OTHER", "john.smith@example.com"),
     ] {
@@ -638,10 +674,18 @@ async fn targeted_sentiment_types_every_target_from_the_entity_recogniser() {
              {targets:?}"
         );
     }
+    // No part of a name is reported as a mention of its own.
+    for fragment in ["Amazon", "Comprehend", "John", "Smith"] {
+        assert!(
+            !targets.iter().any(|(_, target)| target == fragment),
+            "case \"named targets\": {fragment:?} is part of a name, so it is not a \
+             mention of its own, got {targets:?}"
+        );
+    }
 
     // Each target is its own entity: the e-mail address naming the person is not a
     // mention of the person, because the recogniser typed the two differently.
-    for value in ["Amazon", "Comprehend", "John Smith", "john.smith@example.com"] {
+    for value in ["Amazon Comprehend", "John Smith", "john.smith@example.com"] {
         let holders = entities
             .iter()
             .filter(|entity| {

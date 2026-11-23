@@ -183,21 +183,28 @@ const NEUTRAL_MATERIAL_WEIGHT: f64 = 0.3;
 /// document onto one reported value.
 const SENTIMENT_CONTRAST_EXPONENT: i32 = 6;
 
-/// The confidence each of the four modelled classes keeps whatever the document says.
+/// The confidence an OPEN reading keeps whatever the document says.
 ///
-/// `SentimentScore` is a distribution over four hypotheses, and no hypothesis about a
-/// natural-language document is impossible: a document the engine reads as wholly
-/// positive still leaves a little room for a negative reading the lexicon missed.
-/// This is that room — the prior mass each class carries before the document's own
-/// evidence is added, which is what keeps every member strictly positive instead of
-/// reporting a flat 0 for a class the engine found no word for.
+/// A reading is open when the document could carry it and the engine's lexicon could
+/// have missed the words that show it: `POSITIVE`, `NEGATIVE` and `NEUTRAL` are open
+/// for any document, since a document the engine reads as wholly positive still
+/// leaves a little room for a negative word the lexicon does not hold. This is that
+/// room, so a class the engine found no word for comes back as the negligible
+/// possibility it is rather than as a flat 0.
 ///
-/// It is the FLOOR of a reported confidence and not a share of one: a class the
-/// document carries any evidence at all for is reported with that evidence, which is
-/// far larger. So it is small enough that a class the engine found nothing for comes
-/// back as the negligible possibility it is, rather than as a reading a caller's
-/// threshold could pick up or as the one value a whole batch's unsupported classes
-/// share.
+/// `MIXED` is NOT such a reading, and keeps no floor: it is the confidence that the
+/// document carries BOTH polarities at once, which is measured from the two signed
+/// readings rather than read off the document on its own, so a document whose
+/// material carries at most one polarity supports it with nothing at all and it is
+/// reported as the zero it was measured as. The room a missed word leaves is already
+/// what the two signed readings keep below.
+///
+/// It is the FLOOR of a reported confidence and not a share of one, and is applied as
+/// one: an open reading the document carries no evidence for is reported at exactly
+/// this value — not at a value that depends on how many classes there are — and the
+/// room it takes is conceded by the reading the document's own material supports,
+/// which is the only one with anything to concede. A class the document carries any
+/// evidence at all for is reported with that evidence, which is far larger.
 const SENTIMENT_CLASS_PRIOR: f64 = 1e-6;
 
 /// Score `text` into Comprehend's four confidences plus the winning label.
@@ -225,9 +232,11 @@ const SENTIMENT_CLASS_PRIOR: f64 = 1e-6;
 ///    predominantly supports while keeping the four ordered exactly as the engine's
 ///    shares ordered them.
 ///
-/// Each class then keeps the [`SENTIMENT_CLASS_PRIOR`] every hypothesis holds, so no
-/// member is reported as a flat impossibility, and the verdict is the arg-max of the
-/// four the response carries.
+/// Each OPEN class then keeps the [`SENTIMENT_CLASS_PRIOR`] a reading the lexicon
+/// could have missed holds, conceded by the reading the document supports, so no open
+/// reading is reported as a flat impossibility and `MIXED` is reported as the zero it
+/// was measured as for a document carrying at most one polarity. The verdict is the
+/// arg-max of the four the response carries.
 ///
 /// Visible to the crate because `DetectTargetedSentiment` scores the clause each
 /// mention sits in through exactly this function, and `BatchDetectSentiment` scores
@@ -282,17 +291,42 @@ pub(crate) fn score_sentiment(text: &str) -> (String, SentimentScore) {
         [0.0, 0.0, 1.0, 0.0]
     };
 
-    // The prior every hypothesis keeps, which is also what renormalises the four
-    // back onto a distribution.
-    let smooth = |confidence: f64| {
-        (confidence + SENTIMENT_CLASS_PRIOR) / (1.0 + 4.0 * SENTIMENT_CLASS_PRIOR)
-    };
-    let (positive, negative, neutral, mixed) = (
-        smooth(positive),
-        smooth(negative),
-        smooth(neutral),
-        smooth(mixed),
-    );
+    // The floor every OPEN reading keeps ([`SENTIMENT_CLASS_PRIOR`]), raised on the
+    // three single-polarity readings and conceded by the reading the material
+    // supports, so the four still sum to 1. `MIXED` keeps no floor: it is measured
+    // from the two signed readings, and a text carrying at most one polarity
+    // measures it at zero.
+    let mut confidences = [positive, negative, neutral, mixed];
+    let floors = [
+        SENTIMENT_CLASS_PRIOR,
+        SENTIMENT_CLASS_PRIOR,
+        SENTIMENT_CLASS_PRIOR,
+        0.0,
+    ];
+    // The supported reading is the arg-max, taken as the LAST of equal readings
+    // because `ranked_labels` resolves a tie to the FIRST of them: the concession
+    // then comes out of the reading the tie-break does not name, so a tie stays
+    // resolved the way the engine's own shares resolved it. The verdict below is the
+    // arg-max of the four the response carries, whatever this does to them, so the
+    // label and the distribution cannot disagree.
+    let supported = (0..confidences.len())
+        .reduce(|best, candidate| {
+            if confidences[candidate] >= confidences[best] {
+                candidate
+            } else {
+                best
+            }
+        })
+        .unwrap_or_default();
+    let mut conceded = 0.0;
+    for index in 0..confidences.len() {
+        if index != supported && confidences[index] < floors[index] {
+            conceded += floors[index] - confidences[index];
+            confidences[index] = floors[index];
+        }
+    }
+    confidences[supported] -= conceded;
+    let [positive, negative, neutral, mixed] = confidences;
 
     // Arg-max over the four. `ranked_labels` is already in tie-break order and the
     // fold keeps the incumbent on a tie, so two equal confidences always resolve to
