@@ -358,7 +358,7 @@ fn rows() -> Vec<Row> {
                          requests per second",
             value: 10.0,
             unit: "None",
-            adjustable: true,
+            adjustable: false,
             description: None,
             period: None,
             metric: None,
@@ -388,7 +388,7 @@ fn rows() -> Vec<Row> {
         Row {
             service_code: "chime",
             quota_code: "L-B6F2C623",
-            quota_name: "SIP trunking and voice - calls per second (CPS)",
+            quota_name: "Amazon Chime SDK SIP trunking and voice - calls per second (CPS)",
             value: 1.0,
             unit: "None",
             adjustable: true,

@@ -3243,6 +3243,13 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             ],
         ),
         service(
+            // The serverless plane of Managed Workflows for Apache Airflow, which is a
+            // service code of its own beside `airflow` and publishes its own quotas.
+            "airflow-serverless",
+            "Amazon MWAA Serverless (airflow-serverless)",
+            airflow_serverless_quotas(),
+        ),
+        service(
             "amplify",
             "AWS Amplify",
             vec![

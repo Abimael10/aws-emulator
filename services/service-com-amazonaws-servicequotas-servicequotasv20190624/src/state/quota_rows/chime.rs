@@ -32,16 +32,25 @@ fn chime_api_burst_rate(code: &str, api_name: &str, requests: f64) -> QuotaRow {
 pub(in crate::state) fn chime_quotas() -> Vec<QuotaRow> {
     vec![
         chime_api_burst_rate("L-398B2BD6", "DeleteAttendee", 20.0),
-        // The VOICE plane, published as calls per second rather than as a count.
-        quota("SIP trunking and voice - calls per second (CPS)", 1.0).code("L-B6F2C623"),
+        // The VOICE plane, published as calls per second rather than as a count. Its
+        // published name states the SDK the plane belongs to the way the meetings row
+        // below does: a row carries the name AWS publishes under its own code, prefix
+        // included, rather than the shorter phrase that names the plane.
+        quota(
+            "Amazon Chime SDK SIP trunking and voice - calls per second (CPS)",
+            1.0,
+        )
+        .code("L-B6F2C623"),
         // The meetings plane's management rate, published across every meeting
-        // management API rather than per operation.
+        // management API rather than per operation, and published as NOT adjustable
+        // where the voice plane's rate above is adjustable.
         quota(
             "Amazon Chime SDK meetings - All meeting management API rate in requests \
              per second",
             10.0,
         )
-        .code("L-F147F728"),
+        .code("L-F147F728")
+        .fixed(),
         chime_api_burst_rate("L-FE9F896D", "CreateMeeting", 20.0),
     ]
 }
