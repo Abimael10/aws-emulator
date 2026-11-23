@@ -31,6 +31,7 @@ pub use pagination::*;
 pub use publishing::*;
 pub use resource_policies::*;
 pub use subscribers::*;
+pub use tags::*;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, SystemTime};
