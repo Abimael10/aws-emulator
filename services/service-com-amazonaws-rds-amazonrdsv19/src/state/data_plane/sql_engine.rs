@@ -988,6 +988,10 @@ impl InstanceDatabase {
             }
             let empty = std::collections::BTreeSet::new();
             let rows = closed.changed.get(name).unwrap_or(&empty);
+            // Which of them the transaction CREATED, which its commit adds to the shared
+            // database rather than installs over
+            // ([`session_transactions::apply_rows`]).
+            let created = closed.created.get(name).unwrap_or(&empty);
             let live = connection(
                 &mut databases,
                 &self.view,
@@ -1020,7 +1024,7 @@ impl InstanceDatabase {
                             .filter(|(table, _)| !redeclared.contains(table))
                             .cloned()
                             .collect();
-                        session_transactions::apply_rows(live, copy, &rest, deadline)
+                        session_transactions::apply_rows(live, copy, &rest, created, deadline)
                     });
                 // The bound is removed once the commit is over. The next statement on this
                 // connection installs its own, so a failure to remove this one cannot leave
@@ -2158,7 +2162,7 @@ fn value_type(value: ValueRef<'_>) -> Option<&'static str> {
 }
 
 /// Classify what the engine refused, keeping ITS message.
-fn from_engine(error: rusqlite::Error) -> EngineError {
+pub(super) fn from_engine(error: rusqlite::Error) -> EngineError {
     // A statement the engine could not READ at all arrives as its own variant, carrying
     // the engine's bare message and where in the statement it stopped — which is what a
     // wire needs to word its own parse error. Classified by the failure inside it, so it

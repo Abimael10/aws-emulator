@@ -32,16 +32,22 @@
 //! * what a commit carries over is the ROWS it changed and the SCHEMA CHANGES it made
 //!   ([`apply_schema`]) — its own delta against the schema its copy declared when the copy
 //!   was taken, so an object the transaction never touched is left exactly as the shared
-//!   database holds it; a row another transaction inserted at the same engine row id in the
-//!   same table between the snapshot and the commit is one this cannot distinguish from its
-//!   own.
+//!   database holds it.
+//!
+//! A row the transaction CREATED is ADDED to the shared database rather than put in the place
+//! of whatever that database now holds at the same engine row id: the row id of a new row is
+//! the engine's to assign, so another writer may well have given it to a row of its own since
+//! the snapshot, and a commit that replaced that row would drop a write nobody rolled back.
+//! Only a row the transaction found at the snapshot is replaced in place, which is what
+//! changing it means ([`apply_rows`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
+use rusqlite::hooks::Action;
 use rusqlite::types::Value;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use super::sql_engine::{EngineError, EngineErrorKind};
 
@@ -130,6 +136,12 @@ struct Transactions {
 struct Transaction {
     /// The rows it has changed, by database.
     changed: BTreeMap<String, BTreeSet<ChangedRow>>,
+    /// Which of those rows it CREATED: the ones the engine first reported as an INSERT, so
+    /// its copy of the database held no row at that row id when the transaction first
+    /// touched it — and neither did the snapshot that copy is. Its commit ADDS them
+    /// ([`apply_rows`]) instead of taking the place of whatever the shared database holds
+    /// at the same row id now.
+    created: BTreeMap<String, BTreeSet<ChangedRow>>,
     /// The databases it holds its own copy of: the names the engine keeps those copies
     /// under ([`super::sql_engine`]), which is where its statements run, each with the
     /// SCHEMA that copy declared when it was taken.
@@ -154,6 +166,7 @@ struct Transaction {
 #[derive(Debug, Default)]
 pub struct ClosedTransaction {
     pub changed: BTreeMap<String, BTreeSet<ChangedRow>>,
+    pub created: BTreeMap<String, BTreeSet<ChangedRow>>,
     pub copies: BTreeMap<String, SchemaObjects>,
     pub read: BTreeSet<Relation>,
     pub overflowed: bool,
@@ -251,6 +264,7 @@ impl OpenTransactions {
             state.rows = state.rows.saturating_sub(open.rows);
             ClosedTransaction {
                 changed: open.changed,
+                created: open.created,
                 copies: open.copies,
                 read: open.read,
                 overflowed: open.overflowed,
@@ -357,37 +371,72 @@ impl OpenTransactions {
         database: &str,
         rows: impl IntoIterator<Item = ChangedRow>,
     ) {
+        self.note(session, database, rows, false);
+    }
+
+    /// Record the rows `rows` of `database` as changed by whichever transaction is
+    /// recording, `inserted` saying whether the engine reported them as rows an `INSERT`
+    /// put in — the rows the transaction CREATED, which its commit adds rather than
+    /// installs over ([`Transaction::created`]).
+    pub fn note_rows(
+        &self,
+        database: &str,
+        rows: impl IntoIterator<Item = ChangedRow>,
+        inserted: bool,
+    ) {
+        let session = self.state().recording;
+        if let Some(session) = session {
+            self.note(session, database, rows, inserted);
+        }
+    }
+
+    /// The one place a changed row is recorded, whichever of the two above asked for it.
+    ///
+    /// A row is CREATED where the engine reported an `INSERT` the FIRST time this
+    /// transaction touched it: at that moment its copy held no row at that row id, so the
+    /// snapshot the copy is held none either. A row it deleted or updated first is a row of
+    /// the snapshot's however the transaction left it afterwards.
+    fn note(
+        &self,
+        session: u32,
+        database: &str,
+        rows: impl IntoIterator<Item = ChangedRow>,
+        inserted: bool,
+    ) {
         let mut state = self.state();
         let endpoint_rows = state.rows;
         let Some(open) = state.open.get_mut(&session) else {
             return;
         };
+        let own_rows = open.rows;
         let changed = open.changed.entry(database.to_string()).or_default();
         let mut added = 0usize;
         let mut overflowed = false;
+        let mut created = BTreeSet::new();
         for row in rows {
-            let at_its_own_ceiling = open.rows + added >= MAX_UNCOMMITTED_ROWS;
+            let at_its_own_ceiling = own_rows + added >= MAX_UNCOMMITTED_ROWS;
             let at_the_endpoints = endpoint_rows + added >= MAX_UNCOMMITTED_ROWS_PER_ENDPOINT;
             if (at_its_own_ceiling || at_the_endpoints) && !changed.contains(&row) {
                 overflowed = true;
                 break;
             }
-            if changed.insert(row) {
+            if !changed.contains(&row) {
+                if inserted {
+                    created.insert(row.clone());
+                }
+                changed.insert(row);
                 added += 1;
             }
+        }
+        if !created.is_empty() {
+            open.created
+                .entry(database.to_string())
+                .or_default()
+                .extend(created);
         }
         open.rows += added;
         open.overflowed = open.overflowed || overflowed;
         state.rows = endpoint_rows.saturating_add(added);
-    }
-
-    /// Record the rows `rows` of `database` as changed by whichever transaction is
-    /// recording.
-    pub fn note_rows(&self, database: &str, rows: impl IntoIterator<Item = ChangedRow>) {
-        let session = self.state().recording;
-        if let Some(session) = session {
-            self.note_rows_for(session, database, rows);
-        }
     }
 }
 
@@ -407,22 +456,36 @@ pub fn record_changes_of(
     let transactions = Arc::clone(transactions);
     let database = database.to_string();
     conn.update_hook(Some(
-        move |_action, _schema: &str, table: &str, rowid: i64| {
-            transactions.note_rows(&database, [(table.to_string(), rowid)]);
+        move |action, _schema: &str, table: &str, rowid: i64| {
+            transactions.note_rows(
+                &database,
+                [(table.to_string(), rowid)],
+                matches!(action, Action::SQLITE_INSERT),
+            );
         },
     ))
 }
 
-/// Make the rows `rows` of the shared database `live` what `source` holds for them.
+/// Carry the rows `rows` of the committing transaction over into the shared database `live`.
 ///
-/// What a COMMIT carries over: `source` is the committing transaction's own copy of the
-/// database, so for every row it changed, the shared database ends up holding the value that
-/// copy holds — the row as the transaction left it, or no row at all where it deleted one.
+/// `source` is the transaction's own copy of the database, so for every row it CHANGED — one
+/// its copy, and therefore the snapshot, already held — the shared database ends up holding
+/// the value that copy holds: the row as the transaction left it, or no row at all where it
+/// deleted one.
 ///
-/// Two passes, because a row's old value can be the value another of these rows holds now:
-/// every one of them is removed first, then the ones `source` holds are put in. It runs as
-/// ONE engine transaction with the foreign-key checks deferred to its end, so a row that is
-/// the parent of another need not be the first one in.
+/// A row in `created` is one the transaction itself made, at a row id the engine assigned in
+/// its own copy. It is ADDED here: the shared database may have given that row id to a row of
+/// another writer's since the snapshot, and such a row is not this transaction's to remove, so
+/// nothing is deleted for a created row and one whose row id is taken is inserted wherever the
+/// engine puts it — exactly as it would have been had it been inserted here in the first
+/// place. Where the row id is the client's own value (a declared `INTEGER PRIMARY KEY`), the
+/// insert carries it, so two writers' rows of the same key meet the engine's own unique
+/// violation instead of one of them being dropped.
+///
+/// Two passes over the CHANGED rows, because a row's old value can be the value another of
+/// them holds now: every one of them is removed first, then the ones `source` holds are put
+/// in. It runs as ONE engine transaction with the foreign-key checks deferred to its end, so a
+/// row that is the parent of another need not be the first one in.
 ///
 /// Bounded by `deadline`, which the caller also installed on the engine itself: it gives up —
 /// leaving the engine transaction rolled back — rather than running past the budget a commit
@@ -435,6 +498,7 @@ pub fn apply_rows(
     live: &Connection,
     source: &Connection,
     rows: &BTreeSet<ChangedRow>,
+    created: &BTreeSet<ChangedRow>,
     deadline: Instant,
 ) -> Result<(), EngineError> {
     if rows.is_empty() {
@@ -446,7 +510,7 @@ pub fn apply_rows(
     }
     live.execute_batch("BEGIN; PRAGMA defer_foreign_keys = 1")
         .map_err(internal)?;
-    match restore_each(live, source, &by_table, deadline) {
+    match restore_each(live, source, &by_table, created, deadline) {
         Ok(()) => live.execute_batch("COMMIT").map_err(internal),
         Err(error) => {
             let _ = live.execute_batch("ROLLBACK");
@@ -671,6 +735,7 @@ fn restore_each(
     live: &Connection,
     before: &Connection,
     by_table: &BTreeMap<&str, Vec<i64>>,
+    created: &BTreeSet<ChangedRow>,
     deadline: Instant,
 ) -> Result<(), EngineError> {
     for (table, rowids) in by_table {
@@ -680,7 +745,17 @@ fn restore_each(
         }
         let quoted_table = quoted(table);
         let images = row_images(before, &quoted_table, &columns, rowids, deadline)?;
+        // Which of this table's rows the transaction CREATED: they stand for no row of the
+        // shared database, so the first pass passes over them.
+        let own: BTreeSet<i64> = rowids
+            .iter()
+            .copied()
+            .filter(|rowid| created.contains(&((*table).to_string(), *rowid)))
+            .collect();
         for rowid in rowids {
+            if own.contains(rowid) {
+                continue;
+            }
             out_of_time(deadline)?;
             live.execute(
                 &format!("DELETE FROM {quoted_table} WHERE rowid = ?1"),
@@ -699,8 +774,21 @@ fn restore_each(
             names.join(", "),
             placeholders.join(", ")
         );
+        // The same row without its row id, for a created row whose row id the shared
+        // database has since given to another writer's row: the engine assigns this one's,
+        // which is what it does for every new row.
+        let added = format!(
+            "INSERT INTO {quoted_table} ({}) VALUES ({})",
+            names[1..].join(", "),
+            placeholders[..columns.len()].join(", ")
+        );
         for (rowid, values) in images {
             out_of_time(deadline)?;
+            if own.contains(&rowid) && holds_a_row_at(live, &quoted_table, rowid)? {
+                live.execute(&added, rusqlite::params_from_iter(values))
+                    .map_err(super::sql_engine::from_engine)?;
+                continue;
+            }
             let mut bound: Vec<Value> = vec![Value::Integer(rowid)];
             bound.extend(values);
             live.execute(&statement, rusqlite::params_from_iter(bound))
@@ -708,6 +796,24 @@ fn restore_each(
         }
     }
     Ok(())
+}
+
+/// Whether the shared database holds a row at `rowid` of `quoted_table` — which is what
+/// decides whether a row the committing transaction created can keep the row id its own copy
+/// gave it.
+fn holds_a_row_at(
+    live: &Connection,
+    quoted_table: &str,
+    rowid: i64,
+) -> Result<bool, EngineError> {
+    live.query_row(
+        &format!("SELECT 1 FROM {quoted_table} WHERE rowid = ?1"),
+        [rowid],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|found| found.is_some())
+    .map_err(internal)
 }
 
 /// Whether the commit's budget has run out, as the error that says so.

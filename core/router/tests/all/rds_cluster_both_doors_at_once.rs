@@ -13,7 +13,11 @@
 //! reads back of what the OTHER door committed, one statement at a time. This one pins what
 //! happens when the two doors are in flight TOGETHER — which is the case a client reaches as
 //! soon as two of its own processes are, and the case whose outcome used to depend on how the
-//! host happened to interleave them.
+//! host happened to interleave them. The meeting a racing round can land on — one door's
+//! commit arriving while the other door holds a transaction open over the same table — is
+//! driven in a FIXED order, one statement at a time, by
+//! [`crate::rds_cluster_commit_adds_to_the_other_doors_rows`], so that outcome is pinned
+//! whatever the host does with these rounds.
 //!
 //! The rows span what the rule generalises over: WHICH door writes, whether the other door
 //! reads the very table being written or writes it as well, whether it writes a different
