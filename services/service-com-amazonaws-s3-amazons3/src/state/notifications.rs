@@ -1948,6 +1948,44 @@ const SOURCE_ARN_KEY: &str = "aws:SourceArn";
 /// it by.
 const SOURCE_ACCOUNT_KEY: &str = "aws:SourceAccount";
 
+/// The condition keys the publication ANSWERS FOR, and so the keys this decision declares as
+/// ones it models: the bucket the notification is published for, the account that owns that
+/// bucket, and the transport the publication is made over.
+///
+/// One list beside the one context that fills it ([`publication_context`]), so a key the
+/// publication supplies a value for is a key a clause over it can be decided by.
+const PUBLICATION_CONDITION_KEYS: &[&str] = &[
+    SOURCE_ARN_KEY,
+    SOURCE_ACCOUNT_KEY,
+    super::refusals::SECURE_TRANSPORT_KEY,
+];
+
+/// The condition context the publication carries: a value for each of
+/// [`PUBLICATION_CONDITION_KEYS`].
+///
+/// `aws:SourceAccount` is the account that OWNS the publishing bucket, which here is the one
+/// account this emulator serves ([`::engine::emulator_account_id`]) — the same account every
+/// bucket's owner is reported as. A deployment where bucket ownership varies reads the owner
+/// off the bucket's own record instead, and this is the seam that changes.
+///
+/// `aws:SecureTransport` is "whether the request was sent using SSL" (AWS General Reference,
+/// *Global condition context keys*), which this publication knows about itself: it is made
+/// over the same encrypted transport every endpoint of this emulator serves, exactly as the
+/// gate over a request S3 SERVES answers that key ([`super::refusals::SECURE_TRANSPORT_KEY`]).
+fn publication_context(bucket: &str) -> Vec<(String, String)> {
+    vec![
+        (SOURCE_ARN_KEY.to_string(), bucket_arn(bucket)),
+        (
+            SOURCE_ACCOUNT_KEY.to_string(),
+            ::engine::emulator_account_id().to_string(),
+        ),
+        (
+            super::refusals::SECURE_TRANSPORT_KEY.to_string(),
+            super::refusals::SECURE_TRANSPORT_VALUE.to_string(),
+        ),
+    ]
+}
+
 /// Whether `document`, the resource policy of one destination, allows the Amazon S3 service
 /// principal to perform `action` on `resource` for a notification published by `bucket`.
 ///
@@ -1956,27 +1994,25 @@ const SOURCE_ACCOUNT_KEY: &str = "aws:SourceAccount";
 /// it? — and only the action and the resource differ ([`SEND_MESSAGE_ACTION`],
 /// [`PUBLISH_ACTION`], [`INVOKE_FUNCTION_ACTION`]). The decision is
 /// [`::service_common::iam_authorization`]'s, so a document this reads and the same document
-/// read by the service that owns it cannot disagree; the two condition keys such a grant is
-/// narrowed by travel as the request's context, and are declared as keys this request MODELS
-/// because it carries a value for each.
+/// read by the service that owns it cannot disagree.
 ///
-/// `aws:SourceAccount` is the account that OWNS the publishing bucket, which here is the one
-/// account this emulator serves ([`::engine::emulator_account_id`]) — the same account
-/// every bucket's owner is reported as. A deployment where bucket ownership varies reads
-/// the owner off the bucket's own record instead, and this is the seam that changes.
+/// It is the decision about the request THE PUBLICATION ITSELF MAKES, so it carries a value
+/// for every condition key that request answers for and declares each of them as a key it
+/// models ([`PUBLICATION_CONDITION_KEYS`], filled by [`publication_context`]). That is what
+/// makes a statement conditioned on one of those keys DECIDED rather than undecided — and an
+/// undecided statement grants nothing while an undecided `Deny` still refuses (the shared
+/// evaluator's fail-closed reading). The guardrail AWS publishes for a resource that requires
+/// encrypted transport — a `Deny` of every principal whose request did not arrive over SSL —
+/// is such a statement, and it is about no publication this emulator makes, so a destination
+/// carrying it beside the grant is published to rather than refused. A clause over a key the
+/// publication answers nothing for keeps the fail-closed reading.
 fn destination_granted(document: &str, action: &str, resource: &str, bucket: &str) -> bool {
     let principals = [S3_SERVICE_PRINCIPAL.to_string()];
-    let context = [
-        (SOURCE_ARN_KEY.to_string(), bucket_arn(bucket)),
-        (
-            SOURCE_ACCOUNT_KEY.to_string(),
-            ::engine::emulator_account_id().to_string(),
-        ),
-    ];
+    let context = publication_context(bucket);
     let request =
         ::service_common::iam_authorization::Request::new(action, resource, &principals)
             .with_context(&context)
-            .with_published_keys(&[SOURCE_ARN_KEY, SOURCE_ACCOUNT_KEY]);
+            .with_published_keys(PUBLICATION_CONDITION_KEYS);
     ::service_common::iam_authorization::resource_decision(document, &request)
         == ::service_common::iam_authorization::Decision::Allowed
 }
