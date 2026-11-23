@@ -62,7 +62,8 @@ const ASSET_MANAGEMENT_ID: &str = "d4msesd9vvmzmmuvlv06m92uq";
 ///
 /// The ARN SET of each row is the rule under test, and every identifier below is the
 /// catalog's own. A row's `Name` values are the names the catalog publishes where this crate
-/// has the publication's wording for them — "Asset performance management", "Asset
+/// has the publication's wording for them — "Asset acquisition", "Asset deployment", "Asset
+/// retirement and disposition", "Asset performance management", "Asset
 /// maintenance scheduling", "Change request and approval", "Change deployment and
 /// automation", "Asset valuation", "Asset sensitivity", "Asset criticality", "Inventory of
 /// authorized assets and automated discovery" and "Asset inventory reconciliation and audit"
@@ -71,6 +72,23 @@ const ASSET_MANAGEMENT_ID: &str = "d4msesd9vvmzmmuvlv06m92uq";
 /// pins the catalog against its own table rather than against the publication, which is why
 /// the set, paging and filtered-versus-unfiltered assertions are what carry this suite.
 const PUBLISHED_OBJECTIVES: &[PublishedObjective] = &[
+    PublishedObjective {
+        identifier: "5ve4jodybrg8wnky75fp50sbf",
+        name: "Asset lifecycle management",
+        domain_identifier: ASSET_MANAGEMENT_ID,
+        domain_name: ASSET_MANAGEMENT,
+        // One common control per stage of the lifecycle this objective's published
+        // paragraph enumerates: acquisition, deployment, use and retirement.
+        common_controls: &[
+            ("aaaq1vhzpslfrk1o4hvgk3ti4", "Asset acquisition"),
+            ("eboqkjlzo44e0ia5wba1770tw", "Asset deployment"),
+            ("76akwzuoa1j6cxqfsorr12e9k", "Asset use"),
+            (
+                "bme9uq29isv0jdrdy4yj2c702",
+                "Asset retirement and disposition",
+            ),
+        ],
+    },
     PublishedObjective {
         identifier: "3frxxgl64u9kzttiuheywykf7",
         name: "Asset maintenance",

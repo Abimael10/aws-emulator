@@ -172,7 +172,7 @@ pub(super) const PUBLISHED_ONTOLOGY: &[DomainSeed] = &[
             (
                 "asset-maintenance",
                 "Asset maintenance",
-                "Maintain, repair and retire assets under controlled conditions, so that neither service nor data is put at risk.",
+                "This control objective focuses on maintaining the availability and integrity of assets, including performance management, regular maintenance, and repairs to protect and extract the maximum value of the organization's IT investments.",
                 &[
                     (
                         "asset-performance-management",
@@ -189,34 +189,68 @@ pub(super) const PUBLISHED_ONTOLOGY: &[DomainSeed] = &[
             // The catalog publishes the lifecycle of an asset as an OBJECTIVE of its own,
             // beside inventory, classification and maintenance (its published ARN is
             // recorded in PUBLISHED_CATALOG_IDENTIFIERS below), met by the common controls
-            // that govern an asset at each stage it passes through. Its published wording
-            // is not recorded here, so — like the entries beside it whose wording this
-            // crate does not have — its description is the library's subject written in
-            // this table's own terser voice, not the library's paragraph.
+            // that govern an asset at each stage it passes through.
             (
                 "asset-lifecycle-management",
                 "Asset lifecycle management",
-                "Manage each asset through the stages of its lifecycle, from acquisition and deployment to reuse, retirement and disposal.",
+                "This control objective focuses on managing assets throughout their entire lifecycle, including acquisition, deployment, use, and retirement. This helps manage risks associated with asset costs by ensuring optimum asset productivity, performance, efficiency, and profitability.",
                 &[
-                    // The common controls published under this objective are not recorded
-                    // here either: these three are its subject written in this table's own
-                    // voice, and they carry the minted fallback identifier every unrecorded
-                    // entry does, so that the walk down from the objective resolves at all
-                    // (see the module header).
+                    // The set published under this objective is one stage of that lifecycle
+                    // each — acquisition, deployment, use and retirement, as the objective's
+                    // published paragraph above enumerates them — and every entry's
+                    // published identifier is recorded in PUBLISHED_CATALOG_IDENTIFIERS
+                    // below. Only the `asset-use` entry's published wording is not recorded
+                    // here, so — like the entries beside it whose wording this crate does not
+                    // have — its name and description are the library's subject written in
+                    // this table's own voice.
                     (
-                        "asset-acquisition-authorization",
-                        "Asset acquisition authorization",
-                        "Authorize and record the acquisition of an asset before it enters the environment, and record it in the inventory as it does.",
+                        "asset-acquisition",
+                        "Asset acquisition",
+                        "Assess potential security and compliance risks as part of the asset acquisition process.",
                     ),
                     (
-                        "asset-deployment-baseline",
-                        "Asset deployment baseline",
-                        "Bring an asset into service against the configuration baseline defined for its kind, and record the baseline it was deployed against.",
+                        "asset-deployment",
+                        "Asset deployment",
+                        "Configure assets securely prior to deployment in the environment. Confirm the proper integration of new assets with existing systems.",
                     ),
                     (
-                        "asset-reuse-and-disposal-sanitization",
-                        "Asset reuse and disposal sanitization",
-                        "Remove the data an asset holds before it is reused or disposed of, and record what was removed and how.",
+                        "asset-use",
+                        "Asset use",
+                        "Govern the use an asset is put to while it is in service, and the conditions it may be used under.",
+                    ),
+                    (
+                        "asset-retirement-and-disposition",
+                        "Asset retirement and disposition",
+                        "Retire and dispose of assets, including media, that are no longer needed. Securely erase or destroy any sensitive data before asset disposal.",
+                    ),
+                ],
+            ),
+            // The catalog publishes the loss of an asset — preventing it, responding to it
+            // and recovering from it — as an OBJECTIVE of its own (its published ARN is
+            // recorded in PUBLISHED_CATALOG_IDENTIFIERS below). Its published common-control
+            // set is not recorded here, so the three entries below are its subject written in
+            // this table's own voice, carrying the minted fallback identifier every
+            // unrecorded entry does, so that the walk down from the objective resolves at all
+            // (see the module header).
+            (
+                "asset-loss-prevention-response-and-recovery",
+                "Asset loss prevention, response, and recovery",
+                "This control objective focuses on preventing asset loss, and responding to and recovering lost, stolen, or damaged assets to contribute to the organization's profitability by reducing losses.",
+                &[
+                    (
+                        "asset-loss-prevention",
+                        "Asset loss prevention",
+                        "Protect assets against loss, theft and damage while they are in the organization's custody.",
+                    ),
+                    (
+                        "asset-loss-reporting-and-response",
+                        "Asset loss reporting and response",
+                        "Report a lost, stolen or damaged asset as soon as the loss is noticed, and act on the exposure it created.",
+                    ),
+                    (
+                        "asset-recovery",
+                        "Asset recovery",
+                        "Recover a lost, stolen or damaged asset where it can be recovered, and record what the recovery restored.",
                     ),
                 ],
             ),
@@ -1305,6 +1339,11 @@ const PUBLISHED_CATALOG_IDENTIFIERS: &[(&str, &str, &str)] = &[
         "asset-lifecycle-management",
         "5ve4jodybrg8wnky75fp50sbf",
     ),
+    (
+        OBJECTIVE,
+        "asset-loss-prevention-response-and-recovery",
+        "ags5wgkyvwriix77zegtwhyo9",
+    ),
     (OBJECTIVE, "change-management", "14qj3s9axkdma059lhktc14dx"),
     // The common controls published under the `asset-inventory-management` objective.
     (
@@ -1355,6 +1394,19 @@ const PUBLISHED_CATALOG_IDENTIFIERS: &[(&str, &str, &str)] = &[
         COMMON_CONTROL,
         "asset-classification-review",
         "gr180qll01cux9k41amnf002",
+    ),
+    // The common controls published under the `asset-lifecycle-management` objective.
+    (
+        COMMON_CONTROL,
+        "asset-acquisition",
+        "aaaq1vhzpslfrk1o4hvgk3ti4",
+    ),
+    (COMMON_CONTROL, "asset-deployment", "eboqkjlzo44e0ia5wba1770tw"),
+    (COMMON_CONTROL, "asset-use", "76akwzuoa1j6cxqfsorr12e9k"),
+    (
+        COMMON_CONTROL,
+        "asset-retirement-and-disposition",
+        "bme9uq29isv0jdrdy4yj2c702",
     ),
     // The common controls published under the `asset-maintenance` objective.
     (

@@ -144,14 +144,34 @@ const PUBLISHED_ENTRIES: &[PublishedEntry] = &[
         identifier: "3frxxgl64u9kzttiuheywykf7",
         name: "Asset maintenance",
         domain: Some(ASSET_MANAGEMENT),
-        description: None,
+        description: Some(
+            "This control objective focuses on maintaining the availability and integrity \
+             of assets, including performance management, regular maintenance, and repairs \
+             to protect and extract the maximum value of the organization's IT investments.",
+        ),
     },
     PublishedEntry {
         kind: OBJECTIVE,
         identifier: "5ve4jodybrg8wnky75fp50sbf",
         name: "Asset lifecycle management",
         domain: Some(ASSET_MANAGEMENT),
-        description: None,
+        description: Some(
+            "This control objective focuses on managing assets throughout their entire \
+             lifecycle, including acquisition, deployment, use, and retirement. This helps \
+             manage risks associated with asset costs by ensuring optimum asset \
+             productivity, performance, efficiency, and profitability.",
+        ),
+    },
+    PublishedEntry {
+        kind: OBJECTIVE,
+        identifier: "ags5wgkyvwriix77zegtwhyo9",
+        name: "Asset loss prevention, response, and recovery",
+        domain: Some(ASSET_MANAGEMENT),
+        description: Some(
+            "This control objective focuses on preventing asset loss, and responding to \
+             and recovering lost, stolen, or damaged assets to contribute to the \
+             organization's profitability by reducing losses.",
+        ),
     },
     PublishedEntry {
         kind: OBJECTIVE,
