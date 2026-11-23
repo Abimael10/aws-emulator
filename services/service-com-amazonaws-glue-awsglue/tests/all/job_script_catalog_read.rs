@@ -319,6 +319,10 @@ struct Layout {
     /// The records the frame must hold, as the script renders each, or an empty list for a
     /// row that only counts.
     records: Vec<String>,
+    /// The names the RECORDS named beyond the columns the table declares, which the frame's
+    /// schema then carries after them: a JSON document's own fields are content the objects
+    /// hold, so a record carrying one is reported under a column for it.
+    named: Vec<&'static str>,
 }
 
 /// The rows: one per layout a table declares its data in, and one per amount of data.
@@ -341,6 +345,7 @@ fn layouts() -> Vec<Layout> {
                 "{\"amount\": 0.25, \"city\": \"Oslo\", \"id\": 3}".to_string(),
                 "{\"amount\": 20.0, \"city\": \"Lisbon\", \"id\": 2}".to_string(),
             ],
+            named: Vec::new(),
         },
         Layout {
             case: "delimited text with no header line at all, holding one row",
@@ -350,6 +355,7 @@ fn layouts() -> Vec<Layout> {
             objects: vec![("part-0.csv", csv_headerless.to_string())],
             rows: 1,
             records: vec!["{\"amount\": 1.5, \"city\": \"Rome\", \"id\": 7}".to_string()],
+            named: Vec::new(),
         },
         Layout {
             case: "text delimited by something other than a comma",
@@ -362,6 +368,7 @@ fn layouts() -> Vec<Layout> {
                 "{\"amount\": 3.0, \"city\": \"Sofia\", \"id\": 4}".to_string(),
                 "{\"amount\": 4.5, \"city\": \"Riga\", \"id\": 5}".to_string(),
             ],
+            named: Vec::new(),
         },
         Layout {
             case: "one JSON document per line",
@@ -374,6 +381,27 @@ fn layouts() -> Vec<Layout> {
                 "{\"amount\": 9.5, \"city\": \"Porto\", \"id\": 8}".to_string(),
                 "{\"amount\": 2.0, \"city\": \"Vienna\", \"id\": 9}".to_string(),
             ],
+            named: Vec::new(),
+        },
+        Layout {
+            // A JSON document is self-describing, so a field the table does not declare is
+            // still a field the record holds — and the read admits it under the same width
+            // bound the declared columns are checked against.
+            case: "JSON documents carrying a field the table declares no column for",
+            name: "json-undeclared",
+            parameters: json!({ "classification": "json" }),
+            serde_parameters: json!({}),
+            objects: vec![(
+                "part-0.json",
+                "{\"id\": 10, \"city\": \"Ghent\", \"amount\": 1, \"note\": \"late\"}\n"
+                    .to_string(),
+            )],
+            rows: 1,
+            records: vec![
+                "{\"amount\": 1.0, \"city\": \"Ghent\", \"id\": 10, \"note\": \"late\"}"
+                    .to_string(),
+            ],
+            named: vec!["note"],
         },
         Layout {
             case: "a table whose location holds no data object at all",
@@ -383,6 +411,7 @@ fn layouts() -> Vec<Layout> {
             objects: Vec::new(),
             rows: 0,
             records: Vec::new(),
+            named: Vec::new(),
         },
         Layout {
             case: "data spread over two objects, beside the marker a writer left",
@@ -399,6 +428,7 @@ fn layouts() -> Vec<Layout> {
                 "{\"amount\": 1.5, \"city\": \"Rome\", \"id\": 7}".to_string(),
                 "{\"amount\": 8.0, \"city\": \"Athens\", \"id\": 6}".to_string(),
             ],
+            named: Vec::new(),
         },
     ]
 }
@@ -472,10 +502,13 @@ async fn a_frame_read_from_the_catalog_holds_the_rows_the_tables_layout_declares
             "case {case:?}: a dataset asked for more partitions than it has elements holds \
              the same rows, got {read}"
         );
+        let mut expected_columns = vec!["id", "city", "amount"];
+        expected_columns.extend(layout.named.iter().copied());
         assert_eq!(
             read.get("columns"),
-            Some(&json!(["id", "city", "amount"])),
-            "case {case:?}: the frame's schema is the table's columns, got {read}"
+            Some(&json!(expected_columns)),
+            "case {case:?}: the frame's schema is the table's columns and the names its \
+             records named beyond them, got {read}"
         );
         assert_eq!(
             read.get("spark").and_then(Value::as_str),

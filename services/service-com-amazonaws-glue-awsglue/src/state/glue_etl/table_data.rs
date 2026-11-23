@@ -200,7 +200,7 @@ def _within(prefix, key):
     return rest[1:] if rest.startswith("/") else rest
 
 
-def _data_keys(bucket, prefix, left, recurse=True):
+def _data_keys(bucket, prefix, left, recurse=True, source=None):
     """The `(key, size, modified)` objects under one prefix that hold data, at most `left`.
 
     The SIZE comes from the listing, so how much a read is about to take is known before
@@ -210,6 +210,9 @@ def _data_keys(bucket, prefix, left, recurse=True):
     `recurse` is whether the read descends the sub-prefixes under the prefix it was given:
     with it unset only the objects at that prefix's own level are read, which is what a read
     that was not asked to recurse takes.
+
+    `source` is the path the READ was given, which is the path a failure to resolve it names;
+    the prefix being listed is what names it for a read that was given none.
     """
     keys = []
     token = None
@@ -222,10 +225,12 @@ def _data_keys(bucket, prefix, left, recurse=True):
         except Exception as error:
             # A listing the store REFUSES tells this read nothing about what is under the
             # location, which is what a location holding nothing tells it too: the read
-            # resolved no file there, and that is the one failure it reports
-            # (`filesystem.unresolved_source`).
+            # resolved no file there, and that is the one failure the filesystem answers
+            # with (`filesystem.missing_source`).
             if filesystem.is_denial(error):
-                raise filesystem.unresolved_source(filesystem.uri(bucket, prefix))
+                raise filesystem.missing_source(
+                    source or filesystem.uri(bucket, prefix)
+                )
             raise
         for entry in listed.get("Contents") or []:
             key = entry.get("Key") or ""
@@ -251,12 +256,14 @@ def _data_keys(bucket, prefix, left, recurse=True):
             return keys
 
 
-def _object_text(bucket, key, size, left_bytes):
+def _object_text(bucket, key, size, left_bytes, source=None):
     """The text of one object, and how many bytes of the read's budget it took.
 
     What one read may take is checked BEFORE the object is fetched: the listing's own size
     says how large it is, so an object the budget does not cover is refused rather than
     buffered and then rejected.
+
+    `source` is the path the READ was given, as `_data_keys` takes it.
     """
     if size > left_bytes:
         raise TableTooLarge(
@@ -267,7 +274,7 @@ def _object_text(bucket, key, size, left_bytes):
     except Exception as error:
         # As with the listing above: a read the store refuses resolved no file at that path.
         if filesystem.is_denial(error):
-            raise filesystem.unresolved_source(filesystem.uri(bucket, key))
+            raise filesystem.missing_source(source or filesystem.uri(bucket, key))
         raise
     body = read["Body"].read()
     if isinstance(body, bytes) or isinstance(body, bytearray):
@@ -386,8 +393,50 @@ def _json_rows(text, columns, layout):
         yield record
 
 
-def _rows_under(location, columns, layout, left_rows, left_bytes, transformation_ctx=""):
+def _read_budget(columns, partition_keys):
+    """What ONE read of a table may materialise, spent as its rows are kept.
+
+    The catalog's own declared width is checked here, BEFORE any object is fetched: a record
+    carries one entry per declared column, so the declared width multiplies every row the read
+    builds and it is metadata the byte and row budgets do not count. The row allowance is the
+    smaller of the row bound and what the cell bound leaves at that width ([`MAX_CELLS`]), so a
+    narrow source read under a wide declared schema stops at the same ceiling as a wide source
+    does.
+
+    The rest is spent per record, because the declared width is not the whole width: a JSON
+    document's own fields are CONTENT the objects carry, so what the records materialise
+    together and how many distinct names they name are counted as they are kept
+    (`_rows_under`), exactly as the read of the objects under a path counts them
+    (`read_s3_paths`). `known` is the names that cost no further width — the declared columns
+    and partition keys, plus every name admitted beyond them — and `extra` is those admitted
+    ones in the order they were first seen, which is what the read reports as the part of the
+    schema the records themselves named.
+    """
+    width = len(columns) + len(partition_keys)
+    if width > MAX_COLUMNS:
+        raise TableTooLarge(
+            "one read of a table takes at most %d of its columns" % (MAX_COLUMNS,)
+        )
+    known = {}
+    for name, _declared in list(columns) + list(partition_keys):
+        known[name] = True
+    return {
+        "rows": min(MAX_ROWS, MAX_CELLS // max(width, 1)),
+        "cells": MAX_CELLS,
+        "bytes": MAX_BYTES,
+        "known": known,
+        "extra": [],
+    }
+
+
+def _rows_under(location, columns, layout, budget, transformation_ctx="", partition_keys=()):
     """Every row the objects under one location hold, within what is left of the bounds.
+
+    `budget` is what the whole read may still materialise (`_read_budget`), spent here: the
+    bytes each object takes, the rows kept, the entries those rows hold TOGETHER and the
+    distinct names they name — `partition_keys` being the entries the caller adds to each row
+    of a partitioned table after this returns, counted here because this is where the record is
+    admitted.
 
     `transformation_ctx` is the context the read was named under, which is what a bookmarked
     run resumes against: with the bookmark in force the read takes only the objects that are
@@ -395,7 +444,7 @@ def _rows_under(location, columns, layout, left_rows, left_bytes, transformation
     """
     bucket, prefix = _split_uri(location)
     keys = _bookmark.unread(
-        transformation_ctx, _data_keys(bucket, prefix, MAX_OBJECTS)
+        transformation_ctx, _data_keys(bucket, prefix, MAX_OBJECTS, True, location)
     )
     classification = layout["classification"]
     if classification in JSON_CLASSIFICATIONS:
@@ -409,19 +458,38 @@ def _rows_under(location, columns, layout, left_rows, left_bytes, transformation
         )
     rows = []
     for key, size, _modified in keys:
-        text, taken = _object_text(bucket, key, size, left_bytes)
-        left_bytes -= taken
-        # The rows come one at a time, and the bound is checked BEFORE each is kept — so a
-        # read that has taken all the rows it may stops part way through the object rather
-        # than after every record in it has been built.
+        text, taken = _object_text(bucket, key, size, budget["bytes"], location)
+        budget["bytes"] -= taken
+        # The rows come one at a time, and every bound is checked BEFORE the record that
+        # would spend it is kept — so a read that has taken all it may stops part way
+        # through the object rather than after every record in it has been built.
         for row in parse(text, columns, layout):
-            if len(rows) >= left_rows:
+            if budget["rows"] <= 0:
                 raise TableTooLarge(
                     "one read of a table takes at most %d rows and %d cells of it"
                     % (MAX_ROWS, MAX_CELLS)
                 )
+            held = len(row) + len(partition_keys)
+            if held > budget["cells"]:
+                raise TableTooLarge(
+                    "one read of a table materialises at most %d cells of it" % (MAX_CELLS,)
+                )
+            # A name the declared schema does not carry is content this record brought, so
+            # it costs width the way a declared column does.
+            for name in row:
+                if name in budget["known"]:
+                    continue
+                if len(budget["known"]) >= MAX_COLUMNS:
+                    raise TableTooLarge(
+                        "one read of a table takes at most %d of its columns"
+                        % (MAX_COLUMNS,)
+                    )
+                budget["known"][name] = True
+                budget["extra"].append(name)
+            budget["cells"] -= held
+            budget["rows"] -= 1
             rows.append(row)
-    return (rows, left_bytes)
+    return rows
 
 
 def _partitions(database, table_name, catalog_id, predicate):
@@ -479,20 +547,9 @@ def read_catalog_table(
         for key in table.get("PartitionKeys") or []
     ]
     layout = _layout(table, descriptor)
-    # How WIDE the table is, checked BEFORE any object is fetched: a record carries one entry
-    # per declared column, so the declared width multiplies every row this read builds, and
-    # the declared width is catalog metadata that the byte and row budgets do not count.
-    width = len(columns) + len(partition_keys)
-    if width > MAX_COLUMNS:
-        raise TableTooLarge(
-            "one read of a table takes at most %d of its columns" % (MAX_COLUMNS,)
-        )
-    # And the rows this read may keep are bounded on what they materialise TOGETHER: the row
-    # allowance is the smaller of the row bound and what the cell bound leaves at this
-    # table's own width ([`MAX_CELLS`]), so a narrow source read under a wide declared schema
-    # stops at the same ceiling as a wide source does.
-    left_rows = min(MAX_ROWS, MAX_CELLS // max(width, 1))
-    left_bytes = MAX_BYTES
+    # What this read may materialise, and the declared width checked before any object is
+    # fetched ([`_read_budget`]).
+    budget = _read_budget(columns, partition_keys)
     records = []
     if partition_keys:
         for partition in _partitions(database, table_name, catalog_id, push_down_predicate):
@@ -505,13 +562,13 @@ def read_catalog_table(
                 (name, _cast(values[index] if index < len(values) else None, declared))
                 for index, (name, declared) in enumerate(partition_keys)
             )
-            rows, left_bytes = _rows_under(
+            rows = _rows_under(
                 location,
                 columns,
                 _layout(table, partition_descriptor),
-                left_rows - len(records),
-                left_bytes,
+                budget,
                 transformation_ctx,
+                partition_keys,
             )
             for row in rows:
                 row.update(held)
@@ -523,10 +580,13 @@ def read_catalog_table(
                 "the table %s.%s declares no location to read its data from"
                 % (database, table_name)
             )
-        records, left_bytes = _rows_under(
-            location, columns, layout, left_rows, left_bytes, transformation_ctx
-        )
-    return (columns + partition_keys, records)
+        records = _rows_under(location, columns, layout, budget, transformation_ctx)
+    # The schema the frame holds: what the catalog declares, its partition keys, and the names
+    # the records themselves named beyond them — the fields of a JSON document are content the
+    # objects carry, so a record carrying one is reported under a column for it rather than
+    # under a schema that does not describe it.
+    named = [(name, "string") for name in budget["extra"]]
+    return (columns + partition_keys + named, records)
 
 
 def table_format(table):
@@ -547,6 +607,11 @@ def read_s3_paths(
     `recurse` is whether the read descends the sub-prefixes under each path, and
     `transformation_ctx` the context a bookmarked run resumes against — with the bookmark in
     force the read takes only the objects that are new to that context.
+
+    A path the read RESOLVED NO FILE at — the store holds no data object under it, or the
+    role the run is performed as is refused the objects there — is the filesystem's own
+    missing-path failure, naming that path (`filesystem.missing_source`), rather than a frame
+    of no records reported as a read of the path.
     """
     options = dict(format_options or {})
     refuse_unhonoured(
@@ -569,11 +634,16 @@ def read_s3_paths(
     cells = 0
     for path in list(paths or []):
         bucket, prefix = _split_uri(path)
-        listed = _bookmark.unread(
-            transformation_ctx, _data_keys(bucket, prefix, MAX_OBJECTS, recurse)
-        )
+        resolved = _data_keys(bucket, prefix, MAX_OBJECTS, recurse, path)
+        # A path this read resolved no file at is the filesystem's own missing-path failure,
+        # naming the path the read was GIVEN: the store holding nothing under it and the
+        # store refusing the role that is reading it are the same answer, so neither is a
+        # frame of no records reported as a read of the path.
+        if not resolved:
+            raise filesystem.missing_source(path)
+        listed = _bookmark.unread(transformation_ctx, resolved)
         for key, size, _modified in listed:
-            text, taken = _object_text(bucket, key, size, left_bytes)
+            text, taken = _object_text(bucket, key, size, left_bytes, path)
             left_bytes -= taken
             if kind in JSON_CLASSIFICATIONS:
                 read = _json_documents(text)

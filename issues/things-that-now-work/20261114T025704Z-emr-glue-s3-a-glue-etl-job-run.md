@@ -32,3 +32,30 @@ Actual: the run never leaves its non-terminal state within the budget, so `asser
 1. Create a bucket holding data/input.csv and scripts/read_csv.py.
 2. Create two Glue ETL jobs on the same script with two roles: one denied s3:GetObject on data/*, one granted it.
 3. StartJobRun each and poll GetJobRun for a terminal state: AWS settles FAILED (no output) and SUCCEEDED (one part- object counting 3 rows); the emulator never settles either run.
+
+## Resolution
+
+The run-state machine and the job-script executor were already in place: a run goes
+`STARTING` → `RUNNING` → the state its script's execution came to, the script is executed in
+process with the AWS Glue ETL library and the Spark runtime on its import path, and every read
+and write it makes is signed as the job's `Role`, so the denied run already came to rest
+`FAILED` with nothing under its output prefix and the permitted one `SUCCEEDED` with a `part-`
+object holding the count of the source's rows.
+
+What was wrong was HOW a source path the read resolved no file at is REPORTED through the AWS
+Glue ETL library's own Amazon S3 source: it raised the SPARK dataset reader's analysis failure
+(`Path does not exist: …`), naming the object key the store refused, where that reader lets the
+Hadoop-compatible filesystem's own missing-path failure travel
+(`No such file or directory '<the path the read was given>'`). A client matching on that
+failure class could not recognise the run's failure, so it restarted the run until the harness
+budget ran out — which is why the check reported only a timeout. A path the store held no data
+object under was likewise answered as a frame of no records rather than as the same failure.
+
+The Glue ETL library's source reader now reports both as that one failure, naming the path the
+read was given (`services/common/src/spark_runtime/filesystem.rs`'s `missing_source`,
+`state/glue_etl/table_data.rs`); Spark's own dataset reader keeps its analysis failure, and a
+refused WRITE keeps the store's own refusal, because a write is not a resolution. Pinned by
+`services/service-com-amazonaws-glue-awsglue/tests/all/job_run_unresolved_source_wording.rs`
+(both readers over each reason a path resolves no file, with the permitted read as each
+reader's control) and by the reader-specific wording in
+`tests/all/job_run_source_authorization.rs`.

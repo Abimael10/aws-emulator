@@ -402,6 +402,10 @@ class AnalysisException(Exception):
     """A source a read cannot be planned over, as Spark words it."""
 
 
+class FileNotFoundException(IOError):
+    """A path this filesystem resolved no file at, as Hadoop words it."""
+
+
 def _refusal(error):
     """The (code, message) a store's refusal carried, or ('', text) for anything else."""
     response = getattr(error, "response", None)
@@ -420,6 +424,22 @@ def _is_denial(error):
 def is_denial(error):
     """The same question, for the readers of a source path that live beside this module."""
     return _is_denial(error)
+
+
+def missing_source(path):
+    """The failure THIS FILESYSTEM raises for a path it resolved no file at.
+
+    Resolving a source path asks the filesystem which files are there, and it answers a path
+    it found none at the one way: the file is not there. An object store answers a caller it
+    may not read the same way whether or not an object is there, so a resolution it refuses
+    yields no file at the path exactly as a path holding nothing does — neither tells the
+    filesystem the path is there — and both are therefore this one failure, naming the path.
+
+    It is what a reader that lets the filesystem's own error travel reports. Spark's dataset
+    reader is not one of those: it fails its own analysis over such a path instead
+    (`unresolved_source`).
+    """
+    return FileNotFoundException("No such file or directory '%s'" % (_text(path),))
 
 
 def unresolved_source(path):

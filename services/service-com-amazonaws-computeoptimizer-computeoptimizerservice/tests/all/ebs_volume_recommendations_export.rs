@@ -1032,20 +1032,33 @@ async fn the_export_file_states_what_the_reader_reports_for_every_volume() {
                  got {row:?}"
             );
 
-            // When the recommendation was generated, as the reader reports it.
+            // When the recommendation was generated, as the reader reports it. Compared as the
+            // INSTANT each side states rather than as the text of it: the file states the
+            // instant in RFC 3339 while `VolumeRecommendation$lastRefreshTimestamp` crosses the
+            // wire as a JSON NUMBER, and an `f64` of a present-day instant carries less than a
+            // microsecond, so the two renderings of ONE instant can land on neighbouring
+            // microseconds. Both sides are therefore compared at the millisecond resolution an
+            // AWS JSON timestamp states, as the sibling export suite of this crate compares the
+            // same column ([`crate::idle_recommendations_export`]) — close enough that any
+            // other instant, or no instant at all, still fails, and far enough that the
+            // comparison is about the instant rather than about a rounding step neither end
+            // chose.
             let refreshed = recommendation["lastRefreshTimestamp"]
                 .as_f64()
                 .unwrap_or_else(|| {
                     panic!("case {case:?}: the reader reports a refresh instant, got {recommendation}")
                 });
-            let stated = DateTime::from_secs_f64(refreshed)
-                .fmt(Format::DateTime)
-                .unwrap_or_else(|error| panic!("case {case:?}: {refreshed} is an instant: {error}"));
-            assert_eq!(
-                cell(header, row, "LastRefreshTimestamp"),
-                stated,
+            let held = cell(header, row, "LastRefreshTimestamp");
+            let stated = DateTime::from_str(held, Format::DateTime).unwrap_or_else(|error| {
+                panic!(
+                    "case {case:?}: LastRefreshTimestamp of {arn} must state an instant, got \
+                     {held:?} in {row:?}: {error}"
+                )
+            });
+            assert!(
+                (stated.as_secs_f64() - refreshed).abs() < 0.001,
                 "case {case:?}: LastRefreshTimestamp of {arn} must state the instant the reader \
-                 reports, got {row:?}"
+                 reports ({refreshed}), got {row:?}"
             );
 
             option_iops

@@ -7,8 +7,11 @@
 //! the SOURCE path a read resolves is resolved under that role's effective policies — a path
 //! no statement allows is refused exactly as one an explicit deny names is — and a source
 //! path the read resolved no file at, whether the store holds nothing under it or the role is
-//! refused it, is the analysis failure Spark raises for a path that is not there, naming that
-//! path, with nothing written where the run's output would have gone.
+//! refused it, is the missing-path failure its own reader words, naming that path, with
+//! nothing written where the run's output would have gone. The two readers a Glue job script
+//! has word that one condition as their own engines do: Spark's dataset reader fails its
+//! analysis over such a path, while the AWS Glue ETL library's Amazon S3 source lets the
+//! filesystem's own missing-path failure travel ([`unresolved_signature`]).
 //!
 //! The rows differ along HOW the role's documents decide the source read: allowed outright,
 //! left out of every statement (an implicit deny, which is the shape of a role that was given
@@ -38,14 +41,30 @@ use crate::wire::ok;
 
 /// The fixed text Spark's analysis states for a source path it resolved no file at, written
 /// out here rather than read from a crate constant so this suite pins the wording.
-const PATH_DOES_NOT_EXIST: &str = "Path does not exist";
+pub(crate) const PATH_DOES_NOT_EXIST: &str = "Path does not exist";
+
+/// The fixed text the Hadoop-compatible filesystem states for a path it resolved no file at,
+/// which is what the AWS Glue ETL library's own Amazon S3 source reports.
+pub(crate) const NO_SUCH_FILE_OR_DIRECTORY: &str = "No such file or directory";
+
+/// The label of the rows driven through the AWS Glue ETL library's own source reader.
+pub(crate) const FRAME_READER: &str = "frame";
+
+/// The fixed text the reader behind `label` states for a source path it resolved no file at.
+pub(crate) fn unresolved_signature(label: &str) -> &'static str {
+    if label == FRAME_READER {
+        NO_SUCH_FILE_OR_DIRECTORY
+    } else {
+        PATH_DOES_NOT_EXIST
+    }
+}
 
 /// The fixed words the object store's own refusal of a write carries.
 const ACCESS_DENIED: &str = "Access Denied";
 
 /// The script every row runs: it reads the CSV source its `--SOURCE_PATH` names and writes
 /// the number of rows that source really held under its `--OUTPUT_PATH`.
-const COUNTS_ITS_SOURCE: &str = r#"
+pub(crate) const COUNTS_ITS_SOURCE: &str = r#"
 import sys
 
 from awsglue.utils import getResolvedOptions
@@ -60,7 +79,7 @@ spark.sparkContext.parallelize([str(source.count())]).saveAsTextFile(args["OUTPU
 
 /// The same read through the AWS Glue ETL library's own source reader, so the rule is asserted
 /// on both readers a Glue job script has.
-const COUNTS_ITS_SOURCE_THROUGH_A_FRAME: &str = r#"
+pub(crate) const COUNTS_ITS_SOURCE_THROUGH_A_FRAME: &str = r#"
 import sys
 
 from awsglue.context import GlueContext
@@ -82,25 +101,25 @@ glueContext.spark_session.sparkContext.parallelize(
 
 /// The rows of this suite's source data: three records, so what a run writes is a value only
 /// a real read of the source produces.
-const SOURCE_CSV: &str = "id,name,value\n1,ada,10\n2,bo,20\n3,cy,30\n";
+pub(crate) const SOURCE_CSV: &str = "id,name,value\n1,ada,10\n2,bo,20\n3,cy,30\n";
 
 /// Where one case's source objects live.
-fn source_prefix(case: &str) -> String {
+pub(crate) fn source_prefix(case: &str) -> String {
     format!("s3://{BUCKET}/data/{case}/")
 }
 
 /// Where one case's output objects live.
-fn output_prefix(case: &str) -> String {
+pub(crate) fn output_prefix(case: &str) -> String {
     format!("s3://{BUCKET}/output/{case}")
 }
 
 /// The key of the one part file a write leaves under a case's output prefix.
-fn part_key(case: &str) -> String {
+pub(crate) fn part_key(case: &str) -> String {
     format!("output/{case}/part-00000")
 }
 
 /// The `CreateJob` body of a Spark ETL job whose script is at `location`.
-fn job_body(name: &str, role: &str, location: &str) -> Value {
+pub(crate) fn job_body(name: &str, role: &str, location: &str) -> Value {
     json!({
         "Name": name,
         "Role": role,
@@ -123,7 +142,10 @@ struct Row {
     grants: Vec<(&'static str, &'static str, &'static str)>,
     /// Whether the run must succeed and leave the count of the source's rows behind.
     succeeds: bool,
-    /// What the failed run's `ErrorMessage` must carry, each of them.
+    /// Whether the failed run's `ErrorMessage` is the missing-path failure of the reader that
+    /// resolved no file at the source ([`unresolved_signature`]).
+    source_unresolved: bool,
+    /// What the failed run's `ErrorMessage` must carry besides that, each of them.
     carries: Vec<&'static str>,
     /// Whether the path the failure names is the row's OUTPUT prefix rather than its source.
     names_the_output: bool,
@@ -149,6 +171,7 @@ fn rows() -> Vec<Row> {
                 ("Allow", "s3:ListBucket", "arn:aws:s3:::BUCKET"),
             ],
             succeeds: true,
+            source_unresolved: false,
             carries: Vec::new(),
             names_the_output: false,
         },
@@ -162,7 +185,8 @@ fn rows() -> Vec<Row> {
                 ("Allow", "s3:ListBucket", "arn:aws:s3:::BUCKET"),
             ],
             succeeds: false,
-            carries: vec![PATH_DOES_NOT_EXIST],
+            source_unresolved: true,
+            carries: Vec::new(),
             names_the_output: false,
         },
         Row {
@@ -172,7 +196,8 @@ fn rows() -> Vec<Row> {
                 ("Deny", "s3:GetObject", "arn:aws:s3:::BUCKET/data/*"),
             ],
             succeeds: false,
-            carries: vec![PATH_DOES_NOT_EXIST],
+            source_unresolved: true,
+            carries: Vec::new(),
             names_the_output: false,
         },
         Row {
@@ -184,7 +209,8 @@ fn rows() -> Vec<Row> {
                 ("Allow", "s3:PutObject", "arn:aws:s3:::BUCKET/*"),
             ],
             succeeds: false,
-            carries: vec![PATH_DOES_NOT_EXIST],
+            source_unresolved: true,
+            carries: Vec::new(),
             names_the_output: false,
         },
         Row {
@@ -196,6 +222,7 @@ fn rows() -> Vec<Row> {
                 ("Allow", "s3:ListBucket", "arn:aws:s3:::BUCKET"),
             ],
             succeeds: false,
+            source_unresolved: false,
             carries: vec![ACCESS_DENIED, "403"],
             names_the_output: true,
         },
@@ -268,6 +295,16 @@ async fn assert_row(row: &Row, index: usize, script: &str, label: &str) {
              {message:?}"
         );
     }
+    // A source the read resolved no file at is reported in the words of the READER that
+    // resolved it, which is the one thing the two readers of the same condition differ in.
+    if row.source_unresolved {
+        let signature = unresolved_signature(label);
+        assert!(
+            message.contains(signature),
+            "case {case:?} ({label}): expected an ErrorMessage carrying {signature:?}, got \
+             {message:?}"
+        );
+    }
     // The path the run could not reach is named, which is the one variable part of the
     // failure.
     let named = if row.names_the_output {
@@ -304,6 +341,6 @@ async fn a_source_its_role_may_not_read_is_reported_as_a_path_that_is_not_there(
         .enumerate()
         .filter(|(_index, row)| ends.contains(&row.case))
     {
-        assert_row(row, index, COUNTS_ITS_SOURCE_THROUGH_A_FRAME, "frame").await;
+        assert_row(row, index, COUNTS_ITS_SOURCE_THROUGH_A_FRAME, FRAME_READER).await;
     }
 }
