@@ -3213,6 +3213,11 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     STEP_FUNCTIONS_ACTIVITY,
     TRANSFER_SERVER,
     "AWS::Transfer::Workflow",
+    // The two Amazon VPC Lattice types, each publishing the ARN its `Ref` returns, the id
+    // that service minted, and — for a network, the instants of its clock; for a
+    // subscription, the monitored resource that service resolved.
+    VPCLATTICE_SERVICE_NETWORK,
+    VPCLATTICE_ACCESS_LOG_SUBSCRIPTION,
 ];
 
 /// Evaluate one intrinsic function.

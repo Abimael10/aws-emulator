@@ -117,6 +117,7 @@ use super::template::{
     NETWORK_SECURITY_MANAGER_POLICY, NETWORK_SECURITY_MANAGER_RULE,
     NETWORK_SECURITY_MANAGER_SCOPE, NETWORK_SECURITY_MANAGER_TEMPLATE,
     RBIN_RULE, SES_EMAIL_IDENTITY, SSM_QUICKSETUP_CONFIGURATION_MANAGER,
+    VPCLATTICE_ACCESS_LOG_SUBSCRIPTION, VPCLATTICE_SERVICE_NETWORK,
 };
 
 /// The namespace Amazon Web Services' own resource types live under: a type spelled with
@@ -1071,10 +1072,13 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::Transfer::Server",
     "AWS::Transfer::User",
     "AWS::Transfer::Workflow",
-    // Amazon VPC Lattice
+    // Amazon VPC Lattice. The service network and the access-log subscription of one are each
+    // created in that service (`super::provisioner::vpc_lattice`); the namespace segment is
+    // that model's own `awsService.cloudFormationName` (`VpcLattice`).
+    VPCLATTICE_ACCESS_LOG_SUBSCRIPTION,
     "AWS::VpcLattice::Listener",
     "AWS::VpcLattice::Service",
-    "AWS::VpcLattice::ServiceNetwork",
+    VPCLATTICE_SERVICE_NETWORK,
     "AWS::VpcLattice::TargetGroup",
     // AWS WAF classic (global)
     "AWS::WAF::ByteMatchSet",

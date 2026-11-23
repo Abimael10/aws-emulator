@@ -11875,6 +11875,7 @@ dependencies = [
  "service-com-amazonaws-sqs-amazonsqs",
  "service-com-amazonaws-ssm-amazonssm",
  "service-com-amazonaws-sts-awssecuritytokenservicev20110615",
+ "service-com-amazonaws-vpclattice-mercurycontrolplane",
  "service-common",
  "sha2 0.10.9",
  "shell-words",
@@ -22346,6 +22347,7 @@ dependencies = [
 name = "service-com-amazonaws-vpclattice-mercurycontrolplane"
 version = "0.1.0"
 dependencies = [
+ "automod",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",

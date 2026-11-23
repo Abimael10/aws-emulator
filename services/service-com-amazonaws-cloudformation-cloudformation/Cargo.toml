@@ -179,6 +179,11 @@ service-com-amazonaws-sfn-awsstepfunctions = { workspace = true }
 # (`state::provisioning::logs_resources`): a suite that deploys one must have its owning
 # service mounted beside CloudFormation, or the create is refused and the stack fails.
 service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
+# Amazon VPC Lattice, for the `AWS::VpcLattice::ServiceNetwork` and the
+# `AWS::VpcLattice::AccessLogSubscription` a stack really creates there
+# (`state::provisioner::vpc_lattice`): a suite that deploys one must have its owning service
+# mounted beside CloudFormation, or the create is refused and the stack fails.
+service-com-amazonaws-vpclattice-mercurycontrolplane = { workspace = true }
 # AWS IoT, for the `AWS::IoT::Authorizer` a stack really creates there
 # (`state::provisioning::iot_authorizer`), for the same reason.
 service-com-amazonaws-iot-awsiotservice = { workspace = true }

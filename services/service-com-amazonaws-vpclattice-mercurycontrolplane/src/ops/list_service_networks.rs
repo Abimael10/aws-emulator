@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListServiceNetworks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListServiceNetworks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListServiceNetworks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure READ of the service-network slice, paged in creation order — the one stable order
+//! every listing of this service pages by — with each summary's association counts counted
+//! from the persisted associations rather than from a stored counter, exactly as
+//! `GetServiceNetwork` counts them.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +144,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListServiceNetworks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListServiceNetworksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListServiceNetworks"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListServiceNetworksErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the vpc-lattice state store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let Ok(after) = crate::state::decode_cursor(input.next_token.as_deref()) else {
+            // A token no listing of this service ever minted. `nextToken` is an OPAQUE
+            // cursor — the model constrains only its length, which the boundary enforces —
+            // so there is no constraint to report a value against and this message is the
+            // refusal itself, not a constraint clause.
+            return Err(ListServiceNetworksErrorModeled::ValidationException(
+                ValidationException {
+                    message: "nextToken is not a token this service issued".to_string(),
+                    reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "nextToken".to_string(),
+                        message: "the token does not name a page of this result set"
+                            .to_string(),
+                    }]),
+                },
+            )
+            .into());
+        };
+        // `maxResults` caps one page, exactly as it does for every other listing here.
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(crate::state::MAX_PAGE_SIZE)
+            .min(crate::state::MAX_PAGE_SIZE);
+
+        let store = state.lock();
+        let mut ordered: Vec<&crate::state::ServiceNetwork> =
+            store.service_networks.values().collect();
+        ordered.sort_by_key(|network| network.sequence);
+
+        let mut items: Vec<ServiceNetworkSummary> = Vec::new();
+        let mut page_ends_at = after;
+        let mut more_follow = false;
+        for network in ordered.iter().filter(|network| network.sequence > after) {
+            if items.len() == page_size {
+                // One network beyond the page proves a next page exists; the cursor names
+                // where this page ended, so resuming never repeats or skips one.
+                more_follow = true;
+                break;
+            }
+            page_ends_at = network.sequence;
+            items.push(ServiceNetworkSummary {
+                id: Some(network.id.clone()),
+                name: Some(network.name.clone()),
+                arn: Some(network.arn.clone()),
+                created_at: Some(crate::state::timestamp(network.created_at)),
+                last_updated_at: Some(crate::state::timestamp(network.last_updated_at)),
+                // Counted from the persisted associations, never from a stored counter.
+                number_of_associated_vp_cs: Some(store.associated_vpc_count(&network.id)),
+                number_of_associated_services: Some(
+                    store.associated_service_count(&network.id),
+                ),
+                // No resource configuration can be associated with a service network yet:
+                // `CreateServiceNetworkResourceAssociation` is still a 501, so there is
+                // nothing to count.
+                number_of_associated_resource_configurations: Some(0),
+            });
+        }
+
+        Ok(ListServiceNetworksOutput {
+            items,
+            next_token: more_follow.then(|| crate::state::encode_cursor(page_ends_at)),
+        })
     }
 }

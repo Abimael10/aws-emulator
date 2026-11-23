@@ -216,6 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // network, such as the resource policy, auth policy, and access log
             // subscriptions, are also deleted" (this operation's own documentation).
             store.auth_policies.remove(&removed.id);
+            store.remove_access_log_subscriptions_of(&removed.id);
             // A clientToken record must not outlive the resource it created.
             store.idempotency_tokens.forget_resource(&removed.id);
         }

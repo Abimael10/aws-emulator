@@ -493,6 +493,7 @@ use super::template::{
     BEDROCK_KNOWLEDGE_BASE,
     BEDROCK_SESSION,
     BRAKET_SPENDING_LIMIT, CLEANROOMSML_TRAINING_DATASET,
+    VPCLATTICE_ACCESS_LOG_SUBSCRIPTION, VPCLATTICE_SERVICE_NETWORK,
     CLOUDHSM_CLUSTER,
     CLOUDWATCH_DASHBOARD,
     CLOUDWATCH_METRIC_STREAM, CODEARTIFACT_DOMAIN, CODEARTIFACT_REPOSITORY,
@@ -1643,6 +1644,22 @@ pub(super) enum Provisioner {
     /// resource's creation and its deletion are each held open on that service's own report of
     /// the dataset.
     RekognitionDataset,
+    /// `AWS::VpcLattice::ServiceNetwork`: the service network Amazon VPC Lattice's own
+    /// `CreateServiceNetwork` makes under the name the template states, `UpdateServiceNetwork`
+    /// re-authenticates and `DeleteServiceNetwork` removes. That service MINTS the `sn-…` id
+    /// and the ARN built around it, and the type's `Ref` returns that ARN — one of the two
+    /// forms every call on a network takes — so the ARN it answered is the resource's physical
+    /// id ([`vpc_lattice`]).
+    VpcLatticeServiceNetwork,
+    /// `AWS::VpcLattice::AccessLogSubscription`: the access-log delivery that service's own
+    /// `CreateAccessLogSubscription` sets up from such a network (or a service) to a CloudWatch
+    /// Logs log group, a Firehose delivery stream or an Amazon S3 bucket,
+    /// `UpdateAccessLogSubscription` re-points and `DeleteAccessLogSubscription` removes. That
+    /// create takes no identifier at all and answers the `als-…` id it drew with its ARN,
+    /// which the type's `Ref` returns, so that ARN is the resource's physical id. A destination
+    /// the owning service does not hold is ITS refusal — a 404 `ResourceNotFoundException`,
+    /// which the resource reports in the provider envelope under the `NotFound` handler class.
+    VpcLatticeAccessLogSubscription,
 }
 
 /// The provisioner that owns a template resource type, or `None` for a type this emulator
@@ -1955,6 +1972,10 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         REKOGNITION_COLLECTION => Some(Provisioner::RekognitionCollection),
         REKOGNITION_PROJECT => Some(Provisioner::RekognitionProject),
         REKOGNITION_DATASET => Some(Provisioner::RekognitionDataset),
+        VPCLATTICE_SERVICE_NETWORK => Some(Provisioner::VpcLatticeServiceNetwork),
+        VPCLATTICE_ACCESS_LOG_SUBSCRIPTION => {
+            Some(Provisioner::VpcLatticeAccessLogSubscription)
+        }
         // The Amazon Bedrock AgentCore family's entries are catalogued beside that family's
         // own type names and arms ([`type_registry`]), so adding one of its types is a change
         // to that file alone; every other type answers `None` and is left declared-only.
@@ -3087,6 +3108,16 @@ impl Provisioner {
             // CloudFormation gives it beside the ones the declaration asks for.
             Self::RekognitionDataset => {
                 create_rekognition_dataset(ctx, region, resource, propagated).await
+            }
+            // Both Amazon VPC Lattice types publish `Tags`, which each create takes as a
+            // `TagMap` of its own, so a network and a subscription a stack creates carry the
+            // tags CloudFormation gives them beside the ones the declaration asks for.
+            Self::VpcLatticeServiceNetwork => {
+                create_vpc_lattice_service_network(ctx, region, resource, propagated).await
+            }
+            Self::VpcLatticeAccessLogSubscription => {
+                create_vpc_lattice_access_log_subscription(ctx, region, resource, propagated)
+                    .await
             }
         }
     }
@@ -4396,6 +4427,15 @@ impl Provisioner {
             Self::RekognitionDataset => {
                 delete_rekognition_dataset(ctx, region, physical_resource_id).await
             }
+            // Either VPC Lattice delete addresses the resource by the ARN that service minted
+            // for it, which is this resource's physical id.
+            Self::VpcLatticeServiceNetwork => {
+                delete_vpc_lattice_service_network(ctx, region, physical_resource_id).await
+            }
+            Self::VpcLatticeAccessLogSubscription => {
+                delete_vpc_lattice_access_log_subscription(ctx, region, physical_resource_id)
+                    .await
+            }
         }
     }
 
@@ -4821,6 +4861,12 @@ use rekognition_resources::*;
 /// whose arms are [`lifecycle_progress`]'s: one concern of this catalogue, in a file of its
 /// own so this one stays inside the line bound a change may touch.
 mod lifecycle_progress;
+
+/// The two Amazon VPC Lattice arms: the service network a stack declares and the access-log
+/// subscription of one. Visible to the rest of this service's state because the module is
+/// reached only through this catalogue's own arms.
+pub(in crate::state) mod vpc_lattice;
+use vpc_lattice::*;
 /// Applying a CHANGED declaration to a resource the stack ALREADY has — the configuration
 /// update and the re-tagging arms of this catalogue — which is the concern beside its create,
 /// its lifecycle progress above and its delete, in a file of its own for the same reason.

@@ -429,6 +429,23 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
     // ([`provisioning::step_functions_state_machine`] and
     // [`provisioning::step_functions_versions_and_aliases`]).
     ("states", "Sfn", SdkDiagnostic::Attempts),
+    // Amazon VPC Lattice's SDK names it `VpcLattice` — that model's own
+    // `awsService.cloudFormationName` (`smithy_query(query="service_info")` on that service's
+    // model: `sdkId: "VPC Lattice"`, `cloudFormationName: VpcLattice`), which is the name its
+    // SDK client carries. The shape is the ATTEMPT-counting one, as the recorded
+    // `ResourceStatusReason` of an `AWS::VpcLattice::AccessLogSubscription` whose declared
+    // destination log group does not exist carries it (in the behavioral corpus
+    // `simparity-behavioral-aws-v1`, check `cloudformation__logs__vpc-lattice.deploy-\
+    // vpclattice-access-log-subscription-missing-log-group-rejected`, whose reason reads
+    // `Resource handler returned message: "<the service's sentence> (Service: VpcLattice,
+    // Status Code: 404, Request ID: …) (SDK Attempt Count: …)" (RequestToken: …,
+    // HandlerErrorCode: NotFound)`). The two resource types this emulator provisions over this
+    // signing name are both that service's ([`provisioner::vpc_lattice`]).
+    (
+        crate::state::provisioner::vpc_lattice::VPC_LATTICE_SIGNING_NAME,
+        "VpcLattice",
+        SdkDiagnostic::Attempts,
+    ),
     // AWS X-Ray's SDK names it by that model's own `sdkId` (`XRay`,
     // `smithy_query(query="service_info")` on that service's model), which is also the
     // `cloudFormationName` the type names of its resources carry. The shape is the bare

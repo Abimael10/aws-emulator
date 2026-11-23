@@ -950,6 +950,15 @@ impl Provisioner {
             Self::SsmQuickSetupConfigurationManager => {
                 describe_configuration_manager(ctx, region, physical_resource_id).await
             }
+            // Amazon VPC Lattice's own reads of the two resources a stack declares in it, each
+            // by the ARN that service minted for it.
+            Self::VpcLatticeServiceNetwork => {
+                describe_vpc_lattice_service_network(ctx, region, physical_resource_id).await
+            }
+            Self::VpcLatticeAccessLogSubscription => {
+                describe_vpc_lattice_access_log_subscription(ctx, region, physical_resource_id)
+                    .await
+            }
         }
     }
 }

@@ -258,6 +258,50 @@ pub(super) const BCM_SCHEDULED_REPORT_ATTRIBUTES: &[&str] = &["Arn", "CreatedAt"
 /// the ARN, which is also the identity each type's `Ref` returns.
 pub(super) const BCM_ARN_ATTRIBUTE: &str = "Arn";
 
+/// The `AWS::<cloudFormationName>::<Resource>` types of the two Amazon VPC Lattice resources
+/// an access-logging estate declares. The middle segment is that model's own
+/// `awsService.cloudFormationName` (`VpcLattice`, `smithy_query(query="service_info")` on that
+/// service's model).
+///
+/// * a SERVICE NETWORK — the "logical boundary for a collection of services" that service's
+///   own `CreateServiceNetwork` makes under the name the template states. It MINTS the
+///   network's id (`^sn-[0-9a-z]{17}$`) and the ARN built around it, and "Ref returns the ARN
+///   of the service network", so neither value can be computed from the template and
+///   [`identity_is_service_assigned`] names the type. `Fn::GetAtt` reads `Arn`, `Id`,
+///   `CreatedAt` and `LastUpdatedAt`, the last two being that service's clock;
+/// * an ACCESS LOG SUBSCRIPTION — the delivery `CreateAccessLogSubscription` sets up from one
+///   such network (or one service) to a CloudWatch Logs log group, a Firehose delivery stream
+///   or an Amazon S3 bucket. That create takes NO identifier at all and answers the
+///   `^als-[0-9a-z]{17}$` id it drew with the ARN around it, which is what "Ref returns the
+///   ARN of the access log subscription" publishes, so the same holds. `Fn::GetAtt` reads
+///   `Arn`, `Id`, `ResourceArn` and `ResourceId` — the last two being the monitored resource,
+///   as that service resolved it.
+pub const VPCLATTICE_SERVICE_NETWORK: &str = "AWS::VpcLattice::ServiceNetwork";
+pub const VPCLATTICE_ACCESS_LOG_SUBSCRIPTION: &str =
+    "AWS::VpcLattice::AccessLogSubscription";
+
+/// Amazon VPC Lattice's ARN namespace, which is the namespace both of those ARNs carry
+/// (`ServiceNetworkArn`:
+/// `^arn:[a-z0-9\-]+:vpc-lattice:[a-zA-Z0-9\-]+:\d{12}:servicenetwork/sn-[0-9a-z]{17}$`).
+pub const VPCLATTICE_ARN_NAMESPACE: &str = "vpc-lattice";
+
+/// The resource paths those two ARNs carry before the identifier that service minted, from
+/// those same patterns.
+pub(super) const VPCLATTICE_SERVICE_NETWORK_PATH: &str = "servicenetwork";
+pub(super) const VPCLATTICE_ACCESS_LOG_SUBSCRIPTION_PATH: &str = "accesslogsubscription";
+
+/// How many characters follow the `sn-` / `als-` prefix of either identifier: 17, from those
+/// same patterns.
+pub(super) const VPCLATTICE_ID_CHARACTERS: usize = 17;
+
+/// The attributes `AWS::VpcLattice::ServiceNetwork` publishes, and the ones its subscription
+/// sibling publishes. Only each type's ARN and the id inside it are values these naming rules
+/// compute a stand-in for; the rest reach the resource off that service's own report.
+pub(super) const VPCLATTICE_SERVICE_NETWORK_ATTRIBUTES: &[&str] =
+    &["Arn", "CreatedAt", "Id", "LastUpdatedAt"];
+pub(super) const VPCLATTICE_ACCESS_LOG_SUBSCRIPTION_ATTRIBUTES: &[&str] =
+    &["Arn", "Id", "ResourceArn", "ResourceId"];
+
 /// The `AWS::<cloudFormationName>::<Resource>` type of an Amazon Braket SPENDING LIMIT: the
 /// cost control that service's own `CreateSpendingLimit` makes for a quantum device. The
 /// middle segment is that model's own `awsService.sdkId` (`Braket`).

@@ -139,6 +139,16 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         // the limit's amount and its period and no device at all, so a declaration naming
         // another device asks for a different limit.
         BRAKET_SPENDING_LIMIT => &["DeviceArn"],
+        // A VPC Lattice service network keeps the SHARING setting it was created with:
+        // `UpdateServiceNetwork` takes the network's `authType` and nothing else, so a
+        // declaration restating the sharing configuration asks for a different network. (Its
+        // `Name` is in that position through [`name_is_create_only`], and its `Tags` reach the
+        // network through that service's own `TagResource`/`UntagResource`.)
+        VPCLATTICE_SERVICE_NETWORK => &["SharingConfig"],
+        // An access log subscription keeps the resource it MONITORS and the log type it
+        // monitors it for: `UpdateAccessLogSubscription` takes the destination and nothing
+        // else, so a declaration restating either asks for a different subscription.
+        VPCLATTICE_ACCESS_LOG_SUBSCRIPTION => &["ResourceIdentifier", "ServiceNetworkLogType"],
         // A Quick Setup configuration manager keeps the DEFINITIONS it was created with:
         // `UpdateConfigurationDefinition` addresses ONE definition by the `Id` Quick Setup
         // minted for it — a value no template states — and takes neither the definition's

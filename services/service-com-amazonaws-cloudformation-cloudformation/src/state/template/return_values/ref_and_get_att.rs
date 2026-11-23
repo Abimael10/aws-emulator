@@ -2072,6 +2072,50 @@ pub(crate) fn return_values(
             }
             (arn, attributes)
         }
+        // Amazon VPC Lattice's own control plane: the service network an
+        // `AWS::VpcLattice::ServiceNetwork` declares and the subscription an
+        // `AWS::VpcLattice::AccessLogSubscription` declares. Either type's `Ref` returns the
+        // resource's ARN (its primary identifier) and `Fn::GetAtt` reads that ARN, the id that
+        // service minted and — for a network, the two instants of its clock; for a
+        // subscription, the monitored resource it resolved. Both identifiers are that
+        // service's own, so the values here are STAND-INS of their published forms
+        // (`sn-`/`als-` plus 17 characters of `[0-9a-z]`), which `super::provisioning`
+        // re-points at what each create really answered
+        // ([`super::provisioner::Provisioner::VpcLatticeServiceNetwork`],
+        // [`super::provisioner::Provisioner::VpcLatticeAccessLogSubscription`]).
+        VPCLATTICE_SERVICE_NETWORK | VPCLATTICE_ACCESS_LOG_SUBSCRIPTION => {
+            let (path, prefix, published) = if resource_type == VPCLATTICE_SERVICE_NETWORK {
+                (
+                    VPCLATTICE_SERVICE_NETWORK_PATH,
+                    "sn",
+                    VPCLATTICE_SERVICE_NETWORK_ATTRIBUTES,
+                )
+            } else {
+                (
+                    VPCLATTICE_ACCESS_LOG_SUBSCRIPTION_PATH,
+                    "als",
+                    VPCLATTICE_ACCESS_LOG_SUBSCRIPTION_ATTRIBUTES,
+                )
+            };
+            let id = generated_service_id(prefix, name, VPCLATTICE_ID_CHARACTERS);
+            let arn = ::emulator_server::emulator_arn(
+                VPCLATTICE_ARN_NAMESPACE,
+                region,
+                &format!("{path}/{id}"),
+            );
+            attributes.insert("Arn".to_string(), arn.clone());
+            attributes.insert("Id".to_string(), id);
+            for attribute in published
+                .iter()
+                .filter(|attribute| **attribute != "Arn" && **attribute != "Id")
+            {
+                attributes.insert(
+                    (*attribute).to_string(),
+                    service_assigned_document(name, attribute),
+                );
+            }
+            (arn, attributes)
+        }
         // Amazon Braket's own control plane: the spending limit an
         // `AWS::Braket::SpendingLimit` declares. "Ref returns the spending limit ARN" (the
         // type's primary identifier); Fn::GetAtt reads `SpendingLimitArn` and `CreatedAt`.

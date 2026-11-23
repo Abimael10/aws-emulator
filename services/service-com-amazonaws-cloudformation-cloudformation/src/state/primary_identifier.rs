@@ -105,6 +105,11 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         // ("Ref returns the spending limit ARN"), which is the handle every spending-limit
         // API takes — the type declares no name a client could name one by.
         BRAKET_SPENDING_LIMIT => "SpendingLimitArn",
+        // The two Amazon VPC Lattice types, each identified by the ARN that service minted for
+        // the resource ("Ref returns the ARN") — one of the two forms every call of that
+        // service on the resource takes as its identifier. A network's own `Name` is only what
+        // it is called, and a subscription declares no name at all.
+        VPCLATTICE_SERVICE_NETWORK | VPCLATTICE_ACCESS_LOG_SUBSCRIPTION => "Arn",
         // An Application Signals service level objective and an instrumentation config are
         // each identified by the ARN that type's `Ref` returns — the objective's is the one
         // every SLO operation takes as its `Id`, the configuration's the one its create

@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAccessLogSubscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAccessLogSubscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAccessLogSubscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The subscription is stored in this service's own slice
+//! ([`crate::state::AccessLogSubscription`]) and the response is read back out of it, so
+//! `GetAccessLogSubscription`, `ListAccessLogSubscriptions` and the tag operations all report
+//! what this create persisted.
+//!
+//! Two things have to RESOLVE before anything is stored, because a subscription that resolves
+//! neither delivers nothing:
+//!
+//! * the `resourceIdentifier` has to name a service network, a service or a resource
+//!   configuration this service holds ([`crate::state::subscribed_resource`]);
+//! * the `destinationArn` has to name a resource one of the three supported destination
+//!   services holds ([`crate::state::AccessLogDestination`]), which is asked of that service
+//!   itself over the in-process transport.
+//!
+//! Either failure is the modelled `ResourceNotFoundException` (HTTP 404).
 //!
 //! ## Shape of an operation
 //!
@@ -148,6 +155,32 @@ impl From<CreateAccessLogSubscriptionErrorModeled> for CreateAccessLogSubscripti
     }
 }
 
+/// The response for a stored subscription — every member read back out of state, never
+/// echoed from the request.
+fn output_of(
+    subscription: &crate::state::AccessLogSubscription,
+) -> CreateAccessLogSubscriptionOutput {
+    CreateAccessLogSubscriptionOutput {
+        id: subscription.id.clone(),
+        arn: subscription.arn.clone(),
+        resource_id: subscription.resource_id.clone(),
+        resource_arn: subscription.resource_arn.clone(),
+        destination_arn: subscription.destination_arn.clone(),
+        service_network_log_type: subscription.service_network_log_type.clone(),
+    }
+}
+
+/// How this operation reports an identifier that names no resource of `kind`.
+fn not_found(
+    kind: crate::state::ResourceKind,
+    identifier: &str,
+) -> CreateAccessLogSubscriptionError {
+    CreateAccessLogSubscriptionErrorModeled::ResourceNotFoundException(
+        crate::state::resource_not_found(kind, identifier),
+    )
+    .into()
+}
+
 /// The `CreateAccessLogSubscription` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -184,18 +217,153 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAccessLogSubscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAccessLogSubscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAccessLogSubscription"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateAccessLogSubscriptionErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the vpc-lattice state store is unavailable".to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::region_of(ctx.parts());
+        // A map's cardinality is one modelled constraint the boundary does not refuse for
+        // this service's `tags` member.
+        if let Err(violation) = crate::state::check_tag_count(input.tags.as_ref()) {
+            return Err(
+                CreateAccessLogSubscriptionErrorModeled::ValidationException(
+                    crate::state::validation_exception(&[violation]),
+                )
+                .into(),
+            );
+        }
+
+        // The MONITORED resource: `resourceIdentifier` names a service network, a service or
+        // a resource configuration, in the bare id or the ARN form, and this service has to
+        // hold it.
+        let Some((kind, resource_id)) =
+            crate::state::subscribed_resource(&input.resource_identifier)
+        else {
+            return Err(not_found(
+                crate::state::UNRESOLVED_SUBSCRIBED_KIND,
+                &input.resource_identifier,
+            ));
+        };
+
+        // The DESTINATION: a resource of another service, which that service has to hold —
+        // asked of it over the in-process transport, with NO state guard held.
+        let Some(destination) =
+            crate::state::AccessLogDestination::of_arn(&input.destination_arn)
+        else {
+            return Err(destination_not_found(&input.destination_arn));
+        };
+        if crate::state::destination_is_absent(ctx, &region, &destination).await {
+            return Err(destination_not_found(&input.destination_arn));
+        }
+
+        let mut store = state.lock();
+        if !store.holds(kind, &resource_id) {
+            return Err(not_found(kind, &input.resource_identifier));
+        }
+
+        // `clientToken` is an @idempotencyToken: a retry carrying the token of a completed
+        // create answers with that same subscription.
+        let token = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::token_key(Self::NAME, token));
+        if let Some(existing) = token
+            .as_ref()
+            .and_then(|key| store.idempotency_tokens.get(key))
+            .and_then(|id| store.access_log_subscriptions.get(id))
+        {
+            if existing.destination_arn != input.destination_arn
+                || existing.resource_id != resource_id
+            {
+                // No recording covers a clientToken replayed with different parameters, so
+                // this message keeps its own wording; the identifier of the conflicting
+                // resource is in it and the resourceType token comes from the shared path.
+                return Err(CreateAccessLogSubscriptionErrorModeled::ConflictException(
+                    crate::state::conflict(
+                        crate::state::ResourceKind::AccessLogSubscription,
+                        &existing.id,
+                        format!(
+                            "AccessLogSubscription {} was already created with this \
+                             clientToken and different parameters.",
+                            existing.id
+                        ),
+                    ),
+                )
+                .into());
+            }
+            return Ok(output_of(existing));
+        }
+
+        // The emulator's own ceiling on stored subscriptions, so a caller looping on create
+        // cannot grow this process without bound.
+        if store.access_log_subscriptions.len() >= crate::state::MAX_ACCESS_LOG_SUBSCRIPTIONS {
+            return Err(CreateAccessLogSubscriptionErrorModeled::ConflictException(
+                crate::state::conflict(
+                    crate::state::ResourceKind::AccessLogSubscription,
+                    &resource_id,
+                    format!(
+                        "this account already holds the maximum of {} access log \
+                         subscriptions",
+                        crate::state::MAX_ACCESS_LOG_SUBSCRIPTIONS
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        let now = std::time::SystemTime::now();
+        let id = crate::state::mint_id(crate::state::PREFIX_ACCESS_LOG_SUBSCRIPTION);
+        let sequence = store.next_sequence();
+        let record = crate::state::AccessLogSubscription {
+            arn: crate::state::arn_for(
+                &region,
+                crate::state::KIND_ACCESS_LOG_SUBSCRIPTION,
+                &id,
+            ),
+            id: id.clone(),
+            // The monitored resource's own ARN, built over the kind that resolved it, so a
+            // read reports the ARN of the resource this subscription really monitors however
+            // the caller addressed it.
+            resource_arn: crate::state::arn_for(&region, kind.arn_kind(), &resource_id),
+            resource_id,
+            destination_arn: input.destination_arn.clone(),
+            service_network_log_type: input.service_network_log_type.clone(),
+            tags: input.tags.clone().unwrap_or_default(),
+            created_at: now,
+            last_updated_at: now,
+            sequence,
+        };
+        if let Some(key) = token {
+            store.idempotency_tokens.record(key, id.clone());
+        }
+        store.access_log_subscriptions.insert(id.clone(), record);
+        let stored = store
+            .access_log_subscriptions
+            .get(&id)
+            .expect("the access log subscription was just inserted under this id");
+        Ok(output_of(stored))
     }
+}
+
+/// How this operation reports a `destinationArn` no supported destination service holds.
+///
+/// The `resourceType` and `resourceId` of the modelled exception are the SUBSCRIPTION's —
+/// the resource the call was about — while the message names the destination the request
+/// carried ([`crate::state::destination_not_found_message`]).
+fn destination_not_found(destination_arn: &str) -> CreateAccessLogSubscriptionError {
+    CreateAccessLogSubscriptionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: crate::state::destination_not_found_message(destination_arn),
+        resource_id: destination_arn.to_string(),
+        resource_type: crate::state::ResourceKind::AccessLogSubscription
+            .wire_type()
+            .to_string(),
+    })
+    .into()
 }

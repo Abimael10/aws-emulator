@@ -355,6 +355,12 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         // keeps are that service's clock and reach the resource off its own report of the
         // session, exactly as a flow's do.
         BEDROCK_SESSION => BEDROCK_SESSION_ATTRIBUTES,
+        // A VPC Lattice service network publishes the ARN its `Ref` also returns, the id
+        // that service minted and the two instants of its clock; a subscription publishes the
+        // same ARN and id beside the monitored resource that service resolved. Only each ARN
+        // and the id inside it are values these naming rules compute a stand-in for.
+        VPCLATTICE_SERVICE_NETWORK => VPCLATTICE_SERVICE_NETWORK_ATTRIBUTES,
+        VPCLATTICE_ACCESS_LOG_SUBSCRIPTION => VPCLATTICE_ACCESS_LOG_SUBSCRIPTION_ATTRIBUTES,
         // A spending limit's ARN is the one return value these naming rules can compute; its
         // `CreatedAt` is Amazon Braket's clock, which reaches the resource off that
         // service's own report of the limit rather than from here, exactly as a knowledge
@@ -1088,6 +1094,14 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // That ARN is also what every call on a limit takes (`UpdateSpendingLimit` and
         // `DeleteSpendingLimit` each address one by it).
         || resource_type == BRAKET_SPENDING_LIMIT
+        // The two Amazon VPC LATTICE types are two more: `CreateServiceNetwork` takes the
+        // network's name and answers the `sn-` id it drew with the ARN built around it, and
+        // `CreateAccessLogSubscription` takes no identifier at all and answers the `als-` id
+        // it drew with its own ARN. Either type's `Ref` returns that ARN, and the id inside it
+        // is what every call of that service on the resource takes, so no name CloudFormation
+        // decides is either and the identity in force is the one that service answered.
+        || resource_type == VPCLATTICE_SERVICE_NETWORK
+        || resource_type == VPCLATTICE_ACCESS_LOG_SUBSCRIPTION
         // The two AWS DIRECT CONNECT types are two more: neither create takes an identifier
         // for the resource — a template declares a gateway's name and Amazon-side ASN, and a
         // group's name and intended resiliency model — and each answers the identifier that

@@ -25,7 +25,14 @@ pub struct ListServiceNetworksOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.vpclattice#ServiceNetworkSummary")]
+/// `ServiceNetworkSummary`, with its schema written out instead of derived because
+/// `createdAt` and `lastUpdatedAt` are `@timestampFormat("date-time")`; the note in
+/// `shared_types` says why that cannot be derived here. Member for member this is the
+/// model's shape: same ids, same order, same indices.
+///
+/// The deserializer is reproduced too: `ListServiceNetworksOutput` above is derived, and its
+/// generated read path for `items` calls
+/// `<ServiceNetworkSummary as DeserializableStruct>::deserialize`.
 #[derive(Debug, Clone, Default)]
 pub struct ServiceNetworkSummary {
     pub id: Option<String>,
@@ -36,5 +43,128 @@ pub struct ServiceNetworkSummary {
     pub number_of_associated_vp_cs: Option<i64>,
     pub number_of_associated_services: Option<i64>,
     pub number_of_associated_resource_configurations: Option<i64>,
+}
+
+#[allow(non_upper_case_globals)]
+impl ServiceNetworkSummary {
+    const M_ID: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("ServiceNetworkSummary", "id", String, 0);
+    const M_NAME: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("ServiceNetworkSummary", "name", String, 1);
+    const M_ARN: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("ServiceNetworkSummary", "arn", String, 2);
+    const M_CREATED_AT: ::aws_smithy_schema::Schema =
+        shared_types::date_time_member_of!("ServiceNetworkSummary", "createdAt", 3);
+    const M_LAST_UPDATED_AT: ::aws_smithy_schema::Schema =
+        shared_types::date_time_member_of!("ServiceNetworkSummary", "lastUpdatedAt", 4);
+    const M_NUMBER_OF_ASSOCIATED_VP_CS: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("ServiceNetworkSummary", "numberOfAssociatedVPCs", Long, 5);
+    const M_NUMBER_OF_ASSOCIATED_SERVICES: ::aws_smithy_schema::Schema = shared_types::member_of!(
+        "ServiceNetworkSummary",
+        "numberOfAssociatedServices",
+        Long,
+        6
+    );
+    const M_NUMBER_OF_ASSOCIATED_RESOURCE_CONFIGURATIONS: ::aws_smithy_schema::Schema =
+        shared_types::member_of!(
+            "ServiceNetworkSummary",
+            "numberOfAssociatedResourceConfigurations",
+            Long,
+            7
+        );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.vpclattice#ServiceNetworkSummary",
+            shared_types::NAMESPACE,
+            "ServiceNetworkSummary",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ID,
+            &Self::M_NAME,
+            &Self::M_ARN,
+            &Self::M_CREATED_AT,
+            &Self::M_LAST_UPDATED_AT,
+            &Self::M_NUMBER_OF_ASSOCIATED_VP_CS,
+            &Self::M_NUMBER_OF_ASSOCIATED_SERVICES,
+            &Self::M_NUMBER_OF_ASSOCIATED_RESOURCE_CONFIGURATIONS,
+        ],
+    );
+}
+
+pub static SERVICE_NETWORK_SUMMARY_SCHEMA: &::aws_smithy_schema::Schema =
+    &ServiceNetworkSummary::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for ServiceNetworkSummary {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(value) = self.id.as_ref() {
+            serializer.write_string(&Self::M_ID, value.as_str())?;
+        }
+        if let Some(value) = self.name.as_ref() {
+            serializer.write_string(&Self::M_NAME, value.as_str())?;
+        }
+        if let Some(value) = self.arn.as_ref() {
+            serializer.write_string(&Self::M_ARN, value.as_str())?;
+        }
+        if let Some(value) = self.created_at.as_ref() {
+            serializer.write_timestamp(&Self::M_CREATED_AT, value)?;
+        }
+        if let Some(value) = self.last_updated_at.as_ref() {
+            serializer.write_timestamp(&Self::M_LAST_UPDATED_AT, value)?;
+        }
+        if let Some(value) = self.number_of_associated_vp_cs.as_ref() {
+            serializer.write_long(&Self::M_NUMBER_OF_ASSOCIATED_VP_CS, *value)?;
+        }
+        if let Some(value) = self.number_of_associated_services.as_ref() {
+            serializer.write_long(&Self::M_NUMBER_OF_ASSOCIATED_SERVICES, *value)?;
+        }
+        if let Some(value) = self
+            .number_of_associated_resource_configurations
+            .as_ref()
+        {
+            serializer.write_long(&Self::M_NUMBER_OF_ASSOCIATED_RESOURCE_CONFIGURATIONS, *value)?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for ServiceNetworkSummary {
+    fn deserialize(
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut summary = Self::default();
+        deserializer.read_struct(&Self::SCHEMA, &mut |member, value| {
+            match member.member_index() {
+                Some(0) => summary.id = Some(value.read_string(&Self::M_ID)?),
+                Some(1) => summary.name = Some(value.read_string(&Self::M_NAME)?),
+                Some(2) => summary.arn = Some(value.read_string(&Self::M_ARN)?),
+                Some(3) => summary.created_at = Some(value.read_timestamp(&Self::M_CREATED_AT)?),
+                Some(4) => {
+                    summary.last_updated_at =
+                        Some(value.read_timestamp(&Self::M_LAST_UPDATED_AT)?);
+                }
+                Some(5) => {
+                    summary.number_of_associated_vp_cs =
+                        Some(value.read_long(&Self::M_NUMBER_OF_ASSOCIATED_VP_CS)?);
+                }
+                Some(6) => {
+                    summary.number_of_associated_services =
+                        Some(value.read_long(&Self::M_NUMBER_OF_ASSOCIATED_SERVICES)?);
+                }
+                Some(7) => {
+                    summary.number_of_associated_resource_configurations = Some(
+                        value.read_long(&Self::M_NUMBER_OF_ASSOCIATED_RESOURCE_CONFIGURATIONS)?,
+                    );
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(summary)
+    }
 }
 

@@ -141,6 +141,15 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
     router.register_service(
         service_com_amazonaws_iot_awsiotservice::EmulatedService::new(Arc::clone(&engine)),
     );
+    // Amazon VPC Lattice, for the `AWS::VpcLattice::ServiceNetwork` and the
+    // `AWS::VpcLattice::AccessLogSubscription` a stack really creates there, so a suite that
+    // deploys an access-logging estate reads the network and the subscription back through
+    // that service's own wire, by the ARNs it minted.
+    router.register_service(
+        service_com_amazonaws_vpclattice_mercurycontrolplane::EmulatedService::new(Arc::clone(
+            &engine,
+        )),
+    );
     // Amazon CloudFront, for the `AWS::CloudFront::Distribution` and the
     // `AWS::CloudFront::OriginAccessControl` a stack really creates there, so a suite that
     // deploys a content-delivery estate reads the distribution and the control back through

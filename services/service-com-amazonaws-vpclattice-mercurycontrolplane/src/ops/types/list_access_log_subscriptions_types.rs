@@ -26,7 +26,16 @@ pub struct ListAccessLogSubscriptionsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.vpclattice#AccessLogSubscriptionSummary")]
+/// `AccessLogSubscriptionSummary`, with its schema written out instead of derived because
+/// `createdAt` and `lastUpdatedAt` are `@timestampFormat("date-time")`; the note in
+/// `shared_types` says why that cannot be derived here. Member for member this is the
+/// model's shape: same ids, same order, same indices.
+///
+/// The deserializer is reproduced too: `ListAccessLogSubscriptionsOutput` above is derived,
+/// and its generated read path for `items` calls
+/// `<AccessLogSubscriptionSummary as DeserializableStruct>::deserialize`. Every member the
+/// model requires is non-optional here, so this shape has no `Default`: the read builds each
+/// member before the summary exists.
 #[derive(Debug, Clone)]
 pub struct AccessLogSubscriptionSummary {
     pub id: String,
@@ -37,5 +46,114 @@ pub struct AccessLogSubscriptionSummary {
     pub service_network_log_type: Option<String>,
     pub created_at: ::aws_smithy_types::DateTime,
     pub last_updated_at: ::aws_smithy_types::DateTime,
+}
+
+#[allow(non_upper_case_globals)]
+impl AccessLogSubscriptionSummary {
+    const M_ID: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("AccessLogSubscriptionSummary", "id", String, 0);
+    const M_ARN: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("AccessLogSubscriptionSummary", "arn", String, 1);
+    const M_RESOURCE_ID: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("AccessLogSubscriptionSummary", "resourceId", String, 2);
+    const M_RESOURCE_ARN: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("AccessLogSubscriptionSummary", "resourceArn", String, 3);
+    const M_DESTINATION_ARN: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("AccessLogSubscriptionSummary", "destinationArn", String, 4);
+    // `ServiceNetworkLogType` is an enum shape, which the generator writes as
+    // `ShapeType::String`.
+    const M_SERVICE_NETWORK_LOG_TYPE: ::aws_smithy_schema::Schema = shared_types::member_of!(
+        "AccessLogSubscriptionSummary",
+        "serviceNetworkLogType",
+        String,
+        5
+    );
+    const M_CREATED_AT: ::aws_smithy_schema::Schema =
+        shared_types::date_time_member_of!("AccessLogSubscriptionSummary", "createdAt", 6);
+    const M_LAST_UPDATED_AT: ::aws_smithy_schema::Schema =
+        shared_types::date_time_member_of!("AccessLogSubscriptionSummary", "lastUpdatedAt", 7);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.vpclattice#AccessLogSubscriptionSummary",
+            shared_types::NAMESPACE,
+            "AccessLogSubscriptionSummary",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ID,
+            &Self::M_ARN,
+            &Self::M_RESOURCE_ID,
+            &Self::M_RESOURCE_ARN,
+            &Self::M_DESTINATION_ARN,
+            &Self::M_SERVICE_NETWORK_LOG_TYPE,
+            &Self::M_CREATED_AT,
+            &Self::M_LAST_UPDATED_AT,
+        ],
+    );
+}
+
+pub static ACCESS_LOG_SUBSCRIPTION_SUMMARY_SCHEMA: &::aws_smithy_schema::Schema =
+    &AccessLogSubscriptionSummary::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for AccessLogSubscriptionSummary {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        serializer.write_string(&Self::M_ID, self.id.as_str())?;
+        serializer.write_string(&Self::M_ARN, self.arn.as_str())?;
+        serializer.write_string(&Self::M_RESOURCE_ID, self.resource_id.as_str())?;
+        serializer.write_string(&Self::M_RESOURCE_ARN, self.resource_arn.as_str())?;
+        serializer.write_string(&Self::M_DESTINATION_ARN, self.destination_arn.as_str())?;
+        if let Some(value) = self.service_network_log_type.as_ref() {
+            serializer.write_string(&Self::M_SERVICE_NETWORK_LOG_TYPE, value.as_str())?;
+        }
+        serializer.write_timestamp(&Self::M_CREATED_AT, &self.created_at)?;
+        serializer.write_timestamp(&Self::M_LAST_UPDATED_AT, &self.last_updated_at)?;
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for AccessLogSubscriptionSummary {
+    fn deserialize(
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut id = String::new();
+        let mut arn = String::new();
+        let mut resource_id = String::new();
+        let mut resource_arn = String::new();
+        let mut destination_arn = String::new();
+        let mut service_network_log_type: Option<String> = None;
+        let mut created_at = ::aws_smithy_types::DateTime::from_secs(0);
+        let mut last_updated_at = ::aws_smithy_types::DateTime::from_secs(0);
+        deserializer.read_struct(&Self::SCHEMA, &mut |member, value| {
+            match member.member_index() {
+                Some(0) => id = value.read_string(&Self::M_ID)?,
+                Some(1) => arn = value.read_string(&Self::M_ARN)?,
+                Some(2) => resource_id = value.read_string(&Self::M_RESOURCE_ID)?,
+                Some(3) => resource_arn = value.read_string(&Self::M_RESOURCE_ARN)?,
+                Some(4) => destination_arn = value.read_string(&Self::M_DESTINATION_ARN)?,
+                Some(5) => {
+                    service_network_log_type =
+                        Some(value.read_string(&Self::M_SERVICE_NETWORK_LOG_TYPE)?);
+                }
+                Some(6) => created_at = value.read_timestamp(&Self::M_CREATED_AT)?,
+                Some(7) => last_updated_at = value.read_timestamp(&Self::M_LAST_UPDATED_AT)?,
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(Self {
+            id,
+            arn,
+            resource_id,
+            resource_arn,
+            destination_arn,
+            service_network_log_type,
+            created_at,
+            last_updated_at,
+        })
+    }
 }
 

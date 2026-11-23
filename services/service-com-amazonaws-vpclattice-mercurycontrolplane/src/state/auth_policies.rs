@@ -125,7 +125,8 @@ impl ComAmazonawsVpclatticeMercurycontrolplaneState {
             | ResourceKind::Listener
             | ResourceKind::Rule
             | ResourceKind::TargetGroup
-            | ResourceKind::ResourceConfiguration => None,
+            | ResourceKind::ResourceConfiguration
+            | ResourceKind::AccessLogSubscription => None,
         }
     }
 

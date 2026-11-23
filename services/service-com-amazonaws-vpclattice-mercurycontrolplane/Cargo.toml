@@ -44,6 +44,9 @@ aws-sdk-lambda = { version = "1", default-features = false }
 form_urlencoded = "1"
 
 [dev-dependencies]
+# Declares one suite module per `tests/all/<name>.rs`, so the single integration-test target
+# is a file list nobody maintains by hand. TEST-ONLY.
+automod = { workspace = true }
 # The Lambda service, so the data-plane suites can create a real function through the service
 # that OWNS functions and watch what a `forward` to a `LAMBDA` target group answers with.
 # TEST-ONLY — `src/` reaches that service over the in-process callback instead.

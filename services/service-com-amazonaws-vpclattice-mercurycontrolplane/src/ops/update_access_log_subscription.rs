@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAccessLogSubscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAccessLogSubscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAccessLogSubscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The one call that changes a subscription that exists, and the one member it changes is
+//! the DESTINATION. The new destination is resolved against the service that owns it before
+//! anything is written ([`crate::state::AccessLogDestination`]), exactly as the create
+//! resolves its own: a destination nothing holds would leave the subscription delivering
+//! into nowhere, so it is the modelled `ResourceNotFoundException` (HTTP 404) and the stored
+//! destination is left where it was.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +166,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAccessLogSubscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAccessLogSubscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAccessLogSubscription"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateAccessLogSubscriptionErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the vpc-lattice state store is unavailable".to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::region_of(ctx.parts());
+        // The subscription has to exist before its destination is resolved, so a call about
+        // a subscription this store does not hold asks the destination's owning service
+        // nothing.
+        if state
+            .lock()
+            .access_log_subscription(&input.access_log_subscription_identifier)
+            .is_none()
+        {
+            return Err(not_found(&input.access_log_subscription_identifier));
+        }
+
+        // The NEW destination, resolved where its owning service holds it — asked of that
+        // service over the in-process transport, with NO state guard held.
+        let Some(destination) =
+            crate::state::AccessLogDestination::of_arn(&input.destination_arn)
+        else {
+            return Err(destination_not_found(&input.destination_arn));
+        };
+        if crate::state::destination_is_absent(ctx, &region, &destination).await {
+            return Err(destination_not_found(&input.destination_arn));
+        }
+
+        let mut store = state.lock();
+        let Some(id) = store
+            .access_log_subscription(&input.access_log_subscription_identifier)
+            .map(|subscription| subscription.id.clone())
+        else {
+            return Err(not_found(&input.access_log_subscription_identifier));
+        };
+        let now = std::time::SystemTime::now();
+        let Some(subscription) = store.access_log_subscriptions.get_mut(&id) else {
+            return Err(not_found(&input.access_log_subscription_identifier));
+        };
+        subscription.destination_arn = input.destination_arn.clone();
+        subscription.last_updated_at = now;
+        Ok(UpdateAccessLogSubscriptionOutput {
+            id: subscription.id.clone(),
+            arn: subscription.arn.clone(),
+            resource_id: subscription.resource_id.clone(),
+            resource_arn: subscription.resource_arn.clone(),
+            destination_arn: subscription.destination_arn.clone(),
+        })
     }
+}
+
+/// How this operation reports an identifier that names no subscription this store holds.
+fn not_found(identifier: &str) -> UpdateAccessLogSubscriptionError {
+    UpdateAccessLogSubscriptionErrorModeled::ResourceNotFoundException(
+        crate::state::resource_not_found(
+            crate::state::ResourceKind::AccessLogSubscription,
+            identifier,
+        ),
+    )
+    .into()
+}
+
+/// How this operation reports a `destinationArn` no supported destination service holds,
+/// which is the same refusal the create answers for one ([`crate::state`]).
+fn destination_not_found(destination_arn: &str) -> UpdateAccessLogSubscriptionError {
+    UpdateAccessLogSubscriptionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: crate::state::destination_not_found_message(destination_arn),
+        resource_id: destination_arn.to_string(),
+        resource_type: crate::state::ResourceKind::AccessLogSubscription
+            .wire_type()
+            .to_string(),
+    })
+    .into()
 }

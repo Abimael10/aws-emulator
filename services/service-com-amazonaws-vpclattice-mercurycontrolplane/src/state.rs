@@ -44,6 +44,7 @@
 //! ComAmazonawsVpclatticeMercurycontrolplaneState::add_tags), [`remove_tags`](
 //! ComAmazonawsVpclatticeMercurycontrolplaneState::remove_tags)).
 
+mod access_log_subscriptions;
 mod announced_dns;
 mod auth_policies;
 mod data_plane_addresses;
@@ -51,6 +52,11 @@ mod tags;
 mod targets;
 mod vpc_associations;
 
+pub use access_log_subscriptions::{
+    destination_is_absent, destination_not_found_message, subscribed_resource,
+    AccessLogDestination, AccessLogSubscription, KIND_ACCESS_LOG_SUBSCRIPTION,
+    MAX_ACCESS_LOG_SUBSCRIPTIONS, PREFIX_ACCESS_LOG_SUBSCRIPTION, UNRESOLVED_SUBSCRIBED_KIND,
+};
 pub use announced_dns::{
     announced_dns_entry, announced_dns_name, service_label, AnnouncedService,
 };
@@ -159,11 +165,13 @@ pub enum ResourceKind {
     TargetGroup,
     /// A resource configuration (`rcfg-…`).
     ResourceConfiguration,
+    /// An access log subscription (`als-…`).
+    AccessLogSubscription,
 }
 
 impl ResourceKind {
     /// How many kinds there are, so a per-kind cache can hold one slot each.
-    pub const COUNT: usize = 8;
+    pub const COUNT: usize = 9;
 
     /// This kind's slot in a per-kind array ([`Self::COUNT`] wide).
     pub const fn slot(self) -> usize {
@@ -176,6 +184,7 @@ impl ResourceKind {
             Self::TargetGroup => 5,
             Self::ResourceConfiguration => 6,
             Self::VpcAssociation => 7,
+            Self::AccessLogSubscription => 8,
         }
     }
 
@@ -191,6 +200,7 @@ impl ResourceKind {
             Self::Rule => KIND_RULE,
             Self::TargetGroup => KIND_TARGET_GROUP,
             Self::ResourceConfiguration => KIND_RESOURCE_CONFIGURATION,
+            Self::AccessLogSubscription => KIND_ACCESS_LOG_SUBSCRIPTION,
         }
     }
 
@@ -205,6 +215,7 @@ impl ResourceKind {
             Self::Rule => PREFIX_RULE,
             Self::TargetGroup => PREFIX_TARGET_GROUP,
             Self::ResourceConfiguration => PREFIX_RESOURCE_CONFIGURATION,
+            Self::AccessLogSubscription => PREFIX_ACCESS_LOG_SUBSCRIPTION,
         }
     }
 
@@ -228,6 +239,7 @@ impl ResourceKind {
             Self::Rule => "RULE",
             Self::TargetGroup => "TARGET_GROUP",
             Self::ResourceConfiguration => "RESOURCE_CONFIGURATION",
+            Self::AccessLogSubscription => "ACCESS_LOG_SUBSCRIPTION",
         }
     }
 
@@ -251,6 +263,7 @@ impl ResourceKind {
             Self::Rule => "Rule",
             Self::TargetGroup => "TargetGroup",
             Self::ResourceConfiguration => "ResourceConfiguration",
+            Self::AccessLogSubscription => "AccessLogSubscription",
         }
     }
 
@@ -267,6 +280,7 @@ impl ResourceKind {
             Self::Rule => "rule",
             Self::TargetGroup => "target group",
             Self::ResourceConfiguration => "resource configuration",
+            Self::AccessLogSubscription => "access log subscription",
         }
     }
 
@@ -315,7 +329,9 @@ impl ResourceKind {
             Self::Rule => Some(RULE_NAME_PATTERN),
             Self::TargetGroup => Some(TARGET_GROUP_NAME_PATTERN),
             Self::ResourceConfiguration => Some(RESOURCE_CONFIGURATION_NAME_PATTERN),
-            Self::ServiceAssociation | Self::VpcAssociation => None,
+            // Neither an association nor an access log subscription has a name: each is
+            // named by what it binds.
+            Self::ServiceAssociation | Self::VpcAssociation | Self::AccessLogSubscription => None,
         }
     }
 }
@@ -1596,6 +1612,10 @@ pub struct ComAmazonawsVpclatticeMercurycontrolplaneState {
     /// create that opened the listener and dropped by [`Self::remove_listener`] — which is
     /// what withdraws the addresses — so the listener ceilings bound this map too.
     pub data_plane_addresses: HashMap<String, ListenerAddresses>,
+    /// Keyed by `als-…` id. At most [`MAX_ACCESS_LOG_SUBSCRIPTIONS`] entries, and every
+    /// subscription of a deleted service network or service goes with it
+    /// ([`ComAmazonawsVpclatticeMercurycontrolplaneState::remove_access_log_subscriptions_of`]).
+    pub access_log_subscriptions: HashMap<String, AccessLogSubscription>,
     /// `<operation>/<clientToken>` -> the id the first call created, so a retry with the
     /// same `@idempotencyToken` returns that resource instead of creating a second one.
     pub idempotency_tokens: IdempotencyTokens,
@@ -2036,6 +2056,9 @@ impl ComAmazonawsVpclatticeMercurycontrolplaneState {
             // `CreateResourceConfiguration` is still a 501, so no resource
             // configuration can be stored for one to be found.
             ResourceKind::ResourceConfiguration => false,
+            ResourceKind::AccessLogSubscription => {
+                self.access_log_subscriptions.contains_key(id)
+            }
         }
     }
 
@@ -2448,6 +2471,7 @@ pub fn check_resource_name(
 /// one slot per kind.
 fn compiled_pattern(kind: ResourceKind) -> Option<&'static ::fancy_regex::Regex> {
     static COMPILED: [::std::sync::OnceLock<::fancy_regex::Regex>; ResourceKind::COUNT] = [
+        ::std::sync::OnceLock::new(),
         ::std::sync::OnceLock::new(),
         ::std::sync::OnceLock::new(),
         ::std::sync::OnceLock::new(),

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAccessLogSubscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAccessLogSubscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAccessLogSubscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure READ of the subscription slice: every member it reports is one
+//! `CreateAccessLogSubscription` or `UpdateAccessLogSubscription` persisted, and nothing a
+//! later caller sees changes. An identifier this store holds no subscription for is the
+//! modelled `ResourceNotFoundException` (HTTP 404).
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +164,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAccessLogSubscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAccessLogSubscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAccessLogSubscription"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetAccessLogSubscriptionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the vpc-lattice state store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let store = state.lock();
+        let Some(subscription) =
+            store.access_log_subscription(&input.access_log_subscription_identifier)
+        else {
+            return Err(
+                GetAccessLogSubscriptionErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(
+                        crate::state::ResourceKind::AccessLogSubscription,
+                        &input.access_log_subscription_identifier,
+                    ),
+                )
+                .into(),
+            );
+        };
+        Ok(GetAccessLogSubscriptionOutput {
+            id: subscription.id.clone(),
+            arn: subscription.arn.clone(),
+            resource_id: subscription.resource_id.clone(),
+            resource_arn: subscription.resource_arn.clone(),
+            destination_arn: subscription.destination_arn.clone(),
+            service_network_log_type: subscription.service_network_log_type.clone(),
+            created_at: crate::state::timestamp(subscription.created_at),
+            last_updated_at: crate::state::timestamp(subscription.last_updated_at),
+        })
     }
 }
