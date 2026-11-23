@@ -33,9 +33,13 @@ sha2 = { workspace = true }
 uuid = "1"
 # `event_pattern`: the ONE reading and evaluation of an EventBridge event
 # pattern, which is the language a subscriber's `FilterConfiguration` filters
-# are written in; `arn`: the one parse of a target ARN, so this crate does not
-# split a caller's ARN its own way (`state::subscribers`,
-# `state::subscriber_delivery`).
+# are written in; `jsonata`: this workspace's one BOUNDED seam onto the
+# maintained JSONata interpreter, which is how a subscriber's own `{% … %}`
+# expressions are evaluated — the ceilings that confine an engine evaluating
+# caller-written text are stated and met there, and this crate adds its own
+# per-call budget on top (`state::event_expressions`); `arn`: the one parse of a
+# target ARN, so this crate does not split a caller's ARN its own way
+# (`state::subscribers`, `state::subscriber_delivery`).
 service-common = { path = "../common" }
 # The engine behind a modelled `@pattern` at the request boundary, asked in
 # `service::unapplied_patterns` whether that boundary can compile one at all.

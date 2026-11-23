@@ -11,13 +11,13 @@
 //! rather than a failure of this module.
 //!
 //! The record is a DOCUMENT about the delivery that did not happen, as recorded
-//! behaviour shapes it: the subscriber whose delivery failed, the target it was
-//! for, the CONDITION it failed under and the sentence AWS words for that
-//! condition, how many retries were spent, and the identity of each event that
-//! was not delivered ([`record`]) — a POINTER at the events rather than a copy
-//! of them, since the bus they were published to retains them. One record per
-//! failure, so a window whose deliveries all failed the same way is one record
-//! listing them all.
+//! behaviour shapes it: the bus the events were published to, the subscriber
+//! whose delivery failed, the target it was for, the CONDITION it failed under
+//! and the sentence AWS words for that condition, how many retries were spent,
+//! and the identity of each event that was not delivered ([`record`]) — a
+//! POINTER at the events rather than a copy of them, since the bus they were
+//! published to retains them. One record per failure, so a window whose
+//! deliveries all failed the same way is one record listing them all.
 //!
 //! The write itself is NOT held to the subscriber's role: the record exists so a
 //! client can see a delivery that did not happen, and a delivery that did not
@@ -30,13 +30,20 @@ use ::serde_json::json;
 use super::{Delivery, Subscriber, Target};
 
 /// The condition a delivery this service COULD NOT MAKE is recorded under: the
-/// permissions in force on the acting identity did not allow it, or the target
-/// was not there to take it.
+/// permissions in force on the acting identity did not allow it.
 ///
-/// Recorded behaviour words both as one class, because the sentence it states
-/// for them ([`Failure::inaccessible`]) is about both: the target may not exist,
-/// or the role may not be allowed to reach it.
+/// Recorded behaviour words the sentence it states
+/// ([`Failure::inaccessible`]) about both halves of what such an answer can
+/// mean: the target may not exist, or the role may not be allowed to reach it.
 pub(super) const ACCESS_DENIED: &str = "ACCESS_DENIED";
+
+/// The condition a delivery whose TARGET IS NOT THERE is recorded under.
+///
+/// It is held apart from [`ACCESS_DENIED`] because the two are different things
+/// for an operator to act on — a permission to grant, or a resource to create —
+/// and the answer the target's service gave says which: a service that answers
+/// "no such queue" has decided the resource, not the identity.
+pub(super) const RESOURCE_NOT_FOUND: &str = "RESOURCE_NOT_FOUND";
 
 /// The condition a delivery is recorded under when the answer it failed with is
 /// not one about reaching the target at all: what there is to go on is that
@@ -49,6 +56,21 @@ pub(super) const DELIVERY_FAILED: &str = "DELIVERY_FAILED";
 /// answer a retry changes, and no other failure is retried either, so no record
 /// may report attempts nothing made.
 const RETRY_ATTEMPTS_SPENT: u32 = 0;
+
+/// Which bound of the subscriber's `RetryPolicy` the failed delivery exhausted,
+/// as the record names it.
+///
+/// The policy bounds a delivery two ways — `MaxRetryAttempts`, "maximum number
+/// of retry attempts", and `MaxEventAgeInSeconds`, "maximum age of an event in
+/// seconds before it is discarded" — and the record says which one ended this
+/// delivery. It is always the ATTEMPTS, whichever of the two the subscriber's
+/// policy states and whether it states either: this slice attempts a delivery
+/// once and spends the attempts the policy allows
+/// ([`RETRY_ATTEMPTS_SPENT`]), and nothing here discards an event for its AGE,
+/// so no record may name the age bound for a delivery no clock stopped. A
+/// policy that names only the age bound is therefore recorded under the
+/// attempts bound too, because that is the one this delivery ended on.
+const EXHAUSTED_RETRY_CONDITION: &str = "MaximumRetryAttempts";
 
 /// The wire error code an emulated service answers for an operation nobody has
 /// implemented yet (`crate::scaffolded`), which is a gap in this emulator rather
@@ -102,19 +124,35 @@ pub(super) struct Failure {
 }
 
 impl Failure {
-    /// The failure of a delivery this service could not make to `target_arn`:
-    /// the identity was refused, or the target was not there.
+    /// The failure of a delivery this service could not make to `target_arn`
+    /// because the identity it would have been made as was refused.
     ///
-    /// The sentence is the one AWS words for that condition, whose only
-    /// variable part is the target the delivery was for — read off the
-    /// subscriber's own configuration.
+    /// The sentence is the one AWS words for a target a delivery could not
+    /// reach, whose only variable part is the target the delivery was for — read
+    /// off the subscriber's own configuration.
     pub(super) fn inaccessible(target_arn: &str) -> Self {
         Self {
             code: ACCESS_DENIED,
-            message: format!(
-                "EventBridge could not access {target_arn}. Check that it exists and that the \
-                 subscriber's delivery role is allowed to access it."
-            ),
+            message: unreachable_target(target_arn),
+        }
+    }
+
+    /// The failure of a delivery to a `target_arn` whose own service answered
+    /// that no such resource is there.
+    pub(super) fn absent(target_arn: &str) -> Self {
+        Self {
+            code: RESOURCE_NOT_FOUND,
+            message: unreachable_target(target_arn),
+        }
+    }
+
+    /// The failure of a delivery the target itself answered about rather than
+    /// about reaching it: the answer is what there is to go on, so the record
+    /// carries it in full.
+    pub(super) fn refused(message: String) -> Self {
+        Self {
+            code: DELIVERY_FAILED,
+            message,
         }
     }
 
@@ -142,21 +180,35 @@ impl Failure {
     }
 
     /// The failure an answer carrying the error code `code` is recorded as: one
-    /// about REACHING the target is the class recorded behaviour words a
-    /// sentence for, and every other answer is reported as that answer.
+    /// about REACHING the target is recorded under the condition that answer
+    /// decided — the identity, or the resource — and every other answer is
+    /// reported as that answer.
     ///
     /// The condition is this service's own classification and never the target
     /// service's error code, so a consumer of the destination keys its alarms
     /// off the same few conditions whichever service the target lives in.
     fn classified(code: &str, message: &str, target_arn: &str) -> Self {
-        if ACCESS_DENIED_CODES.contains(&code) || ABSENT_RESOURCE_CODES.contains(&code) {
+        if ACCESS_DENIED_CODES.contains(&code) {
             return Self::inaccessible(target_arn);
+        }
+        if ABSENT_RESOURCE_CODES.contains(&code) {
+            return Self::absent(target_arn);
         }
         Self {
             code: DELIVERY_FAILED,
             message: message.to_string(),
         }
     }
+}
+
+/// The sentence a delivery that did not REACH its target is recorded with: the
+/// one AWS words for that class, whose only variable part is the target the
+/// delivery was for.
+fn unreachable_target(target_arn: &str) -> String {
+    format!(
+        "EventBridge could not access {target_arn}. Check that it exists and that the \
+         subscriber's delivery role is allowed to access it."
+    )
 }
 
 /// Record the deliveries of `undelivered` where this subscriber's
@@ -225,10 +277,11 @@ fn by_failure<'a>(
 /// The record of the deliveries `failed` that did not happen.
 ///
 /// Every member is read off the stored subscriber, the deliveries that were
-/// attempted and the answer they failed with: the subscriber whose delivery it
-/// was, the target it was for, the condition and its sentence, the retries spent
-/// ([`RETRY_ATTEMPTS_SPENT`]) and the identity of each event that was not
-/// delivered.
+/// attempted and the answer they failed with: the bus the events were published
+/// to, the subscriber whose delivery it was, the target it was for, the
+/// condition and its sentence, the retries spent ([`RETRY_ATTEMPTS_SPENT`]) with
+/// the bound that ended the delivery ([`EXHAUSTED_RETRY_CONDITION`]), and the
+/// identity of each event that was not delivered.
 fn record(
     subscriber: &Subscriber,
     target_arn: &str,
@@ -236,14 +289,16 @@ fn record(
     failed: &[&Delivery],
 ) -> ::serde_json::Value {
     json!({
+        "busArn": subscriber.event_bus_arn,
         "subscriberArn": subscriber.arn,
         "targetArn": target_arn,
         "errorCode": failure.code,
         "errorMessage": failure.message,
         "retryAttempts": RETRY_ATTEMPTS_SPENT,
+        "exhaustedRetryCondition": EXHAUSTED_RETRY_CONDITION,
         "failedMessages": failed
             .iter()
-            .map(|delivery| json!({ "eventId": delivery.event_id }))
+            .map(|delivery| json!({ "eventId": delivery.event_id() }))
             .collect::<Vec<::serde_json::Value>>(),
     })
 }
@@ -275,6 +330,11 @@ async fn write(
                 .map_err(|error| rendered(&error))
                 .map(|_| ())
         }
+        // "An Amazon SQS queue is the supported destination"
+        // (`OnFailureConfiguration$Arn`), and the member's own pattern admits
+        // only a queue ARN, so a value naming an event bus of this service is
+        // no destination a record is written to.
+        Target::EventBus { arn, .. } => Err(format!("{arn} names no destination for a record")),
     };
     if let Err(answered) = answered {
         ::tracing::warn!(
@@ -297,19 +357,19 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{Failure, ACCESS_DENIED, DELIVERY_FAILED};
+    use super::{Failure, ACCESS_DENIED, DELIVERY_FAILED, RESOURCE_NOT_FOUND};
 
     /// The target a failure below is about.
     const TARGET: &str = "arn:aws:sns:us-west-2:000000000000:orders";
 
     /// RULE: the condition a failed delivery is recorded under is this
-    /// service's own classification of the answer — one about REACHING the
-    /// target, which is the class AWS words one sentence for, or the answer
-    /// itself — and never the target service's own error code.
+    /// service's own classification of the answer — the IDENTITY was refused,
+    /// the RESOURCE is not there, or the answer itself — and never the target
+    /// service's own error code.
     ///
-    /// The rows differ along which service answered and which of the two classes
-    /// its code belongs to, which is what the rule generalises over. Each code
-    /// is one the model of the service a target lives in declares
+    /// The rows differ along which service answered and which of the three
+    /// classes its code belongs to, which is what the rule generalises over.
+    /// Each code is one the model of the service a target lives in declares
     /// (`smithy_query(query="operation", operation="SendMessageBatch")` of
     /// Amazon SQS, `operation="PublishBatch"` of Amazon SNS).
     #[test]
@@ -339,9 +399,9 @@ mod tests {
             (
                 "the queue is not there",
                 "AWS.SimpleQueueService.NonExistentQueue",
-                ACCESS_DENIED,
+                RESOURCE_NOT_FOUND,
             ),
-            ("the topic is not there", "NotFound", ACCESS_DENIED),
+            ("the topic is not there", "NotFound", RESOURCE_NOT_FOUND),
             (
                 "the batch was larger than the service takes",
                 "TooManyEntriesInBatchRequest",
@@ -360,7 +420,14 @@ mod tests {
                 classified.code, expected,
                 "case {case:?}: expected {expected:?}, got {classified:?}"
             );
-            if expected == ACCESS_DENIED {
+            if expected == DELIVERY_FAILED {
+                // Every answer that is not about reaching the target is
+                // reported AS that answer.
+                assert_eq!(
+                    classified.message, "what the service answered",
+                    "case {case:?}: expected the answer the service gave, got {classified:?}"
+                );
+            } else {
                 // The class AWS words one sentence for: the only variable part
                 // of it is the target the delivery was for.
                 assert_eq!(
@@ -371,12 +438,6 @@ mod tests {
                 assert!(
                     classified.message.contains(TARGET),
                     "case {case:?}: the sentence must name the target, got {classified:?}"
-                );
-            } else {
-                // Every other answer is reported AS that answer.
-                assert_eq!(
-                    classified.message, "what the service answered",
-                    "case {case:?}: expected the answer the service gave, got {classified:?}"
                 );
             }
         }

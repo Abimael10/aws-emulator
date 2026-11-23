@@ -231,7 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // log's events behind its position, and they are due as soon as it
         // exists. A `LATEST` subscriber is at the end of the log and is owed
         // nothing yet, so this delivers nothing for it.
-        crate::state::subscriber_delivery::deliver_due(ctx.callback(), &created.due).await;
+        crate::state::subscriber_delivery::deliver_due(&store, ctx.callback(), &created.due).await;
 
         Ok(created.response)
     }

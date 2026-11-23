@@ -469,9 +469,9 @@ async fn an_event_reaches_the_subscribers_whose_filters_select_it() {
             delivered: 2,
         },
         Row {
-            case: "a DATA-scoped filter on the event's own payload",
+            case: "a DATA-scoped filter on the event as it is delivered",
             filters: Some(filters(vec![filter(
-                r#"{"orderId":["A-1"]}"#,
+                r#"{"detail":{"orderId":["A-1"]}}"#,
                 eventsv2::state::FILTER_SCOPE_DATA,
             )])),
             state: None,
@@ -481,7 +481,28 @@ async fn an_event_reaches_the_subscribers_whose_filters_select_it() {
         Row {
             case: "a DATA-scoped filter no event matches",
             filters: Some(filters(vec![filter(
-                r#"{"orderId":["Z-9"]}"#,
+                r#"{"detail":{"orderId":["Z-9"]}}"#,
+                eventsv2::state::FILTER_SCOPE_DATA,
+            )])),
+            state: None,
+            transformer: None,
+            delivered: 0,
+        },
+        Row {
+            case: "a DATA-scoped filter on an envelope member beside the payload",
+            filters: Some(filters(vec![filter(
+                r#"{"source":["orders.service"],"detail-type":["order.created"]}"#,
+                eventsv2::state::FILTER_SCOPE_DATA,
+            )])),
+            state: None,
+            transformer: None,
+            delivered: 1,
+        },
+        Row {
+            case: "a DATA-scoped filter naming the payload at the top level, which the \
+                   delivered event does not carry there",
+            filters: Some(filters(vec![filter(
+                r#"{"orderId":["A-1"]}"#,
                 eventsv2::state::FILTER_SCOPE_DATA,
             )])),
             state: None,
@@ -516,7 +537,7 @@ async fn an_event_reaches_the_subscribers_whose_filters_select_it() {
                     eventsv2::state::FILTER_SCOPE_METADATA,
                 ),
                 filter(
-                    r#"{"orderId":["A-1"]}"#,
+                    r#"{"detail":{"orderId":["A-1"]}}"#,
                     eventsv2::state::FILTER_SCOPE_DATA,
                 ),
             ])),
@@ -532,7 +553,7 @@ async fn an_event_reaches_the_subscribers_whose_filters_select_it() {
                     eventsv2::state::FILTER_SCOPE_METADATA,
                 ),
                 filter(
-                    r#"{"orderId":["B-2"]}"#,
+                    r#"{"detail":{"orderId":["B-2"]}}"#,
                     eventsv2::state::FILTER_SCOPE_DATA,
                 ),
             ])),
@@ -677,8 +698,10 @@ async fn an_event_reaches_the_subscribers_whose_filters_select_it() {
                     "case {case:?}: a delivery must carry the publisher's metadata, got {body}"
                 );
                 assert!(
-                    body["Data"]["orderId"].is_string(),
-                    "case {case:?}: a delivery must carry the event's payload, got {body}"
+                    body["Data"]["detail"]["orderId"].is_string(),
+                    "case {case:?}: a delivery must carry the event's data, which for a \
+                     structured event is the envelope carrying the payload under detail, got \
+                     {body}"
                 );
             } else {
                 // An untransformed delivery is the event envelope: the

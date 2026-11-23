@@ -91,8 +91,12 @@ pub const POINT_TYPE_HORIZON: &str = "HORIZON";
 /// of [`crate::ops::types::POINT_TYPE_VALUES`].
 pub const POINT_TYPE_TIMESTAMP: &str = "TIMESTAMP";
 
-/// `FilterScope::DATA` — the filter is matched against the event's own payload.
-/// An entry of [`crate::ops::types::FILTER_SCOPE_VALUES`].
+/// `FilterScope::DATA` — the filter is matched against the event's own DATA,
+/// which is the event as this service represents it: the envelope written
+/// around a structured entry's payload (so a clause names `detail` to reach
+/// into that payload), and a raw entry's pre-shaped payload as its publisher
+/// sent it ([`DeliveredEvent::data`]). An entry of
+/// [`crate::ops::types::FILTER_SCOPE_VALUES`].
 pub const FILTER_SCOPE_DATA: &str = "DATA";
 
 /// `FilterScope::METADATA` — the filter is matched against the metadata the
@@ -119,6 +123,13 @@ pub const TRANSFORMER_TYPE_RAW: &str = "RAW";
 /// service models an event as. An entry of
 /// [`crate::ops::types::TRANSFORMER_TYPE_VALUES`].
 pub const TRANSFORMER_TYPE_WITH_METADATA: &str = "WITH_METADATA";
+
+/// `TransformerType::JSONATA` — "Transform the event using a JSONata
+/// expression": the target is handed what the subscriber's
+/// `JsonataConfiguration$Expression` produces over the event
+/// ([`super::event_expressions`]). An entry of
+/// [`crate::ops::types::TRANSFORMER_TYPE_VALUES`].
+pub const TRANSFORMER_TYPE_JSONATA: &str = "JSONATA";
 
 /// The member of a delivered event envelope carrying the envelope's own schema
 /// version, which is the fixed text [`ENVELOPE_VERSION_VALUE`].
@@ -158,8 +169,8 @@ const ENVELOPE_RESOURCES: &str = "resources";
 /// publishing entry's `Detail` as a document.
 const ENVELOPE_DETAIL: &str = "detail";
 
-/// The member of a delivered event that carries the event's payload — the
-/// `DATA` a filter of that scope is matched against.
+/// The member of a delivered event that carries the event's data — the `DATA` a
+/// filter of that scope is matched against ([`DeliveredEvent::data`]).
 pub const DELIVERED_DATA: &str = "Data";
 
 /// The member of a delivered event that carries the publisher's metadata — the
@@ -329,6 +340,46 @@ impl Subscriber {
         } else {
             DELIVERY_TYPE_LIVE
         }
+    }
+}
+
+/// A subscriber for this crate's own unit tests: one on a bus of
+/// [`super::DEFAULT_REGION`], delivering to a queue, with every optional member
+/// unset so a test states only what it is about.
+#[cfg(test)]
+pub fn test_subscriber() -> Subscriber {
+    Subscriber {
+        arn: subscriber_arn(super::DEFAULT_REGION, "orders", "a".repeat(SUBSCRIBER_ID_LEN).as_str()),
+        name: "orders".to_string(),
+        event_bus_arn: ::engine::emulator_arn(
+            ARN_SERVICE,
+            super::DEFAULT_REGION,
+            &format!("{}/orders/{}", super::ARN_RESOURCE_TYPE, "b".repeat(super::BUS_ID_LEN)),
+        ),
+        account_id: ::engine::emulator_account_id().to_string(),
+        region: super::DEFAULT_REGION.to_string(),
+        invoke_configuration: InvokeConfiguration {
+            role_arn: "arn:aws:iam::000000000000:role/event-delivery".to_string(),
+            target_arn: "arn:aws:sqs:us-east-1:000000000000:orders".to_string(),
+            ..InvokeConfiguration::default()
+        },
+        description: None,
+        filter_configuration: None,
+        ordering_type: ORDERING_TYPE_UNORDERED.to_string(),
+        starting_position: STARTING_POSITION_LATEST.to_string(),
+        point_in_time_configuration: None,
+        batch_configuration: None,
+        transformer: None,
+        retry_policy: None,
+        on_failure_configuration: None,
+        log_configuration: None,
+        state: SubscriberRunState::Running,
+        revoked: false,
+        creation_time: SystemTime::UNIX_EPOCH,
+        last_modified_time: SystemTime::UNIX_EPOCH,
+        tags: BTreeMap::new(),
+        client_token: None,
+        next_sequence_number: 0,
     }
 }
 
@@ -545,8 +596,20 @@ pub struct DeliveredEvent {
     /// pre-shaped payload as its publisher sent it
     /// ([`crate::state::RawPayload::untransformed_text`]).
     pub untransformed: String,
-    /// The event's payload: the `DATA` a filter of that scope is matched
-    /// against.
+    /// The event's DATA: what a `DATA`-scoped filter is matched against, what
+    /// an expression of the subscriber's own configuration reads as
+    /// `$events.Data`, and what a `WITH_METADATA` delivery carries under that
+    /// member.
+    ///
+    /// It is the event as this service REPRESENTS it, which is the text a
+    /// target is handed untransformed read as a document: for a structured
+    /// (`PutEvents`) event the envelope the service writes around the published
+    /// payload — `version`, `id`, `detail-type`, `source`, `account`, `time`,
+    /// `region`, `resources` and the payload under `detail` — and for a raw
+    /// (`PutRawEvents`) event the payload as published, which is what that
+    /// entry's `Data` carried. So a clause that reaches into a structured
+    /// event's payload names it under `detail`, exactly as it does in the
+    /// delivered event.
     pub data: ::serde_json::Value,
     /// The metadata the publisher sent with the event.
     pub metadata: ::serde_json::Value,
@@ -560,13 +623,16 @@ pub struct DeliveredEvent {
 /// the event sits relative to the subscriber's own creation
 /// ([`Subscriber::delivery_type`]).
 ///
-/// A structured entry's `Detail` is parsed as a document, because a
-/// `DATA`-scoped filter reaches INTO it and a target is handed it as a document
-/// rather than as a quoted string; an entry that carried no `Detail`, or one
-/// whose text is not a document, has an empty object for its data — the same
-/// value a `DATA` clause finds nothing in. A raw entry's parts are read by the
-/// payload itself ([`crate::state::RawPayload`]), which is what knows whether
-/// its bytes are text this service reads or binary it does not.
+/// A structured entry's DATA is the ENVELOPE this service writes around its
+/// payload, which is also the text its target is handed untransformed: a filter
+/// clause and an expression read the event the way a delivery carries it, so
+/// both name the published payload under `detail` rather than at the top level.
+/// The `Detail` itself is parsed as a document, because the envelope carries it
+/// as one rather than as a quoted string; an entry that carried no `Detail`, or
+/// one whose text is not a document, has an empty object there — the same value
+/// a clause reaching into it finds nothing in. A raw entry's parts are read by
+/// the payload itself ([`crate::state::RawPayload`]), which is what knows
+/// whether its bytes are text this service reads or binary it does not.
 pub fn delivered_event(subscriber: &Subscriber, stored: &StoredEvent) -> DeliveredEvent {
     let account_id = subscriber.account_id.as_str();
     let region = subscriber.region.as_str();
@@ -606,7 +672,7 @@ pub fn delivered_event(subscriber: &Subscriber, stored: &StoredEvent) -> Deliver
     let (untransformed, data, metadata) = match &stored.payload {
         crate::state::EventPayload::Structured(structured) => {
             let time = to_event_time(stored.time);
-            let data = structured
+            let payload = structured
                 .detail
                 .as_deref()
                 .and_then(|detail| crate::state::json_document(detail.as_bytes()))
@@ -617,11 +683,11 @@ pub fn delivered_event(subscriber: &Subscriber, stored: &StoredEvent) -> Deliver
                 region,
                 structured,
                 &time,
-                &data,
+                &payload,
             );
             (
                 envelope.to_string(),
-                data,
+                envelope,
                 structured_metadata(structured, &time),
             )
         }
@@ -775,6 +841,15 @@ const DEDUPLICATION_ID_METADATA: &str = "DeduplicationId";
 const CONTENT_TYPE_METADATA: &str = "ContentType";
 
 impl DeliveredEvent {
+    /// The `EventGroupId` the publishing entry carried — "event group ID for
+    /// FIFO ordering" — or `None` for an event published without one. Read out
+    /// of the event's own system metadata, which is where both publish
+    /// operations put it, so a delivery and a `SYSTEM_METADATA` filter read one
+    /// value.
+    pub fn event_group_id(&self) -> Option<&str> {
+        self.system_metadata.get(EVENT_GROUP_ID_METADATA)?.as_str()
+    }
+
     /// The part of this event a filter of `scope` is matched against, or `None`
     /// for a scope this slice does not place — a value `FilterScope` does not
     /// declare, which the boundary validator refuses before a handler stores it.
@@ -790,7 +865,12 @@ impl DeliveredEvent {
     /// This event inside the METADATA ENVELOPE a `WITH_METADATA` transformer
     /// names — "deliver the event with metadata envelope" — which is the three
     /// parts this service models an event as: the publisher's metadata, the
-    /// event's system metadata and its payload.
+    /// event's system metadata and its data.
+    ///
+    /// It is also the document an expression of the subscriber's own
+    /// configuration is evaluated over ([`super::event_expressions`]), which is
+    /// why the example `SqsParameters`' documentation gives reads
+    /// `$events.Data`.
     ///
     /// The envelope carries those three and nothing else: a `WITH_METADATA`
     /// delivery recorded against the real service holds exactly `Data`,
@@ -933,10 +1013,9 @@ pub fn transformer_fault(
     )
 }
 
-/// What this subscriber's target is handed for `event`, or `None` when the
-/// subscriber's `Transformer` names a transformation this slice does not perform
-/// — in which case nothing is delivered rather than a document the transformer
-/// did not produce.
+/// What this subscriber's target is handed for `event`, or why it is handed
+/// nothing — in which case nothing is delivered rather than a document the
+/// transformer did not produce.
 ///
 /// `Transformer$Type` names the shape of that text. `RAW` — "Deliver the raw
 /// event payload" — hands the target the event UNTRANSFORMED
@@ -947,17 +1026,49 @@ pub fn transformer_fault(
 /// none. `WITH_METADATA` hands it the event inside this service's own metadata
 /// envelope ([`DeliveredEvent::document`]), which carries the event's position
 /// on its bus's log and its system metadata beside the parts the event already
-/// names. `JSONATA` names a transformation computed by an expression; this slice
-/// performs none, so a subscriber configuring it delivers nothing here.
-pub fn delivered_body(subscriber: &Subscriber, event: &DeliveredEvent) -> Option<String> {
-    let transformer_type = subscriber
-        .transformer
-        .as_ref()
-        .and_then(|transformer| transformer.r#type.as_deref());
+/// names. `JSONATA` — "Transform the event using a JSONata expression" — hands
+/// it what the subscriber's `JsonataConfiguration$Expression` produces over the
+/// event, EVALUATED through this crate's bounded seam onto the language
+/// ([`super::event_expressions`]): a string unquoted, every other value its JSON
+/// serialization. A `JSONATA` transformer carrying no expression names no
+/// transformation at all — the member is "required when Type is JSONATA" — and
+/// an expression that produced nothing, or that the seam refused, produces no
+/// text for the target either.
+pub fn delivered_body(
+    subscriber: &Subscriber,
+    event: &DeliveredEvent,
+    budget: &mut super::event_expressions::EvaluationBudget,
+) -> Result<String, String> {
+    let transformer = subscriber.transformer.as_ref();
+    let transformer_type = transformer.and_then(|transformer| transformer.r#type.as_deref());
     match transformer_type {
-        None | Some(TRANSFORMER_TYPE_RAW) => Some(event.untransformed.clone()),
-        Some(TRANSFORMER_TYPE_WITH_METADATA) => Some(event.document().to_string()),
-        Some(_) => None,
+        None | Some(TRANSFORMER_TYPE_RAW) => Ok(event.untransformed.clone()),
+        Some(TRANSFORMER_TYPE_WITH_METADATA) => Ok(event.document().to_string()),
+        Some(TRANSFORMER_TYPE_JSONATA) => {
+            let Some(expression) = transformer
+                .and_then(|transformer| transformer.jsonata_configuration.as_ref())
+                .map(|configuration| configuration.expression.as_str())
+            else {
+                return Err(format!(
+                    "a {TRANSFORMER_TYPE_JSONATA} transformer carries no JsonataConfiguration"
+                ));
+            };
+            match super::event_expressions::evaluated_text(
+                expression,
+                event,
+                super::event_expressions::MAX_BODY_BYTES,
+                budget,
+            )? {
+                Some(text) => Ok(text),
+                None => Err(format!(
+                    "a {TRANSFORMER_TYPE_JSONATA} transformer's expression produced no value for \
+                     this event"
+                )),
+            }
+        }
+        Some(named) => Err(format!(
+            "a transformer of type {named} names a transformation this emulator does not perform"
+        )),
     }
 }
 

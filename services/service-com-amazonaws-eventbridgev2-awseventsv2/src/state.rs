@@ -18,7 +18,9 @@
 //! List operation shares, and the `tags` module resolves one taggable ARN
 //! against all three registries, because tagging spans them.
 
+mod event_expressions;
 mod event_sources;
+mod forwarding;
 mod pagination;
 mod publishing;
 mod resource_policies;
@@ -26,7 +28,9 @@ pub mod subscriber_delivery;
 mod subscribers;
 mod tags;
 
+pub use event_expressions::*;
 pub use event_sources::*;
+pub use forwarding::*;
 pub use pagination::*;
 pub use publishing::*;
 pub use resource_policies::*;

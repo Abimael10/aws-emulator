@@ -73,6 +73,9 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+// The one `DeduplicationType` the model declares, stated once for every slice
+// of this service that deduplicates a publish.
+use crate::state::CONTENT_BASED_DEDUPLICATION;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -162,7 +165,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // bus is owed each accepted event its filters select, which is what
         // makes an event observable to the client that is watching the
         // subscriber's TARGET rather than this bus.
-        crate::state::subscriber_delivery::deliver_due(ctx.callback(), &published.due).await;
+        crate::state::subscriber_delivery::deliver_due(&store, ctx.callback(), &published.due)
+            .await;
 
         // Counted from the results just built, never assumed.
         let failed_entry_count = published
@@ -370,10 +374,6 @@ fn publish(
 /// The value prefix the `Source` member's documentation reserves for AWS's own
 /// services, so no caller may publish under it.
 const RESERVED_SOURCE_PREFIX: &str = "aws.";
-
-/// The one `DeduplicationType` the model declares, per
-/// `smithy_query(query="shape",shape="DeduplicationType")`.
-const CONTENT_BASED_DEDUPLICATION: &str = "CONTENT_BASED";
 
 /// `SuccessCode::PUBLISHED` — "the event was published to the message store".
 /// One of the two entries of the generated [`SUCCESS_CODE_VALUES`].

@@ -643,7 +643,9 @@ struct Fanout {
     case: &'static str,
     /// How many events the publish accepts.
     published: usize,
-    /// The subscriber's one `DATA`-scoped filter, when the row states one.
+    /// The subscriber's one `DATA`-scoped filter, when the row states one: a
+    /// pattern over the event as it is delivered, so it names the published
+    /// payload under `detail`.
     filter: Option<&'static str>,
     /// How many of those events the subscriber is owed.
     delivered: usize,
@@ -682,13 +684,13 @@ async fn each_selected_event_reaches_the_topic_a_subscriber_targets_once() {
         Fanout {
             case: "six events and a filter selecting the shipped ones",
             published: 6,
-            filter: Some(r#"{"kind":["ship"]}"#),
+            filter: Some(r#"{"detail":{"kind":["ship"]}}"#),
             delivered: 3,
         },
         Fanout {
             case: "six events and a filter selecting none of them",
             published: 6,
-            filter: Some(r#"{"kind":["return"]}"#),
+            filter: Some(r#"{"detail":{"kind":["return"]}}"#),
             delivered: 0,
         },
     ];

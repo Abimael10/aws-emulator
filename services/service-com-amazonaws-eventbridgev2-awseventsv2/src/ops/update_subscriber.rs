@@ -213,7 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // delivering, and it is due as soon as it is RUNNING again. An unpause
         // that resumed at the tip, and an update that is no unpause, make
         // nothing due and deliver nothing here.
-        crate::state::subscriber_delivery::deliver_due(ctx.callback(), &applied.due).await;
+        crate::state::subscriber_delivery::deliver_due(&store, ctx.callback(), &applied.due).await;
 
         Ok(applied.response)
     }
