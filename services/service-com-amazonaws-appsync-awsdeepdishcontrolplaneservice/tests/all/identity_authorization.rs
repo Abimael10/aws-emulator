@@ -582,8 +582,10 @@ fn gated_requests(fixture: &Fixture, suffix: &str) -> Vec<Gated> {
             path: "/v1/dataplane-evaluatecode".to_string(),
             body: Some(json!({
                 "runtime": {"name": "APPSYNC_JS", "runtimeVersion": "1.0.0"},
-                "code": "export function request(ctx) { return {ok: true} }",
+                "code": "export function request(ctx) { return {ok: true} }\n\
+                         export function response(ctx) { return ctx.result }\n",
                 "context": "{\"arguments\":{}}",
+                "function": "request",
             })),
             operation: "EvaluateCode",
             resource: arn(ANY_RESOURCE),

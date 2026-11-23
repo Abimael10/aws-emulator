@@ -99,7 +99,11 @@ pub async fn subscribe_time(
         return Ok(Installed::default());
     };
     let context_document = subscribe_context(root_type, field, arguments);
-    let evaluation = appsync_js::evaluate(code, REQUEST_FUNCTION.to_string(), context_document).await;
+    // No call site is read for this run: what a subscribe-time half DECIDED is what it
+    // installed, and the lines it logs are reported to no caller.
+    let evaluation =
+        appsync_js::evaluate(code, REQUEST_FUNCTION.to_string(), context_document, Vec::new())
+            .await;
     match evaluation.outcome {
         // The value a subscribe-time request half returns configures nothing this plane
         // calls: what it DECIDED is what it installed.

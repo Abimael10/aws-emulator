@@ -3217,8 +3217,16 @@ async fn returned(
     appended: &mut Vec<Raised>,
     extensions: &mut Vec<appsync_js::ExtensionCall>,
 ) -> Result<Evaluated, Failure> {
-    let evaluation =
-        appsync_js::evaluate(code.to_string(), function.to_string(), context.clone()).await;
+    let evaluation = appsync_js::evaluate(
+        code.to_string(),
+        function.to_string(),
+        context.clone(),
+        // No call site is read for this run: a resolved field reports the value, the stash and
+        // the appended errors a half produced, and the lines it logs reach no caller of this
+        // plane.
+        Vec::new(),
+    )
+    .await;
     extensions.extend(evaluation.extensions.iter().cloned());
     if let Some(left) = evaluation
         .stash

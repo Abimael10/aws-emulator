@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EvaluateCode
-//! Implemented: RUNS the request's APPSYNC_JS code in the engine this process embeds
-//! ([`appsync_js`]) and answers with what the evaluated function returned, the lines it
-//! logged, the stash it left and the errors it appended; code the engine cannot read, or
-//! that does not export both of the functions a mapping is defined by, is answered with the
-//! `error` payload carrying one `CodeError` per fault. This is the ONLY file to touch for
+//! Implemented: READS the request's APPSYNC_JS code the way this service reads every
+//! definition's code — the compiler and the APPSYNC_JS rule set ([`crate::state`]) — and
+//! answers code that earned a diagnostic with the `error` payload carrying one `CodeError`
+//! per diagnostic; code both passes is RUN in the engine this process embeds
+//! ([`appsync_js`]), and the answer is what the evaluated function returned, the lines it
+//! logged, the stash it left and the errors it appended. This is the ONLY file to touch for
 //! this operation.
 //!
 //! ## Shape of an operation
@@ -92,6 +93,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// How an untouched run reports the two members it always has, which this operation and the
+/// VELOCITY evaluation beside it state one way
+/// (`crate::service::graphql_api::mapping_template::utilities`).
+use crate::service::graphql_api::mapping_template::utilities::{EMPTY_OUT_ERRORS, EMPTY_STASH};
+
 /// The APPSYNC_JS sandbox the evaluated code runs in.
 ///
 /// The `#[path]` is what points this declaration into `ops/evaluate_code/`: this file is
@@ -101,7 +107,7 @@ use super::types::*;
 pub mod appsync_js;
 
 use appsync_js::{
-    CodeFault, Evaluation, Outcome, ARGUMENTS_MEMBER, ARGUMENTS_SHORT_MEMBER, DEFAULT_FUNCTION,
+    CodeFault, Evaluation, Outcome, ARGUMENTS_MEMBER, ARGUMENTS_SHORT_MEMBER,
     EVALUATED_FUNCTIONS, STASH_MEMBER,
 };
 
@@ -190,13 +196,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Currently, only the APPSYNC_JS runtime is supported" and its only version is
         // 1.0.0, so a request naming another version names a runtime nothing can run.
         if input.runtime.runtime_version != APPSYNC_JS_RUNTIME_VERSION {
-            return Err(invalid_member("runtimeVersion"));
+            return Err(bad_request(INVALID_RUNTIME_VERSION.to_string()));
         }
 
         // "The function within the code to be evaluated. If provided, the valid values are
-        // request and response" — anything else names no function of a resolver.
+        // request and response": the member is modelled optional, and recorded behaviour
+        // refuses a request that states none — the evaluation is OF one of the two functions,
+        // so a call naming neither names nothing to evaluate — and refuses anything else as
+        // naming no function of a resolver.
         let function = match input.function.as_deref() {
-            None => DEFAULT_FUNCTION.to_string(),
+            None => return Err(bad_request(MISSING_FUNCTION.to_string())),
             Some(named) if EVALUATED_FUNCTIONS.contains(&named) => named.to_string(),
             Some(_) => return Err(bad_request(invalid_function_message())),
         };
@@ -209,12 +218,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             _ => return Err(invalid_member("context")),
         };
 
+        // The code is READ before it is run, by the compiler and the APPSYNC_JS rule set this
+        // service reads every definition's code with (`crate::state::evaluable_code`): a
+        // diagnostic of either is this call's own answer rather than a refusal of it, because
+        // what the call asks is what the code came to.
+        let sites = match crate::state::evaluable_code(input.code.clone()).await {
+            crate::state::Evaluable::Read(sites) => sites,
+            crate::state::Evaluable::Faults(faults) => {
+                return Ok(EvaluateCodeOutput {
+                    error: Some(diagnostics_error(&faults, &input.code)),
+                    ..Default::default()
+                })
+            }
+            // Nothing was learned about the code, so neither answer about it can be given:
+            // the operation's own server fault says so instead.
+            crate::state::Evaluable::Unknown(reason) => {
+                return Err(EvaluateCodeErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: Some(reason),
+                    },
+                )
+                .into())
+            }
+        };
+
         answer(
-            appsync_js::evaluate(input.code.clone(), function, context).await,
+            appsync_js::evaluate(input.code.clone(), function, context, sites).await,
             &input.code,
         )
     }
 }
+
+/// The refusal text a `runtimeVersion` this operation cannot run with takes, and the one a
+/// request naming no `function` takes: both are AppSync's own fixed sentences, naming nothing
+/// of the request.
+const INVALID_RUNTIME_VERSION: &str = "Runtime version invalid.";
+/// See [`INVALID_RUNTIME_VERSION`].
+const MISSING_FUNCTION: &str = "Function must be provided";
 
 /// The context the evaluated code is RUN with: the one the request states, with the members
 /// a resolver's own `ctx` carries that are not values a caller states.
@@ -253,13 +293,15 @@ fn resolver_context(mut context: ::serde_json::Value) -> ::serde_json::Value {
 /// the response", whose `error` member is "the payload of the response error" — so every
 /// outcome is one 200 answer:
 ///
-/// * a run that RETURNED answers with its `evaluationResult`;
-/// * a run that raised, or that a bound stopped, answers with the `error` payload instead,
-///   because the code is what failed;
+/// * a run that RETURNED answers with its `evaluationResult`, the `logs` it wrote and the
+///   `stash` and `outErrors` it left;
+/// * a run that raised, that ended its step through `runtime.earlyReturn`, or that a bound
+///   stopped, answers with what it ended on and the stash and out-errors it left, and with no
+///   log list: the lines a run reports are the lines of a run that RETURNED;
 /// * code that defines no mapping at all — code the engine could not read, or a module that
 ///   does not export both of the functions a mapping is defined by — answers with the
-///   `error` payload carrying one `CodeError` per fault ([`code_faults_error`]) and no
-///   result, because nothing ran.
+///   `error` payload carrying one `CodeError` per fault ([`diagnostics_error`]) and nothing
+///   else, because nothing ran.
 fn answer(evaluation: Evaluation, code: &str) -> Result<EvaluateCodeOutput, EvaluateCodeError> {
     let Evaluation {
         outcome,
@@ -272,47 +314,71 @@ fn answer(evaluation: Evaluation, code: &str) -> Result<EvaluateCodeOutput, Eval
         // response models no member for it.
         extensions: _,
     } = evaluation;
-    let mut output = EvaluateCodeOutput {
-        logs: Some(logs),
-        stash,
-        out_errors,
-        ..Default::default()
-    };
+    let mut output = EvaluateCodeOutput::default();
     match outcome {
-        // An early return is a function that RETURNED, with the value it was handed: this
-        // call evaluates ONE function rather than running a resolver's steps, so there is no
-        // later step for the early return to end.
-        Outcome::Returned(result) | Outcome::ReturnedEarly(result) => {
+        // The run RETURNED: its result, the lines it logged — "a list of logs that were
+        // generated by calls to util.log.info and util.log.error in the evaluated code",
+        // which is the empty list for a run that wrote none — and the stash and appended
+        // errors it left.
+        Outcome::Returned(result) => {
             output.evaluation_result = Some(result);
+            output.logs = Some(logs);
+            report_run(&mut output, stash, out_errors);
+        }
+        // An early return is a function that ended the step it belongs to rather than one
+        // that returned: the value it was handed is the step's answer, and the response
+        // carries no log list, as no other run that ended by RAISING does — which is how
+        // `runtime.earlyReturn` ends one.
+        Outcome::ReturnedEarly(result) => {
+            output.evaluation_result = Some(result);
+            report_run(&mut output, stash, out_errors);
         }
         Outcome::Raised { message, .. } | Outcome::Stopped(message) => {
             output.error = Some(EvaluateCodeErrorDetail {
                 message: Some(message),
                 code_errors: None,
             });
+            report_run(&mut output, stash, out_errors);
         }
-        Outcome::Faults(faults) => output.error = Some(code_faults_error(&faults, code)),
+        Outcome::Faults(faults) => {
+            let stated: Vec<CodeFault> = faults
+                .iter()
+                .map(|fault| crate::state::stated_code_fault(fault, code))
+                .collect();
+            output.error = Some(diagnostics_error(&stated, code));
+        }
     }
     Ok(output)
 }
 
-/// The `error` payload for code that defines nothing this call could run: AppSync's own
-/// sentence for code carrying faults, and one `CodeError` per fault so a client can place
-/// each one in the code it sent.
+/// The `stash` and the `outErrors` a run that HAPPENED is reported with.
 ///
-/// The sentence, the per-fault projection and the position each fault is stated at are the
-/// shared ones (`crate::state`), so this evaluation and the create or update of a definition
-/// report one fault the same way — only the member that carries them differs, because an
-/// evaluation is SERVED (the faults are the answer) where a definition is REFUSED (the
-/// faults are the refusal's detail).
-fn code_faults_error(faults: &[CodeFault], code: &str) -> EvaluateCodeErrorDetail {
-    let stated: Vec<CodeFault> = faults
-        .iter()
-        .map(|fault| crate::state::stated_code_fault(fault, code))
-        .collect();
+/// "A single stash object lives through a single resolver run" and `outErrors` is "the list of
+/// runtime errors that are added to the GraphQL operation response": a run has both whatever
+/// it did with them, so each is reported as the run left it — the empty object and the empty
+/// list for a run that wrote to neither. Only an answer about the CODE rather than about a run
+/// ([`diagnostics_error`]) carries neither: nothing ran to leave them.
+fn report_run(
+    output: &mut EvaluateCodeOutput,
+    stash: Option<String>,
+    out_errors: Option<String>,
+) {
+    output.stash = Some(stash.unwrap_or_else(|| EMPTY_STASH.to_string()));
+    output.out_errors = Some(out_errors.unwrap_or_else(|| EMPTY_OUT_ERRORS.to_string()));
+}
+
+/// The `error` payload an answer about the CODE carries: one `CodeError` per diagnostic so a
+/// client can place each one in the code it sent, and a message stating every diagnostic in
+/// turn.
+///
+/// Both projections are the shared ones (`crate::state`), so a diagnostic of an evaluation and
+/// a diagnostic of the create or update of a definition read the same — only the member that
+/// carries them differs, because an evaluation is SERVED (the diagnostics are the answer)
+/// where a definition is REFUSED (they are the refusal's detail).
+fn diagnostics_error(faults: &[CodeFault], code: &str) -> EvaluateCodeErrorDetail {
     EvaluateCodeErrorDetail {
-        message: Some(crate::state::CODE_ERRORS_MESSAGE.to_string()),
-        code_errors: Some(crate::state::code_errors(&stated)),
+        message: Some(crate::state::stated_diagnostics(code, faults)),
+        code_errors: Some(crate::state::code_errors(faults)),
     }
 }
 

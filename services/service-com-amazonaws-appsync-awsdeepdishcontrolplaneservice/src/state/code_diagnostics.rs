@@ -41,10 +41,13 @@
 //! definition the model admits is therefore read to an answer: stored, or refused with the
 //! diagnostics it earned.
 //!
-//! The rule is over the MEMBER rather than over one operation, so every operation that
-//! stores `code` (`CreateFunction`, `UpdateFunction`, `CreateResolver`, `UpdateResolver`)
-//! reads it the same way through [`super::code_definition`]; a request that carries no
-//! `code` defines nothing to read.
+//! The rule is over the MEMBER rather than over one operation, so every operation this
+//! service reads APPSYNC_JS `code` for reads it the same way: an operation that STORES one
+//! (`CreateFunction`, `UpdateFunction`, `CreateResolver`, `UpdateResolver`) through
+//! [`super::code_definition`], which REFUSES a definition that earned a diagnostic, and the
+//! operation that EVALUATES one (`EvaluateCode`) through [`evaluable_code`], which SERVES the
+//! diagnostics as that call's own answer. A request that carries no `code` defines nothing to
+//! read.
 
 use ::std::ops::Range;
 
@@ -55,12 +58,16 @@ use ::swc_ecma_parser::lexer::Lexer;
 use ::swc_ecma_parser::{EsSyntax, Parser, StringInput, Syntax};
 
 use crate::ops::evaluate_code::appsync_js::{
-    in_sandbox, CodeFault, Entered, CODE_UNIT, PARSE_ERROR,
+    in_sandbox, CallSite, CodeFault, Entered, CODE_UNIT, PARSE_ERROR,
 };
 
 /// The APPSYNC_JS rule set the parsed module is checked against.
 mod appsync_js_rules;
 pub use appsync_js_rules::{RULE_SET, RULE_SET_PREFIX};
+
+/// Where each CALL in the read code sits, which a run reports the position of a log line
+/// from.
+mod call_sites;
 
 /// The `errorType` a fault the RULE SET found is reported under: "Examples include, but
 /// aren't limited to: `LINT_ERROR`, `PARSER_ERROR`" (`CodeError$errorType`), and recorded
@@ -120,6 +127,44 @@ const READ_THREAD_STACK_BYTES: usize = 512 * 1024 * 1024;
 
 /// Read `code` on THIS thread: compile it, and check what compiled against the rule set.
 fn read(code: &str) -> Diagnosed {
+    let module = match read_module(code) {
+        Ok(module) => module,
+        Err(fault) => return fault.into(),
+    };
+    let faults = appsync_js_rules::rule_faults(code, &module);
+    if faults.is_empty() {
+        Diagnosed::Read
+    } else {
+        Diagnosed::Faults(faults)
+    }
+}
+
+/// Why a read produced no module: the diagnostics the compile stated, or the fact that
+/// nothing was learned about the code at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReadFault {
+    /// The diagnostics the compile stated, in the order they sit in the code. Never empty.
+    Faults(Vec<CodeFault>),
+    /// The read did not happen or did not come back: the text says why.
+    Unknown(String),
+}
+
+impl From<ReadFault> for Diagnosed {
+    fn from(fault: ReadFault) -> Self {
+        match fault {
+            ReadFault::Faults(faults) => Self::Faults(faults),
+            ReadFault::Unknown(reason) => Self::Unknown(reason),
+        }
+    }
+}
+
+/// Compile `code` on THIS thread and answer the module the compiler built, or why it built
+/// none.
+///
+/// The one compile every read of a definition's code goes through, whether the code is read
+/// to be STORED ([`read`]) or read to be RUN ([`read_to_evaluate`]), so one definition is
+/// compiled one way whichever call carries it.
+fn read_module(code: &str) -> Result<Box<Module>, ReadFault> {
     // The bracket the code never closes, which the diagnostic for a read that ran out of
     // input names. Read off the TOKENS in one straight pass, so a bracket inside a string, a
     // comment, a template or a regular expression is not taken for one the code opened.
@@ -138,21 +183,114 @@ fn read(code: &str) -> Diagnosed {
                 let blanked = " ".repeat(keyword.len());
                 source.replace_range(keyword, &blanked);
             }
-            Compiled::Faults(faults) => return Diagnosed::Faults(faults),
-            Compiled::Unreadable => {
-                return Diagnosed::Unknown("the code could not be read".to_string())
-            }
-            Compiled::Module(module) => {
-                let faults = appsync_js_rules::rule_faults(code, &module);
-                return if faults.is_empty() {
-                    Diagnosed::Read
-                } else {
-                    Diagnosed::Faults(faults)
-                };
-            }
+            Compiled::Faults(faults) => return Err(ReadFault::Faults(faults)),
+            Compiled::Unreadable => return Err(ReadFault::Unknown(UNREADABLE.to_string())),
+            Compiled::Module(module) => return Ok(module),
         }
     }
-    Diagnosed::Unknown("the code could not be read".to_string())
+    Err(ReadFault::Unknown(UNREADABLE.to_string()))
+}
+
+/// What a read that learned nothing about the code states.
+const UNREADABLE: &str = "the code could not be read";
+
+/// What the read of the `code` an evaluation is about to RUN came to.
+///
+/// The same two passes a written definition is read by ([`read`]), reported the way the call
+/// that EVALUATES code has to answer them: the diagnostics are that call's own answer rather
+/// than a refusal of it, and code that compiled and broke no rule carries on to the engine
+/// with the positions of its calls, which is what a log line's position is read from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Evaluable {
+    /// The code compiled and broke no rule: where each call in it sits.
+    Read(Vec<CallSite>),
+    /// The faults the read found, in the order they sit in the code.
+    Faults(Vec<CodeFault>),
+    /// The read did not happen or did not come back, so nothing is known about the code: the
+    /// text says why.
+    Unknown(String),
+}
+
+impl From<ReadFault> for Evaluable {
+    fn from(fault: ReadFault) -> Self {
+        match fault {
+            ReadFault::Faults(faults) => Self::Faults(faults),
+            ReadFault::Unknown(reason) => Self::Unknown(reason),
+        }
+    }
+}
+
+/// Read `code` the way the call that would EVALUATE it reads it, on a thread of the sandbox's
+/// own and under its bounds.
+pub async fn evaluable_code(code: String) -> Evaluable {
+    match in_sandbox(READ_THREAD_STACK_BYTES, move || read_to_evaluate(&code)).await {
+        Entered::Answered(evaluable) => evaluable,
+        Entered::GaveUp(reason) => Evaluable::Unknown(reason),
+    }
+}
+
+/// Read `code` on THIS thread the way [`read`] reads it, and report where each of its calls
+/// sits for code that was read to the end.
+fn read_to_evaluate(code: &str) -> Evaluable {
+    let module = match read_module(code) {
+        Ok(module) => module,
+        Err(fault) => return fault.into(),
+    };
+    let faults = appsync_js_rules::rule_faults(code, &module);
+    if !faults.is_empty() {
+        return Evaluable::Faults(faults);
+    }
+    Evaluable::Read(call_sites::call_sites(code, &module))
+}
+
+/// The `message` an answer that carries code diagnostics states: one sentence per diagnostic,
+/// in the order the faults sit in the code.
+///
+/// Each sentence is the diagnostic as the compiler or the rule stated it, followed by the
+/// class it falls under and the stretch of the submitted code it is about — its first and its
+/// last position. The diagnostics themselves are the `codeErrors` of the same answer
+/// (`super::code_errors`), so this sentence states nothing the list does not.
+#[must_use]
+pub fn stated_diagnostics(code: &str, faults: &[CodeFault]) -> String {
+    faults
+        .iter()
+        .map(|fault| stated_diagnostic(code, fault))
+        .collect::<Vec<String>>()
+        .join(" ")
+}
+
+/// One diagnostic as [`stated_diagnostics`] states it.
+fn stated_diagnostic(code: &str, fault: &CodeFault) -> String {
+    let (end_line, end_column) = end_of(code, fault);
+    format!(
+        "Error: {} [code: {}] [start: line: {}, col: {}] [end: line: {}, col: {}]",
+        fault.value, fault.error_type, fault.line, fault.column, end_line, end_column
+    )
+}
+
+/// Where the stretch of `code` a fault is about ENDS: its own position advanced by its length
+/// ([`length`] counts one, so this spends one), which is the position just past the last
+/// character the fault covers. A fault about a POSITION rather than a stretch ends where it
+/// starts.
+fn end_of(code: &str, fault: &CodeFault) -> (i32, i32) {
+    let span = usize::try_from(fault.span).unwrap_or_default();
+    let Some(start) = offset_of(code, fault.line, fault.column) else {
+        return (fault.line, fault.column);
+    };
+    position(code, past(code, start, span))
+}
+
+/// The offset `span` of the units [`length`] counts past `offset` in `code`, or the end of the
+/// code where it holds fewer than that many.
+fn past(code: &str, offset: usize, span: usize) -> usize {
+    let mut spent = 0;
+    for (at, character) in code.get(offset..).unwrap_or_default().char_indices() {
+        if spent >= span {
+            return offset.saturating_add(at);
+        }
+        spent += character.len_utf16();
+    }
+    code.len()
 }
 
 /// The token that would close the bracket `code` opens last and never closes, or `None` for
@@ -399,6 +537,37 @@ pub(super) fn position(code: &str, offset: usize) -> (i32, i32) {
         i32::try_from(line).unwrap_or(i32::MAX),
         i32::try_from(column).unwrap_or(i32::MAX),
     )
+}
+
+/// The offset in `code` of the position `line` and `column` name, both counted from one the
+/// way [`position`] counts them — its inverse — or `None` for a position the code does not
+/// hold.
+///
+/// What a position STATED about the code is taken back to an offset into it by: the engine
+/// names the frame of a call by a line and a column (`crate::ops::evaluate_code::appsync_js`),
+/// and a diagnostic's own position is read back the same way to find where the stretch it is
+/// about ends.
+#[must_use]
+pub fn offset_of(code: &str, line: i32, column: i32) -> Option<usize> {
+    let line = usize::try_from(line).ok()?.checked_sub(1)?;
+    let column = usize::try_from(column).ok()?.checked_sub(1)?;
+    let mut at = 0;
+    for _ in 0..line {
+        at += code.get(at..)?.find('\n')? + 1;
+    }
+    let mut counted = 0;
+    for (index, character) in code.get(at..)?.char_indices() {
+        if counted == column {
+            return Some(at + index);
+        }
+        if character == '\n' {
+            return None;
+        }
+        counted += 1;
+    }
+    // The position just past the code's last character, which is where a read that ran out of
+    // input stopped.
+    (counted == column).then_some(code.len())
 }
 
 /// How long the stretch of `code` a diagnostic is about is, as `CodeErrorLocation$span` —

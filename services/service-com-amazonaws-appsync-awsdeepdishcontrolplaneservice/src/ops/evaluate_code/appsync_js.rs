@@ -62,6 +62,7 @@
 //! The run happens on a thread of the sandbox's own ([`in_sandbox`]), never on the async
 //! executor serving the request.
 
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -72,7 +73,7 @@ use ::rquickjs::{CatchResultExt, Context, Ctx, Function, Module, Runtime, Value}
 use ::serde_json::Value as Json;
 
 use crate::service::event_api::handlers::UTILS_MODULE;
-use crate::state::{now_nanos, splitmix64};
+use crate::state::{now_nanos, offset_of, splitmix64};
 
 /// The `@aws-appsync/utils/rds` module: the statement builders a resolver over a relational
 /// database writes its request with, as their own module. The `#[path]` is what points this
@@ -150,10 +151,6 @@ pub const INVALIDATE_SUBSCRIPTIONS: &str = "invalidateSubscriptions";
 /// (`EvaluateCodeRequest$function`).
 pub const EVALUATED_FUNCTIONS: &[&str] = &["request", "response"];
 
-/// The function evaluated when the request names none: the first of the two the code
-/// defines, which is the one a resolver runs first.
-pub const DEFAULT_FUNCTION: &str = "request";
-
 /// The `errorType` of a [`CodeFault`] for a module that does not export a FUNCTION the
 /// runtime would call: "the code defines the request and response functions"
 /// (`EvaluateCode`), so a module exporting a function for only one of them — or exporting
@@ -229,6 +226,24 @@ pub struct CodeFault {
     pub span: i32,
 }
 
+/// Where one CALL in the submitted code sits, read off the syntax tree the compile built
+/// (`crate::state::code_diagnostics`).
+///
+/// What a log line's position is read from: the engine names the frame of a call by the
+/// CALLEE's own name, and what a line states is where the whole call starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallSite {
+    /// The offset of the name the engine names a frame of this call by: the property for a
+    /// call made on a member, the callee itself otherwise.
+    pub names_at: usize,
+    /// The stretch of the submitted code the whole call occupies.
+    pub stretch: Range<usize>,
+    /// The line the call starts on, counted from one.
+    pub line: i32,
+    /// The column the call starts at, counted from one.
+    pub column: i32,
+}
+
 /// What evaluating the code came to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -269,7 +284,8 @@ pub enum Outcome {
 pub struct Evaluation {
     /// What the run came to.
     pub outcome: Outcome,
-    /// The log lines the run wrote, through `util.log` and `console`.
+    /// The log lines the run wrote, through `util.log` and `console`, in the order it wrote
+    /// them.
     pub logs: Vec<String>,
     /// The stash as it stands after the run, as JSON text, or `None` where the run left it
     /// empty.
@@ -283,15 +299,24 @@ pub struct Evaluation {
 
 /// Evaluate `function` of `code` over `context`, on a thread of its own.
 ///
+/// `sites` is where each call in the code sits, which the lines the run logs name their
+/// position from ([`LoggedAt`]): it is read off the compile the caller already made of this
+/// code, so this run reads no code text for it. A caller that reports no logs passes none.
+///
 /// The engine, the bounds and the whole run live inside that thread, so nothing of the
 /// engine crosses onto the executor serving the request, and the thread is the sandbox's own
 /// rather than one of the executor's ([`in_sandbox`], which also bounds how many engines this
 /// process runs at once). The CALLER's wait is bounded separately ([`CALLER_WAIT_CEILING`]):
 /// a run the engine has not come back from by then is given up on, so the request is answered
 /// whatever the engine is doing, and the given-up run costs one sandbox slot until it ends.
-pub async fn evaluate(code: String, function: String, context: Json) -> Evaluation {
+pub async fn evaluate(
+    code: String,
+    function: String,
+    context: Json,
+    sites: Vec<CallSite>,
+) -> Evaluation {
     match in_sandbox(ENGINE_THREAD_STACK_BYTES, move || {
-        run(&code, &function, &context)
+        run(&code, &function, &context, sites)
     })
     .await
     {
@@ -546,8 +571,12 @@ fn stopped(reason: String) -> Evaluation {
 
 /// Evaluate `function` of `code` over `context` on THIS thread, under every bound this
 /// module declares.
-fn run(code: &str, function: &str, context: &Json) -> Evaluation {
+fn run(code: &str, function: &str, context: &Json, sites: Vec<CallSite>) -> Evaluation {
     let collected = Arc::new(Mutex::new(Collected::default()));
+    let logged_at = Arc::new(LoggedAt {
+        code: code.to_string(),
+        sites,
+    });
     let Ok(context_json) = ::serde_json::to_string(context) else {
         return finished(
             Outcome::Stopped("the context could not be rendered".to_string()),
@@ -584,7 +613,14 @@ fn run(code: &str, function: &str, context: &Json) -> Evaluation {
         }
     };
     let (outcome, stash) = engine_context.with(|ctx| {
-        evaluate_in(&ctx, code, function, &context_json, &Arc::clone(&collected))
+        evaluate_in(
+            &ctx,
+            code,
+            function,
+            &context_json,
+            &Arc::clone(&collected),
+            &logged_at,
+        )
     });
     // A breached bound is the run's answer, whatever the code then said or returned: the
     // latch is host state the code cannot reach.
@@ -627,8 +663,9 @@ fn evaluate_in(
     function: &str,
     context_json: &str,
     collected: &Arc<Mutex<Collected>>,
+    logged_at: &Arc<LoggedAt>,
 ) -> (Outcome, Option<String>) {
-    if let Err(error) = install_host(ctx, collected) {
+    if let Err(error) = install_host(ctx, collected, logged_at) {
         return (Outcome::Stopped(error), None);
     }
     if let Err(caught) = ctx.eval::<Value<'_>, _>(CONSOLE_SOURCE).catch(ctx) {
@@ -859,11 +896,20 @@ struct Collected {
 
 impl Collected {
     /// Record one log line, under the line and length ceilings.
-    fn log(&mut self, level: &str, message: &str) {
+    ///
+    /// A line states the LEVEL it was written at, where in the submitted code the call that
+    /// wrote it sits ([`LoggedAt`]) and what that call was handed, as recorded; a line the
+    /// host could not place carries only what the call was handed. The position is read only
+    /// for a line the log still has room for, so a run that keeps logging past the ceiling
+    /// costs the host nothing per call but the call itself.
+    fn log(&mut self, level: &str, message: &str, site: impl FnOnce() -> Option<String>) {
         if self.logs.len() >= MAX_LOG_ENTRIES {
             return;
         }
-        let mut line = format!("{level} - {message}");
+        let mut line = match site() {
+            Some(site) => format!("{level} - {site}: {message}"),
+            None => format!("{level} - {message}"),
+        };
         if line.len() > MAX_LOG_ENTRY_BYTES {
             line.truncate(boundary_at_or_below(&line, MAX_LOG_ENTRY_BYTES));
         }
@@ -908,6 +954,69 @@ impl Collected {
     }
 }
 
+/// Where in the submitted code the call that wrote a log line sits.
+///
+/// A line a run logs names that position — the unit the code is compiled under, the line and
+/// the column the call starts at — and what the ENGINE hands the host is the stack it built at
+/// the call, whose innermost frame IN the caller's code names the callee rather than the whole
+/// call ([`CallSite`]). This takes one back to the other: the frame's position is resolved
+/// against the calls the compile found, so the position a line states is the call's own.
+#[derive(Debug)]
+struct LoggedAt {
+    /// The code the run is over, which the frame's line and column are counted in.
+    code: String,
+    /// Where each call in that code sits, as the compile read them.
+    sites: Vec<CallSite>,
+}
+
+impl LoggedAt {
+    /// How a log line states where the call that wrote it sits, for the `stack` the engine
+    /// built at that call, or `None` for a stack with no frame in the caller's code at all.
+    fn stated(&self, stack: &str) -> Option<String> {
+        let (line, column) = innermost_frame(stack)?;
+        let (line, column) = self.called_at(line, column).unwrap_or((line, column));
+        Some(format!("{CODE_UNIT}:{line}:{column}"))
+    }
+
+    /// Where the call the engine named by the position `line` and `column` STARTS, or `None`
+    /// where no call of the code was named by it.
+    fn called_at(&self, line: i32, column: i32) -> Option<(i32, i32)> {
+        let named = offset_of(&self.code, line, column)?;
+        self.sites
+            .iter()
+            .find(|site| site.names_at == named)
+            // A frame the engine states another position of its call for is placed by the
+            // innermost call that position sits inside.
+            .or_else(|| {
+                self.sites
+                    .iter()
+                    .filter(|site| site.stretch.contains(&named))
+                    .min_by_key(|site| site.stretch.len())
+            })
+            .map(|site| (site.line, site.column))
+    }
+}
+
+/// The position of the innermost frame of `stack` that sits in the CALLER's code: the engine
+/// states every frame as `<unit>:<line>:<column>`, and the units of this module's own
+/// (the invoker, the utilities module, the console) are not the caller's.
+fn innermost_frame(stack: &str) -> Option<(i32, i32)> {
+    let unit = format!("{CODE_UNIT}:");
+    stack.lines().find_map(|frame| {
+        let (_, stated) = frame.rsplit_once(unit.as_str())?;
+        let mut positions = stated.split(':');
+        let line = read_position(positions.next()?)?;
+        let column = read_position(positions.next().unwrap_or_default()).unwrap_or(1);
+        Some((line, column))
+    })
+}
+
+/// The number `stated` begins with, which is how one part of a frame's position reads.
+fn read_position(stated: &str) -> Option<i32> {
+    let digits: String = stated.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
 /// The largest byte index at or below `limit` that `text` can be cut at.
 fn boundary_at_or_below(text: &str, limit: usize) -> usize {
     text.char_indices()
@@ -922,19 +1031,24 @@ fn boundary_at_or_below(text: &str, limit: usize) -> usize {
 /// each of which only writes to or reads from THIS run.
 ///
 /// Nothing else of the host is reachable from the engine.
-fn install_host(ctx: &Ctx<'_>, collected: &Arc<Mutex<Collected>>) -> Result<(), String> {
+fn install_host(
+    ctx: &Ctx<'_>,
+    collected: &Arc<Mutex<Collected>>,
+    logged_at: &Arc<LoggedAt>,
+) -> Result<(), String> {
     let logged = Arc::clone(collected);
+    let sited = Arc::clone(logged_at);
     let appended = Arc::clone(collected);
     let extended = Arc::clone(collected);
     let globals = ctx.globals();
     globals
         .set(
             "__appsyncLog",
-            Func::from(move |level: String, message: String| {
+            Func::from(move |level: String, message: String, stack: String| {
                 logged
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .log(&level, &message);
+                    .log(&level, &message, || sited.stated(&stack));
             }),
         )
         .map_err(|error| format!("the sandbox log could not be installed: {error}"))?;
@@ -1219,15 +1333,23 @@ const hostAppendError = __appsyncAppendError;
 const hostAutoId = __appsyncAutoId;
 const hostDynamoDb = __appsyncDynamoDb;
 const hostExtension = __appsyncExtension;
+// Every value a log line carries is rendered as the JSON of what it is, so a line reads as
+// the document the call was handed rather than as text the runtime wrote.
 const rendered = function (value) {
-    if (typeof value === "string") {
-        return value;
-    }
     const text = JSON.stringify(value);
     return text === undefined ? String(value) : text;
 };
 const joined = function (args) {
     return Array.prototype.map.call(args, rendered).join(" ");
+};
+// The stack the engine builds at the call, which is what places a log line in the code the
+// caller submitted.
+const tracedAt = function () {
+    try {
+        return String(new Error().stack);
+    } catch (ignored) {
+        return "";
+    }
 };
 const detail = function (message, errorType, data, errorInfo) {
     return {
@@ -1235,6 +1357,18 @@ const detail = function (message, errorType, data, errorInfo) {
         errorType: errorType === undefined || errorType === null ? null : String(errorType),
         data: data === undefined ? null : data,
         errorInfo: errorInfo === undefined ? null : errorInfo,
+    };
+};
+// One entry of the appended-error list, by the names such an entry carries (the host's one
+// reading of them, `Raised::detail`): what the call worded, the class it named, the data it
+// carried and the information beside it.
+const appendedEntry = function (message, errorType, data, errorInfo) {
+    const described = detail(message, errorType, data, errorInfo);
+    return {
+        message: described.message,
+        type: described.errorType,
+        data: described.data,
+        info: described.errorInfo,
     };
 };
 const raise = function (message, errorType, data, errorInfo) {
@@ -1286,7 +1420,7 @@ export const util = {
     error: raise,
     dynamodb: dynamodb,
     appendError: function (message, errorType, data, errorInfo) {
-        hostAppendError(JSON.stringify(detail(message, errorType, data, errorInfo)));
+        hostAppendError(JSON.stringify(appendedEntry(message, errorType, data, errorInfo)));
     },
     unauthorized: function () {
         const error = new Error("Unauthorized");
@@ -1301,8 +1435,8 @@ export const util = {
         return hostAutoId();
     },
     log: {
-        info: function () { hostLog("INFO", joined(arguments)); },
-        error: function () { hostLog("ERROR", joined(arguments)); },
+        info: function () { hostLog("INFO", joined(arguments), tracedAt()); },
+        error: function () { hostLog("ERROR", joined(arguments), tracedAt()); },
     },
     time: {
         nowISO8601: function () { return new Date().toISOString(); },
@@ -1342,21 +1476,37 @@ export default { util, runtime, extensions };
 /// installed, so a module that rebinds the host function cannot redirect it.
 ///
 /// `console.log` and `console.error` are what an APPSYNC_JS resolver logs with beside
-/// `util.log`, and both land in the `logs` the response reports. Code that replaces
+/// `util.log`, and both land in the `logs` the response reports — the first at the level
+/// `util.log.info` writes at and the second at `util.log.error`'s. Code that replaces
 /// `globalThis.console` only stops its OWN lines from being logged.
 const CONSOLE_SOURCE: &str = r#"
 (function () {
     const hostLog = __appsyncLog;
+    const stringify = JSON.stringify;
+    const toText = String;
+    const CapturedError = Error;
+    // Every value a log line carries is rendered as the JSON of what it is, so a line reads
+    // as the document the call was handed rather than as text the runtime wrote.
     const rendered = function (value) {
-        if (typeof value === "string") {
-            return value;
+        const text = stringify(value);
+        return text === undefined ? toText(value) : text;
+    };
+    // The stack the engine builds at the call, which is what places the line in the code the
+    // caller submitted.
+    const tracedAt = function () {
+        try {
+            return toText(new CapturedError().stack);
+        } catch (ignored) {
+            return "";
         }
-        const text = JSON.stringify(value);
-        return text === undefined ? String(value) : text;
     };
     const writer = function (level) {
         return function () {
-            hostLog(level, Array.prototype.map.call(arguments, rendered).join(" "));
+            hostLog(
+                level,
+                Array.prototype.map.call(arguments, rendered).join(" "),
+                tracedAt()
+            );
         };
     };
     globalThis.console = {

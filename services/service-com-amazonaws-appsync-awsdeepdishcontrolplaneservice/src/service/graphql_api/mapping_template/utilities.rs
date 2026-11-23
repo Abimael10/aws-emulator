@@ -41,6 +41,28 @@ pub enum Answer {
     Appended(Raised),
 }
 
+/// How one entry of an `outErrors` list names what the call that appended it carried: the
+/// message it worded, the type it classified the error under, the data it carried and the
+/// further information beside it. The names an entry of that list is READ by, which is why
+/// they are stated once here and used by both halves of the projection ([`Raised::detail`]
+/// and [`Raised::of_detail`]).
+pub const DETAIL_MESSAGE: &str = "message";
+/// See [`DETAIL_MESSAGE`].
+pub const DETAIL_TYPE: &str = "type";
+/// See [`DETAIL_MESSAGE`].
+pub const DETAIL_DATA: &str = "data";
+/// See [`DETAIL_MESSAGE`].
+pub const DETAIL_INFO: &str = "info";
+
+/// How a sandbox evaluation reports the two members a RUN always has when the run wrote to
+/// neither: the stash as the empty JSON object and the appended errors as the empty JSON
+/// array. Stated once here, beside the names one entry of that list carries, so the
+/// APPSYNC_JS evaluation (`crate::ops::evaluate_code`) and the VELOCITY one
+/// (`crate::ops::evaluate_mapping_template`) cannot report an untouched run two ways.
+pub const EMPTY_STASH: &str = "{}";
+/// See [`EMPTY_STASH`].
+pub const EMPTY_OUT_ERRORS: &str = "[]";
+
 /// The error a template raises or appends, with every member the helper takes.
 #[derive(Debug, Clone, Default)]
 pub struct Raised {
@@ -60,6 +82,11 @@ impl Raised {
     /// The error as one entry of an `outErrors` list: every member the helper takes, each
     /// one the raise named none of carried as `null`.
     ///
+    /// The members are named as an `outErrors` entry names them ([`DETAIL_MESSAGE`],
+    /// [`DETAIL_TYPE`], [`DETAIL_DATA`], [`DETAIL_INFO`]), which is a shorter set of names
+    /// than the helper's own parameters: the list reports what each call carried, not how the
+    /// call was written.
+    ///
     /// This is the projection a SANDBOX evaluation reports an appended error by
     /// (`crate::ops::evaluate_mapping_template`), the same one the APPSYNC_JS runtime of the
     /// same sandbox writes (`crate::ops::evaluate_code::appsync_js`), so one appended error
@@ -70,13 +97,16 @@ impl Raised {
     pub fn detail(&self) -> Json {
         let member = |value: Option<Json>| value.unwrap_or(Json::Null);
         let mut entry = JsonMap::new();
-        entry.insert("message".to_string(), Json::String(self.message.clone()));
         entry.insert(
-            "errorType".to_string(),
+            DETAIL_MESSAGE.to_string(),
+            Json::String(self.message.clone()),
+        );
+        entry.insert(
+            DETAIL_TYPE.to_string(),
             member(self.error_type.clone().map(Json::String)),
         );
-        entry.insert("data".to_string(), member(self.data.clone()));
-        entry.insert("errorInfo".to_string(), member(self.error_info.clone()));
+        entry.insert(DETAIL_DATA.to_string(), member(self.data.clone()));
+        entry.insert(DETAIL_INFO.to_string(), member(self.error_info.clone()));
         Json::Object(entry)
     }
 
@@ -98,14 +128,14 @@ impl Raised {
         };
         Self {
             message: entry
-                .get("message")
+                .get(DETAIL_MESSAGE)
                 .and_then(Json::as_str)
                 .unwrap_or_default()
                 .to_string(),
-            error_type: named("errorType")
+            error_type: named(DETAIL_TYPE)
                 .and_then(|value| value.as_str().map(str::to_string)),
-            data: named("data"),
-            error_info: named("errorInfo"),
+            data: named(DETAIL_DATA),
+            error_info: named(DETAIL_INFO),
             refuses_the_field: false,
         }
     }

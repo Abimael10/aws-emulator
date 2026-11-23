@@ -216,16 +216,16 @@ async fn the_stash_and_the_appended_errors_are_what_the_render_left() {
         written.body
     );
 
-    // A context carrying no stash, and a template writing none, leave nothing to report.
+    // A context carrying no stash, and a template writing none, are still reported: both
+    // members carry what the render left, which is the empty object and the empty list.
     let none = evaluate(&router, "rendered", "{}").await;
-    assert!(
-        none.body.get("stash").is_none(),
-        "case a run that left no stash: expected no stash reported, got {:?}",
-        none.body
-    );
-    assert!(
-        none.body.get("outErrors").is_none(),
-        "case a run that appended no error: expected no outErrors reported, got {:?}",
+    assert_eq!(
+        (
+            none.body["stash"].as_str(),
+            none.body["outErrors"].as_str()
+        ),
+        (Some("{}"), Some("[]")),
+        "case a run that left neither: expected the empty object and the empty list, got {:?}",
         none.body
     );
 
@@ -250,8 +250,8 @@ async fn the_stash_and_the_appended_errors_are_what_the_render_left() {
     assert_eq!(
         out_errors,
         json!([
-            {"message": "noted", "errorType": null, "data": null, "errorInfo": null},
-            {"message": "flagged", "errorType": "Flagged", "data": null, "errorInfo": null},
+            {"message": "noted", "type": null, "data": null, "info": null},
+            {"message": "flagged", "type": "Flagged", "data": null, "info": null},
         ]),
         "case a template appending errors: expected both errors in order, got {:?}",
         appended.body
