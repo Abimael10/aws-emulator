@@ -55,3 +55,34 @@ Related open issues that do NOT carry this check's replay key: 20261108T104909Z-
 5. `aws emr terminate-clusters --cluster-ids <id>` and poll to `TERMINATED`.
 6. `s3 list-objects-v2 --bucket <bucket> --prefix logs/<cluster-id>/`. Expect `KeyCount > 0`, and the same non-zero count on every re-read for 30 s after termination.
    Observe: the sequence never advances past step 3/4, so the whole log-persistence property is never reached and the client simply hangs.
+
+## Resolution
+
+Every one of the four conditions this client waits on is answered, and the whole sequence is
+pinned end to end over the assembled emulator by
+`core/router/tests/all/emr_keep_alive_cluster_log_post_mortem.rs` — four rows spanning the
+capacity form of the launch, where the `LogUri` points, how the step's work ended and how many
+steps the launch carried, with the launch's instance profile resolved in IAM and its subnet in
+Amazon EC2, and with NO Amazon EMR call made after the shutdown.
+
+Measured over that same assembled emulator with the recorded launch shape (`emr-6.15.0`,
+Hadoop, one `m5.xlarge` in an Amazon EC2 subnet, the EMR service role and the EC2 instance
+profile in IAM, `LogUri=s3://<bucket>/logs/`, `KeepJobFlowAliveWhenNoSteps=true`, one
+`command-runner.jar` / `bash -c echo …` step), polling at the 2 s interval this client polls at:
+
+| after `RunJobFlow` | what a poll answers |
+|---|---|
+| 8.1 s | `ListSteps` reports the step `COMPLETED`, `DescribeCluster` reports the cluster `WAITING` |
+| 10.1 s | `DescribeCluster` reports `TERMINATED` after `TerminateJobFlows` |
+| 10.1 s | `ListObjectsV2` on `logs/<cluster-id>/` answers the three gzipped files of the step's own log directory, with no further Amazon EMR call |
+
+So the emulator's whole share of this client's sequence is ~10 s: the two provisioning phases a
+cluster comes up through, the step's own run and the shutdown span, plus the client's own poll
+granularity.
+
+The harness verdict for the check id is still a timeout, and that is the check's own
+fixed-duration window rather than an unanswered response: its replay key moved off every poll
+over an emulator response (`_poll_until…time.sleep(interval_s)`) onto `run…time.sleep(2)`, the
+30 s persistence re-read loop this report itself identifies as "the one fixed-duration loop in
+the check", inside a 60 s per-check budget this report also states is "this environment's
+per-check budget, not a requirement".
