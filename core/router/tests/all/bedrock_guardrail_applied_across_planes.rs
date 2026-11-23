@@ -609,7 +609,10 @@ async fn each_configured_policy_is_evaluated_by_the_data_plane() {
     }
 
     // The sensitive-information policy, configured to MASK: the value is reported and
-    // the content comes back with it replaced.
+    // the content comes back with it replaced. Masking rewrites the text the guardrail
+    // answers with, so it is the RESPONSE side such an entry is evaluated on — the
+    // asymmetry itself is
+    // `all/bedrock_guardrail_masking_is_a_response_side_transform.rs`'s subject.
     let (status, masking) = create_guardrail(
         &router,
         "masking-guardrail",
@@ -632,7 +635,7 @@ async fn each_configured_policy_is_evaluated_by_the_data_plane() {
         &router,
         &masking_id,
         "DRAFT",
-        "INPUT",
+        "OUTPUT",
         "Write to dana.reed@example.com about the order.",
     )
     .await;

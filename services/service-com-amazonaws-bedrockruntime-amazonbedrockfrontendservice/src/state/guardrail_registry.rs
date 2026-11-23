@@ -190,7 +190,7 @@ impl Sides {
     }
 
     /// Both sides evaluated under one action: the shape of an entry whose
-    /// configuration states no side of its own.
+    /// configuration carries that action for each side of an invocation.
     #[must_use]
     pub fn both(action: PolicyAction) -> Self {
         Self {

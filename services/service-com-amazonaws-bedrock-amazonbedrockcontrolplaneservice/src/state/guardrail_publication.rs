@@ -154,13 +154,14 @@ fn applied_policies(revision: &GuardrailRevision) -> runtime_registry::Guardrail
                 entity_type: entity.r#type.clone(),
                 // A sensitive-information entry carries the action for the entry as a
                 // whole (`GuardrailPiiEntity$action`, `@required`), which is what each
-                // side takes where that side names none of its own.
-                sides: Sides::new(
+                // side takes where that side names none of its own — except that a
+                // masking one configures the response side alone ([`sensitive_sides`]).
+                sides: sensitive_sides(
                     entity.input_action.as_deref(),
                     entity.input_enabled,
                     entity.output_action.as_deref(),
                     entity.output_enabled,
-                    sensitive_action(&entity.action),
+                    &entity.action,
                 ),
             })
             .collect(),
@@ -172,12 +173,12 @@ fn applied_policies(revision: &GuardrailRevision) -> runtime_registry::Guardrail
             .map(|regex| runtime_registry::RegexEntry {
                 name: regex.name.clone(),
                 pattern: regex.pattern.clone(),
-                sides: Sides::new(
+                sides: sensitive_sides(
                     regex.input_action.as_deref(),
                     regex.input_enabled,
                     regex.output_action.as_deref(),
                     regex.output_enabled,
-                    sensitive_action(&regex.action),
+                    &regex.action,
                 ),
             })
             .collect(),
@@ -198,6 +199,41 @@ fn applied_policies(revision: &GuardrailRevision) -> runtime_registry::Guardrail
             })
             .collect(),
     }
+}
+
+/// The sides a sensitive-information entry — a PII entity type or a regular expression — is
+/// evaluated on, and what it does on each.
+///
+/// The entry's own `action` is what a side takes where that side names none of its own
+/// (`GuardrailPiiEntityConfig$action` / `GuardrailRegexConfig$action`, both `@required`),
+/// with ONE asymmetry: masking REWRITES the text the guardrail answers with ("ANONYMIZE –
+/// Mask the content and replace it with identifier tags"), which is a transform of the
+/// RESPONSE, so an entry whose action is the masking one configures the response side and
+/// the request side of it is evaluated only where the configuration asks for a request-side
+/// evaluation of its own — a request-side action, or request-side evaluation enabled
+/// (`GuardrailPiiEntityConfig$inputAction`, `$inputEnabled`). An entry no side of a given
+/// evaluation holds is not evaluated there, so it is neither charged for nor reported there
+/// ("When disabled, you aren't charged for the evaluation. The evaluation doesn't appear in
+/// the response.").
+fn sensitive_sides(
+    input_action: Option<&str>,
+    input_enabled: Option<bool>,
+    output_action: Option<&str>,
+    output_enabled: Option<bool>,
+    action: &str,
+) -> runtime_registry::Sides {
+    let default = sensitive_action(action);
+    let mut sides = runtime_registry::Sides::new(
+        input_action,
+        input_enabled,
+        output_action,
+        output_enabled,
+        default,
+    );
+    if default.anonymizes() && input_action.is_none() && input_enabled.is_none() {
+        sides.input = None;
+    }
+    sides
 }
 
 /// The action a sensitive-information entry's own `action` names.
