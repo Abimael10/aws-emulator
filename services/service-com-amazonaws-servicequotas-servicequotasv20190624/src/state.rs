@@ -3162,85 +3162,12 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             "AWS Agent Registry",
             agent_registry_quotas(),
         ),
-        service(
-            "aidevops",
-            "AWS DevOps Agent",
-            // This service names a quota with the hyphenated slug of what it counts and
-            // describes it with that same phrase as prose, which is the form the row
-            // whose published text the recorded listing of this service states carries.
-            // The agent-space row's own text is not among the data available here — that
-            // recording shows the prose form of its slug is not the sentence the service
-            // publishes, and withholds the sentence — so that row publishes no
-            // description rather than wording of this catalog's own.
-            vec![
-                quota("agent-spaces-per-account-per-region", 100.0).code("L-510AF4A9"),
-                quota("concurrent-evaluations-per-agent-space", 1.0)
-                    .code("L-4FF187E6")
-                    .unit("Count")
-                    .fixed()
-                    .describe("Concurrent evaluations per agent space"),
-            ],
-        ),
-        service(
-            "aiops",
-            "Amazon AI Operations",
-            vec![
-                // The investigations a month may cover, which AWS publishes over a
-                // ONE-HOUR window rather than the five-minute one its resource counts
-                // are published over. The published text of this row and of the
-                // investigation-group row below is not among the data available here —
-                // the recorded listing of this service shows wording in the form of the
-                // sentences around them is not what it carries, and withholds the text —
-                // so neither publishes a description of this catalog's own.
-                quota("Monthly investigations", 150.0)
-                    .code("L-4CD81CD5")
-                    .fixed()
-                    .period(1, "HOUR")
-                    .metric(usage_metric(
-                        "Amazon AI Operations",
-                        &[
-                            ("Class", "None"),
-                            ("Resource", "MonthlyAIAssistedInvestigations"),
-                            ("Type", "Resource"),
-                        ],
-                    )),
-                quota("Investigation groups", 1.0).code("L-5EC19707").fixed(),
-                quota("Concurrent active investigations", 2.0)
-                    .code("L-EF31E0C4")
-                    .fixed()
-                    .metric(usage_metric(
-                        "Amazon AI Operations",
-                        &[
-                            ("Class", "None"),
-                            ("Resource", "ConcurrentActiveInvestigations"),
-                            ("Type", "Resource"),
-                        ],
-                    ))
-                    .describe(
-                        "The maximum number of concurrent investigations with active AI \
-                         analysis per account per region.",
-                    ),
-            ],
-        ),
+        service("aidevops", "AWS DevOps Agent", aidevops_quotas()),
+        service("aiops", "Amazon AI Operations", aiops_quotas()),
         service(
             "airflow",
             "Amazon Managed Workflows for Apache Airflow",
-            vec![
-                quota(
-                    "Environments per account per Region (small, medium, large)",
-                    10.0,
-                )
-                .code("L-67D41C6B")
-                .describe("The maximum number of environments per account per Region."),
-                quota("Web servers per environment", 5.0)
-                    .code("L-52DCDA32")
-                    .describe("The maximum number of web servers per environment."),
-                // The worker plane of an environment, which AWS publishes as adjustable
-                // the way the environment counts are.
-                quota("Workers per environment", 25.0)
-                    .code("L-78AC1883")
-                    .describe("The maximum number of workers per environment."),
-            ],
+            airflow_quotas(),
         ),
         service(
             // The serverless plane of Managed Workflows for Apache Airflow, which is a
@@ -3249,24 +3176,7 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             "Amazon MWAA Serverless (airflow-serverless)",
             airflow_serverless_quotas(),
         ),
-        service(
-            "amplify",
-            "AWS Amplify",
-            vec![
-                // How fast apps may be created, which AWS publishes as not adjustable.
-                quota("Maximum app creations per hour", 25.0)
-                    .code("L-2FC3A2FA")
-                    .fixed(),
-                // The branch plane of an app, RE-KEYED onto AWS's own code: the recorded
-                // default listing of this service reports the descriptive stand-in this
-                // catalog used (`BranchesPerApp`) as a surplus entry and states the code
-                // AWS publishes the quota under. The app-count row's stand-in
-                // (`AppsPerRegion`) is surplus too, and that recording states no AWS
-                // code for the quota it names, so that row is dropped rather than paired
-                // with a code this catalog would be guessing at.
-                quota("Branches per app", 50.0).code("L-A6716586"),
-            ],
-        ),
+        service("amplify", "AWS Amplify", amplify_quotas()),
         service(
             "amplifyuibuilder",
             "Amplify UI Builder",

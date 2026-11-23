@@ -214,6 +214,23 @@ const COUNT_ROWS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// The rows a class service publishes that are a count METERED by a resource count: a
+/// count rather than a rate, so no rate class holds for it, but one CloudWatch publishes
+/// the resources in use for — so it carries the `AWS/Usage` `ResourceCount` series of its
+/// own plane and the window those counts are published over, not a rate window. Named by
+/// `(ServiceCode, QuotaName, (PeriodValue, PeriodUnit), Resource dimension)`.
+///
+/// SOURCE: AWS's published Service Quotas data for the service code, as
+/// `src/state/quota_rows/agent_registry.rs` carries it: AWS Agent Registry publishes the
+/// registries of an account as a metered count beside its per-operation rates, over the
+/// five-minute window a resource count is published over.
+const METERED_COUNT_ROWS: &[(&str, &str, (i64, &str), &str)] = &[(
+    "agent-registry",
+    "Registries per Account",
+    (5, "MINUTE"),
+    "Registry",
+)];
+
 /// The display name AWS's integrated-service inventory reports for a `ServiceCode`.
 ///
 /// SOURCE: AWS's own Service Quotas service catalog (what `aws service-quotas
@@ -459,6 +476,41 @@ async fn a_class_service_publishes_no_row_outside_its_classes() {
                         && row.get("UsageMetric").is_none_or(Value::is_null),
                     "case {service_code}/{code}: a count is published over no window and with \
                      no call count, got {row}"
+                );
+                continue;
+            }
+            if let Some((_, _, (period_value, period_unit), resource)) = METERED_COUNT_ROWS
+                .iter()
+                .find(|(code, quota_name, _, _)| *code == service_code && *quota_name == name)
+            {
+                // A metered count is not a rate either: it is published over the window
+                // its own resource count is published over, with that plane's
+                // `ResourceCount` series rather than an operation's call count.
+                assert!(
+                    !matched,
+                    "case {service_code}/{code}: a count is not a rate, got {name:?}"
+                );
+                assert_eq!(
+                    row["Period"],
+                    json!({"PeriodValue": period_value, "PeriodUnit": period_unit}),
+                    "case {service_code}/{code}: a metered count is published over the window \
+                     its resource count is, got {row}"
+                );
+                assert_eq!(
+                    (
+                        row["UsageMetric"]["MetricName"].as_str(),
+                        row["UsageMetric"]["MetricStatisticRecommendation"].as_str(),
+                        row["UsageMetric"]["MetricDimensions"]["Resource"].as_str(),
+                        row["UsageMetric"]["MetricDimensions"]["Type"].as_str(),
+                    ),
+                    (
+                        Some("ResourceCount"),
+                        Some("Maximum"),
+                        Some(*resource),
+                        Some("Resource"),
+                    ),
+                    "case {service_code}/{code}: a metered count carries its own plane's \
+                     resource-count series, got {row}"
                 );
                 continue;
             }

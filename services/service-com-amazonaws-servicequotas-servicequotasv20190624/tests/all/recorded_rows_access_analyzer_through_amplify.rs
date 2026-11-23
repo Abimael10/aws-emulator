@@ -71,9 +71,22 @@ fn rows() -> Vec<Row> {
             period: None,
             metric: None,
         },
-        // The analyzer count's AWS code is published with a name and a description this
-        // evidence withholds, so no row is served under it (see
-        // `UNPUBLISHED_QUOTA_CODES`).
+        // The analyzer count of an account, whose published name, value, adjustability
+        // and sentence this evidence states, keyed on AWS's own code for it.
+        Row {
+            service_code: "access-analyzer",
+            quota_code: "L-6F85FE0C",
+            quota_name: "Organization level analyzer",
+            value: 5.0,
+            unit: "None",
+            adjustable: true,
+            description: Some(
+                "The maximum number of organization level analyzers that can be created per \
+                 analyzer type per AWS Account per Region.",
+            ),
+            period: None,
+            metric: None,
+        },
         // The per-API request-rate class of AWS Private CA: one-second window, the
         // class's own sentence, and a per-operation limit.
         Row {
@@ -186,7 +199,7 @@ fn rows() -> Vec<Row> {
             value: 100.0,
             unit: "None",
             adjustable: true,
-            description: None,
+            description: Some("Agent spaces per account per Region"),
             period: None,
             metric: None,
         },
@@ -199,7 +212,10 @@ fn rows() -> Vec<Row> {
             value: 150.0,
             unit: "None",
             adjustable: false,
-            description: None,
+            description: Some(
+                "The maximum number of AI-assisted investigations per month in this account in \
+                 the current region.",
+            ),
             period: Some((1, "HOUR")),
             metric: Some((
                 "ResourceCount",
@@ -215,7 +231,10 @@ fn rows() -> Vec<Row> {
             value: 1.0,
             unit: "None",
             adjustable: false,
-            description: None,
+            description: Some(
+                "The maximum number of investigation groups that can be created per account in \
+                 a region.",
+            ),
             period: None,
             metric: None,
         },
@@ -242,15 +261,19 @@ fn rows() -> Vec<Row> {
             metric: None,
         },
         // The branch plane of an Amplify app, re-keyed off a stand-in code onto AWS's
-        // own: same published quota, the code AWS resolves it by.
+        // own: same published quota, the code AWS resolves it by, published as NOT
+        // adjustable and with the sentence its whole per-app class carries.
         Row {
             service_code: "amplify",
             quota_code: "L-A6716586",
             quota_name: "Branches per app",
             value: 50.0,
             unit: "None",
-            adjustable: true,
-            description: None,
+            adjustable: false,
+            description: Some(
+                "The maximum number of branches per app that you can create in this account in \
+                 the current Region.",
+            ),
             period: None,
             metric: None,
         },
@@ -293,24 +316,14 @@ const UNPUBLISHED_QUOTA_CODES: &[(&str, &str, &str)] = &[
         "a stand-in re-keyed onto the AWS code for the same quota",
     ),
     (
-        "access-analyzer",
-        "L-2F63646F",
-        "an AWS code whose published quota name this evidence withholds",
-    ),
-    (
-        "access-analyzer",
-        "L-FD4CD927",
-        "an AWS code whose published quota this catalog carries no facts for",
-    ),
-    (
         "acm",
-        "L-8849A1A8",
+        "L-12943EEB",
         "an AWS code whose published per-operation rate this catalog carries no facts for",
     ),
     (
-        "aco-automation",
-        "L-D0AFC926",
-        "an AWS code whose published throttle limit this catalog carries no facts for",
+        "aidevops",
+        "L-1553F789",
+        "an AWS code whose published default this evidence withholds",
     ),
 ];
 

@@ -44,13 +44,17 @@ fn acm_pca_request_rate(api_name: &str, requests_per_second: f64) -> QuotaRow {
 /// the recording states no AWS code for it, so the row is dropped rather than paired
 /// with a code this catalog would be guessing at; the rate rows whose own per-second
 /// limit no source available here states are likewise left to the default-quota-set
-/// gap.
+/// gap, as is the revoked-certificate plane of a CA with complete CRLs (`L-DFF54388`),
+/// whose published default no source available here states.
 pub(in crate::state) fn acm_pca_quotas() -> Vec<QuotaRow> {
     vec![
         acm_pca_request_rate("CreateCertificateAuthority", 1.0).code("L-01B8608D"),
+        acm_pca_request_rate("GetPolicy", 5.0).code("L-3549B861"),
         acm_pca_request_rate("DeleteCertificateAuthority", 10.0).code("L-4065FDCB"),
         acm_pca_request_rate("PutPolicy", 5.0).code("L-506CC328"),
         acm_pca_request_rate("ListCertificateAuthorities", 20.0).code("L-5A3CF806"),
         acm_pca_request_rate("CreatePermission", 1.0).code("L-773738D3"),
+        acm_pca_request_rate("ListTags", 20.0).code("L-AF91D77C"),
+        acm_pca_request_rate("CreateCertificateAuthorityAuditReport", 1.0).code("L-C0A08797"),
     ]
 }

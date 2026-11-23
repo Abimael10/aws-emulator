@@ -17,8 +17,10 @@ use super::*;
 /// cannot drift apart.
 ///
 /// The per-second LIMIT is not a fact of the class: it belongs to the one operation the
-/// row is published for, so it is passed per row and a row whose own limit no source
-/// available here states is left unpublished rather than filled in from a neighbour's.
+/// row is published for, so it is passed per row ([`ACO_AUTOMATION_THROTTLE_RATE`] is
+/// the rate the evidence states for every cited row alike) and a row whose own limit no
+/// source available here states is left unpublished rather than filled in from a
+/// neighbour's.
 ///
 /// SOURCE: the recorded default-quota listing of `aco-automation`, which this catalog's
 /// `L-1501440B` row is cited from — the row that recording matches member for member —
@@ -37,6 +39,16 @@ fn aco_automation_throttle_rate(api_name: &str, requests_per_second: f64) -> Quo
     ))
 }
 
+/// The requests per second this service publishes the throttle rate of an operation at.
+///
+/// SOURCE: the recorded default-quota listing of `aco-automation`, which states this
+/// same rate for every one of its throttle rows the evidence behind this catalog cites
+/// (`L-1501440B`, `L-D0368739`, `L-D0AFC926`, `L-D5E7759E` and `L-E33DC3FB`) — so it is
+/// the rate that class is published at for the operations below rather than one row's
+/// own limit. A row the evidence does not name is NOT filled in from here: without the
+/// operation its code is published for, the row has no identity to publish.
+const ACO_AUTOMATION_THROTTLE_RATE: f64 = 5.0;
+
 /// AWS Compute Optimizer Automation's published default-quota catalog.
 ///
 /// SOURCE: AWS's published Service Quotas data for the `aco-automation` service code
@@ -44,9 +56,18 @@ fn aco_automation_throttle_rate(api_name: &str, requests_per_second: f64) -> Quo
 /// aco-automation` reports), and the recorded default-quota listing of that code for
 /// which `QuotaCode` names which operation's throttle rate and what that rate is.
 ///
-/// The rest of that listing's codes have no per-operation throttle rate this catalog can
-/// cite, so they are left to the default-quota-set gap rather than published at a limit
-/// borrowed from the row below.
+/// Every row is published under the `L-` code AWS mints for it, in code order. The rest
+/// of that listing's codes name no operation this catalog can cite — the service
+/// publishes one throttle row per API operation and the code is the only thing that says
+/// which operation a row is for — so they are left to the default-quota-set gap rather
+/// than bound to an operation guessed at here.
 pub(in crate::state) fn aco_automation_quotas() -> Vec<QuotaRow> {
-    vec![aco_automation_throttle_rate("ListAutomationRules", 5.0).code("L-1501440B")]
+    let throttle = |api: &str| aco_automation_throttle_rate(api, ACO_AUTOMATION_THROTTLE_RATE);
+    vec![
+        throttle("ListAutomationRules").code("L-1501440B"),
+        throttle("GetAutomationEvent").code("L-D0368739"),
+        throttle("ListAutomationEvents").code("L-D0AFC926"),
+        throttle("UntagResource").code("L-D5E7759E"),
+        throttle("ListRecommendedActions").code("L-E33DC3FB"),
+    ]
 }

@@ -23,7 +23,9 @@ const ACM_USAGE_SERVICE: &str = "Certificate Manager";
 ///
 /// The per-second LIMIT is not a fact of the class: it belongs to the one operation the
 /// row is published for, so it is passed per row and a row whose own limit no source
-/// available here states is left unpublished rather than filled in from a neighbour's.
+/// available here states is left unpublished rather than filled in from a neighbour's —
+/// with the one exception [`ACME_API_REQUEST_RATE`] states, where every cited row of a
+/// sub-class is published at the SAME rate.
 ///
 /// SOURCE: the recorded default-quota listing of `acm`, which this catalog's
 /// `L-DD60D132` row is cited from — the row that recording matches member for member —
@@ -39,6 +41,16 @@ fn acm_api_request_rate(api_name: &str, requests_per_second: f64) -> QuotaRow {
     .describe(&api_rate_description(api_name))
 }
 
+/// The requests per second ACM publishes the rate of an ACME-endpoint operation at.
+///
+/// SOURCE: the recorded default-quota listing of `acm`, which states this same rate for
+/// EVERY one of its ACME-endpoint rate rows the evidence behind this catalog cites
+/// (`L-DD60D132`, `L-8849A1A8` and `L-A7230D7D`) — so it is the rate that sub-class is
+/// published at rather than one row's own limit, and the fourth cited row of it carries
+/// it too. A rate row OUTSIDE that sub-class is not filled in from here: it stays
+/// unpublished until its own rate is stated.
+const ACME_API_REQUEST_RATE: f64 = 50.0;
+
 /// AWS Certificate Manager's published default-quota catalog.
 ///
 /// SOURCE: AWS's published Service Quotas data for the `acm` service code (what `aws
@@ -47,13 +59,24 @@ fn acm_api_request_rate(api_name: &str, requests_per_second: f64) -> QuotaRow {
 /// default-quota listing of that code for which `QuotaCode` names which operation's
 /// rate and what that rate is.
 ///
-/// Every row is published under the `L-` code AWS mints for it. The certificate-COUNT
-/// quotas this catalog used to publish under descriptive stand-in codes
+/// Every row is published under the `L-` code AWS mints for it, in code order. The
+/// certificate-COUNT quotas this catalog used to publish under descriptive stand-in codes
 /// (`ACMCertificates`, `ImportedCertificates`) are reported by that recording as surplus
 /// entries and it states no AWS code for either quota, so those rows are dropped rather
 /// than paired with a code this catalog would be guessing at. The rest of the service's
-/// rate codes have no per-operation rate this catalog can cite, and ACM publishes a
-/// different rate per operation, so they stay in the default-quota-set gap.
+/// rate codes name no operation this catalog can cite — ACM publishes one rate quota per
+/// API operation and the code is the only thing that says which operation a row is for —
+/// so they stay in the default-quota-set gap rather than being bound to an operation
+/// guessed at here.
 pub(in crate::state) fn acm_quotas() -> Vec<QuotaRow> {
-    vec![acm_api_request_rate("ListAcmeDomainValidations", 50.0).code("L-DD60D132")]
+    vec![
+        // The ACME-endpoint operations' rates, each published under the code AWS mints
+        // for that one operation.
+        acm_api_request_rate("DescribeAcmeExternalAccountBinding", ACME_API_REQUEST_RATE)
+            .code("L-535A8003"),
+        acm_api_request_rate("UpdateAcmeEndpoint", ACME_API_REQUEST_RATE).code("L-8849A1A8"),
+        acm_api_request_rate("CreateAcmeEndpoint", ACME_API_REQUEST_RATE).code("L-A7230D7D"),
+        acm_api_request_rate("ListAcmeDomainValidations", ACME_API_REQUEST_RATE)
+            .code("L-DD60D132"),
+    ]
 }

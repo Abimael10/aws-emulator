@@ -56,14 +56,13 @@ const AGENT_REGISTRY_REQUEST_RATE: f64 = 10.0;
 /// SOURCE: AWS's published Service Quotas data for the `agent-registry` service code
 /// (what `aws service-quotas list-aws-default-service-quotas --service-code
 /// agent-registry` reports), and the recorded default-quota listing of that code for
-/// which `QuotaCode` names which operation's rate.
+/// which `QuotaCode` names which operation's rate, what that rate is, and the registry
+/// plane's own published name, default and window.
 ///
-/// Every row is published under the `L-` code AWS mints for it, in code order. The
-/// registry COUNT quota that listing carries (`L-197AC8CB`, the registries of an
-/// account, published with a five-minute resource-count window) states no default value
-/// this catalog can source, and the rest of its codes name no operation this catalog can
-/// cite, so both are left to the default-quota-set gap rather than published under a
-/// guessed fact.
+/// Every row is published under the `L-` code AWS mints for it, in code order. The rest
+/// of that listing's codes name no operation this catalog can cite, or state no default
+/// value for the quota they publish, so they are left to the default-quota-set gap
+/// rather than published under a guessed fact.
 pub(in crate::state) fn agent_registry_quotas() -> Vec<QuotaRow> {
     vec![
         agent_registry_request_rate(
@@ -71,6 +70,29 @@ pub(in crate::state) fn agent_registry_quotas() -> Vec<QuotaRow> {
             AGENT_REGISTRY_REQUEST_RATE,
         )
         .code("L-0CAE3C7F"),
+        // The one rate row of this class the evidence states a rate of its own for, and
+        // the one beside `L-4BB62FF5` the registry publishes as NOT adjustable.
+        agent_registry_request_rate("GetRegistry", 5.0)
+            .code("L-160B222D")
+            .fixed(),
+        // The REGISTRY plane of an account: a count of resources rather than a call
+        // rate, so it is metered by that plane's `AWS/Usage` resource count and carries
+        // the five-minute window those counts are published over instead of the class's
+        // one-second rate window. `Resource` is the series CloudWatch publishes the
+        // count under, which is the RESOURCE TYPE the plane counts (the form the
+        // resource planes of `appconfig` carry), not the plane's own name. The plane's
+        // own published sentence is not among the data available here, so the row
+        // publishes none rather than wording of this catalog's own.
+        quota("Registries per Account", 10.0)
+            .code("L-197AC8CB")
+            .metric(usage_metric(
+                AGENT_REGISTRY_USAGE_SERVICE,
+                &[
+                    ("Class", "None"),
+                    ("Resource", "Registry"),
+                    ("Type", "Resource"),
+                ],
+            )),
         agent_registry_request_rate("DeleteRegistryRecord", AGENT_REGISTRY_REQUEST_RATE)
             .code("L-4BB62FF5")
             // The one row of this class the recorded listing publishes as NOT
