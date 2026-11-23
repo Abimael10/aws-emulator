@@ -38,7 +38,11 @@ const MEDIA: &[&[u8]] = &[b"chunk-bytes-for-the-wording-suite"];
 /// The `Message` member of an error answer, as the restJson1 error envelope carries it
 /// (`ResourceNotFoundException$Message` / `InvalidArgumentException$Message`,
 /// `smithy_query(query="shape", shape="InvalidArgumentException")`).
-fn message(response: &http::Response<Bytes>) -> String {
+///
+/// `pub(crate)` because the request-rejection suite beside this one
+/// (`request_rejection_wording`) reads the same member of the same envelope, and one reader
+/// is what keeps the two suites agreeing on where a refusal's sentence lives.
+pub(crate) fn message(response: &http::Response<Bytes>) -> String {
     let body = json(response);
     body.get("Message")
         .or_else(|| body.get("message"))

@@ -61,6 +61,13 @@
 //!
 //! The Matroska container a producer submits is read by [`matroska`].
 //!
+//! ## How a refused request is worded
+//!
+//! A request this endpoint could READ and whose value a modelled constraint does not admit
+//! is refused by the boundary validator ahead of every handler, and [`validation`] is how
+//! [`Service::override_refusal`] words that refusal: the shared AWS constraint envelope,
+//! stating no value the caller sent and quoting each `@pattern` as this API publishes it.
+//!
 //! ## Who may reach either plane
 //!
 //! Both routes are authorized before they read or write anything, against the
@@ -82,6 +89,7 @@ pub mod authorization;
 pub mod matroska;
 pub mod put_media;
 pub mod read_plane;
+pub mod validation;
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
@@ -230,8 +238,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // required member, or a value outside a declared bound) to let this
         // service reword it. Returning `None` keeps the framework's default
         // wording.
-        let _ = refusal;
-        None
+        //
+        // This endpoint states the shared AWS constraint envelope with the two renderings
+        // that are its own — a clause carrying no caller value, and a `@pattern` quoted as
+        // this API publishes the expression for the member's shape ([`validation`]) — and
+        // keeps the framework's wording for every refusal that is not about a value.
+        validation::stated_refusal(refusal)
     }
 
     fn override_routing_error(

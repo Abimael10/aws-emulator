@@ -200,6 +200,121 @@ fn resource_not_found(message: impl Into<String>) -> GetMediaError {
 }
 
 // ---------------------------------------------------------------------------
+// The companion member a `StartSelector` type requires, and how its absence is
+// stated.
+// ---------------------------------------------------------------------------
+//
+// `StartSelector$StartSelectorType` is the only `@required` member of the shape:
+// `AfterFragmentNumber`, `StartTimestamp` and `ContinuationToken` are all optional
+// (`smithy_query(query="shape", shape="StartSelector")`), so WHICH of the three a
+// selector type needs is this handler's rule rather than the schema's. The model
+// declares one error class for every one of them — `InvalidArgumentException`, "The
+// value for this input parameter is invalid" — so the MESSAGE is the only thing that
+// says which member was missing, and Kinesis Video Streams words it the same way for
+// all three: the requirement that was not met, then the whole selector as the request
+// carried it.
+
+/// One class of "the selector named a type whose companion member is absent" refusal:
+/// the requirement the sentence leads with, and how that sentence spells the member the
+/// selector arrived in.
+///
+/// Both are FIXED text per class — the fragment-number class names the selector TYPE
+/// that needed a companion, the other two name the absent MEMBER, and the two spellings
+/// of `StartSelector` are the service's own — so they are stated here, once, beside the
+/// one renderer of the selector itself.
+#[derive(Clone, Copy, Debug)]
+struct MissingCompanion {
+    /// What the sentence says must be specified.
+    requirement: &'static str,
+    /// How the sentence spells the `StartSelector` member it then renders.
+    selector: &'static str,
+}
+
+/// `FRAGMENT_NUMBER` with no `AfterFragmentNumber` — "Start with the chunk after a
+/// specific fragment" names no fragment.
+const FRAGMENT_NUMBER_WITHOUT_FRAGMENT: MissingCompanion = MissingCompanion {
+    requirement: "FRAGMENT_NUMBER",
+    selector: "startSelector",
+};
+
+/// `PRODUCER_TIMESTAMP` or `SERVER_TIMESTAMP` with no `StartTimestamp` — a timestamp
+/// selector names no timestamp. One class for both types: the sentence states the absent
+/// member, and the selector rendering beside it carries which of the two was asked for.
+const TIMESTAMP_WITHOUT_START: MissingCompanion = MissingCompanion {
+    requirement: "Start Timestamp",
+    selector: "StartSelector",
+};
+
+/// `CONTINUATION_TOKEN` with no `ContinuationToken` — a resumption names no cursor.
+const CONTINUATION_TOKEN_WITHOUT_TOKEN: MissingCompanion = MissingCompanion {
+    requirement: "ContinuationToken",
+    selector: "StartSelector",
+};
+
+/// The refusal for a selector missing the companion member its type requires:
+/// `InvalidArgumentException` (HTTP 400) stating the requirement and then the selector
+/// the request carried.
+fn missing_companion(class: MissingCompanion, selector: &StartSelector) -> GetMediaError {
+    invalid_argument(format!(
+        "{} must be specified for {} : {}",
+        class.requirement,
+        class.selector,
+        rendered_start_selector(selector)
+    ))
+}
+
+/// The `StartSelector` a request carried, rendered as a modelled structure renders: the
+/// shape's name over its four members, in the order the model declares them, each either
+/// the value the request stated for it or the one spelling of a member the request left
+/// unset.
+///
+/// Both the form and that spelling are the shared ones every clause of this emulator
+/// quotes a structure through (`service_common::validation::rendered_record` over
+/// `service_common::validation::UNSET_MEMBER`), so the sentence above and a boundary
+/// clause about the same selector cannot render one value two ways. The member names are
+/// the API's own lower-camel spellings, which is how this family's messages name them.
+fn rendered_start_selector(selector: &StartSelector) -> String {
+    let timestamp = selector.start_timestamp.as_ref().map(stated_instant);
+    ::service_common::validation::rendered_record(
+        "StartSelector",
+        &[
+            ("startSelectorType", selector.start_selector_type.as_str()),
+            (
+                "afterFragmentNumber",
+                stated_or_unset(selector.after_fragment_number.as_deref()),
+            ),
+            (
+                "startTimestamp",
+                timestamp
+                    .as_deref()
+                    .unwrap_or(::service_common::validation::UNSET_MEMBER),
+            ),
+            (
+                "continuationToken",
+                stated_or_unset(selector.continuation_token.as_deref()),
+            ),
+        ],
+    )
+}
+
+/// A string member as the rendering above states it: the value the request carried, or the
+/// unset spelling when it carried none.
+fn stated_or_unset(value: Option<&str>) -> &str {
+    value.unwrap_or(::service_common::validation::UNSET_MEMBER)
+}
+
+/// An instant as the rendering above states it: the RFC 3339 date-time form, which is both
+/// what Smithy's `date-time` is and what an SDK prints a timestamp member as.
+///
+/// An instant the date-time formatter cannot express keeps the epoch-second number the
+/// request carried, rather than being stated as a member that was never sent.
+fn stated_instant(value: &::aws_smithy_types::DateTime) -> String {
+    value
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_else(|_| value.secs().to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Chunk framing: the Matroska `Tags` element Kinesis Video Streams adds to each
 // chunk it returns.
 // ---------------------------------------------------------------------------
@@ -429,18 +544,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let selector_type = selector.start_selector_type.as_str();
         match selector_type {
             "FRAGMENT_NUMBER" if selector.after_fragment_number.is_none() => {
-                return Err(invalid_argument(
-                    "StartSelector.AfterFragmentNumber is required when StartSelectorType is FRAGMENT_NUMBER.",
+                return Err(missing_companion(
+                    FRAGMENT_NUMBER_WITHOUT_FRAGMENT,
+                    selector,
                 ))
             }
             "PRODUCER_TIMESTAMP" | "SERVER_TIMESTAMP" if selector.start_timestamp.is_none() => {
-                return Err(invalid_argument(format!(
-                    "StartSelector.StartTimestamp is required when StartSelectorType is {selector_type}."
-                )))
+                return Err(missing_companion(TIMESTAMP_WITHOUT_START, selector))
             }
             "CONTINUATION_TOKEN" if selector.continuation_token.is_none() => {
-                return Err(invalid_argument(
-                    "StartSelector.ContinuationToken is required when StartSelectorType is CONTINUATION_TOKEN.",
+                return Err(missing_companion(
+                    CONTINUATION_TOKEN_WITHOUT_TOKEN,
+                    selector,
                 ))
             }
             "EARLIEST" | "NOW" | "FRAGMENT_NUMBER" | "PRODUCER_TIMESTAMP" | "SERVER_TIMESTAMP"
