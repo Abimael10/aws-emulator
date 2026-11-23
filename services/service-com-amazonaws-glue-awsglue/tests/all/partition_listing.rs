@@ -399,34 +399,19 @@ async fn an_expression_outside_the_filter_language_is_refused() {
     seed_table(&router, "filters", "flagged", &[("flag", "boolean")]).await;
     create_partition(&router, "filters", "flagged", &["true"]).await;
 
-    // Rows differ along the way an expression can fail to be a filter: a column the table
-    // does not partition by, a partition key of a type an expression cannot compare, a
-    // literal that is no value of the key's type, and text that is no expression at all.
+    // Rows differ along the way an expression can fail to be a filter over the keys the
+    // table declares: a column the table does not partition by, a partition key of a type an
+    // expression cannot compare, and text that is no expression at all.
     // EVERY one of them is refused with the same fixed wording, which names no part of the
-    // request: the service discloses no classification of why a filter could not be run.
+    // request: the service discloses no classification of why a filter could not be run. The
+    // comparison whose LITERAL is no value of the key's declared type is a DIFFERENT recorded
+    // refusal class and is covered by `crate::partition_value_refusal`.
     let cases: Vec<(&str, &str, &str)> = vec![
         ("a column that is no partition key", "events", "country = 'us'"),
         (
             "a partition key of a type an expression cannot compare",
             "flagged",
             "flag = 'true'",
-        ),
-        ("a word compared against a numeric key", "events", "year = 'abc'"),
-        ("NULL compared against a key", "events", "year = NULL"),
-        (
-            "a value that is no instant against a date key",
-            "events",
-            "dt >= 'yesterday'",
-        ),
-        (
-            "components that name no day against a date key",
-            "events",
-            "dt = '2024-13-45'",
-        ),
-        (
-            "a time of day no clock shows against a date key",
-            "events",
-            "dt > '2024-01-05 25:00:00'",
         ),
         ("text that is no expression", "events", "this is not a filter("),
         ("a column name on its own", "events", "region"),

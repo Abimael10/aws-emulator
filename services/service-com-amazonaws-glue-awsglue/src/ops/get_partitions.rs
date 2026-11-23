@@ -349,7 +349,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Err(refusal) => {
                     return Err(GetPartitionsErrorModeled::InvalidInputException(
                         InvalidInputException {
-                            message: Some(refusal.message().to_string()),
+                            message: Some(refusal.message()),
                             from_federation_source: None,
                         },
                     )
@@ -405,7 +405,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         Err(refusal) => {
                             return Err(GetPartitionsErrorModeled::InvalidInputException(
                                 InvalidInputException {
-                                    message: Some(refusal.message().to_string()),
+                                    message: Some(refusal.message()),
                                     from_federation_source: None,
                                 },
                             )

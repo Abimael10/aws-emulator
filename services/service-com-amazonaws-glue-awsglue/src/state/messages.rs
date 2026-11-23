@@ -2585,19 +2585,52 @@ pub fn unsupported_export_sse_algorithm(value: &str) -> String {
     )
 }
 
+/// A partition listing (`GetPartitions`) whose `Expression` addresses a table that declares
+/// NO partition keys.
+///
+/// A filter selects among the keys a partition is addressed by, so a table that declares
+/// none offers no key collection to read one against, and the read fails on that absent
+/// collection rather than on the expression. The whole sentence is FIXED and names nothing
+/// of the request: neither the expression, nor the table, nor a column.
+pub const PARTITION_FILTER_ON_UNPARTITIONED_TABLE: &str =
+    "Cannot invoke \"java.util.Collection.toArray()\" because \"elements\" is null";
+
 /// A partition listing (`GetPartitions`, and the Lake Formation application-integration
 /// listing that carries the same member) whose `Expression` is no filter the service can
-/// evaluate over the addressed table's partitions
+/// evaluate over the keys the addressed table DECLARES
 /// ([`super::ParsedPartitionFilter::parse`], [`super::ParsedPartitionFilter::bind`]).
 ///
-/// RECORDED constant, and the ONE wording every unusable expression is refused with:
-/// a predicate that is no `WHERE`-clause expression at all, one reading a column the table
-/// does not have, one reading a real column that is no partition key of it, one filtering a
-/// key of a type a filter cannot compare, and one comparing a key against a literal that is
-/// no value of its type all answer this sentence. It is fixed text in full — it carries
-/// neither the expression, nor the column, nor the operators a filter is built from — so
-/// the refusal discloses nothing about which part of the filter could not be run.
+/// RECORDED constant, and the ONE wording every such expression is refused with: a predicate
+/// that is no `WHERE`-clause expression at all, one carrying an operator the member does not
+/// document, one reading a column the table does not have, one reading a real column that is
+/// no partition key of it, and one filtering a key of a type a filter cannot compare all
+/// answer this sentence. It is fixed text in full — it carries neither the expression, nor
+/// the column, nor the operators a filter is built from — so the refusal discloses nothing
+/// about which part of the filter could not be run.
+///
+/// What it does NOT cover is the comparison whose LITERAL is no value of the addressed key's
+/// declared type, which is recorded as its own refusal class
+/// ([`partition_value_not_of_key_type`]).
 pub const INVALID_PARTITION_EXPRESSION: &str = "Invalid partition expression!";
+
+/// The server-side exception class this service names when a partition-key comparison
+/// addresses a literal that is no value of that key's declared type. The refusal of such a
+/// comparison is reported as that class name, then the offending literal, then the type the
+/// literal could not be read as — a different class from the expression-level refusal
+/// ([`INVALID_PARTITION_EXPRESSION`]), which names no class at all.
+const INVALID_PARTITION_VALUE_CLASS: &str =
+    "com.amazonaws.daylight.core.exceptions.InvalidPartitionValueException";
+
+/// A partition listing whose `Expression` compares a partition key against a literal that
+/// is no value of that key's declared type.
+///
+/// The FIXED text is the class name above, the connective " is not a " and the closing stop;
+/// the VARIABLE parts are `literal`, the offending literal as the request's `Expression`
+/// spells it, and `declared`, the type the addressed partition key is stored with. The key's
+/// own name is not part of the sentence.
+pub fn partition_value_not_of_key_type(literal: &str, declared: &str) -> String {
+    format!("{INVALID_PARTITION_VALUE_CLASS}: {literal} is not a {declared}.")
+}
 
 /// A partition listing whose `Segment` names a segment outside the scan it splits the
 /// table into: "the zero-based index number of the segment. For example, if the total
