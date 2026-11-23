@@ -266,8 +266,7 @@ impl Derived {
 }
 
 /// One deployment: where the emulator is served, the Region the stack is made in, what the
-/// template declares, and the zone and port the published registry authority must therefore
-/// carry.
+/// template declares, and the authority the published address must therefore carry.
 struct Row {
     case: &'static str,
     /// The address this emulator is SERVED at for this row, which is the authority every
