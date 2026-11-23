@@ -58,6 +58,7 @@
 
 pub mod authorization;
 mod envelope;
+pub(crate) mod member_text;
 mod unset_members;
 
 use aws_smithy_schema::Schema;

@@ -98,6 +98,10 @@ pub fn trial_component_addressed(
 /// [`ANY_RESOURCE`] for an element that carries none — an element whose reference the request
 /// left unset addresses no resource of this service.
 ///
+/// A reference STATING nothing is one the request left unset, by this service's one reading
+/// of a member's text (`crate::service::member_text`): blank text says no more than an
+/// absent member does, so a reference of blanks addresses no resource either.
+///
 /// Each reference is taken as the request sent it, before this service reads whether it is a
 /// well-formed SageMaker reference at all: IAM decides ahead of the service, and the resource
 /// element of a statement is matched against the value the caller submitted.
@@ -107,7 +111,7 @@ pub fn trial_component_addressed(
 pub fn referenced_resources<'a>(references: impl Iterator<Item = &'a str>) -> Vec<String> {
     let mut resources: Vec<String> = Vec::new();
     for reference in references {
-        let resource = if reference.is_empty() {
+        let resource = if crate::service::member_text::states_no_value(reference) {
             ANY_RESOURCE
         } else {
             reference
@@ -188,6 +192,23 @@ mod tests {
             (
                 "an element carrying no reference",
                 vec![""],
+                vec![ANY_RESOURCE.to_string()],
+            ),
+            (
+                // Blank text states no more than an absent member does, so this element
+                // addresses no resource of this service either.
+                "an element whose reference is blank",
+                vec!["   "],
+                vec![ANY_RESOURCE.to_string()],
+            ),
+            (
+                "an element whose reference is a tab and a newline",
+                vec!["\t\n"],
+                vec![ANY_RESOURCE.to_string()],
+            ),
+            (
+                "a blank reference beside an empty one",
+                vec!["  ", ""],
                 vec![ANY_RESOURCE.to_string()],
             ),
             (

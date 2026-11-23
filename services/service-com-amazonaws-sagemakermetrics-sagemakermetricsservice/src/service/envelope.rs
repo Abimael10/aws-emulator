@@ -478,13 +478,17 @@ fn unset_member_refusal(
 /// `null`, or it is an empty collection or blank text — a list with no element and a name
 /// with no non-blank character state no more than an absent member does.
 ///
+/// Blank text is read by [`super::member_text::states_no_value`], this service's one
+/// reading of that question, so every layer that judges a string reads one of these the
+/// same way.
+///
 /// A value of another JSON class is a value (one the member may not be readable from,
 /// which [`unreadable_member`] answers first).
 fn carries_no_value(held: Option<&Value>) -> bool {
     match held {
         None | Some(Value::Null) => true,
         Some(Value::Array(elements)) => elements.is_empty(),
-        Some(Value::String(text)) => text.trim().is_empty(),
+        Some(Value::String(text)) => super::member_text::states_no_value(text),
         Some(_) => false,
     }
 }

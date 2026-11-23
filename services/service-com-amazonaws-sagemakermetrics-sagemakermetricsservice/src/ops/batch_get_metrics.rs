@@ -51,7 +51,9 @@
 //! `MetricQuery.ResourceArn` in `super::types`), because the boundary refuses every
 //! modelled constraint of this request and this service refuses only this one; the rest are
 //! reported per query above. A reference the request leaves UNSET is not a malformed one:
-//! it names no series, so that query selects nothing.
+//! it names no series, so that query selects nothing — and a reference of blank text states
+//! no value any more than an absent member does
+//! ([`crate::service::member_text`]), so it is answered the same way.
 //!
 //! The refusals this service words for a request its envelope cannot serve at all — no
 //! queries, a member whose JSON type its shape cannot hold — are
@@ -358,18 +360,28 @@ fn nothing_matched() -> MetricQueryResult {
 /// Whether a `ResourceArn` the request carried is a SageMaker resource reference, by the
 /// member's own modelled expression.
 ///
-/// A reference the request left UNSET (absent, null or empty) is not judged: there is no
-/// value to be malformed, so the query it belongs to simply names no series.
+/// A reference the request left UNSET is not judged: there is no value to be malformed, so
+/// the query it belongs to simply names no series. Whether the request stated a value at
+/// all is [`crate::service::member_text::states_no_value`]'s reading — absent, null, empty
+/// or any other text with no non-blank character in it — so a reference that says nothing
+/// is answered in-band however it says it, rather than one spelling of nothing being served
+/// and another refused.
 fn names_a_sagemaker_resource(resource_arn: &str) -> bool {
-    resource_arn.is_empty() || SAGEMAKER_RESOURCE_ARN.is_match(resource_arn)
+    crate::service::member_text::states_no_value(resource_arn)
+        || SAGEMAKER_RESOURCE_ARN.is_match(resource_arn)
 }
 
 /// The trial component a `ResourceArn` names: the final `/`-separated segment of the
-/// ARN. `None` when there is no such segment, so the ARN names no resource — which the
-/// modelled `@pattern` allows, since it only requires the resource part to CONTAIN a `/`.
+/// ARN. `None` when there is no such segment, or when that segment states no name
+/// ([`crate::service::member_text::states_no_value`]), so the ARN names no resource — which
+/// the modelled `@pattern` allows, since it only requires the resource part to CONTAIN a
+/// `/`.
+///
+/// The segment is otherwise taken as written: a name is an opaque key, matched against the
+/// name the points were stored under.
 fn trial_component_of(resource_arn: &str) -> Option<&str> {
     let (_, name) = resource_arn.rsplit_once('/')?;
-    (!name.is_empty()).then_some(name)
+    (!crate::service::member_text::states_no_value(name)).then_some(name)
 }
 
 /// The sentence a query reports when its `Period` and its `XAxisType` disagree about the

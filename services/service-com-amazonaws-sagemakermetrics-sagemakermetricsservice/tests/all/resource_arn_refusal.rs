@@ -631,6 +631,176 @@ async fn a_reference_the_expression_accepts_is_answered_in_band() {
     );
 }
 
+/// Every spelling of text that states NO value: a string with no non-blank character in
+/// it, which says no more than an absent member does.
+///
+/// The list is `str::trim`'s own reading of blank — every Unicode whitespace character,
+/// not the ASCII space alone — with the empty string as the row that already held, so each
+/// case is checked against the control.
+fn references_stating_no_value() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("empty", ""),
+        ("one-space", " "),
+        ("several-spaces", "    "),
+        ("a-tab", "\t"),
+        ("a-newline", "\n"),
+        ("a-carriage-return-and-newline", "\r\n"),
+        ("a-form-feed", "\u{000c}"),
+        ("mixed-blanks", " \t\r\n "),
+        // Whitespace outside ASCII, which `str::trim` reads as blank too.
+        ("a-no-break-space", "\u{00a0}"),
+        ("an-ideographic-space", "\u{3000}"),
+    ]
+}
+
+/// Assert `results[position]` is the in-band answer of a query that selected nothing.
+fn assert_selected_nothing(case: &str, results: &[Value], position: usize) {
+    let result = &results[position];
+    assert_eq!(
+        result["Status"].as_str(),
+        Some("Complete"),
+        "case {case:?}: query {position} names no series, which is Complete, got {result:?}"
+    );
+    assert_eq!(
+        result["MetricValues"].as_array().map(Vec::len),
+        Some(0),
+        "case {case:?}: query {position} selected nothing, got {result:?}"
+    );
+    assert_eq!(
+        result["XAxisValues"].as_array().map(Vec::len),
+        Some(0),
+        "case {case:?}: query {position} selected nothing, got {result:?}"
+    );
+}
+
+/// A reference that STATES nothing is a reference the request does not state, whichever
+/// blank it is spelled with: it is answered in-band like any query that selects nothing,
+/// wherever in a batch it sits and however many of them the batch carries.
+#[tokio::test]
+async fn a_reference_of_blank_text_is_not_a_malformed_one() {
+    let router = emulator();
+    let good = well_formed_arns()[0].1.clone();
+
+    for (shape, blank) in references_stating_no_value() {
+        // The same value alone, first, last and in the middle of a longer batch, and
+        // twice in one batch: the answer does not vary with position or count.
+        let layouts: Vec<(&str, Vec<Value>, Vec<usize>)> = vec![
+            ("alone", vec![query(blank)], vec![0]),
+            ("first-of-two", vec![query(blank), query(&good)], vec![0]),
+            ("last-of-two", vec![query(&good), query(blank)], vec![1]),
+            (
+                "middle-of-three",
+                vec![query(&good), query(blank), query(&good)],
+                vec![1],
+            ),
+            (
+                "twice-in-four",
+                vec![
+                    query(&good),
+                    query(blank),
+                    query(&good),
+                    query(blank),
+                ],
+                vec![1, 3],
+            ),
+        ];
+        for (layout, queries, positions) in layouts {
+            let case = format!("{shape}/{layout}");
+            let expected = queries.len();
+            let answer = get_metrics(&router, queries).await;
+            assert_eq!(
+                answer.status, 200,
+                "case {case:?}: a query stating no reference is served, got {} ({:?})",
+                answer.status, answer.body
+            );
+            let results = answer.body["MetricQueryResults"]
+                .as_array()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {case:?}: expected MetricQueryResults, got {:?}",
+                        answer.body
+                    )
+                })
+                .clone();
+            assert_eq!(
+                results.len(),
+                expected,
+                "case {case:?}: one result per query, got {results:?}"
+            );
+            for position in positions {
+                assert_selected_nothing(&case, &results, position);
+            }
+        }
+    }
+}
+
+/// A reference stating nothing answers for ITSELF: a sibling query naming a resource this
+/// store wrote for is still answered from state, positionally beside it.
+#[tokio::test]
+async fn a_reference_stating_nothing_does_not_hide_its_siblings_answer() {
+    let router = emulator();
+    let component = "tc-blank-reference";
+    let put = call(
+        &router,
+        "PUT",
+        "/BatchPutMetrics",
+        &json!({
+            "TrialComponentName": component,
+            "MetricData": [{
+                "MetricName": "loss",
+                "Timestamp": T0,
+                "Step": 0,
+                "Value": 9.5,
+            }],
+        }),
+    )
+    .await;
+    assert_eq!(
+        put.status, 200,
+        "BatchPutMetrics must answer 200, got {} ({:?})",
+        put.status, put.body
+    );
+    let stored = format!(
+        "arn:aws:sagemaker:us-east-1:123456789012:experiment-trial-component/{component}"
+    );
+
+    for (case, blank) in references_stating_no_value() {
+        let answer = get_metrics(&router, vec![query(blank), query(&stored)]).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: the call is served, got {} ({:?})",
+            answer.status, answer.body
+        );
+        let results = answer.body["MetricQueryResults"]
+            .as_array()
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: expected MetricQueryResults, got {:?}",
+                    answer.body
+                )
+            })
+            .clone();
+        assert_eq!(
+            results.len(),
+            2,
+            "case {case:?}: one result per query, got {results:?}"
+        );
+        assert_selected_nothing(case, &results, 0);
+        assert_eq!(
+            results[1]["Status"].as_str(),
+            Some("Complete"),
+            "case {case:?}: the sibling query is answered from state, got {:?}",
+            results[1]
+        );
+        let value = results[1]["MetricValues"][0].as_f64();
+        assert_eq!(
+            value,
+            Some(9.5),
+            "case {case:?}: expected the stored value 9.5, got {value:?}"
+        );
+    }
+}
+
 // The second fault that refuses the whole call: IAM's authorization decision on the CALLER.
 
 /// A second Region, for the cases that vary which Region a call was signed for.
@@ -1235,4 +1405,101 @@ async fn a_read_is_decided_against_every_reference_its_queries_carry() {
         "one result per query, got {:?}",
         served.body
     );
+}
+
+/// IAM's own sentence for a call that addresses no resource of its own: the any-resource
+/// wildcard is what the decision is taken against, and the sentence states no resource
+/// clause because there is nothing to name.
+fn denial_without_a_resource_clause(principal: &str, operation: &str) -> String {
+    let action = format!("{ACTION_PREFIX}:{operation}");
+    format!(
+        "User: {principal} is not authorized to perform: {action} because no identity-based \
+         policy allows the {action} action"
+    )
+}
+
+/// RULE: a query whose reference STATES nothing addresses no resource of this service,
+/// whichever blank it is spelled with, so the decision on it is taken against the
+/// any-resource wildcard — a grant scoped to one component does not cover it, and a grant
+/// on every resource does.
+#[tokio::test]
+async fn a_query_stating_no_reference_is_decided_against_the_any_resource_wildcard() {
+    let router = emulator_with_identity_services();
+    let action = format!("{ACTION_PREFIX}:BatchGetMetrics");
+    let scoped = assumed_role(
+        &router,
+        "smm-authz-blank-scoped",
+        &[statement(
+            "Allow",
+            &[action.as_str()],
+            &component_arn(REGION, "tc-authz-blank"),
+        )],
+    )
+    .await;
+    let unscoped = assumed_role(
+        &router,
+        "smm-authz-blank-unscoped",
+        &[statement("Allow", &[action.as_str()], "*")],
+    )
+    .await;
+
+    for (case, blank) in references_stating_no_value() {
+        let body = json!({ "MetricQueries": [query(blank)] });
+        let refused = call_as(
+            &router,
+            &scoped.access_key_id,
+            REGION,
+            "POST",
+            "/BatchGetMetrics",
+            &body,
+        )
+        .await;
+        assert_eq!(
+            refused.status, ACCESS_DENIED_STATUS,
+            "case {case:?}: expected HTTP {ACCESS_DENIED_STATUS}, got {} ({:?})",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_type.as_deref(),
+            Some(ACCESS_DENIED),
+            "case {case:?}: expected __type {ACCESS_DENIED}, got {:?}",
+            refused.error_type
+        );
+        assert_eq!(
+            refused.message(),
+            denial_without_a_resource_clause(&scoped.arn, "BatchGetMetrics"),
+            "case {case:?}: expected IAM's sentence for a call addressing no resource, got {:?}",
+            refused.message()
+        );
+        assert!(
+            refused.body.get("MetricQueryResults").is_none(),
+            "case {case:?}: a refused read answers no query at all, got {:?}",
+            refused.body
+        );
+
+        let served = call_as(
+            &router,
+            &unscoped.access_key_id,
+            REGION,
+            "POST",
+            "/BatchGetMetrics",
+            &body,
+        )
+        .await;
+        assert_eq!(
+            served.status, 200,
+            "case {case:?}: a caller granted every resource is served, got {} ({:?})",
+            served.status, served.body
+        );
+        let results = served.body["MetricQueryResults"]
+            .as_array()
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: expected MetricQueryResults, got {:?}",
+                    served.body
+                )
+            })
+            .clone();
+        assert_selected_nothing(case, &results, 0);
+    }
 }

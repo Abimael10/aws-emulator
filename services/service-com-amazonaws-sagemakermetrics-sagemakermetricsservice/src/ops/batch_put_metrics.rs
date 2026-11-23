@@ -227,11 +227,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // drops a validation one. Two values are such a point: a `Value` that is not a
             // number at all (`NaN` has no position in any ordering, so it can be neither
             // stored at a coordinate nor aggregated) and a `MetricName` with nothing in it
-            // (it names no series to store the point in). Nothing else about a point is
+            // (it names no series to store the point in — `crate::service::member_text` is
+            // this service's one reading of whether a member's text states anything). Nothing else about a point is
             // judged — an infinite value is a number, a name is otherwise an opaque series
             // key stored as sent, and every instant the modelled timestamp can hold is
             // stored.
-            if raw.value.is_nan() || raw.metric_name.trim().is_empty() {
+            if raw.value.is_nan()
+                || crate::service::member_text::states_no_value(&raw.metric_name)
+            {
                 errors.push(failure(CODE_INTERNAL_ERROR, index));
                 continue;
             }
