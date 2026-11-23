@@ -4659,15 +4659,23 @@ pub fn encode_page_token(after: &str) -> String {
     ::hex::encode(::serde_json::json!({ "a": after }).to_string())
 }
 
-/// What every list operation refuses a `NextToken` it cannot resume from with.
+/// What a list operation refuses a `NextToken` it cannot resume from with.
 ///
-/// The service states the parameter that was rejected and the reason clause
-/// every refusal of a parameter of this service carries — the request is
-/// malformed, which is all a token it cannot resume from says — and nothing of
-/// the token or the listing, so a token this service never minted and a
-/// well-formed one whose position is gone are refused in exactly these words.
-/// Written once, so the twelve paginated listings cannot word it differently.
-pub const INVALID_NEXT_TOKEN: &str =
+/// The service names the parameter it rejected and nothing else: no part of the
+/// token, the listing or the position the token named is in it, so a token this
+/// service never minted and a well-formed one whose position is gone are refused
+/// in exactly these words. Written once, so the paginated listings that answer
+/// this sentence cannot word it differently.
+pub const INVALID_NEXT_TOKEN: &str = "Parameter NextToken is not valid.";
+
+/// What `ListConnections` refuses a `NextToken` it cannot resume from with.
+///
+/// The connection listing states a reason clause beside the rejected parameter —
+/// the request is malformed, which is all a token it cannot resume from says.
+/// It is the ONE listing of this service observed to carry the clause; every
+/// other listing answers [`INVALID_NEXT_TOKEN`] alone, which is why the two
+/// forms are kept apart here instead of one sentence being used for all of them.
+pub const CONNECTION_INVALID_NEXT_TOKEN: &str =
     "Parameter NextToken is not valid. Reason: The request is malformed.";
 
 /// Decode a list page token. `None` when it is not one this service minted,

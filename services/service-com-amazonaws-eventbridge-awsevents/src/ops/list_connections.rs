@@ -164,7 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(after) => Some(after),
                 None => {
                     return Err(crate::scaffolded::Scaffolded::validation(
-                        crate::state::INVALID_NEXT_TOKEN,
+                        crate::state::CONNECTION_INVALID_NEXT_TOKEN,
                     ))
                 }
             },

@@ -312,13 +312,14 @@ async fn a_delete_precondition_states_one_sentence_whatever_the_resource_or_the_
 }
 
 /// A `NextToken` this service cannot resume from is refused with one sentence
-/// naming the parameter and the reason clause a refused parameter of this service
-/// carries, whichever listing was asked and whatever the token looked like:
-/// nothing of the token or the listing is in it.
+/// naming the parameter it rejected, whatever the token looked like: nothing of
+/// the token or the listing is in it. The connection listing states that parameter
+/// with the reason clause it carries, which is the one row below that differs.
 #[tokio::test]
 async fn a_next_token_this_service_cannot_resume_from_is_refused_with_one_sentence() {
     let router = emulator();
-    const INVALID_NEXT_TOKEN: &str =
+    const INVALID_NEXT_TOKEN: &str = "Parameter NextToken is not valid.";
+    const CONNECTION_INVALID_NEXT_TOKEN: &str =
         "Parameter NextToken is not valid. Reason: The request is malformed.";
     given_rule(&router, "the rule the target listing pages", None, "paged", 2).await;
 
@@ -329,22 +330,39 @@ async fn a_next_token_this_service_cannot_resume_from_is_refused_with_one_senten
     // `7b2262223a2278227d` is the hex of `{"b":"x"}`: well formed as far as the
     // decoder gets, and carrying no position it could resume at.
     let tokens = ["not-a-token", "7b2262223a2278227d", "zzzz", "0"];
-    // (case, the listing, the request members it needs beside NextToken)
-    let listings: [(&str, &str, Value); 8] = [
-        ("event buses", "ListEventBuses", json!({})),
-        ("rules", "ListRules", json!({})),
-        ("targets of a rule", "ListTargetsByRule", json!({ "Rule": "paged" })),
-        ("connections", "ListConnections", json!({})),
-        ("archives", "ListArchives", json!({})),
-        ("api destinations", "ListApiDestinations", json!({})),
-        ("replays", "ListReplays", json!({})),
+    // (case, the listing, the request members it needs beside NextToken, the
+    // sentence that listing answers)
+    let listings: [(&str, &str, Value, &str); 8] = [
+        ("event buses", "ListEventBuses", json!({}), INVALID_NEXT_TOKEN),
+        ("rules", "ListRules", json!({}), INVALID_NEXT_TOKEN),
+        (
+            "targets of a rule",
+            "ListTargetsByRule",
+            json!({ "Rule": "paged" }),
+            INVALID_NEXT_TOKEN,
+        ),
+        (
+            "connections",
+            "ListConnections",
+            json!({}),
+            CONNECTION_INVALID_NEXT_TOKEN,
+        ),
+        ("archives", "ListArchives", json!({}), INVALID_NEXT_TOKEN),
+        (
+            "api destinations",
+            "ListApiDestinations",
+            json!({}),
+            INVALID_NEXT_TOKEN,
+        ),
+        ("replays", "ListReplays", json!({}), INVALID_NEXT_TOKEN),
         (
             "rule names by target",
             "ListRuleNamesByTarget",
             json!({ "TargetArn": target_arn("queue-0") }),
+            INVALID_NEXT_TOKEN,
         ),
     ];
-    for (listing, operation, members) in listings {
+    for (listing, operation, members, expected) in listings {
         for token in tokens {
             let case = format!("{listing} resumed from {token:?}");
             let mut request = members.clone();
@@ -355,7 +373,7 @@ async fn a_next_token_this_service_cannot_resume_from_is_refused_with_one_senten
                 operation,
                 &request,
                 "ValidationException",
-                INVALID_NEXT_TOKEN,
+                expected,
             )
             .await;
         }

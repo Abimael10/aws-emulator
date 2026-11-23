@@ -4,25 +4,27 @@
 //! from, end to end over the wire (`awsJson1_1`, `POST /` with
 //! `X-Amz-Target: AWSEvents.<Operation>`) through the real `MultiServiceRouter`.
 //!
-//! The RULE asserted here: a `NextToken` this service cannot resume from is
-//! refused with `ValidationException` (HTTP 400) whose message names the parameter
-//! that was rejected and states the reason a refused parameter of this service
-//! carries — the request is malformed — and nothing of the token, the listing or
-//! the position it named. One sentence for every paginated listing and every way a
-//! token is unusable, because it is one answer: this listing cannot resume from it.
+//! The RULE asserted here: a `NextToken` a listing cannot resume from is refused
+//! with `ValidationException` (HTTP 400) whose message names the parameter that was
+//! rejected — `Parameter NextToken is not valid.` — and carries nothing of the
+//! token, the listing or the position the token named; the connection listing is the
+//! one listing that states a reason clause beside that parameter. One sentence per
+//! listing, for every way a token is unusable, because it is one answer: this
+//! listing cannot resume from it.
 //!
 //! `NextToken` is modelled `@length 1..2048` and carries no pattern, so a token
 //! inside those bounds reaches the handler and the handler is what decides it
-//! (`smithy_query(query="operation", operation="ListConnections")`); a `Limit`
+//! (`smithy_query(query="operation", operation="ListEventBuses")`); a `Limit`
 //! outside `LimitMax100`'s modelled `@range 1..100` is refused at the boundary
 //! instead, which is the control row below: its own constraint clause is unchanged
 //! by the sentence above.
 //!
 //! The rows span the class rather than one case: they differ along the listing
-//! asked (five of them, one of which takes a filter beside the token), and along
-//! WHY the token is unusable — text that is no token of this service at all, text
-//! that decodes but names no position, an empty-ish token, and a token this
-//! service really issued whose position is gone by the time it comes back.
+//! asked (nine of them, two of which take a filter or a required member beside the
+//! token), and along WHY the token is unusable — text that is no token of this
+//! service at all, text that decodes but names no position, an empty-ish token, and
+//! a token this service really issued whose position is gone by the time it comes
+//! back.
 
 use std::sync::Arc;
 
@@ -36,7 +38,11 @@ const REGION: &str = "us-west-2";
 /// The whole message a listing answers a token it cannot resume from. Written out
 /// here rather than imported, so a wrong constant in the implementation cannot
 /// make a row pass.
-const INVALID_NEXT_TOKEN: &str =
+const INVALID_NEXT_TOKEN: &str = "Parameter NextToken is not valid.";
+
+/// The whole message the CONNECTION listing answers such a token with: the same
+/// rejected parameter, stated with the reason clause that listing carries.
+const CONNECTION_INVALID_NEXT_TOKEN: &str =
     "Parameter NextToken is not valid. Reason: The request is malformed.";
 
 /// The error code every refused parameter of this service answers under.
@@ -102,7 +108,7 @@ fn error_message(body: &Value) -> String {
         .to_string()
 }
 
-/// Three `API_KEY` connections, so the listings below have something to page
+/// Three `API_KEY` connections, so the connection listing has something to page
 /// through.
 async fn given_connections(router: &MultiServiceRouter, count: usize) {
     for index in 0..count {
@@ -122,28 +128,80 @@ async fn given_connections(router: &MultiServiceRouter, count: usize) {
     }
 }
 
-/// Every paginated listing refuses a token it cannot resume from in exactly those
-/// words, whatever the token looked like.
+/// A rule carrying two targets, so the target listing has something to page
+/// through and a token of its own to issue.
+async fn given_rule_with_targets(router: &MultiServiceRouter, rule: &str) {
+    let (status, body) = events(
+        router,
+        "PutRule",
+        &json!({ "Name": rule, "EventPattern": json!({ "source": ["sim"] }).to_string() }),
+    )
+    .await;
+    assert_eq!(status, 200, "PutRule answered {status} {body}");
+    let (status, body) = events(
+        router,
+        "PutTargets",
+        &json!({
+            "Rule": rule,
+            "Targets": [
+                { "Id": "t0", "Arn": target_arn("queue-0") },
+                { "Id": "t1", "Arn": target_arn("queue-1") },
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "PutTargets answered {status} {body}");
+}
+
+/// An SQS queue ARN, the kind of target ARN a rule's targets and
+/// `ListRuleNamesByTarget` name.
+fn target_arn(queue: &str) -> String {
+    format!("arn:aws:sqs:{REGION}:000000000000:{queue}")
+}
+
+/// Every paginated listing refuses a token it cannot resume from with the sentence
+/// that listing states, whatever the token looked like.
 #[tokio::test]
-async fn an_unresumable_next_token_is_refused_with_the_reason_clause() {
+async fn an_unresumable_next_token_is_refused_with_one_sentence_per_listing() {
     let router = emulator();
     given_connections(&router, 3).await;
+    given_rule_with_targets(&router, "paged").await;
 
     // The token forms differ along WHY this service cannot resume from them: text
     // that is not one of its tokens at all, text that decodes but carries no
     // position (`7b2262223a2278227d` is the hex of `{"b":"x"}`), and an empty-ish
     // token.
     let tokens = ["not-a-token", "7b2262223a2278227d", "zzzz", "0"];
-    // (the listing, the request members it needs beside NextToken)
-    let listings: [(&str, Value); 5] = [
-        ("ListConnections", json!({})),
-        ("ListConnections", json!({ "NamePrefix": "paged" })),
-        ("ListRules", json!({})),
-        ("ListEventBuses", json!({})),
-        ("ListArchives", json!({})),
+    // (the listing, the request members it needs beside NextToken, the sentence it
+    // answers). The listings are the ones bound to this service that take a
+    // NextToken and need no partner event source
+    // (`smithy_query(query="list_operations")`).
+    let listings: [(&str, Value, &str); 10] = [
+        ("ListConnections", json!({}), CONNECTION_INVALID_NEXT_TOKEN),
+        (
+            "ListConnections",
+            json!({ "NamePrefix": "paged" }),
+            CONNECTION_INVALID_NEXT_TOKEN,
+        ),
+        ("ListEventBuses", json!({}), INVALID_NEXT_TOKEN),
+        ("ListRules", json!({}), INVALID_NEXT_TOKEN),
+        (
+            "ListTargetsByRule",
+            json!({ "Rule": "paged" }),
+            INVALID_NEXT_TOKEN,
+        ),
+        ("ListArchives", json!({}), INVALID_NEXT_TOKEN),
+        ("ListReplays", json!({}), INVALID_NEXT_TOKEN),
+        ("ListApiDestinations", json!({}), INVALID_NEXT_TOKEN),
+        ("ListEndpoints", json!({}), INVALID_NEXT_TOKEN),
+        (
+            "ListRuleNamesByTarget",
+            json!({ "TargetArn": target_arn("queue-0") }),
+            INVALID_NEXT_TOKEN,
+        ),
     ];
 
-    for (operation, members) in &listings {
+    for (operation, members, expected) in &listings {
         for token in tokens {
             let case = format!("{operation} resumed from {token:?} with {members}");
             let mut request = members.clone();
@@ -160,16 +218,63 @@ async fn an_unresumable_next_token_is_refused_with_the_reason_clause() {
             );
             let actual = error_message(&refused);
             assert_eq!(
-                actual, INVALID_NEXT_TOKEN,
-                "case {case:?}: expected {INVALID_NEXT_TOKEN:?}, got {actual:?}"
+                &actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
             );
         }
     }
 }
 
-/// A token this service DID issue resumes the listing, so the sentence above is
-/// this service's answer about a token it cannot resume from and not about every
-/// token a request carries.
+/// A token a listing DID issue, whose position is gone by the time it comes back,
+/// is refused with that listing's own sentence too: it is the same answer — this
+/// listing cannot resume from it.
+#[tokio::test]
+async fn a_token_whose_position_is_gone_is_refused_with_the_same_sentence() {
+    let router = emulator();
+    given_rule_with_targets(&router, "paged").await;
+
+    let (status, page) = events(
+        &router,
+        "ListTargetsByRule",
+        &json!({ "Rule": "paged", "Limit": 1 }),
+    )
+    .await;
+    assert_eq!(status, 200, "the first page answered {status} {page}");
+    let stale = page["NextToken"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a first page of one of two targets carries a NextToken: {page}"))
+        .to_string();
+
+    let (status, removed) = events(
+        &router,
+        "RemoveTargets",
+        &json!({ "Rule": "paged", "Ids": ["t0"] }),
+    )
+    .await;
+    assert_eq!(status, 200, "RemoveTargets answered {status} {removed}");
+
+    let (status, refused) = events(
+        &router,
+        "ListTargetsByRule",
+        &json!({ "Rule": "paged", "Limit": 1, "NextToken": stale }),
+    )
+    .await;
+    assert_eq!(status, 400, "expected HTTP 400, got {status} {refused}");
+    assert_eq!(
+        error_code(&refused),
+        VALIDATION_EXCEPTION,
+        "answered {refused}"
+    );
+    let actual = error_message(&refused);
+    assert_eq!(
+        actual, INVALID_NEXT_TOKEN,
+        "expected {INVALID_NEXT_TOKEN:?}, got {actual:?}"
+    );
+}
+
+/// A token a listing issued resumes it, so the sentences above are this service's
+/// answer about a token it cannot resume from and not about every token a request
+/// carries.
 #[tokio::test]
 async fn a_token_this_service_issued_resumes_the_listing() {
     let router = emulator();
@@ -200,8 +305,8 @@ async fn a_token_this_service_issued_resumes_the_listing() {
 }
 
 /// The control: a `Limit` outside the modelled range keeps the constraint clause
-/// the boundary states for it, so the token sentence above is this service's answer
-/// about the TOKEN and not a rewording of every refusal the listing makes.
+/// the boundary states for it, so the token sentences above are this service's
+/// answer about the TOKEN and not a rewording of every refusal a listing makes.
 #[tokio::test]
 async fn a_limit_outside_its_modelled_range_keeps_its_own_clause() {
     let router = emulator();
