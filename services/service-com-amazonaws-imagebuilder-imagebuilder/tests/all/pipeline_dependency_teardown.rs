@@ -211,9 +211,8 @@ fn resource_dependency_message(arn: &str) -> String {
     )
 }
 
-/// The missing-resource sentence a call ADDRESSED by a CONFIGURATION's own ARN to READ it
-/// carries: the ARN the request named, quoted — both families' reads, and the infrastructure
-/// configuration's delete.
+/// The missing-resource sentence a call addressed by the INFRASTRUCTURE configuration's own
+/// ARN carries: the ARN the request named, quoted — that family's read and its delete.
 fn configuration_not_found_message(arn: &str) -> String {
     format!("The resource ARN '{arn}' was not found.")
 }
@@ -241,8 +240,8 @@ struct Dependent {
     dependency: String,
     /// What a READ answers once it is gone.
     missing: String,
-    /// What a repeat of the DELETE answers once it is gone, which the distribution
-    /// configuration words differently from its read.
+    /// What a repeat of the DELETE answers once it is gone, which the infrastructure
+    /// configuration words as its read does.
     missing_on_delete: String,
 }
 
@@ -501,7 +500,7 @@ async fn a_pipeline_protects_every_resource_it_references_until_it_is_gone() {
                 read: "/GetDistributionConfiguration?distributionConfigurationArn=",
                 echoed: "distributionConfigurationArn",
                 dependency: resource_dependency_message(&distribution),
-                missing: configuration_not_found_message(&distribution),
+                missing: required_resource_message("DistributionConfiguration", &distribution),
                 missing_on_delete: required_resource_message(
                     "DistributionConfiguration",
                     &distribution,

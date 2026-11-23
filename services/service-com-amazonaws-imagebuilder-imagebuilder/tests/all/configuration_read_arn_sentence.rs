@@ -7,15 +7,16 @@
 //! serialization, the modelled-constraint walk and the handlers — so what is asserted is what
 //! a signed AWS SDK request observes.
 //!
-//! The rule under test: WHICH of the two sentences a refusal carries is the recorded contract
-//! of the ROUTE that looked the ARN up, under the error this service models for a resource it
-//! does not hold (`ResourceNotFoundException`, HTTP 404; the model defines the shape and no
-//! message text, `smithy_query(query="shape",shape="ResourceNotFoundException")`). The READ of
-//! a CONFIGURATION — a call addressed by that configuration's own ARN — reports the ARN it
-//! could not resolve, quoted and by itself: "The resource ARN '<arn>' was not found.", while
-//! the kind-naming sentence — "The following required resource '<Kind>' cannot be found:
-//! '<arn>'." — is carried by every route that must RESOLVE a reference to a resource (a
-//! delete, an update, a tagging write, the versioned families' own lookups).
+//! The rule under test: WHICH of the two sentences a refusal carries follows the RESOURCE the
+//! lookup addressed, under the error this service models for a resource it does not hold
+//! (`ResourceNotFoundException`, HTTP 404; the model defines the shape and no message text,
+//! `smithy_query(query="shape",shape="ResourceNotFoundException")`). A call addressed by the
+//! INFRASTRUCTURE configuration's own ARN reports the ARN it could not resolve, quoted and by
+//! itself: "The resource ARN '<arn>' was not found.", while every other resource of this
+//! service — the DISTRIBUTION configuration, the components, the recipes, the pipelines — is
+//! reported in the kind-naming sentence "The following required resource '<Kind>' cannot be
+//! found: '<arn>'.", whichever route looked it up (a read, a delete, an update, a tagging
+//! write, a reference a create resolves).
 //!
 //! The rows span what the rule generalises over: which configuration family the ARN names,
 //! why the ARN resolves to nothing (nothing ever created it, it was deleted, its name only
@@ -38,13 +39,14 @@ const OTHER_REGION: &str = "eu-west-1";
 /// The canonical emulator account (`engine::EMULATOR_ACCOUNT_ID`) every ARN carries.
 const ACCOUNT: &str = "000000000000";
 
-/// The sentence a call addressed by a CONFIGURATION's own ARN carries for a read it cannot
-/// resolve, spelled out here rather than taken from the crate so a reworded refusal fails.
+/// The sentence a call addressed by the INFRASTRUCTURE configuration's own ARN carries for a
+/// lookup it cannot resolve, spelled out here rather than taken from the crate so a reworded
+/// refusal fails.
 fn arn_sentence(arn: &str) -> String {
     format!("The resource ARN '{arn}' was not found.")
 }
 
-/// The sentence a call that has to RESOLVE a reference to a resource carries.
+/// The sentence every other resource of this service is reported missing in.
 fn kind_sentence(kind: &str, arn: &str) -> String {
     format!("The following required resource '{kind}' cannot be found: '{arn}'.")
 }
@@ -179,6 +181,9 @@ struct Family {
     minted: &'static str,
     read: &'static str,
     delete: &'static str,
+    /// The sentence a lookup of a configuration of this family that resolves to nothing
+    /// carries, for the ARN the request named.
+    missing: fn(&str) -> String,
 }
 
 /// The body a `CreateDistributionConfiguration` carries: one target Region with one output,
@@ -209,6 +214,7 @@ const DISTRIBUTION: Family = Family {
     minted: "distributionConfigurationArn",
     read: "/GetDistributionConfiguration?distributionConfigurationArn=",
     delete: "/DeleteDistributionConfiguration?distributionConfigurationArn=",
+    missing: |arn| kind_sentence("DistributionConfiguration", arn),
 };
 
 const INFRASTRUCTURE: Family = Family {
@@ -219,6 +225,7 @@ const INFRASTRUCTURE: Family = Family {
     minted: "infrastructureConfigurationArn",
     read: "/GetInfrastructureConfiguration?infrastructureConfigurationArn=",
     delete: "/DeleteInfrastructureConfiguration?infrastructureConfigurationArn=",
+    missing: arn_sentence,
 };
 
 /// The ARN a configuration of `family` named `name` carries in `region`.
@@ -250,9 +257,10 @@ async fn create(
         .to_string()
 }
 
-/// RULE: the READ of either configuration family reports an ARN it cannot resolve by quoting
-/// that ARN alone, whatever the reason it resolves to nothing and whatever form the
-/// configuration name takes.
+/// RULE: the READ of either configuration family reports an ARN it cannot resolve in the
+/// sentence that family's lookups carry — the infrastructure configuration by the ARN alone,
+/// the distribution configuration by the kind its ARN identifies — whatever the reason the ARN
+/// resolves to nothing and whatever form the configuration name takes.
 #[tokio::test]
 async fn a_configuration_read_reports_an_unresolvable_arn_in_its_own_sentence() {
     for family in [DISTRIBUTION, INFRASTRUCTURE] {
@@ -330,7 +338,7 @@ async fn a_configuration_read_reports_an_unresolvable_arn_in_its_own_sentence() 
 
         for (row, region, arn) in rows {
             let case = format!("{} on {row}", family.label);
-            let expected = arn_sentence(&arn);
+            let expected = (family.missing)(&arn);
             assert_reports_missing(
                 &router,
                 &case,
@@ -374,8 +382,9 @@ struct Reference {
     arn: String,
 }
 
-/// RULE's boundary: the calls that have to RESOLVE a reference to a resource name the KIND the
-/// ARN identifies — the same absent ARN a read reports by itself.
+/// RULE's boundary: the kind-naming sentence does not belong to one route — every other call
+/// that looks a resource up carries it too, naming the KIND the ARN identifies, while the same
+/// absent infrastructure-configuration ARN is reported by itself.
 #[tokio::test]
 async fn a_call_that_resolves_a_reference_names_the_kind() {
     let router = emulator();

@@ -4658,9 +4658,8 @@ pub const FILTERS_MEMBER: &str = "filters";
 ///
 /// The sentence every missing-resource report of this service carries except where
 /// [`resource_arn_not_found_message`] states otherwise: the components, recipes, pipelines,
-/// images and workflows are reported this way whether the call reads one, deletes one, updates
-/// one, tags one or resolves a reference to one, and so is a distribution configuration a
-/// create, an update, a tagging write or a delete names.
+/// images, workflows and distribution configurations are reported this way whether the call
+/// reads one, deletes one, updates one, tags one or resolves a reference to one.
 #[must_use]
 pub fn required_resource_not_found_message(arn: &str) -> String {
     missing_resource_message(&arn_resource_type(arn), arn)
@@ -4678,17 +4677,16 @@ pub fn missing_resource_message(resource_type: &str, identifier: &str) -> String
     format!("The following required resource '{resource_type}' cannot be found: '{identifier}'.")
 }
 
-/// Why a call addressing a CONFIGURATION resource this Region holds nothing under to READ it
+/// Why a call addressing an INFRASTRUCTURE configuration this Region holds nothing under
 /// reports it missing.
 ///
-/// The sentence a READ carries when it is addressed by a configuration's own ARN: it quotes
-/// the ARN the request carried and names no kind. Both configuration families' reads carry it
-/// (`GetDistributionConfiguration`, `GetInfrastructureConfiguration`), as does the
-/// infrastructure configuration's delete. Every route that has to RESOLVE A REFERENCE to a
-/// resource — one a create or an update names, a tagging write, a delete, the versioned
-/// families' own lookups — names the kind the ARN identifies through
-/// [`required_resource_not_found_message`] instead, so which sentence a route carries is that
-/// route's own recorded contract rather than a service-wide rule; see the note there.
+/// The sentence the INFRASTRUCTURE configuration's own lookups carry: it quotes the ARN the
+/// request carried and names no kind. That family's read (`GetInfrastructureConfiguration`)
+/// and its delete (`DeleteInfrastructureConfiguration`) are the routes recorded with it; every
+/// other resource of this service — components, recipes, pipelines, images, workflows and the
+/// DISTRIBUTION configuration — is reported as the required resource it is, naming the kind
+/// its ARN identifies, through [`required_resource_not_found_message`]. Which sentence a
+/// refusal carries therefore follows the RESOURCE the lookup addressed; see the note there.
 #[must_use]
 pub fn resource_arn_not_found_message(arn: &str) -> String {
     format!("The resource ARN '{arn}' was not found.")
