@@ -338,16 +338,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // are of BOTH snapshots, so the one instant it reports is the earliest at
             // which any of them stops resolving. An answer that hands out no token has no
             // such instant to report, so the member is OMITTED rather than filled with the
-            // expiry of tokens nobody was given — as are the geometry members below, which
-            // describe the blocks a page reported.
+            // expiry of tokens nobody was given.
             expiry_time: hands_out_block_tokens.then(|| {
                 ::aws_smithy_types::DateTime::from(first.expiry_time.min(second.expiry_time))
             }),
-            // The size of the volume and of the blocks the comparison is of, read off the
-            // snapshot the request named: a snapshot taken from a parent is of that
-            // parent's volume, so the two sides agree on both.
-            volume_size: hands_out_block_tokens.then_some(second.volume_size),
-            block_size: hands_out_block_tokens.then_some(second.block_size),
+            // "The size of the volume in GB" and "the size of the blocks IN THE SNAPSHOT,
+            // in bytes", read off the snapshot the request named: a snapshot taken from a
+            // parent is of that parent's volume, so the two sides agree on both. Both
+            // describe the snapshots the comparison is of rather than the page it reported,
+            // and are the same on every page of one comparison — a page that reports no
+            // changed block included, which "the request can return less blocks than
+            // MaxResults or an empty array of blocks" (`MaxResults`) makes a page a
+            // continuing listing may carry. So they are reported on every answer that
+            // resolved both sides.
+            volume_size: Some(second.volume_size),
+            block_size: Some(second.block_size),
             next_token,
         })
     }

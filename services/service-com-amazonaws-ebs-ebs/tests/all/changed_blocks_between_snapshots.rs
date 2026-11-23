@@ -32,10 +32,11 @@
 //! 5. THE SNAPSHOT THE URI NAMES MUST HOLD CONTENT: one that holds no block at all has
 //!    nothing for the comparison to report, so it is refused with the same
 //!    `INVALID_SNAPSHOT_ID` validation, worded with the snapshot's own id.
-//! 6. THE TOKEN MEMBERS BELONG TO THE TOKENS: a page that reports changed blocks hands out
-//!    block tokens and reports the instant they expire together with the geometry of the
-//!    blocks it reported; a page that reports no changed block hands out no token and omits
-//!    `ExpiryTime`, `VolumeSize` and `BlockSize` altogether.
+//! 6. EACH OUTPUT MEMBER IS REPORTED FROM WHAT IT DESCRIBES: `ExpiryTime` is "the time
+//!    when the `BlockToken` expires", so it belongs to the tokens a page handed out and a
+//!    page that reports no changed block (handing out no token) omits it; `VolumeSize` and
+//!    `BlockSize` describe the snapshots under comparison rather than the page, so every
+//!    answer carries both, a page that reports nothing included.
 //! 7. A REPORTED TOKEN IS THE ONE ITS OWN SIDE HANDS OUT: the token reported for a side at a
 //!    changed index is a token of THAT snapshot, so `GetSnapshotBlock` on that snapshot at
 //!    that index answers with exactly the bytes that side holds there, and the token of the
@@ -97,7 +98,10 @@ async fn list_changed_blocks(
 }
 
 /// The comparison of `first` against `second`, asserted to have answered 200.
-async fn compared(
+///
+/// `pub(crate)` so a sibling suite asserting a rule over BOTH listings of this service
+/// drives the same wire path rather than growing a second copy of it.
+pub(crate) async fn compared(
     router: &MultiServiceRouter,
     case: &str,
     first: &str,
@@ -158,43 +162,42 @@ fn reported(reply: &Reply) -> Vec<Changed> {
         .unwrap_or_default()
 }
 
-/// RULE 6, asserted on one answer: `ExpiryTime`, `VolumeSize` and `BlockSize` are reported
-/// exactly where the page handed out block tokens, and `ChangedBlocks` is always reported.
+/// RULE 6, asserted on one answer: `ExpiryTime` is reported exactly where the page handed
+/// out block tokens, while `ChangedBlocks` and the snapshot geometry (`VolumeSize`,
+/// `BlockSize`) are reported on every answer.
 ///
 /// `volume_size` is the size the snapshots under comparison were declared with, which is
-/// what a page that reports blocks must report.
+/// what every answer about them must report.
 fn assert_token_members(case: &str, reply: &Reply, hands_out_tokens: bool, volume_size: i64) {
     let answer = reply.json();
     assert!(
         answer.get("ChangedBlocks").is_some(),
         "case {case:?}: every answer must report ChangedBlocks, got {answer}"
     );
+    assert_eq!(
+        answer.get("BlockSize").and_then(serde_json::Value::as_i64),
+        Some(i64::from(BLOCK_SIZE)),
+        "case {case:?}: every answer must report the block size of the snapshots compared, \
+         got {answer}"
+    );
+    assert_eq!(
+        answer.get("VolumeSize").and_then(serde_json::Value::as_i64),
+        Some(volume_size),
+        "case {case:?}: every answer must report the volume size of the snapshots compared, \
+         got {answer}"
+    );
     if hands_out_tokens {
-        assert_eq!(
-            answer.get("BlockSize").and_then(serde_json::Value::as_i64),
-            Some(i64::from(BLOCK_SIZE)),
-            "case {case:?}: a page that handed out block tokens must report the block size, \
-             got {answer}"
-        );
-        assert_eq!(
-            answer.get("VolumeSize").and_then(serde_json::Value::as_i64),
-            Some(volume_size),
-            "case {case:?}: a page that handed out block tokens must report the volume size, \
-             got {answer}"
-        );
         assert!(
             answer.get("ExpiryTime").is_some(),
             "case {case:?}: a page that handed out block tokens must report when they expire, \
              got {answer}"
         );
     } else {
-        for member in ["ExpiryTime", "VolumeSize", "BlockSize"] {
-            assert!(
-                answer.get(member).is_none(),
-                "case {case:?}: a page that handed out no block token must omit {member}, got \
-                 {answer}"
-            );
-        }
+        assert!(
+            answer.get("ExpiryTime").is_none(),
+            "case {case:?}: a page that handed out no block token must omit ExpiryTime, got \
+             {answer}"
+        );
     }
 }
 
@@ -885,16 +888,17 @@ async fn a_comparison_needs_a_first_snapshot_and_a_second_that_holds_content() {
     }
 }
 
-/// RULE 6: the token members belong to the tokens — a page that reports no changed block
-/// hands out no block token, so it omits `ExpiryTime`, `VolumeSize` and `BlockSize`, while a
-/// page that reports changed blocks carries all three.
+/// RULE 6: each output member is reported from what it describes — a page that reports no
+/// changed block hands out no block token, so it omits `ExpiryTime` while still reporting
+/// the `VolumeSize` and `BlockSize` of the snapshots compared, and a page that reports
+/// changed blocks carries all three.
 ///
 /// The rows differ along WHY the page reports nothing (a snapshot compared against itself, a
 /// child that wrote nothing of its own, a listing starting past every changed index), along
 /// the declared volume size and the indexes involved, and include pages that DO report
 /// blocks — so the rule is asserted in both directions rather than on one shape of answer.
 #[tokio::test]
-async fn a_page_with_no_changed_block_omits_the_token_members() {
+async fn a_page_with_no_changed_block_omits_only_the_token_expiry() {
     let router = router();
     let case = "the compared lineage";
 
