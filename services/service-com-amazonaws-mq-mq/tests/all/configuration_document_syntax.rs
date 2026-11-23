@@ -236,7 +236,7 @@ fn the_tables_cover_every_modelled_engine_type() {
 }
 
 /// Create a configuration of `engine_type` and report its id.
-async fn configuration_of(mq: &Mq, case: &str, name: &str, engine_type: &str) -> String {
+pub(crate) async fn configuration_of(mq: &Mq, case: &str, name: &str, engine_type: &str) -> String {
     let mut body = configuration_body(name);
     body["engineType"] = json!(engine_type);
     let (status, created) = mq.call("POST", "/v1/configurations", Some(body)).await;
