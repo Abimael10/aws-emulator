@@ -30,7 +30,13 @@
 //! `id` and the `arn` — so a summary that reported an identity nothing resolves
 //! would fail here.
 //!
-//! A fourth table crosses the projection with the PAGE the summary arrived on:
+//! A fourth table crosses the projection with the rest of the STORE: a summary
+//! is the projection of its own stored record, so templates created and deleted
+//! beside it — and another domain holding a template of the same name — leave
+//! every member of its element where it was, and the identity the element
+//! reports stays the one the domain that listed it resolves.
+//!
+//! A fifth table crosses the projection with the PAGE the summary arrived on:
 //! a page boundary cuts a listing, so every page size the model admits — not
 //! only the one-entry page the tables above read — has to report each element in
 //! full.
@@ -921,6 +927,294 @@ async fn every_page_of_a_cut_listing_carries_the_full_projection() {
                  {gathered:?}"
             ),
         }
+    }
+}
+
+/// One row of the population table: how many OTHER templates the domain holds
+/// around the one under test, and how that population changes between two
+/// listings.
+///
+/// The rows differ along what the rule generalises over once a summary is a
+/// projection of its own stored record: how many other templates the domain
+/// holds, how many of them are deleted between the listings, and how many are
+/// created between them.
+struct PopulationRow {
+    case: &'static str,
+    /// Templates created in the domain beside the subject before the first
+    /// listing.
+    neighbours: usize,
+    /// How many of those neighbours are deleted between the two listings.
+    deleted: usize,
+    /// How many further templates are created between the two listings.
+    added: usize,
+}
+
+/// The population table: a domain holding the subject alone, and domains whose
+/// population shrinks, grows, and does both between the listings.
+fn population_rows() -> Vec<PopulationRow> {
+    vec![
+        PopulationRow {
+            case: "the only template in its domain",
+            neighbours: 0,
+            deleted: 0,
+            added: 0,
+        },
+        PopulationRow {
+            case: "one neighbour, deleted between the listings",
+            neighbours: 1,
+            deleted: 1,
+            added: 0,
+        },
+        PopulationRow {
+            case: "one neighbour, another template created between the listings",
+            neighbours: 1,
+            deleted: 0,
+            added: 1,
+        },
+        PopulationRow {
+            case: "several neighbours, some deleted and some created",
+            neighbours: 5,
+            deleted: 2,
+            added: 3,
+        },
+    ]
+}
+
+/// Every element of an unfiltered listing is self-describing: it reports ONE
+/// identity under both names the service reports a template by, an ARN that
+/// addresses the template that identity names, and a tag-propagation list.
+///
+/// Hands back the identities in the order they were reported, so a caller can
+/// check a listing reports each of the domain's templates exactly once.
+fn self_describing_identities(case: &str, domain_id: &str, answer: &Value) -> Vec<String> {
+    let summaries = answer
+        .get("templates")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("case {case:?}: a listing must carry templates, got {answer:?}"));
+    let mut identities = Vec::new();
+    for summary in summaries {
+        let id = string_at(summary, "id", case);
+        assert_eq!(
+            id,
+            string_at(summary, "templateId", case),
+            "case {case:?}: an element's id and templateId are one identity, got {summary:?}"
+        );
+        let arn = string_at(summary, "arn", case);
+        assert_eq!(
+            arn,
+            string_at(summary, "templateArn", case),
+            "case {case:?}: an element's arn and templateArn are one identity, got {summary:?}"
+        );
+        // The ARN read the way a client holding only it reads it: it must
+        // address the template the element's id names, in the domain the
+        // listing was made against.
+        assert_eq!(
+            identity_in(case, &arn),
+            (domain_id.to_string(), id.clone()),
+            "case {case:?}: an element's ARN must address the template its id names, in the \
+             domain that listed it, got {arn}"
+        );
+        // Present whatever the template holds, so the caller never has to tell
+        // an empty list from an absent member.
+        tag_propagation_configurations(case, "a summary", summary);
+        identities.push(id);
+    }
+    identities
+}
+
+/// A summary is the projection of its OWN stored record, so what else the store
+/// holds cannot change it: templates created and deleted beside it leave every
+/// member of its element — the identity under both names it is reported by, the
+/// name, the status and the tag-propagation list, empty rather than absent —
+/// exactly as it was, every element of the listing stays self-describing and
+/// distinct, the single-template read agrees with the element on the same
+/// record, and the identity an element reports is scoped to the domain that
+/// holds the template: another domain holding a template of the same name
+/// neither shares that identity nor resolves it.
+#[tokio::test]
+async fn a_summary_reports_its_own_stored_template_whatever_else_the_store_holds() {
+    // The region the caller signs for, which the ARN each element reports is
+    // scoped to: named once, so the emulator and the expected ARNs cannot drift
+    // apart.
+    const REGION: &str = "eu-west-1";
+
+    let emulator = Emulator::in_region(REGION);
+    let populations = population_rows();
+    let subjects = rows();
+
+    // The FULL cross product of the two tables: every row of the table at the
+    // top of this suite — each tag-propagation shape, each `TemplateStatus`,
+    // each resource type — in every population shape, so which population a
+    // shape of template is projected under does not depend on the order either
+    // table happens to be written in.
+    let pairs: Vec<(usize, &Row, &PopulationRow)> = subjects
+        .iter()
+        .enumerate()
+        .flat_map(|(subject_index, subject)| {
+            populations
+                .iter()
+                .map(move |population| (subject_index, subject, population))
+        })
+        .collect();
+
+    for (index, (subject_index, subject, population)) in pairs.into_iter().enumerate() {
+        // The shape the neighbours and the later arrivals are created with: the
+        // next row of the subject table, so the templates around the subject are
+        // not of its shape — a population of one shape only could not show that
+        // the subject's element is its own record's.
+        let neighbour_shape = &subjects[(subject_index + 1) % subjects.len()];
+        let case = format!("{} / {}", population.case, subject.case);
+        let domain_id = domain(&emulator, &format!("population-domain-{index:03}")).await;
+        let other_domain_id =
+            domain(&emulator, &format!("population-other-domain-{index:03}")).await;
+        let name = format!("population-subject-{index:03}");
+
+        let (template_id, template_arn) =
+            create(&emulator, &case, &domain_id, &name, subject).await;
+        // The same name and the same shape in ANOTHER domain: a template is
+        // identified by its own record, so the two cannot share an identity.
+        let (decoy_id, decoy_arn) =
+            create(&emulator, &case, &other_domain_id, &name, subject).await;
+        assert_ne!(
+            decoy_id, template_id,
+            "case {case:?}: two templates of the same name in different domains are two \
+             templates, so they cannot share an id, got {decoy_id}"
+        );
+        assert_ne!(
+            decoy_arn, template_arn,
+            "case {case:?}: an ARN addresses the domain its template lives in, so the two cannot \
+             share one, got {decoy_arn}"
+        );
+
+        let mut neighbours: Vec<String> = Vec::new();
+        for neighbour in 0..population.neighbours {
+            let neighbour_case = format!("{case}: neighbour {neighbour:03}");
+            let (neighbour_id, _) = create(
+                &emulator,
+                &neighbour_case,
+                &domain_id,
+                &format!("population-neighbour-{index:03}-{neighbour:03}"),
+                neighbour_shape,
+            )
+            .await;
+            neighbours.push(neighbour_id);
+        }
+
+        let stored = Stored {
+            region: REGION,
+            domain_id: &domain_id,
+            template_id: &template_id,
+            name: &name,
+            status: subject.status.unwrap_or("Active"),
+            tag_propagation_configurations: &subject.tag_propagation_configurations,
+        };
+
+        let before = list(&emulator, &case, &domain_id, "").await;
+        let listed = self_describing_identities(&case, &domain_id, &before);
+        assert_eq!(
+            listed.len(),
+            population.neighbours + 1,
+            "case {case:?}: the listing reports the domain's own templates, so it must report \
+             {} of them, got {listed:?}",
+            population.neighbours + 1
+        );
+        let distinct: BTreeSet<&String> = listed.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            listed.len(),
+            "case {case:?}: each template of the domain is one element, so no identity may be \
+             reported twice, got {listed:?}"
+        );
+        let summary = summary_of(&case, &before, &template_id);
+        assert_summary(&case, &summary, &stored);
+
+        // The population changes around the subject, which touches no record of
+        // its own.
+        for neighbour in neighbours.iter().take(population.deleted) {
+            let (status, body) = emulator
+                .send(
+                    "DELETE",
+                    &format!("/domains/{domain_id}/templates/{neighbour}"),
+                    Some(json!({})),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: deleting neighbour {neighbour} must succeed, got {status} with \
+                 {body:?}"
+            );
+        }
+        for added in 0..population.added {
+            let added_case = format!("{case}: added {added:03}");
+            create(
+                &emulator,
+                &added_case,
+                &domain_id,
+                &format!("population-added-{index:03}-{added:03}"),
+                neighbour_shape,
+            )
+            .await;
+        }
+
+        let after = list(&emulator, &case, &domain_id, "").await;
+        let relisted = self_describing_identities(&case, &domain_id, &after);
+        let expected_count =
+            population.neighbours.saturating_sub(population.deleted) + population.added + 1;
+        assert_eq!(
+            relisted.len(),
+            expected_count,
+            "case {case:?}: after the population changed the listing must report \
+             {expected_count} template(s), got {relisted:?}"
+        );
+        let again = summary_of(&case, &after, &template_id);
+        assert_eq!(
+            again, summary,
+            "case {case:?}: an element is the projection of its own stored record, so templates \
+             created and deleted beside it cannot change it: expected {summary:?}, got {again:?}"
+        );
+        assert_summary(&case, &again, &stored);
+
+        // The single-template read resolves the identity the element reported
+        // — read off the element, not from the create — and agrees with it on
+        // the same stored record.
+        let reported_id = string_at(&again, "id", &case);
+        let record = get_template(&emulator, &case, &domain_id, &reported_id).await;
+        assert_eq!(
+            string_at(&record, "templateArn", &case),
+            string_at(&again, "arn", &case),
+            "case {case:?}: the read and the element report one ARN for one template, got \
+             {record:?}"
+        );
+        assert_eq!(
+            string_at(&record, "name", &case),
+            name,
+            "case {case:?}: the element's identity must reach the template it listed, got \
+             {record:?}"
+        );
+        assert_eq!(
+            tag_propagation_configurations(&case, "the single-template read", &record),
+            tag_propagation_configurations(&case, "a summary", &again),
+            "case {case:?}: the read and the element report one tag-propagation list for one \
+             template, got {record:?}"
+        );
+
+        // And that identity is the subject's alone: the other domain holds a
+        // template of the same name and does not resolve it.
+        let (status, code) = emulator
+            .failure(
+                &case,
+                "POST",
+                &format!("/domains/{other_domain_id}/templates/{reported_id}"),
+                Some(json!({})),
+            )
+            .await;
+        assert_eq!(
+            (status, code.as_str()),
+            (404, "ResourceNotFoundException"),
+            "case {case:?}: the identity an element reports names a template of the domain that \
+             listed it, so another domain must refuse it with 404 ResourceNotFoundException, got \
+             {status} {code}"
+        );
     }
 }
 

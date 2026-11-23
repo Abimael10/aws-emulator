@@ -770,11 +770,14 @@ const PUBLISHED_FRACTION_DIGITS: usize = 3;
 
 /// Assert the published attribute `key` is the instant the reported record carries in
 /// `member`, written the way a published return value writes one: an ISO-8601 UTC instant
-/// with exactly [`PUBLISHED_FRACTION_DIGITS`] fractional digits, denoting the same instant
-/// as the value that service reported to within one millisecond.
+/// with exactly [`PUBLISHED_FRACTION_DIGITS`] fractional digits, denoting the instant that
+/// service reported truncated to its milliseconds.
 ///
 /// Asserted as that INVARIANT rather than against a second rendering of the same value, so
-/// the case cannot pass by re-deriving whatever the implementation happens to do.
+/// the case cannot pass by re-deriving whatever the implementation happens to do. The
+/// comparison is in whole MILLISECONDS, which is the precision a published instant carries:
+/// reading an epoch instant back as a float carries a representation error of a fraction of a
+/// microsecond, which a comparison in seconds would have to tolerate and this one cannot see.
 fn assert_published_instant(case: &str, published: &str, reported: &Value, member: &str) {
     let fraction = published
         .strip_suffix('Z')
@@ -787,21 +790,29 @@ fn assert_published_instant(case: &str, published: &str, reported: &Value, membe
         PUBLISHED_FRACTION_DIGITS,
         "case {case:?}: expected {PUBLISHED_FRACTION_DIGITS} fractional digits, got {published:?}"
     );
-    let parsed =
+    let published_millis =
         aws_smithy_types::DateTime::from_str(published, aws_smithy_types::date_time::Format::DateTime)
             .unwrap_or_else(|error| {
                 panic!("case {case:?}: expected {published:?} to be an instant, got {error}")
             })
-            .as_secs_f64();
+            .to_millis()
+            .unwrap_or_else(|error| {
+                panic!("case {case:?}: expected {published:?} to be an epoch instant, got {error}")
+            });
     let seconds = reported
         .get(member)
         .and_then(Value::as_f64)
         .unwrap_or_else(|| panic!("case {case:?}: no {member} on the reported record {reported}"));
-    let behind = seconds - parsed;
+    // The millisecond the record's instant falls in, reading it back the way a client does.
+    let reported_millis = (seconds * 1000.0).round() as i64;
+    // A published instant TRUNCATES the record's instant to its milliseconds, so it is that
+    // millisecond or the one before it — the one before it when the record carries a finer
+    // fraction that rounds up.
+    let behind = reported_millis - published_millis;
     assert!(
-        (0.0..=0.001).contains(&behind),
+        (0..=1).contains(&behind),
         "case {case:?}: expected the published {published:?} to be the instant the record \
-         reports ({seconds}) at its milliseconds, it is {behind} seconds away"
+         reports ({seconds}) truncated to its milliseconds, it is {behind} millisecond(s) away"
     );
 }
 
