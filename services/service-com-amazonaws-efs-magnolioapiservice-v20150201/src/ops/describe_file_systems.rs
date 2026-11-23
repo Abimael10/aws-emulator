@@ -184,19 +184,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(not_found(efs::file_system_not_found_message(id)));
             }
         }
-        // A `CreationToken` names one file system exactly as a `FileSystemId` does, so a
-        // token this account holds no file system for is the same 404 — the observable
-        // DeleteFileSystem documents for a released token: "If you pass file system ID or
-        // creation token for the deleted file system, the DescribeFileSystems returns a
-        // 404 FileSystemNotFound error."
-        if let Some(token) = input.creation_token.as_deref() {
-            if !state.creation_tokens.contains_key(token) {
-                return Err(not_found(format!(
-                    "No file system exists with creation token {}.",
-                    efs::quoted(token)
-                )));
-            }
-        }
+        // A CreationToken is a SELECTOR over the list — "(Optional) Restricts the list to the
+        // file system with this creation token" — and the modelled FileSystemNotFound names
+        // the FileSystemId alone ("returned if the specified FileSystemId value doesn't exist
+        // in the requester's Amazon Web Services account"), so a token this account holds no
+        // file system for — including one whose file system has been deleted — selects nothing
+        // and the list it restricts comes back empty. That is the behaviour a client reads
+        // back after deleting a file system it created with a token of its own: the read is
+        // served and reports that nothing is left, rather than refused.
 
         let mut matched: Vec<&efs::FileSystem> = state
             .file_systems

@@ -36,7 +36,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use ::service_common::posix_shell_volume::{ShellVolume, VolumeLimits};
+use ::service_common::posix_shell_volume::{MountFacts, MountedTree, ShellVolume, VolumeLimits};
 
 use super::*;
 
@@ -74,6 +74,18 @@ impl MountedFileSystem {
     /// take the file system's data with it.
     pub fn files(&self) -> MutexGuard<'_, ShellVolume> {
         self.files.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// This file system as a client MOUNTS it into its own tree: the one tree above — shared,
+    /// never copied, which is what makes a mount the thing data is handed over through —
+    /// rooted at `root` inside it and reporting `facts`.
+    ///
+    /// `None` for a root that is not an absolute path at all. Whether the file system HOLDS
+    /// that directory is the mount's own question, asked where the mount is made
+    /// ([`::service_common::posix_shell_volume::ShellVolume::mount`]).
+    #[must_use]
+    pub fn mounted_tree(&self, root: &str, facts: MountFacts) -> Option<MountedTree> {
+        MountedTree::new(Arc::clone(&self.files), root, facts)
     }
 }
 

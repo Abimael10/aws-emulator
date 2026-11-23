@@ -88,7 +88,10 @@ pub fn shell_step(
             // one.
             continue;
         };
-        let commands = resolved_script(script, &values, 0);
+        // One budget for the whole script, spent across every level the content nests
+        // ([`MAX_SCRIPT_BYTES`]).
+        let mut budget = MAX_SCRIPT_BYTES;
+        let commands = resolved_script(script, &values, 0, &mut budget);
         if commands.is_empty() {
             continue;
         }
@@ -138,6 +141,19 @@ const MAX_SCRIPT_LINES: usize = 256;
 /// How many bytes ONE line of script comes to once its parameter references are resolved.
 const MAX_SCRIPT_LINE_BYTES: usize = 8 * 1024;
 
+/// How many bytes the WHOLE resolved script of one step comes to, over every line of it and
+/// every level the content nests.
+///
+/// Both halves of what reaches this walk are a caller's — the document's content and the
+/// parameter values the send carried — and one line of the content may name a parameter whose
+/// value is a list, so the lines and the bytes multiply. The line count and the per-line
+/// ceiling bound each factor alone; this bounds their PRODUCT, so the script is built against
+/// one budget whichever shape the document takes. It is the emulator's own number, matched to
+/// what the guest will take at all (`…ec2…::state::guest_commands`'s `MAX_GUEST_SCRIPT_BYTES`):
+/// a script past it is refused where it is performed anyway, so nothing is gained by building
+/// it first.
+const MAX_SCRIPT_BYTES: usize = 256 * 1024;
+
 /// The lines of the script a step's `commands` input holds, with the document's parameter
 /// references resolved.
 ///
@@ -147,13 +163,17 @@ const MAX_SCRIPT_LINE_BYTES: usize = 8 * 1024;
 /// A reference that IS the whole value resolves to the list it names, line for line; one
 /// inside a line resolves to its value in that line.
 ///
-/// Bounded in all three directions a caller chooses: how deep the content nests
-/// ([`MAX_SCRIPT_DEPTH`]), how many lines it comes to ([`MAX_SCRIPT_LINES`]) and how long
-/// one resolved line is ([`MAX_SCRIPT_LINE_BYTES`]).
+/// Bounded in every direction a caller chooses: how deep the content nests
+/// ([`MAX_SCRIPT_DEPTH`]), how many lines it comes to ([`MAX_SCRIPT_LINES`]), how long one
+/// resolved line is ([`MAX_SCRIPT_LINE_BYTES`]) and how many bytes the whole script comes to
+/// ([`MAX_SCRIPT_BYTES`], spent across every level of the walk). A line that would run past
+/// the budget is not built, and the walk stops there: the guest is handed the lines that fit
+/// rather than a script this process grew without a ceiling.
 fn resolved_script(
     script: &::yaml_rust2::Yaml,
     values: &BTreeMap<String, Vec<String>>,
     depth: usize,
+    budget: &mut usize,
 ) -> Vec<String> {
     if depth >= MAX_SCRIPT_DEPTH {
         return Vec::new();
@@ -162,10 +182,10 @@ fn resolved_script(
         ::yaml_rust2::Yaml::Array(lines) => {
             let mut resolved: Vec<String> = Vec::new();
             for line in lines {
-                if resolved.len() >= MAX_SCRIPT_LINES {
+                if resolved.len() >= MAX_SCRIPT_LINES || *budget == 0 {
                     break;
                 }
-                resolved.extend(resolved_script(line, values, depth + 1));
+                resolved.extend(resolved_script(line, values, depth + 1, budget));
             }
             resolved.truncate(MAX_SCRIPT_LINES);
             resolved
@@ -174,11 +194,21 @@ fn resolved_script(
             let Some(text) = scalar_string(other) else {
                 return Vec::new();
             };
-            let mut lines = match whole_reference(&text).and_then(|name| values.get(name)) {
-                Some(named) => named.clone(),
+            let named = match whole_reference(&text).and_then(|name| values.get(name)) {
+                // A reference that IS the whole value resolves to the list it names, line for
+                // line — and each of those lines is spent from the one budget, so a value the
+                // send carried cannot be cloned wholesale past it.
+                Some(named) => named.iter().take(MAX_SCRIPT_LINES).cloned().collect(),
                 None => vec![resolved_line(&text, values)],
             };
-            lines.truncate(MAX_SCRIPT_LINES);
+            let mut lines: Vec<String> = Vec::new();
+            for line in named {
+                if line.len() > MAX_SCRIPT_LINE_BYTES || line.len() > *budget {
+                    break;
+                }
+                *budget -= line.len();
+                lines.push(line);
+            }
             lines
         }
     }
@@ -249,12 +279,19 @@ pub fn perform_in_guest<Eng: Send + Sync + 'static>(
     // BUILD this service holds for the node — read here, before the store that owns the guest
     // is taken, because it is a read of this service's own node store.
     let packages = agent_package_programs(engine, region, instance_id);
-    let supplied = match (resolver, packages) {
-        (Some(resolver), Some(packages)) => Some(::service_common::posix_shell_session::layered(
-            resolver, packages,
-        )),
-        (resolver, packages) => resolver.or(packages),
-    };
+    // ... and the NFS client of the node's own VPC, which is how a script MOUNTS a file system
+    // of Amazon EFS: which address serves NFS, which file system is behind it and the files
+    // that file system holds are facts of that service, read through its own data-plane
+    // accessor before the store that owns the guest is taken.
+    let nfs = ::service_com_amazonaws_efs_magnolioapiservice_v20150201::state::nfs_client_programs(
+        engine,
+        now,
+        node_vpc_id(engine, instance_id).as_deref(),
+    );
+    let supplied = [resolver, packages, nfs]
+        .into_iter()
+        .flatten()
+        .reduce(::service_common::posix_shell_session::layered);
     let identity = ec2_store::GuestIdentity {
         iam_role_name: ec2_store::instance_profile_role_name(engine, instance_id),
         iam_role_credentials: ec2_store::instance_role_credentials(
@@ -272,6 +309,24 @@ pub fn perform_in_guest<Eng: Send + Sync + 'static>(
     // write, through its own one-stop materialiser.
     store.materialize_due_transitions();
     store.run_in_instance_guest_with(instance_id, commands, supplied, &identity)
+}
+
+/// The VPC the node `instance_id` names is IN, as the service that owns instances reports it
+/// — and `None` for an instance that service holds none, or that it can place in no VPC.
+///
+/// Which VPC a machine stands in decides which addresses of the account it can reach at all,
+/// so a program of its guest that reaches a resource by a private address is offered the ones
+/// of that VPC and no other. The fact is EC2's own — an instance's interface is in a subnet,
+/// and the subnet is in the VPC — so it is read off that store rather than kept a second time
+/// here.
+///
+/// LOCK ORDER: this takes the EC2 store's lock and holds no other while it does, and is called
+/// BEFORE that store is taken for the run itself.
+fn node_vpc_id<Eng: Send + Sync + 'static>(engine: &Eng, instance_id: &str) -> Option<String> {
+    let ec2 = ec2_store::service_state(engine)?;
+    let store = ec2.lock();
+    let instance = store.instances.get(instance_id)?;
+    store.instance_vpc_id(instance)
 }
 
 /// The package-query client for the guest of the node `instance_id` names in `region`, or

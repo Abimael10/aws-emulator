@@ -139,9 +139,59 @@ fn only_the_catalog_is_performed() {
     }
     assert_eq!(
         BUILT_IN_COMMANDS.len(),
-        9,
-        "case the catalog: expected the nine session-local utilities, got {BUILT_IN_COMMANDS:?}"
+        12,
+        "case the catalog: expected the twelve session-local utilities, got \
+         {BUILT_IN_COMMANDS:?}"
     );
+}
+
+/// RULE: `seq` writes the NUMBERS from the first operand to the last in steps of the
+/// increment between them — the sequence a program written as "try this a few times"
+/// iterates over — and an invocation whose operands or options it performs nothing of writes
+/// nothing at all.
+///
+/// The rows differ along what the rule generalises over: how many operands name the sequence,
+/// the direction and size of the step, what separates the numbers, how they are padded,
+/// whether the sequence reaches its last number, and which invocations are performed at all.
+#[test]
+fn seq_writes_the_numbers_the_operands_name() {
+    let statuses = Statuses::default();
+    // (case, the program, the status, what it wrote)
+    let rows: [(&str, &str, i32, &[&str]); 12] = [
+        ("one operand counts from one", "seq 3", statuses.success, &["1", "2", "3"]),
+        ("two operands", "seq 2 4", statuses.success, &["2", "3", "4"]),
+        ("three operands", "seq 1 2 7", statuses.success, &["1", "3", "5", "7"]),
+        ("a step past the last number", "seq 1 4 6", statuses.success, &["1", "5"]),
+        ("a negative step", "seq 3 -1 1", statuses.success, &["3", "2", "1"]),
+        ("negative operands", "seq -2 0", statuses.success, &["-2", "-1", "0"]),
+        ("a sequence of one", "seq 5 5", statuses.success, &["5"]),
+        // A sequence that does not reach its last number writes nothing and succeeds.
+        ("a sequence that goes nowhere", "seq 5 1", statuses.success, &[]),
+        ("a separator of its own", "seq -s , 1 3", statuses.success, &["1,2,3"]),
+        (
+            "numbers padded to one width",
+            "seq -w 8 11",
+            statuses.success,
+            &["08", "09", "10", "11"],
+        ),
+        // An invocation this command performs nothing of writes nothing.
+        ("a step of nothing", "seq 1 0 3", statuses.could_not_run, &[]),
+        ("an operand that is no integer", "seq 1.5", statuses.could_not_run, &[]),
+    ];
+    for (case, program, expected, written) in rows {
+        let mut held = session();
+        let status = held.run(program);
+        assert_eq!(
+            status, expected,
+            "case {case:?}: expected the status {expected}, got {status}"
+        );
+        assert_eq!(
+            held.output(),
+            written,
+            "case {case:?}: expected {written:?}, got {:?}",
+            held.output()
+        );
+    }
 }
 
 /// RULE: a pipeline connects its stages — what one stage writes to standard output is the
@@ -1787,6 +1837,90 @@ fn a_session_over_a_tree_performs_the_grammars_control_flow() {
             held.run(program),
             statuses.could_not_run,
             "case {case:?}: expected the budget to end the loop"
+        );
+    }
+}
+
+/// RULE: `break` leaves the enclosing LOOP and `continue` goes on with its next iteration, so
+/// a loop written as "try this a few times, and stop once it worked" stops at the iteration
+/// that worked — and the count either takes names how many enclosing loops it leaves.
+///
+/// The rows differ along what the rule generalises over: which of the two commands runs, which
+/// loop form encloses it, how deeply the loops nest, how many levels the command leaves, and
+/// whether there is a loop to leave at all.
+#[test]
+fn break_and_continue_leave_the_enclosing_loop() {
+    let statuses = Statuses::default();
+    // (case, the program, the status it answers, what it left in STATE)
+    let rows: [(&str, &str, i32, &str); 9] = [
+        (
+            "a break at the iteration that worked",
+            "for WORD in a b c; do export STATE=\"$WORD\"; if [ \"$WORD\" = b ]; then break; fi; done",
+            statuses.success,
+            "b",
+        ),
+        (
+            "a break out of a while loop",
+            "export STATE=0; while true; do export STATE=\"$(( STATE + 1 ))\"; break; done",
+            statuses.success,
+            "1",
+        ),
+        (
+            "a break out of an until loop",
+            "export STATE=start; until false; do export STATE=once; break; done",
+            statuses.success,
+            "once",
+        ),
+        (
+            "a continue that skips the rest of the iteration",
+            "export STATE=none; for WORD in a b; do continue; export STATE=\"$WORD\"; done",
+            statuses.success,
+            "none",
+        ),
+        (
+            "a continue that goes on to the last word",
+            "for WORD in a b c; do export STATE=\"$WORD\"; continue; export STATE=skipped; done",
+            statuses.success,
+            "c",
+        ),
+        (
+            "a break of one level leaves the inner loop only",
+            "for OUTER in a b; do for INNER in x y; do break; done; export STATE=\"$OUTER\"; done",
+            statuses.success,
+            "b",
+        ),
+        (
+            "a break of two levels leaves both loops",
+            "export STATE=none; for OUTER in a b; do for INNER in x y; do break 2; done; \
+             export STATE=\"$OUTER\"; done",
+            statuses.success,
+            "none",
+        ),
+        (
+            "a break where there is no loop at all",
+            "export STATE=outside; break; export STATE=after",
+            statuses.success,
+            "after",
+        ),
+        (
+            "a count that is no positive number",
+            "export STATE=0; for WORD in a; do break nought; export STATE=reached; done",
+            statuses.success,
+            "reached",
+        ),
+    ];
+    for (case, program, expected, state) in rows {
+        let mut held = working_tree_session();
+        let status = held.run(program);
+        assert_eq!(
+            status, expected,
+            "case {case:?}: expected the status {expected}, got {status}"
+        );
+        assert_eq!(
+            held.variable("STATE").unwrap_or_default(),
+            state,
+            "case {case:?}: expected STATE {state:?}, got {:?}",
+            held.variable("STATE")
         );
     }
 }

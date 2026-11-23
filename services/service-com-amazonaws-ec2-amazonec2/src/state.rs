@@ -2787,6 +2787,11 @@ pub use guest_cpu::*;
 pub mod guest_block_devices;
 pub use guest_block_devices::*;
 
+/// What one instance's GUEST sees of the filesystems MOUNTED into it, and the programs it
+/// asks about them with. A SUBMODULE for the same reason [`image_usage_reports`] is one.
+pub mod guest_mounts;
+pub use guest_mounts::*;
+
 /// The SERVICES one instance's guest runs — the web server its own program installed and
 /// started — and what such a server answers for a request to the port it listens on. A
 /// SUBMODULE for the same reason [`image_usage_reports`] is one.

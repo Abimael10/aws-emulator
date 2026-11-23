@@ -37,15 +37,37 @@
 //! beside the contents rather than computed by whoever reports them; how a caller WORDS a
 //! listing is the caller's, because the form belongs to the utility it stands for.
 //!
+//! # What is MOUNTED into it
+//!
+//! Not everything a program reaches through this tree is the machine's own storage: a
+//! filesystem of ANOTHER component — a network filesystem whose files are held beside the
+//! resource that owns them — is MOUNTED at a directory of this tree
+//! ([`ShellVolume::mount`]), and from then on every path under that directory is a path of
+//! that filesystem instead. The mounted tree is SHARED, not copied: what a program on one
+//! machine writes under the mount point, a program on another machine that mounted the same
+//! filesystem reads under its own, which is the whole of what mounting one is for. Taking it
+//! away again ([`ShellVolume::unmount`]) leaves the directory it was mounted over exactly as
+//! it was, and leaves the filesystem's own files with whoever holds them: they were never
+//! this machine's storage, so they are not among the files the caller keeps beside the
+//! machine ([`ShellVolume::stored_files`]).
+//!
+//! What a mount REPORTS about itself — the filesystem type a listing of the mounts names, the
+//! type a statfs of a path on it names, what was mounted and with which options
+//! ([`MountFacts`]) — is the mounting component's to state, and is kept beside the mount so
+//! the programs that ask about it (a guest's `findmnt`, its `stat -f`) answer out of the one
+//! mount table rather than out of a second notion of what is mounted where.
+//!
 //! # Bounds
 //!
 //! Every write is bounded by [`VolumeLimits`], held here rather than in the program's
 //! reach: how many files the tree holds and how many bytes they come to, how long one path
 //! may be, and how many lines and bytes one device keeps. A write past a bound does not
 //! happen and is reported as the failure it is, so a caller-supplied program cannot grow
-//! this process without a stated ceiling.
+//! this process without a stated ceiling. A write that lands in a MOUNTED filesystem is
+//! bounded by that filesystem's own limits, held by whoever holds its files.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::SystemTime;
 
 /// How much one volume may hold. Every field is the EMULATOR's number: the programs are
@@ -116,6 +138,142 @@ pub struct EntryFacts {
     pub modified: SystemTime,
 }
 
+/// What a MOUNTED filesystem reports about itself, as the programs that ask about the mounts
+/// of a machine report it.
+///
+/// Every field is the MOUNTING component's statement about the filesystem it mounted, kept
+/// beside the mount so a guest's `findmnt` and its `stat -f` answer out of the one mount
+/// table: the type a mount listing names a filesystem by, the type a statfs of a path on it
+/// names (the two differ — a network filesystem mounted as `nfs4` is a `nfs` filesystem to
+/// statfs), what was mounted, and the options it was mounted with as the command wrote them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountFacts {
+    /// The filesystem TYPE a listing of the mounts reports — `findmnt`'s own `FSTYPE`.
+    pub file_system_type: String,
+    /// The type a statfs of a path on this filesystem reports — `stat -f`'s own `%T`.
+    pub statfs_type: String,
+    /// WHAT was mounted, as the mounting command's first operand named it — `findmnt`'s own
+    /// `SOURCE`.
+    pub source: String,
+    /// The options the filesystem was mounted with, as the command wrote them —
+    /// `findmnt`'s own `OPTIONS`.
+    pub options: String,
+}
+
+/// A tree ANOTHER component holds, as a volume mounts it: the files themselves, the path
+/// INSIDE them the mount point shows, and what the mount reports about itself.
+///
+/// The files are shared rather than copied — that is what makes a mount the thing data is
+/// handed over through — so two machines that mount the same filesystem reach one tree, and a
+/// lock an earlier panic poisoned is taken rather than propagated: a filesystem outlives the
+/// program that was writing to it.
+#[derive(Debug, Clone)]
+pub struct MountedTree {
+    /// The one tree the mounted filesystem holds.
+    files: Arc<Mutex<ShellVolume>>,
+    /// The path inside that tree the mount point shows, resolved — the whole filesystem for
+    /// a mount of its root, and a directory of it for a mount rooted deeper.
+    root: String,
+    /// What the mount reports about itself.
+    facts: MountFacts,
+}
+
+impl MountedTree {
+    /// The mount of `files` rooted at `root` inside them, reporting `facts` — `None` for a
+    /// root that is not an absolute path at all.
+    #[must_use]
+    pub fn new(files: Arc<Mutex<ShellVolume>>, root: &str, facts: MountFacts) -> Option<Self> {
+        Some(Self {
+            files,
+            root: resolved_path(root)?,
+            facts,
+        })
+    }
+
+    /// What this mount reports about itself.
+    #[must_use]
+    pub fn facts(&self) -> &MountFacts {
+        &self.facts
+    }
+
+    /// Whether the mounted filesystem is one this tree can mount AT ALL, and holds the
+    /// directory this mount is rooted at — what makes it something to mount: a filesystem that
+    /// holds nothing there would show an empty tree at the mount point rather than the
+    /// directory the mount names, and one that already MOUNTS something itself would make the
+    /// mount a chain rather than one filesystem at one directory.
+    ///
+    /// Asked WITHOUT waiting for the mounted tree's lock ([`Self::unlocked_files`]): the only
+    /// way that lock is already held at this point is that the filesystem being mounted is the
+    /// one being mounted INTO, or one reached through it, which is a mount this tree will not
+    /// make rather than one it blocks for — a lock of this kind is not reentrant, so waiting
+    /// for it would wedge the thread for good. A filesystem something else is working on at
+    /// this instant is answered the same way, and the command that asked for the mount reports
+    /// the failure as its own.
+    #[must_use]
+    pub fn can_be_mounted(&self) -> bool {
+        self.unlocked_files()
+            .is_some_and(|files| files.mounts.is_empty() && files.is_directory(&self.root))
+    }
+
+    /// The mounted tree, with a lock poisoned by an earlier panic taken rather than
+    /// propagated.
+    ///
+    /// LOCK ORDER: the mounting tree is held before the mounted one, never the other way
+    /// round, and a mounted tree carries no mounts of its own ([`Self::can_be_mounted`]) — so
+    /// delegating one path operation takes exactly these two locks and no third.
+    fn files(&self) -> MutexGuard<'_, ShellVolume> {
+        self.files.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// [`Self::files`] for a caller that must not WAIT for that lock, answering `None` when
+    /// something holds it at this instant — which is what makes a mount of a filesystem into
+    /// itself a refusal instead of a thread that never returns.
+    fn unlocked_files(&self) -> Option<MutexGuard<'_, ShellVolume>> {
+        match self.files.try_lock() {
+            Ok(files) => Some(files),
+            Err(::std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+            Err(::std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+}
+
+/// ONE filesystem mounted into a tree, as that tree holds it.
+#[derive(Debug, Clone)]
+struct Mount {
+    /// The directory of the mounting tree the filesystem is mounted at, resolved.
+    point: String,
+    /// The filesystem mounted there.
+    tree: MountedTree,
+}
+
+impl Mount {
+    /// Whether the resolved `path` lies in this mount — the mount point itself, or anything
+    /// under it. Only a SEPARATOR after the mount point puts a path inside it: `/datax` is
+    /// not inside the mount at `/data`.
+    fn holds(&self, path: &str) -> bool {
+        match path.strip_prefix(self.point.as_str()) {
+            Some("") => true,
+            Some(under) => under.starts_with('/'),
+            None => false,
+        }
+    }
+
+    /// The path INSIDE the mounted filesystem that the resolved `path` names.
+    fn source_of(&self, path: &str) -> String {
+        let relative = path
+            .strip_prefix(self.point.as_str())
+            .unwrap_or_default()
+            .trim_start_matches('/');
+        if relative.is_empty() {
+            return self.tree.root.clone();
+        }
+        if self.tree.root.ends_with('/') {
+            return format!("{}{relative}", self.tree.root);
+        }
+        format!("{}/{relative}", self.tree.root)
+    }
+}
+
 /// The tree one session's commands read and write. See the module docs.
 #[derive(Debug, Clone)]
 pub struct ShellVolume {
@@ -133,6 +291,10 @@ pub struct ShellVolume {
     modified: BTreeMap<String, SystemTime>,
     /// How many bytes the files come to, kept as they are written rather than recomputed.
     held_bytes: usize,
+    /// The filesystems of other components mounted into this tree, DEEPEST mount point
+    /// first, so a path lands in the deepest mount that holds it — which is how a mount
+    /// inside another mount's directory shadows it.
+    mounts: Vec<Mount>,
     limits: VolumeLimits,
 }
 
@@ -198,8 +360,110 @@ impl ShellVolume {
             devices: BTreeMap::new(),
             modified: BTreeMap::from([(ROOT.to_string(), SystemTime::now())]),
             held_bytes: 0,
+            mounts: Vec::new(),
             limits,
         }
+    }
+
+    /// Mount `tree` at `path`, so every path under it is a path of that filesystem from now
+    /// on — what mounting a filesystem onto a directory of a machine does.
+    ///
+    /// `false` is a mount that did not happen, which the command performing it reports as its
+    /// own failure: a path this tree does not accept, a path it holds no DIRECTORY of its own
+    /// at (a filesystem is mounted over a directory, and one inside another mount is not this
+    /// tree's to mount over), a point something is already mounted at, and a filesystem that
+    /// is not one this tree can mount — one that does not hold the directory the mount would
+    /// be rooted at, one that already mounts something itself, and this tree itself or any
+    /// tree reached through it ([`MountedTree::can_be_mounted`], which is also what keeps one
+    /// path operation to two locks and makes a mount of a filesystem into itself a refusal
+    /// rather than a thread that never returns).
+    pub fn mount(&mut self, path: &str, tree: MountedTree) -> bool {
+        let Some(point) = self.resolve(path) else {
+            return false;
+        };
+        if !self.directories.contains(&point) {
+            return false;
+        }
+        if self.mounts.iter().any(|mount| mount.point == point) {
+            return false;
+        }
+        if !tree.can_be_mounted() {
+            return false;
+        }
+        self.mounts.push(Mount { point, tree });
+        // Deepest first: a path is matched against the deepest mount that holds it.
+        self.mounts.sort_by(|left, right| {
+            right
+                .point
+                .len()
+                .cmp(&left.point.len())
+                .then_with(|| left.point.cmp(&right.point))
+        });
+        true
+    }
+
+    /// Take the filesystem mounted AT `path` away again, answering whether one was mounted
+    /// there — `false` being what a command unmounting a path nothing is mounted at reports.
+    ///
+    /// The directory the filesystem was mounted over is left exactly as it was, and the
+    /// filesystem's own files are left with whoever holds them.
+    pub fn unmount(&mut self, path: &str) -> bool {
+        let Some(point) = self.resolve(path) else {
+            return false;
+        };
+        let held = self.mounts.len();
+        self.mounts.retain(|mount| mount.point != point);
+        self.mounts.len() < held
+    }
+
+    /// What is mounted AT `path` exactly, and `None` for a path that is not a mount point of
+    /// this tree — what a listing of the mounts answers for a path it was given.
+    #[must_use]
+    pub fn mount_facts(&self, path: &str) -> Option<&MountFacts> {
+        let resolved = self.resolve(path)?;
+        self.mounts
+            .iter()
+            .find(|mount| mount.point == resolved)
+            .map(|mount| mount.tree.facts())
+    }
+
+    /// What filesystem the resolved `path` lies ON — the deepest mount holding it — and
+    /// `None` for a path on the tree's own storage, whose filesystem is the machine's and not
+    /// something mounted into it.
+    #[must_use]
+    pub fn file_system_facts(&self, path: &str) -> Option<&MountFacts> {
+        let resolved = self.resolve(path)?;
+        self.mounts
+            .iter()
+            .find(|mount| mount.holds(&resolved))
+            .map(|mount| mount.tree.facts())
+    }
+
+    /// Read the tree the resolved `path` lies in, when that is a MOUNTED filesystem rather
+    /// than this tree's own storage — with the path inside that filesystem.
+    ///
+    /// LOCK ORDER: the mounted tree's lock is taken while this tree's caller holds whatever it
+    /// holds, and a mounted tree carries no mounts of its own ([`MountedTree::can_be_mounted`]),
+    /// so this takes exactly one further lock and never a third.
+    fn in_mount<T>(&self, resolved: &str, read: impl FnOnce(&ShellVolume, &str) -> T) -> Option<T> {
+        let mount = self.mounts.iter().find(|mount| mount.holds(resolved))?;
+        let inside = mount.source_of(resolved);
+        let files = mount.tree.files();
+        Some(read(&files, &inside))
+    }
+
+    /// [`Self::in_mount`] for a change of that filesystem. It takes `&self`: what is being
+    /// changed is the MOUNTED tree, which is shared and reached through its own lock, and not
+    /// this tree.
+    fn in_mount_mut<T>(
+        &self,
+        resolved: &str,
+        write: impl FnOnce(&mut ShellVolume, &str) -> T,
+    ) -> Option<T> {
+        let mount = self.mounts.iter().find(|mount| mount.holds(resolved))?;
+        let inside = mount.source_of(resolved);
+        let mut files = mount.tree.files();
+        Some(write(&mut files, &inside))
     }
 
     /// `path` as this tree resolves it: absolute, with the empty, `.` and `..` segments a
@@ -223,6 +487,12 @@ impl ShellVolume {
     /// machine's storage already held when this run started.
     ///
     /// `false` when the tree is at its bounds and the file was not seeded.
+    ///
+    /// A seed is the MACHINE's own storage and is MOUNT-BLIND, as the devices below are: the
+    /// file is put in this tree, so a path that lies under a mount point is shadowed by what
+    /// is mounted there, exactly as the machine's own file under a mount point is on a machine.
+    /// A service seeds before a program runs and mounts happen while it runs, so the two do
+    /// not meet in practice.
     pub fn put_file(&mut self, path: &str, contents: &str) -> bool {
         let Some(resolved) = self.resolve(path) else {
             return false;
@@ -235,7 +505,8 @@ impl ShellVolume {
     /// rather than one the guest chose. A write to it fails the way a write to a read-only
     /// file fails.
     ///
-    /// `false` when the tree is at its bounds and the file was not seeded.
+    /// `false` when the tree is at its bounds and the file was not seeded. Mount-blind, for
+    /// the reason [`Self::put_file`] states.
     pub fn seal_file(&mut self, path: &str, contents: &str) -> bool {
         let Some(resolved) = self.resolve(path) else {
             return false;
@@ -277,6 +548,11 @@ impl ShellVolume {
         let Some(resolved) = self.resolve(path) else {
             return false;
         };
+        if let Some(made) = self.in_mount_mut(&resolved, |files, inside| {
+            files.make_directories(inside)
+        }) {
+            return made;
+        }
         let mut built = String::new();
         let mut made: Vec<String> = Vec::new();
         for segment in resolved.split('/').filter(|segment| !segment.is_empty()) {
@@ -325,9 +601,15 @@ impl ShellVolume {
     /// What reading `path` answers: a file's contents, a sealed file's contents, or the
     /// empty text a discarding device answers — and `None` for a path the tree does not
     /// hold, a directory, or a device whose lines are kept (a console is written, not read).
+    ///
+    /// A path inside a MOUNTED filesystem is read out of that filesystem, which is where its
+    /// files are.
     #[must_use]
     pub fn read(&self, path: &str) -> Option<String> {
         let resolved = self.resolve(path)?;
+        if let Some(read) = self.in_mount(&resolved, |files, inside| files.read(inside)) {
+            return read;
+        }
         if let Some(Device::Discard) = self.devices.get(&resolved) {
             return Some(String::new());
         }
@@ -338,6 +620,9 @@ impl ShellVolume {
     #[must_use]
     pub fn exists(&self, path: &str) -> bool {
         self.resolve(path).is_some_and(|resolved| {
+            if let Some(holds) = self.in_mount(&resolved, |files, inside| files.exists(inside)) {
+                return holds;
+            }
             self.files.contains_key(&resolved)
                 || self.directories.contains(&resolved)
                 || self.devices.contains_key(&resolved)
@@ -347,15 +632,25 @@ impl ShellVolume {
     /// Whether `path` is a file of the tree (sealed or not).
     #[must_use]
     pub fn is_file(&self, path: &str) -> bool {
-        self.resolve(path)
-            .is_some_and(|resolved| self.files.contains_key(&resolved))
+        self.resolve(path).is_some_and(|resolved| {
+            if let Some(is_file) = self.in_mount(&resolved, |files, inside| files.is_file(inside)) {
+                return is_file;
+            }
+            self.files.contains_key(&resolved)
+        })
     }
 
     /// Whether `path` is a directory of the tree.
     #[must_use]
     pub fn is_directory(&self, path: &str) -> bool {
-        self.resolve(path)
-            .is_some_and(|resolved| self.directories.contains(&resolved))
+        self.resolve(path).is_some_and(|resolved| {
+            if let Some(is_directory) =
+                self.in_mount(&resolved, |files, inside| files.is_directory(inside))
+            {
+                return is_directory;
+            }
+            self.directories.contains(&resolved)
+        })
     }
 
     /// Write `contents` at `path`, replacing what is there or APPENDING to it.
@@ -369,6 +664,13 @@ impl ShellVolume {
         let Some(resolved) = self.resolve(path) else {
             return false;
         };
+        // A path inside a MOUNTED filesystem is written to that filesystem, under its own
+        // bounds, which is what makes the write one another client of it reads.
+        if let Some(wrote) =
+            self.in_mount_mut(&resolved, |files, inside| files.write(inside, contents, append))
+        {
+            return wrote;
+        }
         if self.sealed.contains(&resolved) || self.directories.contains(&resolved) {
             return false;
         }
@@ -461,6 +763,11 @@ impl ShellVolume {
         let Some(resolved) = self.resolve(path) else {
             return false;
         };
+        if let Some(removed) = self.in_mount_mut(&resolved, |files, inside| {
+            files.remove_file(inside)
+        }) {
+            return removed;
+        }
         if self.sealed.contains(&resolved) {
             return false;
         }
@@ -486,6 +793,9 @@ impl ShellVolume {
     #[must_use]
     pub fn facts(&self, path: &str) -> Option<EntryFacts> {
         let resolved = self.resolve(path)?;
+        if let Some(facts) = self.in_mount(&resolved, |files, inside| files.facts(inside)) {
+            return facts;
+        }
         let (kind, size) = if let Some(contents) = self.files.get(&resolved) {
             (EntryKind::File, contents.len())
         } else if self.directories.contains(&resolved) {
@@ -521,6 +831,9 @@ impl ShellVolume {
         let Some(resolved) = self.resolve(path) else {
             return Vec::new();
         };
+        if let Some(names) = self.in_mount(&resolved, |files, inside| files.entry_names(inside)) {
+            return names;
+        }
         if !self.directories.contains(&resolved) {
             return Vec::new();
         }

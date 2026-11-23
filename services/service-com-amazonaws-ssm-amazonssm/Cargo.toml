@@ -107,6 +107,11 @@ iso8601 = "0.6"
 # the private hosted zones associated with that VPC hold, read through that service's own
 # state accessors rather than from a second copy of them here (`state::guest_resolver`).
 service-com-amazonaws-route53resolver-route53resolver = { workspace = true }
+# The NFS data plane of Amazon EFS: a script delivered to a node's guest MOUNTS a file system
+# of that service, and which address serves NFS, which file system is behind it and the files
+# that file system holds are read through that service's own data-plane accessor rather than
+# from a second copy of them here (`state::guest_execution`).
+service-com-amazonaws-efs-magnolioapiservice-v20150201 = { workspace = true }
 # The AWS SDK for EventBridge, driven over the in-process callback
 # (`OperationContext::callback`): a write to Parameter Store — a create, an update, a delete —
 # is published onto the account's default event bus (`state::parameter_events`). Only the

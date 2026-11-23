@@ -42,6 +42,9 @@ ipnet = "2"
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# One module per `tests/all/<name>.rs`, so a new suite is a new file: this crate's tests
+# are the single `all` target rooted at `tests/all/main.rs`.
+automod = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 # The EC2 service, mounted beside this one in the test harness: that a mount target is

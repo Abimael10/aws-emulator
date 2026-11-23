@@ -16,11 +16,12 @@
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_efs_magnolioapiservice_v20150201::state;
 use service_com_amazonaws_efs_magnolioapiservice_v20150201::EmulatedService;
+use service_common::posix_shell_session::EnvironmentPrograms;
 use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
 
 /// A SigV4 `Authorization` header scoped to `region` and to EFS's signing name, which
@@ -55,6 +56,10 @@ impl Reply {
 /// mount target is placed in — mounted on one shared engine.
 pub struct Emulator {
     router: MultiServiceRouter,
+    /// The one engine both services are mounted on, kept so a suite that drives this
+    /// service's NATIVE data plane can reach its state accessors the way the component that
+    /// delivers a program to a machine does.
+    engine: Arc<engine::InMemoryEngine>,
     region: String,
 }
 
@@ -68,12 +73,25 @@ impl Emulator {
         let mut router = MultiServiceRouter::new();
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
         router.register_service(
-            service_com_amazonaws_ec2_amazonec2::EmulatedService::new(engine),
+            service_com_amazonaws_ec2_amazonec2::EmulatedService::new(Arc::clone(&engine)),
         );
         Self {
             router,
+            engine,
             region: region.to_string(),
         }
+    }
+
+    /// The NFS client programs this service hands the component that reaches into a machine
+    /// standing in `vpc_id`, with the exports this data plane offers read AT `at` — the seam
+    /// a guest's own shell session performs `mount` and `umount` through.
+    ///
+    /// The instant is the caller's, exactly as it is for the component that delivers a program
+    /// to a machine, so a suite names the instant it wants the exports read at instead of
+    /// waiting for one.
+    pub fn nfs_client(&self, at: SystemTime, vpc_id: Option<&str>) -> Box<dyn EnvironmentPrograms> {
+        state::nfs_client_programs(&*self.engine, at, vpc_id)
+            .expect("the engine this service is mounted on must hold its store")
     }
 
     /// An EC2 client for this emulator's Region over the router's own in-process callback

@@ -32,6 +32,11 @@ pub use model_patterns::{
 mod file_system_data;
 pub use file_system_data::*;
 
+/// The NATIVE data plane: the NFSv4.1 server a mount target's own address answers on, and
+/// the client programs a machine inside the VPC mounts it with.
+mod nfs_data_plane;
+pub use nfs_data_plane::*;
+
 /// The network a mount target is placed in, as the service that owns subnets reports it.
 /// Re-exported by name for the same reason as the module above: a handler reaches it beside
 /// the rest of this module.

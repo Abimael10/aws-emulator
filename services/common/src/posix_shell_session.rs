@@ -221,7 +221,9 @@ use super::posix_shell_files::{
     self, AppliedRedirect, FileRefusal, Redirections, ShellFiles,
 };
 use super::posix_shell_text_filters::{Filter, STANDARD_INPUT_LABEL, TEXT_FILTER_COMMANDS};
-use super::posix_shell_volume::ShellVolume;
+use super::posix_shell_volume::{
+    MountFacts as ShellMountFacts, MountedTree as ShellMountedTree, ShellVolume,
+};
 
 /// The commands a session provides, as their names.
 ///
@@ -236,8 +238,34 @@ use super::posix_shell_volume::ShellVolume;
 /// ([`EnvironmentPrograms`]) and not the shell's, and is answered as a command that could not
 /// be run when the environment provides none of that name.
 pub const BUILT_IN_COMMANDS: &[&str] = &[
-    "echo", "cat", "true", "false", ":", "exit", "export", "unset", SET_COMMAND,
+    "echo",
+    "cat",
+    "true",
+    "false",
+    ":",
+    "exit",
+    "export",
+    "unset",
+    SET_COMMAND,
+    BREAK_COMMAND,
+    CONTINUE_COMMAND,
+    SEQUENCE_COMMAND,
 ];
+
+/// The built-ins that leave the enclosing LOOP: `break` — "exit from the smallest enclosing
+/// for, while, or until loop" — and `continue`, which goes on with "the next iteration of the
+/// smallest enclosing" one. Each takes an optional count of enclosing loops to leave, and
+/// neither is a command of its own: what it does is change which command runs NEXT
+/// ([`ShellSession::run_loop_control`]), which is why a session holds it rather than the
+/// command answering out of it.
+const BREAK_COMMAND: &str = "break";
+const CONTINUE_COMMAND: &str = "continue";
+
+/// The utility that writes a SEQUENCE of numbers — "print numbers from FIRST to LAST, in steps
+/// of INCREMENT" — which is what a program written as "try this a few times" iterates over
+/// (`for i in $(seq 6)`). Its whole effect is the lines it writes, which is why every session
+/// performs it ([`ShellSession::run_sequence`]).
+const SEQUENCE_COMMAND: &str = "seq";
 
 /// The built-in utility that changes the OPTIONS the shell performs the rest of the program
 /// under ([`ShellOption`]), which is what a script's own first line does.
@@ -352,8 +380,38 @@ impl EnvironmentPrograms for LayeredPrograms {
     }
 }
 
-/// The FILES of the tree a session works over, as the ENVIRONMENT's own programs reach them.
+/// The value `word` carries for one of the options `names`, in either spelling an option takes
+/// it in: joined to the option (`-tnfs4`, `--types=nfs4`) or as the next word.
 ///
+/// The ONE reading of an option word for the PROGRAMS an environment provides
+/// ([`EnvironmentPrograms`]), so two of them cannot read the same option grammar two ways:
+/// `None` when `word` is not one of those options at all, and `Some(None)` for one written
+/// with no value after it — the command's own usage failure, and so an invocation the program
+/// performs nothing of.
+///
+/// `words` is the rest of the command's words, advanced only where the value is the next one.
+#[must_use]
+pub fn program_option_value<'a>(
+    word: &str,
+    words: &mut impl Iterator<Item = &'a String>,
+    names: &[&str],
+) -> Option<Option<String>> {
+    for name in names {
+        if word == *name {
+            return Some(words.next().cloned());
+        }
+        if let Some(joined) = word.strip_prefix(name) {
+            // `--name=value` carries its separator; `-nvalue` does not.
+            let joined = joined.strip_prefix('=').unwrap_or(joined);
+            if !joined.is_empty() {
+                return Some(Some(joined.to_string()));
+            }
+        }
+    }
+    None
+}
+
+/// The FILES of the tree a session works over, as the ENVIRONMENT's own programs reach them.///
 /// It is the same tree the session's redirections write and its `cat` reads — a machine's
 /// where it was given one, and the session's own otherwise — so a program hands a file the
 /// commands around it wrote on, and leaves one they read back. A path is a KEY of that tree:
@@ -394,6 +452,41 @@ pub trait ProgramFiles {
     fn make_directories(&mut self, path: &str) -> bool {
         let _ = path;
         false
+    }
+
+    /// Mount the filesystem `tree` at `path` in that tree, so every path under it is a path
+    /// of that filesystem from now on — what a program that MOUNTS one does.
+    ///
+    /// The filesystem is another component's, held by whoever owns it, and the program that
+    /// mounts it is the one that could resolve it ([`super::posix_shell_volume::MountedTree`]).
+    /// `false` is a mount that did not happen, which the program reports as its own failure.
+    ///
+    /// The default is `false`, which is "nothing can be mounted into this tree": a session
+    /// whose tree takes a mount is one that implements this.
+    fn mount(&mut self, path: &str, tree: super::posix_shell_volume::MountedTree) -> bool {
+        let _ = (path, tree);
+        false
+    }
+
+    /// Take the filesystem mounted at `path` away again, answering whether one was mounted
+    /// there. The default is `false`, as [`Self::mount`]'s is.
+    fn unmount(&mut self, path: &str) -> bool {
+        let _ = path;
+        false
+    }
+
+    /// What is mounted AT `path` exactly, and `None` for a path that is not a mount point —
+    /// what a program LISTING the mounts of the machine answers out of.
+    fn mounted_at(&self, path: &str) -> Option<super::posix_shell_volume::MountFacts> {
+        let _ = path;
+        None
+    }
+
+    /// What filesystem `path` lies ON, and `None` for a path on the tree's own storage —
+    /// what a program reporting the FILESYSTEM of a path answers out of.
+    fn file_system_at(&self, path: &str) -> Option<super::posix_shell_volume::MountFacts> {
+        let _ = path;
+        None
     }
 }
 
@@ -471,6 +564,13 @@ const TEE_COMMAND: &str = "tee";
 /// answers `ls` out of that catalog.
 const LIST_COMMAND: &str = "ls";
 
+/// How many numbers ONE invocation of [`SEQUENCE_COMMAND`] writes.
+///
+/// The EMULATOR's number: the operands are a caller's text, so what one of them can make this
+/// process build is bounded here rather than by the numbers it was given. Far above the few a
+/// retry loop iterates over and far below what would cost this process anything noticeable.
+const MAX_SEQUENCE_NUMBERS: usize = 4_096;
+
 /// The commands that only change HOW the command after them is run, and are therefore not
 /// commands of their own: `nohup` — "invoke a utility immune to hangups", whose operands are
 /// "the utility to be invoked" and its arguments — and `setsid`, which runs one in a session
@@ -478,6 +578,38 @@ const LIST_COMMAND: &str = "ls";
 /// such a wrapper names IS the command performed, with the wrapper's remaining words as its
 /// own ([`ShellSession::run_simple_command`]). A wrapper naming no utility runs nothing.
 const COMMAND_WRAPPERS: &[&str] = &["nohup", "setsid"];
+
+/// The command that runs another one AS ANOTHER USER: `sudo` — "execute a command as another
+/// user", whose operands after its own options are "the command to run and any arguments".
+///
+/// It is a wrapper of the same kind ([`COMMAND_WRAPPERS`]) with options of its own, which is
+/// why it is read apart from them: the words it consumes are its own and not the command's.
+/// The session has one identity and nothing to escalate — an agent delivering a script to a
+/// machine runs it as the superuser already — so the command it names IS the command
+/// performed, with the words after it as that command's own
+/// ([`ShellSession::run_simple_command`]). A `sudo` naming no utility at all runs nothing,
+/// which is its own usage failure.
+const PRIVILEGE_WRAPPER: &str = "sudo";
+
+/// The options of [`PRIVILEGE_WRAPPER`] whose VALUE is the next word, so both words are the
+/// wrapper's own rather than the command's (`sudo(8)`: the user, group, prompt, host, role,
+/// type, chroot, directory and timeout a command may be run under, and the user a password is
+/// read for). The `--option=value` spelling of each is one word and needs no entry.
+const PRIVILEGE_WRAPPER_VALUE_OPTIONS: &[&str] = &[
+    "-u", "--user", "-g", "--group", "-p", "--prompt", "-h", "--host", "-r", "--role", "-t",
+    "--type", "-R", "--chroot", "-D", "--chdir", "-T", "--command-timeout", "-C", "--close-from",
+    "-U", "--other-user",
+];
+
+/// The options of [`PRIVILEGE_WRAPPER`] that name the USER the command is to run as, and the
+/// one identity a session has: an agent's script runs as the superuser, which is the identity
+/// the command the wrapper names is performed with. An invocation naming ANOTHER user asks for
+/// an identity this session does not have, so it is one the wrapper performs nothing of rather
+/// than one performed as the identity it has.
+const PRIVILEGE_WRAPPER_USER_OPTIONS: &[&str] = &["-u", "--user", "-U", "--other-user"];
+
+/// See [`PRIVILEGE_WRAPPER_USER_OPTIONS`].
+const SUPERUSER: &str = "root";
 
 /// The commands an assignment written before them persists in the session for: POSIX's
 /// special built-in utilities, for which "variable assignments specified with special
@@ -726,6 +858,12 @@ fn file_path(named: &str) -> Option<String> {
 /// so it refuses a program and never admits one; a caller that hands this session a whole
 /// SCRIPT therefore states the bound for a script's worth of groups, and sizes the stack its
 /// run is performed on for that bound (`…ec2…::state::guest_commands`).
+///
+/// It is deliberately a COUNT and not a measured depth: a depth would have to be measured
+/// through the program's quoting and its here-documents to stay an upper bound on what the
+/// parse descends to, and a measure that is not an upper bound is no bound at all — a closing
+/// character of a quoted word would leave a group it never entered, and a program could then
+/// hold the measure near zero while nesting without end.
 fn within_parse_bounds(line: &str, bounds: &Bounds) -> bool {
     if line.len() > bounds.command_bytes {
         return false;
@@ -851,6 +989,24 @@ pub struct ShellSession {
     /// what bounds this module's own recursion over the grammar's control flow
     /// ([`Self::run_compound`]).
     compound_depth: usize,
+    /// How many LOOPS are being performed inside one another right now, which is what decides
+    /// whether `break` and `continue` have a loop to leave at all.
+    loop_depth: usize,
+    /// The loop the program asked to leave, and how many enclosing loops it is leaving —
+    /// `None` while no `break` or `continue` is in flight. Set by those built-ins and taken by
+    /// the loop that honours it ([`Self::run_loop_control`]).
+    loop_control: Option<LoopControl>,
+}
+
+/// What a `break` or a `continue` asked for: which of the two it was, and how many enclosing
+/// loops it leaves.
+#[derive(Debug, Clone, Copy)]
+struct LoopControl {
+    /// Whether the loops being left go on to their next iteration (`continue`) or end
+    /// (`break`).
+    goes_on: bool,
+    /// How many enclosing loops this leaves — "the n-th enclosing loop", at least one.
+    levels: usize,
 }
 
 /// The FILES of the tree this session works over, handed to the ENVIRONMENT's programs
@@ -881,6 +1037,22 @@ impl ProgramFiles for SessionFiles<'_> {
 
     fn make_directories(&mut self, path: &str) -> bool {
         self.session.tree_make_directories(path)
+    }
+
+    fn mount(&mut self, path: &str, tree: ShellMountedTree) -> bool {
+        self.session.tree_mount(path, tree)
+    }
+
+    fn unmount(&mut self, path: &str) -> bool {
+        self.session.tree_unmount(path)
+    }
+
+    fn mounted_at(&self, path: &str) -> Option<ShellMountFacts> {
+        self.session.tree_mounted_at(path)
+    }
+
+    fn file_system_at(&self, path: &str) -> Option<ShellMountFacts> {
+        self.session.tree_file_system_at(path)
     }
 }
 
@@ -992,6 +1164,8 @@ impl ShellSession {
             negated_pipeline: false,
             separate_errors: false,
             compound_depth: 0,
+            loop_depth: 0,
+            loop_control: None,
             config,
         };
         for (name, value) in variables {
@@ -1500,11 +1674,16 @@ impl ShellSession {
 
     /// Perform a list of and-or lists — the body of a compound command — and answer the
     /// status of the last one that ran.
+    ///
+    /// A `break` or `continue` the body performed ends the list where it stands: what runs next
+    /// is for the enclosing LOOP to decide ([`Self::run_loop_control`]), so the lists between
+    /// that command and the loop — the branches of an `if`, a brace group — stop too, exactly
+    /// as the program's own `exit` stops them.
     fn run_compound_list(&mut self, list: &::brush_parser::ast::CompoundList) -> i32 {
         let mut status = self.config.statuses.success;
         for item in &list.0 {
             status = self.run_and_or_list(&item.0);
-            if self.exit_status.is_some() {
+            if self.exit_status.is_some() || self.loop_control.is_some() {
                 return status;
             }
         }
@@ -1550,25 +1729,80 @@ impl ShellSession {
         while_success: bool,
     ) -> i32 {
         let mut status = self.config.statuses.success;
+        self.loop_depth = self.loop_depth.saturating_add(1);
         loop {
             // The budget is what ends a loop that has no end of its own, and a loop cut
             // off by it did not run to its own end: it answers as a command that could
             // not run rather than as the body that last succeeded.
             if self.commands_left == 0 {
+                self.loop_depth = self.loop_depth.saturating_sub(1);
                 return self.config.statuses.could_not_run;
             }
             let condition = self.run_tested_list(&clause.0);
             if self.exit_status.is_some() {
+                self.loop_depth = self.loop_depth.saturating_sub(1);
                 return condition;
             }
             if (condition == self.config.statuses.success) != while_success {
+                self.loop_depth = self.loop_depth.saturating_sub(1);
                 return status;
             }
             status = self.run_compound_list(&clause.1.list);
             if self.exit_status.is_some() {
+                self.loop_depth = self.loop_depth.saturating_sub(1);
                 return status;
             }
+            match self.taken_loop_control() {
+                Some(true) => continue,
+                Some(false) => break,
+                None => {}
+            }
         }
+        self.loop_depth = self.loop_depth.saturating_sub(1);
+        status
+    }
+
+    /// What the `break` or `continue` the body just performed means FOR THIS LOOP:
+    /// `Some(true)` to go on with its next iteration, `Some(false)` to end it, and `None` when
+    /// the body performed neither — or when the one it performed is leaving an OUTER loop too,
+    /// which is left in flight for that loop to take and makes this one end where it stands.
+    fn taken_loop_control(&mut self) -> Option<bool> {
+        let control = self.loop_control?;
+        if control.levels > 1 {
+            // "the n-th enclosing loop": this loop is one of the ones being left, and the
+            // rest of them is the enclosing loop's to honour.
+            self.loop_control = Some(LoopControl {
+                levels: control.levels - 1,
+                ..control
+            });
+            return Some(false);
+        }
+        self.loop_control = None;
+        Some(control.goes_on)
+    }
+
+    /// Perform `break` or `continue`: leave the enclosing loops the argument names — one by
+    /// default — so what runs next is that loop's next iteration or the command after it.
+    ///
+    /// "If n is greater than the number of enclosing loops, the outermost enclosing loop shall
+    /// be used", and one performed where there is no loop at all changes nothing and answers
+    /// success. A count that is not a positive integer is the command's own usage failure.
+    fn run_loop_control(&mut self, name: &str, arguments: &[String]) -> i32 {
+        let levels = match arguments.first() {
+            Some(written) => match written.parse::<usize>() {
+                Ok(levels) if levels >= 1 => levels,
+                _ => return self.config.statuses.failure,
+            },
+            None => 1,
+        };
+        if self.loop_depth == 0 {
+            return self.config.statuses.success;
+        }
+        self.loop_control = Some(LoopControl {
+            goes_on: name == CONTINUE_COMMAND,
+            levels: levels.min(self.loop_depth),
+        });
+        self.config.statuses.success
     }
 
     /// `for NAME in WORD…; do LIST; done`: the body once per word, with the loop's variable
@@ -1579,21 +1813,32 @@ impl ShellSession {
         let Some(values) = clause.values.as_ref() else {
             return status;
         };
+        self.loop_depth = self.loop_depth.saturating_add(1);
         for word in values {
             let Some(value) = self.expand_word(&word.value) else {
+                self.loop_depth = self.loop_depth.saturating_sub(1);
                 return self.config.statuses.could_not_run;
             };
             if !self.set_variable(clause.variable_name.clone(), value) {
+                self.loop_depth = self.loop_depth.saturating_sub(1);
                 return self.config.statuses.could_not_run;
             }
             if self.commands_left == 0 {
+                self.loop_depth = self.loop_depth.saturating_sub(1);
                 return self.config.statuses.could_not_run;
             }
             status = self.run_compound_list(&clause.body.list);
             if self.exit_status.is_some() {
+                self.loop_depth = self.loop_depth.saturating_sub(1);
                 return status;
             }
+            match self.taken_loop_control() {
+                Some(true) => continue,
+                Some(false) => break,
+                None => {}
+            }
         }
+        self.loop_depth = self.loop_depth.saturating_sub(1);
         status
     }
 
@@ -1630,7 +1875,9 @@ impl ShellSession {
         let mut redirections = Redirections::default();
         let prefix = simple.prefix.as_ref().map(|prefix| &prefix.0);
         let suffix = simple.suffix.as_ref().map(|suffix| &suffix.0);
-        for item in prefix.into_iter().chain(suffix).flatten() {
+        // The PREFIX: the words before the command name, where an assignment is an assignment
+        // — "the variable assignments shall affect the current execution environment".
+        for item in prefix.into_iter().flatten() {
             match item {
                 ::brush_parser::ast::CommandPrefixOrSuffixItem::Word(word) => {
                     let Some(expanded) = self.expand_word(&word.value) else {
@@ -1652,6 +1899,30 @@ impl ShellSession {
                 _ => return self.config.statuses.could_not_run,
             }
         }
+        // The SUFFIX: the words AFTER the command name, where a word of the `NAME=VALUE` form
+        // is an ARGUMENT and nothing else — "assignment to a variable shall occur only in the
+        // command prefix". The grammar still reports such a word as an assignment word,
+        // because that is the form the utilities that take one read their operands in
+        // (`export NAME=VALUE`), so what it reaches the command as is the word itself: an
+        // option value carrying an `=` (`-o key=value`) is one of the command's own words, not
+        // a variable this session sets.
+        for item in suffix.into_iter().flatten() {
+            match item {
+                ::brush_parser::ast::CommandPrefixOrSuffixItem::Word(word)
+                | ::brush_parser::ast::CommandPrefixOrSuffixItem::AssignmentWord(_, word) => {
+                    let Some(expanded) = self.expand_word(&word.value) else {
+                        return self.config.statuses.could_not_run;
+                    };
+                    words.push(expanded);
+                }
+                ::brush_parser::ast::CommandPrefixOrSuffixItem::IoRedirect(redirect) => {
+                    if !self.apply_redirect(redirect, &mut redirections) {
+                        return self.config.statuses.could_not_run;
+                    }
+                }
+                _ => return self.config.statuses.could_not_run,
+            }
+        }
         let name = match simple.word_or_name.as_ref() {
             Some(word) => match self.expand_word(&word.value) {
                 Some(expanded) => Some(expanded),
@@ -1664,10 +1935,39 @@ impl ShellSession {
         // command name and the rest are its words. One naming no utility at all runs
         // nothing, which is the wrapper's own failure.
         let mut name = name;
-        while name
-            .as_deref()
-            .is_some_and(|name| COMMAND_WRAPPERS.contains(&name))
-        {
+        loop {
+            match name.as_deref() {
+                Some(wrapper) if COMMAND_WRAPPERS.contains(&wrapper) => {}
+                // The privilege wrapper carries OPTIONS of its own before the command it
+                // names ([`PRIVILEGE_WRAPPER`]), so those words are dropped here rather than
+                // taken for the command's name or its arguments.
+                Some(PRIVILEGE_WRAPPER) => {
+                    while let Some(first) = words.first().cloned() {
+                        if !first.starts_with('-') {
+                            break;
+                        }
+                        words.remove(0);
+                        // `--` ends the wrapper's own options: the word after it is the
+                        // command, whatever it starts with.
+                        if first == "--" {
+                            break;
+                        }
+                        if PRIVILEGE_WRAPPER_VALUE_OPTIONS.contains(&first.as_str())
+                            && !words.is_empty()
+                        {
+                            let value = words.remove(0);
+                            // An invocation asking for an identity this session does not have
+                            // performs nothing ([`PRIVILEGE_WRAPPER_USER_OPTIONS`]).
+                            if PRIVILEGE_WRAPPER_USER_OPTIONS.contains(&first.as_str())
+                                && value != SUPERUSER
+                            {
+                                return self.config.statuses.could_not_run;
+                            }
+                        }
+                    }
+                }
+                _ => break,
+            }
             if words.is_empty() {
                 return self.config.statuses.could_not_run;
             }
@@ -1986,6 +2286,41 @@ impl ShellSession {
             Some(volume) => volume.make_directories(&resolved),
             None => !self.tree_holds_file(path),
         }
+    }
+
+    /// Mount the filesystem `tree` at `path` in the tree this session works over, so every
+    /// path under it is a path of that filesystem from now on.
+    ///
+    /// Only a session given a MACHINE's tree takes one: a session's own tree keys a file by
+    /// the path a program named and has no directory to mount a filesystem over.
+    fn tree_mount(&mut self, path: &str, tree: ShellMountedTree) -> bool {
+        let resolved = self.at(path);
+        self.volume
+            .as_mut()
+            .is_some_and(|volume| volume.mount(&resolved, tree))
+    }
+
+    /// Take the filesystem mounted at `path` away again, answering whether one was mounted
+    /// there.
+    fn tree_unmount(&mut self, path: &str) -> bool {
+        let resolved = self.at(path);
+        self.volume
+            .as_mut()
+            .is_some_and(|volume| volume.unmount(&resolved))
+    }
+
+    /// What is mounted AT `path` exactly in that tree, and `None` for a path that is not a
+    /// mount point of it.
+    fn tree_mounted_at(&self, path: &str) -> Option<ShellMountFacts> {
+        let resolved = self.at(path);
+        self.volume.as_ref()?.mount_facts(&resolved).cloned()
+    }
+
+    /// What filesystem `path` lies ON in that tree, and `None` for a path on the machine's
+    /// own storage.
+    fn tree_file_system_at(&self, path: &str) -> Option<ShellMountFacts> {
+        let resolved = self.at(path);
+        self.volume.as_ref()?.file_system_facts(&resolved).cloned()
     }
 
     /// Remove the file at `path` from the tree this session works over, answering whether
@@ -2441,6 +2776,8 @@ impl ShellSession {
                 self.config.statuses.success
             }
             SET_COMMAND => self.run_set(arguments, redirections),
+            BREAK_COMMAND | CONTINUE_COMMAND => self.run_loop_control(name, arguments),
+            SEQUENCE_COMMAND => self.run_sequence(arguments, redirections),
             _ => self.config.statuses.could_not_run,
         }
     }
@@ -2850,9 +3187,115 @@ impl ShellSession {
         }
     }
 
-    /// `test` / `[`: the question its arguments ask, answered as a status — success for
-    /// true, failure for false.
+    /// `seq`: the numbers from the first operand to the last, in steps of the increment
+    /// between them, one per line — "seq LAST", "seq FIRST LAST" and "seq FIRST INCREMENT
+    /// LAST", which is the form a program written as "try this a few times" iterates over.
     ///
+    /// `-s` writes a separator of its own between the numbers instead of a line ending, and
+    /// `-w` pads them with leading zeros to a common width, as the utility does. A sequence
+    /// that does not reach its last number writes nothing and answers success, which is what
+    /// `seq 5 1` does.
+    ///
+    /// How many numbers one invocation writes is bounded by [`MAX_SEQUENCE_NUMBERS`], the
+    /// emulator's own number: the operands are a caller's text, so a sequence past it is one
+    /// this command does not perform rather than output this process holds. A non-integer
+    /// operand, and an option this command does not read, are the same closed failure: nothing
+    /// is written.
+    fn run_sequence(&mut self, arguments: &[String], redirections: &Redirections) -> i32 {
+        let mut separator: Option<String> = None;
+        let mut equal_width = false;
+        let mut operands: Vec<i64> = Vec::new();
+        let mut words = arguments.iter();
+        while let Some(word) = words.next() {
+            if word == "--" {
+                for operand in words.by_ref() {
+                    match operand.parse::<i64>() {
+                        Ok(number) => operands.push(number),
+                        Err(_) => return self.config.statuses.could_not_run,
+                    }
+                }
+                break;
+            }
+            // A negative number is an operand, not an option, which is what makes the
+            // leading-dash test a test of the WHOLE word.
+            if word.parse::<i64>().is_ok() {
+                operands.push(word.parse::<i64>().unwrap_or_default());
+                continue;
+            }
+            if word == "-s" || word == "--separator" {
+                match words.next() {
+                    Some(given) => separator = Some(given.clone()),
+                    None => return self.config.statuses.could_not_run,
+                }
+                continue;
+            }
+            if let Some(given) = word
+                .strip_prefix("--separator=")
+                .or_else(|| word.strip_prefix("-s"))
+            {
+                separator = Some(given.to_string());
+                continue;
+            }
+            if word == "-w" || word == "--equal-width" {
+                equal_width = true;
+                continue;
+            }
+            // Anything else — an option this command does not read, and an operand that is no
+            // integer — is an invocation it performs nothing of.
+            return self.config.statuses.could_not_run;
+        }
+        let (first, increment, last) = match operands.as_slice() {
+            [last] => (1, 1, *last),
+            [first, last] => (*first, 1, *last),
+            [first, increment, last] => (*first, *increment, *last),
+            _ => return self.config.statuses.could_not_run,
+        };
+        if increment == 0 {
+            return self.config.statuses.could_not_run;
+        }
+        let mut numbers: Vec<i64> = Vec::new();
+        let mut at = first;
+        while (increment > 0 && at <= last) || (increment < 0 && at >= last) {
+            if numbers.len() >= MAX_SEQUENCE_NUMBERS {
+                return self.config.statuses.could_not_run;
+            }
+            numbers.push(at);
+            match at.checked_add(increment) {
+                Some(next) => at = next,
+                None => break,
+            }
+        }
+        let width = if equal_width {
+            numbers
+                .iter()
+                .map(|number| number.to_string().len())
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let written: Vec<String> = numbers
+            .iter()
+            .map(|number| format!("{:0>width$}", number.to_string()))
+            .collect();
+        // The sequence ends with a line ending whichever separator the invocation named, which
+        // is what the utility writes.
+        let text = match written.is_empty() {
+            true => String::new(),
+            false => format!(
+                "{}\n",
+                written.join(separator.as_deref().unwrap_or("\n"))
+            ),
+        };
+        if self.write_stdout(&text, redirections) {
+            self.config.statuses.success
+        } else {
+            self.config.statuses.failure
+        }
+    }
+
+    /// `test` / `[`: the question its arguments ask, answered as a status — success for
+    /// true, failure for false.    ///
     /// The questions answered are the ones a boot script asks: whether the tree holds a
     /// path (`-e`), a file (`-f`), a directory (`-d`) or a file with something in it
     /// (`-s`), whether a string is empty (`-z`) or not (`-n`), whether two strings are

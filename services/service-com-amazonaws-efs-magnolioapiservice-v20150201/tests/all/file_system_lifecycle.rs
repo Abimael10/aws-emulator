@@ -21,7 +21,7 @@ use service_com_amazonaws_efs_magnolioapiservice_v20150201::state;
 // it is re-exported here so a suite that reaches it as
 // `crate::file_system_lifecycle::{settle, Emulator, Reply}` keeps resolving to the one
 // harness rather than to a copy of it.
-pub(crate) use super::harness::{matches_id_pattern, settle, Emulator, Reply};
+pub(crate) use super::harness::{matches_id_pattern, settle, settle_deletion, Emulator, Reply};
 
 // ---------------------------------------------------------------------------
 // The whole lifecycle, in order, with every read observing the preceding write.
@@ -570,21 +570,40 @@ async fn create_file_system_stores_every_configuration_and_reads_it_back() {
         );
     }
 
-    // A CreationToken no file system holds is the same 404 an unknown id is: the
-    // selector names one file system, so a selector that matches nothing has not found
-    // it — the observable DeleteFileSystem documents for a released token.
-    let none = efs.describe_file_systems("CreationToken=never-used").await;
+    // A CreationToken is a SELECTOR over the list — "(Optional) Restricts the list to the
+    // file system with this creation token" — and the modelled FileSystemNotFound names the
+    // FileSystemId alone ("returned if the specified FileSystemId value doesn't exist in the
+    // requester's Amazon Web Services account"), so a token no file system holds restricts the
+    // list to nothing rather than refusing the read. Both ways a token can hold nothing: one
+    // nothing was ever created with, and one whose file system has been deleted — the read a
+    // client makes to confirm that what it created with its own token is gone.
+    let deleted = efs.available_file_system("token-released-by-a-delete").await;
+    let removed = efs.delete_file_system(&deleted).await;
     assert_eq!(
-        none.status, 404,
-        "an unused CreationToken filter: expected 404, got {} {:?}",
-        none.status, none.body
+        removed.status, 204,
+        "deleting the file system of a released token must be accepted, got {} {:?}",
+        removed.status, removed.body
     );
-    assert_eq!(
-        none.error_type.as_deref(),
-        Some("FileSystemNotFound"),
-        "an unused CreationToken filter: expected FileSystemNotFound, got {:?}",
-        none.error_type
-    );
+    settle_deletion().await;
+    for (case, token) in [
+        ("a token nothing was created with", "never-used"),
+        ("the token of a deleted file system", "token-released-by-a-delete"),
+    ] {
+        let none = efs
+            .describe_file_systems(&format!("CreationToken={token}"))
+            .await;
+        assert_eq!(
+            none.status, 200,
+            "case {case:?}: expected the list to be served, got {} {:?}",
+            none.status, none.body
+        );
+        assert_eq!(
+            none.get("FileSystems"),
+            &json!([]),
+            "case {case:?}: expected no file system, got {:?}",
+            none.get("FileSystems")
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

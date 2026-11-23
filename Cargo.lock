@@ -14068,6 +14068,7 @@ dependencies = [
 name = "service-com-amazonaws-efs-magnolioapiservice-v20150201"
 version = "0.1.0"
 dependencies = [
+ "automod",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",
@@ -21362,6 +21363,7 @@ dependencies = [
  "rrule",
  "serde_json",
  "service-com-amazonaws-ec2-amazonec2",
+ "service-com-amazonaws-efs-magnolioapiservice-v20150201",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-kms-trentservice",
  "service-com-amazonaws-lambda-awsgirapiservice",
