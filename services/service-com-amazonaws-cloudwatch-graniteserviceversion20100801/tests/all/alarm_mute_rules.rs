@@ -993,10 +993,10 @@ async fn a_listing_the_store_cannot_serve_is_refused() {
         );
     }
 
-    // A token this service cannot read a cursor out of names no position of this listing's
-    // enumeration, so it is IGNORED and the first page is served rather than the request
-    // refused. Rows differ along how the token misses: text that is no token at all, a truncated
-    // one, and one with text appended.
+    // A token this service cannot read a cursor out of names no position this listing's
+    // enumeration holds, so it marks a walk already carried past its rules: the EXHAUSTED page is
+    // served rather than the request refused. Rows differ along how the token misses: text that is
+    // no token at all, a truncated one, and one with text appended.
     let minted = text(
         &ok(&router, "ListAlarmMuteRules", &json!({"MaxRecords": 1})).await,
         "NextToken",
@@ -1023,17 +1023,16 @@ async fn a_listing_the_store_cannot_serve_is_refused() {
         .await;
         assert_eq!(
             (status, listed_arns(&body), body.get("NextToken")),
-            (200, every_rule.clone(), None),
-            "case {case:?}: expected HTTP 200 with the first page {every_rule:?}, \
-             got {status} with {body}"
+            (200, Vec::new(), None),
+            "case {case:?}: expected HTTP 200 with the exhausted page, got {status} with {body}"
         );
     }
 
     // The rules the store holds are untouched by those reads.
     let listed = ok(&router, "ListAlarmMuteRules", &json!({})).await;
     assert_eq!(
-        listed_arns(&listed).len(),
-        4,
+        listed_arns(&listed),
+        every_rule,
         "case \"after the refusals\": every stored rule must still be listed, got {listed}"
     );
 }
@@ -1301,12 +1300,13 @@ async fn deleting_a_mute_rule_is_idempotent_and_reaches_only_its_own_region() {
 }
 
 #[tokio::test]
-async fn a_next_token_this_listing_cannot_resume_from_is_ignored() {
+async fn a_next_token_this_listing_cannot_resume_from_is_answered_the_exhausted_page() {
     // The rule: a `NextToken` names a POSITION in the enumeration — "The token returned from a
     // previous call to indicate where to continue retrieving results."
     // (`ListAlarmMuteRulesInput$NextToken`) — and one this listing cannot read a cursor out of
-    // names no position of it at all, so it is IGNORED: the first page is served, not a refusal
-    // that aborts the walk and not an empty page that ends it.
+    // names no position it holds at all, so it marks a walk already carried past its rules: the
+    // EXHAUSTED page is served, not a refusal that aborts the walk and not a restart that hands
+    // back rules it already delivered.
     //
     // Rows differ along the FORM of the value offered: no token at all, the empty string, a token
     // this listing minted, and four shapes of value it cannot read a cursor out of (text that is
@@ -1343,22 +1343,18 @@ async fn a_next_token_this_listing_cannot_resume_from_is_ignored() {
             Some(minted.clone()),
             every_rule.get(1..).unwrap_or_default().to_vec(),
         ),
-        (
-            "text that is no cursor",
-            Some("not-a-token".to_string()),
-            every_rule.clone(),
-        ),
+        ("text that is no cursor", Some("not-a-token".to_string()), vec![]),
         (
             "an opaque blob of another service's form",
             Some("eyJuZXh0Ijoibm90aGluZyJ9".to_string()),
-            every_rule.clone(),
+            vec![],
         ),
         (
             "a blob whose bytes are no text",
             Some("AAAA".to_string()),
-            every_rule.clone(),
+            vec![],
         ),
-        ("a minted cursor truncated", Some(truncated), every_rule.clone()),
+        ("a minted cursor truncated", Some(truncated), vec![]),
     ];
 
     for (case, token, expected) in cases {
@@ -1372,10 +1368,11 @@ async fn a_next_token_this_listing_cannot_resume_from_is_ignored() {
             (200, expected.clone()),
             "case {case:?}: expected HTTP 200 with {expected:?}, got {status} with {body}"
         );
-        if expected == every_rule {
+        if expected == every_rule || expected.is_empty() {
             assert!(
                 body.get("NextToken").is_none(),
-                "case {case:?}: the page holds every rule, so no token is owed, got {body}"
+                "case {case:?}: the page holds the rest of the listing, so no token is owed, \
+                 got {body}"
             );
         }
     }

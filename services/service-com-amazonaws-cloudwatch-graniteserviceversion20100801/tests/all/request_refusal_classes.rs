@@ -16,7 +16,7 @@
 //! * **a paginated listing answers a `NextToken` it cannot resume from in ITS OWN terms**: the
 //!   alarm HISTORY refuses it naming the value at fault, the Contributor Insights listings
 //!   refuse it with their coded sentence, and the alarm listing refuses it not at all — such a
-//!   value names no position of its enumeration, so it is ignored and the first page is served;
+//!   value names no position its enumeration holds, so the exhausted page is served;
 //! * **`SetAlarmState` refuses a `StateReasonData` that is not a JSON document with
 //!   `InvalidFormat` and leaves the alarm's state untouched**, whatever the value is wrong
 //!   about;
@@ -280,7 +280,7 @@ async fn a_next_token_a_listing_cannot_resume_from_is_answered_in_that_listings_
         }
 
         // The alarm LISTING refuses no token: a value it cannot read a cursor out of names no
-        // position of this enumeration, so it is IGNORED and the first page is served
+        // position this enumeration holds, so the page served is the EXHAUSTED one
         // (`tests/all/paginated_read_cursor.rs` holds that rule over every listing of this
         // service that serves such a token).
         let listed = ok(&router, "DescribeAlarms", &json!({"NextToken": token})).await;
@@ -294,15 +294,14 @@ async fn a_next_token_a_listing_cannot_resume_from_is_answered_in_that_listings_
             .collect();
         assert_eq!(
             named,
-            vec!["paged-alarm".to_string()],
-            "case {case:?}: a token the alarm listing cannot resume from must be ignored and \
-             its first page served, got {listed}"
+            Vec::<String>::new(),
+            "case {case:?}: a token the alarm listing cannot resume from must be answered the \
+             exhausted page, got {listed}"
         );
         assert_eq!(
             listed.get("NextToken"),
             None,
-            "case {case:?}: the first page holds the only alarm, so no token is owed, got \
-             {listed}"
+            "case {case:?}: an exhausted page owes no token, got {listed}"
         );
     }
 }

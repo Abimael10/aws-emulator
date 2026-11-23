@@ -242,9 +242,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Which POSITION of this enumeration the request's `NextToken` names, by the one rule
         // every listing of this service that SERVES such a token shares
         // ([`crate::state::ResumedAt`]). This read refuses no token: a value this service
-        // cannot read a cursor out of names no position of this enumeration, so it is ignored
-        // and the page served is the FIRST one — the answer this listing is recorded giving a
-        // token it cannot resume from.
+        // cannot locate in this enumeration marks a walk it cannot resume, so the page served
+        // is the EXHAUSTED one — the three lists present and empty with no token, the answer
+        // this listing is recorded giving a token it cannot resume from, rather than a restart
+        // that would hand back alarms the walk already delivered.
         let start_at = crate::state::ResumedAt::of(input.next_token.as_deref());
 
         // One page size for every path below, so paging behaves the same whichever filter
@@ -284,19 +285,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     input.parents_of_alarm_name.as_deref().unwrap_or_default(),
                 ),
             };
-            // The alarm NAME is the identity and therefore the paging order and the cursor
-            // on this path too.
+            // The alarm NAME is the identity and therefore the paging order and the cursor on
+            // this path too, cut and resumed by the one rule every page of this service's alarm
+            // listings follows ([`crate::state::ResumedAt::page_of`]).
             related.sort();
-            let from = start_at.start_of(|cursor| {
-                related.partition_point(|name| name.as_str() < cursor)
-            });
-            let page = related.get(from..).unwrap_or_default();
-            let next_token = page
-                .get(limit)
-                .map(|name| crate::state::encode_page_token(name));
+            let crate::state::ListingPage { items, next_token } =
+                start_at.page_of(&related, limit, |name| name.as_str());
             let mut metric_alarms: Vec<ReportedMetricAlarm> = Vec::new();
             let mut composite_alarms: Vec<CompositeAlarm> = Vec::new();
-            for name in page.iter().take(limit) {
+            for name in items {
                 // "Only the Alarm Name, ARN, StateValue (OK/ALARM/INSUFFICIENT_DATA), and
                 // StateUpdatedTimestamp information are returned by this operation when you
                 // use [ChildrenOfAlarmName]"; for `ParentsOfAlarmName`, "Only the Alarm Name
@@ -432,18 +429,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // metric and composite alarms still advances exactly once.
         matching.sort_by(|left, right| left.0.cmp(right.0));
 
-        let from = start_at.start_of(|cursor| {
-            matching.partition_point(|(name, _)| name.as_str() < cursor)
-        });
-        let page = matching.get(from..).unwrap_or_default();
-        let next_token = page
-            .get(limit)
-            .map(|(name, _)| crate::state::encode_page_token(name));
+        // The page the request asked for, cut out of the whole selection and resumed from the
+        // position the inbound token names ([`crate::state::ResumedAt::page_of`]): a token is
+        // owed only while an alarm is left over beyond it, and a walk already carried past the
+        // selection is served the three lists present and EMPTY with no token.
+        let crate::state::ListingPage { items, next_token } =
+            start_at.page_of(&matching, limit, |(name, _)| name.as_str());
 
         let mut metric_alarms: Vec<ReportedMetricAlarm> = Vec::new();
         let mut composite_alarms: Vec<CompositeAlarm> = Vec::new();
         let mut log_alarms: Vec<LogAlarm> = Vec::new();
-        for (_, alarm) in page.iter().take(limit) {
+        for (_, alarm) in items {
             match alarm {
                 // Through the one projection every reader of a metric alarm reports it
                 // through, so this read and `DescribeAlarmsForMetric` cannot answer with

@@ -98,8 +98,8 @@ pub enum ListAlarmMuteRulesErrorModeled {
     // answer with rather than the scaffold's 501.
     InternalServiceFault(InternalServiceFault),
     // Declared because the model declares it, and not answered by the handler below: a
-    // `NextToken` this listing cannot resume from names no position of its enumeration, so it
-    // is ignored and the first page is served rather than the request refused ([`ResumedAt`]).
+    // `NextToken` this listing cannot resume from marks a walk already carried past the rules it
+    // holds, so the exhausted page is served rather than the request refused ([`ResumedAt`]).
     InvalidNextToken(InvalidNextToken),
     ResourceNotFoundException(ResourceNotFoundException),
 }
@@ -182,8 +182,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Where this page resumes from, read off the token the request offered
         // ([`crate::state::ResumedAt`], the one rule every listing of this service that SERVES an
         // unreadable token shares): a value this listing can read a cursor out of names the rule
-        // the page starts at, and one it cannot names no position of the enumeration at all, so
-        // it is ignored — the first page, which is what no token at all asks for too.
+        // the page starts at, and one it cannot marks a walk this listing cannot resume — the
+        // position past its last rule, which is the exhausted page.
         let resume = crate::state::ResumedAt::of(input.next_token.as_deref());
 
         let now = crate::state::now_secs();
@@ -232,20 +232,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|(key, stored)| (&key.name, stored))
             .collect();
         selected.sort_unstable_by_key(|(name, _)| *name);
-        let from = resume.start_of(|cursor| {
-            selected.partition_point(|(name, _)| name.as_str() < cursor)
-        });
-        let page = selected.get(from..).unwrap_or_default();
-        // "The token to use when requesting the next set of results. If this field is absent,
-        // there are no more results to retrieve." (`ListAlarmMuteRulesOutput$NextToken`) — present
-        // only when a rule is left over, so the last page terminates the walk.
-        let next_token = page
-            .get(page_size)
-            .map(|(name, _)| crate::state::encode_page_token(name));
+        // The page the request asked for, by the one rule every page of this service's alarm
+        // listings follows ([`crate::state::ResumedAt::page_of`]): cut at the size asked for and
+        // resumed at the position the inbound token names. "The token to use when requesting the
+        // next set of results. If this field is absent, there are no more results to retrieve."
+        // (`ListAlarmMuteRulesOutput$NextToken`) — so a token is owed only while a rule is left
+        // over beyond this page, and a walk already carried past the selection is served an
+        // empty `AlarmMuteRuleSummaries` with no token, which terminates it.
+        let crate::state::ListingPage { items, next_token } =
+            resume.page_of(&selected, page_size, |(name, _)| name.as_str());
 
-        let summaries: Vec<AlarmMuteRuleSummary> = page
+        let summaries: Vec<AlarmMuteRuleSummary> = items
             .iter()
-            .take(page_size)
             .map(|(_, stored)| summary_of(&stored.reported(now)))
             .collect();
 

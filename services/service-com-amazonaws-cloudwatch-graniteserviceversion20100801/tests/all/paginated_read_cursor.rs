@@ -6,9 +6,9 @@
 //! The rule under test: **a `NextToken` names a POSITION in the enumeration, and a listing that
 //! serves such a token rather than refusing it resumes AT that position — never at the
 //! beginning** — so a continuation delivers only the items after the ones already delivered,
-//! while a value this service cannot read a cursor out of names no position of the enumeration
-//! at all: such a value is IGNORED and the listing serves the FIRST page, the answer a request
-//! carrying no token gets
+//! while a value this service cannot read a cursor out of names no position the enumeration
+//! holds at all: such a value marks a walk this listing cannot resume, so the page it is served
+//! is the EXHAUSTED one — every item member present and empty, with no token
 //! (`DescribeAlarmsInput$NextToken` "The token returned by a previous call to indicate that
 //! there is more data available.", `ListAlarmMuteRulesOutput$NextToken` "If this field is
 //! absent, there are no more results to retrieve."). An EMPTY `NextToken` is no token at all:
@@ -38,8 +38,9 @@ const PREFIX: &str = "cursor-alarm-";
 /// A `NextToken` value the service did not mint, in each form one can take.
 ///
 /// The first is no cursor at all; the second reads as a hexadecimal cursor whose bytes are not
-/// text; the third is the padded base64 blob AWS carries its own tokens in. None of them names
-/// a position of this service's enumerations, so a listing that serves such a value ignores it.
+/// text; the third is the padded base64 blob AWS carries its own tokens in. None of them names a
+/// position this service's enumerations hold, so a listing that serves such a value answers the
+/// page past its last item.
 const FOREIGN_TOKENS: [(&str, &str); 3] = [
     ("a value that is no cursor at all", "not-a-cursor"),
     ("a cursor whose bytes are not text", "fffe"),
@@ -128,7 +129,7 @@ async fn a_continued_alarm_listing_delivers_only_the_alarms_after_the_ones_alrea
 }
 
 #[tokio::test]
-async fn an_unresumable_token_is_ignored_by_the_alarm_listing() {
+async fn a_token_past_the_listing_is_answered_the_exhausted_alarm_page() {
     let router = build_router();
     let names = given_alarms(&router, 2).await;
     let first = ok(
@@ -152,14 +153,23 @@ async fn an_unresumable_token_is_ignored_by_the_alarm_listing() {
         .await;
         assert_eq!(
             listed_alarms(&listed),
-            names,
-            "case {case:?}: expected the token ignored and the first page served, got {listed}"
+            Vec::<String>::new(),
+            "case {case:?}: expected the exhausted page and no alarm delivered twice, got \
+             {listed}"
         );
-        // That page is the first one, which here holds the whole listing, so it owes no token.
+        // Every list this read reports is present and empty there, and the walk is over, so no
+        // token is owed.
+        for member in ["MetricAlarms", "CompositeAlarms", "LogAlarms"] {
+            assert_eq!(
+                listed.get(member).and_then(Value::as_array),
+                Some(&Vec::new()),
+                "case {case:?}: expected {member} present and empty, got {listed}"
+            );
+        }
         assert_eq!(
             next_token(&listed),
             None,
-            "case {case:?}: the first page holds every alarm, so no token is owed, got {listed}"
+            "case {case:?}: an exhausted page owes no token, got {listed}"
         );
     }
 
@@ -185,7 +195,7 @@ async fn an_unresumable_token_is_ignored_by_the_alarm_listing() {
 }
 
 #[tokio::test]
-async fn an_unresumable_token_is_ignored_by_a_relationship_walk() {
+async fn a_token_past_a_relationship_walk_is_answered_the_exhausted_page() {
     let router = build_router();
     let children = given_alarms(&router, 2).await;
     let parent = "cursor-parent";
@@ -220,15 +230,19 @@ async fn an_unresumable_token_is_ignored_by_a_relationship_walk() {
         .await;
         assert_eq!(
             listed_alarms(&listed),
-            children,
-            "case {case:?}: expected the token ignored and the first page of children served, \
-             got {listed}"
+            Vec::<String>::new(),
+            "case {case:?}: expected the exhausted page of children, got {listed}"
+        );
+        assert_eq!(
+            next_token(&listed),
+            None,
+            "case {case:?}: an exhausted page owes no token, got {listed}"
         );
     }
 }
 
 #[tokio::test]
-async fn an_unresumable_token_is_ignored_by_the_mute_rule_listing() {
+async fn a_token_past_the_mute_rule_listing_is_answered_the_exhausted_page() {
     let router = build_router();
     // The same rule, read through the OTHER listing of this service that serves a token it
     // cannot read: one rule decides what such a token names for both.
@@ -259,9 +273,8 @@ async fn an_unresumable_token_is_ignored_by_the_mute_rule_listing() {
         .await;
         assert_eq!(
             listed_arns(&listed),
-            listed_arns(&first),
-            "case {case:?}: expected the token ignored and the first page of rules served, got \
-             {listed}"
+            Vec::<String>::new(),
+            "case {case:?}: expected the exhausted page and no rule delivered twice, got {listed}"
         );
     }
 }

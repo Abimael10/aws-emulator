@@ -2879,53 +2879,91 @@ pub fn requested_page(token: Option<&str>) -> Option<&str> {
 /// A token names a POSITION in the enumeration — "The token returned by a previous call to
 /// indicate that there is more data available." (`DescribeAlarmsInput$NextToken`), "The token
 /// returned from a previous call to indicate where to continue retrieving results."
-/// (`ListAlarmMuteRulesInput$NextToken`) — so the only positions a request can ask for are the
-/// beginning of the enumeration and an item of it.
+/// (`ListAlarmMuteRulesInput$NextToken`), "The token that marks the start of the next batch of
+/// returned results." (`DescribeAlarmsOutput$NextToken`) — so a request asks for the beginning
+/// of the enumeration, for the item a cursor names, or for the position PAST its last item,
+/// which is the page a walk that has already delivered everything asks for.
 ///
 /// Shared by every listing of this service that SERVES a token it cannot read instead of
-/// refusing one, so one rule decides what such a token does: a value no cursor of this
-/// enumeration can be read out of names no position of it, so it is IGNORED and the request is
-/// served as the one carrying no token — the FIRST page, which is what the recorded alarm
-/// listings answer a token they cannot resume from. A listing that refuses such a token instead
-/// reads the cursor itself ([`decode_page_token`]) and words the refusal its own model declares
+/// refusing one, so one rule decides what such a token does: a token is the mark a previous
+/// page left of how far it got, and one this listing cannot locate in its own enumeration is
+/// the mark of a walk it cannot resume — the recorded answer is the EXHAUSTED page, no items
+/// and no token, rather than a restart that would deliver items a second time and never
+/// terminate. A listing that refuses such a token instead reads the cursor itself
+/// ([`decode_page_token`]) and words the refusal its own model declares
 /// ([`invalid_next_token_message`]).
 pub enum ResumedAt {
-    /// The beginning: what a request carrying no token asks for, and what one carrying a token
-    /// this service cannot read a cursor out of asks for too.
+    /// The beginning: what a request carrying no token at all asks for.
     TheFirstItem,
-    /// The item the token's cursor names — which the listing that minted it reads as the
-    /// position it left off at.
+    /// The item the token's cursor names — the one the page that minted it stopped before, so
+    /// the continuation delivers that item and what follows it.
     TheItemNamed(String),
+    /// The position past the last item: the page a walk this listing cannot resume asks for,
+    /// which holds no item and owes no token ([`ResumedAt::page_of`]).
+    TheEndOfTheListing,
 }
 
 impl ResumedAt {
-    /// Which of the two `token` asks for.
+    /// Which of the three `token` asks for.
     ///
     /// An EMPTY `NextToken` is no token at all and asks for the first page, the one rule every
-    /// paginated read of this service shares ([`requested_page`]). A value this service did not
-    /// mint carries no cursor of this enumeration ([`decode_page_token`]) and therefore names no
-    /// position of it: a listing that serves such a token ignores it, which is the first page.
+    /// paginated read of this service shares ([`requested_page`]). A value this listing did not
+    /// mint carries no cursor of this enumeration ([`decode_page_token`]), so it cannot be
+    /// located in it: what it marks is a walk already carried past the items this listing
+    /// holds, which is its end.
     #[must_use]
     pub fn of(token: Option<&str>) -> Self {
-        match requested_page(token).and_then(decode_page_token) {
-            Some(cursor) => Self::TheItemNamed(cursor),
+        match requested_page(token) {
             None => Self::TheFirstItem,
+            Some(token) => match decode_page_token(token) {
+                Some(cursor) => Self::TheItemNamed(cursor),
+                None => Self::TheEndOfTheListing,
+            },
         }
     }
 
-    /// The index this position falls at in the listing, where `before` reports how many of its
-    /// items sort before the cursor a token named.
+    /// The page this position asks for, cut out of `selected` — the whole selection in the
+    /// listing's own order — at the size the request asked for, paired with the token the walk
+    /// owes after it. `key` is an item's cursor key, the value `selected` is ordered by.
     ///
-    /// The listing's own order is the caller's — a key is both the paging order and the cursor —
-    /// so only the POSITIONS are decided here; `before` is how the caller locates one of
-    /// them in the order it sorted.
+    /// The cursor is the key of the item the NEXT page starts at, so a token is owed only while
+    /// an item is left over beyond the page just cut: the last page carrying items carries no
+    /// token, and the page asked for past the end of the selection carries neither items nor a
+    /// token. Every page a walk is served therefore holds only items it has not delivered yet.
     #[must_use]
-    pub fn start_of(&self, before: impl FnOnce(&str) -> usize) -> usize {
-        match self {
+    pub fn page_of<'a, T>(
+        &self,
+        selected: &'a [T],
+        page_size: usize,
+        key: impl Fn(&T) -> &str,
+    ) -> ListingPage<'a, T> {
+        // The listing's own order is the caller's — a key is both the paging order and the
+        // cursor — so the position is located in that order: the page starts at the first item
+        // whose key does not sort before the cursor.
+        let from = match self {
             Self::TheFirstItem => 0,
-            Self::TheItemNamed(cursor) => before(cursor),
-        }
+            Self::TheItemNamed(cursor) => {
+                selected.partition_point(|item| key(item) < cursor.as_str())
+            }
+            Self::TheEndOfTheListing => selected.len(),
+        };
+        let remainder = selected.get(from..).unwrap_or_default();
+        let items = remainder.get(..page_size).unwrap_or(remainder);
+        let next_token = remainder
+            .get(page_size)
+            .map(|item| encode_page_token(key(item)));
+        ListingPage { items, next_token }
     }
+}
+
+/// One page of a listing of this service: the items it delivers and the token the walk owes
+/// after it ([`ResumedAt::page_of`]).
+pub struct ListingPage<'a, T> {
+    /// The items this page delivers, at most as many as the request asked for.
+    pub items: &'a [T],
+    /// The cursor the page after this one resumes from: "If this field is absent, there are no
+    /// more results to retrieve." (`ListAlarmMuteRulesOutput$NextToken`).
+    pub next_token: Option<String>,
 }
 
 /// How a listing of this service that quotes an unusable `NextToken` refuses one it cannot
@@ -2940,7 +2978,8 @@ impl ResumedAt {
 /// sentence its own recordings show (`crate::ops::list_metric_streams`), the Contributor Insights
 /// listings their coded one ([`insight_rule_records::invalid_page_token_message`]), and two reads
 /// refuse such a token not at all because they serve a page instead: the alarm listing and the
-/// alarm mute rule listing both ignore it and serve their first page ([`ResumedAt`]). So this
+/// alarm mute rule listing both read it as the position past their last item and serve the
+/// exhausted page ([`ResumedAt`]). So this
 /// is the sentence of the reads recorded quoting
 /// the token — the alarm HISTORY listing and the alarm CONTRIBUTOR read
 /// (`crate::ops::describe_alarm_contributors`) — not a fourth wording of one class.
