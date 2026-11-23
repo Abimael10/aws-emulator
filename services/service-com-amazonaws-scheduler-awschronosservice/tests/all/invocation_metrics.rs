@@ -246,7 +246,7 @@ async fn an_occurrence_publishes_what_it_came_to() {
 
 /// The `Sum` of every datapoint CloudWatch holds for one group's `metric`, read exactly as
 /// a client reads it. A series that does not exist holds nothing, which reads as 0.
-async fn sum_of(router: &MultiServiceRouter, group: &str, metric: &str) -> f64 {
+pub(crate) async fn sum_of(router: &MultiServiceRouter, group: &str, metric: &str) -> f64 {
     let now = epoch_seconds();
     let (status, answered) = cloudwatch(
         router,
@@ -320,7 +320,7 @@ fn epoch_seconds() -> f64 {
 /// The emulator: EventBridge Scheduler, the service its targets live in, IAM, and the
 /// CloudWatch whose store the counters land in — on ONE engine, the shape
 /// `core/router/src/lib.rs` mounts them in.
-fn emulator_with_cloudwatch() -> MultiServiceRouter {
+pub(crate) fn emulator_with_cloudwatch() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
