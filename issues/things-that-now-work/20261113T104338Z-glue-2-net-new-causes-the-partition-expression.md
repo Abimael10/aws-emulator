@@ -77,3 +77,31 @@ Cause 2:
 3. glue CreateJob (GlueVersion 4.0, WorkerType G.1X, NumberOfWorkers 2, Command glueetl pointing at that script) and StartJobRun.
 4. Poll GetJobRun: expect JobRunState 'SUCCEEDED' and the output/partitions written; observe 'FAILED' with ErrorMessage "ModuleNotFoundError: No module named 'awsglue.context'".
 5. Or re-replay: glue.glue-job-reads-its-source-through-the-catalog-and-writes-partitions-into-a-registered-table, glue.glue-job-rejects-a-type-violating-source-row-and-writes-no-output-or-partition, glue.glue-job-runs-add-catalog-partitions-incrementally-and-re-registering-one-creates-no-duplicate.
+
+## Resolution
+
+Cause 1 is fixed for the partition filter itself: every `Expression` the service cannot
+evaluate over the addressed table's partition keys — one that is no `WHERE`-clause
+expression, one carrying text past the expression, one naming a column that is no partition
+key, one filtering a key of a type a filter cannot compare, and one comparing a key against
+a literal that is no value of its type — is refused with HTTP 400, the operation's modelled
+`InvalidInputException` and the single fixed sentence `Invalid partition expression!`, which
+carries no part of the request.
+
+Step 6 above, the same `Expression` against `GetUnfilteredPartitionsMetadata`, is NOT what
+the recording shows and was not implemented: a caller presenting no vended Lake Formation
+query session is refused `AccessDeniedException` with an empty message FIRST, whatever the
+`Expression` says. Validating the filter ahead of that gate made the recorded unit's next
+step diverge (it asserts `AccessDeniedException`), so the gate stays ahead of the filter and
+the two application-integration reads inspect nothing of the request. A later replay
+divergence on that trace is about the Lake Formation gate, not about this message.
+
+Cause 2 is fixed for the run as a whole: the ETL library is present, and the sink now
+performs the write options the service documents (`compression`, `partitionKeys`,
+`enableUpdateCatalog`, `updateBehavior`) instead of refusing them, appends to the path it
+writes rather than replacing an earlier write's part, and brings the registered table's
+schema up to date (or logs the difference) as the update behaviour names. The negative arm of
+glue.glue-job-rejects-a-type-violating-source-row-and-writes-no-output-or-partition still
+diverges: a frame column holding a value its declared type could not be read from is refused
+naming that column, on the write and on the conversion to a dataset of rows, but the recorded
+script carries its type violation on neither of those paths.

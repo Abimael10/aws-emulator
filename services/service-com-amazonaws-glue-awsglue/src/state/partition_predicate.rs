@@ -50,8 +50,8 @@ const MAX_FILTER_DEPTH: usize = 32;
 ///
 /// Source: `GetPartitionsRequest$Expression`, "Supported Partition Key Types": `string`,
 /// `date`, `timestamp`, `int`, `bigint`, `long`, `tinyint`, `smallint`, `decimal`. A
-/// declared type outside this list is one the filter cannot compare, which is what
-/// [`PartitionFilterRefusal::KeyTypeNotSupported`] reports.
+/// declared type outside this list is one the filter cannot compare, so an expression
+/// filtering such a key is one the service cannot evaluate ([`PartitionFilterRefusal`]).
 pub const FILTERABLE_PARTITION_KEY_TYPES: &[&str] = &[
     "string",
     "date",
@@ -64,61 +64,29 @@ pub const FILTERABLE_PARTITION_KEY_TYPES: &[&str] = &[
     "decimal",
 ];
 
-/// Why an `Expression` is no filter on the addressed table's partitions.
+/// An `Expression` that is no filter the service can evaluate over the addressed table's
+/// partitions.
 ///
-/// Every one of these is a fault of the REQUEST — a filter the service cannot run against
-/// this table — so each is answered with the listing's own `InvalidInputException`, and
-/// none of them depends on which partitions the table holds.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PartitionFilterRefusal {
-    /// The value is not a `WHERE`-clause expression over the documented operators at all:
-    /// it does not parse as one, it carries text beyond the expression, it nests deeper
-    /// than [`MAX_FILTER_DEPTH`], it uses an operator the member does not document, or it
-    /// compares something other than a partition key against a literal.
-    NotAFilter,
-    /// The expression names a column that is no partition key of the addressed table. A
-    /// filter selects partitions, so the only columns it can read are the ones a partition
-    /// is addressed by.
-    UnknownPartitionKey {
-        /// The column name the expression named, as it named it.
-        key: String,
-    },
-    /// The expression filters a partition key whose declared type is outside
-    /// [`FILTERABLE_PARTITION_KEY_TYPES`] — "if a type is encountered that is not valid,
-    /// an exception is thrown".
-    KeyTypeNotSupported {
-        /// The partition key the expression filters.
-        key: String,
-        /// The type that key is declared with.
-        declared: String,
-    },
-    /// The expression compares a partition key against a literal that is no value of the
-    /// key's own type: a word against a numeric key, a value that is no instant against a
-    /// `date` or `timestamp` key, `NULL` or a boolean against any of them.
-    ValueNotOfKeyType {
-        /// The partition key the comparison addresses.
-        key: String,
-        /// The type that key is declared with, which the literal has to be a value of.
-        declared: String,
-    },
-}
+/// Carries NO classification of why, because the service discloses none: a value that is no
+/// `WHERE`-clause expression over the documented operators at all (it does not parse as one,
+/// it carries text beyond the expression, it nests deeper than [`MAX_FILTER_DEPTH`], it uses
+/// an operator the member does not document, or it compares something other than a partition
+/// key against a literal), one naming a column that is no partition key of the addressed
+/// table, one filtering a key whose declared type is outside
+/// [`FILTERABLE_PARTITION_KEY_TYPES`], and one comparing a key against a literal that is no
+/// value of its own type are ONE refusal with ONE wording.
+///
+/// Every one of them is a fault of the REQUEST — a filter the service cannot run against
+/// this table — so each is answered with the listing's own `InvalidInputException`, and none
+/// of them depends on which partitions the table holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartitionFilterRefusal;
 
 impl PartitionFilterRefusal {
-    /// This refusal's wording, the one a listing answers `InvalidInputException` with.
-    ///
-    /// `expression` is the filter as the request sent it, carried only by the refusal that
-    /// is about the expression as a whole.
-    pub fn message(&self, expression: &str) -> String {
-        match self {
-            Self::NotAFilter => messages::expression_is_not_a_partition_filter(expression),
-            Self::UnknownPartitionKey { key } => messages::expression_names_no_partition_key(key),
-            Self::KeyTypeNotSupported { key, declared } => {
-                messages::partition_key_type_not_filterable(key, declared)
-            }
-            Self::ValueNotOfKeyType { key, declared } => {
-                messages::expression_value_not_of_partition_key_type(key, declared)
-            }
-        }
+    /// This refusal's wording, the one a listing answers `InvalidInputException` with: the
+    /// single fixed sentence, whichever way the expression failed to be a filter.
+    pub fn message(&self) -> &'static str {
+        messages::INVALID_PARTITION_EXPRESSION
     }
 }
 
@@ -143,14 +111,14 @@ impl ParsedPartitionFilter {
         let mut parser = Parser::new(&GenericDialect {})
             .with_recursion_limit(MAX_FILTER_DEPTH)
             .try_with_sql(expression)
-            .map_err(|_| PartitionFilterRefusal::NotAFilter)?;
+            .map_err(|_| PartitionFilterRefusal)?;
         let parsed = parser
             .parse_expr()
-            .map_err(|_| PartitionFilterRefusal::NotAFilter)?;
+            .map_err(|_| PartitionFilterRefusal)?;
         // Everything the request sent has to BE the filter: text left over past the
         // expression is not a filter whose remainder can be dropped.
         if parser.peek_token().token != Token::EOF {
-            return Err(PartitionFilterRefusal::NotAFilter);
+            return Err(PartitionFilterRefusal);
         }
         Ok(Self { expression: parsed })
     }
@@ -580,7 +548,7 @@ fn read_condition(
     depth: usize,
 ) -> Result<Condition, PartitionFilterRefusal> {
     if depth > MAX_FILTER_DEPTH {
-        return Err(PartitionFilterRefusal::NotAFilter);
+        return Err(PartitionFilterRefusal);
     }
     let depth = depth + 1;
     match expression {
@@ -596,20 +564,20 @@ fn read_condition(
             )),
             operator => {
                 let comparison =
-                    Comparison::of(operator).ok_or(PartitionFilterRefusal::NotAFilter)?;
+                    Comparison::of(operator).ok_or(PartitionFilterRefusal)?;
                 // A comparison names a partition key and a literal, in either order.
                 if let Some(name) = column_of(left) {
-                    let (key, column) = resolve_key(&name, partition_keys)?;
-                    let value = read_scalar(right, &column, key.kind)?;
+                    let key = resolve_key(&name, partition_keys)?;
+                    let value = read_scalar(right, key.kind)?;
                     return Ok(Condition::Compare {
                         key,
                         comparison,
                         value,
                     });
                 }
-                let name = column_of(right).ok_or(PartitionFilterRefusal::NotAFilter)?;
-                let (key, column) = resolve_key(&name, partition_keys)?;
-                let value = read_scalar(left, &column, key.kind)?;
+                let name = column_of(right).ok_or(PartitionFilterRefusal)?;
+                let key = resolve_key(&name, partition_keys)?;
+                let value = read_scalar(left, key.kind)?;
                 Ok(Condition::Compare {
                     key,
                     comparison: comparison.mirrored(),
@@ -626,8 +594,8 @@ fn read_condition(
             depth,
         )?))),
         Expr::IsNull(inner) => {
-            let (key, _) = resolve_key(
-                &column_of(inner).ok_or(PartitionFilterRefusal::NotAFilter)?,
+            let key = resolve_key(
+                &column_of(inner).ok_or(PartitionFilterRefusal)?,
                 partition_keys,
             )?;
             Ok(Condition::IsNull {
@@ -636,8 +604,8 @@ fn read_condition(
             })
         }
         Expr::IsNotNull(inner) => {
-            let (key, _) = resolve_key(
-                &column_of(inner).ok_or(PartitionFilterRefusal::NotAFilter)?,
+            let key = resolve_key(
+                &column_of(inner).ok_or(PartitionFilterRefusal)?,
                 partition_keys,
             )?;
             Ok(Condition::IsNull { key, negated: true })
@@ -647,13 +615,13 @@ fn read_condition(
             list,
             negated,
         } => {
-            let (key, column) = resolve_key(
-                &column_of(expr).ok_or(PartitionFilterRefusal::NotAFilter)?,
+            let key = resolve_key(
+                &column_of(expr).ok_or(PartitionFilterRefusal)?,
                 partition_keys,
             )?;
             let mut values = Vec::with_capacity(list.len());
             for item in list {
-                values.push(read_scalar(item, &column, key.kind)?);
+                values.push(read_scalar(item, key.kind)?);
             }
             Ok(Condition::In {
                 key,
@@ -667,15 +635,15 @@ fn read_condition(
             low,
             high,
         } => {
-            let (key, column) = resolve_key(
-                &column_of(expr).ok_or(PartitionFilterRefusal::NotAFilter)?,
+            let key = resolve_key(
+                &column_of(expr).ok_or(PartitionFilterRefusal)?,
                 partition_keys,
             )?;
             let kind = key.kind;
             Ok(Condition::Between {
                 key,
-                low: read_scalar(low, &column, kind)?,
-                high: read_scalar(high, &column, kind)?,
+                low: read_scalar(low, kind)?,
+                high: read_scalar(high, kind)?,
                 negated: *negated,
             })
         }
@@ -686,19 +654,19 @@ fn read_condition(
             escape_char,
             ..
         } => {
-            let (key, _) = resolve_key(
-                &column_of(expr).ok_or(PartitionFilterRefusal::NotAFilter)?,
+            let key = resolve_key(
+                &column_of(expr).ok_or(PartitionFilterRefusal)?,
                 partition_keys,
             )?;
             // A `LIKE` selects by the TEXT of the value, so its operand is a text pattern
             // whatever type the key it filters is declared with.
-            let pattern = literal_text(pattern).ok_or(PartitionFilterRefusal::NotAFilter)?;
+            let pattern = literal_text(pattern).ok_or(PartitionFilterRefusal)?;
             let escape = escape_char.as_ref().and_then(|clause| {
                 let text = clause.to_string();
                 text.chars().next()
             });
             let matcher =
-                like_matcher(&pattern, escape).ok_or(PartitionFilterRefusal::NotAFilter)?;
+                like_matcher(&pattern, escape).ok_or(PartitionFilterRefusal)?;
             Ok(Condition::Like {
                 key,
                 matcher,
@@ -706,12 +674,11 @@ fn read_condition(
             })
         }
         // Anything else is no filter over a table's partitions.
-        _ => Err(PartitionFilterRefusal::NotAFilter),
+        _ => Err(PartitionFilterRefusal),
     }
 }
 
-/// The partition key `name` names, as the filter addresses it, together with the column
-/// that declares it.
+/// The partition key `name` names, as the filter addresses it.
 ///
 /// A column name is matched without regard to case: a Hive column name is case
 /// insensitive, and the catalog stores a partition key under the name the table was
@@ -719,22 +686,15 @@ fn read_condition(
 fn resolve_key(
     name: &str,
     partition_keys: &[Column],
-) -> Result<(KeyRef, Column), PartitionFilterRefusal> {
+) -> Result<KeyRef, PartitionFilterRefusal> {
     let (index, column) = partition_keys
         .iter()
         .enumerate()
         .find(|(_, column)| column.name.eq_ignore_ascii_case(name))
-        .ok_or_else(|| PartitionFilterRefusal::UnknownPartitionKey {
-            key: name.to_string(),
-        })?;
+        .ok_or(PartitionFilterRefusal)?;
     let declared = column.r#type.clone().unwrap_or_default();
-    let kind = KeyKind::of(&declared).ok_or_else(|| {
-        PartitionFilterRefusal::KeyTypeNotSupported {
-            key: column.name.clone(),
-            declared: declared.clone(),
-        }
-    })?;
-    Ok((KeyRef { index, kind }, column.clone()))
+    let kind = KeyKind::of(&declared).ok_or(PartitionFilterRefusal)?;
+    Ok(KeyRef { index, kind })
 }
 
 /// The column name `expression` names, if it names one.
@@ -762,19 +722,10 @@ fn column_of(expression: &Expr) -> Option<String> {
 /// text it spells when the key is a `string`, so `year = 2024` filters a string key by the
 /// characters it is stored as. A literal of neither — `NULL`, a boolean, a value that is no
 /// number for a numeric key or no instant for a `date` — is no value of the key's type.
-fn read_scalar(
-    expression: &Expr,
-    column: &Column,
-    kind: KeyKind,
-) -> Result<Scalar, PartitionFilterRefusal> {
-    let not_of_key_type = || PartitionFilterRefusal::ValueNotOfKeyType {
-        key: column.name.clone(),
-        declared: column.r#type.clone().unwrap_or_default(),
-    };
+fn read_scalar(expression: &Expr, kind: KeyKind) -> Result<Scalar, PartitionFilterRefusal> {
     match literal_of(expression) {
-        Some(Literal::Value(text)) => kind.read(&text).ok_or_else(not_of_key_type),
-        Some(Literal::OutsideKeyTypes) => Err(not_of_key_type()),
-        None => Err(PartitionFilterRefusal::NotAFilter),
+        Some(Literal::Value(text)) => kind.read(&text).ok_or(PartitionFilterRefusal),
+        Some(Literal::OutsideKeyTypes) | None => Err(PartitionFilterRefusal),
     }
 }
 

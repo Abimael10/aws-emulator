@@ -234,7 +234,7 @@ fn job_body(name: &str, location: &str) -> Value {
 }
 
 /// The bytes of one object, or `None` when the object store does not serve it.
-async fn object_bytes(router: &MultiServiceRouter, key: &str) -> Option<Vec<u8>> {
+pub(crate) async fn object_bytes(router: &MultiServiceRouter, key: &str) -> Option<Vec<u8>> {
     let object = crate::wire::s3_client(router)
         .get_object()
         .bucket(BUCKET)
@@ -246,7 +246,11 @@ async fn object_bytes(router: &MultiServiceRouter, key: &str) -> Option<Vec<u8>>
 }
 
 /// Every object key the store holds under `prefix`, in the order the store lists them.
-async fn keys_under(router: &MultiServiceRouter, case: &str, prefix: &str) -> Vec<String> {
+pub(crate) async fn keys_under(
+    router: &MultiServiceRouter,
+    case: &str,
+    prefix: &str,
+) -> Vec<String> {
     let listed = crate::wire::s3_client(router)
         .list_objects_v2()
         .bucket(BUCKET)
@@ -277,24 +281,24 @@ fn rendered(field: &Field) -> String {
 /// What one Parquet object holds, read with a Parquet reader: its rows, its columns' names
 /// and physical types, the codec its pages are stored under, and what its footer states about
 /// each column.
-struct Held {
+pub(crate) struct Held {
     /// Every row, each value rendered in column order.
-    rows: Vec<Vec<String>>,
+    pub(crate) rows: Vec<Vec<String>>,
     /// The (column, physical type) pairs the footer's schema states, in column order.
-    schema: Vec<(String, String)>,
+    pub(crate) schema: Vec<(String, String)>,
     /// The codec the chunks' pages are stored under.
-    compression: String,
+    pub(crate) compression: String,
     /// The row count the footer states, which a reader trusts before reading a page.
-    stated_rows: i64,
+    pub(crate) stated_rows: i64,
     /// Per column: how many nulls the footer says it holds, and its stated bounds.
-    statistics: Vec<(i64, String, String)>,
+    pub(crate) statistics: Vec<(i64, String, String)>,
     /// The writer the footer is stamped with, which is the Parquet writer the environment
     /// that ran the script ships.
-    created_by: String,
+    pub(crate) created_by: String,
 }
 
 /// Read one written object as the Parquet file it has to be.
-fn held_by(case: &str, key: &str, body: &[u8]) -> Held {
+pub(crate) fn held_by(case: &str, key: &str, body: &[u8]) -> Held {
     let reader = SerializedFileReader::new(bytes::Bytes::from(body.to_vec()))
         .unwrap_or_else(|error| {
             panic!("case {case:?}: {key} must be a Parquet file, got {error:?}")

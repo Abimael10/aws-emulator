@@ -41,6 +41,12 @@ MAX_PARTITIONS = 1000
 # carry, so the number of distinct columns one read can be made to hold is bounded here the
 # way the rows and the objects are.
 MAX_COLUMNS = 1000
+# How many CELLS one read MATERIALISES: every record carries one entry per column, so the
+# two dimensions above multiply, and a width stated by catalog metadata or by one header row
+# costs nothing of the byte budget — a narrow source read under a wide schema would hold
+# `rows * columns` entries while passing every other bound. So what one read may hold is
+# bounded on the PRODUCT as well, checked before each record is kept.
+MAX_CELLS = 2000000
 
 # The names a Spark output writes beside its data, which hold none of the table's rows.
 MARKER_PREFIXES = ("_", ".")
@@ -279,7 +285,7 @@ def _cast(value, declared):
     """
     if value is None:
         return None
-    kind = str(declared or "string").lower().split("<")[0].strip()
+    kind = base_hive_type(declared)
     text = str(value)
     if kind in ("int", "integer", "bigint", "smallint", "tinyint", "long"):
         try:
@@ -297,6 +303,40 @@ def _cast(value, declared):
             return folded == "true"
         return text
     return text
+
+
+def base_hive_type(declared):
+    """The TYPE a declaration names, folded and without its parameter or member list.
+
+    A table states its column types in Hive type syntax (`int`, `varchar(64)`,
+    `decimal(10,2)`, `array<string>`), and neither the parameter list of a parameterised name
+    nor the member list of a complex one changes WHICH type is named. Read in ONE place, so
+    the cast of a cell ([`_cast`]) and the question of whether a value is one of its column's
+    own type ([`holds_declared`]) cannot disagree about a declaration.
+    """
+    return str(declared or "string").lower().split("<")[0].split("(")[0].strip()
+
+
+def holds_declared(value, declared):
+    """Whether `value` is a value of the Hive type `declared`.
+
+    A cell the declared type could not be read from is kept as the TEXT it was ([`_cast`]),
+    so this is what tells such a value from one the column really holds — the two read the
+    declaration through the same [`base_hive_type`], so a value `_cast` resolved is one this
+    accepts. A declared type whose values this library does not resolve into a native one — a
+    date, a timestamp, a nested type — holds whatever the source carried for it, so nothing
+    is judged there.
+    """
+    if value is None:
+        return True
+    kind = base_hive_type(declared)
+    if kind in ("int", "integer", "bigint", "smallint", "tinyint", "long"):
+        return isinstance(value, int) and not isinstance(value, bool)
+    if kind in ("double", "float", "decimal", "real"):
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if kind == "boolean":
+        return isinstance(value, bool)
+    return True
 
 
 def _text_rows(text, columns, layout):
@@ -377,7 +417,8 @@ def _rows_under(location, columns, layout, left_rows, left_bytes, transformation
         for row in parse(text, columns, layout):
             if len(rows) >= left_rows:
                 raise TableTooLarge(
-                    "one read of a table takes at most %d rows of it" % (MAX_ROWS,)
+                    "one read of a table takes at most %d rows and %d cells of it"
+                    % (MAX_ROWS, MAX_CELLS)
                 )
             rows.append(row)
     return (rows, left_bytes)
@@ -441,11 +482,16 @@ def read_catalog_table(
     # How WIDE the table is, checked BEFORE any object is fetched: a record carries one entry
     # per declared column, so the declared width multiplies every row this read builds, and
     # the declared width is catalog metadata that the byte and row budgets do not count.
-    if len(columns) + len(partition_keys) > MAX_COLUMNS:
+    width = len(columns) + len(partition_keys)
+    if width > MAX_COLUMNS:
         raise TableTooLarge(
             "one read of a table takes at most %d of its columns" % (MAX_COLUMNS,)
         )
-    left_rows = MAX_ROWS
+    # And the rows this read may keep are bounded on what they materialise TOGETHER: the row
+    # allowance is the smaller of the row bound and what the cell bound leaves at this
+    # table's own width ([`MAX_CELLS`]), so a narrow source read under a wide declared schema
+    # stops at the same ceiling as a wide source does.
+    left_rows = min(MAX_ROWS, MAX_CELLS // max(width, 1))
     left_bytes = MAX_BYTES
     records = []
     if partition_keys:
@@ -519,6 +565,8 @@ def read_s3_paths(
     known = {}
     records = []
     left_bytes = MAX_BYTES
+    # How many entries the records kept so far hold together ([`MAX_CELLS`]).
+    cells = 0
     for path in list(paths or []):
         bucket, prefix = _split_uri(path)
         listed = _bookmark.unread(
@@ -546,6 +594,16 @@ def read_s3_paths(
                 if len(records) >= MAX_ROWS:
                     raise TableTooLarge(
                         "one read takes at most %d rows of the objects it reads" % (MAX_ROWS,)
+                    )
+                # And what the rows MATERIALISE together, which is the product of the two
+                # dimensions ([`MAX_CELLS`]): the entries this record would add are counted
+                # before it is kept, so a narrow source read under a wide header stops at
+                # the same ceiling as a wide source does.
+                cells += len(record)
+                if cells > MAX_CELLS:
+                    raise TableTooLarge(
+                        "one read materialises at most %d cells of the objects it reads"
+                        % (MAX_CELLS,)
                     )
                 for name in record:
                     if name in known:

@@ -207,7 +207,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The Lake Formation gate. No query session exists for a caller to present —
         // this emulator's Lake Formation surface vends none — so every request that
-        // reaches here is denied, and nothing in the request is inspected: a
+        // reaches here is denied, and NOTHING in the request is inspected: not the
+        // addressed table, and not the `Expression` either, which a served listing would
+        // read as its partition filter — the recorded refusal of a caller holding no
+        // vended session is the same for a filter that is no filter at all. A
         // `QuerySessionContext` a caller writes itself is not a vended session. The denial
         // is decided before any catalog lookup, so neither what the addressed table holds
         // nor whether it exists can change the answer, and the store is never touched.

@@ -103,7 +103,7 @@ job.commit()
 /// output are objects of the store; Lake Formation because it OWNS the permissions a catalog
 /// read is judged against. STS is mounted with it, because the session a run's calls are
 /// signed as is minted by the token service and resolved back to the role through it.
-fn emulator_with_catalog_and_s3() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator_with_catalog_and_s3() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let (mut router, engine) = emulator_with_iam();
     router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
         Arc::clone(&engine),
@@ -123,7 +123,7 @@ fn emulator_with_catalog_and_s3() -> (MultiServiceRouter, Arc<engine::InMemoryEn
 
 /// Seed the role a run is performed as: one Glue can assume, allowed every Amazon S3 call,
 /// so what decides a catalog read is the Lake Formation state and nothing else.
-fn job_role(engine: &Arc<engine::InMemoryEngine>, role_name: &str) -> String {
+pub(crate) fn job_role(engine: &Arc<engine::InMemoryEngine>, role_name: &str) -> String {
     let arn = seed_role(engine, role_name, Some(glue_trust()));
     let state = engine.state::<IamState>();
     let mut store = state.lock();

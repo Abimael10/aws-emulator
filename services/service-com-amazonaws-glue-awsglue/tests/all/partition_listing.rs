@@ -25,6 +25,7 @@
 use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_glue_awsglue::state::messages::INVALID_PARTITION_EXPRESSION;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::error_messages::assert_refusal;
@@ -401,94 +402,47 @@ async fn an_expression_outside_the_filter_language_is_refused() {
     // Rows differ along the way an expression can fail to be a filter: a column the table
     // does not partition by, a partition key of a type an expression cannot compare, a
     // literal that is no value of the key's type, and text that is no expression at all.
-    let cases: Vec<(&str, &str, &str, &str)> = vec![
-        (
-            "a column that is no partition key",
-            "events",
-            "country = 'us'",
-            "Expression references country, which is not a partition key of the table",
-        ),
+    // EVERY one of them is refused with the same fixed wording, which names no part of the
+    // request: the service discloses no classification of why a filter could not be run.
+    let cases: Vec<(&str, &str, &str)> = vec![
+        ("a column that is no partition key", "events", "country = 'us'"),
         (
             "a partition key of a type an expression cannot compare",
             "flagged",
             "flag = 'true'",
-            "Expression filters partition key flag of type boolean; the supported \
-             partition key types are string, date, timestamp, int, bigint, long, \
-             tinyint, smallint, decimal",
         ),
-        (
-            "a word compared against a numeric key",
-            "events",
-            "year = 'abc'",
-            "Expression compares partition key year against a value that is not of its \
-             type int",
-        ),
-        (
-            "NULL compared against a key",
-            "events",
-            "year = NULL",
-            "Expression compares partition key year against a value that is not of its \
-             type int",
-        ),
+        ("a word compared against a numeric key", "events", "year = 'abc'"),
+        ("NULL compared against a key", "events", "year = NULL"),
         (
             "a value that is no instant against a date key",
             "events",
             "dt >= 'yesterday'",
-            "Expression compares partition key dt against a value that is not of its \
-             type date",
         ),
         (
             "components that name no day against a date key",
             "events",
             "dt = '2024-13-45'",
-            "Expression compares partition key dt against a value that is not of its \
-             type date",
         ),
         (
             "a time of day no clock shows against a date key",
             "events",
             "dt > '2024-01-05 25:00:00'",
-            "Expression compares partition key dt against a value that is not of its \
-             type date",
         ),
-        (
-            "text that is no expression",
-            "events",
-            "this is not a filter(",
-            "Expression this is not a filter( is not a filter on the table's partitions; \
-             an expression uses SQL syntax similar to the SQL WHERE filter clause, built \
-             from the operators =, <>, >, <, >=, <=, AND, OR, IN, BETWEEN, LIKE, NOT and \
-             IS NULL",
-        ),
-        (
-            "a column name on its own",
-            "events",
-            "region",
-            "Expression region is not a filter on the table's partitions; an expression \
-             uses SQL syntax similar to the SQL WHERE filter clause, built from the \
-             operators =, <>, >, <, >=, <=, AND, OR, IN, BETWEEN, LIKE, NOT and IS NULL",
-        ),
+        ("text that is no expression", "events", "this is not a filter("),
+        ("a column name on its own", "events", "region"),
         (
             "text past the expression",
             "events",
             "region = 'us-east-1' leftover",
-            "Expression region = 'us-east-1' leftover is not a filter on the table's \
-             partitions; an expression uses SQL syntax similar to the SQL WHERE filter \
-             clause, built from the operators =, <>, >, <, >=, <=, AND, OR, IN, BETWEEN, \
-             LIKE, NOT and IS NULL",
         ),
         (
             "an operator the member does not document",
             "events",
             "year + 1 = 10",
-            "Expression year + 1 = 10 is not a filter on the table's partitions; an \
-             expression uses SQL syntax similar to the SQL WHERE filter clause, built \
-             from the operators =, <>, >, <, >=, <=, AND, OR, IN, BETWEEN, LIKE, NOT and \
-             IS NULL",
         ),
     ];
 
-    for (case, table, expression, expected_message) in cases {
+    for (case, table, expression) in cases {
         assert_refusal(
             &router,
             case,
@@ -499,7 +453,7 @@ async fn an_expression_outside_the_filter_language_is_refused() {
                 "Expression": expression
             }),
             "InvalidInputException",
-            expected_message,
+            INVALID_PARTITION_EXPRESSION,
         )
         .await;
     }

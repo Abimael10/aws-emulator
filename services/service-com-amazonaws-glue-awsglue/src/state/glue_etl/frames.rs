@@ -197,15 +197,44 @@ class DynamicFrame(object):
             print(record)
         return None
 
+    def _unresolved(self):
+        """The first `(column, declared, value)` this frame holds outside its column's type.
+
+        A record carries the value its source really held, and a cell the declared type
+        could not be read from is kept as the text it was — so a column can hold a value
+        that is no value of its own declared type. Such a column has no ONE type, and every
+        operation that needs one — a write of the frame, a conversion of it to a dataset of
+        rows — says so rather than answering as if it had: it is resolved first
+        (`ResolveChoice`). `None` when every value is one of its column's own type.
+        """
+        from awsglue import _table_data
+
+        for name, declared in self._columns:
+            for record in self._records:
+                value = record.get(name)
+                if not _table_data.holds_declared(value, declared):
+                    return (name, declared, value)
+        return None
+
     def toDF(self, options=None):
         """This frame as a Spark dataset of rows, which is what `toDF` hands out.
 
-        The options a conversion takes name how a field of more than one type is resolved
-        on the way; every record here carries the value that was really read, under the type
-        the table declares, so there is none to resolve and the rows are the frame's own.
+        The options a conversion takes name how a field of more than one type is resolved on
+        the way. A dataset of rows carries ONE type per column, so a column this frame holds
+        a value outside the type of is one the conversion cannot carry: it is refused naming
+        that column rather than converted as if the value were of that type
+        ([`DynamicFrame._unresolved`]).
         """
         from pyspark.sql import DataFrame, Row
 
+        unresolved = self._unresolved()
+        if unresolved is not None:
+            name, declared, value = unresolved
+            raise ValueError(
+                "the column %s is declared %s and the frame holds %r, which is no value of "
+                "it; such a column is resolved before it is converted"
+                % (name, declared, value)
+            )
         columns = [name for name, _declared in self._columns]
         rows = []
         for record in self._records:

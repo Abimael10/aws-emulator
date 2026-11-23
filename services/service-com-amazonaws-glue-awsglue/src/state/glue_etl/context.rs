@@ -300,9 +300,12 @@ class DataSource(object):
 /// shared Spark filesystem a program's own writes go through — so a later read of the path
 /// sees exactly what the frame held. A frame written in the columnar format is encoded by
 /// the Spark runtime under this library ([`::service_common::spark_runtime`]), so its part
-/// files are Apache Parquet files any Parquet reader reads. A sink asked to UPDATE THE
-/// CATALOG registers the partitions it wrote with the Data Catalog's own API, so a partition
-/// a run reports as written is one the catalog answers for.
+/// files are Apache Parquet files any Parquet reader reads, stored under the codec the write
+/// named. A sink asked to UPDATE THE CATALOG registers the partitions it wrote with the Data
+/// Catalog's own API and brings the registered table's schema up to date with the one the
+/// frame was written under — or, where the write asked for the difference to be logged
+/// instead, leaves that schema as it stands — so a partition a run reports as written is one
+/// the catalog answers for.
 pub(super) const DATA_SINK_SOURCE: &str = r#"
 """The sink a frame is written to, as `getSink` hands one out."""
 
@@ -319,8 +322,10 @@ from pyspark import filesystem, parquet
 from pyspark.release import MARKS_SUCCESSFUL_JOBS
 
 # The name one write of a frame leaves its records under, beside the marker Spark writes for
-# an output that was written in full.
-PART_NAME = "part-00000"
+# an output that was written in full. A write APPENDS to the path it is given rather than
+# replacing what is already there, so the index a part carries is the first one no part under
+# that path carries yet ([`_part_name`]).
+PART_PREFIX = "part-"
 SUCCESS_MARKER = "_SUCCESS"
 
 # The formats a frame is written in: the two text layouts, and the columnar one the Spark
@@ -332,8 +337,49 @@ JSON_FORMATS = ("json", "jsonl")
 PARQUET_FORMATS = ("parquet", "glueparquet")
 
 # The connection options a sink HONOURS: where it writes, how it partitions what it writes,
-# and whether it registers those partitions with the Data Catalog.
-HONOURED_OPTIONS = ("path", "paths", "partitionKeys", "enableUpdateCatalog")
+# the codec the parts it writes are stored under, and whether and how what it wrote is
+# brought into the Data Catalog.
+HONOURED_OPTIONS = (
+    "path",
+    "paths",
+    "partitionKeys",
+    "compression",
+    "enableUpdateCatalog",
+    "updateBehavior",
+)
+
+# What a sink asked to update the catalog does to the TABLE it registers into, as
+# `updateBehavior` names it: the schema the frame was written under replaces the registered
+# one, or the difference is reported in the run's log and the registered schema left as it
+# stands. A write naming neither updates the registered schema.
+UPDATE_IN_DATABASE = "UPDATE_IN_DATABASE"
+LOG_ONLY = "LOG"
+UPDATE_BEHAVIOURS = (UPDATE_IN_DATABASE, LOG_ONLY)
+
+# The members of a registered table a write of its schema carries back (`TableInput`): the
+# table is updated by sending its own definition with the schema replaced, so everything else
+# it states stays exactly as it stands.
+TABLE_INPUT_MEMBERS = (
+    "Name",
+    "Description",
+    "Owner",
+    "LastAccessTime",
+    "LastAnalyzedTime",
+    "Retention",
+    "StorageDescriptor",
+    "PartitionKeys",
+    "ViewOriginalText",
+    "ViewExpandedText",
+    "TableType",
+    "Parameters",
+    "TargetTable",
+)
+
+# How a `compression` option names no compression at all. A part of delimited text or of
+# JSON documents is written as the characters it holds, so this is the only codec such a part
+# is stored under; the columnar format's own codecs are the Spark runtime's to say
+# ([`pyspark.parquet.codec_of`]).
+UNCOMPRESSED_NAMES = ("", "none", "uncompressed")
 
 # The format options it honours: whether delimited text carries a header line, the delimiter
 # between its cells, and the codec a columnar part's pages are stored under.
@@ -377,6 +423,44 @@ class DataSink(object):
     def withFormat(self, format, **options):
         return self.setFormat(format, **options)
 
+    def _compression(self):
+        """The codec the parts this sink writes are stored under, as either side names it.
+
+        `compression` is a connection option of the write and a format option of the layout
+        it writes in, and names the same codec in both; the layout's own is the more
+        specific, so it decides when a write gives both. Read ONCE here and in one spelling —
+        trimmed and folded, and a value naming nothing at all is a codec unnamed — so every
+        layout's write reads the option the same way.
+        """
+        for named in (
+            self._format_options.get("compression"),
+            self._options.get("compression"),
+        ):
+            if named is None:
+                continue
+            held = str(named).strip().lower()
+            if held:
+                return held
+        return None
+
+    def _update_behaviour(self):
+        """What a write asked to update the catalog does to the registered table's schema.
+
+        A write naming no behaviour updates it, which is what a sink that only asks for the
+        catalog to be updated gets; a value naming neither behaviour is refused rather than
+        treated as one of them.
+        """
+        named = self._options.get("updateBehavior")
+        if named is None or str(named).strip() == "":
+            return UPDATE_IN_DATABASE
+        held = str(named).strip().upper()
+        if held not in UPDATE_BEHAVIOURS:
+            raise ValueError(
+                "a sink updates the catalog as one of %r; updateBehavior %r is neither"
+                % (list(UPDATE_BEHAVIOURS), str(named))
+            )
+        return held
+
     def write(self, dynamic_frame, info=""):
         return self.writeFrame(dynamic_frame, info)
 
@@ -387,8 +471,8 @@ class DataSink(object):
                 "this emulator writes a frame to Amazon S3; %r is not a connection type it "
                 "writes to" % (self._connection_type,)
             )
-        # An option changes what the write DOES — a compression it would have to apply, an
-        # update behaviour it would have to follow — so one this sink performs nothing for is
+        # An option changes what the write DOES — the codec its parts are stored under, the
+        # behaviour it updates the catalog with — so one this sink performs nothing for is
         # refused naming it rather than dropped, which would leave an object that is not
         # what the script asked for and report a success for it.
         _table_data.refuse_unhonoured(
@@ -402,16 +486,38 @@ class DataSink(object):
         if not self._path:
             raise ValueError("a sink names the Amazon S3 path it writes to")
         kind = str(self._format or "json").lower()
+        # Both read before anything is written, so a write asked for a codec this emulator
+        # cannot store a part under, or for an update behaviour that is neither of the two,
+        # leaves no object behind at all.
+        requested_compression = self._compression()
+        behaviour = self._update_behaviour()
+        if kind not in PARQUET_FORMATS:
+            _refuse_text_codec(requested_compression)
         partition_keys = [
             str(key) for key in (self._options.get("partitionKeys") or []) if str(key)
         ]
         records = dynamic_frame.records
         columns = [name for name, _declared in dynamic_frame._columns]
         declared = dict(dynamic_frame._columns)
+        # A value that is no value of its own column's DECLARED type is one no write can
+        # store under that schema: a frame carries the value its source really held, and a
+        # cell the declared type could not be read from is kept as the text it was, so
+        # writing it would store text in a column the schema states as a number. Such a
+        # column is resolved (`ResolveChoice`) before it is written, so the write is refused
+        # naming it instead — before any object is written and any partition registered.
+        unresolved = dynamic_frame._unresolved()
+        if unresolved is not None:
+            name, stated, value = unresolved
+            raise ValueError(
+                "the column %s is declared %s and the frame holds %r, which is no value of "
+                "it; such a column is resolved before it is written" % (name, stated, value)
+            )
+        # The fields one part file HOLDS: a partition key's value is spelled by the path the
+        # part is under, so it is not written into the part as well.
+        held = [name for name in columns if name not in partition_keys]
         prefix = str(self._path).rstrip("/")
         written = []
         for values, group in _grouped(records, partition_keys):
-            held = [name for name in columns if name not in partition_keys]
             # The value of a partition key is DATA — a field of the records being written —
             # so it goes into the path through the layout's own escaping: a value spelling a
             # path separator or a parent directory may not name an object outside the path
@@ -425,14 +531,15 @@ class DataSink(object):
                 for index, key in enumerate(partition_keys)
             )
             at = "%s/%s" % (prefix, within) if within else prefix
+            part = _part_name(at)
             if kind in PARQUET_FORMATS:
                 # The part is the Parquet file its records make: the values themselves in
                 # its pages, and the row count, the schema and each column's bounds in its
                 # footer, encoded by the Spark runtime under this library.
-                compression = self._format_options.get("compression", "snappy")
+                compression = requested_compression or "snappy"
                 _codec, suffix = parquet.codec_of(compression)
                 filesystem.write_bytes(
-                    "%s/%s%s.parquet" % (at, PART_NAME, suffix),
+                    "%s/%s%s.parquet" % (at, part, suffix),
                     parquet.file_bytes(
                         held,
                         [
@@ -446,20 +553,72 @@ class DataSink(object):
             else:
                 body = _rendered(group, held, kind, self._format_options)
                 filesystem.write_text(
-                    "%s/%s.%s" % (at, PART_NAME, _suffix(kind)), body
+                    "%s/%s.%s" % (at, part, _suffix(kind)), body
                 )
             if MARKS_SUCCESSFUL_JOBS:
                 filesystem.write_text("%s/%s" % (at, SUCCESS_MARKER), "")
             written.append((values, at))
-        if self._options.get("enableUpdateCatalog") and self._catalog_table:
+        if _table_data.truthy(self._options.get("enableUpdateCatalog")) and self._catalog_table:
             _register(
                 self._catalog_database,
                 self._catalog_table,
                 self._catalog_id,
                 partition_keys,
                 written,
+                [(name, declared.get(name)) for name in held],
+                behaviour,
+                self._glue_context.get_logger(),
             )
         return dynamic_frame
+
+
+def _part_name(at):
+    """The name this write gives the part it leaves under the path `at`.
+
+    A write of a path APPENDS to it: the objects an earlier write left there are data of the
+    same dataset, so a later write may not take their names — a run that wrote a partition
+    once and writes it again leaves two parts, and the second does not replace the first.
+    The index is therefore the first one no part already under that path carries, which for
+    the first write of a path is the first index of all.
+
+    Only the parts at that path's OWN level are counted: a listing is over the whole prefix
+    ([`pyspark.filesystem.list_objects`]), and the parts under a sub-prefix of it belong to
+    another directory of the dataset — a partition of its own — whose names this one cannot
+    collide with.
+    """
+    taken = set()
+    named = filesystem.prefix_of(at)
+    prefix = "" if named is None else named[1].rstrip("/")
+    if prefix:
+        prefix = prefix + "/"
+    for key, _size in filesystem.list_objects(at):
+        rest = key[len(prefix):] if key.startswith(prefix) else key
+        # A part under a SUB-prefix belongs to another directory of the dataset — a
+        # partition of its own — whose names this one cannot collide with.
+        if "/" in rest:
+            continue
+        if rest.startswith(PART_PREFIX):
+            taken.add(rest.split(".")[0])
+    index = 0
+    while "%s%05d" % (PART_PREFIX, index) in taken:
+        index += 1
+    return "%s%05d" % (PART_PREFIX, index)
+
+
+def _refuse_text_codec(compression):
+    """Refuse a codec a part of delimited text or of JSON documents cannot be stored under.
+
+    Such a part is written as the characters it holds, so the only codec this writer stores
+    one under is none at all: a write asking for another is refused naming it, rather than
+    leaving an uncompressed object behind under a name saying it was compressed.
+    """
+    named = str(compression or "").strip().lower()
+    if named in UNCOMPRESSED_NAMES:
+        return None
+    raise UnwritableFormat(
+        "this emulator writes delimited text and JSON documents uncompressed; the "
+        "compression %r is not one it stores them under" % (named,)
+    )
 
 
 def _suffix(kind):
@@ -517,10 +676,17 @@ def _rendered(records, columns, kind, format_options):
     return held.getvalue()
 
 
-def _register(database, table_name, catalog_id, partition_keys, written):
-    """Register the partitions a write left behind with the Data Catalog."""
-    if not partition_keys:
-        return None
+def _register(database, table_name, catalog_id, partition_keys, written, columns, behaviour,
+              logger):
+    """Register with the Data Catalog what a write left behind.
+
+    "enableUpdateCatalog" asks for the write to be reflected in the catalog, and
+    `updateBehavior` says what that does to the registered TABLE: its schema is brought up to
+    date with the one the frame was written under, or the difference is reported in the run's
+    log and the registered schema left as it stands. The partitions the write laid down are
+    registered either way, which is what makes a partition a run reports as written one the
+    catalog answers for.
+    """
     # The Data Catalog client the RUNTIME supplies the guest, through this library's one
     # construction of it: its transport is this emulator's own in-process callback, signed
     # as the role the run is performed as — it resolves no endpoint, opens no connection and
@@ -530,7 +696,9 @@ def _register(database, table_name, catalog_id, partition_keys, written):
     if catalog_id:
         request["CatalogId"] = catalog_id
     table = glue.get_table(**request)["Table"]
-    descriptor = dict(table.get("StorageDescriptor") or {})
+    descriptor = _schema_updated(glue, table, database, catalog_id, columns, behaviour, logger)
+    if not partition_keys:
+        return None
     for values, at in written:
         partition = {
             "Values": list(values),
@@ -561,6 +729,52 @@ def _register(database, table_name, catalog_id, partition_keys, written):
                 PartitionInput=partition,
             )
     return None
+
+
+def _schema_updated(glue, table, database, catalog_id, columns, behaviour, logger):
+    """Bring the registered table's schema up to date with the one the frame was written
+    under, and answer the storage descriptor this write's partitions are registered under.
+
+    A table already registered with the schema that was written has nothing to bring up to
+    date, so nothing is written to the catalog for it.
+    """
+    descriptor = dict(table.get("StorageDescriptor") or {})
+    wrote = [
+        {"Name": str(name), "Type": str(declared or "string")} for name, declared in columns
+    ]
+    registered = [
+        {
+            "Name": str(column.get("Name") or ""),
+            "Type": str(column.get("Type") or "string"),
+        }
+        for column in (descriptor.get("Columns") or [])
+    ]
+    if wrote == registered:
+        return descriptor
+    if behaviour == LOG_ONLY:
+        logger.warn(
+            "the frame written to %s.%s holds the columns %r, and the catalog holds %r for "
+            "it; the registered schema is left as it stands"
+            % (
+                database,
+                table.get("Name"),
+                [column["Name"] for column in wrote],
+                [column["Name"] for column in registered],
+            )
+        )
+        return descriptor
+    descriptor["Columns"] = wrote
+    carried = dict(
+        (member, table[member])
+        for member in TABLE_INPUT_MEMBERS
+        if table.get(member) is not None
+    )
+    carried["StorageDescriptor"] = descriptor
+    call = {"DatabaseName": database, "TableInput": carried}
+    if catalog_id:
+        call["CatalogId"] = catalog_id
+    glue.update_table(**call)
+    return descriptor
 "#;
 
 /// The source of `awsglue/job.py`.
