@@ -42,6 +42,11 @@ use service_com_amazonaws_endusermessaging_endusermessaging::EmulatedService;
 #[path = "notify_code_configuration_lifecycle/listing.rs"]
 mod listing;
 
+// `UpdateNotifyCodeConfiguration`, driven over the same wire and off this suite's own
+// harness: a child module of this suite, declared the same way `listing` is.
+#[path = "notify_code_configuration_lifecycle/update.rs"]
+mod update;
+
 /// This service's sigv4 signing name, from the model (`OPERATIONS.md`, "Wire protocol").
 const SIGNING_NAME: &str = "end-user-messaging";
 

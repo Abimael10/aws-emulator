@@ -18,6 +18,11 @@ pub use brand_profile_attributes::*;
 mod tags;
 pub use tags::*;
 
+/// How an update is applied to a stored notify code configuration: which members it
+/// replaces, which it clears, and which it leaves alone.
+mod notify_code_configuration_updates;
+pub use notify_code_configuration_updates::*;
+
 /// The asynchronous jobs the registration-import operations start, and the terminal
 /// status the clock owes each one.
 mod jobs;
