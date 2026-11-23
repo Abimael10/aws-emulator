@@ -77,15 +77,9 @@ use crate::state::{
     EVENT_LAMBDA_FUNCTION_SUCCEEDED, EVENT_LAMBDA_FUNCTION_TIMED_OUT, EVENT_MAP_ITERATION_ABORTED,
     EVENT_MAP_ITERATION_FAILED, EVENT_MAP_ITERATION_STARTED, EVENT_MAP_ITERATION_SUCCEEDED,
     EVENT_TASK_FAILED, EVENT_TASK_SCHEDULED, EVENT_TASK_SUBMITTED, EVENT_TASK_SUBMIT_FAILED,
-    EVENT_TASK_SUCCEEDED, EVENT_TASK_TIMED_OUT, STATE_ENTERED_SUFFIX, STATE_EXITED_SUFFIX,
+    EVENT_TASK_SUCCEEDED, EVENT_TASK_TIMED_OUT, STATE_ABORTED_SUFFIX, STATE_ENTERED_SUFFIX,
+    STATE_EXITED_SUFFIX,
 };
-
-/// The suffix of the event type a state writes when the work around it was STOPPED in
-/// flight: `HistoryEventType` models `WaitStateAborted`, `TaskStateAborted`,
-/// `MapStateAborted` and `ParallelStateAborted`, which is one per kind of state that can
-/// still be running when the stop reaches it
-/// (`smithy_query(query="shape",shape="HistoryEventType")`).
-const STATE_ABORTED_SUFFIX: &str = "StateAborted";
 
 /// The prefix of the event types an EXECUTION's own outcome is written under, which
 /// report the run rather than a state of it.

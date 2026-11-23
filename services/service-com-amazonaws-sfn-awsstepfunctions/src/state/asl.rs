@@ -1899,7 +1899,12 @@ pub const SIBLING_STOP_CAUSE: &str =
 /// and `ParallelStateAborted` and no others
 /// (`smithy_query(query="shape",shape="HistoryEventType")`), because a `Pass`, a
 /// `Choice`, a `Succeed` and a `Fail` leave in the same instant they are entered.
-fn aborted_event(state_type: &str) -> Option<&'static str> {
+///
+/// Read by the walk, which writes one for every state a SIBLING unit's failure stopped
+/// ([`Interpreter::abort_units`]), and by the stop of an execution, which writes one for
+/// every state it caught in flight ([`super::in_flight::states_in_flight`]): the two are
+/// the same fact about the same state, so they name the event through one reading.
+pub(crate) fn aborted_event(state_type: &str) -> Option<&'static str> {
     match state_type {
         "Wait" => Some("WaitStateAborted"),
         "Task" => Some("TaskStateAborted"),
@@ -1908,6 +1913,11 @@ fn aborted_event(state_type: &str) -> Option<&'static str> {
         _ => None,
     }
 }
+
+/// The bytes the longest event type [`aborted_event`] answers with holds, which the
+/// reserve a running execution holds for its own stop is measured with
+/// ([`super::STOP_RESERVE_BYTES`]).
+pub const MAX_ABORTED_EVENT_BYTES: usize = "ParallelStateAborted".len();
 
 /// The `$$.Map.Item` of the enclosing `Map` iteration, if the walk is inside one.
 #[derive(Debug, Clone, Default)]

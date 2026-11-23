@@ -661,6 +661,12 @@ pub const STATE_ENTERED_SUFFIX: &str = "StateEntered";
 /// The same for `<Type>StateExited` and `stateExitedEventDetails`.
 pub const STATE_EXITED_SUFFIX: &str = "StateExited";
 
+/// The suffix every `<Type>StateAborted` event's type carries: the event a state records
+/// when the work around it was STOPPED while it was still running. `HistoryEventType`
+/// models one per kind of state that can be ([`asl::aborted_event`]), and the event
+/// carries no detail of its own.
+pub const STATE_ABORTED_SUFFIX: &str = "StateAborted";
+
 // ---------------------------------------------------------------------------
 // Store bounds
 //
@@ -801,6 +807,11 @@ pub const MAX_HISTORY_EVENTS: usize = asl::MAX_HISTORY_EVENTS;
 /// means a re-measurement after the stop can only shrink the store's total, so
 /// admission is the ONLY place the store grows and [`MAX_STORE_BYTES`] bounds what
 /// is retained at every instant.
+///
+/// The events the stop writes for the states it catches IN FLIGHT are reserved beside
+/// this, against the history that holds those states' entries
+/// ([`in_flight::stop_reserve_bytes`]), because how many there are is a fact of the run
+/// rather than a constant.
 pub const STOP_RESERVE_BYTES: usize = 2 * (asl::MAX_ERROR_BYTES + asl::MAX_CAUSE_BYTES)
     + std::mem::size_of::<HistoryEvent>()
     + EVENT_EXECUTION_ABORTED.len();
@@ -1867,8 +1878,10 @@ pub enum StartedAlready {
 /// The `events` it carries are owed ONE BY ONE rather than all at once: each is
 /// stamped at the instant it happened, so an event whose instant has passed is
 /// reported while the execution is still running
-/// ([`Execution::advance_history`]) and only the event the attempt ENDS on —
-/// stamped at `due_at` — waits for the outcome itself.
+/// ([`Execution::advance_history`]). Only the events the OUTCOME is reported with wait
+/// for it — the event the attempt ends on, and the exit of the state the run ends at,
+/// whose work is still in flight for as long as the outcome is owed
+/// ([`in_flight::reportable_before_outcome`]).
 #[derive(Debug, Clone)]
 pub struct PendingOutcome {
     pub due_at: SystemTime,
@@ -2208,15 +2221,16 @@ impl Execution {
             + self.redrive_step.as_ref().map_or(0, asl::RedriveStep::measure)
             + self.pending.as_ref().map_or(0, PendingOutcome::measure)
             // A running execution can still be stopped, and a stop writes a
-            // caller-sized `error` and `cause` plus one event. Those bytes are
-            // RESERVED here, at admission, so no later write can take the store past
+            // caller-sized `error` and `cause` plus one event of its own, and one event
+            // for every state it catches in flight. Those bytes are RESERVED here, at
+            // admission, so no later write can take the store past
             // [`MAX_STORE_BYTES`]: once the execution is terminal the reserve is
             // released and what the stop actually wrote is counted, which is never
             // more than the reserve.
             + if self.is_terminal() {
                 0
             } else {
-                STOP_RESERVE_BYTES
+                STOP_RESERVE_BYTES + in_flight::stop_reserve_bytes(&self.history)
             }
             // The page cursors a read of this history may hand out are RESERVED here
             // too, and in full: the list is capped at [`MAX_HISTORY_PAGE_CURSORS`],
@@ -2239,9 +2253,10 @@ impl Execution {
     /// The events are moved in order and only as a PREFIX, so an event is reported
     /// once it and every event before it is due: the stored history stays in the order
     /// the walk numbered it, and no event names a predecessor the history does not
-    /// carry. The event the attempt ENDS on is stamped at the outcome's own instant,
-    /// so it is never moved here — [`Execution::apply_pending`] writes it with the
-    /// status it reports.
+    /// carry. The events the OUTCOME is reported with are never moved here — the event
+    /// the attempt ends on, and the exit of the state the run ends at, which is work
+    /// still in flight while the outcome is owed ([`in_flight`]) —
+    /// [`Execution::apply_pending`] writes them with the status they report.
     fn advance_history(&mut self, now: SystemTime) {
         let Some(pending) = self.pending.as_mut() else {
             return;
@@ -2249,6 +2264,7 @@ impl Execution {
         let due = pending
             .events
             .iter()
+            .take(in_flight::reportable_before_outcome(&pending.events))
             .take_while(|event| event.timestamp <= now)
             .count();
         if due == 0 {
@@ -4904,6 +4920,7 @@ pub mod events;
 pub mod execution_role_session;
 pub mod express_machines;
 pub mod http_task;
+mod in_flight;
 pub mod integration;
 pub mod item_batcher;
 pub mod item_reader;
