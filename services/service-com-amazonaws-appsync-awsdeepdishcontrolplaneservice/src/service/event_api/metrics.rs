@@ -94,7 +94,16 @@ pub const ACTIVE_CONNECTIONS_METRIC: &str = "ActiveConnections";
 pub const ACTIVE_SUBSCRIPTIONS_METRIC: &str = "ActiveSubscriptions";
 
 /// The `StandardUnit` a bare count of things carries: `Count`.
-const COUNT_UNIT: &str = "Count";
+pub const COUNT_UNIT: &str = "Count";
+
+/// The `StandardUnit` of a measurement published with NO unit of its own: `None`, which is
+/// what the series AppSync publishes about the REQUESTS a GraphQL API answered and about the
+/// work within them carry ([`super::super::graphql_api::metrics`]).
+pub const NO_UNIT: &str = "None";
+
+/// The `StandardUnit` a SPAN of time is measured in: `Milliseconds`, which is the unit
+/// AppSync's own latency series are reported in.
+pub const MILLISECONDS_UNIT: &str = "Milliseconds";
 
 /// The `StorageResolution` these datapoints are published at, in seconds: regular
 /// resolution, "which CloudWatch stores at 1-minute resolution"
@@ -266,6 +275,20 @@ pub fn append_observation(
     dimensions: cloudwatch::DimensionSet,
     value: f64,
 ) -> bool {
+    append_measurement(store, metric, dimensions, value, COUNT_UNIT)
+}
+
+/// The same, for a measurement whose `StandardUnit` is not a count: a SPAN of time
+/// ([`MILLISECONDS_UNIT`]) is as much an `AWS/AppSync` series as a tally is, and the unit is
+/// part of what a reader of the series is told about it, so it travels with the value rather
+/// than being assumed.
+pub fn append_measurement(
+    store: &::engine::ServiceState<CloudWatchState>,
+    metric: &str,
+    dimensions: cloudwatch::DimensionSet,
+    value: f64,
+    unit: &str,
+) -> bool {
     let key = cloudwatch::MetricKey {
         namespace: METRIC_NAMESPACE.to_string(),
         metric_name: metric.to_string(),
@@ -277,7 +300,7 @@ pub fn append_observation(
         sum: value,
         minimum: value,
         maximum: value,
-        unit: Some(COUNT_UNIT.to_string()),
+        unit: Some(unit.to_string()),
         storage_resolution: STANDARD_STORAGE_RESOLUTION_SECONDS,
     };
     let watched = cloudwatch::WrittenSeries {

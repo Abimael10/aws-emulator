@@ -40,12 +40,16 @@
 //! API's own data plane (`crate::state::GraphqlDataPlane::mint_request_id`). It is the value
 //! a client correlates its answer with what the API LOGGED about producing it by, because
 //! every record an API with a `logConfig` writes carries that same id
-//! ([`super::field_logs`]). A request the API itself answered is also a request it LOGS;
-//! four are not, because AppSync produced no answer of its own for them: one the WEB ACL
-//! decided at the edge, one this endpoint never read (shed for want of a permit, past the
-//! body ceiling, or past the read deadline), one refused by the transport-safety rules
-//! before any of it was dispatched, and one answered at the CORS preflight, which reaches
-//! neither the API's authorization nor a document.
+//! ([`super::field_logs`]). A request the API itself answered is also a request it LOGS and
+//! one it COUNTS in its own `AWS/AppSync` series
+//! ([`super::metrics::GraphqlApiMetrics::request_answered`]); four are not, because AppSync
+//! produced no answer of its own for them: one the WEB ACL decided at the edge, one this
+//! endpoint never read (shed for want of a permit, past the body ceiling, or past the read
+//! deadline), one refused by the transport-safety rules before any of it was dispatched, and
+//! one answered at the CORS preflight, which reaches neither the API's authorization nor a
+//! document. So no `5xx` answer this endpoint writes is one the API itself produced — each of
+//! them is a request it never read or a contained panic — and its `5XXError` series carries a
+//! zero for every request it did answer.
 
 use ::std::future::Future;
 use ::std::pin::Pin;
@@ -598,7 +602,14 @@ async fn served_request(
             api_id = %context.api_id,
             "this caller's IAM policies permit no field this call selects"
         );
-        return error_response(401, event_api::UNAUTHORIZED_ERROR_TYPE, PERMISSION_DENIED);
+        context
+            .metrics
+            .request_answered(UNAUTHORIZED_STATUS, clock.elapsed());
+        return error_response(
+            UNAUTHORIZED_STATUS,
+            event_api::UNAUTHORIZED_ERROR_TYPE,
+            PERMISSION_DENIED,
+        );
     }
     // Beside the fields the authorizer withheld, where there was one.
     request.unauthorized.extend(judged.refused);
@@ -614,6 +625,9 @@ async fn served_request(
         },
     )
     .await;
+    // What the API publishes about having answered this request, which is the ONLY way a
+    // client observes its request rate, its latency and its client-error rate.
+    context.metrics.request_answered(200, clock.elapsed());
     json_response(200, &answered.document())
 }
 
@@ -622,7 +636,8 @@ async fn served_request(
 ///
 /// A request the API itself refused is one it SERVED — the status it was answered with is
 /// what a request-level record states — so it is logged like any other, with no execution to
-/// report because none ran.
+/// report because none ran, and counted like any other
+/// ([`super::metrics::GraphqlApiMetrics::request_answered`]).
 async fn refusal_logged(
     context: &PlaneContext,
     request_id: &str,
@@ -643,6 +658,7 @@ async fn refusal_logged(
         },
     )
     .await;
+    context.metrics.request_answered(status, clock.elapsed());
     error_response(status, error_type, message)
 }
 

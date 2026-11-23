@@ -1061,7 +1061,11 @@ async fn the_endpoints_refuse_what_they_do_not_serve() {
 }
 
 /// Every datapoint of one series, by dimension set, as `GetMetricStatistics` reports them.
-async fn statistics(
+///
+/// Shared with the suites that read an `AWS/AppSync` series of their own
+/// ([`crate::graphql_api_request_metrics`]), so there is one reading of how a client asks for
+/// one rather than one per suite.
+pub(crate) async fn statistics(
     router: &MultiServiceRouter,
     metric: &str,
     dimensions: &[(&str, &str)],
@@ -1083,7 +1087,7 @@ async fn statistics(
             "StartTime": now - 600.0,
             "EndTime": now + 60.0,
             "Period": 60,
-            "Statistics": ["Sum", "Minimum", "Maximum"],
+            "Statistics": ["SampleCount", "Sum", "Minimum", "Maximum"],
         }),
     )
     .await;
@@ -1098,7 +1102,7 @@ async fn statistics(
 }
 
 /// The `Sum` of every datapoint of one series, or `None` when the series holds none.
-async fn metric_sum(
+pub(crate) async fn metric_sum(
     router: &MultiServiceRouter,
     metric: &str,
     dimensions: &[(&str, &str)],

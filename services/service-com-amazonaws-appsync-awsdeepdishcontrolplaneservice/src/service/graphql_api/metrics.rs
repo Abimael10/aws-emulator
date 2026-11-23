@@ -1,24 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The `AWS/AppSync` metrics a GraphQL API's REAL-TIME plane publishes about its own work:
-//! the connects it admitted, the ones it refused, the subscriptions started and ended on
-//! them, the data messages those subscriptions were delivered, and the disconnects that
-//! followed.
+//! The `AWS/AppSync` metrics a GraphQL API publishes about its own work: what its REQUEST
+//! plane answered, what the resolvers and data sources of those requests did, and what its
+//! REAL-TIME plane admitted, refused, subscribed and delivered.
 //!
-//! A real-time connect leaves no response a later caller can read — nothing in the control
-//! plane reports that a subscriber attached, that a handshake was turned away, that a
-//! subscription is open or that a mutation reached it. The only way a client learns any of
-//! it is the series AppSync publishes about itself, so this module publishes one datapoint
-//! per thing that happened, as it happens, and the two GAUGES
+//! Neither plane leaves a response a later caller can read — nothing in the control plane
+//! reports that a request was refused for a stale key, that a resolver raised, that a
+//! subscriber attached or that a mutation reached it. The only way a client learns any of it
+//! is the series AppSync publishes about itself, so this module publishes one datapoint per
+//! thing that happened, as it happens, and the two GAUGES
 //! ([`ACTIVE_CONNECTIONS_METRIC`], [`ACTIVE_SUBSCRIPTIONS_METRIC`]) with the counts the
 //! store holds AT that moment — every time one changes AND on the cadence the plane observes
 //! them at while a connection is open ([`super::gauges`]), which is what lets a reader see
 //! subscriptions fall back to zero, and STAY there, while a connection stays open.
 //!
-//! WHICH dimension set they land under is part of the contract: all of this happens on the
-//! API, so every series here is reported under [`GRAPHQL_API_ID_DIMENSION`] alone — the
-//! dimension that names a GraphQL API, as opposed to the `EventAPIId` an Event API's own
-//! series carry ([`super::super::event_api::metrics`]).
+//! WHICH dimension set they land under is part of the contract:
+//!
+//! * what happens on the API — a request answered, a connect admitted or refused, a
+//!   subscription started or ended, a `data` message delivered — is reported under
+//!   [`GRAPHQL_API_ID_DIMENSION`] alone, the dimension that names a GraphQL API (as opposed
+//!   to the `EventAPIId` an Event API's own series carry,
+//!   [`super::super::event_api::metrics`]);
+//! * what happens WITHIN one request — one resolver's invocation, one data source's
+//!   invocation, one named operation's execution — is reported under that dimension AND
+//!   exactly one key naming the thing it is of ([`RESOLVER_DIMENSION`],
+//!   [`DATA_SOURCE_DIMENSION`], [`OPERATION_DIMENSION`]). These are the ENHANCED series: an
+//!   API publishes them only where its `enhancedMetricsConfig` asks for them, which
+//!   [`super::enhanced_metrics`] decides.
 //!
 //! The datapoints go into the CloudWatch store directly rather than through
 //! `PutMetricData`, which reserves the `AWS/` namespaces for the services that own them
@@ -26,6 +34,10 @@
 //! `PutMetricData$Namespace`); the append and the alarm wake-up it owes are the Event API
 //! plane's own ([`super::super::event_api::metrics::EventApiMetrics`] documents both), so
 //! one service's metrics have ONE way into the store they are read from.
+//!
+//! Each series about a REQUEST and about the work within it is published with no unit of its
+//! own — `StandardUnit`'s `None` — beside the one measurement that has one: the span a
+//! [`LATENCY_METRIC`] datapoint reports, in `Milliseconds`.
 
 use ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state as cloudwatch;
 
@@ -70,7 +82,47 @@ pub const CONNECT_CLIENT_ERROR_METRIC: &str = "ConnectClientError";
 /// mutation that reached two subscribers is counted twice.
 pub const PUBLISH_DATA_MESSAGE_SUCCESS_METRIC: &str = "PublishDataMessageSuccess";
 
-/// The publisher of the metrics one GraphQL API's real-time plane produces: the store the
+/// One unit of work the API performed: one GraphQL request it answered, one invocation of a
+/// resolver it ran, one invocation of a data source one of those made, or one GraphQL
+/// operation it executed — WHICH of them is said by the dimension set the series is published
+/// under ([`api_dimensions`], [`resolver_dimensions`], [`data_source_dimensions`],
+/// [`operation_dimensions`]).
+pub const REQUESTS_METRIC: &str = "Requests";
+
+/// How long that unit of work took, in [`appsync_metrics::MILLISECONDS_UNIT`]: the span the
+/// API spent answering one request, running one resolver invocation or making one data source
+/// invocation, again said by the dimension set.
+pub const LATENCY_METRIC: &str = "Latency";
+
+/// One request the API answered with a CLIENT error — a `4xx` status: material that
+/// authorizes no call on the API, a document the API could not accept, a route it does not
+/// serve.
+pub const CLIENT_ERROR_METRIC: &str = "4XXError";
+
+/// One request the API answered with a SERVER error — a `5xx` status.
+pub const SERVER_ERROR_METRIC: &str = "5XXError";
+
+/// The GraphQL errors one unit of work produced: the entries a result's own `errors` list
+/// carries for the resolver invocation, or for the operation, the series is published of.
+pub const GRAPHQL_ERROR_METRIC: &str = "GraphQLError";
+
+/// The errors ONE data source invocation produced — "Errors: The number of errors that
+/// occurred during a data source invocation" (`EnhancedMetricsConfig$dataSourceLevelMetricsBehavior`).
+pub const DATA_SOURCE_ERROR_METRIC: &str = "Errors";
+
+/// The dimension that names the RESOLVER an enhanced resolver-level series is of: the field
+/// the resolver is attached to, as `<typeName>.<fieldName>`.
+pub const RESOLVER_DIMENSION: &str = "Resolver";
+
+/// The dimension that names the DATA SOURCE an enhanced data-source-level series is of: the
+/// name the API holds it under.
+pub const DATA_SOURCE_DIMENSION: &str = "DataSource";
+
+/// The dimension that names the OPERATION an enhanced operation-level series is of: the
+/// ROOT OPERATION TYPE the executed operation is of.
+pub const OPERATION_DIMENSION: &str = "Operation";
+
+/// The publisher of the metrics one GraphQL API produces about its own work: the store the
 /// datapoints go to, and the API they are all of.
 ///
 /// It holds no counts of its own — every observation is a datapoint in the CloudWatch
@@ -154,6 +206,75 @@ impl GraphqlApiMetrics {
         self.sampled(counts);
     }
 
+    /// Publish what ONE GraphQL request the API itself answered came to: that it was
+    /// answered at all, how long answering it took, and whether the status it carried was a
+    /// client or a server error.
+    ///
+    /// Both error series carry a datapoint for EVERY such request, a zero included: "how many
+    /// of this minute's requests were refused" is as much a measurement when it is none as
+    /// when it is many, and a series that skipped its zeros would leave a reader unable to
+    /// tell an API that is refusing nothing from one that is serving no request at all.
+    pub fn request_answered(&self, status: u16, latency: ::std::time::Duration) {
+        let dimensions = || api_dimensions(&self.api_id);
+        self.tallied(REQUESTS_METRIC, dimensions(), 1.0);
+        self.measure(LATENCY_METRIC, dimensions(), latency);
+        self.tallied(
+            CLIENT_ERROR_METRIC,
+            dimensions(),
+            errored(status, CLIENT_ERROR_CLASS),
+        );
+        self.tallied(
+            SERVER_ERROR_METRIC,
+            dimensions(),
+            errored(status, SERVER_ERROR_CLASS),
+        );
+    }
+
+    /// Publish what ONE invocation of a resolver came to, under the resolver's own dimension:
+    /// the invocation, the span it took and the GraphQL errors it produced — the three
+    /// resolver-level series an API with enhanced metrics on emits
+    /// ([`super::enhanced_metrics`] decides WHETHER it does).
+    pub fn resolver_invoked(
+        &self,
+        resolver: &str,
+        latency: ::std::time::Duration,
+        errors: u32,
+    ) {
+        let dimensions = || resolver_dimensions(&self.api_id, resolver);
+        self.tallied(REQUESTS_METRIC, dimensions(), 1.0);
+        self.measure(LATENCY_METRIC, dimensions(), latency);
+        self.tallied(GRAPHQL_ERROR_METRIC, dimensions(), f64::from(errors));
+    }
+
+    /// Publish what ONE invocation of a data source came to, under the data source's own
+    /// dimension: the invocation, the span it took and the errors it produced.
+    pub fn data_source_invoked(
+        &self,
+        data_source: &str,
+        latency: ::std::time::Duration,
+        errors: u32,
+    ) {
+        let dimensions = || data_source_dimensions(&self.api_id, data_source);
+        self.tallied(REQUESTS_METRIC, dimensions(), 1.0);
+        self.measure(LATENCY_METRIC, dimensions(), latency);
+        self.tallied(
+            DATA_SOURCE_ERROR_METRIC,
+            dimensions(),
+            f64::from(errors),
+        );
+    }
+
+    /// Publish what ONE execution of a GraphQL operation came to, under the dimension naming
+    /// the ROOT OPERATION TYPE it is of: that it was called, and the GraphQL errors it
+    /// produced — the two operation-level series the model names ("Requests: The number of
+    /// times a specified GraphQL operation was called", "GraphQL errors: The number of GraphQL
+    /// errors that occurred during a specified GraphQL operation").
+    pub fn operation_executed(&self, operation: &str, errors: u32) {
+        let dimensions = || operation_dimensions(&self.api_id, operation);
+        self.tallied(REQUESTS_METRIC, dimensions(), 1.0);
+        self.tallied(GRAPHQL_ERROR_METRIC, dimensions(), f64::from(errors));
+    }
+
     /// Publish ONE SAMPLE of the two gauges: the connections open on the API and the
     /// subscriptions they hold, as the store holds them at this moment.
     ///
@@ -171,17 +292,51 @@ impl GraphqlApiMetrics {
         }
     }
 
-    /// Append ONE observation of `metric`, dimensioned on the API alone.
+    /// Append ONE observation of `metric`, dimensioned on the API alone, as a count of things.
     fn publish(&self, metric: &str, value: f64) {
-        let Some(store) = self.store.as_ref() else {
-            return;
-        };
-        if !appsync_metrics::append_observation(
-            store,
+        self.written(
             metric,
             api_dimensions(&self.api_id),
             value,
-        ) {
+            appsync_metrics::COUNT_UNIT,
+        );
+    }
+
+    /// Append ONE tally of `metric` under `dimensions`: a count AppSync publishes with no
+    /// unit of its own, which is what the series about a REQUEST and about the work within it
+    /// carry.
+    fn tallied(&self, metric: &str, dimensions: cloudwatch::DimensionSet, value: f64) {
+        self.written(metric, dimensions, value, appsync_metrics::NO_UNIT);
+    }
+
+    /// Append ONE measurement of `metric` under `dimensions`: a SPAN, reported in the unit
+    /// AppSync's latency series carry.
+    fn measure(
+        &self,
+        metric: &str,
+        dimensions: cloudwatch::DimensionSet,
+        latency: ::std::time::Duration,
+    ) {
+        self.written(
+            metric,
+            dimensions,
+            latency.as_secs_f64() * MILLISECONDS_PER_SECOND,
+            appsync_metrics::MILLISECONDS_UNIT,
+        );
+    }
+
+    /// Write one datapoint into the store, or report that the store could not hold it.
+    fn written(
+        &self,
+        metric: &str,
+        dimensions: cloudwatch::DimensionSet,
+        value: f64,
+        unit: &str,
+    ) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        if !appsync_metrics::append_measurement(store, metric, dimensions, value, unit) {
             ::tracing::warn!(
                 api_id = %self.api_id,
                 %metric,
@@ -191,12 +346,59 @@ impl GraphqlApiMetrics {
     }
 }
 
+/// How many milliseconds one second is, for the series reported in them.
+const MILLISECONDS_PER_SECOND: f64 = 1_000.0;
+
+/// The first status of the CLIENT error class and of the SERVER error class, as HTTP defines
+/// them: a status is of a class when it is in the hundred the class begins at.
+const CLIENT_ERROR_CLASS: u16 = 400;
+const SERVER_ERROR_CLASS: u16 = 500;
+
+/// Whether `status` is of the error class beginning at `class`, as the datapoint such a
+/// series carries for one request: one when it is, zero when it is not.
+fn errored(status: u16, class: u16) -> f64 {
+    match (class..class.saturating_add(100)).contains(&status) {
+        true => 1.0,
+        false => 0.0,
+    }
+}
+
 /// The dimension set of a series about one GraphQL API: the API, and nothing else.
 pub fn api_dimensions(api_id: &str) -> cloudwatch::DimensionSet {
     [(
         GRAPHQL_API_ID_DIMENSION.to_string(),
         api_id.to_string(),
     )]
+    .into_iter()
+    .collect()
+}
+
+/// The dimension set of an enhanced series about one RESOLVER of the API: the API and the
+/// field the resolver is attached to, which together identify it.
+pub fn resolver_dimensions(api_id: &str, resolver: &str) -> cloudwatch::DimensionSet {
+    enhanced_dimensions(api_id, RESOLVER_DIMENSION, resolver)
+}
+
+/// The dimension set of an enhanced series about one DATA SOURCE of the API.
+pub fn data_source_dimensions(api_id: &str, data_source: &str) -> cloudwatch::DimensionSet {
+    enhanced_dimensions(api_id, DATA_SOURCE_DIMENSION, data_source)
+}
+
+/// The dimension set of an enhanced series about one OPERATION executed on the API.
+pub fn operation_dimensions(api_id: &str, operation: &str) -> cloudwatch::DimensionSet {
+    enhanced_dimensions(api_id, OPERATION_DIMENSION, operation)
+}
+
+/// The dimension set of one enhanced series: the API, and EXACTLY ONE key beside it naming
+/// the thing within the API the series is of.
+fn enhanced_dimensions(api_id: &str, name: &str, value: &str) -> cloudwatch::DimensionSet {
+    [
+        (
+            GRAPHQL_API_ID_DIMENSION.to_string(),
+            api_id.to_string(),
+        ),
+        (name.to_string(), value.to_string()),
+    ]
     .into_iter()
     .collect()
 }

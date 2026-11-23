@@ -52,6 +52,7 @@ pub mod authorizer;
 pub mod caller;
 pub mod data_source_role;
 pub mod dynamodb;
+pub mod enhanced_metrics;
 pub mod event_bridge;
 pub mod execution;
 pub mod field_auth;

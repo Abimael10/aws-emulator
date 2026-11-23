@@ -405,12 +405,16 @@ async fn each_series_is_catalogued_under_exactly_the_apis_own_dimension() {
             "case {case:?}: {metric} belongs to the API alone, got {dimensions:?}"
         );
     }
-    // Nothing else: a series this plane does not publish would be one nobody can account
-    // for. The two refusal counters are the rest of what it publishes
-    // ([`crate::graphql_api_realtime_endpoint`] grades those).
+    // Nothing else: a series neither of the API's planes publishes would be one nobody can
+    // account for. The two refusal counters are the rest of what the real-time plane
+    // publishes ([`crate::graphql_api_realtime_endpoint`] grades those), and the four series
+    // the REQUEST plane reports about each mutation this case POSTed to the API's own GraphQL
+    // endpoint are the rest of what the API publishes at this dimension
+    // ([`crate::graphql_api_request_metrics`] grades those).
     let published = {
         let mut published: Vec<&str> = owed.to_vec();
         published.extend(["ConnectRequests", "ConnectClientError"]);
+        published.extend(["Requests", "Latency", "4XXError", "5XXError"]);
         published
     };
     for (metric, _) in &catalogued {

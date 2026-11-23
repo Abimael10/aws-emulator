@@ -38,12 +38,20 @@
 //! A field whose code raised, and one this emulator cannot resolve at all, is reported as an
 //! error of that field's own path with the value `null`, which is how a GraphQL result
 //! states a field that did not resolve.
+//!
+//! What the execution DID is also reported in the API's own `AWS/AppSync` series, where the
+//! API's `enhancedMetricsConfig` asks for the granular data: one invocation, its span and
+//! the GraphQL errors it produced per RESOLVER run, one invocation, its span and the errors
+//! it produced per DATA SOURCE called, and one call and its GraphQL errors per named
+//! OPERATION executed ([`super::enhanced_metrics`] decides which of them, and
+//! [`super::metrics`] publishes them).
 
 use ::std::collections::BTreeMap;
 use ::std::time::Duration;
 
 use ::serde_json::{json, Map as JsonMap, Value as Json};
 
+use super::enhanced_metrics::Enhanced;
 use super::lambda;
 use super::mapping_template::{self, Raised};
 use super::PlaneContext;
@@ -192,6 +200,11 @@ impl Answer {
 /// The members a GraphQL response carries.
 const DATA_MEMBER: &str = "data";
 const ERRORS_MEMBER: &str = "errors";
+
+/// What joins the type and the field in the RESOLVER NAME an enhanced resolver-level series
+/// is dimensioned on: resolver metrics are "recorded by API ID and resolver name", and a
+/// resolver is named by the field it is attached to and the type that declares it.
+const RESOLVER_NAME_SEPARATOR: &str = ".";
 
 /// How deep a selection set this endpoint executes.
 ///
@@ -421,7 +434,7 @@ pub async fn execute(context: &PlaneContext, request: &GraphqlRequest) -> Answer
     // The parse happens in a scope of its own: the parser's own tree is not `Send`, so what
     // leaves this call is the operation and the fields it selects, read out of that tree and
     // owned, and the tree itself is gone before anything is awaited.
-    let (kind, fields) = match read_operation(
+    let read = match read_operation(
         &request.query,
         request.operation_name.as_deref(),
         &request.variables,
@@ -429,6 +442,7 @@ pub async fn execute(context: &PlaneContext, request: &GraphqlRequest) -> Answer
         Ok(read) => read,
         Err(refusal) => return Answer::refused(refusal),
     };
+    let (kind, fields) = (read.kind, read.fields);
     // The type the operation's fields belong to: the type the API's schema binds as that
     // operation's root, which is what says WHICH resolvers the selection addresses — beside
     // the QUERY root, which is the type the introspection system's own two root fields are
@@ -464,6 +478,17 @@ pub async fn execute(context: &PlaneContext, request: &GraphqlRequest) -> Answer
             traces: Vec::new(),
         };
     }
+    // Both read off ONE guard of the store, taken and released before the execution starts:
+    // whether the API captures field-level logs, and which of its ENHANCED series this
+    // request publishes ([`super::enhanced_metrics`]) — read ONCE here so every field of the
+    // request is reported under the configuration the request met.
+    let (traced, enhanced) = {
+        let store = context.state.lock();
+        (
+            super::field_logs::captures_field_logs(&store, &context.api_id),
+            Enhanced::of_api(&store, &context.api_id),
+        )
+    };
     let mut execution = Execution {
         context,
         request,
@@ -475,7 +500,7 @@ pub async fn execute(context: &PlaneContext, request: &GraphqlRequest) -> Answer
         engine_runs: 0,
         errors: Vec::new(),
         started: ::std::time::Instant::now(),
-        traced: super::field_logs::captures_field_logs(&context.state.lock(), &context.api_id),
+        traced,
         traces: Vec::new(),
         trace_bytes: MAX_TRACE_BYTES,
         steps: Vec::new(),
@@ -483,6 +508,7 @@ pub async fn execute(context: &PlaneContext, request: &GraphqlRequest) -> Answer
         template_spent: ::std::time::Duration::ZERO,
         engine_spent: ::std::time::Duration::ZERO,
         extensions: Vec::new(),
+        enhanced,
     };
     let data = execution
         .resolve_fields(&root_type, &Json::Null, &fields, Vec::new(), 0)
@@ -499,6 +525,17 @@ pub async fn execute(context: &PlaneContext, request: &GraphqlRequest) -> Answer
         // filter accepts the payload it raised are completed, which is read from the calls
         // this execution's runs stated ([`super::subscription_filters`]).
         super::subscription_filters::invalidated(context, &execution.extensions).await;
+    }
+    // What the OPERATION came to, where the API asked for operation-level metrics: "the
+    // number of times a specified GraphQL operation was called" and "the number of GraphQL
+    // errors that occurred during" it, reported under the ROOT OPERATION TYPE the operation
+    // is of — the key that names an operation of a GraphQL API, whatever the document calls
+    // that operation or whether it names it at all.
+    if execution.enhanced.reports_operations() {
+        context.metrics.operation_executed(
+            kind.root_operation_type(),
+            u32::try_from(execution.errors.len()).unwrap_or(u32::MAX),
+        );
     }
     Answer {
         data: Some(data),
@@ -518,13 +555,14 @@ pub fn selected_root_fields(
     context: &PlaneContext,
     request: &GraphqlRequest,
 ) -> Vec<(String, String)> {
-    let Ok((kind, fields)) = read_operation(
+    let Ok(read) = read_operation(
         &request.query,
         request.operation_name.as_deref(),
         &request.variables,
     ) else {
         return Vec::new();
     };
+    let (kind, fields) = (read.kind, read.fields);
     let Some(root_type) = context
         .state
         .lock()
@@ -559,14 +597,22 @@ pub fn subscription_selection(
     operation_name: Option<&str>,
     variables: &JsonMap<String, Json>,
 ) -> Option<SelectedField> {
-    let (kind, fields) = read_operation(query, operation_name, variables).ok()?;
-    if kind != OperationKind::Subscription {
+    let read = read_operation(query, operation_name, variables).ok()?;
+    if read.kind != OperationKind::Subscription {
         return None;
     }
-    match fields.as_slice() {
+    match read.fields.as_slice() {
         [selected] => Some(selected.clone()),
         _ => None,
     }
+}
+
+/// One request's document as the execution reads it: which operation is being run, and the
+/// fields it selects.
+#[derive(Debug, Clone)]
+struct ReadOperation {
+    kind: OperationKind,
+    fields: Vec<SelectedField>,
 }
 
 /// Read one document: the operation to run and the fields it selects, owned, with the
@@ -577,7 +623,7 @@ fn read_operation(
     query: &str,
     operation_name: Option<&str>,
     variables: &JsonMap<String, Json>,
-) -> Result<(OperationKind, Vec<SelectedField>), String> {
+) -> Result<ReadOperation, String> {
     let parsed = ::apollo_parser::Parser::new(query)
         .recursion_limit(crate::state::DEFINITION_RECURSION_LIMIT)
         .token_limit(crate::state::DEFINITION_TOKEN_LIMIT)
@@ -596,7 +642,10 @@ fn read_operation(
         spreading: Vec::new(),
     };
     let fields = expansion.selection_set(operation.selection_set.as_ref(), 0)?;
-    Ok((operation.kind, fields))
+    Ok(ReadOperation {
+        kind: operation.kind,
+        fields,
+    })
 }
 
 /// One request being executed: what it is executing against, and what it has produced so
@@ -652,6 +701,9 @@ struct Execution<'a> {
     /// ([`super::subscription_filters`]), which reads them once the operation has been
     /// executed.
     extensions: Vec<appsync_js::ExtensionCall>,
+    /// Which of the API's ENHANCED series this request publishes, as its
+    /// `enhancedMetricsConfig` asks for them ([`super::enhanced_metrics`]).
+    enhanced: Enhanced,
 }
 
 impl Execution<'_> {
@@ -822,6 +874,14 @@ impl Execution<'_> {
         }
         let plan = self.plan(type_name, &field.name);
         let resolver_arn = plan.as_ref().and_then(|plan| plan.arn.clone());
+        // WHETHER this field's resolver has its enhanced resolver-level series published, and
+        // the value they are dimensioned on: resolver metrics are "recorded by API ID and
+        // resolver name", which names the field the resolver is attached to. A field that
+        // carries no resolver invokes none, so it reports nothing of its own.
+        let reported_resolver = plan
+            .as_ref()
+            .filter(|plan| self.enhanced.reports_resolver(plan.metrics_config.as_deref()))
+            .map(|_| format!("{type_name}{RESOLVER_NAME_SEPARATOR}{}", field.name));
         // Where this field sits in the execution, so its trace reports the offset and the
         // span the API's field logging states them as.
         let start_offset = self.started.elapsed();
@@ -848,8 +908,10 @@ impl Execution<'_> {
                 }
             },
         };
+        // How long resolving this field took, which is the span both the field's own trace and
+        // the resolver's own `Latency` series report.
+        let duration = self.started.elapsed().saturating_sub(start_offset);
         if self.traced && self.traces.len() < MAX_FIELD_TRACES {
-            let duration = self.started.elapsed().saturating_sub(start_offset);
             let return_type = self.field_type_name(type_name, &field.name);
             let steps = ::std::mem::take(&mut self.steps);
             // What this entry RETAINS is the verbose half of it — the field's own context and
@@ -877,8 +939,22 @@ impl Execution<'_> {
         }
         // Whatever the run came to, the errors its templates appended are reported
         // under this field's path: that is what appending one is for.
-        for appended in ::std::mem::take(&mut self.appended) {
+        let appended = ::std::mem::take(&mut self.appended);
+        let appended_errors = appended.len();
+        for appended in appended {
             self.fault(appended.document(path));
+        }
+        // What the resolver's own invocation came to, where the API asked for resolver-level
+        // metrics: the invocation, the span it took and the GraphQL errors it produced — the
+        // error of a field that did not resolve, and every error its definition appended
+        // beside a value it still answered.
+        if let Some(resolver) = reported_resolver {
+            let errors = appended_errors.saturating_add(usize::from(resolved.is_err()));
+            self.context.metrics.resolver_invoked(
+                &resolver,
+                duration,
+                u32::try_from(errors).unwrap_or(u32::MAX),
+            );
         }
         let value = match resolved {
             Ok(value) => value,
@@ -1020,6 +1096,7 @@ impl Execution<'_> {
             data_source: step_data_source(api, resolver.data_source_name.as_deref()),
             functions: pipeline_steps(api, resolver),
             sync_config: resolver.sync_config.clone(),
+            metrics_config: resolver.metrics_config.clone(),
             is_pipeline: resolver.kind == crate::state::PIPELINE_KIND,
             max_batch_size: resolver.max_batch_size,
         })
@@ -1355,17 +1432,30 @@ impl Execution<'_> {
         let context = direct_event(base, stash, previous);
         let recorded = self.recorded_step(&step.name);
         self.record_request(recorded, &loggable_event(&context));
-        let answered = self
+        let called = ::std::time::Instant::now();
+        let invoked = self
             .lambda_results(
                 &data_source,
                 vec![context],
                 batches(step.max_batch_size),
                 ItemMapping::Envelope,
             )
-            .await?
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| Err(NOT_ONE_RESULT.to_string().into()))?;
+            .await;
+        let answered = invoked
+            .map(|results| {
+                results
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| Err(NOT_ONE_RESULT.to_string().into()))
+            })
+            .and_then(|one| one);
+        self.data_source_invoked(
+            &data_source.name,
+            data_source.metrics_config.as_deref(),
+            called.elapsed(),
+            answered.is_err(),
+        );
+        let answered = answered?;
         self.record_response(recorded, &answered);
         Ok(answered)
     }
@@ -1648,6 +1738,60 @@ impl Execution<'_> {
     /// [`DataSourceOutcome`] draws, and what keeps such a refusal reaching the CALLER instead
     /// of being offered to a definition as a failure it may handle.
     async fn data_source_outcome(
+        &mut self,
+        step: &PipelineStep,
+        base: &FieldContext,
+        requested: &Json,
+    ) -> DataSourceOutcome {
+        let called = ::std::time::Instant::now();
+        let outcome = self.data_source_called(step, base, requested).await;
+        // Whether there was an INVOCATION to report, and whether it produced an error. A
+        // step no data source was called for performed none, so it is counted by neither
+        // series: reporting one would be an invocation nothing made, and reporting it with no
+        // error would be a successful one.
+        let invoked = match &outcome {
+            DataSourceOutcome::Result(_) => Some(false),
+            DataSourceOutcome::Answered(_) => Some(true),
+            DataSourceOutcome::NotCalled(_) => None,
+        };
+        if let (Some(data_source), Some(errored)) = (step.data_source.as_ref(), invoked) {
+            self.data_source_invoked(
+                &data_source.name,
+                data_source.metrics_config.as_deref(),
+                called.elapsed(),
+                errored,
+            );
+        }
+        outcome
+    }
+
+    /// Publish what ONE invocation of a data source came to, where the API asked for
+    /// data-source-level metrics: the invocation, the span it took and whether it produced an
+    /// error ([`super::enhanced_metrics`] decides whether it is reported at all).
+    ///
+    /// The ONE place an invocation of a data source is counted, whichever way a step made it
+    /// — the call a definition's rendered request drives ([`Self::data_source_outcome`]), the
+    /// Direct Lambda invocation a step with no definition makes ([`Self::run_direct`]) and the
+    /// one invocation a batched resolver's siblings share ([`Self::batched_results`]) — so
+    /// one data source's series cannot differ between them. Every caller has established that
+    /// the data source WAS called: a step that invoked none is reported by neither series.
+    fn data_source_invoked(
+        &self,
+        name: &str,
+        metrics_config: Option<&str>,
+        latency: ::std::time::Duration,
+        errored: bool,
+    ) {
+        if !self.enhanced.reports_data_source(metrics_config) {
+            return;
+        }
+        self.context
+            .metrics
+            .data_source_invoked(name, latency, u32::from(errored));
+    }
+
+    /// The result the step's data source produces, as the data source itself answers it.
+    async fn data_source_called(
         &mut self,
         step: &PipelineStep,
         base: &FieldContext,
@@ -2088,6 +2232,10 @@ impl Execution<'_> {
             }),
             false => batches(step.max_batch_size),
         };
+        let called = ::std::time::Instant::now();
+        // Whether any member produced an event at all, which is whether there is an
+        // invocation of the data source to report ([`Self::data_source_invoked`]).
+        let any_events = !events.is_empty();
         let invoked = match (events.is_empty(), batched) {
             // Nothing to invoke for: no member produced an event at all.
             (true, _) => Ok(Vec::new()),
@@ -2113,6 +2261,20 @@ impl Execution<'_> {
                 Ok(answered)
             }
         };
+        // What this group's ONE invocation of the data source came to, where the API asked for
+        // data-source-level metrics: the siblings share the invocation, so it is counted once
+        // and the errors it reported are its own.
+        if any_events {
+            self.data_source_invoked(
+                &data_source.name,
+                data_source.metrics_config.as_deref(),
+                called.elapsed(),
+                match &invoked {
+                    Err(_) => true,
+                    Ok(answers) => answers.iter().any(Result::is_err),
+                },
+            );
+        }
         let mut answers = match invoked {
             Ok(answers) => answers.into_iter(),
             // The invocation itself produced nothing, so no member of the group resolved —
@@ -2301,6 +2463,10 @@ struct ResolverPlan {
     /// "The `SyncConfig` for a resolver attached to a versioned data source"
     /// (`Resolver$syncConfig`) the resolver carries, which its own step is made under.
     sync_config: Option<SyncConfig>,
+    /// `Resolver$metricsConfig`: whether this resolver OPTED IN to the enhanced
+    /// resolver-level series, which decides whether it is reported under an API whose
+    /// behavior is `PER_RESOLVER_METRICS` ([`super::enhanced_metrics`]).
+    metrics_config: Option<String>,
     /// Whether the resolver is of the `PIPELINE` kind.
     is_pipeline: bool,
     /// "The maximum batching size for a resolver" (`Resolver$maxBatchSize`): how many field
@@ -2634,6 +2800,10 @@ fn item_envelope(element: &Json) -> bool {
 struct StepDataSource {
     kind: String,
     name: String,
+    /// `DataSource$metricsConfig`: whether this data source OPTED IN to the enhanced
+    /// data-source-level series, which decides whether it is reported under an API whose
+    /// behavior is `PER_DATA_SOURCE_METRICS` ([`super::enhanced_metrics`]).
+    metrics_config: Option<String>,
     /// "The Amazon Resource Name (ARN) for the Lambda function"
     /// (`LambdaDataSourceConfig$lambdaFunctionArn`), for a data source configured with one.
     function_arn: Option<String>,
@@ -2692,6 +2862,7 @@ fn step_data_source(api: &GraphqlApiRecord, name: Option<&str>) -> Option<StepDa
         .map(|record: &DataSourceRecord| StepDataSource {
             kind: record.r#type.clone(),
             name: record.name.clone(),
+            metrics_config: record.metrics_config.clone(),
             event_bus_arn: record
                 .event_bridge_config
                 .as_ref()
@@ -3165,6 +3336,20 @@ pub enum OperationKind {
     Query,
     Mutation,
     Subscription,
+}
+
+impl OperationKind {
+    /// The ROOT OPERATION TYPE this operation is of, as GraphQL names the three of them: the
+    /// key an operation-level enhanced series is dimensioned on
+    /// ([`super::metrics::OPERATION_DIMENSION`]), which names the operation type and not
+    /// whatever one document happened to call its operation.
+    fn root_operation_type(self) -> &'static str {
+        match self {
+            Self::Query => "Query",
+            Self::Mutation => "Mutation",
+            Self::Subscription => "Subscription",
+        }
+    }
 }
 
 /// One operation of a document: which kind it is, and the fields it selects.
