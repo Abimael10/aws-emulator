@@ -879,3 +879,170 @@ async fn each_rule_result_reports_the_metric_its_check_measured() {
         }
     }
 }
+
+/// One row of the measurement table: a table of its own size, and how much of its data is
+/// missing.
+struct MeasurementCase {
+    case: &'static str,
+    /// How many rows the table's data holds.
+    rows: usize,
+    /// How many of those rows hold the layout's NULL marker in `note`.
+    missing: usize,
+}
+
+/// The data of a table holding `rows` rows, `missing` of which hold the layout's NULL marker
+/// in `note` (as [`ROWS`] writes it): `id` counts the rows, so each of its values is
+/// distinct, and `status` alternates between two values.
+fn staged_rows(rows: usize, missing: usize) -> String {
+    (0..rows)
+        .map(|row| {
+            let status = if row % 2 == 0 { "ACTIVE" } else { "INACTIVE" };
+            let note = if row < missing {
+                "\\N".to_string()
+            } else {
+                format!("note-{row}")
+            };
+            format!("{row},{status},{note}\n")
+        })
+        .collect()
+}
+
+/// Every metric a rule's result reports is the MEASUREMENT taken from the data source that was
+/// evaluated, never a value read off the rule's own text: a table of N rows reports N
+/// whatever N is, and the same measurement is reported whether the rule it decided passed or
+/// failed.
+///
+/// The rows differ along how much data the table holds and how much of it is missing, which is
+/// what every metric here is computed from — the recorded case, a twenty-row table, is one row
+/// of this table rather than the requirement. Each ruleset states the SAME dataset metric
+/// twice, under a condition the data satisfies and one it does not, so a metric that came from
+/// the rule's literal instead of from the table could not report the same value for both.
+#[tokio::test]
+async fn a_reported_metric_is_measured_from_the_table_that_was_evaluated() {
+    let (router, engine) = emulator_with_s3();
+
+    let cases: [MeasurementCase; 4] = [
+        MeasurementCase {
+            case: "a table of one row",
+            rows: 1,
+            missing: 0,
+        },
+        MeasurementCase {
+            case: "a table of two rows, one of them missing its note",
+            rows: 2,
+            missing: 1,
+        },
+        MeasurementCase {
+            case: "a table of five rows, two of them missing their note",
+            rows: 5,
+            missing: 2,
+        },
+        MeasurementCase {
+            case: "a table of twenty rows, every one of them missing its note",
+            rows: 20,
+            missing: 20,
+        },
+    ];
+
+    for MeasurementCase {
+        case,
+        rows,
+        missing,
+    } in cases
+    {
+        let table = format!("measured_{rows}");
+        store_table(&router, &table, Some(&staged_rows(rows, missing))).await;
+        let ruleset = format!("measured-ruleset-{rows}");
+        let rules: [String; 6] = [
+            format!("RowCount = {rows}"),
+            format!("RowCount = {}", rows + 999),
+            "ColumnCount = 3".to_string(),
+            "Completeness \"note\" >= 0".to_string(),
+            "IsUnique \"id\"".to_string(),
+            "DistinctValuesCount \"status\" >= 1".to_string(),
+        ];
+        // What each of those rules measures over the staged data, in the order the ruleset
+        // declares them, and whether the data satisfies the condition it states: the two
+        // counts of the whole dataset first, then the three metrics of a column. `status`
+        // alternates, so it holds two distinct values as soon as there is a second row.
+        let expected: Vec<(&str, f64, bool)> = vec![
+            ("Dataset.*.RowCount", rows as f64, true),
+            ("Dataset.*.RowCount", rows as f64, false),
+            ("Dataset.*.ColumnCount", 3.0, true),
+            (
+                "Column.note.Completeness",
+                (rows - missing) as f64 / rows as f64,
+                true,
+            ),
+            ("Column.id.Uniqueness", 1.0, true),
+            (
+                "Column.status.DistinctValuesCount",
+                if rows > 1 { 2.0 } else { 1.0 },
+                true,
+            ),
+        ];
+
+        store_ruleset(
+            &router,
+            &ruleset,
+            &rules.iter().map(String::as_str).collect::<Vec<&str>>(),
+        )
+        .await;
+        let run_id = start_run(&router, &table, &[ruleset.as_str()]).await;
+        make_terminal_status_due(&engine);
+        let run = get_run(&router, &run_id).await;
+        let ids = result_ids(&run);
+        assert_eq!(
+            ids.len(),
+            1,
+            "case {case:?}: the run evaluated one ruleset, so it publishes one result, got {run}"
+        );
+
+        let result = get_result(&router, &ids[0]).await;
+        let reported = result
+            .get("RuleResults")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("case {case:?}: the result reports RuleResults, got {result}"));
+        assert_eq!(
+            reported.len(),
+            rules.len(),
+            "case {case:?}: one entry per rule the ruleset declares, got {reported:?}"
+        );
+
+        for (position, (name, measurement, passes)) in expected.into_iter().enumerate() {
+            let rule = &rules[position];
+            let entry = &reported[position];
+            assert_eq!(
+                entry.get("Result").and_then(Value::as_str),
+                Some(if passes {
+                    DATA_QUALITY_RULE_RESULT_PASS
+                } else {
+                    DATA_QUALITY_RULE_RESULT_FAIL
+                }),
+                "case {case:?}: the rule {rule:?} is answered over the staged rows, got {entry}"
+            );
+            let evaluated = entry
+                .get("EvaluatedMetrics")
+                .and_then(Value::as_object)
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: the rule {rule:?} reports EvaluatedMetrics, got {entry}")
+                });
+            assert_eq!(
+                evaluated.len(),
+                1,
+                "case {case:?}: checking {rule:?} measures one metric, got {entry}"
+            );
+            let measured = evaluated
+                .get(name)
+                .and_then(Value::as_f64)
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: the metric {name:?} is reported as a number, got {entry}")
+                });
+            assert!(
+                (measured - measurement).abs() < SCORE_TOLERANCE,
+                "case {case:?}: the metric {name:?} measures {measurement} over the staged rows, \
+                 got {measured}"
+            );
+        }
+    }
+}
