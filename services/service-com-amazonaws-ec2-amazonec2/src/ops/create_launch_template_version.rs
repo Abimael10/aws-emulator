@@ -174,8 +174,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            launch_template_limit_exceeded, launch_template_version_payload_bytes,
-            require_service_state, resolve_launch_template_id, resolve_launch_template_version,
+            held_launch_template_version, launch_template_limit_exceeded,
+            launch_template_version_payload_bytes, require_service_state,
+            resolve_launch_template_id, source_launch_template_version_not_found,
             LaunchTemplateVersionSpec, MAX_CLIENT_TOKEN_CHARS, MAX_LAUNCH_TEMPLATE_VERSIONS,
             MAX_STORED_BYTES, MAX_USER_DATA_BYTES,
         };
@@ -239,7 +240,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // from the source version … If you omit this parameter, the new version contains
         // only the launch parameters that you specify for the new version"
         // (`SourceVersion`). The source has to be a version the template holds, so an alias
-        // or a number it cannot answer is refused before anything is stored.
+        // or a number it cannot answer is refused before anything is stored — with the
+        // sentence EC2 records for THIS validator
+        // ([`crate::state::source_launch_template_version_not_found`]), which states that the
+        // version does not exist and nothing else: the message a version it cannot resolve
+        // earns is a fact of the operation that asked rather than of the one code they all
+        // answer, so the lookup is shared and the wording is not.
         let record = store.launch_templates.get(&launch_template_id).ok_or_else(|| {
             Scaffolded::internal_error(format!(
                 "launch template '{launch_template_id}' is not stored"
@@ -248,7 +254,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let data = match input.source_version.as_deref() {
             None => input.launch_template_data.clone(),
             Some(source_version) => {
-                let number = resolve_launch_template_version(record, source_version)?;
+                let number = held_launch_template_version(record, source_version)?
+                    .ok_or_else(source_launch_template_version_not_found)?;
                 let source = record.versions.get(&number).ok_or_else(|| {
                     Scaffolded::internal_error(format!(
                         "launch template version '{number}' is not stored"

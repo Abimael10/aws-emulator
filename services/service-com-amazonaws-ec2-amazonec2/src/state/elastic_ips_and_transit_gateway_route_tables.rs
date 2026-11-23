@@ -2166,16 +2166,71 @@ pub fn resolve_launch_template_version<E>(
     record: &LaunchTemplateRecord,
     version: &str,
 ) -> Result<i64, Scaffolded<E>> {
+    held_launch_template_version(record, version)?.ok_or_else(|| {
+        specified_launch_template_version_not_found(record.launch_template_id(), version)
+    })
+}
+
+/// The version number a request's word resolves to AGAINST the template, with the
+/// not-found verdict left to the caller: `Ok(None)` is a word the template holds no version
+/// for, and the `Err` is the one refusal of a word that is neither an alias nor a number
+/// ([`launch_template_version_request`]).
+///
+/// The STORE half of [`resolve_launch_template_version`], separated because the message a
+/// version EC2 cannot resolve earns is a fact of the VALIDATOR that asked, not of the code
+/// they all answer ([`INVALID_LAUNCH_TEMPLATE_ID_VERSION_NOT_FOUND`]): an operation whose
+/// own recorded refusal words that code its own way resolves here and builds its own
+/// sentence, so the lookup itself — alias to number, number to a version the template holds
+/// — is still defined once.
+pub fn held_launch_template_version<E>(
+    record: &LaunchTemplateRecord,
+    version: &str,
+) -> Result<Option<i64>, Scaffolded<E>> {
     let numbered = match launch_template_version_request(version)? {
         LaunchTemplateVersionRequest::Latest => record.template.latest_version_number,
         LaunchTemplateVersionRequest::Default => record.template.default_version_number,
         LaunchTemplateVersionRequest::Numbered(number) => Some(number),
     };
-    numbered
-        .filter(|number| record.versions.contains_key(number))
-        .ok_or_else(|| {
-            specified_launch_template_version_not_found(record.launch_template_id(), version)
-        })
+    Ok(numbered.filter(|number| record.versions.contains_key(number)))
+}
+
+/// Refuse a `CreateLaunchTemplateVersion` whose `SourceVersion` the named template holds no
+/// version for: HTTP 400 [`INVALID_LAUNCH_TEMPLATE_ID_VERSION_NOT_FOUND`], `Launch template
+/// version does not exist.`
+///
+/// The WRITER's wording for that code, recorded for the operation that inherits a new
+/// version's parameters from a source one: the whole sentence is fixed text, naming neither
+/// the version the request asked to copy nor the template it named — which is why it cannot
+/// be built by the resolver every READER of a version shares
+/// ([`specified_launch_template_version_not_found`]).
+pub fn source_launch_template_version_not_found<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_LAUNCH_TEMPLATE_ID_VERSION_NOT_FOUND,
+        400,
+        "Launch template version does not exist.",
+    )
+}
+
+/// Refuse a `ModifyLaunchTemplate` whose `DefaultVersion` the named template holds no
+/// version for: HTTP 400 [`INVALID_LAUNCH_TEMPLATE_ID_VERSION_NOT_FOUND`], `The launch
+/// template version <version> is not found for the specified launch template.`
+///
+/// The wording recorded for the operation that SETS a template's default version: one
+/// variable part, the version the request named, unquoted, and no template id — the template
+/// is "the specified launch template", the one the same request already named. Distinct from
+/// both the writer's sentence ([`source_launch_template_version_not_found`]) and the
+/// resolver's ([`specified_launch_template_version_not_found`]), because EC2's validators do
+/// not agree about the one code they all answer. The echo is cut to length by
+/// [`echoed_resource_id`] the way every refusal of this crate bounds a value it repeats back.
+pub fn default_launch_template_version_not_found<E>(version: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_LAUNCH_TEMPLATE_ID_VERSION_NOT_FOUND,
+        400,
+        format!(
+            "The launch template version {} is not found for the specified launch template.",
+            echoed_resource_id(version)
+        ),
+    )
 }
 
 /// Refuse a request that named a version the launch template does not hold, in the wording

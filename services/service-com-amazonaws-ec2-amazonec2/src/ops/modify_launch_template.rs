@@ -138,8 +138,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            MAX_CLIENT_TOKEN_CHARS, require_service_state, resolve_launch_template_id,
-            resolve_launch_template_version,
+            MAX_CLIENT_TOKEN_CHARS, default_launch_template_version_not_found,
+            held_launch_template_version, require_service_state, resolve_launch_template_id,
         };
 
         // Nothing here depends on the Region: a launch template carries no Region member,
@@ -198,14 +198,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "launch template '{launch_template_id}' resolved but was not stored"
             ))
         })?;
-        // The version a request names is resolved by the one resolver every launch-template
-        // operation that names a version shares, so a number the template does not hold is
-        // `InvalidLaunchTemplateId.VersionNotFound` and a value that is neither a number nor
-        // one of the aliases the API documents is a bad parameter value — the same verdicts
-        // `DescribeLaunchTemplateVersions` and `CreateLaunchTemplateVersion`'s `SourceVersion`
-        // give for the same values. Read-only, so it is also what a `DryRun` is answered
-        // against.
-        let version_number = resolve_launch_template_version(record, default_version)?;
+        // The version a request names is looked up by the one lookup every launch-template
+        // operation that names a version shares, so a value that is neither a number nor one
+        // of the aliases the API documents is a bad parameter value here as there. A number
+        // the template does not hold is `InvalidLaunchTemplateId.VersionNotFound` with the
+        // sentence EC2 records for THIS validator
+        // ([`crate::state::default_launch_template_version_not_found`]), which names the
+        // version the request asked to make default and leaves the template to "the specified
+        // launch template": the message is a fact of the operation that asked rather than of
+        // the code they all answer, so a reader resolving a version to describe it and
+        // `CreateLaunchTemplateVersion` resolving a `SourceVersion` each word it their own
+        // way. Read-only, so it is also what a `DryRun` is answered against.
+        let version_number = held_launch_template_version(record, default_version)?
+            .ok_or_else(|| default_launch_template_version_not_found(default_version))?;
 
         // DryRun sits AFTER every parameter has been validated and every read-only check
         // made, and BEFORE the first write: the flag asks whether the request WOULD have
