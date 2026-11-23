@@ -3,12 +3,12 @@
 //! The SENTENCE a `StepConcurrencyLevel` outside the band Amazon EMR allows is refused
 //! with, end to end over the wire.
 //!
-//! THE RULE: a level outside the band is refused with the fixed sentence of the class it
-//! falls into, and that sentence STATES the band that is enforced — the band a cluster's
-//! own step execution mode allows for a level no mode of the service could take at all,
-//! and the level, the ceiling it exceeded, the mode that ceiling belongs to and the mode
-//! that would take it for a level another mode would. Neither sentence is the other, and
-//! neither is a range-checker's prose.
+//! THE RULE: a level outside the band is refused with the entirely FIXED sentence of the
+//! class it falls into — the bare sentence, which states no band at all, for a level
+//! outside every band the service serves, and that same sentence EXTENDED with the clause
+//! stating the enforced band for a level just above the documented maximum. Neither
+//! sentence is the other, neither echoes the level it refused, and neither is a
+//! range-checker's prose.
 //!
 //! The table spans both sides of the band, each published bound and one past it, numbers
 //! far past both, and both operations that take the member — `RunJobFlow`, which judges a
@@ -29,21 +29,17 @@ const SERVICE_ERROR: &str = "InvalidRequestException";
 /// steps" (`ModifyCluster$StepConcurrencyLevel`).
 const BAND: (i64, i64) = (1, 256);
 
-/// The widest ceiling any step execution mode raises the band to, which the above-the-band
-/// sentence points a caller at.
+/// The highest level the band-stating refusal is answered for; a level past it is outside
+/// every band the service serves.
 const WIDEST_CEILING: i64 = 6400;
 
-/// The sentence a level NO mode could take earns: the enforced band, and nothing of the
-/// request.
-const BAND_SENTENCE: &str = "Invalid step concurrency level. Allowed level is from 1 to 256";
+/// The sentence a level outside every band the service serves earns: fixed text that states
+/// no band and nothing of the request.
+const BARE_SENTENCE: &str = "Invalid step concurrency level.";
 
-/// The sentence a level above the cluster's own ceiling but inside the widest one earns.
-fn above_the_band(level: i64) -> String {
-    format!(
-        "StepConcurrencyLevel {level} exceeds the maximum (256) for StepExecutionMode \
-         STANDARD. Set StepExecutionMode to DISTRIBUTED for up to 6400 concurrent steps."
-    )
-}
+/// The sentence a level above the documented maximum, but no higher than the highest level
+/// a band is stated for, earns: the bare sentence extended with the enforced band.
+const BAND_SENTENCE: &str = "Invalid step concurrency level. Allowed level is from 1 to 256";
 
 #[tokio::test]
 async fn the_refusal_of_a_level_outside_the_band_states_the_band_it_enforces() {
@@ -52,27 +48,27 @@ async fn the_refusal_of_a_level_outside_the_band_states_the_band_it_enforces() {
     let (low, high) = BAND;
 
     // Each row: the level, and the whole sentence it earns.
-    let rows: Vec<(i64, String)> = vec![
-        (low - 1, BAND_SENTENCE.to_string()),
-        (low - 2, BAND_SENTENCE.to_string()),
-        (-7, BAND_SENTENCE.to_string()),
-        (i64::from(i32::MIN), BAND_SENTENCE.to_string()),
-        (high + 1, above_the_band(high + 1)),
-        (high + 44, above_the_band(high + 44)),
-        (WIDEST_CEILING, above_the_band(WIDEST_CEILING)),
-        (WIDEST_CEILING + 1, BAND_SENTENCE.to_string()),
-        (99_999, BAND_SENTENCE.to_string()),
-        (i64::from(i32::MAX), BAND_SENTENCE.to_string()),
+    let rows: Vec<(i64, &str)> = vec![
+        (low - 1, BARE_SENTENCE),
+        (low - 2, BARE_SENTENCE),
+        (-7, BARE_SENTENCE),
+        (i64::from(i32::MIN), BARE_SENTENCE),
+        (high + 1, BAND_SENTENCE),
+        (high + 44, BAND_SENTENCE),
+        (WIDEST_CEILING, BAND_SENTENCE),
+        (WIDEST_CEILING + 1, BARE_SENTENCE),
+        (99_999, BARE_SENTENCE),
+        (i64::from(i32::MAX), BARE_SENTENCE),
     ];
 
-    for (level, sentence) in &rows {
+    for &(level, sentence) in &rows {
         let case = format!("RunJobFlow with StepConcurrencyLevel {level}");
         let mut request = minimal_request("band-sentences");
         request["StepConcurrencyLevel"] = json!(level);
         let (status, payload) = emr.call("RunJobFlow", request).await;
         assert_refused(&case, status, &payload, REQUEST_VALIDATION);
         assert_eq!(
-            &message(&case, &payload),
+            message(&case, &payload),
             sentence,
             "case {case:?}: expected {sentence:?}, got {payload}"
         );
@@ -86,7 +82,7 @@ async fn the_refusal_of_a_level_outside_the_band_states_the_band_it_enforces() {
             .await;
         assert_refused(&case, status, &payload, SERVICE_ERROR);
         assert_eq!(
-            &message(&case, &payload),
+            message(&case, &payload),
             sentence,
             "case {case:?}: expected {sentence:?}, got {payload}"
         );

@@ -50,25 +50,20 @@ const INVERTED_COMPUTE_LIMITS_SENTENCE: &str = "Invalid configuration for manage
                                                 The specified max capacity must be greater \
                                                 than min capacity.";
 
-/// The sentence a step concurrency level NO step execution mode could take is refused
-/// with: the band the cluster's own mode allows, and nothing of the request.
-const BEYOND_EVERY_BAND_SENTENCE: &str =
+/// The sentence a step concurrency level outside EVERY band Amazon EMR serves is refused
+/// with: entirely fixed text, naming no band and nothing of the request.
+const BEYOND_EVERY_BAND_SENTENCE: &str = "Invalid step concurrency level.";
+
+/// The sentence a level above the documented maximum but no higher than the highest level
+/// a band is stated for is refused with: the bare sentence extended with the clause that
+/// states the band the member may use, both figures being the enforced band.
+const ABOVE_THE_BAND_SENTENCE: &str =
     "Invalid step concurrency level. Allowed level is from 1 to 256";
 
-/// The sentence a level above the cluster's own ceiling but inside the widest one a mode
-/// raises it to is refused with: the level it could not take, the ceiling and the mode that
-/// ceiling belongs to, then the mode that would take it and that mode's own ceiling.
-fn above_the_band_sentence(level: i64) -> String {
-    format!(
-        "StepConcurrencyLevel {level} exceeds the maximum (256) for StepExecutionMode \
-         STANDARD. Set StepExecutionMode to DISTRIBUTED for up to 6400 concurrent steps."
-    )
-}
-
 /// The documented band a `StepConcurrencyLevel` lies in ("a minimum of 1 step and a
-/// maximum of 256 steps", `ModifyCluster$StepConcurrencyLevel` doc) and the widest ceiling
-/// any step execution mode raises it to (the service's
-/// `step_execution_mode::DISTRIBUTED_MAX_STEP_CONCURRENCY_LEVEL`).
+/// maximum of 256 steps", `ModifyCluster$StepConcurrencyLevel` doc) and the highest level
+/// the band-stating refusal is answered for (the service's
+/// `state::MAX_BAND_STATED_STEP_CONCURRENCY_LEVEL`).
 const STEP_CONCURRENCY_BAND: (i64, i64) = (1, 256);
 const WIDEST_STEP_CONCURRENCY_CEILING: i64 = 6400;
 
@@ -468,12 +463,11 @@ async fn inverted_managed_scaling_compute_limits_are_refused_with_one_fixed_sent
 // StepConcurrencyLevel: the class decides which of the two sentences is answered
 // ---------------------------------------------------------------------------
 
-/// THE RULE: a `StepConcurrencyLevel` outside the band the cluster's step execution mode
-/// allows is refused under the error identity `ModifyCluster` MODELS, with the sentence of
-/// the class it falls into — the level, the ceiling it exceeded and the mode that would take
-/// it for a level another mode would take, and the cluster's own band, with nothing of the
-/// request, for one no mode could take. Rows walk each published bound of both bands, one
-/// past each, and far past both.
+/// THE RULE: a `StepConcurrencyLevel` outside the documented band is refused under the
+/// error identity `ModifyCluster` MODELS, with the entirely fixed sentence of the class it
+/// falls into — the bare sentence for a level outside every band the service serves, and
+/// that sentence extended with the band clause for one just above the documented maximum.
+/// Rows walk each published bound of both classes, one past each, and far past both.
 #[tokio::test]
 async fn an_out_of_range_step_concurrency_level_is_refused_per_class() {
     let emr = Emr::new();
@@ -481,16 +475,16 @@ async fn an_out_of_range_step_concurrency_level_is_refused_per_class() {
     let (low, high) = STEP_CONCURRENCY_BAND;
     let widest = WIDEST_STEP_CONCURRENCY_CEILING;
 
-    for (level, says, echoes_the_level) in [
-        (low - 1, BEYOND_EVERY_BAND_SENTENCE.to_string(), false),
-        (-1, BEYOND_EVERY_BAND_SENTENCE.to_string(), false),
-        (i64::from(i32::MIN), BEYOND_EVERY_BAND_SENTENCE.to_string(), false),
-        (high + 1, above_the_band_sentence(high + 1), true),
-        (high + 2, above_the_band_sentence(high + 2), true),
-        (widest - 1, above_the_band_sentence(widest - 1), true),
-        (widest, above_the_band_sentence(widest), true),
-        (widest + 1, BEYOND_EVERY_BAND_SENTENCE.to_string(), false),
-        (i64::from(i32::MAX), BEYOND_EVERY_BAND_SENTENCE.to_string(), false),
+    for (level, says) in [
+        (low - 1, BEYOND_EVERY_BAND_SENTENCE),
+        (-1, BEYOND_EVERY_BAND_SENTENCE),
+        (i64::from(i32::MIN), BEYOND_EVERY_BAND_SENTENCE),
+        (high + 1, ABOVE_THE_BAND_SENTENCE),
+        (high + 2, ABOVE_THE_BAND_SENTENCE),
+        (widest - 1, ABOVE_THE_BAND_SENTENCE),
+        (widest, ABOVE_THE_BAND_SENTENCE),
+        (widest + 1, BEYOND_EVERY_BAND_SENTENCE),
+        (i64::from(i32::MAX), BEYOND_EVERY_BAND_SENTENCE),
     ] {
         let case = format!("ModifyCluster with StepConcurrencyLevel {level}");
         let (status, payload) = emr
@@ -499,20 +493,16 @@ async fn an_out_of_range_step_concurrency_level_is_refused_per_class() {
                 json!({ "ClusterId": &cluster_id, "StepConcurrencyLevel": level }),
             )
             .await;
-        // The class that names no band names nothing of the request either, so the level
-        // must not have been appended to it.
-        let absent: Vec<String> = if echoes_the_level {
-            Vec::new()
-        } else {
-            vec![level.to_string()]
-        };
+        // Neither sentence echoes the refused level: both are fixed text, so the level
+        // the request carried must appear nowhere in the message.
+        let absent = [level.to_string()];
         let absent: Vec<&str> = absent.iter().map(String::as_str).collect();
         assert_says(
             &case,
             status,
             &payload,
             INVALID_REQUEST_EXCEPTION,
-            &says,
+            says,
             &absent,
         );
 

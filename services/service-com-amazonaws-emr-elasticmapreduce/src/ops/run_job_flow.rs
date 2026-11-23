@@ -581,7 +581,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Specifies the number of steps that can be executed concurrently. The default
         // value is 1. The maximum value is 256." (RunJobFlow$StepConcurrencyLevel doc.)
         // A level outside that band is refused with Amazon EMR's own sentence for the
-        // side of the band it falls outside.
+        // class the refused level falls into.
         let step_concurrency_level = input
             .step_concurrency_level
             .unwrap_or(DEFAULT_STEP_CONCURRENCY_LEVEL);

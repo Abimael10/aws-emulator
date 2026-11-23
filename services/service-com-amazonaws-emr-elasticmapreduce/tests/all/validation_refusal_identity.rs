@@ -482,32 +482,27 @@ async fn a_request_naming_no_release_label_is_refused_as_an_empty_one() {
 /// and a maximum of 256 steps" (`ModifyCluster$StepConcurrencyLevel` doc).
 const STEP_CONCURRENCY_BAND: (i64, i64) = (1, 256);
 
-/// The widest ceiling any step execution mode raises the band to, exported by the service
-/// as `state::step_execution_mode::DISTRIBUTED_MAX_STEP_CONCURRENCY_LEVEL`: a level past
-/// it is one no mode of the service could take.
+/// The highest level the band-stating refusal is answered for, exported by the service as
+/// `state::MAX_BAND_STATED_STEP_CONCURRENCY_LEVEL`: a level past it is outside every band
+/// the service serves.
 const WIDEST_STEP_CONCURRENCY_CEILING: i64 = 6400;
 
-/// The sentence a level NO mode could take is refused with: the band the cluster's own mode
-/// allows, and nothing of the request.
-const BEYOND_EVERY_BAND_SENTENCE: &str =
+/// The sentence a level outside EVERY band the service serves is refused with: entirely
+/// fixed text, naming no band and nothing of the request.
+const BEYOND_EVERY_BAND_SENTENCE: &str = "Invalid step concurrency level.";
+
+/// The sentence a level above the documented maximum but no higher than the highest level
+/// a band is stated for is refused with: the bare sentence extended with the clause stating
+/// the band the member may use.
+const ABOVE_THE_BAND_SENTENCE: &str =
     "Invalid step concurrency level. Allowed level is from 1 to 256";
 
-/// The sentence a level above the cluster's own ceiling but inside the widest one a mode
-/// raises it to is refused with: the level it could not take, the ceiling and the mode that
-/// ceiling belongs to, then the mode that would take it and that mode's own ceiling.
-fn above_the_band_sentence(level: i64) -> String {
-    format!(
-        "StepConcurrencyLevel {level} exceeds the maximum (256) for StepExecutionMode \
-         STANDARD. Set StepExecutionMode to DISTRIBUTED for up to 6400 concurrent steps."
-    )
-}
-
-/// THE RULE: a `StepConcurrencyLevel` outside the band the cluster's step execution mode
-/// allows is refused with the class's own sentence for WHICH class it falls into — the
-/// level, the ceiling it exceeded and the mode that would take it for a level another mode
-/// would take, and the cluster's own band for one no mode could take — on every operation
-/// that takes the member; a level inside the band is stored and read back. Rows span either
-/// side of each published bound and far past both.
+/// THE RULE: a `StepConcurrencyLevel` outside the documented band is refused with the
+/// entirely fixed sentence of the class it falls into — the bare sentence for a level
+/// outside every band the service serves, and that sentence extended with the band clause
+/// for one just above the documented maximum — on every operation that takes the member; a
+/// level inside the band is stored and read back. Rows span either side of each published
+/// bound and far past both.
 #[tokio::test]
 async fn a_step_concurrency_level_outside_the_band_is_refused_per_side_of_the_band() {
     let emr = Emr::new();
@@ -516,15 +511,15 @@ async fn a_step_concurrency_level_outside_the_band_is_refused_per_side_of_the_ba
     let widest = WIDEST_STEP_CONCURRENCY_CEILING;
 
     let out_of_band = [
-        (low - 1, BEYOND_EVERY_BAND_SENTENCE.to_string()),
-        (low - 2, BEYOND_EVERY_BAND_SENTENCE.to_string()),
-        (-1, BEYOND_EVERY_BAND_SENTENCE.to_string()),
-        (high + 1, above_the_band_sentence(high + 1)),
-        (high + 2, above_the_band_sentence(high + 2)),
-        (widest, above_the_band_sentence(widest)),
-        (widest + 1, BEYOND_EVERY_BAND_SENTENCE.to_string()),
-        (10_000, BEYOND_EVERY_BAND_SENTENCE.to_string()),
-        (i64::from(i32::MAX), BEYOND_EVERY_BAND_SENTENCE.to_string()),
+        (low - 1, BEYOND_EVERY_BAND_SENTENCE),
+        (low - 2, BEYOND_EVERY_BAND_SENTENCE),
+        (-1, BEYOND_EVERY_BAND_SENTENCE),
+        (high + 1, ABOVE_THE_BAND_SENTENCE),
+        (high + 2, ABOVE_THE_BAND_SENTENCE),
+        (widest, ABOVE_THE_BAND_SENTENCE),
+        (widest + 1, BEYOND_EVERY_BAND_SENTENCE),
+        (10_000, BEYOND_EVERY_BAND_SENTENCE),
+        (i64::from(i32::MAX), BEYOND_EVERY_BAND_SENTENCE),
     ];
 
     for (level, sentence) in out_of_band {

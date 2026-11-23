@@ -1671,81 +1671,63 @@ pub const MIN_STEP_CONCURRENCY_LEVEL: i32 = DEFAULT_STEP_CONCURRENCY_LEVEL;
 pub const MAX_STEP_CONCURRENCY_LEVEL: i32 = 256;
 
 /// How every operation that takes a `StepConcurrencyLevel` refuses one that lies outside
-/// EVERY band Amazon EMR offers — below the lower bound, or above the widest ceiling any
-/// step execution mode raises it to: Amazon EMR's own sentence for that class, which
-/// states the band a cluster's own mode allows and nothing of the request.
+/// EVERY band Amazon EMR serves — below the minimum the member documents, or above the
+/// highest level the band-stating refusal is answered for
+/// ([`MAX_BAND_STATED_STEP_CONCURRENCY_LEVEL`]): Amazon EMR's bare sentence for that class.
 ///
-/// Recorded behavior for the text. Both figures are read from the band this service holds
-/// a level to ([`MIN_STEP_CONCURRENCY_LEVEL`], [`MAX_STEP_CONCURRENCY_LEVEL`]), so the
-/// band a caller is TOLD about is the band that is ENFORCED, and the level the request
-/// carried is not echoed back into it. A level that one mode WOULD take is the other class
-/// ([`step_concurrency_level_exceeded_message`]), and the two are not interchangeable.
+/// Recorded behavior for the text, which is entirely FIXED: it names no band, and nothing
+/// of the request or of the store — not even the level that was refused. A level above the
+/// documented maximum that the service still states a band for is the other class, which
+/// takes this sentence EXTENDED with the band clause
+/// ([`step_concurrency_level_above_band_message`]), and the two are not interchangeable.
 pub fn invalid_step_concurrency_level_message() -> String {
-    format!(
-        "Invalid step concurrency level. Allowed level is from \
-         {MIN_STEP_CONCURRENCY_LEVEL} to {MAX_STEP_CONCURRENCY_LEVEL}"
-    )
+    "Invalid step concurrency level.".to_string()
 }
 
-/// The mode a cluster runs its steps in, which is what sets the ceiling a
-/// `StepConcurrencyLevel` is held to.
+/// The highest `StepConcurrencyLevel` the band-stating refusal
+/// ([`step_concurrency_level_above_band_message`]) is answered for; a level above this one
+/// is refused as invalid outright ([`invalid_step_concurrency_level_message`]), as is one
+/// below [`MIN_STEP_CONCURRENCY_LEVEL`].
 ///
-/// The Smithy model carries no member to ask for a mode on any operation
-/// (`smithy_query(query="operation", operation="RunJobFlow,ModifyCluster")`), so every
-/// cluster this service holds runs in the default mode and is held to its ceiling
-/// ([`MAX_STEP_CONCURRENCY_LEVEL`]); the other mode is what the refusal points a caller
-/// who needs more concurrency at.
-pub mod step_execution_mode {
-    /// The default mode, whose ceiling is [`super::MAX_STEP_CONCURRENCY_LEVEL`].
-    pub const DEFAULT: &str = "STANDARD";
+/// Recorded behavior: the band clause is appended for a level above the documented maximum
+/// up to here, and the bare sentence answers anything larger.
+pub const MAX_BAND_STATED_STEP_CONCURRENCY_LEVEL: i32 = 6400;
 
-    /// The mode that raises the ceiling to [`DISTRIBUTED_MAX_STEP_CONCURRENCY_LEVEL`].
-    pub const DISTRIBUTED: &str = "DISTRIBUTED";
-
-    /// The concurrency ceiling of [`DISTRIBUTED`], as the refusal states it.
-    pub const DISTRIBUTED_MAX_STEP_CONCURRENCY_LEVEL: i32 = 6400;
-}
-
-/// How every operation that takes a `StepConcurrencyLevel` refuses one ABOVE the ceiling
-/// of the mode the cluster runs its steps in but inside the widest ceiling a mode raises
-/// it to: Amazon EMR's own sentence for that class, which states the level it could not
-/// take, the ceiling and the mode that ceiling belongs to, then the mode that would take it
-/// and that mode's own ceiling.
+/// How every operation that takes a `StepConcurrencyLevel` refuses one ABOVE the documented
+/// maximum but no higher than [`MAX_BAND_STATED_STEP_CONCURRENCY_LEVEL`]: the bare sentence
+/// of the other class EXTENDED with the clause that states the band the member may use.
 ///
-/// Recorded behavior for the text. Every variable part is read from the request and from
-/// this service's own bounds — the `level` the request carried, the ceiling of the mode the
-/// cluster runs its steps in, and the other mode's name and ceiling — so the band a caller
-/// is TOLD about is the band that is ENFORCED.
-pub fn step_concurrency_level_exceeded_message(level: i32) -> String {
+/// Recorded behavior for the text, which is entirely FIXED as well: both figures are the
+/// band this service enforces ([`MIN_STEP_CONCURRENCY_LEVEL`],
+/// [`MAX_STEP_CONCURRENCY_LEVEL`]), so the band a caller is TOLD about is the band that is
+/// ENFORCED, and the level the request carried is not echoed into it.
+pub fn step_concurrency_level_above_band_message() -> String {
     format!(
-        "StepConcurrencyLevel {level} exceeds the maximum ({MAX_STEP_CONCURRENCY_LEVEL}) for \
-         StepExecutionMode {mode}. Set StepExecutionMode to {other} for up to {ceiling} \
-         concurrent steps.",
-        mode = step_execution_mode::DEFAULT,
-        other = step_execution_mode::DISTRIBUTED,
-        ceiling = step_execution_mode::DISTRIBUTED_MAX_STEP_CONCURRENCY_LEVEL,
+        "{bare} Allowed level is from {MIN_STEP_CONCURRENCY_LEVEL} to \
+         {MAX_STEP_CONCURRENCY_LEVEL}",
+        bare = invalid_step_concurrency_level_message(),
     )
 }
 
 /// Why this `StepConcurrencyLevel` cannot be accepted, if it cannot: the sentence for the
 /// class it falls into.
 ///
-/// A level the cluster's own mode would not take but another mode WOULD is told the band
-/// that mode allows ([`step_concurrency_level_exceeded_message`]); a level no mode of the
-/// service could take at all — below the lower bound, or above the widest ceiling any mode
-/// raises it to — is refused with the band of the cluster's own mode
-/// ([`invalid_step_concurrency_level_message`]). Every operation that takes the member
-/// judges it through here, so one level cannot be refused two ways.
+/// A level just above the maximum the member documents is told the band it may use
+/// ([`step_concurrency_level_above_band_message`]); a level outside every band the service
+/// serves — below the documented minimum, or above
+/// [`MAX_BAND_STATED_STEP_CONCURRENCY_LEVEL`] — is refused with the bare sentence, which
+/// states no band at all ([`invalid_step_concurrency_level_message`]). Every operation that
+/// takes the member judges it through here, so one level cannot be refused two ways.
 pub fn step_concurrency_level_violation(level: i32) -> Option<String> {
-    let servable =
-        MIN_STEP_CONCURRENCY_LEVEL..=step_execution_mode::DISTRIBUTED_MAX_STEP_CONCURRENCY_LEVEL;
-    if !servable.contains(&level) {
-        return Some(invalid_step_concurrency_level_message());
+    let band = MIN_STEP_CONCURRENCY_LEVEL..=MAX_STEP_CONCURRENCY_LEVEL;
+    if band.contains(&level) {
+        return None;
     }
-    if level > MAX_STEP_CONCURRENCY_LEVEL {
-        return Some(step_concurrency_level_exceeded_message(level));
+    let band_stated = (MAX_STEP_CONCURRENCY_LEVEL + 1)..=MAX_BAND_STATED_STEP_CONCURRENCY_LEVEL;
+    if band_stated.contains(&level) {
+        return Some(step_concurrency_level_above_band_message());
     }
-    None
+    Some(invalid_step_concurrency_level_message())
 }
 
 /// "A maximum of 256 steps are allowed in each CancelSteps request." (`CancelSteps`
