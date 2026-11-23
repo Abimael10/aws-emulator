@@ -660,13 +660,17 @@ fn group_due_instants(group: &StoredGroup) -> Vec<SystemTime> {
             // What the group's health check owes each member a failed check has recorded
             // unhealthy, which the same clock makes due ([`super::instance_health`]) — and
             // only where that check will ACT when the instant arrives, through the one
-            // reading of it ([`super::instance_health::health_check_due_at`]): a debt the
-            // check defers (a member parked in `Standby`, one already leaving the group)
-            // names no instant at which anything happens, so the clock does not wait on it.
+            // reading of it ([`super::instance_health::health_check_action_due_at`]): a debt
+            // the check defers (a member parked in `Standby`, one already leaving the group)
+            // and one a group that has suspended its `ReplaceUnhealthy` process is not acting
+            // on name no instant at which anything happens, so the clock does not wait on
+            // them.
             group
                 .instances
                 .iter()
-                .filter_map(super::instance_health::health_check_due_at),
+                .filter_map(|instance| {
+                    super::instance_health::health_check_action_due_at(group, instance)
+                }),
         )
         .chain(
             // The transient states of the instances the group's warm pool holds, which

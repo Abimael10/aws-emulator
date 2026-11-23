@@ -172,7 +172,8 @@ pub mod suspended_processes;
 
 pub use suspended_processes::{
     named_processes, resumed_convergence_cause, suspension_reason, unknown_process_message,
-    ProcessRefusal, SuspendedProcesses, PROCESS_LAUNCH, PROCESS_TERMINATE,
+    ProcessRefusal, SuspendedProcesses, PROCESS_HEALTH_CHECK, PROCESS_LAUNCH,
+    PROCESS_REPLACE_UNHEALTHY, PROCESS_TERMINATE,
 };
 
 /// The group metrics a group aggregates to CloudWatch: the collection
@@ -2250,6 +2251,12 @@ impl AutoScalingState {
             let Some(group) = self.groups.get_mut(&group_name) else {
                 continue;
             };
+            // Reaching a verdict about a member is the group's `HealthCheck` process, so a
+            // group that has suspended it derives nothing from the load balancer and leaves
+            // the health it reports exactly as it stands ([`suspended_processes`]).
+            if !group.performs_health_checks() {
+                continue;
+            }
             let grace = Duration::from_secs(
                 u64::try_from(
                     group
@@ -2264,6 +2271,16 @@ impl AutoScalingState {
                 // termination hook — is leaving whatever its targets report, through the one
                 // reading of that ([`StoredInstance::is_leaving_group`]).
                 if instance.is_leaving_group() {
+                    continue;
+                }
+                // A member the account's Amazon EC2 store no longer runs has been found out of
+                // service by a check of its own ([`ec2_health`]), which no verdict about the
+                // target it used to occupy takes back: the instance is gone whatever that
+                // target reports.
+                if instance
+                    .health_check_due
+                    .is_some_and(|debt| debt.reason == EC2_INSTANCE_GONE_REASON)
+                {
                     continue;
                 }
                 // Checked only once the instance has come into service and the group's grace

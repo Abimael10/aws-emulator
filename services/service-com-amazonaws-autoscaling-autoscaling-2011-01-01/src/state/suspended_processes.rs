@@ -39,6 +39,15 @@
 //! process does, which is to bring its instances to the capacity it holds — the capacity
 //! the changes made while the process was suspended recorded
 //! ([`resumed_convergence_cause`] is the cause that convergence records).
+//!
+//! The health of a group's members is two processes rather than one, and each stops only
+//! what it does: `HealthCheck` is what REACHES the verdict — it marks a member unhealthy
+//! when the member's Amazon EC2 state, or the load balancer checking it, says it is out of
+//! service ([`PROCESS_HEALTH_CHECK`]) — and `ReplaceUnhealthy` is what ACTS on that verdict,
+//! terminating the member and launching a replacement for the capacity it was providing
+//! ([`PROCESS_REPLACE_UNHEALTHY`]). So a group that has suspended the replacement alone goes
+//! on reporting a member it found unhealthy, in the lifecycle state that member already
+//! held, and one that has suspended the check alone reaches no verdict to act on.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -63,6 +72,28 @@ pub const PROCESS_TERMINATE: &str = "Terminate";
 /// ([`super::alarm_driven_policies`]) — a policy performed by a request of its own is
 /// another process and is not affected.
 pub const PROCESS_ALARM_NOTIFICATION: &str = "AlarmNotification";
+
+/// The process that CHECKS the health of a group's instances, as the catalog names it.
+///
+/// What it does is reach the verdict: it is what marks a member unhealthy when the Amazon
+/// EC2 state of that member, or the load balancer checking it, says it is out of service. So
+/// while it is suspended the group reaches no such verdict and leaves the health it reports
+/// for its members exactly as it stands ([`super::ec2_health`], [`super::elb_health`]) — a
+/// status a CALLER records with `SetInstanceHealth` is that caller's check rather than this
+/// process and is recorded whatever this group has suspended.
+pub const PROCESS_HEALTH_CHECK: &str = "HealthCheck";
+
+/// The process that REPLACES a member a health check has found unhealthy, as the catalog
+/// names it.
+///
+/// What it does is act on the verdict: it terminates the member the check condemned and
+/// launches a replacement for the capacity that member was providing. The marking is the
+/// other process ([`PROCESS_HEALTH_CHECK`]), so while this one is suspended the group goes
+/// on reporting the member it found unhealthy — with the `LifecycleState` it already held —
+/// and takes nothing out and launches nothing for it
+/// ([`super::AutoScalingState::reconcile_unhealthy_instances`]); resuming it leaves the
+/// replacement owed, so the group then performs it with no further call from anybody.
+pub const PROCESS_REPLACE_UNHEALTHY: &str = "ReplaceUnhealthy";
 
 /// The suspended processes of ONE group: the instant each process was suspended at, keyed
 /// by the process name.
@@ -134,6 +165,30 @@ impl StoredGroup {
     #[must_use]
     pub fn is_process_suspended(&self, process: &str) -> bool {
         self.suspended_processes.contains_key(process)
+    }
+
+    /// Whether this group's own health checks REACH a verdict about its members: the process
+    /// that performs them is running ([`PROCESS_HEALTH_CHECK`]).
+    ///
+    /// THE ONE reading of that question, for every check of the group that marks a member —
+    /// the Amazon EC2 state change that leaves a member no longer running
+    /// ([`super::ec2_health`]) and the load balancer's verdict on the target it occupies
+    /// ([`super::elb_health`]) — so a group that has suspended the process marks a member for
+    /// neither of them.
+    #[must_use]
+    pub fn performs_health_checks(&self) -> bool {
+        !self.is_process_suspended(PROCESS_HEALTH_CHECK)
+    }
+
+    /// Whether this group ACTS on such a verdict: the process that replaces a member a health
+    /// check found unhealthy is running ([`PROCESS_REPLACE_UNHEALTHY`]).
+    ///
+    /// THE ONE reading of that question, whichever check reached the verdict: while the
+    /// process is suspended the group reports the member unhealthy and neither terminates it
+    /// nor launches anything for it.
+    #[must_use]
+    pub fn replaces_unhealthy_instances(&self) -> bool {
+        !self.is_process_suspended(PROCESS_REPLACE_UNHEALTHY)
     }
 
     /// This group's suspensions as the API reports them — one `SuspendedProcess` each.

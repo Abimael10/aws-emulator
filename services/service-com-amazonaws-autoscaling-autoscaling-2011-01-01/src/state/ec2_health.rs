@@ -18,6 +18,19 @@
 //! reported `Terminating` until [`super::LIFECYCLE_TRANSITION`] is due, with the lifecycle
 //! event and the scaling activity every other termination records.
 //!
+//! # Noticing and replacing are two steps
+//!
+//! What this check does is reach the VERDICT: the member Amazon EC2 no longer runs is out of
+//! service, so the group reports it [`super::HEALTH_STATUS_UNHEALTHY`]. Acting on that
+//! verdict is a step of its own — the member is taken out and a replacement launched for the
+//! capacity it was providing — and the two are two PROCESSES of the group: the marking is
+//! `HealthCheck` and the replacement `ReplaceUnhealthy` ([`super::suspended_processes`]). So a
+//! group that has suspended one of them stops exactly that half: with the replacement
+//! suspended the member stays listed in the lifecycle state it already held, reported
+//! unhealthy and never taken out — the verdict kept as the debt that replacement is owed under
+//! ([`super::HealthCheckDebt`]), so resuming the process performs it — and with the check
+//! suspended the group reaches no verdict about it at all.
+//!
 //! Nothing is taken out on an assumption: the ids come from Amazon EC2's own store
 //! ([`super::ec2_instances::gone`]), and an engine carrying no Amazon EC2 store at all
 //! leaves every group exactly as it stands.
@@ -26,8 +39,8 @@ use std::collections::BTreeSet;
 use std::time::SystemTime;
 
 use super::{
-    ec2_instances, AutoScalingState, InstanceLifecycle, InstanceLifecycleChange,
-    LIFECYCLE_TRANSITION,
+    ec2_instances, AutoScalingState, HealthCheckDebt, InstanceLifecycle, InstanceLifecycleChange,
+    HEALTH_STATUS_UNHEALTHY, LIFECYCLE_TRANSITION, UNHEALTHY_INSTANCE_REPLACEMENT,
 };
 
 /// What the activity of an instance the group lost to an Amazon EC2 state change records,
@@ -51,9 +64,13 @@ pub const UNHEALTHY_REPLACEMENT_REASON: &str = "an instance was launched in resp
                                                unhealthy instance needing to be replaced";
 
 impl AutoScalingState {
-    /// Take out of every group the instances the account's Amazon EC2 store no longer runs,
-    /// and let each group converge on the capacity it is configured for — which launches a
-    /// replacement for every unit those instances were providing.
+    /// Report as out of service every member the account's Amazon EC2 store no longer runs,
+    /// and take each of them out of its group — letting the group converge on the capacity it
+    /// is configured for, which launches a replacement for every unit those members were
+    /// providing — for as long as the group's `ReplaceUnhealthy` process is the one doing it.
+    ///
+    /// A group that has suspended that process reports the verdict and acts on none of it (see
+    /// the module docs); one that has suspended the check reaches no verdict at all.
     ///
     /// An instance already on its way out of its group ([`StoredInstance::is_leaving_group`])
     /// is left alone: it is leaving for a reason the group itself recorded, and Amazon EC2
@@ -111,15 +128,54 @@ impl AutoScalingState {
             if lost.is_empty() {
                 continue;
             }
-            // Out of service and replaced through THE ONE path a failed health check takes
-            // a member out by, under this check's own sentence for why it left the group.
-            self.replace_unhealthy_instances(
-                engine,
-                &group_name,
-                &lost,
-                EC2_INSTANCE_GONE_REASON,
-                now,
-            );
+            let Some(group) = self.groups.get_mut(&group_name) else {
+                continue;
+            };
+            // Noticing is the group's `HealthCheck` process, so a group that has suspended it
+            // reaches no verdict about the member and leaves the health it reports exactly as
+            // it stands ([`super::suspended_processes`]).
+            if !group.performs_health_checks() {
+                continue;
+            }
+            // Acting on the verdict is the group's `ReplaceUnhealthy` process, which is a
+            // different one: a group that has suspended it goes on reporting the member the
+            // check condemned instead of taking it out.
+            let replaces = group.replaces_unhealthy_instances();
+            for instance in group
+                .instances
+                .iter_mut()
+                .filter(|instance| lost.contains(&instance.instance_id))
+            {
+                // The verdict itself: the member Amazon EC2 no longer runs is out of service,
+                // which is what the group reports for it from here on.
+                instance.health_status = HEALTH_STATUS_UNHEALTHY.to_string();
+                // A group that is not replacing it REMEMBERS that verdict, as the debt the
+                // replacement is owed under ([`super::HealthCheckDebt`], one debt with every
+                // other check): resuming the process then performs it through the one path a
+                // failed health check takes a member out by, and no later verdict of another
+                // check takes this one back
+                // ([`super::AutoScalingState::reconcile_elb_instance_health`]). A group that IS
+                // replacing it needs nothing remembered — the replacement is below — and a
+                // debt a pass has already armed is left where it is, since re-arming it on
+                // every later pass would keep pushing its instant out of reach.
+                if !replaces && instance.health_check_due.is_none() {
+                    instance.health_check_due = Some(HealthCheckDebt {
+                        due: now + UNHEALTHY_INSTANCE_REPLACEMENT,
+                        reason: EC2_INSTANCE_GONE_REASON,
+                    });
+                }
+            }
+            if replaces {
+                // Out of service and replaced through THE ONE path a failed health check takes
+                // a member out by, under this check's own sentence for why it left the group.
+                self.replace_unhealthy_instances(
+                    engine,
+                    &group_name,
+                    &lost,
+                    EC2_INSTANCE_GONE_REASON,
+                    now,
+                );
+            }
         }
     }
 

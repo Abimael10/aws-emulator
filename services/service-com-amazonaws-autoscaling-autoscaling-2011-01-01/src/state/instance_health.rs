@@ -46,8 +46,8 @@
 use std::time::{Duration, SystemTime};
 
 use super::{
-    AutoScalingState, StoredInstance, DEFAULT_HEALTH_CHECK_GRACE_PERIOD, HEALTH_STATUS_HEALTHY,
-    HEALTH_STATUS_UNHEALTHY, INSTANCE_REFRESH_REPLACEMENT,
+    AutoScalingState, StoredGroup, StoredInstance, DEFAULT_HEALTH_CHECK_GRACE_PERIOD,
+    HEALTH_STATUS_HEALTHY, HEALTH_STATUS_UNHEALTHY, INSTANCE_REFRESH_REPLACEMENT,
 };
 
 /// What a failed health check of this instance's group OWES it: the instant the group ACTS
@@ -220,6 +220,12 @@ impl AutoScalingState {
     /// ([`StoredInstance::is_leaving_group`]) — and so is one parked in `Standby`, which the
     /// group performs no health check on while it is parked. The debt is discharged as the
     /// check acts, so one recorded status is acted on exactly once.
+    ///
+    /// Acting on the verdict is the group's `ReplaceUnhealthy` process, so a group that has
+    /// suspended it acts on none of its members: the verdict stands — each stays listed in
+    /// the lifecycle state it already held, reported unhealthy — and the debt stands with it,
+    /// so resuming the process performs the replacement that was owed
+    /// ([`health_check_action_due_at`]).
     pub(crate) fn reconcile_unhealthy_instances<Eng: Send + Sync + 'static>(
         &mut self,
         engine: &Eng,
@@ -234,7 +240,7 @@ impl AutoScalingState {
             .values()
             .flat_map(|group| {
                 let mut by_reason: Vec<(&'static str, Vec<String>)> = Vec::new();
-                for instance in group.instances.iter().filter(|i| acts_now(i, now)) {
+                for instance in group.instances.iter().filter(|i| acts_now(group, i, now)) {
                     let reason = instance
                         .health_check_due
                         .map(|debt| debt.reason)
@@ -297,8 +303,32 @@ fn unhealthy_check_due(
 /// Whether the group's health check acts on `instance` at `now`: a check has recorded it
 /// unhealthy, the clock has made that check due, and the instance is one the group still
 /// performs health checks on (see the module docs).
-fn acts_now(instance: &StoredInstance, now: SystemTime) -> bool {
-    health_check_due_at(instance).is_some_and(|due| due <= now)
+fn acts_now(group: &StoredGroup, instance: &StoredInstance, now: SystemTime) -> bool {
+    health_check_action_due_at(group, instance).is_some_and(|due| due <= now)
+}
+
+/// WHEN the group acts on the check a member of `group` has failed — the instant the clock
+/// waits for on its behalf — and `None` when nothing is owed at any instant.
+///
+/// The acting is the group's `ReplaceUnhealthy` process: it is what terminates the member the
+/// check condemned and launches a replacement for the capacity it was providing, so a group
+/// that has suspended that process acts at no instant at all while the verdict itself stands
+/// ([`super::suspended_processes`]). The debt STAYS on the instance, exactly as it stays for a
+/// member the check declines to act on, so resuming the process leaves the replacement owed
+/// and the group performs it with no further call from anybody.
+///
+/// THE ONE reading of that instant, for the acting pass ([`acts_now`]) and for the clock that
+/// waits on what this store owes ([`AutoScalingState::next_clock_due_at`]) alike: a clock
+/// waiting on an instant no pass acts at would wake, retire nothing and wait again, with
+/// nothing for it to do and nothing to end it.
+pub(crate) fn health_check_action_due_at(
+    group: &StoredGroup,
+    instance: &StoredInstance,
+) -> Option<SystemTime> {
+    if !group.replaces_unhealthy_instances() {
+        return None;
+    }
+    health_check_due_at(instance)
 }
 
 /// WHEN the group's health check acts on `instance` — the instant the clock waits for on its
@@ -313,10 +343,8 @@ fn acts_now(instance: &StoredInstance, now: SystemTime) -> bool {
 /// due again once the instance is back in service (see the module docs); what is not owed is
 /// an instant at which anything happens.
 ///
-/// THE ONE reading of that instant, for the acting pass ([`acts_now`]) and for the clock that
-/// waits on what this store owes ([`AutoScalingState::next_clock_due_at`]) alike: a clock
-/// waiting on an instant no pass acts at would wake, retire nothing and wait again, with
-/// nothing for it to do and nothing to end it.
+/// What the GROUP has suspended is weighed beside this, in the one reading both the acting
+/// pass and the clock take ([`health_check_action_due_at`]).
 pub(crate) fn health_check_due_at(instance: &StoredInstance) -> Option<SystemTime> {
     if instance.is_leaving_group() || instance.is_in_standby() {
         return None;
