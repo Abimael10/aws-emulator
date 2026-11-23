@@ -297,6 +297,13 @@ fn rows() -> Vec<Row> {
 async fn every_created_workspace_instance_resolves_a_launched_ec2_instance() {
     let (router, _engine) = harness();
     let ec2 = ec2_client(&router);
+    // The key pair one row names: a launch is GIVEN the key pair it names, so Amazon EC2 has
+    // to hold one under that name before the launch can take it.
+    ec2.create_key_pair()
+        .key_name("my-key")
+        .send()
+        .await
+        .expect("ec2:CreateKeyPair answers");
 
     let mut reported_ids: Vec<String> = Vec::new();
     for row in rows() {

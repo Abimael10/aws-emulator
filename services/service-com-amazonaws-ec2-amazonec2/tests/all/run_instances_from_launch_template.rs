@@ -241,6 +241,20 @@ async fn default_network(router: &MultiServiceRouter) -> (String, String) {
 async fn a_launch_runs_from_the_template_overlaid_with_the_request() {
     let router = emulator();
     let (subnet_id, group_id) = default_network(&router).await;
+    // The key pair the row below names on its template: a launch is GIVEN the key pair its
+    // parameters name, so the account holds one under that name whichever side of the overlay
+    // the name came from.
+    let (status, body) = call(
+        &router,
+        REGION,
+        "CreateKeyPair",
+        &[p("KeyName", "cluster-key")],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the account must hold the key pair the template names, got {status} with body {body}"
+    );
 
     // One row per member the overlay decides, plus a row for each side winning. `expected`
     // is read off the instance the launch minted AND off the describe that reads it back.

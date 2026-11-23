@@ -481,6 +481,14 @@ async fn launch_parameters_round_trip_through_describe_instances() {
             p("InstanceType", case.instance_type),
         ];
         if let Some(key_name) = case.key_name {
+            // A launch is GIVEN the key pair it names, so the account holds one under that
+            // name before the launch takes it.
+            let created = ec2.call("CreateKeyPair", vec![p("KeyName", key_name)]).await;
+            assert_eq!(
+                created.status, 200,
+                "case {}: CreateKeyPair must succeed, got {}: {}",
+                case.name, created.status, created.body
+            );
             extra.push(p("KeyName", key_name));
         }
         if let Some(subnet_id) = case.subnet_id {
@@ -984,14 +992,47 @@ async fn create_tags_writes_through_to_describe_and_to_tag_filters() {
 #[tokio::test]
 async fn describe_instances_resolves_each_supported_filter() {
     let ec2 = Ec2::new();
+    // The key pair and the security group the launch names: a launch is GIVEN the resources it
+    // names, so both have to be held before it can take them (the launch's own refusals for a
+    // name nothing holds are the subject of the sibling suites
+    // `tests/all/launch_members_read_before_the_dry_run_probe.rs` and
+    // `tests/all/dry_run_probe_against_request_validation.rs`).
+    let created = ec2
+        .call(
+            "CreateKeyPair",
+            vec![p("KeyName", "filter-key"), p("KeyType", "ed25519")],
+        )
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "CreateKeyPair must succeed, got {}: {}",
+        created.status, created.body
+    );
+    let created = ec2
+        .call(
+            "CreateSecurityGroup",
+            vec![
+                p("GroupName", "web-tier"),
+                p("GroupDescription", "the group the launch names"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "CreateSecurityGroup must succeed, got {}: {}",
+        created.status, created.body
+    );
+    let group_id = ec2_query::element(&created.body, "groupId")
+        .unwrap_or_else(|| panic!("CreateSecurityGroup must report a groupId: {}", created.body));
     let launched = launch(
         &ec2,
         1,
         vec![
             p("InstanceType", "t4g.small"),
             p("KeyName", "filter-key"),
-            p("SubnetId", "subnet-0123456789abcdef0"),
-            p("SecurityGroupId.1", "sg-0123456789abcdef0"),
+            // The group is named BY NAME, which a launch may do only when it names no subnet
+            // of its own ("[Default VPC] The names of the security groups"), so this launch
+            // takes the default subnet — whose id the describe below reports back.
             p("SecurityGroup.1", "web-tier"),
             p("ClientToken", "filter-token"),
             p("Monitoring.Enabled", "true"),
@@ -1032,7 +1073,7 @@ async fn describe_instances_resolves_each_supported_filter() {
         ("instance-type", "t4g.small".to_string(), "m5.large"),
         (
             "instance.group-id",
-            "sg-0123456789abcdef0".to_string(),
+            group_id.clone(),
             "sg-99999999999999999",
         ),
         ("instance.group-name", "web-tier".to_string(), "db-tier"),
@@ -1062,7 +1103,7 @@ async fn describe_instances_resolves_each_supported_filter() {
         ),
         (
             "subnet-id",
-            "subnet-0123456789abcdef0".to_string(),
+            described.subnet_id.clone().unwrap_or_default(),
             "subnet-99999999999999999",
         ),
         ("tag:Name", "filtered".to_string(), "other"),

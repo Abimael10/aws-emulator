@@ -102,6 +102,17 @@ fn emulator() -> (MultiServiceRouter, Images) {
     (router, images)
 }
 
+/// Hold the key pair `key_name` in the account, so a launch may be GIVEN it: a launch names
+/// the credential its instances are reachable with, so a name the account holds no key pair
+/// under names none and the launch is refused for it.
+async fn hold_key_pair(router: &MultiServiceRouter, key_name: &str) {
+    let (status, body) = api(router, "CreateKeyPair", &[p("KeyName", key_name)]).await;
+    assert!(
+        status == 200 || super::ec2_query::error_code(&body) == "InvalidKeyPair.Duplicate",
+        "the account must hold the key pair {key_name:?}, got {status}: {body}"
+    );
+}
+
 /// Launch one instance from `image_id`, optionally naming a key pair, and answer its id.
 async fn launch(router: &MultiServiceRouter, image_id: &str, key_name: Option<&str>) -> String {
     let mut params = vec![
@@ -110,6 +121,7 @@ async fn launch(router: &MultiServiceRouter, image_id: &str, key_name: Option<&s
         p("MaxCount", "1"),
     ];
     if let Some(key_name) = key_name {
+        hold_key_pair(router, key_name).await;
         params.push(p("KeyName", key_name));
     }
     let (status, body) = api(router, "RunInstances", &params).await;

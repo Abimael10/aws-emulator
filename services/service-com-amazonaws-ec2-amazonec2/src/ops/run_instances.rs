@@ -661,6 +661,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                  {MAX_SECURITY_GROUPS_PER_INSTANCE} security groups, not {named_groups}"
             )));
         }
+        // "[Default VPC] The names of the security groups"
+        // (`RunInstancesRequest$SecurityGroups`): a NAME is the default VPC's spelling of a
+        // group, the id being how a group of any other network is named
+        // (`$SecurityGroupIds`) — so a launch that names the SUBNET it goes into gives its
+        // groups by id, and one that names them by name beside a subnet has given two members
+        // that cannot be served together. Asked of the RESOLVED launch, so a name and a
+        // subnet that reached it from its launch template are held to the same rule, and
+        // asked HERE, with the rest of the parameter validation and BEFORE the DryRun arm: a
+        // request whose own members cannot hold together is refused for that whether or not
+        // it was only a probe.
+        if input
+            .subnet_id
+            .as_deref()
+            .is_some_and(|subnet_id| !subnet_id.is_empty())
+            && input
+                .security_groups
+                .iter()
+                .flatten()
+                .any(|group_name| !group_name.is_empty())
+        {
+            return Err(crate::state::parameters_cannot_be_combined(
+                "groupName", "subnet",
+            ));
+        }
         // `BlockDeviceMappings` carries no modelled `@length` either, and every entry of it is
         // walked below — the `KmsKeyId`/`Encrypted` pairing, the root device overlay, and the
         // keys this launch asks the service that owns them about — so the list needs a ceiling
@@ -1087,6 +1111,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         } else {
             MONITORING_STATE_DISABLED
         };
+        // "The name of the key pair" (`RunInstancesRequest$KeyName`): the key pair is the
+        // credential every instance of this launch is reachable with, so a name the account
+        // holds no key pair under names a credential no instance of it could ever carry, and
+        // the launch is refused with the key pair's own not-found class rather than placed
+        // with a name that resolves to nothing — the reading `RequestSpotFleet` already gives
+        // a launch specification's key pair, so one launch path cannot accept a key pair name
+        // another refuses. Read BEFORE the DryRun arm, with the rest of the resources the
+        // request NAMES.
+        if let Some(key_name) = input
+            .key_name
+            .as_deref()
+            .filter(|key_name| !key_name.is_empty())
+        {
+            if store.key_pair_id_for_name(key_name).is_none() {
+                return Err(crate::state::invalid_key_pair_name_not_found(key_name));
+            }
+        }
         // "The name of the placement group that the instance is in"
         // (`Placement$GroupName`): a launch that names one puts every instance it mints in
         // THAT group, so the name is resolved against the placement group store here — a

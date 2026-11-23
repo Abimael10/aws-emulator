@@ -103,6 +103,11 @@ async fn launch(router: &MultiServiceRouter, case: &str, image_id: &str, extra: 
         p("MaxCount", "1"),
     ];
     params.extend_from_slice(extra);
+    // A launch is GIVEN the key pair it names, so the account has to hold one under that name
+    // before the launch can take it.
+    for (_, key_name) in extra.iter().filter(|(key, _)| key == "KeyName") {
+        ok(router, case, "CreateKeyPair", &[p("KeyName", key_name)]).await;
+    }
     let body = ok(router, case, "RunInstances", &params).await;
     element(&body, "instanceId")
         .unwrap_or_else(|| panic!("case {case:?}: RunInstances must report the instance it minted: {body}"))

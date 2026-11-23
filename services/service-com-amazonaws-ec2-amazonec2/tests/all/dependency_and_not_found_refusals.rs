@@ -34,7 +34,8 @@ use ec2::ops::types::{IPAM_POOL_CIDR_STATE_VALUES, NatGateway, Tag};
 use ec2::state::{
     ADDRESS_FAMILY_IPV4, ADDRESS_FAMILY_IPV6, ComAmazonawsEc2Amazonec2State as Ec2State,
     DEPENDENCY_VIOLATION, INCORRECT_STATE, INVALID_GROUP_NOT_FOUND, INVALID_IPAM_ID_NOT_FOUND,
-    INVALID_PARAMETER, INVALID_PREFIX_LIST_ID_NOT_FOUND, INVALID_TRANSIT_GATEWAY_ID_NOT_FOUND,
+    INVALID_PARAMETER, INVALID_PARAMETER_COMBINATION, INVALID_PREFIX_LIST_ID_NOT_FOUND,
+    INVALID_TRANSIT_GATEWAY_ID_NOT_FOUND,
     INVALID_VPC_ENDPOINT_ID_NOT_FOUND, IPAM_POOL_CIDR_STATE_PENDING_PROVISION,
     IPAM_POOL_CIDR_STATE_PROVISIONED, NAT_GATEWAY_STATE_AVAILABLE, NAT_GATEWAY_STATE_DELETED,
     NAT_GATEWAY_STATE_DELETING, TRANSITION_DELAY, system_time_to_date_time,
@@ -718,7 +719,7 @@ async fn a_launch_cannot_apply_a_security_group_from_another_vpc() {
         let group_id = member(case, &body, "groupId");
         networks.push((vpc_id, subnet_id, group_id));
     }
-    let (first_vpc, first_subnet, first_group) = networks[0].clone();
+    let (_first_vpc, first_subnet, first_group) = networks[0].clone();
     let (_, _, second_group) = networks[1].clone();
 
     // A group of the subnet's own VPC launches.
@@ -752,10 +753,14 @@ async fn a_launch_cannot_apply_a_security_group_from_another_vpc() {
             ),
         ),
         (
-            "a group of another VPC, by name",
+            // A group NAME is "[Default VPC] The names of the security groups"
+            // (`RunInstancesRequest$SecurityGroups`), so it cannot be given beside the subnet
+            // the launch is placed in at all: the launch is refused that parameter
+            // combination before either resource is resolved, whichever VPC holds the group.
+            "a group named by name beside a subnet",
             param("SecurityGroup.1", "tier-1"),
-            INVALID_GROUP_NOT_FOUND.to_string(),
-            format!("The security group 'tier-1' does not exist in VPC '{first_vpc}'"),
+            INVALID_PARAMETER_COMBINATION.to_string(),
+            "The parameter groupName cannot be used with the parameter subnet".to_string(),
         ),
         (
             "a group the account holds none of",

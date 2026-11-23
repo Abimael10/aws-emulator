@@ -391,6 +391,16 @@ async fn a_launch_naming_no_profile_associates_nothing() {
 
     for (case, count, extra) in rows {
         let router = emulator();
+        // A launch is GIVEN the key pair it names, so a row that names one has the account
+        // hold it first.
+        for (_, key_name) in extra.iter().filter(|(key, _)| key == "KeyName") {
+            let (status, body) =
+                call(&router, "CreateKeyPair", &[param("KeyName", key_name)]).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: CreateKeyPair must succeed, got {status}: {body}"
+            );
+        }
         let (status, body) = launch(&router, count, &extra).await;
         assert_eq!(
             status, 200,
