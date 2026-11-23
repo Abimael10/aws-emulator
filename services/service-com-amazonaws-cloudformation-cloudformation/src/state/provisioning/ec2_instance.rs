@@ -47,13 +47,24 @@
 //! the reason [`tag_resource`] records: it carries the three `aws:cloudformation:*` keys, and
 //! `CreateTags` is the request that service admits them from.
 //!
+//! Every property of this type that is a member of that call travels to it, whatever its
+//! SHAPE: a scalar as that member, a STRUCTURE as that member's own members
+//! ([`INSTANCE_STRUCTURE_PROPERTIES`] — the CPU, credit, enclave, hibernation, metadata and
+//! private-DNS options) and a LIST OF STRUCTURES as the parameter name `ec2Query` flattens that
+//! list under ([`INSTANCE_STRUCTURE_LIST_PROPERTIES`] — the block device mappings, the IPv6
+//! addresses, the license specifications and the two accelerator lists). So a declaration that
+//! asks for an encrypted root volume or for IMDSv2 is launched with them rather than failed.
+//! Each such property is READ against the members the type publishes ([`published_structure`])
+//! and WRITTEN by the one ec2Query writer this crate has for this service
+//! ([`push_ec2_member`]), which the launch-template arm writes its own nested members with.
+//!
 //! A declared property this module does not apply is REFUSED
 //! ([`refuse_unmapped_properties`]), so an instance is never reported created with less than
-//! its declaration asked for: a block device mapping, CPU options, a credit specification,
-//! enclave or hibernation options, a license specification, an
-//! `SsmAssociations` entry, an attached `Volumes` entry, a `SourceDestCheck` switch (a
-//! `ModifyInstanceAttribute` this emulator does not serve) and an `Ipv6Addresses` list are each
-//! one of those.
+//! its declaration asked for. What is left is exactly the properties `RunInstances` has no
+//! member for, each of which is another call: `SourceDestCheck` is a
+//! `ModifyInstanceAttribute`, an attached `Volumes` entry an `AttachVolume`, an
+//! `SsmAssociations` entry a Systems Manager association, and
+//! `PropagateTagsToVolumeOnCreation` the tagging of the volumes a launch creates.
 //!
 //! ## What the stack waits for
 //!
@@ -74,6 +85,7 @@ use super::ec2_vpc_network::{
     EC2_SIGNING_NAME, NOT_FOUND_SUFFIX,
 };
 use super::{call_query, xml_scalar_children, Created, Readiness, Refusal, Removal};
+use crate::state::provisioner::compute_fleet::{ec2_list_element, push_ec2_member};
 use crate::state::provisioner::ec2_in_place::{retag_ec2_resource, update_ec2_instance};
 use crate::state::provisioner::tags_of;
 use crate::state::StoredResource;
@@ -90,8 +102,15 @@ const INSTANCE_PROPERTIES: &[&str] = &[
     "AdditionalInfo",
     "Affinity",
     "AvailabilityZone",
+    "BlockDeviceMappings",
+    "CpuOptions",
+    "CreditSpecification",
     "DisableApiTermination",
     "EbsOptimized",
+    "ElasticGpuSpecifications",
+    "ElasticInferenceAccelerators",
+    "EnclaveOptions",
+    "HibernationOptions",
     "HostId",
     "HostResourceGroupArn",
     "IamInstanceProfile",
@@ -99,12 +118,16 @@ const INSTANCE_PROPERTIES: &[&str] = &[
     "InstanceInitiatedShutdownBehavior",
     "InstanceType",
     "Ipv6AddressCount",
+    "Ipv6Addresses",
     "KernelId",
     "KeyName",
     "LaunchTemplate",
+    "LicenseSpecifications",
+    "MetadataOptions",
     "Monitoring",
     "NetworkInterfaces",
     "PlacementGroupName",
+    "PrivateDnsNameOptions",
     "PrivateIpAddress",
     "RamdiskId",
     "SecurityGroupIds",
@@ -155,6 +178,189 @@ const INSTANCE_LIST_MEMBERS: &[(&str, &str)] = &[
     ("SecurityGroupIds", "SecurityGroupId"),
     ("SecurityGroups", "SecurityGroup"),
 ];
+
+/// One member of a declared STRUCTURE property: the member of the call's own shape it travels
+/// as, and — where that member is itself a structure — the members of IT that are written.
+///
+/// The three constructors below are the three cases the catalogues need: a member spelled the
+/// same on the type and on the call, a member the call takes under another name, and a member
+/// that is a nested structure.
+#[derive(Debug)]
+struct StructureMember {
+    /// The member as the resource type publishes it.
+    property: &'static str,
+    /// The member as the call takes it, which is also its `ec2QueryName`.
+    sent: &'static str,
+    /// The members of the nested structure this member is, empty for a scalar one.
+    nested: &'static [StructureMember],
+    /// The text the member travels as whatever the declaration states it, for the one member
+    /// whose published FORM is not the value the call takes: `BlockDeviceMapping$NoDevice` is
+    /// "specify an empty string" on the call, where the type publishes it as an empty
+    /// structure.
+    fixed: Option<&'static str>,
+}
+
+/// A member spelled identically on the resource type and on the call.
+const fn sent_as_itself(property: &'static str) -> StructureMember {
+    StructureMember {
+        property,
+        sent: property,
+        nested: &[],
+        fixed: None,
+    }
+}
+
+/// A member the call takes under a DIFFERENT name than the type publishes it under.
+const fn sent_as(property: &'static str, sent: &'static str) -> StructureMember {
+    StructureMember {
+        property,
+        sent,
+        nested: &[],
+        fixed: None,
+    }
+}
+
+/// A member that is itself a structure, whose own members are `nested`.
+const fn sent_as_structure(
+    property: &'static str,
+    nested: &'static [StructureMember],
+) -> StructureMember {
+    StructureMember {
+        property,
+        sent: property,
+        nested,
+        fixed: None,
+    }
+}
+
+/// The published members of an `Ebs` entry of a `BlockDeviceMappings` entry, each a member of
+/// `RunInstances`'s own `EbsBlockDevice` under the same name
+/// (`smithy_query(query="shape",shape="EbsBlockDevice")`).
+const EBS_BLOCK_DEVICE_MEMBERS: &[StructureMember] = &[
+    sent_as_itself("DeleteOnTermination"),
+    sent_as_itself("Encrypted"),
+    sent_as_itself("Iops"),
+    sent_as_itself("KmsKeyId"),
+    sent_as_itself("SnapshotId"),
+    sent_as_itself("Throughput"),
+    sent_as_itself("VolumeSize"),
+    sent_as_itself("VolumeType"),
+];
+
+/// The published members of a `BlockDeviceMappings` entry, each a member of that call's own
+/// `BlockDeviceMapping` (`smithy_query(query="shape",shape="BlockDeviceMapping")`).
+///
+/// `NoDevice` is the one member whose form differs: the type publishes it as an empty
+/// structure and the call takes "an empty string", so it travels as that string.
+const BLOCK_DEVICE_MAPPING_MEMBERS: &[StructureMember] = &[
+    sent_as_itself("DeviceName"),
+    sent_as_structure("Ebs", EBS_BLOCK_DEVICE_MEMBERS),
+    StructureMember {
+        property: "NoDevice",
+        sent: "NoDevice",
+        nested: &[],
+        fixed: Some(""),
+    },
+    sent_as_itself("VirtualName"),
+];
+
+/// The published members of `CpuOptions`, each a member of that call's own `CpuOptionsRequest`
+/// under the same name.
+const CPU_OPTIONS_MEMBERS: &[StructureMember] = &[
+    sent_as_itself("CoreCount"),
+    sent_as_itself("ThreadsPerCore"),
+];
+
+/// The published member of `CreditSpecification`: the type spells the credit option
+/// `CPUCredits` and the call's own `CreditSpecificationRequest` spells it `CpuCredits`, which
+/// is the one renaming on the way.
+const CREDIT_SPECIFICATION_MEMBERS: &[StructureMember] =
+    &[sent_as("CPUCredits", "CpuCredits")];
+
+/// The published member of `EnclaveOptions` (`EnclaveOptionsRequest$Enabled`).
+const ENCLAVE_OPTIONS_MEMBERS: &[StructureMember] = &[sent_as_itself("Enabled")];
+
+/// The published member of `HibernationOptions`
+/// (`HibernationOptionsRequest$Configured`).
+const HIBERNATION_OPTIONS_MEMBERS: &[StructureMember] = &[sent_as_itself("Configured")];
+
+/// The published members of `MetadataOptions`, each a member of that call's own
+/// `InstanceMetadataOptionsRequest` under the same name — which is how a declaration asking
+/// for IMDSv2 (`HttpTokens: required`) reaches the launch.
+const METADATA_OPTIONS_MEMBERS: &[StructureMember] = &[
+    sent_as_itself("HttpEndpoint"),
+    sent_as_itself("HttpProtocolIpv6"),
+    sent_as_itself("HttpPutResponseHopLimit"),
+    sent_as_itself("HttpTokens"),
+    sent_as_itself("InstanceMetadataTags"),
+];
+
+/// The published members of `PrivateDnsNameOptions`, each a member of that call's own
+/// `PrivateDnsNameOptionsRequest` under the same name.
+const PRIVATE_DNS_NAME_OPTIONS_MEMBERS: &[StructureMember] = &[
+    sent_as_itself("EnableResourceNameDnsAAAARecord"),
+    sent_as_itself("EnableResourceNameDnsARecord"),
+    sent_as_itself("HostnameType"),
+];
+
+/// The published member of an `Ipv6Addresses` entry
+/// (`InstanceIpv6Address$Ipv6Address`).
+const IPV6_ADDRESS_MEMBERS: &[StructureMember] = &[sent_as_itself("Ipv6Address")];
+
+/// The published member of a `LicenseSpecifications` entry
+/// (`LicenseConfigurationRequest$LicenseConfigurationArn`).
+const LICENSE_SPECIFICATION_MEMBERS: &[StructureMember] =
+    &[sent_as_itself("LicenseConfigurationArn")];
+
+/// The published member of an `ElasticGpuSpecifications` entry
+/// (`ElasticGpuSpecification$Type`).
+const ELASTIC_GPU_MEMBERS: &[StructureMember] = &[sent_as_itself("Type")];
+
+/// The published members of an `ElasticInferenceAccelerators` entry
+/// (`ElasticInferenceAccelerator$Type` and `$Count`).
+const ELASTIC_INFERENCE_MEMBERS: &[StructureMember] =
+    &[sent_as_itself("Count"), sent_as_itself("Type")];
+
+/// The properties that are STRUCTURE members of `RunInstances` under the SAME member name,
+/// each with the members of that shape the type publishes: a declared member travels as
+/// `<Member>.<Inner>`, which is how ec2Query spells a structure.
+const INSTANCE_STRUCTURE_PROPERTIES: &[(&str, &[StructureMember])] = &[
+    ("CpuOptions", CPU_OPTIONS_MEMBERS),
+    ("CreditSpecification", CREDIT_SPECIFICATION_MEMBERS),
+    ("EnclaveOptions", ENCLAVE_OPTIONS_MEMBERS),
+    ("HibernationOptions", HIBERNATION_OPTIONS_MEMBERS),
+    ("MetadataOptions", METADATA_OPTIONS_MEMBERS),
+    ("PrivateDnsNameOptions", PRIVATE_DNS_NAME_OPTIONS_MEMBERS),
+];
+
+/// The properties that are LISTS OF STRUCTURES on that call, each with the members of the
+/// entry shape the type publishes. The element name `ec2Query` flattens the list under is the
+/// shared reading of that question ([`list_element`]).
+const INSTANCE_STRUCTURE_LIST_PROPERTIES: &[(&str, &[StructureMember])] = &[
+    ("BlockDeviceMappings", BLOCK_DEVICE_MAPPING_MEMBERS),
+    ("ElasticGpuSpecifications", ELASTIC_GPU_MEMBERS),
+    ("ElasticInferenceAccelerators", ELASTIC_INFERENCE_MEMBERS),
+    ("Ipv6Addresses", IPV6_ADDRESS_MEMBERS),
+    ("LicenseSpecifications", LICENSE_SPECIFICATION_MEMBERS),
+];
+
+/// The element name `ec2Query` flattens one of this type's LIST properties under: the
+/// `xmlName` `RunInstances` declares for that member, and the member's own name where it
+/// declares none.
+///
+/// The sibling writer's table ([`ec2_list_element`]) answers that question for every list both
+/// calls declare — the block device mappings, the two accelerator lists and the license
+/// specifications are flattened identically on each — so it is read rather than re-stated, and
+/// only the ONE member the two shapes spell differently is named here:
+/// `RunInstancesRequest$Ipv6Addresses` carries `xmlName: Ipv6Address`
+/// (`smithy_query(query="operation",operation="RunInstances")`), where the launch template's
+/// same-named list carries none.
+fn list_element(property: &str) -> &str {
+    match property {
+        "Ipv6Addresses" => "Ipv6Address",
+        other => ec2_list_element(other),
+    }
+}
 
 /// The published members of the type's `LaunchTemplate` property, each the member of
 /// `RunInstances`'s own `LaunchTemplateSpecification` it travels as.
@@ -260,6 +466,37 @@ pub(super) async fn create(
     // that template, so the launch carries it ([`launch_template_parameters`]) and Amazon EC2
     // merges the template's parameters with the ones the declaration states itself.
     parameters.extend(launch_template_parameters(resource)?);
+    // The properties that are STRUCTURES of that call — the metadata, CPU, credit, enclave,
+    // hibernation and private-DNS options — each read against the members the type publishes
+    // and written by the shared ec2Query writer.
+    for (property, members) in INSTANCE_STRUCTURE_PROPERTIES {
+        let Some(declared) = declared_value(resource, property) else {
+            continue;
+        };
+        let sent = published_structure(resource, property, declared, members)?;
+        push_ec2_member(&mut parameters, "", property, &sent, 0)?;
+    }
+    // The properties that are LISTS OF STRUCTURES on that call — the block device mappings,
+    // the IPv6 addresses, the license specifications and the two accelerator lists — each
+    // entry read the same way and the list flattened under the element name that call gives
+    // it ([`list_element`]).
+    for (property, members) in INSTANCE_STRUCTURE_LIST_PROPERTIES {
+        let declared = declared_list_entries(resource, property);
+        if declared.is_empty() {
+            continue;
+        }
+        let mut sent = Vec::with_capacity(declared.len());
+        for entry in &declared {
+            sent.push(published_structure(resource, property, entry, members)?);
+        }
+        push_ec2_member(
+            &mut parameters,
+            "",
+            list_element(property),
+            &Value::Array(sent),
+            0,
+        )?;
+    }
     // "The network interfaces to associate with the instance": each entry is one interface of
     // `RunInstances`'s own `NetworkInterfaces` list ([`interface_parameters`]), which is how a
     // template puts an instance on a chosen subnet with chosen security groups and a public
@@ -635,6 +872,88 @@ fn interface_parameters(resource: &StoredResource) -> Result<Vec<(String, String
         }
     }
     Ok(parameters)
+}
+
+/// The declared value of `property`, or `None` where the declaration states none — a property
+/// left out, and one stated as `null`, are the same thing to CloudFormation.
+fn declared_value<'a>(resource: &'a StoredResource, property: &str) -> Option<&'a Value> {
+    resource
+        .properties
+        .get(property)
+        .filter(|value| !value.is_null())
+}
+
+/// The entries of a declared LIST property, in the order the declaration states them.
+///
+/// A declaration that writes a single entry without the sequence syntax is the one-entry list
+/// of itself, which is how CloudFormation reads a list property
+/// ([`interface_parameters`] reads its own list the same way).
+fn declared_list_entries(resource: &StoredResource, property: &str) -> Vec<Value> {
+    match declared_value(resource, property) {
+        None => Vec::new(),
+        Some(Value::Array(entries)) => entries
+            .iter()
+            .filter(|entry| !entry.is_null())
+            .cloned()
+            .collect(),
+        Some(single) => vec![single.clone()],
+    }
+}
+
+/// One declared STRUCTURE read against the members the resource type publishes for it: the
+/// same structure under the names the CALL takes those members by, which the shared ec2Query
+/// writer then flattens ([`push_ec2_member`]).
+///
+/// The walk runs over the CATALOGUE rather than over the declaration, so its depth is the
+/// depth of the shape the call publishes however deeply a declaration nests; the writer bounds
+/// the declaration's own depth.
+///
+/// A member outside `members` is REFUSED naming it, for the reason
+/// [`refuse_unmapped_properties`] records: an instance launched without what one of its
+/// declared options asked for is not the instance the template declared. `property` names the
+/// property the structure belongs to, so the refusal says which declaration it came from.
+fn published_structure(
+    resource: &StoredResource,
+    property: &str,
+    declared: &Value,
+    members: &[StructureMember],
+) -> Result<Value, Refusal> {
+    let Some(stated) = declared.as_object() else {
+        return Err(Refusal {
+            code: "InvalidRequest".to_string(),
+            message: format!(
+                "the {property} property of {} is a structure of the members its property \
+                 type publishes",
+                resource.resource_type
+            ),
+        });
+    };
+    let mut sent = ::serde_json::Map::new();
+    for (stated_member, value) in stated {
+        if value.is_null() {
+            continue;
+        }
+        let Some(published) = members
+            .iter()
+            .find(|published| published.property == stated_member)
+        else {
+            return Err(Refusal {
+                code: "NotImplemented".to_string(),
+                message: format!(
+                    "this emulator does not apply the {stated_member} member of the \
+                     {property} property of {}",
+                    resource.resource_type
+                ),
+            });
+        };
+        let read = match published.fixed {
+            Some(text) => Value::String(text.to_string()),
+            None if published.nested.is_empty() => value.clone(),
+            None => published_structure(resource, property, value, published.nested)?,
+        };
+        sent.insert(published.sent.to_string(), read);
+    }
+    Ok(Value::Object(sent))
 }
 
 /// One member of a declared STRUCTURE — an interface entry, a launch template specification —

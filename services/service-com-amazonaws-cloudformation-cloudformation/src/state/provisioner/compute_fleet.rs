@@ -91,7 +91,12 @@ const LAUNCH_TEMPLATE_RESOURCE_TYPE: &str = "launch-template";
 /// an `xmlName` is flattened under THAT name (`SecurityGroupIds` -> `SecurityGroupId.1`,
 /// `BlockDeviceMappings` -> `BlockDeviceMapping.1`), which is the protocol's rule, and one
 /// carrying none under its own (`Ipv6Addresses.1.Ipv6Address`).
-fn ec2_list_element(member: &str) -> &str {
+///
+/// `pub(in crate::state)` because the arm that launches an `AWS::EC2::Instance`
+/// (`crate::state::provisioning::ec2_instance`) writes the same protocol for the same
+/// service's `RunInstances`, so the element names and the writer below are shared rather than
+/// spelled a second way.
+pub(in crate::state) fn ec2_list_element(member: &str) -> &str {
     match member {
         "BlockDeviceMappings" => "BlockDeviceMapping",
         "ElasticGpuSpecifications" => "ElasticGpuSpecification",
@@ -119,7 +124,8 @@ fn ec2_list_element(member: &str) -> &str {
 /// top level of a request). The walk is bounded by [`MAX_PROPERTY_NESTING`] for the reason
 /// that constant records: the document comes from a caller-supplied template, so one nested
 /// past the bound is REFUSED rather than walked or quietly truncated.
-fn push_ec2_member(
+/// `pub(in crate::state)` for the reason [`ec2_list_element`] records.
+pub(in crate::state) fn push_ec2_member(
     parameters: &mut Vec<(String, String)>,
     prefix: &str,
     member: &str,
