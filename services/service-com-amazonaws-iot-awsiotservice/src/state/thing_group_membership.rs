@@ -134,6 +134,8 @@ pub fn dynamic_group_things_unknown_message(thing_group_name: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MembershipRefusal {
     /// The request named a thing group this account does not hold; carries the name.
+    /// Worded as the MEMBERSHIP plane words that miss
+    /// ([`super::not_found::membership_missing_thing_group_message`]).
     MissingThingGroup(String),
     /// The request named a thing the registry does not hold; carries the name.
     MissingThing(String),
@@ -157,7 +159,7 @@ impl MembershipRefusal {
     pub fn message(&self) -> String {
         match self {
             Self::MissingThingGroup(thing_group_name) => {
-                super::not_found::missing_thing_group_message(thing_group_name)
+                super::not_found::membership_missing_thing_group_message(thing_group_name)
             }
             Self::MissingThing(thing_name) => {
                 super::not_found::missing_thing_message(thing_name)

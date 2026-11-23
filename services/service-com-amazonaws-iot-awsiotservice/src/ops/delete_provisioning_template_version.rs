@@ -166,9 +166,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DeleteProvisioningTemplateVersionErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
+                        // A DELETE states what it could not do rather than the pair it
+                        // could not resolve, so the version is named and the template is
+                        // not — the wording of the LOOKUP of one version
+                        // ([`crate::state::provisioning_templates::missing_template_version_message`])
+                        // belongs to the operations that resolve that pair, not here.
                         message: Some(
-                            crate::state::provisioning_templates::missing_template_version_message(
-                                &input.template_name,
+                            crate::state::provisioning_templates::undeletable_template_version_message(
                                 input.version_id,
                             ),
                         ),

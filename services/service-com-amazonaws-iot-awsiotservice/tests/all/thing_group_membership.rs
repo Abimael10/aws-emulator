@@ -361,14 +361,20 @@ async fn a_membership_between_records_that_do_not_exist_is_refused() {
             json!({ "thingGroupName": "no-such-fleet", "thingName": "sensor-a" }),
             404,
             "ResourceNotFoundException",
-            format!("ThingGroup {ACCOUNT_ID}:no-such-fleet not found."),
+            format!(
+                "Cannot find requested thing group for accountId: {ACCOUNT_ID} and thing group \
+                 name: no-such-fleet"
+            ),
         ),
         (
             "a thing group ARN the registry does not hold",
             json!({ "thingGroupArn": thing_group_arn("no-such-fleet"), "thingName": "sensor-a" }),
             404,
             "ResourceNotFoundException",
-            format!("ThingGroup {ACCOUNT_ID}:no-such-fleet not found."),
+            format!(
+                "Cannot find requested thing group for accountId: {ACCOUNT_ID} and thing group \
+                 name: no-such-fleet"
+            ),
         ),
         (
             "a thing the registry does not hold",
@@ -1085,7 +1091,10 @@ async fn a_refused_bulk_update_changes_no_membership() {
             json!({ "thingName": "sensor-a", "thingGroupsToAdd": ["beta", "no-such-fleet"] }),
             404,
             "ResourceNotFoundException",
-            format!("ThingGroup {ACCOUNT_ID}:no-such-fleet not found."),
+            format!(
+                "Cannot find requested thing group for accountId: {ACCOUNT_ID} and thing group \
+                 name: no-such-fleet"
+            ),
         ),
         (
             "a group to leave the registry does not hold",
@@ -1096,7 +1105,10 @@ async fn a_refused_bulk_update_changes_no_membership() {
             }),
             404,
             "ResourceNotFoundException",
-            format!("ThingGroup {ACCOUNT_ID}:no-such-fleet not found."),
+            format!(
+                "Cannot find requested thing group for accountId: {ACCOUNT_ID} and thing group \
+                 name: no-such-fleet"
+            ),
         ),
         (
             "a group to join whose membership is its query's",

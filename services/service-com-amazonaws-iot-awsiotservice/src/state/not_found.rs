@@ -35,9 +35,11 @@
 //!   ([`fleet_metric_write_not_found_message`]) — `FleetMetric <metricName> doesn't exist`,
 //!   which is what `UpdateFleetMetric` answers;
 //! * the THING GROUP family, whose operations addressing the GROUP state the registry
-//!   families' sentence ([`missing_thing_group_message`]) while the operations addressing a
+//!   families' sentence ([`missing_thing_group_message`]), while the operations addressing a
 //!   resource by ARN alone — the tagging plane — state
-//!   [`tagged_thing_group_not_found_message`].
+//!   [`tagged_thing_group_not_found_message`] and the operations that write a THING's
+//!   membership of a group state
+//!   [`membership_missing_thing_group_message`].
 //!
 //! A family is split here only on that evidence, never to let a handler phrase a miss its
 //! own way: a handler names the half it answers with and words nothing itself.
@@ -70,6 +72,26 @@ pub fn missing_thing_message(thing_name: &str) -> String {
 /// holds — for a reader of one, a writer of one, and for a job whose target named it.
 pub fn missing_thing_group_message(thing_group_name: &str) -> String {
     registry_not_found("ThingGroup", thing_group_name)
+}
+
+/// How the MEMBERSHIP plane states that a request named no thing group this account holds.
+///
+/// The operations that write which groups a THING belongs to — `AddThingToThingGroup`,
+/// `RemoveThingFromThingGroup` and `UpdateThingGroupsForThing` — state this family's miss
+/// as the lookup they make rather than as a read of the group: the fixed text says the
+/// requested group could not be found, and the variable parts are the two things that
+/// identify a group, the account the call was made for and the name the request asked
+/// about. The operations that address the group RECORD state the registry families'
+/// sentence instead ([`missing_thing_group_message`]).
+///
+/// The account id is this emulator's own ([`engine::emulator_account_id`]), the account
+/// every record this service holds belongs to.
+pub fn membership_missing_thing_group_message(thing_group_name: &str) -> String {
+    format!(
+        "Cannot find requested thing group for accountId: {} and thing group name: \
+         {thing_group_name}",
+        ::engine::emulator_account_id()
+    )
 }
 
 /// How the TAG plane states that a `resourceArn` names no thing group this account holds.

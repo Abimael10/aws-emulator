@@ -132,13 +132,32 @@ pub fn missing_template_for_version_message(template_name: &str) -> String {
 pub const UNDELETABLE_MISSING_TEMPLATE_MESSAGE: &str =
     "Unable to delete template, template not found";
 
-/// The message a reader of ONE VERSION of a template refuses a `versionId` the
-/// template does not hold with.
+/// The message the operations that LOOK UP one version of a template refuse a `versionId`
+/// the template does not hold with: the reader of one version, and the re-pointing of the
+/// version in effect (`UpdateProvisioningTemplate$defaultVersionId`).
 ///
-/// The fixed text is the family's, and the variable parts are the version and the
-/// template the request named.
+/// A lookup states the PAIR that identifies a version — the id the request carried and the
+/// template it was looked for within — because what it could not resolve is that pair. The
+/// DELETE of one states what it could not do instead, naming the version alone
+/// ([`undeletable_template_version_message`]), the way the delete of a TEMPLATE states its
+/// own miss rather than the reader's ([`UNDELETABLE_MISSING_TEMPLATE_MESSAGE`]). Both
+/// wordings are requirements of the operations that answer them, so the two sit beside each
+/// other here rather than one being reused for the other.
 pub fn missing_template_version_message(template_name: &str, version_id: i32) -> String {
     format!("Unable to find a template version with ID {version_id} for template {template_name}")
+}
+
+/// The message a DELETE of one version of a template refuses a `versionId` the template
+/// does not hold with.
+///
+/// A delete states what it could not DO rather than the pair it could not resolve, so the
+/// ONE variable part is the version the request named and the template is not named — the
+/// same shape the delete of a TEMPLATE takes against the reader of one
+/// ([`UNDELETABLE_MISSING_TEMPLATE_MESSAGE`] against
+/// [`missing_provisioning_template_message`]). The lookup's wording is
+/// [`missing_template_version_message`].
+pub fn undeletable_template_version_message(version_id: i32) -> String {
+    format!("Unable to find template version {version_id}")
 }
 
 /// How this service refuses the delete of the version a template is PROVISIONING
