@@ -754,7 +754,11 @@ fn period_account(index: usize) -> String {
 /// every resource of this store stands in the period it was created in and in every later
 /// one: so the sequence this month holds is the same one the current month holds, whatever
 /// month the suite runs in.
-fn two_spelling_period() -> String {
+///
+/// `pub(crate)` because the sibling suite `tests/all/association_token_period_scope.rs`
+/// names the two spellings of the same month, off the same clock, rather than re-spelling
+/// this.
+pub(crate) fn two_spelling_period() -> String {
     (0..12)
         .map(period)
         .find(|billing_period| {
@@ -1001,12 +1005,14 @@ async fn period_scoped_fixture() -> World {
     // cases vary; `mints` says whether the read's own `MaxResults` can ask for a page
     // smaller than the server's.
     //
-    // The reads NOT here are the ones whose sequence no billing period shapes:
-    // `ListCustomLineItemVersions` (no `BillingPeriod` member at all) and
+    // The reads NOT here are `ListCustomLineItemVersions`, whose sequence no billing period
+    // shapes (it models no `BillingPeriod` member at all), and the two association reads
     // `ListPricingRulesAssociatedToPricingPlan` /
-    // `ListPricingPlansAssociatedWithPricingRule`, whose elements are the associated ARNs
-    // themselves — the period selects which of them are reported without changing what one
-    // element is or what its cursor key spells.
+    // `ListPricingPlansAssociatedWithPricingRule`, which ARE answered for one month and are
+    // driven over the same crossings by `tests/all/association_token_period_scope.rs`
+    // instead: the resource their sequence belongs to exists in no period before the one it
+    // was created in, so the rows below that read an EARLIER month are answered 404 for
+    // them before any token is looked at.
     let reads = vec![
         Read {
             operation: "ListBillingGroups",

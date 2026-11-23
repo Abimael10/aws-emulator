@@ -220,10 +220,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The plan ARN is both the element and its page key: the sequence is ordered
         // by ARN, so the `NextToken` handed back names the first plan left out and
         // resuming from it skips exactly the plans already reported.
+        //
+        // The read is ANSWERED FOR one billing period, so the month travels in the
+        // scope of the token a truncated page mints beside the rule the read is within
+        // (`crate::state::page_scope_in_period`): the period decides which
+        // associations were in force and so which sequence of plan ARNs is walked, and
+        // a cursor into one month's sequence names no position in another's, so a
+        // token handed back under a different month is refused rather than read as a
+        // cut point that silently drops the plans sorting below it.
         let keyed: Vec<(String, String)> =
             plan_arns.into_iter().map(|arn| (arn.clone(), arn)).collect();
         let (page, next_token) = crate::state::paginate(
-            &crate::state::page_scope_within(Self::NAME, &pricing_rule_arn),
+            &crate::state::page_scope_in_period(
+                Self::NAME,
+                Some(&pricing_rule_arn),
+                &billing_period,
+            ),
             keyed,
             input.next_token.as_deref(),
             input.max_results,
