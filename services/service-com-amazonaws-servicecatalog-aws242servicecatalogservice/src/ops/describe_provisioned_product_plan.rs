@@ -174,10 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     DescribeProvisionedProductPlanErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
-                            message: Some(crate::state::not_found_message(
-                                crate::state::KIND_PROVISIONED_PRODUCT_PLAN,
-                                &input.plan_id,
-                            )),
+                            message: Some(crate::state::plan_not_found_message(&input.plan_id)),
                         },
                     )
                     .into(),

@@ -940,8 +940,16 @@ pub const PLAN_STATUS_CREATE_SUCCESS: &str = "CREATE_SUCCESS";
 /// plan's status message is the reason CloudFormation gave.
 pub const PLAN_STATUS_CREATE_FAILED: &str = "CREATE_FAILED";
 
-/// The resource kind a plan is, as its not-found names it.
-pub const KIND_PROVISIONED_PRODUCT_PLAN: &str = "Plan";
+/// The sentence a read of a plan refuses a plan id that resolves to no stored plan
+/// with: this service words a missing plan by the identifier the request addressed it
+/// by, which is the only variable part — the rest is fixed text.
+///
+/// Deliberately NOT the generic [`not_found_message`] every other lookup in this
+/// service reports: a plan's own refusal is worded this way, so the plan reads share
+/// this sentence rather than the service-wide default.
+pub fn plan_not_found_message(plan_id: &str) -> String {
+    format!("No plan with ID {plan_id} exists.")
+}
 
 /// The `ProvisionedProductStatus` values an EXISTING provisioned product must be in
 /// for a plan to be created for it: "to create a plan for an existing provisioned

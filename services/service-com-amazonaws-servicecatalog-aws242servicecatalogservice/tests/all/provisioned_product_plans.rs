@@ -1053,7 +1053,7 @@ async fn a_plan_request_naming_an_unresolved_resource_is_refused() {
             operation: "DescribeProvisionedProductPlan",
             request: |_| json!({"PlanId": "plan-00000000nope"}),
             code: "ResourceNotFoundException",
-            message: "Plan not found: plan-00000000nope",
+            message: "No plan with ID plan-00000000nope exists.",
         },
     ];
 
