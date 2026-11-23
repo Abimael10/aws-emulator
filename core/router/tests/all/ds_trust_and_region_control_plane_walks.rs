@@ -18,8 +18,11 @@
 //! has, leaves the whole description exactly as it was, in service rather than being torn
 //! down, and is refused again the same way because nothing moved; and the operation the
 //! documentation names instead ("You cannot remove the primary Region with this operation.
-//! Instead, use the DeleteDirectory API") is what takes the directory away, through the
-//! teardown's `Deleting` to the modelled chain's terminal `Deleted` and then out of the store.
+//! Instead, use the DeleteDirectory API") is what takes the directory away — a teardown that
+//! runs INSIDE the call, so the first read after it finds the id naming no directory of the
+//! account at all, which is the rule the owning crate states and its own suite pins
+//! (`services/service-com-amazonaws-directoryservice-directoryservice-20150416`:
+//! `src/state/directory_deletion.rs`, `tests/all/directory_deletion.rs`).
 //!
 //! RULE 2 (the trust walk): a trust id names ONE relationship for as long as this service
 //! holds it, and every state of the modelled `TrustState` chain is reached by the clock alone
@@ -499,9 +502,10 @@ async fn a_refused_region_removal_is_inert_and_delete_directory_takes_the_direct
              {again:?}"
         );
 
-        // The operation the documentation names instead is what takes the directory away. It
-        // answers while the teardown is still running, which is what a client that reads the
-        // directory straight after the call observes.
+        // The operation the documentation names instead is what takes the directory away. Its
+        // teardown runs inside the call — everything the directory was given is released in
+        // the services that own it before the answer — so a client that reads the directory
+        // straight afterwards finds the account holding it no longer.
         let deleted = ds_ok(
             &router,
             "DeleteDirectory",
@@ -516,34 +520,18 @@ async fn a_refused_region_removal_is_inert_and_delete_directory_takes_the_direct
              {deleted}"
         );
         assert_eq!(
-            stage(&router, directory_id, case).await.as_deref(),
-            Some(STAGE_DELETING),
-            "case {case:?}: expected the teardown's first stage straight after the delete"
+            stage(&router, directory_id, case).await,
+            None,
+            "case {case:?}: expected the delete to have taken the directory away in the call"
         );
-
-        // The stage after that one is the terminal stage of the modelled chain, reached by the
-        // clock alone — the polls only read — and the end of the teardown is the record
-        // leaving the store.
-        let settled = poll_until(
-            case,
-            &format!("{directory_id} to leave {STAGE_DELETING}"),
-            || stage(&router, directory_id, case),
-            |observed: &Option<String>| observed.as_deref() != Some(STAGE_DELETING),
-        )
-        .await;
+        // And it stays away: nothing of the record is left for the clock to finish, so a
+        // second read reports the same absence rather than a stage of a teardown still
+        // running.
         assert_eq!(
-            settled.as_deref(),
-            Some(STAGE_DELETED),
-            "case {case:?}: expected the teardown to settle on the chain's terminal stage, got \
-             {settled:?}"
+            stage(&router, directory_id, case).await,
+            None,
+            "case {case:?}: expected the directory to stay away after the delete"
         );
-        poll_until(
-            case,
-            &format!("{directory_id} to leave the store"),
-            || stage(&router, directory_id, case),
-            |observed: &Option<String>| observed.is_none(),
-        )
-        .await;
     }
 }
 

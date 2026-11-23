@@ -298,25 +298,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The `EventTime` of an update is the value the group's own
         // `EventTimeFeatureName` carries among the posted features — the runtime API has
         // no separate member for it — and "If you omit EventTime, the service keeps the
-        // record's existing EventTime and applies the update."
+        // record's existing EventTime and applies the update." The feature is read for
+        // the one value it states ([`crate::state::held_scalar_feature`]), the same
+        // reading every whole-record write of this data plane makes, so a value in a form
+        // this plane cannot read as an event time is refused here too.
         let event_time_feature_name = definition.event_time_feature_name.clone();
-        let posted_event_time = match posted_features
-            .iter()
-            .copied()
-            .find(|feature| feature.feature_name == event_time_feature_name)
-        {
-            None => None,
-            Some(FeatureValue {
-                value_as_string: Some(value),
-                ..
-            }) => Some(value.clone()),
-            Some(_) => {
-                return Err(validation(format!(
-                    "EventTime: the event time feature '{event_time_feature_name}' must carry \
-                     ValueAsString, not ValueAsStringList"
-                )))
-            }
-        };
+        let posted_event_time =
+            match crate::state::held_scalar_feature(&posted_features, &event_time_feature_name) {
+                crate::state::ScalarFeature::Absent => None,
+                crate::state::ScalarFeature::Value(value) => Some(value.to_owned()),
+                crate::state::ScalarFeature::Unreadable => {
+                    return Err(validation(crate::state::event_time_not_scalar(
+                        &event_time_feature_name,
+                    )))
+                }
+            };
 
         // "If you specify a TtlDuration, you must also provide an EventTime in the
         // request. Otherwise, the operation returns a ValidationError." (`ExpiresAt` is
@@ -351,9 +347,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(at) => match crate::state::parse_event_time_secs(at) {
                 Some(secs) => Some(secs),
                 None => {
-                    return Err(validation(format!(
-                        "EventTime: the event time feature '{event_time_feature_name}' must \
-                         carry an ISO-8601 timestamp or seconds since the epoch, not '{at}'"
+                    return Err(validation(crate::state::event_time_not_timestamp(
+                        &event_time_feature_name,
+                        at,
                     )))
                 }
             },
@@ -431,10 +427,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "Updates one or more feature values for an existing record… Features that
             // you do not include in the request remain unchanged": each posted feature
             // replaces the stored value of the feature it names, in place, and a feature
-            // the record does not carry yet is added — up to the store's per-record
-            // capacity bound, which is this operation's to respect because it is the only
-            // one that GROWS a record (`PutRecord` replaces a record's features
-            // wholesale).
+            // the record does not carry yet is added. The store's per-record capacity
+            // bound is read where the merged record is COMMITTED
+            // (`crate::state::FeatureGroupStore::insert_record`, the one place every write
+            // of this store passes), so a merge that would grow a record past it is
+            // refused there with the one wording of a store that is full — this loop
+            // states no bound of its own.
             for posted in posted_features.iter().copied() {
                 let value = crate::state::StoredFeatureValue::from(posted);
                 match updated
@@ -444,13 +442,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 {
                     Some(held) => *held = value,
                     None => {
-                        if updated.features.len() >= crate::state::MAX_FEATURES_PER_RECORD {
-                            return Err(at_capacity(format!(
-                                "record '{identifier}' of feature group '{key}' already holds \
-                                 {} feature values",
-                                crate::state::MAX_FEATURES_PER_RECORD
-                            )));
-                        }
                         updated.features.push(value);
                     }
                 }
@@ -488,10 +479,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // the group; the capacity answer is kept all the same, so a future change
                 // to the store cannot turn a refused write into a silent success.
                 if !group.insert_record(updated) {
-                    return Err(at_capacity(format!(
-                        "the online store of feature group '{key}' already holds {} records",
-                        crate::state::MAX_RECORDS_PER_GROUP
-                    )));
+                    return Err(at_capacity(crate::state::at_capacity_message(&key)));
                 }
             }
             offline_row

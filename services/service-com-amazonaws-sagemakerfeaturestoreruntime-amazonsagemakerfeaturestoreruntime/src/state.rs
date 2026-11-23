@@ -171,9 +171,17 @@ impl FeatureGroupStore {
 
     /// Store `record`, over-writing any record with the same identifier.
     ///
-    /// `false` — nothing stored — when the record is new and the group already holds
-    /// [`MAX_RECORDS_PER_GROUP`].
+    /// `false` — nothing stored — for a write this bounded store has no room for: the record
+    /// is new and the group already holds [`MAX_RECORDS_PER_GROUP`] of them, or the record
+    /// itself carries more than [`MAX_FEATURES_PER_RECORD`] feature values. Both bounds are
+    /// read HERE, the one place every write of this store commits through — a whole-record
+    /// write and a merge alike — so no path can store past a bound this module states, and
+    /// the caller answers either with the one wording of a store that is full
+    /// ([`at_capacity_message`]).
     pub fn insert_record(&mut self, record: StoredRecord) -> bool {
+        if record.features.len() > MAX_FEATURES_PER_RECORD {
+            return false;
+        }
         let is_new = !self.records.contains_key(&record.identifier);
         if is_new && self.records.len() >= MAX_RECORDS_PER_GROUP {
             return false;
@@ -443,6 +451,95 @@ pub fn held_feature_values(
     held
 }
 
+/// What a request states for a feature whose value is ONE value — the form the two
+/// features a feature group's definition fixes are declared in ([`held_scalar_feature`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarFeature<'a> {
+    /// The request names the feature nowhere, so it states no value for it.
+    Absent,
+    /// The one value the request states for it.
+    Value(&'a str),
+    /// The request DOES name the feature, but not with a value this plane can read as one
+    /// value: in `ValueAsStringList`, or in neither value member at all.
+    Unreadable,
+}
+
+/// The value a request states for `feature_name`, out of the values it HOLDS
+/// ([`held_feature_values`]), for a feature whose `CollectionType` is `None`.
+///
+/// `ValueAsString` is "The value in string format associated with a feature. Used when
+/// your CollectionType is None", while `ValueAsStringList` is "Used when your
+/// CollectionType is a List, Set, or Vector". The two features a feature group's
+/// definition fixes are both of the first kind — a record identifier is one value and an
+/// event time is one timestamp — so the value a request states for either is read from
+/// `ValueAsString`, and a value the request puts anywhere else is
+/// [`ScalarFeature::Unreadable`]: the caller refuses it, which is never the same answer as
+/// the request stating no value for the feature at all ([`ScalarFeature::Absent`]).
+pub fn held_scalar_feature<'a>(
+    held: &[&'a crate::ops::types::FeatureValue],
+    feature_name: &str,
+) -> ScalarFeature<'a> {
+    match held
+        .iter()
+        .copied()
+        .find(|feature| feature.feature_name == feature_name)
+    {
+        None => ScalarFeature::Absent,
+        Some(crate::ops::types::FeatureValue {
+            value_as_string: Some(value),
+            ..
+        }) => ScalarFeature::Value(value),
+        Some(_) => ScalarFeature::Unreadable,
+    }
+}
+
+/// The refusal every write of this data plane answers for the group's RECORD-IDENTIFIER
+/// feature carrying no value this plane can read as one value
+/// ([`ScalarFeature::Unreadable`]) — a value in `ValueAsStringList`, or in neither value
+/// member, which is why the wording states the member the value has to be in rather than the
+/// one a request happened to use.
+pub fn identifier_not_scalar(identifier_feature_name: &str) -> String {
+    format!(
+        "the record identifier feature '{identifier_feature_name}' must carry its value in \
+         ValueAsString"
+    )
+}
+
+/// The refusal every write of this data plane answers for the group's EVENT-TIME feature
+/// carrying no value this plane can read as one value ([`ScalarFeature::Unreadable`]):
+/// stated once here, so a whole-record write and a partial update refuse the same posted
+/// value the same way.
+pub fn event_time_not_scalar(event_time_feature_name: &str) -> String {
+    format!(
+        "EventTime: the event time feature '{event_time_feature_name}' must carry its value \
+         in ValueAsString"
+    )
+}
+
+/// The refusal every write of this data plane answers for an event time it CAN read as one
+/// value but which states no instant ([`parse_event_time_secs`]).
+pub fn event_time_not_timestamp(event_time_feature_name: &str, value: &str) -> String {
+    format!(
+        "EventTime: the event time feature '{event_time_feature_name}' must carry an \
+         ISO-8601 timestamp or seconds since the epoch, not '{value}'"
+    )
+}
+
+/// How this store states a write it has no room for ([`FeatureGroupStore::insert_record`]):
+/// both bounds a write of one record of the feature group `group` can pass, so a caller never
+/// has to tell the client which of the two it was and the wording is one.
+///
+/// Answered with the modelled `ServiceUnavailable` (503), not a `ValidationError`: the request
+/// is well-formed and it is this emulator's bounded store that is out of room, so it is not
+/// reported to the caller as its own mistake.
+pub fn at_capacity_message(group: &str) -> String {
+    format!(
+        "the online store of feature group '{group}' is at capacity: it holds at most \
+         {MAX_RECORDS_PER_GROUP} records, each of at most {MAX_FEATURES_PER_RECORD} feature \
+         values"
+    )
+}
+
 /// Read one posted record against the DEFINITION of the feature group it is written to.
 ///
 /// The two names the record is read through are the group's own, as the control plane
@@ -471,22 +568,10 @@ pub fn prepare_record(
     let held = held_feature_values(record);
 
     let identifier_feature_name = &definition.record_identifier_feature_name;
-    let identifier = match held
-        .iter()
-        .copied()
-        .find(|feature| feature.feature_name == *identifier_feature_name)
-    {
-        Some(crate::ops::types::FeatureValue {
-            value_as_string: Some(value),
-            ..
-        }) => value.clone(),
-        Some(_) => {
-            return Err(format!(
-                "the record identifier feature '{identifier_feature_name}' must carry \
-                 ValueAsString, not ValueAsStringList"
-            ))
-        }
-        None => {
+    let identifier = match held_scalar_feature(&held, identifier_feature_name) {
+        ScalarFeature::Value(value) => value.to_owned(),
+        ScalarFeature::Unreadable => return Err(identifier_not_scalar(identifier_feature_name)),
+        ScalarFeature::Absent => {
             return Err(format!(
                 "Record is missing the record identifier feature \
                  '{identifier_feature_name}' of feature group '{}'",
@@ -498,13 +583,16 @@ pub fn prepare_record(
     // A record that carries no value for the group's event-time feature has no event time
     // to compute an expiry from, and none to be ordered by either: such a write is not
     // greater than any record the group holds, so [`FeatureGroupStore::ingest`] treats it
-    // as historic rather than letting it replace one.
+    // as historic rather than letting it replace one. A record that DOES carry the feature
+    // is read for the one value it states ([`held_scalar_feature`]): a value in a form
+    // this plane cannot read as an event time is refused, never read as a record that
+    // states none.
     let event_time_feature_name = &definition.event_time_feature_name;
-    let event_time = held
-        .iter()
-        .copied()
-        .find(|feature| feature.feature_name == *event_time_feature_name)
-        .and_then(|feature| feature.value_as_string.clone());
+    let event_time = match held_scalar_feature(&held, event_time_feature_name) {
+        ScalarFeature::Value(value) => Some(value.to_owned()),
+        ScalarFeature::Unreadable => return Err(event_time_not_scalar(event_time_feature_name)),
+        ScalarFeature::Absent => None,
+    };
 
     // An event time the group identified must be a timestamp: the TTL and the
     // historic-record rule are both computed from it, so a value in neither accepted
@@ -512,12 +600,7 @@ pub fn prepare_record(
     let event_time_secs = match event_time.as_deref() {
         Some(at) => match parse_event_time_secs(at) {
             Some(secs) => Some(secs),
-            None => {
-                return Err(format!(
-                    "EventTime: the event time feature '{event_time_feature_name}' must carry \
-                     an ISO-8601 timestamp or seconds since the epoch, not '{at}'"
-                ))
-            }
+            None => return Err(event_time_not_timestamp(event_time_feature_name, at)),
         },
         None => None,
     };
@@ -669,13 +752,27 @@ fn event_time_order(event_time_secs: Option<f64>) -> f64 {
     event_time_secs.unwrap_or(f64::NEG_INFINITY)
 }
 
+/// The epoch-seconds window an ISO-8601 date-time states, and so the only one a
+/// [`DateTime`] is built for ([`iso8601`]): `Format::DateTime` writes a four-digit year, so
+/// the window runs from `0001-01-01T00:00:00Z` to `9999-12-31T23:59:59Z`.
+const EARLIEST_STATABLE_SECS: f64 = -62_135_596_800.0;
+const LATEST_STATABLE_SECS: f64 = 253_402_300_799.0;
+
 /// `secs` as the ISO-8601 string an `ExpiresAt` carries.
 ///
-/// `Err` for an instant [`DateTime`] cannot format: one outside the range a timestamp can
-/// state. An event time plus a `TtlDuration` reaches that range — see [`derived_expiry`],
-/// the one caller, for what a record whose expiry lands there is stored with.
-fn iso8601(secs: f64) -> Result<String, aws_smithy_types::date_time::DateTimeFormatError> {
-    DateTime::from_secs_f64(secs).fmt(Format::DateTime)
+/// `None` for an instant outside the window a timestamp can state
+/// ([`EARLIEST_STATABLE_SECS`] to [`LATEST_STATABLE_SECS`]), which is checked BEFORE any
+/// `DateTime` is built from it: an event-time feature carries any finite number of seconds
+/// since the epoch and a `TtlDuration` is added to it, so the sum reaching here is of a
+/// magnitude a request chooses, while the construction of a `DateTime` is defined only for an
+/// instant it can hold. An instant outside the window therefore has no `ExpiresAt` spelling —
+/// see [`derived_expiry`], the one caller, for what a record whose expiry lands there is
+/// stored with.
+fn iso8601(secs: f64) -> Option<String> {
+    if !(EARLIEST_STATABLE_SECS..=LATEST_STATABLE_SECS).contains(&secs) {
+        return None;
+    }
+    DateTime::from_secs_f64(secs).fmt(Format::DateTime).ok()
 }
 
 /// `EventTime + TtlDuration` as the TWO spellings a record holds one expiry in: the
@@ -697,7 +794,7 @@ fn derived_expiry(event_time_secs: Option<f64>, ttl_secs: Option<f64>) -> Option
     let at = ttl_secs
         .zip(event_time_secs)
         .map(|(ttl, event_time)| event_time + ttl)?;
-    Some((iso8601(at).ok()?, at))
+    Some((iso8601(at)?, at))
 }
 
 /// The TTL a record of feature group `definition` is under, in seconds: the duration the

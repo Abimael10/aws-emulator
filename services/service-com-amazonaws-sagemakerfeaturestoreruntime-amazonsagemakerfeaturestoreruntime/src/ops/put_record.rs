@@ -270,10 +270,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             match group.ingest(prepared) {
                 crate::state::Ingested::Stored | crate::state::Ingested::Historic => {}
                 crate::state::Ingested::AtCapacity => {
-                    return Err(at_capacity(format!(
-                        "the online store of feature group '{key}' already holds {} records",
-                        crate::state::MAX_RECORDS_PER_GROUP
-                    )))
+                    return Err(at_capacity(crate::state::at_capacity_message(&key)))
                 }
             }
         }
