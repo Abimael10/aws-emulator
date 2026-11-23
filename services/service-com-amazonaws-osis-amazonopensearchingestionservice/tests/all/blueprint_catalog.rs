@@ -50,9 +50,13 @@ const MIN_PUBLISHED_BLUEPRINTS: usize = 7;
 /// caught. Deliberately NOT one of the blueprints the recorded units named.
 const A_PUBLISHED_BLUEPRINT: &str = "AWS-VPCFlowLogPipeline";
 
-/// A published blueprint name has the service's `AWS-<source>Pipeline` form.
+/// A published blueprint name is one the service owns: the `AWS-` prefix it publishes every
+/// blueprint of its own catalog under, followed by what the blueprint is for. The suffix is
+/// NOT fixed — the catalog carries both `AWS-<source>Pipeline` names and names ending in
+/// what the blueprint does to the records (an enrichment, a sampling) — so only the prefix
+/// and a non-empty remainder are the rule here.
 fn is_aws_blueprint_name(name: &str) -> bool {
-    name.starts_with("AWS-") && name.ends_with("Pipeline") && name.len() > "AWS-Pipeline".len()
+    name.strip_prefix("AWS-").is_some_and(|rest| !rest.is_empty())
 }
 
 /// What one call answered: the status and the parsed body.
@@ -183,7 +187,7 @@ async fn listing_reports_every_published_blueprint_with_all_summary_members() {
     for name in &listed_names {
         assert!(
             is_aws_blueprint_name(name),
-            "case {name:?}: a published blueprint is named AWS-<source>Pipeline, got {name:?}"
+            "case {name:?}: a published blueprint is named AWS-<what it is for>, got {name:?}"
         );
     }
     assert!(

@@ -7,6 +7,10 @@
 //! persisted, the pipeline enters `UPDATING`, and the clock owes it the settled status it
 //! was in before the call, so a later `GetPipeline` / `ListPipelines` reports both.
 //!
+//! A change whose `PipelineConfigurationBody` names an IAM role this service cannot take on
+//! ([`crate::state::unassumable_configuration_roles`]) is refused 400 `ValidationException`
+//! before any of it is applied, the same rule a create is judged by.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -164,10 +168,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+
+        // A pipeline this account does not hold is answered before the submitted change is
+        // looked at: the lookup is taken on its own here because the configuration body is
+        // validated against IAM next, which is a call, and no lock is held across it.
+        if !state.lock().pipelines.contains_key(&input.pipeline_name) {
+            return Err(not_found());
+        }
+
+        // The same rule a create is judged by: a configuration body naming an IAM role this
+        // service cannot take on describes a pipeline that could never reach its sources and
+        // sinks, so the change is refused before any of it is applied
+        // (`crate::state::unassumable_configuration_roles`).
+        if let Some(configuration_body) = input.pipeline_configuration_body.as_deref() {
+            if let Some(message) =
+                crate::state::unassumable_configuration_roles(ctx, &region, configuration_body)
+                    .await
+            {
+                return Err(UpdatePipelineErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        }
+
         let mut store = state.lock();
 
         let pipeline_name = input.pipeline_name.clone();

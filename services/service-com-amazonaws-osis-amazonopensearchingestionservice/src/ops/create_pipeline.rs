@@ -8,7 +8,10 @@
 //!
 //! A create whose `Tags` name a key in the namespace AWS keeps for its own tags
 //! ([`crate::state::RESERVED_TAG_KEY_PREFIX`]) is refused 400 `ValidationException` before
-//! the record is built, so no pipeline is minted.
+//! the record is built, so no pipeline is minted. So is one whose
+//! `PipelineConfigurationBody` names an IAM role this service cannot take on
+//! ([`crate::state::unassumable_configuration_roles`]): the pipeline it describes could
+//! never reach that source or sink.
 //!
 //! ## Shape of an operation
 //!
@@ -224,6 +227,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // a reserved key.
                 message: Some(crate::state::reserved_tag_key_message(reserved)),
             })
+            .into());
+        }
+
+        // A configuration body naming an IAM role this service cannot take on describes a
+        // pipeline that could never reach its sources and sinks, so it is refused BEFORE any
+        // record is minted — and asked before the store is locked, because resolving a role
+        // is a call to IAM. `crate::state::unassumable_configuration_roles` states the rule.
+        if let Some(message) = crate::state::unassumable_configuration_roles(
+            ctx,
+            &region,
+            &input.pipeline_configuration_body,
+        )
+        .await
+        {
+            return Err(CreatePipelineErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
             .into());
         }
 

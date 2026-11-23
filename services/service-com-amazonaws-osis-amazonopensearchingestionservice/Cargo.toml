@@ -53,10 +53,17 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one `mod <name>;` per `tests/all/<name>.rs`, so the single integration-test target
+# at `tests/all/main.rs` picks up every suite without a hand-written declaration list.
+automod = { workspace = true }
 # `tests/all/ingest_data_plane.rs` asserts where the records a pipeline's ingestion endpoint
 # accepted really ARRIVE, so the sink bucket is created through the wire of the service that
 # OWNS it and the delivered object is read back through that service's own reader. DEV-ONLY.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
+# `tests/all/configuration_role_validation.rs` asserts WHICH roles a submitted pipeline
+# configuration may name, and that question is IAM's answer about the role, so the roles are
+# created through the wire of the service that OWNS them. DEV-ONLY.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [lints]
 workspace = true

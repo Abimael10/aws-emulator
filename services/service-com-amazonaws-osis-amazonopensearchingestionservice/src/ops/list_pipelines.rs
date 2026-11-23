@@ -3,7 +3,10 @@
 //! @op ListPipelines
 //!
 //! A REPORT: one `PipelineSummary` per stored pipeline, in name order, paginated by the
-//! `@paginated` contract. The only write it makes is the status transition the clock
+//! `@paginated` contract. An account holding no pipeline has exactly one page — the empty
+//! one — so it is answered 200 with an empty list whatever pagination inputs the request
+//! carries; a `NextToken` names a position, so it is read only to resume a listing that has
+//! records. The only write it makes is the status transition the clock
 //! already owed at this instant.
 //!
 //! ## Shape of an operation
@@ -152,18 +155,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let now = ::std::time::SystemTime::now();
 
-        // A `NextToken` this service never minted names no position to resume from, and
-        // this operation models InvalidPaginationTokenException for exactly that.
-        let after = crate::state::decode_cursor(input.next_token.as_deref()).map_err(|_| {
-            ListPipelinesErrorModeled::InvalidPaginationTokenException(
-                InvalidPaginationTokenException {
-                    message: Some(
-                        "Invalid pagination token: it was not issued by this service".to_string(),
-                    ),
-                },
-            )
-        })?;
-
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListPipelinesErrorModeled::InternalException(InternalException {
                 message: Some(
@@ -181,6 +172,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .keys()
             .map(|name| (name.clone(), name.clone()))
             .collect();
+
+        // A listing with nothing to page through has exactly ONE page — the empty one — and
+        // it is the last: there is no position in it to resume from, to skip or to run past,
+        // so no pagination input decides anything and the account is reported empty. A
+        // `NextToken` is read below, where it is read to RESUME a listing that has records.
+        if ordered.is_empty() {
+            return Ok(ListPipelinesOutput {
+                pipelines: Some(Vec::new()),
+                next_token: None,
+            });
+        }
+
+        // Resuming, which is where the token names a position: one this service never minted
+        // names none, and this operation models InvalidPaginationTokenException for exactly
+        // that.
+        let after = crate::state::decode_cursor(input.next_token.as_deref()).map_err(|_| {
+            ListPipelinesErrorModeled::InvalidPaginationTokenException(
+                InvalidPaginationTokenException {
+                    message: Some(
+                        "Invalid pagination token: it was not issued by this service".to_string(),
+                    ),
+                },
+            )
+        })?;
+
         let page = crate::state::page_of(ordered, after.as_deref(), input.max_results);
 
         let mut summaries: Vec<PipelineSummary> = Vec::with_capacity(page.items.len());

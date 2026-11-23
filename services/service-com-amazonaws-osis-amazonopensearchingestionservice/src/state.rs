@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 mod blueprint_format;
+mod configuration_roles;
 mod ingest_delivery;
 mod ingest_endpoint;
 mod pipeline_configuration;
@@ -17,6 +18,10 @@ mod pipeline_configuration;
 pub use blueprint_format::{
     document_as_json, BlueprintFormat, UnrenderableBlueprint, BLUEPRINT_FORMATS,
     BLUEPRINT_FORMAT_JSON, BLUEPRINT_FORMAT_PATTERN, BLUEPRINT_FORMAT_YAML,
+};
+pub use configuration_roles::{
+    configuration_body_invalid, configuration_role_arns, unable_to_assume_role,
+    unassumable_configuration_roles, INGESTION_SERVICE_PRINCIPAL,
 };
 pub use ingest_delivery::{
     delivered, object_bytes, object_key, DeliveredObject, UndeliveredRecords,
@@ -391,18 +396,92 @@ struct CatalogEntry {
 /// Hand-written, because the catalog is data the real service ships rather than anything
 /// the model carries: the member meanings come from smithy_query shape
 /// `PipelineBlueprintSummary` (`BlueprintName`, `DisplayName`, `DisplayDescription`,
-/// `Service`, `UseCase`), and the names and configuration documents follow the
-/// `AWS-<source>Pipeline` blueprints described by "Using blueprints to create a pipeline",
-/// the page `ListPipelineBlueprints`' own model doc points at. Each body is a Data Prepper
-/// v2 pipeline configuration; the set is the emulator's own and is NOT a claim to be
-/// byte-identical with the live catalog, which AWS grows over time.
+/// `Service`, `UseCase`), and the names follow the `AWS-<source>Pipeline` blueprints of
+/// "Using blueprints to create a pipeline", the page `ListPipelineBlueprints`' own model doc
+/// points at. Each body is a Data Prepper v2 pipeline configuration.
+///
+/// Where the service's PUBLISHED values for an entry are known they are carried verbatim —
+/// those entries are marked `published:` member by member below, and nothing about them is
+/// reworded. For every other member the wording is the emulator's OWN: the published catalog
+/// is service-owned data that neither this service's model nor its docs carry, so a value
+/// nothing publishes is written as the blueprint's documented purpose states it rather than
+/// guessed at a published string. The set is therefore NOT a claim to be byte-identical with
+/// the live catalog, which AWS also grows over time.
 const BLUEPRINT_CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
+        // published: every summary member.
+        blueprint_name: "AWS-AlbAccessLogS3Pipeline",
+        display_name: "ALB access logs",
+        display_description: "Extracts data from ALB access logs.",
+        service: "ALB Logs",
+        use_case: "Log Analytics",
+        configuration_body: r#"version: "2"
+alb-access-log-pipeline:
+  source:
+    s3:
+      codec:
+        newline: {}
+      compression: "gzip"
+      sqs:
+        queue_url: "https://sqs.us-east-1.amazonaws.com/123456789012/alb-access-log-notifications"
+      aws:
+        sts_role_arn: "arn:aws:iam::123456789012:role/Example-Role"
+        region: "us-east-1"
+  processor:
+    - grok:
+        match:
+          message:
+            - "%{NOTSPACE:type} %{TIMESTAMP_ISO8601:time} %{NOTSPACE:elb} %{NOTSPACE:client} %{NOTSPACE:target} %{NUMBER:request_processing_time} %{NUMBER:target_processing_time} %{NUMBER:response_processing_time} %{NUMBER:elb_status_code} %{NOTSPACE:target_status_code} %{NUMBER:received_bytes} %{NUMBER:sent_bytes} \"%{DATA:request}\""
+  sink:
+    - opensearch:
+        hosts:
+          - "https://search-domain-endpoint.us-east-1.es.amazonaws.com"
+        aws:
+          sts_role_arn: "arn:aws:iam::123456789012:role/Example-Role"
+          region: "us-east-1"
+        index: "alb_access_logs"
+"#,
+    },
+    CatalogEntry {
+        // published: BlueprintName, DisplayName, Service, UseCase. The description is this
+        // emulator's wording for the enrichment the blueprint performs.
+        blueprint_name: "AWS-ApacheLogEnrichment",
+        display_name: "GeoIP enrichment for Apache logs",
+        display_description: "Adds the geographical location of the client address to each \
+                              Apache log event.",
+        service: "Apache Logs",
+        use_case: "GeoIP",
+        configuration_body: r#"version: "2"
+apache-log-enrichment-pipeline:
+  source:
+    http:
+      path: "/${pipelineName}/logs"
+  processor:
+    - grok:
+        match:
+          log:
+            - "%{COMMONAPACHELOG_DATATYPED}"
+    - geoip:
+        entries:
+          - source: "clientip"
+            target: "geo"
+  sink:
+    - opensearch:
+        hosts:
+          - "https://search-domain-endpoint.us-east-1.es.amazonaws.com"
+        aws:
+          sts_role_arn: "arn:aws:iam::123456789012:role/Example-Role"
+          region: "us-east-1"
+        index: "apache_logs"
+"#,
+    },
+    CatalogEntry {
+        // published: BlueprintName, DisplayName, DisplayDescription, Service.
         blueprint_name: "AWS-ApacheLogPipeline",
-        display_name: "Apache log ingestion",
-        display_description: "Ingest Apache access logs over HTTP, parse them with grok, \
-                              and write them to an OpenSearch index.",
-        service: "Apache HTTP Server",
+        display_name: "Apache logs",
+        display_description: "Extracts logs by matching the value in the 'log' key against \
+                              the grok common Apache log pattern.",
+        service: "Apache Logs",
         use_case: "Log Analytics",
         configuration_body: r#"version: "2"
 apache-log-pipeline:
@@ -414,6 +493,38 @@ apache-log-pipeline:
         match:
           log:
             - "%{COMMONAPACHELOG_DATATYPED}"
+  sink:
+    - opensearch:
+        hosts:
+          - "https://search-domain-endpoint.us-east-1.es.amazonaws.com"
+        aws:
+          sts_role_arn: "arn:aws:iam::123456789012:role/Example-Role"
+          region: "us-east-1"
+        index: "apache_logs"
+"#,
+    },
+    CatalogEntry {
+        // published: BlueprintName, Service. The rest is this emulator's wording for the
+        // sampling the blueprint performs.
+        blueprint_name: "AWS-ApacheLogSampling",
+        display_name: "Apache log sampling",
+        display_description: "Keeps a bounded share of the Apache log events a pipeline \
+                              receives and indexes those.",
+        service: "Apache Logs",
+        use_case: "Sampling",
+        configuration_body: r#"version: "2"
+apache-log-sampling-pipeline:
+  source:
+    http:
+      path: "/${pipelineName}/logs"
+  processor:
+    - grok:
+        match:
+          log:
+            - "%{COMMONAPACHELOG_DATATYPED}"
+    - rate_limiter:
+        events_per_second: 100
+        when_throttling: "drop"
   sink:
     - opensearch:
         hosts:
