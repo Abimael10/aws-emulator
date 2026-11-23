@@ -23,9 +23,17 @@
 //! the service ([`super::authorization::Authorized`]), so every refusal stated here is
 //! stated to a caller that decision allowed: a clause restating what the request submitted
 //! can never reach a principal no statement allows.
+//!
+//! A request this wrapper ANSWERS is a request this service answered, so it emits that
+//! request's access record ([`crate::ops::put_audit_events::record_access`]) before
+//! answering it, exactly as the layer in front of it and the handler behind it do for the
+//! requests they answer: the record is emitted once per answered request, by whichever
+//! layer answered it.
 
 use super::refuses_channel_arn;
-use crate::ops::put_audit_events::{INVALID_CHANNEL_ARN_CODE, INVALID_CHANNEL_ARN_MESSAGE};
+use crate::ops::put_audit_events::{
+    record_access, INVALID_CHANNEL_ARN_CODE, INVALID_CHANNEL_ARN_MESSAGE,
+};
 use service_common::validation::SubmittedEcho;
 use service_common::validation_message::quoting_the_submitted_collection;
 use smithy_server_runtime::{ErasedOperation, Operation, Refused, Service, Violation};
@@ -82,6 +90,17 @@ const MAX_ECHO_POSITIONS: usize =
 /// summary stands, which is the fail-safe direction.
 const MAX_QUOTED_BATCH: usize = 2 * 1024 * 1024;
 
+/// What the access record of a request refused for its channel reference states: the value
+/// the request carried is outside the expression every channel reference is modelled with,
+/// so it names no channel at all.
+const INVALID_CHANNEL_ARN_DETAIL: &str =
+    "channelArn is outside the pattern a channel reference is modelled with";
+
+/// What the access record of every other pre-handler refusal states: the request broke one
+/// of the model's own constraints, so nothing of its payload was read and nothing was
+/// persisted.
+const CONSTRAINT_DETAIL: &str = "the request is outside a modelled constraint";
+
 /// One modelled operation, served so that a refusal found before its handler runs is
 /// stated the way this service states one.
 pub(super) struct StatingSubmittedValues<Op> {
@@ -116,7 +135,18 @@ where
                     MAX_ECHO_POSITIONS,
                     MAX_QUOTED_BATCH,
                 );
-            if let Some(refused) = refusal_of(&collected) {
+            if let Some(PreHandlerRefusal { refused, detail }) = refusal_of(&collected) {
+                // This wrapper answers this request itself, so the access record every
+                // request this service answers emits is emitted here: the layer that
+                // answers a request is the layer that records it, and the channel the
+                // record names is the reference the REQUEST carried, read the way the
+                // layer in front of this one reads it.
+                record_access(
+                    ctx,
+                    &super::authorization::judged_resource(req),
+                    &refused.code,
+                    detail,
+                );
                 let violations: Vec<Violation> =
                     collected.into_iter().map(|(violation, _)| violation).collect();
                 return svc.definition().refusal_response(
@@ -136,6 +166,15 @@ where
     }
 }
 
+/// One refusal this wrapper states: the error the wire carries, and what this request's
+/// access record states about why it was refused.
+struct PreHandlerRefusal {
+    /// The code and the message the refusal is answered under.
+    refused: Refused,
+    /// The `detail` of the access record emitted for it.
+    detail: &'static str,
+}
+
 /// How this service answers the violations `collected` from one request, or `None` when
 /// there are none and the request is the operation's to serve.
 ///
@@ -149,7 +188,10 @@ where
 /// with the two renderings it differs from the framework in — a `@pattern` requirement
 /// quoting the expression without the whole-value anchors the model wraps it in, and a
 /// collection's `@length` clause quoting the collection the request carried.
-fn refusal_of(collected: &[(Violation, SubmittedEcho)]) -> Option<Refused> {
+///
+/// Each refusal carries the detail its access record states beside the wire error, so the
+/// one decision about how a refusal is classed also decides how it is recorded.
+fn refusal_of(collected: &[(Violation, SubmittedEcho)]) -> Option<PreHandlerRefusal> {
     if collected.is_empty() {
         return None;
     }
@@ -157,18 +199,24 @@ fn refusal_of(collected: &[(Violation, SubmittedEcho)]) -> Option<Refused> {
         .iter()
         .any(|(violation, _)| refuses_channel_arn(violation))
     {
-        return Some(Refused {
-            code: INVALID_CHANNEL_ARN_CODE.to_string(),
-            message: INVALID_CHANNEL_ARN_MESSAGE.to_string(),
+        return Some(PreHandlerRefusal {
+            refused: Refused {
+                code: INVALID_CHANNEL_ARN_CODE.to_string(),
+                message: INVALID_CHANNEL_ARN_MESSAGE.to_string(),
+            },
+            detail: INVALID_CHANNEL_ARN_DETAIL,
         });
     }
     let stated: Vec<Violation> = collected
         .iter()
         .map(|(violation, echo)| stated_clause(violation.clone(), echo.clone()))
         .collect();
-    Some(Refused {
-        code: VALIDATION_EXCEPTION.to_string(),
-        message: aws_smithy_schema_server::constraints::envelope(&stated)?,
+    Some(PreHandlerRefusal {
+        refused: Refused {
+            code: VALIDATION_EXCEPTION.to_string(),
+            message: aws_smithy_schema_server::constraints::envelope(&stated)?,
+        },
+        detail: CONSTRAINT_DETAIL,
     })
 }
 

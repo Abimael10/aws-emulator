@@ -284,10 +284,11 @@ fn rejection(event: &AuditEvent) -> Option<(&'static str, String)> {
 /// caller named, and how the request ended. Carries NO event payload and no secret —
 /// an access key id is an identifier, not a credential.
 ///
-/// Reached by the authorization gate in front of this operation
-/// ([`crate::service::authorization`]) as well as by the handler below, so every request
-/// this service answers — served or refused, and whichever layer refused it — is recorded
-/// in one shape.
+/// Reached by every layer that ANSWERS a request of this service — the authorization gate
+/// in front of this operation ([`crate::service::authorization`]), the wrapper that states
+/// a refusal found before this handler runs ([`crate::service`]'s `validation`), and the
+/// handler below — so every request this service answers, served or refused and whichever
+/// layer refused it, is recorded once and in one shape.
 pub(crate) fn record_access(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     channel_arn: &str,

@@ -2,8 +2,11 @@
 
 //! How a request refused BEFORE the handler runs is stated, asserted over tables.
 //!
-//! Two rules:
+//! Three rules:
 //!
+//! 0. Every request this service ANSWERS — served or refused, and whichever of its layers
+//!    answered it — emits exactly one structured access record, so a request refused
+//!    before the handler ran is recorded the same way as one the handler refused.
 //! 1. A modelled-constraint refusal is HTTP 400 `ValidationException` carrying the clause
 //!    envelope built from the request — `N validation error(s) detected: Value '<what the
 //!    request carried>' at '<member path>' failed to satisfy constraint: <requirement>` —
@@ -18,7 +21,10 @@
 //!
 //! The client is this crate's one test harness, reached from the suite that owns it.
 
-use crate::put_audit_events::{channel_arn, ev, Ev, Harness, Reply};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use crate::identity_authorization::{given_session, SESSION_KEY_ID};
+use crate::put_audit_events::{channel_arn, ev, Ev, Harness, Reply, DEFAULT_ACCESS_KEY_ID};
 use service_com_amazonaws_cloudtraildata_cloudtraildataservice::state::Channel;
 
 /// A JSON audit event that passes per-event validation, so nothing but the member under
@@ -319,4 +325,359 @@ async fn a_channel_reference_is_answered_before_the_payloads_own_violations() {
             "case {case:?}: expected the sentence the model documents, got {stated:?}"
         );
     }
+}
+
+/// The operation every access record of this service names, as the model declares it
+/// (`smithy_query(query="list_operations")`).
+const OPERATION: &str = "PutAuditEvents";
+
+/// One captured access record: every field of the event, flattened to strings.
+type Record = std::collections::BTreeMap<String, String>;
+
+/// Collects every field of a `tracing` event into a [`Record`].
+#[derive(Default)]
+struct RecordFields(Record);
+
+impl tracing::field::Visit for RecordFields {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.insert(field.name().to_string(), format!("{value:?}"));
+    }
+}
+
+/// A `tracing` subscriber that keeps this service's access records, so a test can assert
+/// on the record a request produced.
+///
+/// Implemented against `tracing`'s own `Subscriber` trait — the crate this service records
+/// with — rather than pulling a second tracing crate into the harness. An event is kept
+/// when it names this service's operation, which is what every access record states;
+/// spans are no part of the record, so the span half of the trait is inert.
+struct CaptureAccessRecords {
+    records: Arc<Mutex<Vec<Record>>>,
+}
+
+impl tracing::Subscriber for CaptureAccessRecords {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut fields = RecordFields::default();
+        event.record(&mut fields);
+        if fields.0.get("operation").map(String::as_str) != Some(OPERATION) {
+            return;
+        }
+        self.records
+            .lock()
+            .expect("the capture mutex must not be poisoned")
+            .push(fields.0);
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// The process-wide sink of this service's access records, installing the capturing
+/// subscriber the first time it is asked for.
+///
+/// Global rather than thread-local because `tracing` caches a callsite's interest for the
+/// whole process: a thread-local subscriber installed after another case had already
+/// reached the record's callsite would see nothing. Records are therefore selected by the
+/// channel reference the asserting case named, which no other case of this binary uses.
+fn access_records() -> Arc<Mutex<Vec<Record>>> {
+    static SINK: OnceLock<Arc<Mutex<Vec<Record>>>> = OnceLock::new();
+    Arc::clone(SINK.get_or_init(|| {
+        let records = Arc::new(Mutex::new(Vec::new()));
+        tracing::subscriber::set_global_default(CaptureAccessRecords {
+            records: Arc::clone(&records),
+        })
+        .expect("this suite installs the only tracing subscriber in the test binary");
+        // `tracing` caches each callsite's INTEREST the first time it is hit, and with no
+        // subscriber installed yet that cached answer is "never enabled" — so a record
+        // some other case of this binary emitted before this install would leave the
+        // callsite silent, and which records arrive would depend on the order the cases
+        // happened to run in. Rebuilding the cache re-asks this subscriber about every
+        // callsite.
+        tracing::callsite::rebuild_interest_cache();
+        records
+    }))
+}
+
+/// What a captured record states for `field`, with the quotes a Debug-rendered value
+/// carries stripped, so an assertion reads the value and not how `tracing` rendered it.
+fn stated(record: &Record, field: &str) -> String {
+    record
+        .get(field)
+        .map(|value| value.trim_matches('"').to_string())
+        .unwrap_or_default()
+}
+
+/// Every access record naming `channel`, in the order they were emitted.
+fn records_naming(records: &Arc<Mutex<Vec<Record>>>, channel: &str) -> Vec<Record> {
+    records
+        .lock()
+        .expect("the capture mutex must not be poisoned")
+        .iter()
+        .filter(|record| stated(record, "channel") == channel)
+        .cloned()
+        .collect()
+}
+
+/// One answered request and the record it must leave behind.
+struct Answered {
+    case: &'static str,
+    /// The channel reference the request carries — unique to its row, so the record it
+    /// emits is the only one that names it.
+    channel: String,
+    /// Whether a channel is registered under that reference first.
+    registered: bool,
+    external_id: Option<&'static str>,
+    events: Vec<Ev>,
+    /// The answer on the wire: the status, and the error code (empty on a success).
+    status: u16,
+    code: &'static str,
+    /// The `outcome` the record states for that answer.
+    outcome: &'static str,
+}
+
+/// Assert the one record `row` left behind, whatever layer answered the request.
+fn assert_one_record(records: &Arc<Mutex<Vec<Record>>>, row: &Answered, akid: &str) {
+    let case = row.case;
+    let captured = records_naming(records, &row.channel);
+    assert_eq!(
+        captured.len(),
+        1,
+        "case {case:?}: expected exactly one access record naming {:?}, got {captured:?}",
+        row.channel
+    );
+    let record = &captured[0];
+    assert_eq!(
+        stated(record, "operation"),
+        OPERATION,
+        "case {case:?}: the record must name the operation, got {record:?}"
+    );
+    assert_eq!(
+        stated(record, "outcome"),
+        row.outcome,
+        "case {case:?}: expected the outcome {:?}, got {record:?}",
+        row.outcome
+    );
+    // The access key id the caller presented is a public identifier, so the record can
+    // attribute the call; no secret is recorded.
+    assert_eq!(
+        stated(record, "akid"),
+        akid,
+        "case {case:?}: the record must name the access key id presented, got {record:?}"
+    );
+    assert_eq!(
+        stated(record, "account_id"),
+        engine::emulator_account_id(),
+        "case {case:?}: the record must name the caller account, got {record:?}"
+    );
+    assert!(
+        !stated(record, "detail").is_empty(),
+        "case {case:?}: the record must state how the request ended, got {record:?}"
+    );
+    // The record is a record of ACCESS, so it carries no event payload: the events of
+    // this request are nowhere in it.
+    for event in &row.events {
+        assert!(
+            !record.values().any(|value| value.contains(event.data())),
+            "case {case:?}: the record must carry no event payload, got {record:?}"
+        );
+    }
+}
+
+/// RULE: every request this service answers emits exactly one structured access record —
+/// served or refused, and whichever of its layers answered it — naming the operation, the
+/// access key id presented, the caller account, the channel the request named and how the
+/// request ended, with the outcome of a refused request being the error code it was
+/// answered under.
+///
+/// The rows span the layers that answer a request and the classes each of them answers:
+/// the pre-handler refusal layer (a channel reference outside its modelled pattern, a
+/// batch at either end of its declared length, an element's constraint, the external id's
+/// constraint), the handler's own refusals (a value that names no channel, an unheld
+/// channel, a repeated event id, an ARN in another account) and a served request.
+#[tokio::test]
+async fn every_answered_request_emits_one_access_record() {
+    let records = access_records();
+    let harness = Harness::new();
+
+    let rows: Vec<Answered> = vec![
+        Answered {
+            case: "a served request",
+            channel: channel_arn("aa000001-0000-4000-8000-000000000001"),
+            registered: true,
+            external_id: None,
+            events: vec![ev("evt-1", GOOD_EVENT)],
+            status: 200,
+            code: "",
+            outcome: "Ingested",
+        },
+        Answered {
+            case: "a channel reference outside the member's modelled pattern",
+            channel: "access-record-probe-that-is-no-arn".to_string(),
+            registered: false,
+            external_id: None,
+            events: vec![ev("evt-1", GOOD_EVENT)],
+            status: 400,
+            code: "InvalidChannelARN",
+            outcome: "InvalidChannelARN",
+        },
+        Answered {
+            case: "a batch one event past its declared maximum",
+            channel: channel_arn("aa000002-0000-4000-8000-000000000002"),
+            registered: true,
+            external_id: None,
+            events: batch(MAX_BATCH + 1),
+            status: 400,
+            code: "ValidationException",
+            outcome: "ValidationException",
+        },
+        Answered {
+            case: "an empty batch, under its declared minimum",
+            channel: channel_arn("aa000003-0000-4000-8000-000000000003"),
+            registered: true,
+            external_id: None,
+            events: batch(0),
+            status: 400,
+            code: "ValidationException",
+            outcome: "ValidationException",
+        },
+        Answered {
+            case: "an event id outside its expression",
+            channel: channel_arn("aa000004-0000-4000-8000-000000000004"),
+            registered: true,
+            external_id: None,
+            events: vec![ev("bad id!", GOOD_EVENT)],
+            status: 400,
+            code: "ValidationException",
+            outcome: "ValidationException",
+        },
+        Answered {
+            case: "an externalId outside its expression",
+            channel: channel_arn("aa000005-0000-4000-8000-000000000005"),
+            registered: true,
+            external_id: Some("external$id"),
+            events: vec![ev("evt-1", GOOD_EVENT)],
+            status: 400,
+            code: "ValidationException",
+            outcome: "ValidationException",
+        },
+        Answered {
+            case: "an arn: value that names no channel",
+            channel: "arn:aws:s3:::an-access-record-bucket".to_string(),
+            registered: false,
+            external_id: None,
+            events: vec![ev("evt-1", GOOD_EVENT)],
+            status: 400,
+            code: "InvalidChannelARN",
+            outcome: "InvalidChannelARN",
+        },
+        Answered {
+            case: "a channel ARN this emulator does not hold",
+            channel: channel_arn("aa000006-0000-4000-8000-000000000006"),
+            registered: false,
+            external_id: None,
+            events: vec![ev("evt-1", GOOD_EVENT)],
+            status: 400,
+            code: "ChannelNotFound",
+            outcome: "ChannelNotFound",
+        },
+        Answered {
+            case: "a batch repeating an event id",
+            channel: channel_arn("aa000007-0000-4000-8000-000000000007"),
+            registered: true,
+            external_id: None,
+            events: vec![ev("same-id", GOOD_EVENT), ev("same-id", GOOD_EVENT)],
+            status: 400,
+            code: "DuplicatedAuditEventId",
+            outcome: "DuplicatedAuditEventId",
+        },
+        Answered {
+            case: "a channel ARN in another account",
+            channel: format!(
+                "arn:aws:cloudtrail:us-east-1:111122223333:channel/{}",
+                "aa000008-0000-4000-8000-000000000008"
+            ),
+            registered: false,
+            external_id: None,
+            events: vec![ev("evt-1", GOOD_EVENT)],
+            status: 403,
+            code: "AccessDeniedException",
+            outcome: "AccessDeniedException",
+        },
+    ];
+
+    for row in &rows {
+        if row.registered {
+            harness.register(Channel::from_arn(&row.channel, "Custom").expect("a channel ARN"));
+        }
+        let reply = harness.put(&row.channel, row.external_id, &row.events).await;
+        let case = row.case;
+        assert_eq!(
+            reply.status, row.status,
+            "case {case:?}: expected HTTP {}, got {} with body {}",
+            row.status, reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_code(),
+            row.code,
+            "case {case:?}: expected the error code {:?}, got body {}",
+            row.code,
+            reply.body
+        );
+        assert_one_record(&records, row, DEFAULT_ACCESS_KEY_ID);
+    }
+}
+
+/// The same rule for the layer in FRONT of the operation: a request no identity-based
+/// policy allows is refused there, and that layer records it too — so the record is
+/// emitted once per answered request whichever layer answered, and the channel it names is
+/// the reference the request carried.
+#[tokio::test]
+async fn a_request_the_authorization_layer_refuses_is_recorded_too() {
+    let records = access_records();
+    let harness = Harness::new();
+    // A session whose role carries no policy document at all: IAM's default deny, so the
+    // layer in front of the operation answers this request.
+    given_session(harness.engine());
+
+    let row = Answered {
+        case: "a session no statement allows",
+        channel: channel_arn("aa000009-0000-4000-8000-000000000009"),
+        registered: true,
+        external_id: None,
+        events: vec![ev("evt-1", GOOD_EVENT)],
+        status: 403,
+        code: "AccessDeniedException",
+        outcome: "AccessDeniedException",
+    };
+    harness.register(Channel::from_arn(&row.channel, "Custom").expect("a channel ARN"));
+
+    let reply = harness
+        .put_as(SESSION_KEY_ID, &row.channel, None, &row.events)
+        .await;
+    let case = row.case;
+    assert_eq!(
+        (reply.status, reply.error_code().as_str()),
+        (row.status, row.code),
+        "case {case:?}: expected the authorization refusal, got {} with body {}",
+        reply.status,
+        reply.body
+    );
+    assert_one_record(&records, &row, SESSION_KEY_ID);
 }
