@@ -41,9 +41,8 @@
 //! do not write it; editing the entry would let this file drift from the model.
 //!
 //! A sixth seam, `override_protocol`, is one this service also takes, for one thing the
-//! generic renderer cannot express: a failure reports its request id in the
-//! `x-amzn-RequestId` response header as well as in the error document the model declares
-//! it in. See [`wire`].
+//! generic renderer cannot express: a failure repeats the request id its error document
+//! states in the `x-amzn-RequestId` response header. See [`wire`].
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
@@ -62,7 +61,7 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// This service's wire protocol: the model's own `restJson1`, with the error answer
     /// of [`wire`]. Built once here because [`Service::override_protocol`] hands back a
     /// borrow of it.
-    protocol: wire::RequestIdInHeaderRestJson,
+    protocol: wire::RequestIdMirroredRestJson,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -72,7 +71,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
-            protocol: wire::RequestIdInHeaderRestJson::new(),
+            protocol: wire::RequestIdMirroredRestJson::new(),
         }
     }
 }

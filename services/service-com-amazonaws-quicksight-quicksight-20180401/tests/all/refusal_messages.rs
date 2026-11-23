@@ -24,10 +24,10 @@
 //! or name — rather than re-running one recorded call.
 //!
 //! The closing suites are about WHERE an answer states the request id of the call,
-//! which is the same rule read across error classes: a failure states it in the
-//! `x-amzn-RequestId` response header ALONE and leaves the optional `RequestId` member
-//! its error shape declares out of the document, while a SUCCESS states it as the body
-//! member its output shape declares.
+//! which is the same rule read across error classes: every answer states it in the
+//! `RequestId` member the shape it is rendered from declares — a SUCCESS in its output
+//! shape's member, a FAILURE in its error shape's — and a failure repeats that same id in
+//! the `x-amzn-RequestId` response header.
 
 use serde_json::{json, Value};
 
@@ -794,25 +794,26 @@ async fn deleting_a_namespace_nothing_holds_names_the_delete_that_failed() {
     );
 }
 
-/// The response header a QuickSight answer states the request id of a failed call in.
+/// The response header a QuickSight answer repeats the request id of a failed call in.
 /// HTTP header names are case-insensitive, and `HeaderMap` is keyed on the lowercase
 /// spelling.
 const REQUEST_ID_HEADER: &str = "x-amzn-requestid";
 
-/// The member a failure never carries in its document, optional though the model leaves
-/// it: the id of the call travels in [`REQUEST_ID_HEADER`] instead.
+/// The member every answer of this service states the id of the call in — the one the
+/// answered shape declares for it.
 /// Source: smithy_query(query="shape", shape="ResourceNotFoundException,
-/// ResourceExistsException,InvalidParameterValueException") — `RequestId` is optional on
-/// each of them.
+/// ResourceExistsException,InvalidParameterValueException") — each of them declares
+/// `RequestId`.
 const REQUEST_ID_MEMBER: &str = "RequestId";
 
 /// Every member a refusal document of this service may carry: the shape discriminator the
-/// JSON envelope names the error class in, the error shape's own `Message` and
-/// `ResourceType`, and the lowercase `message` the framework's synthetic shapes word a
-/// 501 in. [`REQUEST_ID_MEMBER`] is deliberately NOT among them.
+/// JSON envelope names the error class in, the error shape's own `Message`, `RequestId`
+/// and `ResourceType`, and the lowercase `message` the framework's synthetic shapes word a
+/// 501 in.
 /// Source: smithy_query(query="shape", shape="ResourceNotFoundException,
 /// ResourceExistsException,InvalidParameterValueException").
-const REFUSAL_BODY_MEMBERS: [&str; 4] = ["__type", "Message", "ResourceType", "message"];
+const REFUSAL_BODY_MEMBERS: [&str; 5] =
+    ["__type", "Message", "RequestId", "ResourceType", "message"];
 
 /// One row of the refusal-answer table: the call to make, and what its answer states.
 struct RefusalRow {
@@ -827,13 +828,14 @@ struct RefusalRow {
     /// The `ResourceType` discriminator the class reports, where it reports one.
     resource_type: Option<&'static str>,
     /// Whether the rendered error shape declares a request-id member at all, and so
-    /// whether the answer reports an id in its header. The framework's synthetic shapes
-    /// (the 501 among them) declare none, so they report none anywhere.
+    /// whether the answer states an id in its document and repeats it in its header. The
+    /// framework's synthetic shapes (the 501 among them) declare none, so they report none
+    /// anywhere.
     reports_a_request_id: bool,
 }
 
 #[tokio::test]
-async fn a_refusal_reports_its_request_id_in_its_header_and_in_no_document_member() {
+async fn a_refusal_states_its_request_id_in_its_document_and_repeats_it_in_its_header() {
     let harness = Harness::new();
 
     // Fixtures the rows refuse against: a folder and a group whose ids are taken, a
@@ -1028,15 +1030,30 @@ async fn a_refusal_reports_its_request_id_in_its_header_and_in_no_document_membe
                 "case {case:?}: the document must still carry the class's sentence, got \
                  {document}"
             );
+            let stated = document[REQUEST_ID_MEMBER]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {case:?}: expected the call's id in the {REQUEST_ID_MEMBER} \
+                         member, got {document}"
+                    )
+                })
+                .to_string();
+            assert!(
+                is_uuid_shaped(&stated),
+                "case {case:?}: expected a UUID-shaped request id, got {stated:?}"
+            );
             let reported = reported.unwrap_or_else(|| {
                 panic!(
                     "case {case:?}: expected the request id in the {REQUEST_ID_HEADER} \
                      header, got {headers:?}"
                 )
             });
-            assert!(
-                !reported.is_empty(),
-                "case {case:?}: the reported request id is empty: {headers:?}"
+            // The header repeats the id the document states: one call, one id.
+            assert_eq!(
+                reported, stated,
+                "case {case:?}: the header must repeat the document's id {stated:?}, got \
+                 {reported:?}"
             );
             assert!(
                 reported_ids.insert(reported.clone()),
@@ -1048,14 +1065,12 @@ async fn a_refusal_reports_its_request_id_in_its_header_and_in_no_document_membe
                 "case {case:?}: a shape declaring no request-id member reports none, got \
                  {reported:?}"
             );
+            assert!(
+                document.get(REQUEST_ID_MEMBER).is_none(),
+                "case {case:?}: a shape declaring no request-id member carries none in its \
+                 document either, got {document}"
+            );
         }
-        // Either way the document states no id: the header is the only place a failure
-        // reports it.
-        assert!(
-            document.get(REQUEST_ID_MEMBER).is_none(),
-            "case {case:?}: a refusal document carries no {REQUEST_ID_MEMBER} member, got \
-             {document}"
-        );
     }
 
     // The fixtures the refusals addressed are still readable, so none of them disturbed
@@ -1150,7 +1165,7 @@ struct RequestIdRow {
 }
 
 #[tokio::test]
-async fn every_refusal_class_states_its_request_id_in_its_header_alone() {
+async fn every_refusal_class_states_its_request_id_in_its_document_and_its_header() {
     let harness = Harness::new();
 
     // The fixtures the conflict rows collide with: a group, a folder and a policy
@@ -1291,10 +1306,18 @@ async fn every_refusal_class_states_its_request_id_in_its_header_alone() {
             "case {case:?}: expected the class {shape}, got {document}"
         );
 
+        let in_document = document[REQUEST_ID_MEMBER]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: expected the call's id in the {REQUEST_ID_MEMBER} member, \
+                     got {document}"
+                )
+            })
+            .to_string();
         assert!(
-            document.get(REQUEST_ID_MEMBER).is_none(),
-            "case {case:?}: the document must carry no {REQUEST_ID_MEMBER} member, got \
-             {document}"
+            is_uuid_shaped(&in_document),
+            "case {case:?}: expected a UUID-shaped request id, got {in_document:?}"
         );
         let in_header = headers
             .get(REQUEST_ID_HEADER)
@@ -1306,9 +1329,10 @@ async fn every_refusal_class_states_its_request_id_in_its_header_alone() {
                 )
             })
             .to_string();
-        assert!(
-            is_uuid_shaped(&in_header),
-            "case {case:?}: expected a UUID-shaped request id, got {in_header:?}"
+        assert_eq!(
+            in_header, in_document,
+            "case {case:?}: the header must repeat the document's id {in_document:?}, got \
+             {in_header:?}"
         );
         assert!(
             stated.insert(in_header.clone()),
@@ -1318,15 +1342,15 @@ async fn every_refusal_class_states_its_request_id_in_its_header_alone() {
 }
 
 #[tokio::test]
-async fn a_success_states_its_id_as_a_body_member_and_a_refusal_in_its_header() {
+async fn two_answers_of_one_operation_each_state_their_own_request_id() {
     let harness = Harness::new();
     let group_name = "answered-twice";
 
     // The same operation answered twice: the create that succeeds, then the create that
-    // collides with it. Each states a request id of its own, in the place its own kind of
-    // answer states it — the success in the `RequestId` member its output shape declares,
-    // the refusal in the response header alone — and the two ids differ, because an id
-    // belongs to one call.
+    // collides with it. Each states a request id of its own in the `RequestId` member the
+    // shape it is rendered from declares — the output shape for the success, the error
+    // shape for the refusal, which repeats it in its header too — and the two ids differ,
+    // because an id belongs to one call.
     let (status, created) = create_group(&harness, WEST, ACCOUNT, DEFAULT_NAMESPACE, group_name).await;
     assert_eq!(status, 201, "the create expected 201, got {status}: {created}");
     let (status, refused, headers) = harness
@@ -1351,23 +1375,27 @@ async fn a_success_states_its_id_as_a_body_member_and_a_refusal_in_its_header() 
         "case {:?}: expected a UUID-shaped request id, got {in_body:?}",
         "the success"
     );
+    let refused_body = refused[REQUEST_ID_MEMBER]
+        .as_str()
+        .unwrap_or_else(|| panic!("the refusal must state its id as a body member: {refused}"))
+        .to_string();
     assert!(
-        refused.get(REQUEST_ID_MEMBER).is_none(),
-        "the refusal states no id in its document, got {refused}"
+        is_uuid_shaped(&refused_body),
+        "case {:?}: expected a UUID-shaped request id, got {refused_body:?}",
+        "the refusal"
     );
     let in_header = headers
         .get(REQUEST_ID_HEADER)
         .and_then(|value| value.to_str().ok())
-        .unwrap_or_else(|| panic!("the refusal must state its id in its header, got {headers:?}"))
+        .unwrap_or_else(|| panic!("the refusal must repeat its id in its header, got {headers:?}"))
         .to_string();
-    assert!(
-        is_uuid_shaped(&in_header),
-        "case {:?}: expected a UUID-shaped request id, got {in_header:?}",
-        "the refusal"
+    assert_eq!(
+        in_header, refused_body,
+        "the refusal's header must repeat its document's id {refused_body:?}, got {in_header:?}"
     );
     assert_ne!(
-        in_body, in_header,
-        "each call states its own request id, got {in_body:?} and {in_header:?}"
+        in_body, refused_body,
+        "each call states its own request id, got {in_body:?} and {refused_body:?}"
     );
 
     // Reading an id off a refusal cost the store nothing: the group the first create
@@ -1405,7 +1433,7 @@ struct DocumentShapeRow {
 }
 
 #[tokio::test]
-async fn an_error_document_is_made_of_the_members_the_service_fills_and_no_request_id() {
+async fn an_error_document_is_made_of_the_members_the_service_fills_for_the_class() {
     let harness = Harness::new();
 
     // The fixtures the conflict rows collide with, and the source a miss is read through
@@ -1425,7 +1453,8 @@ async fn an_error_document_is_made_of_the_members_the_service_fills_and_no_reque
     // The rows span what the rule generalises over — the error class, the status, the
     // method, the resource kind, and whether the class reports a `ResourceType`
     // discriminator — including the two classes the recorded fixtures read: a data source
-    // read after its delete, and a folder id created twice.
+    // read after its delete, and a folder id created twice. Every row's document carries
+    // the `RequestId` its error shape declares beside the members the class fills.
     // Source: smithy_query(query="operation", operation="DescribeDataSource,CreateFolder,
     // DescribeFolder,CreateGroup,DeleteNamespace,CreateDataSource").
     let rows: Vec<DocumentShapeRow> = vec![
@@ -1435,7 +1464,7 @@ async fn an_error_document_is_made_of_the_members_the_service_fills_and_no_reque
             path: format!("/accounts/{ACCOUNT}/data-sources/{gone_source}"),
             body: None,
             status: 404,
-            members: &["__type", "Message"],
+            members: &["__type", "Message", "RequestId"],
         },
         DocumentShapeRow {
             case: "a second create of the same folder id, 409",
@@ -1443,7 +1472,7 @@ async fn an_error_document_is_made_of_the_members_the_service_fills_and_no_reque
             path: format!("/accounts/{ACCOUNT}/folders/{held_folder}"),
             body: Some(json!({ "Name": "a folder" })),
             status: 409,
-            members: &["__type", "Message"],
+            members: &["__type", "Message", "RequestId"],
         },
         DocumentShapeRow {
             case: "a folder the account holds none of, on the read, 404",
@@ -1451,17 +1480,17 @@ async fn an_error_document_is_made_of_the_members_the_service_fills_and_no_reque
             path: format!("/accounts/{ACCOUNT}/folders/absent-shape-folder"),
             body: None,
             status: 404,
-            members: &["__type", "Message"],
+            members: &["__type", "Message", "RequestId"],
         },
         DocumentShapeRow {
             // The identity path reports a discriminator for the kind it refused, so the row
-            // shows the rule is about the request id rather than about a short document.
+            // shows the document is the members the class fills rather than a fixed set.
             case: "a second create of the same group name, 409",
             method: "POST",
             path: format!("/accounts/{ACCOUNT}/namespaces/{DEFAULT_NAMESPACE}/groups"),
             body: Some(json!({ "GroupName": held_group })),
             status: 409,
-            members: &["__type", "Message", "ResourceType"],
+            members: &["__type", "Message", "RequestId", "ResourceType"],
         },
         DocumentShapeRow {
             // A namespace miss reports a discriminator too, on another resource kind.
@@ -1470,7 +1499,7 @@ async fn an_error_document_is_made_of_the_members_the_service_fills_and_no_reque
             path: format!("/accounts/{ACCOUNT}/namespaces/absent-shape-ns"),
             body: None,
             status: 404,
-            members: &["__type", "Message", "ResourceType"],
+            members: &["__type", "Message", "RequestId", "ResourceType"],
         },
         DocumentShapeRow {
             case: "a create naming an address with no route, 400",
@@ -1483,7 +1512,7 @@ async fn an_error_document_is_made_of_the_members_the_service_fills_and_no_reque
                 "DataSourceParameters": { "SparkParameters": { "Host": "100::1", "Port": 10000 } },
             })),
             status: 400,
-            members: &["__type", "Message"],
+            members: &["__type", "Message", "RequestId"],
         },
     ];
 
@@ -1516,8 +1545,21 @@ async fn an_error_document_is_made_of_the_members_the_service_fills_and_no_reque
             "case {case:?}: expected the members {expected:?}, got {carried:?} in {document}"
         );
 
-        // The id of the call is still reported — in the response header, which is the one
-        // place a failure states it.
+        // The id of the call is stated in the document's member and repeated in the
+        // response header.
+        let in_document = document[REQUEST_ID_MEMBER]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: expected the call's id in the {REQUEST_ID_MEMBER} member, \
+                     got {document}"
+                )
+            })
+            .to_string();
+        assert!(
+            is_uuid_shaped(&in_document),
+            "case {case:?}: expected a UUID-shaped request id, got {in_document:?}"
+        );
         let reported = headers
             .get(REQUEST_ID_HEADER)
             .and_then(|value| value.to_str().ok())
@@ -1527,9 +1569,160 @@ async fn an_error_document_is_made_of_the_members_the_service_fills_and_no_reque
                      got {headers:?}"
                 )
             });
-        assert!(
-            is_uuid_shaped(reported),
-            "case {case:?}: expected a UUID-shaped request id, got {reported:?}"
+        assert_eq!(
+            reported, in_document,
+            "case {case:?}: the header must repeat the document's id {in_document:?}, got \
+             {reported:?}"
         );
     }
+}
+
+/// One row of the per-operation request-id table: the call that fails, and the status its
+/// refusal is rendered under.
+struct FailedOperationRow {
+    case: &'static str,
+    method: &'static str,
+    path: String,
+    body: Option<Value>,
+    status: u16,
+}
+
+#[tokio::test]
+async fn every_operation_states_the_request_id_of_the_call_it_refused() {
+    let harness = Harness::new();
+
+    // One group name the account holds, so the conflict row collides with it; the other
+    // names below are held by nothing, so each row's refusal comes out of the operation
+    // rather than out of the name.
+    let held_group = "stated-group";
+    let (status, body) = create_group(&harness, WEST, ACCOUNT, DEFAULT_NAMESPACE, held_group).await;
+    assert_eq!(status, 201, "fixture group: got {status} with {body}");
+
+    let groups = format!("/accounts/{ACCOUNT}/namespaces/{DEFAULT_NAMESPACE}/groups");
+    let absent_group = format!("{groups}/absent-stated-group");
+    let assignments =
+        format!("/accounts/{ACCOUNT}/namespaces/{DEFAULT_NAMESPACE}/iam-policy-assignments");
+    let absent_assignment = format!("{assignments}/absent-stated-assignment");
+
+    // What the rows vary is the OPERATION a refusal comes out of: the create that
+    // collides, and the read, the update and the delete of a name nothing holds, over two
+    // resource kinds the identity path serves — so the rule is read per operation rather
+    // than per error class.
+    // Source: smithy_query(query="operation", operation="CreateGroup,DescribeGroup,
+    // UpdateGroup,DeleteGroup,DescribeIAMPolicyAssignment,UpdateIAMPolicyAssignment").
+    let rows: Vec<FailedOperationRow> = vec![
+        FailedOperationRow {
+            case: "CreateGroup onto a name the namespace holds, 409",
+            method: "POST",
+            path: groups.clone(),
+            body: Some(json!({ "GroupName": held_group })),
+            status: 409,
+        },
+        FailedOperationRow {
+            case: "DescribeGroup of a name nothing holds, 404",
+            method: "GET",
+            path: absent_group.clone(),
+            body: None,
+            status: 404,
+        },
+        FailedOperationRow {
+            case: "UpdateGroup of a name nothing holds, 404",
+            method: "PUT",
+            path: absent_group.clone(),
+            body: Some(json!({ "Description": "a description" })),
+            status: 404,
+        },
+        FailedOperationRow {
+            case: "DeleteGroup of a name nothing holds, 404",
+            method: "DELETE",
+            path: absent_group,
+            body: None,
+            status: 404,
+        },
+        FailedOperationRow {
+            case: "DescribeIAMPolicyAssignment of a name nothing holds, 404",
+            method: "GET",
+            path: absent_assignment.clone(),
+            body: None,
+            status: 404,
+        },
+        FailedOperationRow {
+            case: "UpdateIAMPolicyAssignment of a name nothing holds, 404",
+            method: "PUT",
+            path: absent_assignment,
+            body: Some(json!({ "AssignmentStatus": "ENABLED" })),
+            status: 404,
+        },
+    ];
+
+    // Every id stated across the table, so no two refusals can state the same one.
+    let mut stated: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for row in rows {
+        let FailedOperationRow {
+            case,
+            method,
+            path,
+            body,
+            status: expected_status,
+        } = row;
+        let (status, document, headers) = harness
+            .call_reporting_headers(WEST, method, &path, body)
+            .await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected {expected_status}, got {status} with {document}"
+        );
+        let in_document = document[REQUEST_ID_MEMBER]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: expected the call's id in the {REQUEST_ID_MEMBER} member, \
+                     got {document}"
+                )
+            })
+            .to_string();
+        assert!(
+            is_uuid_shaped(&in_document),
+            "case {case:?}: expected a UUID-shaped request id, got {in_document:?}"
+        );
+        let in_header = headers
+            .get(REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: expected the call's id in the {REQUEST_ID_HEADER} header, \
+                     got {headers:?}"
+                )
+            })
+            .to_string();
+        assert_eq!(
+            in_header, in_document,
+            "case {case:?}: the header must repeat the document's id {in_document:?}, got \
+             {in_header:?}"
+        );
+        assert!(
+            stated.insert(in_document.clone()),
+            "case {case:?}: the request id {in_document:?} was stated for another call too"
+        );
+    }
+
+    // The group the fixture created is still readable, so none of the refusals disturbed
+    // the store — and its own answer states an id of its own, in the member its OUTPUT
+    // shape declares.
+    let (status, read) = harness
+        .call_in_region(WEST, "GET", &format!("{groups}/{held_group}"), None)
+        .await;
+    assert_eq!(
+        status, 200,
+        "the refusals must leave the stored group readable, got {status} with {read}"
+    );
+    let read_id = read[REQUEST_ID_MEMBER]
+        .as_str()
+        .unwrap_or_else(|| panic!("the read must state its id as a body member: {read}"))
+        .to_string();
+    assert!(
+        stated.insert(read_id.clone()),
+        "the read's request id {read_id:?} was stated for another call too"
+    );
 }

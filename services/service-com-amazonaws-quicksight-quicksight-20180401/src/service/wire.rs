@@ -2,26 +2,25 @@
 
 //! How this service's `restJson1` answers report the request id of a FAILED call.
 //!
-//! RULE: a failed call of this service reports the request id of the call in the
-//! `x-amzn-RequestId` response header ONLY, and its error document carries just the members
-//! the service fills for the class — the message, and the resource discriminator where it
-//! sets one. The `RequestId` member every exception shape of this model declares
-//! (`smithy_query(query="shape",
+//! RULE: every answer of this service states the request id of the call in the `RequestId`
+//! member the answered shape declares, and a FAILURE repeats that same id in the
+//! `x-amzn-RequestId` response header. Every exception shape of this model declares that
+//! member (`smithy_query(query="shape",
 //! shape="ResourceNotFoundException,ResourceExistsException,LimitExceededException",
-//! model_path="services/service-com-amazonaws-quicksight-quicksight-20180401/smithy-model/com-amazonaws-quicksight-quicksight-20180401.json")`)
-//! is optional, and a failure leaves it out of the document. A SUCCESS is the other half of
-//! the same contract: an output shape declares `RequestId` as a body member and an answer
-//! that succeeds states it there.
+//! model_path="services/service-com-amazonaws-quicksight-quicksight-20180401/smithy-model/com-amazonaws-quicksight-quicksight-20180401.json")`),
+//! so a refusal document carries it beside the message and the resource discriminator the
+//! class sets. A SUCCESS is the other half of the same contract: an output shape declares
+//! `RequestId` as a body member and an answer that succeeds states it there.
 //!
 //! The framework's generic serializer writes the document — every member the handler set,
-//! the request id among them — and knows nothing of the header, and `vendor/` is read-only,
-//! so both halves of the rule live at the seam a service owns over the answers it writes:
-//! [`RequestIdInHeaderRestJson`] is the protocol `service.rs` hands the dispatch sequence
-//! through [`smithy_server_runtime::Service::override_protocol`], so EVERY modelled failure
-//! of EVERY operation goes out the same way and no handler, shape declaration or error
-//! constructor mentions the rendering at all. The id a handler allocated is OBSERVED as the
-//! document is written and WITHHELD from it, never re-minted here, so the header can only
-//! ever report the id the refusing handler allocated for this call; an error shape that
+//! the request id among them — but knows nothing of the header, and `vendor/` is read-only,
+//! so the header half of the rule lives at the seam a service owns over the answers it
+//! writes: [`RequestIdMirroredRestJson`] is the protocol `service.rs` hands the dispatch
+//! sequence through [`smithy_server_runtime::Service::override_protocol`], so EVERY modelled
+//! failure of EVERY operation goes out the same way and no handler, shape declaration or
+//! error constructor mentions the rendering at all. The id a handler allocated is OBSERVED
+//! as the document is written and written on unchanged, never re-minted here, so the header
+//! can only ever repeat the id the document of this very call carries; an error shape that
 //! declares no such member is rendered exactly as the framework writes it and reports no id
 //! anywhere.
 //!
@@ -64,9 +63,8 @@ fn request_id_member(error_schema: &Schema) -> Option<&Schema> {
     })
 }
 
-/// An error structure serialized as the framework writes it except for the request id it
-/// carries, which is noted in `observed` for the response header and left out of the
-/// document.
+/// An error structure serialized exactly as the framework writes it, with the request id it
+/// carries noted in `observed` on the way past so the response header can repeat it.
 struct RequestIdObserved<'a> {
     inner: &'a dyn SerializableStruct,
     request_id: &'a Schema,
@@ -85,8 +83,8 @@ impl SerializableStruct for RequestIdObserved<'_> {
 }
 
 /// The serializer an error's members are written through: every write is the wrapped
-/// serializer's, unchanged, except the write of the request-id member, which is noted for
-/// the response header instead of reaching the document.
+/// serializer's, unchanged — the write of the request-id member is additionally noted, so
+/// the response header can repeat the value the document states.
 struct Observing<'a> {
     inner: &'a mut dyn ShapeSerializer,
     member_name: Option<&'a str>,
@@ -163,11 +161,10 @@ impl ShapeSerializer for Observing<'_> {
 
     fn write_string(&mut self, schema: &Schema, value: &str) -> Result<(), SerdeError> {
         if self.observes(schema) {
-            // The id the handler allocated for this call: noted here for the header, and
-            // NOT passed to the wrapped serializer, so the error document does not carry
-            // the member.
+            // The id the handler allocated for this call: noted here so the header repeats
+            // it, and still passed to the wrapped serializer below, because the member is
+            // where the answer states it.
             *self.observed.borrow_mut() = Some(value.to_string());
-            return Ok(());
         }
         self.inner.write_string(schema, value)
     }
@@ -189,15 +186,15 @@ impl ShapeSerializer for Observing<'_> {
     }
 }
 
-/// The `restJson1` codec that reports a failure's request id in the `x-amzn-RequestId`
-/// response header alone, withholding the optional member the model declares it under from
-/// the error document: the model's own protocol in every other respect.
+/// The `restJson1` codec that repeats a failure's request id — the one its error document
+/// states in the member the model declares — in the `x-amzn-RequestId` response header: the
+/// model's own protocol in every other respect.
 #[derive(Debug)]
-pub struct RequestIdInHeaderRestJson {
+pub struct RequestIdMirroredRestJson {
     inner: RestJsonServerProtocol,
 }
 
-impl RequestIdInHeaderRestJson {
+impl RequestIdMirroredRestJson {
     /// Build the protocol once, at service construction:
     /// [`smithy_server_runtime::Service::override_protocol`] hands back a borrow of it and
     /// must never build one per request.
@@ -215,13 +212,13 @@ impl RequestIdInHeaderRestJson {
     }
 }
 
-impl Default for RequestIdInHeaderRestJson {
+impl Default for RequestIdMirroredRestJson {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl ServerProtocol for RequestIdInHeaderRestJson {
+impl ServerProtocol for RequestIdMirroredRestJson {
     type Request = Request;
     type Response = Response;
 
