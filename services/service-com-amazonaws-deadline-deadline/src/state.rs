@@ -238,7 +238,9 @@ pub const QUEUE_LIMIT_ASSOCIATION_STOPPED_AFTER: Duration = Duration::from_secs(
 /// The one TERMINAL value of that enum: the two `STOP_LIMIT_USAGE_AND_*` statuses are the
 /// association on its way here, and [`QUEUE_LIMIT_ASSOCIATION_STATUS_ACTIVE`] is the queue's
 /// work subject to the limit. The limit is released from the queue's work only in this
-/// status.
+/// status, which is what makes it the one status a delete of the association is allowed in —
+/// `DeleteQueueLimitAssociation` documents exactly that: "Use the GetQueueLimitAssociation
+/// operation to see if the status changed to STOPPED before deleting the association."
 pub const QUEUE_LIMIT_ASSOCIATION_STATUS_STOPPED: &str = "STOPPED";
 
 /// `BudgetStatus` a freshly created budget carries.
@@ -935,7 +937,8 @@ impl QueueLimitAssociation {
     ///
     /// [`QUEUE_LIMIT_ASSOCIATION_STATUS_STOPPED`] is the one status in which neither new
     /// usage of the limit nor the completion or cancellation of the tasks already using it
-    /// is still attached to the queue.
+    /// is still attached to the queue, so it is the one status in which the association can
+    /// be taken away.
     pub fn stopped(&self) -> bool {
         self.status == QUEUE_LIMIT_ASSOCIATION_STATUS_STOPPED
     }

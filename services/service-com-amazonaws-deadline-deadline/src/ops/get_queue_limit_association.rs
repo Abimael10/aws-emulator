@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetQueueLimitAssociation
+//! Reports the association between `queueId` and `limitId` under `farmId` from this service's
+//! store.
+//!
+//! The one thing the read writes is the `STOP_LIMIT_USAGE_* -> STOPPED` move the clock already
+//! made due ([`crate::state::QueueLimitAssociation::settle_status`]): it was owed at this
+//! instant whether or not anybody called, so materialising it here is reporting — which is
+//! what lets a client poll this read for the `STOPPED` the delete of the association waits
+//! for.
 //!
 //! ## Shape of an operation
 //!

@@ -27,24 +27,35 @@ use crate::limit::create_limit;
 
 /// `PUT /2023-10-12/farms/{farmId}/queue-limit-associations` — where an association is
 /// created, from `smithy_query(query="operation", operation="CreateQueueLimitAssociation")`.
-fn create_association_path(farm_id: &str) -> String {
+///
+/// `pub(crate)` so every suite in this test target drives the create through the one request
+/// shape the model lays out.
+pub(crate) fn create_association_path(farm_id: &str) -> String {
     format!("/2023-10-12/farms/{farm_id}/queue-limit-associations")
 }
 
-/// `GET /2023-10-12/farms/{farmId}/queue-limit-associations/{queueId}/{limitId}` — where
-/// one association is read, from
-/// `smithy_query(query="operation", operation="GetQueueLimitAssociation")`.
+/// `GET|PATCH|DELETE /2023-10-12/farms/{farmId}/queue-limit-associations/{queueId}/{limitId}`
+/// — where one association is read, updated and deleted, from
+/// `smithy_query(query="operation", operation="GetQueueLimitAssociation")` and the two
+/// operations bound to the same URI.
+///
+/// `pub(crate)` for the same reason as [`create_association_path`].
 pub(crate) fn association_path(farm_id: &str, queue_id: &str, limit_id: &str) -> String {
     format!("/2023-10-12/farms/{farm_id}/queue-limit-associations/{queue_id}/{limit_id}")
 }
 
 /// The composite id this service reports for a queue-limit association: the three ids of
 /// its path, since the model mints the association no id of its own.
+///
+/// `pub(crate)` so every suite in this test target names an association the same way.
 pub(crate) fn association_id(farm_id: &str, queue_id: &str, limit_id: &str) -> String {
     format!("{farm_id}, {queue_id} and {limit_id}")
 }
 
 /// A `CreateLimit` body for a limit declaring `amount_requirement_name`.
+///
+/// `pub(crate)` so every suite in this test target creates the limits it associates the same
+/// way.
 pub(crate) fn limit_body(display_name: &str, amount_requirement_name: &str) -> Value {
     json!({
         "displayName": display_name,
@@ -54,7 +65,9 @@ pub(crate) fn limit_body(display_name: &str, amount_requirement_name: &str) -> V
 }
 
 /// Associate `queue_id` with `limit_id` under `farm_id`.
-async fn associate(
+///
+/// `pub(crate)` so every suite in this test target sets an association up the same way.
+pub(crate) async fn associate(
     emulator: &Emulator,
     farm_id: &str,
     queue_id: &str,
@@ -70,7 +83,31 @@ async fn associate(
         .await
 }
 
+/// Ask the association of `queue_id` and `limit_id` for `status`.
+///
+/// `pub(crate)` so every suite in this test target drives `UpdateQueueLimitAssociation`
+/// through the one request shape the model lays out: `PATCH` on the association's own path
+/// with the status in the body.
+pub(crate) async fn ask_for_status(
+    emulator: &Emulator,
+    farm_id: &str,
+    queue_id: &str,
+    limit_id: &str,
+    status: &str,
+) -> (u16, Value) {
+    emulator
+        .call(
+            "PATCH",
+            &association_path(farm_id, queue_id, limit_id),
+            Some(json!({"status": status})),
+            None,
+        )
+        .await
+}
+
 /// Associate the pair and fail the test unless the create was accepted.
+///
+/// `pub(crate)` so every suite in this test target sets an association up the same way.
 pub(crate) async fn associate_ok(emulator: &Emulator, farm_id: &str, queue_id: &str, limit_id: &str) {
     let (status, body) = associate(emulator, farm_id, queue_id, limit_id).await;
     assert_eq!(
@@ -84,6 +121,8 @@ pub(crate) async fn associate_ok(emulator: &Emulator, farm_id: &str, queue_id: &
 }
 
 /// Read one association back, failing the test if it can't be read.
+///
+/// `pub(crate)` so every suite in this test target reads an association the same way.
 pub(crate) async fn read_association(
     emulator: &Emulator,
     farm_id: &str,

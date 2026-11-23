@@ -36,24 +36,28 @@ use std::time::{Duration, Instant};
 
 use aws_smithy_types::date_time::Format;
 use aws_smithy_types::DateTime;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::farm_queue_job::{absent_id, caller, error_code, string_at, Emulator};
 use crate::limit::create_limit;
-// An association is reached, created and described through the helpers the create/read suite
-// owns, so every suite in this target drives the same request shapes.
+// An association is reached, created, asked for a status and described through the helpers the
+// create/read suite owns, so every suite in this target drives the same request shapes.
 use crate::queue_limit_association::{
-    associate_ok, association_id, association_path, limit_body, read_association,
+    ask_for_status, associate_ok, association_id, limit_body, read_association,
 };
 
 /// The status an association holds when the queue's usage of the limit has stopped — the one
 /// terminal value of `QueueLimitAssociationStatus` (`smithy_query(query="shape",
 /// shape="QueueLimitAssociationStatus")`: `ACTIVE`, `STOP_LIMIT_USAGE_AND_COMPLETE_TASKS`,
 /// `STOP_LIMIT_USAGE_AND_CANCEL_TASKS`, `STOPPED`).
-const STOPPED: &str = "STOPPED";
+///
+/// `pub(crate)` so every suite in this test target names the terminal status the same way.
+pub(crate) const STOPPED: &str = "STOPPED";
 
 /// The queue's work subject to the limit: terminal in the other direction.
-const ACTIVE: &str = "ACTIVE";
+///
+/// `pub(crate)` for the same reason as [`STOPPED`].
+pub(crate) const ACTIVE: &str = "ACTIVE";
 
 /// How long a poll for a clock-owed status keeps looking before the test gives up.
 ///
@@ -64,25 +68,6 @@ const POLL_DEADLINE: Duration = Duration::from_secs(60);
 
 /// How long the poll waits between two reads.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
-
-/// Ask the association of `queue_id` and `limit_id` for `status`, as the model lays the
-/// request out (`PATCH .../queue-limit-associations/{queueId}/{limitId}`).
-async fn ask_for_status(
-    emulator: &Emulator,
-    farm_id: &str,
-    queue_id: &str,
-    limit_id: &str,
-    status: &str,
-) -> (u16, Value) {
-    emulator
-        .call(
-            "PATCH",
-            &association_path(farm_id, queue_id, limit_id),
-            Some(json!({"status": status})),
-            None,
-        )
-        .await
-}
 
 /// Ask for `status` and fail the test unless the update was accepted with the modelled empty
 /// response.

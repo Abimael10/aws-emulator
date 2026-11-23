@@ -21,19 +21,13 @@
 use serde_json::{json, Value};
 
 use crate::farm_queue_job::{absent_id, error_code, string_at, Emulator};
-use crate::limit::create_limit;
+use crate::limit::{create_limit, limit_path};
 
 /// Collection path of the limit resource, from
 /// `smithy_query(query="operation", operation="ListLimits")`:
 /// `GET /2023-10-12/farms/{farmId}/limits`.
 fn limits_path(farm_id: &str) -> String {
     format!("/2023-10-12/farms/{farm_id}/limits")
-}
-
-/// Single-limit path, from `smithy_query(query="operation", operation="DeleteLimit")`:
-/// `DELETE /2023-10-12/farms/{farmId}/limits/{limitId}`, the same path `GetLimit` reads.
-fn limit_path(farm_id: &str, limit_id: &str) -> String {
-    format!("/2023-10-12/farms/{farm_id}/limits/{limit_id}")
 }
 
 /// A `CreateLimit` body carrying every member the model requires.
@@ -45,7 +39,16 @@ fn create_body(display_name: &str, amount_requirement_name: &str, max_count: i64
     })
 }
 
-async fn delete_limit(emulator: &Emulator, farm_id: &str, limit_id: &str) -> (u16, Value) {
+/// `DELETE /2023-10-12/farms/{farmId}/limits/{limitId}` — the request shape
+/// `smithy_query(query="operation", operation="DeleteLimit")` lays out, on the path `GetLimit`
+/// reads.
+///
+/// `pub(crate)` so every suite in this test target deletes a limit the same way.
+pub(crate) async fn delete_limit(
+    emulator: &Emulator,
+    farm_id: &str,
+    limit_id: &str,
+) -> (u16, Value) {
     emulator
         .call("DELETE", &limit_path(farm_id, limit_id), None, None)
         .await
