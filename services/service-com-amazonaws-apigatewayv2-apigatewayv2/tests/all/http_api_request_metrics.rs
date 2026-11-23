@@ -54,16 +54,16 @@ const REGION: &str = "us-east-1";
 const NAMESPACE: &str = "AWS/ApiGateway";
 
 /// The counters and the measurements one answered request is observed in.
-const COUNT: &str = "Count";
+pub(crate) const COUNT: &str = "Count";
 const CLIENT_ERRORS: &str = "4xx";
 const SERVER_ERRORS: &str = "5xx";
-const LATENCY: &str = "Latency";
+pub(crate) const LATENCY: &str = "Latency";
 const DATA_PROCESSED: &str = "DataProcessed";
-const INTEGRATION_LATENCY: &str = "IntegrationLatency";
+pub(crate) const INTEGRATION_LATENCY: &str = "IntegrationLatency";
 
 /// The dimensions those series are identified by.
-const API_ID: &str = "ApiId";
-const STAGE: &str = "Stage";
+pub(crate) const API_ID: &str = "ApiId";
+pub(crate) const STAGE: &str = "Stage";
 const METHOD: &str = "Method";
 const RESOURCE: &str = "Resource";
 
@@ -79,7 +79,7 @@ const PERIOD_SECONDS: i64 = 60;
 
 /// This service, AWS Lambda and CloudWatch on ONE engine, as `core/router/src/lib.rs` mounts
 /// them.
-fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -137,7 +137,7 @@ fn now_secs() -> f64 {
 /// Summed over the datapoints rather than read off one, because a window boundary crossed
 /// while a case is running splits its observations over two periods — and the whole of what a
 /// counter says is its total.
-async fn total(
+pub(crate) async fn total(
     router: &MultiServiceRouter,
     metric: &str,
     dimensions: &[(&str, String)],
@@ -147,7 +147,7 @@ async fn total(
 
 /// How many OBSERVATIONS the series holds in the window: its `SampleCount`, added up the same
 /// way, which for a measurement is the number of things measured.
-async fn samples(
+pub(crate) async fn samples(
     router: &MultiServiceRouter,
     metric: &str,
     dimensions: &[(&str, String)],
@@ -204,7 +204,10 @@ async fn aggregated(
 
 /// Every series this namespace holds for `api_id`, as `(metric name, its dimension pairs)`
 /// with the pairs ordered by dimension name.
-async fn series(router: &MultiServiceRouter, api_id: &str) -> Vec<(String, Vec<(String, String)>)> {
+pub(crate) async fn series(
+    router: &MultiServiceRouter,
+    api_id: &str,
+) -> Vec<(String, Vec<(String, String)>)> {
     let (status, body) = monitoring(router, "ListMetrics", json!({ "Namespace": NAMESPACE })).await;
     assert_eq!(status, 200, "ListMetrics answered {status} {body}");
     let mut held: Vec<(String, Vec<(String, String)>)> = body
@@ -843,7 +846,7 @@ async fn a_request_the_authorizer_refused_is_counted_as_a_client_error_with_no_b
 }
 
 /// The dimension pairs of a scope, ordered by name the way a series reports them.
-fn pairs(dimensions: &[(&str, String)]) -> Vec<(String, String)> {
+pub(crate) fn pairs(dimensions: &[(&str, String)]) -> Vec<(String, String)> {
     let mut pairs: Vec<(String, String)> = dimensions
         .iter()
         .map(|(name, value)| ((*name).to_string(), value.clone()))

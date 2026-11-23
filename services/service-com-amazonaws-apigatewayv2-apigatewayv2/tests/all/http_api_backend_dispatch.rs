@@ -126,7 +126,7 @@ pub(crate) async fn control(
 
 /// One request against the AWS Lambda emulator; the credential scope is what routes it
 /// there rather than to this service.
-async fn lambda(
+pub(crate) async fn lambda(
     emulator: &MultiServiceRouter,
     method: &str,
     uri: &str,
