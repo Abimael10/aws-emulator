@@ -9,6 +9,13 @@
 //! snapshot and the numbering live on the agent's assistant in `crate::state`, so this
 //! response and every later read of the version are rendered out of one record.
 //!
+//! The publish adds nothing of its own to that snapshot: the `tags` a version reports is the
+//! tag set the agent carried at the instant it was published, which is the tag set a caller
+//! applied to the agent — the `Tags` map is "The tags used to organize, track, or control
+//! access for this resource"
+//! (`smithy_query(query="shape",shape="AIAgentData",member="tags")`), and the service writes
+//! no entry of its own into it.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

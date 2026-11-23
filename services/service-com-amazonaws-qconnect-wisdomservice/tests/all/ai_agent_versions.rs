@@ -16,7 +16,8 @@
 //! later publish is the previous number plus 1, the snapshot is addressable as
 //! `<id>:<versionNumber>` and reports exactly what was published under it however often the
 //! working copy changes afterwards, the listing reports the versions still held in
-//! ascending order, and a delete removes one whatever still NAMES it.
+//! ascending order, and a delete removes one whatever still NAMES it. What a version reports
+//! for the agent's TAGS is `ai_agent_version_tags`'s own suite.
 //!
 //! The rows differ along every axis the rule generalises over:
 //!
@@ -88,7 +89,7 @@ const ONE_DAY_SECONDS: f64 = 86_400.0;
 
 /// `CreateAIAgentVersion` on one agent, as the model's URI binds it
 /// (`POST /assistants/{assistantId}/aiagents/{aiAgentId}/versions`).
-async fn publish(emulator: &Emulator, assistant: &str, agent: &str, body: Value) -> Reply {
+pub(crate) async fn publish(emulator: &Emulator, assistant: &str, agent: &str, body: Value) -> Reply {
     emulator
         .send(
             "POST",
@@ -104,7 +105,12 @@ async fn publish(emulator: &Emulator, assistant: &str, agent: &str, body: Value)
 
 /// `ListAIAgentVersions` (`GET /assistants/{assistantId}/aiagents/{aiAgentId}/versions`),
 /// with `query` appended verbatim so a row can page and filter.
-async fn list_versions(emulator: &Emulator, assistant: &str, agent: &str, query: &str) -> Reply {
+pub(crate) async fn list_versions(
+    emulator: &Emulator,
+    assistant: &str,
+    agent: &str,
+    query: &str,
+) -> Reply {
     emulator
         .send(
             "GET",

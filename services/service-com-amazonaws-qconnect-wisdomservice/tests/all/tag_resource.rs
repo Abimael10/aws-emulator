@@ -58,7 +58,7 @@ const TAG_VALUE_MAX: usize = 256;
 const NO_CONTENT: u16 = 204;
 
 /// `TagResource` on one resource ARN with one tag map.
-async fn tag_resource(
+pub(crate) async fn tag_resource(
     emulator: &Emulator,
     resource_arn: &str,
     tags: &BTreeMap<String, String>,
@@ -74,7 +74,7 @@ async fn tag_resource(
 
 /// The tag map `ListTagsForResource` reports for one ARN, as a sorted map, so a row
 /// compares what is PERSISTED rather than what a call happened to answer.
-async fn stored_tags(
+pub(crate) async fn stored_tags(
     emulator: &Emulator,
     case: &str,
     resource_arn: &str,

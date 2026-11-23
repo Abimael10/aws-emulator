@@ -12,7 +12,9 @@
 //! qualifier reads the snapshot rather than the working copy. The snapshot is a whole
 //! [`AiAgent`] record, so every member a version reports is rendered by the SAME
 //! projection a read of the working copy renders, and the two cannot disagree about what
-//! was published.
+//! was published. The publish adds nothing of its own to that record: a version's `tags` is
+//! the tag set the agent carried when it was published, which is the tag set a caller
+//! applied, so nothing but a tag write to the working copy ever puts an entry there.
 //!
 //! The numbering is the one the modelled `Version` range (`min 1`) admits: 1 for an
 //! agent's first version and the previous number plus 1 for each later publish. A number a
@@ -92,8 +94,10 @@ pub struct AiAgentVersion {
     /// version and the previous one plus 1 for each later publish, which is what the
     /// modelled `Version` range (`min 1`) admits.
     pub version_number: i64,
-    /// The working copy as it was when this version was published. Immutable: a later
-    /// write to the agent leaves this record alone.
+    /// The working copy as it was when this version was published — its tag map included,
+    /// which is the tag set the agent carried at that instant and nothing besides.
+    /// Immutable: a
+    /// later write to the agent leaves this record alone.
     pub snapshot: AiAgent,
 }
 

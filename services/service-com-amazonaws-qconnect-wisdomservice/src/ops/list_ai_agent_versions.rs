@@ -4,7 +4,8 @@
 //!
 //! Reports the versions the AI agent its label names has published, in ascending
 //! `versionNumber` order, one page at a time: `@readonly`, so it answers out of the stored
-//! version records and writes nothing.
+//! version records and writes nothing. Each summary is the snapshot's own projection, so its
+//! `tags` is the tag set the agent carried at the instant that version was published.
 //!
 //! ## Shape of an operation
 //!
