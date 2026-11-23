@@ -19,6 +19,16 @@
 
 use super::*;
 
+/// The `UsageClassType` values a type offered neither a Capacity Block nor anything but
+/// On-Demand and Spot publishes: a Capacity Block reserves the accelerated hardware a WHOLE
+/// host at a time, so a size that holds less than one is not offered that class.
+const ON_DEMAND_AND_SPOT_USAGE_CLASSES: &[&str] = &["on-demand", "spot"];
+
+/// The Neuron device the first generation Trainium family carries, as `NeuronDeviceInfo$Name`
+/// publishes it, with the NeuronCores one device carries, the version of those cores and the
+/// memory of one device in MiB.
+const TRAINIUM_DEVICE: (&str, i32, i32, i32) = ("Trainium", 2, 2, 32_768);
+
 /// The published hardware facts of the Neuron accelerated families' instance types, one row
 /// per type.
 pub(super) static NEURON_ACCELERATED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
@@ -80,4 +90,64 @@ pub(super) static NEURON_ACCELERATED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTyp
         .host_features(false, false)
         .inference(16, "Inferentia", "AWS", 8_192)
         .neurons(16, "Inferentia", 4, 1, 8_192),
+    // Trn1 — training accelerated on the 3rd generation Intel Xeon Scalable (Ice Lake) host at
+    // a sustained 3.5 GHz, carrying AWS Trainium devices of 32 GiB, each with two NeuronCores
+    // of the second version: ONE device on the narrow size and the host's whole sixteen on the
+    // size that holds it, which is 512 GiB of accelerator memory. The family publishes NO
+    // Inference accelerator inventory of those devices, only the Neuron one.
+    // Its EBS figures are the published 80,000 Mbps and 260,000 IOPS of the whole host and the
+    // narrow size's sixteenth of both, which that size bursts above up to its published 20,000
+    // Mbps ceiling; the whole-host size reports its host's entire attachment pool rather than
+    // the pool less the devices it carries, the local devices of that size being the guest's
+    // own hardware, while the narrow size publishes 25 volumes of that pool. The local store is
+    // the published four 1,900 GB devices of the host and one 475 GB device — a sixteenth of
+    // them — on the narrow size. The network is the family's own: the whole-host size carries
+    // the eight cards' 800 Gigabit and eight Elastic Fabric Adapters, while the narrow size
+    // bursts up to 12.5 Gigabit on one card and is offered no adapter; the interfaces the
+    // whole-host size publishes are not recorded here, so it keeps the figure its step of the
+    // published interface ladder gives. Its adapter encrypts traffic between instances, the
+    // published list of the types that do naming the family; its hardware generation offers
+    // neither Nitro Enclaves, nor NitroTPM, nor the UEFI boot mode, nor reboot migration, nor a
+    // local PTP hardware clock; its cores are taken two at a time; and a Capacity Block reserves
+    // a whole accelerated host, so only the size that holds one is offered that usage class.
+    PublishedInstanceTypeFacts::of("trn1.2xlarge")
+        .cores_in_steps_of(2)
+        .ebs(5_000, 16_250, 20_000, 65_000)
+        .ebs_attachments(25)
+        .instance_store(1, 475)
+        .network_bandwidth(3.125, 12.5)
+        .processor("Intel", 3.5)
+        .usage_classes(ON_DEMAND_AND_SPOT_USAGE_CLASSES)
+        .boot_modes(LEGACY_BIOS_BOOT_MODE)
+        .encryption_in_transit(true)
+        .nitro_enclaves(false)
+        .nitro_tpm(false)
+        .host_features(false, false)
+        .neurons(
+            1,
+            TRAINIUM_DEVICE.0,
+            TRAINIUM_DEVICE.1,
+            TRAINIUM_DEVICE.2,
+            TRAINIUM_DEVICE.3,
+        ),
+    PublishedInstanceTypeFacts::of("trn1.32xlarge")
+        .cores_in_steps_of(2)
+        .ebs(80_000, 260_000, 80_000, 260_000)
+        .ebs_attachments(28)
+        .instance_store(4, 1_900)
+        .network_bandwidth(800.0, 800.0)
+        .efa(8)
+        .processor("Intel", 3.5)
+        .boot_modes(LEGACY_BIOS_BOOT_MODE)
+        .encryption_in_transit(true)
+        .nitro_enclaves(false)
+        .nitro_tpm(false)
+        .host_features(false, false)
+        .neurons(
+            16,
+            TRAINIUM_DEVICE.0,
+            TRAINIUM_DEVICE.1,
+            TRAINIUM_DEVICE.2,
+            TRAINIUM_DEVICE.3,
+        ),
 ];

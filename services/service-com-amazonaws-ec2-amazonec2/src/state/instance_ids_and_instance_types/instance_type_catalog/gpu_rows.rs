@@ -20,6 +20,10 @@ use super::*;
 /// and its published memory in MiB: a 24 GB device.
 const L4_ACCELERATOR: (&str, i32) = ("L4", 22_888);
 
+/// The accelerator the sixth generation graphics family's `e` variant carries, and its
+/// published memory in MiB: a 48 GB device, twice the one above.
+const L40S_ACCELERATOR: (&str, i32) = ("L40S", 45_776);
+
 /// The accelerator the fifth generation x86 graphics family carries, and its published memory
 /// in MiB: the same 24 GB of the device above, this one the generation before it.
 const A10G_ACCELERATOR: (&str, i32) = ("A10G", 22_888);
@@ -185,6 +189,198 @@ pub(super) static GPU_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
         .dedicated_hosts(false)
         // The whole host's adapter is this size's own, which is the hardware ENA Express runs
         // on, so this size alone of the family is offered it.
+        .ena_srd(true)
+        .host_features(false, false)
+        .ipv4_per_secondary_interface(0),
+    // G6e — the sixth generation graphics family's `e` variant: NVIDIA L40S accelerators of 48
+    // GB on the same 3rd generation AMD EPYC the G6 family runs on and at the same sustained
+    // 3.4 GHz, with 8 GiB of system memory per vCPU — TWICE the ratio its family letter gives,
+    // which is why every row below publishes its memory. Its local NVMe devices are the
+    // published ones, count and size each the type's own: one device up to the `4xlarge`, two
+    // from the `8xlarge` up — of 450, 1,900 and 950 GB as the ladder climbs — and four of the
+    // family's 1,900 GB device on the size that holds the whole host.
+    // It reads its own rows of "Amazon EBS optimized instance types", four I/O operations per
+    // second for each Mbps of bandwidth throughout: 500 Mbps per vCPU on the `4xlarge` and the
+    // `8xlarge`, the host's own 312.5 Mbps per vCPU above them, and half the family's dedicated
+    // rate on the two narrowest sizes, which burst above what they sustain to the 5,000 Mbps
+    // their published column states. Its volumes are attached to EBS hardware of the type's own
+    // rather than out of the pool shared with its interfaces and local devices, so every size
+    // publishes a limit of its own that grows with the share of the host it holds: 32 up to a
+    // quarter of it, 48 for a third, the recorded 64 for a half and 128 for the whole host, the
+    // three rungs beside that recorded one being DERIVED from it the way the G6 family's are.
+    // The network figure is the family's own published column, well above the general purpose
+    // host's: the two narrowest sizes burst up to 20 Gigabit, and from the `4xlarge` up each
+    // size holds a dedicated share — one adapter's 100 Gigabit on the `12xlarge`, and the two and
+    // four adapters of the wider sizes together, which is why those two publish several network
+    // cards. The Elastic Fabric Adapter is offered from the size that holds a dedicated share
+    // up, ENA Express on the sizes that carry several of the host's accelerators and the adapter
+    // that goes with them, and a Dedicated Host only on the two sizes that hold half the host's
+    // accelerators or more. No size is migrated to another host on a user-initiated reboot and
+    // none carries a local clock; none takes an interface attachment from a secondary network,
+    // so each publishes none of the addresses such an interface would take. The cores of the
+    // `8xlarge` sit on both of the host's processor sockets and are taken one per socket, so it
+    // publishes the even counts alone, while a size wider still holds whole accelerators with
+    // the vCPUs pinned to them and takes its cores ALL at once, so the one count it publishes is
+    // its default; the narrower sizes publish every count.
+    // The interface limits of the three sizes that hold more than a quarter of the host are NOT
+    // recorded here: each publishes a figure of its own that its step of the "IP addresses per
+    // network interface per instance type" ladder does not give, so those sizes keep the
+    // ladder's figure until the published one is read in.
+    PublishedInstanceTypeFacts::of("g6e.xlarge")
+        .memory_gib(32)
+        .ebs(1_000, 4_000, 5_000, 20_000)
+        .dedicated_ebs_attachments(32)
+        .instance_store(1, 250)
+        .network("Up to 20 Gigabit")
+        .gpus(
+            1,
+            L40S_ACCELERATOR.0,
+            NVIDIA,
+            L40S_ACCELERATOR.1,
+            ML_AI_WORKLOAD,
+        )
+        .processor("AMD", 3.4)
+        .dedicated_hosts(false)
+        .ena_srd(false)
+        .host_features(false, false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("g6e.2xlarge")
+        .memory_gib(64)
+        .ebs(2_000, 8_000, 5_000, 20_000)
+        .dedicated_ebs_attachments(32)
+        .instance_store(1, 450)
+        .network("Up to 20 Gigabit")
+        .gpus(
+            1,
+            L40S_ACCELERATOR.0,
+            NVIDIA,
+            L40S_ACCELERATOR.1,
+            ML_AI_WORKLOAD,
+        )
+        .processor("AMD", 3.4)
+        .dedicated_hosts(false)
+        .ena_srd(false)
+        .host_features(false, false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("g6e.4xlarge")
+        .memory_gib(128)
+        .ebs(8_000, 32_000, 8_000, 32_000)
+        .dedicated_ebs_attachments(32)
+        .instance_store(1, 600)
+        .network_bandwidth(20.0, 20.0)
+        .gpus(
+            1,
+            L40S_ACCELERATOR.0,
+            NVIDIA,
+            L40S_ACCELERATOR.1,
+            ML_AI_WORKLOAD,
+        )
+        .processor("AMD", 3.4)
+        .dedicated_hosts(false)
+        .ena_srd(false)
+        .host_features(false, false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("g6e.8xlarge")
+        .memory_gib(256)
+        .cores_in_steps_of(2)
+        .ebs(16_000, 64_000, 16_000, 64_000)
+        .dedicated_ebs_attachments(32)
+        .instance_store(2, 450)
+        .network_bandwidth(25.0, 25.0)
+        .efa(1)
+        .gpus(
+            1,
+            L40S_ACCELERATOR.0,
+            NVIDIA,
+            L40S_ACCELERATOR.1,
+            ML_AI_WORKLOAD,
+        )
+        .processor("AMD", 3.4)
+        .dedicated_hosts(false)
+        .ena_srd(false)
+        .host_features(false, false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("g6e.12xlarge")
+        .memory_gib(384)
+        .cores_all_at_once()
+        .ebs(20_000, 80_000, 20_000, 80_000)
+        .dedicated_ebs_attachments(32)
+        .instance_store(2, 1_900)
+        .network_bandwidth(100.0, 100.0)
+        .efa(1)
+        .gpus(
+            4,
+            L40S_ACCELERATOR.0,
+            NVIDIA,
+            L40S_ACCELERATOR.1,
+            ML_AI_WORKLOAD,
+        )
+        .processor("AMD", 3.4)
+        .dedicated_hosts(false)
+        .ena_srd(true)
+        .host_features(false, false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("g6e.16xlarge")
+        .memory_gib(512)
+        .cores_all_at_once()
+        .ebs(20_000, 80_000, 20_000, 80_000)
+        // A third of the accelerated host, whose published limit sits between the 32 of the
+        // quarter-host sizes and the 64 of the half-host one. DERIVED from that ladder.
+        .dedicated_ebs_attachments(48)
+        .instance_store(2, 950)
+        .network_bandwidth(35.0, 35.0)
+        .efa(1)
+        .gpus(
+            1,
+            L40S_ACCELERATOR.0,
+            NVIDIA,
+            L40S_ACCELERATOR.1,
+            ML_AI_WORKLOAD,
+        )
+        .processor("AMD", 3.4)
+        .dedicated_hosts(false)
+        .ena_srd(false)
+        .host_features(false, false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("g6e.24xlarge")
+        .memory_gib(768)
+        .cores_all_at_once()
+        .ebs(30_000, 120_000, 30_000, 120_000)
+        .dedicated_ebs_attachments(64)
+        .instance_store(2, 1_900)
+        .network_bandwidth(200.0, 200.0)
+        .efa(1)
+        .gpus(
+            4,
+            L40S_ACCELERATOR.0,
+            NVIDIA,
+            L40S_ACCELERATOR.1,
+            ML_AI_WORKLOAD,
+        )
+        .processor("AMD", 3.4)
+        .ena_srd(true)
+        .host_features(false, false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("g6e.48xlarge")
+        .memory_gib(1_536)
+        .cores_all_at_once()
+        .ebs(60_000, 240_000, 60_000, 240_000)
+        // The size that holds the WHOLE accelerated host carries the whole host's EBS hardware,
+        // which is twice what the half-host size above publishes. DERIVED from that ladder.
+        .dedicated_ebs_attachments(128)
+        .instance_store(4, 1_900)
+        .network_bandwidth(400.0, 400.0)
+        .efa(1)
+        .gpus(
+            8,
+            L40S_ACCELERATOR.0,
+            NVIDIA,
+            L40S_ACCELERATOR.1,
+            ML_AI_WORKLOAD,
+        )
+        .processor("AMD", 3.4)
+        // The four adapters of the whole host are this size's own, which is the hardware ENA
+        // Express runs on.
         .ena_srd(true)
         .host_features(false, false)
         .ipv4_per_secondary_interface(0),

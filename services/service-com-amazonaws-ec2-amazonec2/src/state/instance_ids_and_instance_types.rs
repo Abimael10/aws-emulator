@@ -2832,11 +2832,13 @@ pub(super) fn supported_boot_modes(architecture: &str, nitro: bool) -> Vec<Strin
 /// the size that has the whole host's cards carries more than one — so the entries name full
 /// instance types, not families: the bare metal size of a host whose widest virtualized size
 /// carries two cards IS that whole host, so it carries the same two.
-pub(super) const MULTI_NETWORK_CARD_TYPES: [(&str, i32); 19] = [
+pub(super) const MULTI_NETWORK_CARD_TYPES: [(&str, i32); 21] = [
     ("c6in.32xlarge", 2),
     ("c6in.metal", 2),
     ("c8gb.48xlarge", 2),
     ("dl1.24xlarge", 4),
+    ("g6e.24xlarge", 2),
+    ("g6e.48xlarge", 4),
     ("g7.48xlarge", 2),
     ("m6idn.32xlarge", 2),
     ("m6in.32xlarge", 2),
