@@ -162,7 +162,9 @@ async fn a_result_column_is_described_under_the_type_of_the_value_it_carries() {
             sql: "SELECT id, label, reading, live FROM readings WHERE id = $1",
             params: &["7"],
             oids: &[INTEGER, TEXT, NUMERIC, BOOL],
-            values: &[Some("7"), Some("north"), Some("12.5"), Some("t")],
+            // The exact decimal carries the SCALE its column declares: `numeric(10,2)` holds
+            // two fractional digits, and PostgreSQL renders every one of them.
+            values: &[Some("7"), Some("north"), Some("12.50"), Some("t")],
         },
         Case {
             case: "a boolean column of a catalog, for a role the create minted",

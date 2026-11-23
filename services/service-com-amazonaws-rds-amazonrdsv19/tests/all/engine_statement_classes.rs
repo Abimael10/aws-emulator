@@ -422,7 +422,9 @@ async fn a_mysql_session_creates_the_schemas_a_later_session_connects_to() {
         .expect("a qualified read runs");
     assert_eq!(
         column(&qualified),
-        vec!["2.5".to_string()],
+        // The value carries the scale its column declares: a MySQL `decimal(6,2)` holds two
+        // fractional digits and the server renders both.
+        vec!["2.50".to_string()],
         "case {:?}: a qualified name must reach the table in the schema it names, got \
          {qualified:?}",
         "qualified table name"
@@ -447,7 +449,9 @@ async fn a_mysql_session_creates_the_schemas_a_later_session_connects_to() {
         .expect("the same table, unqualified, from the schema it is in");
     assert_eq!(
         column(&unqualified),
-        vec!["2.5".to_string()],
+        // The value carries the scale its `decimal(6,2)` column declares, read from either
+        // form of the table's name.
+        vec!["2.50".to_string()],
         "case {:?}: the row written through a qualified name must be the row the schema \
          holds, got {unqualified:?}",
         "qualified write read back unqualified"

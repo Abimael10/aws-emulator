@@ -329,5 +329,8 @@ pub(super) fn cluster_runtime_of(
             .db_cluster_instance_class
             .as_deref()
             .and_then(crate::ops::describe_orderable_db_instance_options::class_memory_bytes),
+        // The port the cluster was created with (`Port`), which is the port the engine behind
+        // its endpoints is configured to listen on.
+        Some(record.port),
     )
 }

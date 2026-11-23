@@ -72,13 +72,18 @@ const MAX_SCALE: i64 = 1_000;
 ///
 /// `super::pg_server::function_result_type` reports each as `numeric`, which is the type the
 /// wire then reports for a column one of them produced.
-pub const NUMERIC_FUNCTIONS: [&str; 6] = [
+pub const NUMERIC_FUNCTIONS: [&str; 10] = [
     "pg_numeric",
     "pg_numeric_add",
     "pg_numeric_sub",
     "pg_numeric_mul",
     "pg_numeric_div",
     "pg_numeric_neg",
+    // The AGGREGATES, each over the values of an exact-decimal column ([`EXACT_AGGREGATES`]).
+    "pg_numeric_sum",
+    "pg_numeric_avg",
+    "pg_numeric_min",
+    "pg_numeric_max",
 ];
 
 /// The DIVISION the engines' own `/` is, which is not exact-decimal arithmetic: its value is
@@ -101,7 +106,9 @@ pub fn is_numeric_function(function: &str) -> bool {
 /// what the engine's own function allow-list admits (`super::sql_engine`).
 #[must_use]
 pub fn is_engine_function(function: &str) -> bool {
-    is_numeric_function(function) || function.eq_ignore_ascii_case(DIVISION_FUNCTION)
+    is_numeric_function(function)
+        || function.eq_ignore_ascii_case(DIVISION_FUNCTION)
+        || function.eq_ignore_ascii_case(SCALED_TEXT_FUNCTION)
 }
 
 /// Register the exact-decimal functions on `conn`, so a statement the rewriting below has
@@ -203,7 +210,157 @@ pub fn register_numeric_functions(conn: &Connection) -> Result<(), EngineError> 
             return Ok(None);
         };
         Ok(Some(rendered(&(-value))))
-    })?;    Ok(())
+    })?;
+    // `pg_numeric_text(value, scale)` — the TEXT FORM of a value a column declared with that
+    // scale holds. A column declared `numeric(p, s)` carries exactly `s` fractional digits —
+    // "the value will be rounded to the specified number of fractional digits" — and both
+    // engines render such a column with all of them, so the text form of one is the value
+    // rescaled to its declaration rather than the shortest digits that denote it.
+    scalar(conn, SCALED_TEXT_FUNCTION, 2, |context| {
+        let scale = context.get::<i64>(1).unwrap_or_default();
+        if !(-MAX_SCALE..=MAX_SCALE).contains(&scale) {
+            return Err(failed(format!(
+                "NUMERIC scale {scale} must be between {} and {MAX_SCALE}",
+                -MAX_SCALE
+            )));
+        }
+        let Some(value) = decimal_argument(context, 0)? else {
+            return Ok(None);
+        };
+        Ok(Some(at_the_declared_scale(&value, scale)))
+    })?;
+    // The AGGREGATES, each folding the values of an exact-decimal column exactly
+    // ([`EXACT_AGGREGATES`]). Each takes the value and the scale its column declares.
+    for (_, named, fold) in EXACT_AGGREGATES {
+        conn.create_aggregate_function(
+            named,
+            2,
+            FunctionFlags::SQLITE_UTF8,
+            ExactAggregate(fold),
+        )
+        .map_err(|error| {
+            EngineError::new(
+                super::sql_engine::EngineErrorKind::Internal,
+                error.to_string(),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// The function that renders a value at the SCALE its column's declaration carries, under the
+/// name [`exact_decimal_arithmetic`] puts it in a statement's place.
+///
+/// Not one of [`NUMERIC_FUNCTIONS`]: the value it answers with is the column's TEXT FORM, so
+/// the column it produces carries the text type the cast it replaced asked for
+/// (`super::pg_server::function_result_type`).
+pub const SCALED_TEXT_FUNCTION: &str = "pg_numeric_text";
+
+/// The AGGREGATES both engines compute over an exact-decimal column exactly, each paired with
+/// the function this module registers for it.
+///
+/// PostgreSQL's `sum`, `avg`, `min` and `max` over a `numeric` argument ANSWER a `numeric` —
+/// "sum(numeric) → numeric", and the same for the others — so an aggregate over such a column
+/// is computed on the digits its values carry rather than on the binary floating point the
+/// embedded engine would add them up in.
+const EXACT_AGGREGATES: [(&str, &str, Fold); 4] = [
+    ("sum", "pg_numeric_sum", Fold::Total),
+    ("avg", "pg_numeric_avg", Fold::Average),
+    ("min", "pg_numeric_min", Fold::Least),
+    ("max", "pg_numeric_max", Fold::Greatest),
+];
+
+/// How one exact-decimal aggregate folds each row's value into what it already holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fold {
+    /// `sum`: the total of the values.
+    Total,
+    /// `avg`: that total divided by how many rows carried a value.
+    Average,
+    /// `min`: the least of them.
+    Least,
+    /// `max`: the greatest.
+    Greatest,
+}
+
+/// What one exact-decimal aggregate has accumulated so far.
+#[derive(Debug, Clone, Default)]
+struct Accumulated {
+    /// What the fold holds, or `None` while no row has carried a value — which is what makes
+    /// an aggregate over no rows answer NULL, as both engines do.
+    value: Option<BigDecimal>,
+    /// How many rows carried one, which is what an average divides by.
+    rows: i64,
+    /// The scale the column's declaration carries, which the call's second argument names.
+    scale: i64,
+}
+
+/// One exact-decimal aggregate: the fold it computes over the values it is stepped with.
+struct ExactAggregate(Fold);
+
+impl rusqlite::functions::Aggregate<Accumulated, Option<String>> for ExactAggregate {
+    fn init(&self, _: &mut Context<'_>) -> rusqlite::Result<Accumulated> {
+        Ok(Accumulated::default())
+    }
+
+    /// One row's value, folded in at the scale its column declares — a NULL contributes
+    /// nothing, exactly as both engines' aggregates skip one.
+    fn step(&self, context: &mut Context<'_>, acc: &mut Accumulated) -> rusqlite::Result<()> {
+        let scale = context.get::<i64>(1).unwrap_or_default();
+        if !(-MAX_SCALE..=MAX_SCALE).contains(&scale) {
+            return Err(failed(format!(
+                "NUMERIC scale {scale} must be between {} and {MAX_SCALE}",
+                -MAX_SCALE
+            )));
+        }
+        acc.scale = scale;
+        let Some(value) = decimal_argument(context, 0)? else {
+            return Ok(());
+        };
+        let value = value.with_scale_round(scale, RoundingMode::HalfUp);
+        acc.rows += 1;
+        let folded = match (acc.value.take(), self.0) {
+            (None, _) => value,
+            (Some(held), Fold::Total | Fold::Average) => held + value,
+            (Some(held), Fold::Least) => held.min(value),
+            (Some(held), Fold::Greatest) => held.max(value),
+        };
+        within_the_bound(&folded)?;
+        acc.value = Some(folded);
+        Ok(())
+    }
+
+    fn finalize(
+        &self,
+        _: &mut Context<'_>,
+        acc: Option<Accumulated>,
+    ) -> rusqlite::Result<Option<String>> {
+        let Some((value, acc)) = acc.and_then(|acc| acc.value.clone().map(|value| (value, acc)))
+        else {
+            return Ok(None);
+        };
+        if self.0 != Fold::Average {
+            // The total, the least and the greatest of values of that scale are values of
+            // that scale.
+            return Ok(Some(at_the_declared_scale(&value, acc.scale)));
+        }
+        if acc.rows <= 0 {
+            return Ok(None);
+        }
+        // The average is a QUOTIENT, which carries the digits a division carries rather than
+        // the scale of its operands — the same reading `pg_numeric_div` takes of one.
+        let average = (value / BigDecimal::from(acc.rows))
+            .with_scale_round(DIVISION_SCALE, RoundingMode::HalfUp);
+        Ok(Some(rendered(&average)))
+    }
+}
+
+/// `value` with exactly `scale` fractional digits, which is what a column declared with that
+/// scale holds and what both engines render such a column as.
+fn at_the_declared_scale(value: &BigDecimal, scale: i64) -> String {
+    value
+        .with_scale_round(scale, RoundingMode::HalfUp)
+        .to_plain_string()
 }
 
 /// One of this module's functions, registered on `conn`.
@@ -373,6 +530,12 @@ fn failed(message: String) -> rusqlite::Error {
 ///   `SELECT 1/0` is NULL there, because MySQL's `ERROR_FOR_DIVISION_BY_ZERO` governs the
 ///   statements that CHANGE data, not a query.
 ///
+/// And one more, for the columns whose DECLARATION carries a scale (`scales`): a cast of such
+/// a column to text is the column's own text form, which carries every fractional digit its
+/// declaration does ([`SCALED_TEXT_FUNCTION`]), and an aggregate over such a column is folded
+/// exactly ([`EXACT_AGGREGATES`]) — the embedded engine holds the value in its own affinity
+/// and would render the shortest digits that denote it and add them up as binary floats.
+///
 /// A statement the parser does not read is left alone, and the engine's own refusal is what
 /// the client is told. So is a statement LARGER or DEEPER than this pass serves
 /// ([`MAX_REWRITTEN_BYTES`], [`MAX_EXPRESSION_DEPTH`], [`MAX_REWRITES`]): the rewriting is
@@ -380,10 +543,17 @@ fn failed(message: String) -> rusqlite::Error {
 /// replaces, so no statement can drive it to the depth of its own operator chain or make it
 /// re-render a subtree without limit.
 #[must_use]
-pub fn exact_decimal_arithmetic(wire: super::EngineWire, sql: &str) -> Option<String> {
+pub fn exact_decimal_arithmetic(
+    wire: super::EngineWire,
+    sql: &str,
+    scales: &DeclaredScales,
+) -> Option<String> {
     let upper = sql.to_ascii_uppercase();
     if sql.len() > MAX_REWRITTEN_BYTES
-        || (!upper.contains("NUMERIC") && !upper.contains("DECIMAL") && !sql.contains('/'))
+        || (!upper.contains("NUMERIC")
+            && !upper.contains("DECIMAL")
+            && !sql.contains('/')
+            && scales.is_empty())
     {
         return None;
     }
@@ -402,10 +572,136 @@ pub fn exact_decimal_arithmetic(wire: super::EngineWire, sql: &str) -> Option<St
         if budget.spent() {
             return std::ops::ControlFlow::Break(());
         }
-        exactly(expr, 0, &mut budget);
+        exactly(expr, 0, &mut budget, scales);
         std::ops::ControlFlow::<()>::Continue(())
     });
     budget.rewritten.then(|| statement.to_string())
+}
+
+/// The SCALE each exact-decimal column of the relations a statement names carries, by
+/// lowercased column name: what [`exact_decimal_arithmetic`] renders such a column's text
+/// form at.
+pub type DeclaredScales = ::std::collections::BTreeMap<String, i64>;
+
+/// Whether `upper` — the statement, uppercased — could read an exact-decimal COLUMN as a
+/// value of its own, which is what the declared scales are needed for: its text form, or an
+/// aggregate over it. A statement that does neither pays nothing for them.
+fn reads_a_declared_column(upper: &str) -> bool {
+    ["TEXT", "VARCHAR", "CHAR", "SUM", "AVG", "MIN", "MAX"]
+        .iter()
+        .any(|named| upper.contains(named))
+}
+
+/// The declared scales of the exact-decimal columns the relations `relations` of the database
+/// `target` hold, for the statement `sql` — EMPTY for a statement that reads none of them as a
+/// value of its own, which is what makes this cost nothing for one.
+///
+/// The declarations come from the ENGINE itself, which reports the type each column of a
+/// relation was declared with, so the scale is the one the client's own `CREATE TABLE` gave
+/// the column. A relation the session cannot see contributes nothing.
+#[must_use]
+pub fn declared_scales(
+    database: &super::sql_engine::InstanceDatabase,
+    facts: &super::wire_session::SessionFacts,
+    target: &str,
+    relations: &[String],
+    sql: &str,
+) -> DeclaredScales {
+    let mut scales = DeclaredScales::new();
+    if sql.len() > MAX_REWRITTEN_BYTES || !reads_a_declared_column(&sql.to_ascii_uppercase()) {
+        return scales;
+    }
+    // A column NAME two of the statement's relations declare with DIFFERENT scales says
+    // nothing about the value the statement reads: whichever relation it belongs to, the
+    // scale is one of two. Such a name is left out, so the engine answers for it as it
+    // stands rather than at a scale that may be the other column's.
+    let mut conflicting: Vec<String> = Vec::new();
+    for relation in relations.iter().take(MAX_DESCRIBED_RELATIONS) {
+        let Ok(columns) = database.describe(
+            facts.connection_id,
+            target,
+            &format!("SELECT * FROM {}", super::pg_copy::quoted(relation)),
+            &[],
+        ) else {
+            continue;
+        };
+        for column in columns {
+            let named = column.name.to_ascii_lowercase();
+            let Some(scale) = column
+                .declared_type
+                .as_deref()
+                .and_then(declared_scale_of)
+            else {
+                // A column of that name with no declared scale at all is the same
+                // disagreement: one of the two carries whatever scale its values have.
+                if scales.contains_key(&named) {
+                    conflicting.push(named);
+                }
+                continue;
+            };
+            if scales.get(&named).is_some_and(|held| *held != scale) {
+                conflicting.push(named.clone());
+            }
+            scales.insert(named, scale);
+        }
+    }
+    for named in conflicting {
+        scales.remove(&named);
+    }
+    scales
+}
+
+/// How many relations of one statement are described for their declared scales, so a
+/// statement naming relation after relation cannot make this pass ask the engine without
+/// bound. Well above the relations a client joins in one statement.
+const MAX_DESCRIBED_RELATIONS: usize = 16;
+
+/// The SCALE a column declaration carries, or `None` for a declaration that is not an
+/// exact-decimal type with a scale — which includes a bare `numeric`, whose values carry
+/// whatever scale each of them has.
+///
+/// The names are the ones both engines declare the type under: PostgreSQL's `numeric` and
+/// `decimal` (and the standard's `dec`), and MySQL's `decimal`, `numeric` and `fixed`.
+#[must_use]
+pub fn declared_scale_of(declared: &str) -> Option<i64> {
+    let lowered = declared.trim().to_ascii_lowercase();
+    let (base, arguments) = lowered.split_once('(')?;
+    if !matches!(base.trim(), "numeric" | "decimal" | "dec" | "fixed") {
+        return None;
+    }
+    let (_, scale) = arguments.trim_end_matches(')').split_once(',')?;
+    let scale = scale.trim().parse::<i64>().ok()?;
+    (-MAX_SCALE..=MAX_SCALE).contains(&scale).then_some(scale)
+}
+
+/// `value` as a column declared `declared` HOLDS it: the digits its declaration carries, for
+/// a declaration with a scale, and `None` for every other column or value — whose value is
+/// the one the engine answered with.
+///
+/// This is the same rule as [`SCALED_TEXT_FUNCTION`] on the read path a result set takes: a
+/// column declared `numeric(p, s)` carries exactly `s` fractional digits, so that is what a
+/// client reading the column is sent (`super::sql_engine`).
+#[must_use]
+pub fn as_the_declaration_holds_it(declared: &str, value: ValueRef<'_>) -> Option<String> {
+    let scale = declared_scale_of(declared)?;
+    let text = match value {
+        ValueRef::Null => return None,
+        ValueRef::Integer(number) => number.to_string(),
+        ValueRef::Real(number) => number.to_string(),
+        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => {
+            String::from_utf8_lossy(bytes).trim().to_string()
+        }
+    };
+    if i64::try_from(text.len()).unwrap_or(i64::MAX) > MAX_DIGITS {
+        return None;
+    }
+    let value = text.parse::<BigDecimal>().ok()?;
+    // The MAGNITUDE too, not only the length of the text that names it: a short text can name
+    // a number with more digits than the process should hold (`1e1000000000`), and rescaling
+    // one to a declared scale would have to write every one of them out. The same bound
+    // [`decimal_argument`] holds an operand to, so the two readings of a value cannot drift.
+    within_the_bound(&value).ok()?;
+    Some(at_the_declared_scale(&value, scale))
 }
 
 /// How many BYTES of statement this pass rewrites. A longer statement is handed to the
@@ -465,7 +761,13 @@ impl Budget {
 ///
 /// `depth` is how far into the expression this already is, and `budget` what the pass has
 /// left to spend: past either bound the expression is left exactly as the client wrote it.
-fn exactly(expr: &mut Expr, depth: usize, budget: &mut Budget) -> bool {
+/// `scales` are the declared scales of the columns the statement's relations hold.
+fn exactly(
+    expr: &mut Expr,
+    depth: usize,
+    budget: &mut Budget,
+    scales: &DeclaredScales,
+) -> bool {
     if depth >= MAX_EXPRESSION_DEPTH || budget.spent() {
         return false;
     }
@@ -476,8 +778,20 @@ fn exactly(expr: &mut Expr, depth: usize, budget: &mut Budget) -> bool {
             data_type,
             ..
         } => {
-            let inner = exactly(value, depth + 1, budget);
+            let inner = exactly(value, depth + 1, budget, scales);
             let Some(info) = exact_decimal(data_type) else {
+                // A cast of an exact-decimal COLUMN to text is that column's own text form,
+                // which carries the fractional digits its declaration does.
+                if let Some(scale) = text_form_of_a_declared_column(data_type, value, scales) {
+                    if !budget.spend() {
+                        return inner;
+                    }
+                    if let Some(read) =
+                        call(SCALED_TEXT_FUNCTION, &[value.to_string(), scale.to_string()])
+                    {
+                        *expr = read;
+                    }
+                }
                 return false;
             };
             // The budget comes before the work: the replacement below renders the operand,
@@ -502,12 +816,12 @@ fn exactly(expr: &mut Expr, depth: usize, budget: &mut Budget) -> bool {
                 None => inner,
             }
         }
-        Expr::Nested(inner) => exactly(inner, depth + 1, budget),
+        Expr::Nested(inner) => exactly(inner, depth + 1, budget, scales),
         Expr::UnaryOp {
             op: UnaryOperator::Minus,
             expr: value,
         } => {
-            if !exactly(value, depth + 1, budget) {
+            if !exactly(value, depth + 1, budget, scales) {
                 return false;
             }
             if !budget.spend() {
@@ -521,9 +835,10 @@ fn exactly(expr: &mut Expr, depth: usize, budget: &mut Budget) -> bool {
         Expr::UnaryOp {
             op: UnaryOperator::Plus,
             expr: value,
-        } => exactly(value, depth + 1, budget),
+        } => exactly(value, depth + 1, budget, scales),
         Expr::BinaryOp { left, op, right } => {
-            let exact = exactly(left, depth + 1, budget) || exactly(right, depth + 1, budget);
+            let exact = exactly(left, depth + 1, budget, scales)
+                || exactly(right, depth + 1, budget, scales);
             let function = arithmetic_function(op);
             if exact {
                 let Some(function) = function else {
@@ -556,9 +871,99 @@ fn exactly(expr: &mut Expr, depth: usize, budget: &mut Budget) -> bool {
         // A call of one of this module's own functions is already an exact decimal, which is
         // what makes the rewriting idempotent. The division guard is not one: its value is
         // the engine's own.
-        Expr::Function(function) => is_numeric_function(&function.name.to_string()),
+        Expr::Function(function) => {
+            if is_numeric_function(&function.name.to_string()) {
+                return true;
+            }
+            // An AGGREGATE over an exact-decimal column is exact: both engines answer one
+            // with a value of that type, so it is folded on the digits the column's values
+            // carry rather than added up in binary floating point.
+            let Some((exact, argument, scale)) = exact_aggregate(function, scales) else {
+                return false;
+            };
+            if !budget.spend() {
+                return true;
+            }
+            if let Some(applied) = call(exact, &[argument, scale.to_string()]) {
+                *expr = applied;
+            }
+            true
+        }
         _ => false,
     }
+}
+
+/// The exact-decimal aggregate `function` is, with the column it folds and that column's
+/// declared scale — or `None` for a call that is not one of [`EXACT_AGGREGATES`] over a column
+/// whose declaration carries a scale.
+///
+/// Only a plain call of one argument is read: `DISTINCT`, a `FILTER`, an `OVER` or an ordering
+/// clause makes the call something else, which the engine answers for as the client wrote it.
+fn exact_aggregate(
+    function: &sqlparser::ast::Function,
+    scales: &DeclaredScales,
+) -> Option<(&'static str, String, i64)> {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+    let named = function.name.to_string().to_ascii_lowercase();
+    let (_, exact, _) = EXACT_AGGREGATES
+        .iter()
+        .find(|(aggregate, _, _)| *aggregate == named)?;
+    if function.over.is_some() || function.filter.is_some() {
+        return None;
+    }
+    let FunctionArguments::List(arguments) = &function.args else {
+        return None;
+    };
+    if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() {
+        return None;
+    }
+    let [FunctionArg::Unnamed(FunctionArgExpr::Expr(value))] = arguments.args.as_slice() else {
+        return None;
+    };
+    let scale = column_scale(value, scales)?;
+    Some((exact, value.to_string(), scale))
+}
+
+/// The scale the column `value` names carries, or `None` where `value` is not a bare column
+/// reference of one the statement's relations declared with a scale.
+///
+/// A qualified reference (`t.amount`) names the same column; the qualifier says which relation
+/// it is of, and a column name the statement's relations do not share resolves to the one
+/// declaration they have for it.
+fn column_scale(value: &Expr, scales: &DeclaredScales) -> Option<i64> {
+    let named = match value {
+        Expr::Identifier(name) => name.value.clone(),
+        Expr::CompoundIdentifier(parts) => parts.last()?.value.clone(),
+        _ => return None,
+    };
+    scales.get(&named.to_ascii_lowercase()).copied()
+}
+
+/// The SCALE the column `value` names carries, where this is a cast of such a column to a
+/// TEXT type — and `None` for every other cast.
+///
+/// Only a bare column reference is read: the value of one is held in the engine's own
+/// affinity, so its text form is the only place the declared scale has to be put back. An
+/// expression COMPUTED from such a column is a value of its own, which the engine renders as
+/// what it computed.
+fn text_form_of_a_declared_column(
+    data_type: &DataType,
+    value: &Expr,
+    scales: &DeclaredScales,
+) -> Option<i64> {
+    if !matches!(
+        data_type,
+        DataType::Text
+            | DataType::String(_)
+            | DataType::Varchar(_)
+            | DataType::Char(_)
+            | DataType::CharVarying(_)
+            | DataType::CharacterVarying(_)
+            | DataType::Character(_)
+    ) {
+        return None;
+    }
+    column_scale(value, scales)
 }
 
 /// The function that computes `op` over exact decimals, or `None` for an operator that is
@@ -612,6 +1017,55 @@ fn call(function: &str, arguments: &[String]) -> Option<Expr> {
 mod tests {
     use super::*;
 
+    /// A statement read with NO declared column scales, which is every case below that is not
+    /// about them: the rewriting of a cast to text is what reads them.
+    fn no_scales() -> DeclaredScales {
+        DeclaredScales::new()
+    }
+
+    /// RULE: a cast of a column DECLARED with an exact-decimal scale to a text type is that
+    /// column's own text form, which carries every fractional digit the declaration does;
+    /// every other cast to text is left exactly as the client wrote it.
+    #[test]
+    fn the_text_form_of_a_declared_exact_decimal_column_carries_its_scale() {
+        let mut scales = DeclaredScales::new();
+        scales.insert("amount".to_string(), 4);
+        scales.insert("rate".to_string(), 2);
+        // (the statement, what it is rewritten to)
+        let cases: [(&str, Option<&str>); 6] = [
+            (
+                "SELECT CAST(amount AS TEXT) FROM t",
+                Some("SELECT pg_numeric_text(amount, 4) FROM t"),
+            ),
+            (
+                // A qualified reference names the same column.
+                "SELECT CAST(t.rate AS VARCHAR) FROM t",
+                Some("SELECT pg_numeric_text(t.rate, 2) FROM t"),
+            ),
+            (
+                // Inside a concatenation and an aggregate, which is where a client
+                // checksumming its rows reads it.
+                "SELECT md5(string_agg(CAST(amount AS TEXT), ',')) FROM t",
+                Some("SELECT md5(string_agg(pg_numeric_text(amount, 4), ',')) FROM t"),
+            ),
+            // A column the relations declare no scale for, and a cast of one to a type that
+            // is not text: left as it was.
+            ("SELECT CAST(label AS TEXT) FROM t", None),
+            ("SELECT CAST(amount AS INT) FROM t", None),
+            // An expression COMPUTED from such a column is a value of its own.
+            ("SELECT CAST(amount + 1 AS TEXT) FROM t", None),
+        ];
+        for (sql, expected) in cases {
+            let rewritten =
+                exact_decimal_arithmetic(super::super::EngineWire::Postgres, sql, &scales);
+            assert_eq!(
+                rewritten.as_deref(),
+                expected,
+                "case {sql:?}: expected {expected:?}, got {rewritten:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_statements_exact_decimal_arithmetic_is_rewritten_keeping_its_precedence() {
         // The rows span the forms the rule generalises over: a cast with and without a
@@ -663,7 +1117,8 @@ mod tests {
             ("SELECT count(*) FROM t", None),
         ];
         for (sql, expected) in cases {
-            let rewritten = exact_decimal_arithmetic(super::super::EngineWire::Postgres, sql);
+            let rewritten =
+                exact_decimal_arithmetic(super::super::EngineWire::Postgres, sql, &no_scales());
             assert_eq!(
                 rewritten.as_deref(),
                 expected,
@@ -680,7 +1135,8 @@ mod tests {
                 Some("SELECT pg_numeric_add(pg_numeric(0.1), pg_numeric(0.2))"),
             ),
         ] {
-            let rewritten = exact_decimal_arithmetic(super::super::EngineWire::MySql, sql);
+            let rewritten =
+                exact_decimal_arithmetic(super::super::EngineWire::MySql, sql, &no_scales());
             assert_eq!(
                 rewritten.as_deref(),
                 expected,

@@ -847,6 +847,9 @@ pub(super) fn parameter_group_family(
 /// what the published defaults written as a formula over the instance's hardware are
 /// evaluated with; `None` for a resource that runs on no fixed class.
 ///
+/// `configured_port` is the port the resource was created with, which is the port its engine
+/// is configured to listen on.
+///
 /// Whether the engine is REPLAYING a primary's writes is not decided here: it follows the
 /// role of the endpoint the session is on, which [`replaying`] writes onto the runtime.
 pub(super) fn running_engine(
@@ -856,6 +859,7 @@ pub(super) fn running_engine(
     engine_started_at: f64,
     master_username: Option<String>,
     class_memory_bytes: Option<u64>,
+    configured_port: Option<i32>,
 ) -> EngineRuntime {
     EngineRuntime {
         parameters: super::pg_server::running_parameters(
@@ -864,6 +868,7 @@ pub(super) fn running_engine(
             group,
             engine_started_at,
             class_memory_bytes,
+            configured_port,
         ),
         postmaster_start_time: engine_started_at,
         in_recovery: false,
@@ -897,6 +902,9 @@ pub(super) fn engine_runtime_of(
         crate::ops::describe_orderable_db_instance_options::class_memory_bytes(
             &record.db_instance_class,
         ),
+        // The port the instance was created with (`Port`), which is the port its engine is
+        // configured to listen on.
+        Some(record.endpoint_port),
     )
 }
 
@@ -1630,6 +1638,9 @@ pub struct StatementAnswer {
     /// A setting this statement changed for the session, which the caller writes back
     /// onto its [`SessionFacts`].
     pub setting_changed: Option<(String, String)>,
+    /// The settings this statement put BACK to the server's own values (`RESET`), which the
+    /// caller removes from the session's own ([`SettingsReset`]).
+    pub settings_reset: Option<SettingsReset>,
     /// The database this statement moved the session to (`USE`), which the caller writes
     /// back the same way.
     pub database_changed: Option<String>,
@@ -1698,6 +1709,16 @@ impl WireNotice {
     }
 }
 
+/// WHICH of a session's own settings a statement put back to the server's values: the one it
+/// named, or every one of them (`RESET ALL`).
+#[derive(Debug, Clone)]
+pub enum SettingsReset {
+    /// `RESET <name>`: the session's own value for that setting, if it had one.
+    Named(String),
+    /// `RESET ALL`: every setting the session had set for itself.
+    All,
+}
+
 impl StatementAnswer {
     /// What one statement answers with.
     #[must_use]
@@ -1706,6 +1727,7 @@ impl StatementAnswer {
             verb: verb.into(),
             result,
             setting_changed: None,
+            settings_reset: None,
             database_changed: None,
             databases_changed: false,
             notices: Vec::new(),
@@ -1797,6 +1819,64 @@ pub fn run_statement(
         }
     }
     answer
+}
+
+/// The rows the query of a `COPY … TO STDOUT` streams.
+///
+/// The query is prepared the way every statement of a session is — the qualifiers it names
+/// resolved, its own dialect rendered for the engine, the exact-decimal columns it reads put
+/// back at their declared scale and the catalogs it reads rebuilt — and then STREAMED rather
+/// than answered as a result set: a copy carries a whole relation, so it is bounded by the
+/// rows a copy streams and not by the result-set cap
+/// ([`super::sql_engine::InstanceDatabase::stream_for`]).
+pub fn streamed_rows(
+    database: &InstanceDatabase,
+    facts: &SessionFacts,
+    sql: &str,
+) -> Result<ResultSet, EngineError> {
+    let stream = statement_tokens(facts.wire, sql)?;
+    let tokens: Vec<Token> = stream
+        .iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_)))
+        .cloned()
+        .collect();
+    let named = catalogs_named(&tokens);
+    if !named.is_empty() {
+        super::pg_server::refresh_catalogs(database, facts, &named)?;
+    }
+    // A copy out only READS its source — but the source of the query form is the client's own
+    // statement, and PostgreSQL takes a data-modifying one there (`COPY (INSERT … RETURNING …)
+    // TO STDOUT`). Such a statement is refused on a session whose transaction serves no
+    // writes, exactly as it is when the client sends it on its own
+    // ([`read_only::refused_command`]).
+    if facts.read_only_transaction() {
+        if let Some(command) = read_only::refused_command(&tokens) {
+            return Err(read_only::refusal(facts.wire, &command));
+        }
+    }
+    let (target, stream) = resolve_qualifiers(database, facts, &stream)?;
+    let prepared = dialect::render_for_engine(facts, &stream);
+    let scales = super::pg_numeric::declared_scales(
+        database,
+        facts,
+        &target,
+        &relations_named(&tokens),
+        &prepared,
+    );
+    let prepared = super::pg_numeric::exact_decimal_arithmetic(facts.wire, &prepared, &scales)
+        .unwrap_or(prepared);
+    database
+        .stream_for(
+            facts.connection_id,
+            &target,
+            &server_view(facts),
+            &prepared,
+            &[],
+        )
+        .map_err(|error| {
+            let error = server_statements::as_the_engine_words_it(facts.wire, &prepared, error);
+            super::pg_server::as_postgres_words_it(facts.wire, error)
+        })
 }
 
 /// [`run_statement`] under a BUDGET, which is what a statement run from inside a code block
@@ -1956,8 +2036,16 @@ pub(super) fn run_statement_at(
     // The EXACT-DECIMAL arithmetic in it, computed exactly: a cast to `numeric` and the
     // operators over it are the engine's own decimal functions rather than its binary
     // floating point (`super::pg_numeric`). A statement that casts to no such type is handed
-    // to the engine exactly as it was.
-    let prepared = super::pg_numeric::exact_decimal_arithmetic(facts.wire, &prepared)
+    // to the engine exactly as it was — and the text form of a column DECLARED with a scale
+    // carries that scale, which is why the declarations of the relations it names are read.
+    let scales = super::pg_numeric::declared_scales(
+        database,
+        facts,
+        &target,
+        &relations_named(&tokens),
+        &prepared,
+    );
+    let prepared = super::pg_numeric::exact_decimal_arithmetic(facts.wire, &prepared, &scales)
         .unwrap_or(prepared);
     // The rows this statement locks, taken BEFORE it runs: a row another transaction holds
     // is not this statement's to read for update or to write, and the locking clause the
@@ -2438,7 +2526,14 @@ pub fn describe_statement(
         return Vec::new();
     };
     let prepared = dialect::render_for_engine(facts, &stream);
-    let prepared = super::pg_numeric::exact_decimal_arithmetic(facts.wire, &prepared)
+    let scales = super::pg_numeric::declared_scales(
+        database,
+        facts,
+        &target,
+        &relations_named(&tokens),
+        &prepared,
+    );
+    let prepared = super::pg_numeric::exact_decimal_arithmetic(facts.wire, &prepared, &scales)
         .unwrap_or(prepared);
     // A locking clause is this server's to serve, not the engine's to plan: the columns a
     // `SELECT … FOR UPDATE` produces are the columns of the same query without it.
@@ -2498,6 +2593,9 @@ fn server_command(
         (_, "TRUNCATE", _) => server_statements::truncate(database, facts, tokens).map(Some),
         (EngineWire::Postgres, "SHOW", _) => Ok(Some(postgres_show(facts, tokens)?)),
         (EngineWire::Postgres, "SET", _) => Ok(Some(postgres_set(facts, tokens)?)),
+        // `RESET` is the other half of `SET`: it puts a setting back to the value the server
+        // runs with, which is what a session undoing its own `SET` sends.
+        (EngineWire::Postgres, "RESET", _) => Ok(Some(postgres_reset(facts, tokens)?)),
         (EngineWire::MySql, "SHOW", _) => mysql_show(database, facts, words, tokens).map(Some),
         // Setting a GLOBAL system variable is a server-wide change, which the RDS master
         // user does not hold the privilege for; a parameter group is how it is changed.
@@ -2627,6 +2725,47 @@ fn postgres_set(facts: &SessionFacts, tokens: &[Token]) -> Result<StatementAnswe
     }
     let mut answer = StatementAnswer::new("SET", ResultSet::default());
     answer.setting_changed = Some(recorded_setting(facts, lowered, value)?);
+    Ok(answer)
+}
+
+/// `RESET <name>` / `RESET ALL` on the PostgreSQL wire: the session's own value for a setting
+/// is dropped, so the session reads the value the SERVER runs with again.
+///
+/// PostgreSQL documents `RESET` as "restore the value of a run-time parameter to the default
+/// value", which is `SET <name> TO DEFAULT`, and `RESET ALL` as resetting "all settable
+/// run-time parameters to default values" — the default being what the parameter was at the
+/// session's start, which on this endpoint is the instance's own configuration. A name that is
+/// no setting of this server is refused exactly as `SET` refuses one, and the two forms
+/// `RESET` also takes — `RESET ROLE` and `RESET SESSION AUTHORIZATION`, which name no
+/// parameter of the configuration — are accepted and change nothing of this session, as the
+/// `SET` forms that set no named parameter are.
+fn postgres_reset(facts: &SessionFacts, tokens: &[Token]) -> Result<StatementAnswer, EngineError> {
+    // The name is everything after `RESET`, rejoined as the client wrote it: a namespaced
+    // setting (`rds.force_ssl`) is several tokens.
+    let name: String = tokens
+        .iter()
+        .skip(1)
+        .map(|token| token.to_string().replace('"', ""))
+        .collect();
+    let lowered = name.to_ascii_lowercase();
+    let mut answer = StatementAnswer::new("RESET", ResultSet::default());
+    if lowered == "all" {
+        answer.settings_reset = Some(SettingsReset::All);
+        return Ok(answer);
+    }
+    // The forms that name no configuration parameter: `RESET ROLE` puts the session back to
+    // the user it authenticated as, which is the user it has here, and
+    // `RESET SESSION AUTHORIZATION` is that same user.
+    if matches!(lowered.as_str(), "role" | "sessionauthorization") {
+        return Ok(answer);
+    }
+    if !lowered.contains('.') && facts.setting(&lowered).is_none() {
+        return Err(EngineError::new(
+            EngineErrorKind::UndefinedObject,
+            format!("unrecognized configuration parameter \"{name}\""),
+        ));
+    }
+    answer.settings_reset = Some(SettingsReset::Named(lowered));
     Ok(answer)
 }
 

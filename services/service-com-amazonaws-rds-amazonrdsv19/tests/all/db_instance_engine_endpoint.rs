@@ -182,6 +182,11 @@ pub(crate) async fn parameter_group(
 // The PostgreSQL wire, as a client speaks it.
 // ---------------------------------------------------------------------------
 
+/// How many bytes of copy data one `CopyData` message carries, under the most one protocol
+/// message may: a load larger than that is streamed in several, as a client's own driver
+/// streams one.
+const COPY_DATA_CHUNK_BYTES: usize = 512 * 1024;
+
 /// A connection to an engine endpoint, in the clear or upgraded to TLS.
 pub(crate) trait Connection: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Connection for T {}
@@ -343,6 +348,10 @@ pub(crate) struct PostgresSession {
     /// carried one: the field a driver reads the violated constraint's name out of, which is
     /// not part of the message.
     pub(crate) last_refusal_constraint: Option<String>,
+    /// The CONTEXT field (`W`) of the last `ErrorResponse` this session read, where it carried
+    /// one: WHERE the server was when the statement failed, which a driver reads out of its
+    /// own field in the same way.
+    pub(crate) last_refusal_context: Option<String>,
 }
 
 /// Open a PostgreSQL session on `address:port`, as libpq does: the optional `SSLRequest`
@@ -418,6 +427,7 @@ pub(crate) async fn postgres_login(
             b'Z' => return Ok(PostgresSession {
                 conn,
                 last_refusal_constraint: None,
+                last_refusal_context: None,
             }),
             // ParameterStatus, BackendKeyData, NoticeResponse.
             _ => {}
@@ -438,6 +448,15 @@ impl PostgresSession {
     /// does: the statement, then the `CopyInResponse` the server answers with, then the
     /// data in `CopyData` messages and a `CopyDone`.
     pub(crate) async fn copy_in(&mut self, sql: &str, data: &str) -> Result<Rows, Refusal> {
+        self.copy_in_bytes(sql, data.as_bytes()).await
+    }
+
+    /// The same, streaming BYTES: the binary format carries bytes that are no text at all.
+    pub(crate) async fn copy_in_bytes(
+        &mut self,
+        sql: &str,
+        data: &[u8],
+    ) -> Result<Rows, Refusal> {
         let mut message = Vec::new();
         put_cstring(&mut message, sql);
         postgres_send(&mut self.conn, b'Q', &message).await;
@@ -453,9 +472,58 @@ impl PostgresSession {
             "a COPY FROM STDIN must be answered with CopyInResponse, got {:?}",
             kind as char
         );
-        postgres_send(&mut self.conn, b'd', data.as_bytes()).await;
+        // The data goes in `CopyData` messages of their own, as a bulk-loading client sends
+        // it: the protocol bounds ONE message, and a load larger than that is several.
+        for chunk in data.chunks(COPY_DATA_CHUNK_BYTES).chain(match data.is_empty() {
+            true => Some([].as_slice()),
+            false => None,
+        }) {
+            postgres_send(&mut self.conn, b'd', chunk).await;
+        }
         postgres_send(&mut self.conn, b'c', &[]).await;
         self.read_answer().await
+    }
+    /// Run one `COPY … TO STDOUT` and read the rows the server streams, as a client reading a
+    /// table back does: the statement, then the `CopyOutResponse`, the `CopyData` messages and
+    /// the `CopyDone`.
+    pub(crate) async fn copy_out(&mut self, sql: &str) -> Result<String, Refusal> {
+        self.copy_out_bytes(sql)
+            .await
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// The same, as the BYTES the server streamed: the binary format carries bytes that are
+    /// no text at all.
+    pub(crate) async fn copy_out_bytes(&mut self, sql: &str) -> Result<Vec<u8>, Refusal> {
+        let mut message = Vec::new();
+        put_cstring(&mut message, sql);
+        postgres_send(&mut self.conn, b'Q', &message).await;
+        let mut streamed: Vec<u8> = Vec::new();
+        let mut refusal = None;
+        loop {
+            let Some((kind, body)) = postgres_try_read(&mut self.conn).await else {
+                return Err(refusal.unwrap_or(Refusal {
+                    code: "08006".to_string(),
+                    message: "the server closed the connection".to_string(),
+                }));
+            };
+            match kind {
+                // CopyData.
+                b'd' => streamed.extend_from_slice(&body),
+                b'E' => {
+                    refusal = Some(postgres_refusal(&body));
+                    self.last_refusal_context = postgres_error_field(&body, b'W');
+                }
+                // ReadyForQuery ends the exchange.
+                b'Z' => break,
+                // CopyOutResponse, CopyDone, CommandComplete.
+                _ => {}
+            }
+        }
+        match refusal {
+            Some(refusal) => Err(refusal),
+            None => Ok(streamed),
+        }
     }
 
     /// Run one statement through the EXTENDED query protocol, with its parameter values
@@ -560,6 +628,7 @@ impl PostgresSession {
                 b'E' => {
                     refusal = Some(postgres_refusal(&body));
                     self.last_refusal_constraint = postgres_error_field(&body, b'n');
+                    self.last_refusal_context = postgres_error_field(&body, b'W');
                 }
                 // NoticeResponse: what the server has to say about the statement.
                 b'N' => answer.notices.push(postgres_refusal(&body)),

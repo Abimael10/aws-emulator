@@ -139,6 +139,9 @@ impl AwsS3Call {
 pub struct CopyFormat {
     /// Whether the object is in the `csv` format rather than `COPY`'s default text format.
     pub csv: bool,
+    /// Whether it is in `COPY`'s BINARY format, in which every value carries the bytes its
+    /// own type's binary form has rather than its text.
+    pub binary: bool,
     /// The field separator: a tab in the text format and a comma in `csv`, which are
     /// `COPY`'s own defaults for each.
     pub delimiter: u8,
@@ -160,6 +163,7 @@ impl CopyFormat {
     pub fn text() -> Self {
         Self {
             csv: false,
+            binary: false,
             delimiter: b'\t',
             header: false,
             quote: b'"',
@@ -554,7 +558,11 @@ fn column_list(list: &str) -> Vec<String> {
 /// An option `COPY` does not define is refused the way PostgreSQL refuses one, because the
 /// options really are its own; an option it defines and this endpoint does not read the
 /// bytes by is refused as the capability it is.
-fn read_options(options: &str) -> Result<CopyFormat, EngineError> {
+///
+/// `pub(super)` because the options are `COPY`'s own in the first place: the wire's
+/// `COPY … TO STDOUT` carries the same `WITH (…)` clause and reads it here
+/// ([`super::pg_copy`]), so the two cannot read the same clause differently.
+pub(super) fn read_options(options: &str) -> Result<CopyFormat, EngineError> {
     let mut format = CopyFormat::text();
     let trimmed = options.trim();
     let inner = trimmed
@@ -576,6 +584,9 @@ fn read_options(options: &str) -> Result<CopyFormat, EngineError> {
             "FORMAT" => match value.to_ascii_lowercase().as_str() {
                 "csv" => format.csv = true,
                 "text" => format.csv = false,
+                // The BINARY format, in which each value carries its own type's binary form
+                // ([`super::pg_binary`]).
+                "binary" => format.binary = true,
                 other => {
                     return Err(EngineError::new(
                         EngineErrorKind::FeatureNotSupported,
@@ -850,6 +861,9 @@ pub fn serve(
             let target = CopyTarget {
                 table: relation_of(table),
                 columns: columns.clone(),
+                // The records were read out of the object by the format the CALL named; what
+                // the load does with them is the same either way.
+                format: options.clone(),
             };
             let loaded = super::pg_copy::load_rows(database, facts, &target, &rows)?;
             Ok(StatementAnswer::new(
@@ -998,6 +1012,16 @@ fn export_counts(rows: u64, bytes: u64) -> ResultSet {
 /// the NULL string stands for a NULL and the backslash escapes are resolved.
 fn records(options: &CopyFormat, body: &[u8]) -> Result<Records, EngineError> {
     let mut rows: Records = Vec::new();
+    if options.binary {
+        // The BINARY format is the WIRE's copy exchange, in which each value carries the
+        // bytes its own type's binary form has: an object this call reads is text, so the
+        // format is not one this call serves.
+        return Err(EngineError::new(
+            EngineErrorKind::FeatureNotSupported,
+            "this call reads an object in the text and csv formats only".to_string(),
+        )
+        .with_sqlstate("0A000"));
+    }
     if options.csv {
         let mut reader = ::csv::ReaderBuilder::new()
             .delimiter(options.delimiter)
@@ -1006,7 +1030,7 @@ fn records(options: &CopyFormat, body: &[u8]) -> Result<Records, EngineError> {
             .has_headers(options.header)
             .flexible(true)
             .from_reader(body);
-        for record in reader.records() {
+        for (at, record) in reader.records().enumerate() {
             let record = record.map_err(|error| {
                 EngineError::new(
                     EngineErrorKind::DataError,
@@ -1016,15 +1040,23 @@ fn records(options: &CopyFormat, body: &[u8]) -> Result<Records, EngineError> {
             if rows.len() == MAX_LOAD_ROWS {
                 return Err(too_many_rows());
             }
-            rows.push(
-                record
+            rows.push(super::pg_copy::CopyRecord {
+                // WHERE the reader found this record, which is what a load that stops on it
+                // reports: the line the record's own position names, else its place among
+                // the records after the header line the format may carry.
+                line: record
+                    .position()
+                    .map_or(at + 1 + usize::from(options.header), |at| {
+                        usize::try_from(at.line()).unwrap_or(usize::MAX)
+                    }),
+                fields: record
                     .iter()
                     .map(|field| match field == options.null {
                         true => None,
                         false => Some(field.to_string()),
                     })
                     .collect(),
-            );
+            });
         }
         return Ok(rows);
     }
@@ -1059,7 +1091,21 @@ fn too_many_rows() -> EngineError {
 
 /// The bytes an export writes: the query's rows in the format the options named, which is
 /// the format `COPY … TO` would have written them in.
-fn rendered(options: &CopyFormat, result: &ResultSet) -> Result<Vec<u8>, EngineError> {
+///
+/// `pub(super)` for the same reason [`read_options`] is: the wire's `COPY … TO STDOUT` streams
+/// the rows of a query in those same formats ([`super::pg_copy`]), and one writing of a format
+/// is what keeps the two from writing a value differently.
+pub(super) fn rendered(options: &CopyFormat, result: &ResultSet) -> Result<Vec<u8>, EngineError> {
+    if options.binary {
+        // The BINARY format's writing belongs to the copy exchange that streams it
+        // ([`super::pg_copy`]), which is where it is written; an object this call writes is
+        // text.
+        return Err(EngineError::new(
+            EngineErrorKind::FeatureNotSupported,
+            "this call writes an object in the text and csv formats only".to_string(),
+        )
+        .with_sqlstate("0A000"));
+    }
     if result.rows.len() > MAX_LOAD_ROWS {
         return Err(too_many_rows());
     }
@@ -1080,7 +1126,7 @@ fn rendered(options: &CopyFormat, result: &ResultSet) -> Result<Vec<u8>, EngineE
         for row in &result.rows {
             let fields: Vec<String> = row
                 .iter()
-                .map(|cell| field_text(cell, &options.null))
+                .map(|cell| super::pg_copy::field_text(cell, &options.null))
                 .collect();
             writer.write_record(&fields).map_err(not_writable)?;
         }
@@ -1106,7 +1152,7 @@ fn rendered(options: &CopyFormat, result: &ResultSet) -> Result<Vec<u8>, EngineE
     for row in &result.rows {
         let fields: Vec<String> = row
             .iter()
-            .map(|cell| escaped(&field_text(cell, &options.null)))
+            .map(|cell| super::pg_copy::written_field(cell, &options.null))
             .collect();
         body.extend_from_slice(fields.join(&separator.to_string()).as_bytes());
         body.push(b'\n');
@@ -1141,33 +1187,7 @@ fn bound_the_export(bytes: usize) -> Result<(), EngineError> {
     }
 }
 
-/// One exported value as its field: the NULL string for a NULL, and the value's own text
-/// otherwise.
-fn field_text(cell: &Cell, null: &str) -> String {
-    match cell {
-        Cell::Null => null.to_string(),
-        Cell::Integer(value) => value.to_string(),
-        Cell::Real(value) => value.to_string(),
-        Cell::Text(value) => value.clone(),
-        Cell::Blob(bytes) => String::from_utf8_lossy(bytes).to_string(),
-    }
-}
-
-/// One field with the backslash escapes `COPY`'s text format writes put back in, which is
-/// what makes a value carrying a separator or a newline one field.
-///
-/// Source: the `COPY` reference's "Text Format" section, the same escapes the read of that
-/// format resolves ([`super::pg_copy`]).
-fn escaped(field: &str) -> String {
-    let mut out = String::with_capacity(field.len());
-    for character in field.chars() {
-        match character {
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            other => out.push(other),
-        }
-    }
-    out
-}
+// One exported value as its field, and one field with the format's backslash escapes written
+// back, are the FORMAT's own readings — so both live where the format is read and written
+// (`super::pg_copy::field_text`, `super::pg_copy::escaped_field`), and an export cannot write
+// a value differently from the way a load reads it.

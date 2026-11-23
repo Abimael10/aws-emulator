@@ -530,7 +530,21 @@ async fn serve_session(
                                 &context,
                                 &database_handle,
                                 &session_facts,
-                                &target,
+                                target,
+                            )
+                            .await?
+                            {
+                                failed_in_transaction = true;
+                            }
+                            continue;
+                        }
+                        // And a `COPY … TO STDOUT` streams its rows the same way here.
+                        if let Some(source) = copy_out_source(&session_facts, &statement) {
+                            if !serve_copy_out(
+                                &mut conn,
+                                &database_handle,
+                                &session_facts,
+                                source,
                             )
                             .await?
                             {
@@ -830,7 +844,15 @@ async fn run_simple_query(
         // `COPY … FROM STDIN` is not a statement the engine runs on its own: it puts this
         // session into the protocol's copy-in mode, where the client streams the rows.
         if let Some(target) = copy_target(facts, &statement) {
-            if !serve_copy_in(conn, context, database, facts, &target).await? {
+            if !serve_copy_in(conn, context, database, facts, target).await? {
+                return Ok(true);
+            }
+            continue;
+        }
+        // `COPY … TO STDOUT` is the same exchange the other way: the SERVER streams the
+        // rows of the table or the query the statement names.
+        if let Some(source) = copy_out_source(facts, &statement) {
+            if !serve_copy_out(conn, database, facts, source).await? {
                 return Ok(true);
             }
             continue;
@@ -852,12 +874,87 @@ async fn run_simple_query(
 /// to the engine instead, which refuses it as the write it is
 /// (`super::read_only::refused_command`), so the client is told why rather than being asked
 /// for rows nothing will load.
-fn copy_target(facts: &SessionFacts, sql: &str) -> Option<super::pg_copy::CopyTarget> {
+fn copy_target(
+    facts: &SessionFacts,
+    sql: &str,
+) -> Option<Result<super::pg_copy::CopyTarget, EngineError>> {
     if facts.read_only {
         return None;
     }
     let tokens = wire_session::significant_tokens(facts.wire, sql).ok()?;
-    super::pg_copy::copy_in_target(facts, &tokens)
+    super::pg_copy::copy_in_target(facts, sql, &tokens)
+}
+
+/// The copy-out source `sql` names, for the statements that are one — and the refusal for a
+/// statement that is one and names a `WITH (…)` option this endpoint cannot serve.
+///
+/// A copy OUT only reads, so it is served on every session — a read-only endpoint's included.
+fn copy_out_source(
+    facts: &SessionFacts,
+    sql: &str,
+) -> Option<Result<super::pg_copy::CopyOut, EngineError>> {
+    let tokens = wire_session::significant_tokens(facts.wire, sql).ok()?;
+    super::pg_copy::copy_out_target(facts, sql, &tokens)
+}
+
+/// Serve one `COPY … TO STDOUT`: run the query the statement names and stream its rows to
+/// the client in `COPY`'s text format.
+///
+/// Returns whether the copy succeeded. The rows are the rows a `SELECT` of the same query
+/// answers — the statement is run through the same path, so the catalogs it reads, the bounds
+/// it is held to and the values it carries are a query's — and the refusal of one that cannot
+/// run is reported as that statement's.
+async fn serve_copy_out(
+    conn: &mut ::emulator_server::ListenerConn,
+    database: &Arc<InstanceDatabase>,
+    facts: &SessionFacts,
+    source: Result<super::pg_copy::CopyOut, EngineError>,
+) -> std::io::Result<bool> {
+    let source = match source {
+        Ok(source) => source,
+        Err(error) => {
+            engine_error_response(conn, &error).await?;
+            return Ok(false);
+        }
+    };
+    // The engine's work is CPU-bound and runs on a blocking task, exactly as a statement's
+    // does.
+    let streamed = {
+        let database = Arc::clone(database);
+        let facts = facts.clone();
+        let source = source.clone();
+        tokio::task::spawn_blocking(move || {
+            super::pg_copy::stream_out(&database, &facts, &source)
+        })
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))?
+    };
+    let stream = match streamed {
+        Ok(stream) => stream,
+        Err(error) => {
+            engine_error_response(conn, &error).await?;
+            return Ok(false);
+        }
+    };
+    // CopyOutResponse: the format of the stream (0 text, 1 binary) and one format code per
+    // column, which the protocol carries "as a 16-bit integer" each.
+    let format = i16::from(stream.binary);
+    let mut response = vec![u8::from(stream.binary)];
+    response.extend_from_slice(&i16::try_from(stream.columns).unwrap_or_default().to_be_bytes());
+    for _ in 0..stream.columns {
+        response.extend_from_slice(&format.to_be_bytes());
+    }
+    send(conn, b'H', &response).await?;
+    for payload in &stream.payloads {
+        send(conn, b'd', payload).await?;
+    }
+    // CopyDone, then the tag naming how many rows were streamed.
+    send(conn, b'c', &[]).await?;
+    let mut tag = Vec::new();
+    put_cstring(&mut tag, &format!("COPY {}", stream.rows));
+    send(conn, b'C', &tag).await?;
+    conn.flush().await?;
+    Ok(true)
 }
 
 /// Serve one `COPY <table> FROM STDIN`: ask the client for the data, read what it streams,
@@ -874,11 +971,19 @@ async fn serve_copy_in(
     context: &wire_session::SessionContext,
     database: &Arc<InstanceDatabase>,
     facts: &SessionFacts,
-    target: &super::pg_copy::CopyTarget,
+    target: Result<super::pg_copy::CopyTarget, EngineError>,
 ) -> std::io::Result<bool> {
-    // CopyInResponse: the text format (0), and no per-column format codes, which is what
-    // the text format carries.
-    let mut response = vec![0u8];
+    let target = match target {
+        Ok(target) => target,
+        Err(error) => {
+            engine_error_response(conn, &error).await?;
+            return Ok(false);
+        }
+    };
+    // CopyInResponse: the format the client streams in (0 text, 1 binary). The per-column
+    // format codes say the same thing for each column of the stream, and a copy carries one
+    // format for every column of it, which is what the overall code says.
+    let mut response = vec![u8::from(target.format.binary)];
     response.extend_from_slice(&0i16.to_be_bytes());
     send(conn, b'G', &response).await?;
     conn.flush().await?;
@@ -1043,6 +1148,15 @@ async fn run_statement(
     if let Some((name, value)) = answer.setting_changed.clone() {
         facts.settings.insert(name, value);
     }
+    // And a `RESET` takes the session's own value away again, so what it reads next is the
+    // value the server runs with.
+    match answer.settings_reset.clone() {
+        Some(wire_session::SettingsReset::Named(name)) => {
+            facts.settings.remove(&name);
+        }
+        Some(wire_session::SettingsReset::All) => facts.settings.clear(),
+        None => {}
+    }
     if let Some(database) = answer.database_changed.clone() {
         facts.database = database;
     }
@@ -1179,7 +1293,7 @@ fn command_tag(answer: &wire_session::StatementAnswer) -> String {
 /// Source: the type names PostgreSQL's "Data Types" chapter documents (with the aliases it
 /// lists for each) and the OIDs of those types in `pg_type`, which is what the wire
 /// carries.
-fn type_oid(column: &ColumnInfo, sample: Option<&Cell>) -> i32 {
+pub(super) fn type_oid(column: &ColumnInfo, sample: Option<&Cell>) -> i32 {
     if let Some(declared) = &column.declared_type {
         let lowered = declared.to_ascii_lowercase();
         let base = lowered
@@ -1415,8 +1529,20 @@ async fn engine_error_response(
         .unwrap_or_else(|| sqlstate(error.kind));
     // The CONSTRAINT field, for a refusal that is about one: PostgreSQL carries the
     // constraint's name in its own field of the error, which is where a client reads which
-    // rule the row broke rather than parsing it out of the sentence.
-    constrained_response(conn, "ERROR", code, &error.message, error.constraint.as_deref()).await
+    // rule the row broke rather than parsing it out of the sentence. The CONTEXT field is the
+    // same shape of fact: where the server was when the statement failed.
+    message_response(
+        conn,
+        b'E',
+        "ERROR",
+        code,
+        &error.message,
+        ErrorPlace {
+            constraint: error.constraint(),
+            context: error.context(),
+        },
+    )
+    .await
 }
 
 /// One `NoticeResponse`: what the server has to say about a statement it did not refuse.
@@ -1424,7 +1550,15 @@ async fn notice_response(
     conn: &mut ::emulator_server::ListenerConn,
     notice: &wire_session::WireNotice,
 ) -> std::io::Result<()> {
-    message_response(conn, b'N', notice.severity, &notice.code, &notice.message, None).await
+    message_response(
+        conn,
+        b'N',
+        notice.severity,
+        &notice.code,
+        &notice.message,
+        ErrorPlace::default(),
+    )
+    .await
 }
 
 /// One `ErrorResponse`.
@@ -1434,18 +1568,17 @@ async fn error_response(
     code: &str,
     message: &str,
 ) -> std::io::Result<()> {
-    message_response(conn, b'E', severity, code, message, None).await
+    message_response(conn, b'E', severity, code, message, ErrorPlace::default()).await
 }
 
-/// One `ErrorResponse` that names the CONSTRAINT the statement violated.
-async fn constrained_response(
-    conn: &mut ::emulator_server::ListenerConn,
-    severity: &str,
-    code: &str,
-    message: &str,
-    constraint: Option<&str>,
-) -> std::io::Result<()> {
-    message_response(conn, b'E', severity, code, message, constraint).await
+/// The two fields of an `ErrorResponse` that say what the refusal is ABOUT rather than what
+/// it says: the constraint the row violated and where the server was when it failed.
+#[derive(Debug, Clone, Copy, Default)]
+struct ErrorPlace<'a> {
+    /// `n`: "Constraint name: the name of the constraint that was violated".
+    constraint: Option<&'a str>,
+    /// `W`: "Where: an indication of the context in which the error occurred".
+    context: Option<&'a str>,
 }
 
 /// One `ErrorResponse` or `NoticeResponse`, which carry the same fields.
@@ -1455,7 +1588,7 @@ async fn message_response(
     severity: &str,
     code: &str,
     message: &str,
-    constraint: Option<&str>,
+    place: ErrorPlace<'_>,
 ) -> std::io::Result<()> {
     let mut body = Vec::new();
     body.push(b'S');
@@ -1466,9 +1599,16 @@ async fn message_response(
     put_cstring(&mut body, code);
     body.push(b'M');
     put_cstring(&mut body, message);
+    // `W`: "an indication of the context in which the error occurred" — the place the
+    // statement had reached, which a bulk load reports as the table, the line and the column
+    // it stopped on.
+    if let Some(context) = place.context {
+        body.push(b'W');
+        put_cstring(&mut body, context);
+    }
     // `n`: "Constraint name: the name of the constraint that was violated", which the
     // protocol carries as a field of its own.
-    if let Some(constraint) = constraint {
+    if let Some(constraint) = place.constraint {
         body.push(b'n');
         put_cstring(&mut body, constraint);
     }

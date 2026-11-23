@@ -81,10 +81,13 @@ const CATALOG_SCHEMA: [&str; 9] = [
     // The schema the objects of a database live in, and its access control list.
     "CREATE TABLE IF NOT EXISTS pg_namespace (\
        oid integer PRIMARY KEY, nspname text UNIQUE, nspowner integer, nspacl text)",
-    // The relations a database holds, with the privileges granted on each.
+    // The relations a database holds, with the privileges granted on each and the storage
+    // each one occupies — `relpages` is "size of the on-disk representation of this table in
+    // pages" and `reltuples` the rows it holds, which is what the relation-size functions are
+    // answered from ([`measured_storage`]).
     "CREATE TABLE IF NOT EXISTS pg_class (\
        oid integer PRIMARY KEY, relname text UNIQUE, relnamespace integer, \
-       relowner integer, relkind text, relacl text)",
+       relowner integer, relkind text, relacl text, relpages integer, reltuples integer)",
     // The extensions the instance has a control file for, with the version each declares
     // and the version installed in THIS database — which is what an extension is installed
     // in.
@@ -282,6 +285,10 @@ fn context(spec: &ClusterParameterSpec) -> &'static str {
 /// publishes nothing about, both of which leave such a parameter on the engine's own
 /// compiled default.
 ///
+/// `configured_port` is the port the RESOURCE was created with, which is the port its engine
+/// is configured to listen on ([`ENGINE_PORT_PARAMETER`]); `None` for a resource this store
+/// holds no port for.
+///
 /// `catalogs` are the published catalogs the resource's parameters come from, in the order
 /// that resolves one a parameter is in several of. A DB INSTANCE has one — the parameters its
 /// family publishes — while a DB CLUSTER has TWO: its family's cluster-level list and the
@@ -294,6 +301,7 @@ pub fn running_parameters(
     group: Option<&BTreeMap<String, ParameterSetting>>,
     engine_started_at: f64,
     class_memory_bytes: Option<u64>,
+    configured_port: Option<i32>,
 ) -> Vec<RunningParameter> {
     let mut parameters: Vec<RunningParameter> = Vec::new();
     for spec in catalogs.iter().flat_map(|catalog| catalog.iter()) {
@@ -371,7 +379,70 @@ pub fn running_parameters(
         });
     }
     parameters.sort_by(|left, right| left.name.cmp(&right.name));
+    // The port the server listens on is not a value a parameter group carries on a managed
+    // engine: it is the port the RESOURCE was created with (`Port`, "the port number on which
+    // the database accepts connections"), which this store records, so the parameter in force
+    // is that port and a client reading it reads the port the resource is configured with.
+    //
+    // Every server of both families HAS this setting, whether or not the published catalogue
+    // this emulator carries a sample of publishes a record for it, so the entry is added where
+    // the catalogue has none rather than leaving a session unable to read it at all.
+    if let Some(port) = configured_port {
+        let configured = port.to_string();
+        match parameters
+            .iter_mut()
+            .find(|parameter| parameter.name == ENGINE_PORT_PARAMETER)
+        {
+            Some(parameter) => {
+                parameter.running = configured.clone();
+                parameter.reset_value = configured;
+                parameter.pending_restart = false;
+                parameter.source = SOURCE_CONFIGURATION_FILE;
+            }
+            None => {
+                let at = parameters
+                    .iter()
+                    .position(|parameter| parameter.name.as_str() > ENGINE_PORT_PARAMETER)
+                    .unwrap_or(parameters.len());
+                parameters.insert(at, engine_port_parameter(family, &configured));
+            }
+        }
+    }
     parameters
+}
+
+/// The configuration parameter naming the port the server listens on: PostgreSQL's `port`,
+/// "the TCP port the server listens on", which `current_setting('port')` and `pg_settings`
+/// report. MySQL's system variable of the same name is the same setting of that server.
+const ENGINE_PORT_PARAMETER: &str = "port";
+
+/// The highest port a resource of this front door can be created on: `Port`'s own published
+/// range is "1150-65535", and the engine's own ceiling for the setting is the same number —
+/// what `pg_settings.max_val` reports for it.
+const HIGHEST_PORT: u16 = u16::MAX;
+
+/// The engine's `port` parameter as it stands on a resource configured to listen on
+/// `configured`.
+///
+/// `boot_val` is the port the ENGINE itself starts on when nothing configures one, which is
+/// the documented default of the family's engine ([`crate::state::default_port`]); the value
+/// in force came from the configuration this service wrote, which is where a managed engine
+/// gets its port from. `context` is `postmaster`, because a server reads its listening port
+/// only when it starts.
+fn engine_port_parameter(family: &str, configured: &str) -> RunningParameter {
+    RunningParameter {
+        name: ENGINE_PORT_PARAMETER.to_string(),
+        running: configured.to_string(),
+        boot_value: crate::state::default_port(family).to_string(),
+        reset_value: configured.to_string(),
+        pending_restart: false,
+        source: SOURCE_CONFIGURATION_FILE,
+        vartype: "integer",
+        context: "postmaster",
+        bounds: Some(("1".to_string(), HIGHEST_PORT.to_string())),
+        enum_values: None,
+        description: "Sets the TCP port the server listens on.".to_string(),
+    }
 }
 
 /// Create the catalog tables if this database has not served one yet. Called once per
@@ -694,8 +765,8 @@ fn refresh_relations(
             facts.connection_id,
             &facts.database,
             "INSERT OR IGNORE INTO pg_class \
-               (oid, relname, relnamespace, relowner, relkind, relacl) \
-             VALUES ((SELECT IFNULL(MAX(oid), ?) + 1 FROM pg_class), ?, ?, ?, ?, NULL)",
+               (oid, relname, relnamespace, relowner, relkind, relacl, relpages, reltuples) \
+             VALUES ((SELECT IFNULL(MAX(oid), ?) + 1 FROM pg_class), ?, ?, ?, ?, NULL, 0, 0)",
             &[
                 Some(FIRST_RELATION_OID.to_string()),
                 Some(name.clone()),
@@ -704,6 +775,21 @@ fn refresh_relations(
                 Some((*kind).to_string()),
             ],
         )?;
+        // And the STORAGE it occupies right now, which is what the relation-size functions
+        // report: a relation the rows of a load have grown occupies more of it than it did
+        // before, so the measure is taken here rather than kept.
+        if let Some((pages, rows)) = measured_storage(database, facts, name, kind) {
+            database.execute_in(
+                facts.connection_id,
+                &facts.database,
+                "UPDATE pg_class SET relpages = ?, reltuples = ? WHERE relname = ?",
+                &[
+                    Some(pages.to_string()),
+                    Some(rows.to_string()),
+                    Some(name.clone()),
+                ],
+            )?;
+        }
     }
     // The rows of relations the database no longer holds. A database holding NO relation at
     // all is the empty case: `NOT IN ()` is not SQL, so what that asks for is said plainly.
@@ -731,6 +817,73 @@ fn refresh_relations(
     )?;
     Ok(())
 }
+
+/// How many PAGES the relation `name` occupies and how many ROWS it holds, measured on the
+/// storage the engine has for it right now — `None` for a relation this session cannot
+/// measure (a view, which stores no rows of its own, or one the engine will not describe).
+///
+/// PostgreSQL reports a relation's size in whole pages of [`RELATION_PAGE_BYTES`] —
+/// `pg_class.relpages` is "size of the on-disk representation of this table in pages" — so
+/// what is measured here are the BYTES the relation's own values occupy, counted by the
+/// engine over its rows, and reported as the pages they fill. A relation with no rows fills
+/// none, which is the zero PostgreSQL reports for an empty table.
+fn measured_storage(
+    database: &InstanceDatabase,
+    facts: &SessionFacts,
+    name: &str,
+    kind: &str,
+) -> Option<(i64, i64)> {
+    // A VIEW has no storage of its own: its rows are the rows of the relations it reads.
+    if kind != "r" {
+        return Some((0, 0));
+    }
+    let quoted = super::pg_copy::quoted(name);
+    let columns = database
+        .describe(
+            facts.connection_id,
+            &facts.database,
+            &format!("SELECT * FROM {quoted}"),
+            &[],
+        )
+        .ok()?;
+    // The bytes one row occupies: the length of each of its values, with a NULL counting
+    // nothing — the measure the engine itself can take over the rows it holds.
+    let occupied = columns
+        .iter()
+        .map(|column| {
+            format!(
+                "IFNULL(LENGTH({}), 0)",
+                super::pg_copy::quoted(&column.name)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" + ");
+    let measured = if occupied.is_empty() {
+        format!("SELECT COUNT(*), 0 FROM {quoted}")
+    } else {
+        format!("SELECT COUNT(*), IFNULL(SUM({occupied}), 0) FROM {quoted}")
+    };
+    let answer = database
+        .execute_in(facts.connection_id, &facts.database, &measured, &[])
+        .ok()?;
+    let row = answer.rows.first()?;
+    let number = |at: usize| match row.get(at) {
+        Some(super::sql_engine::Cell::Integer(value)) => Some(*value),
+        Some(super::sql_engine::Cell::Real(value)) => Some(*value as i64),
+        _ => None,
+    };
+    let rows = number(0)?;
+    let bytes = number(1)?;
+    // The pages those bytes fill, rounded up: a relation holding rows occupies at least one
+    // page, as PostgreSQL's own accounting does.
+    let pages = bytes.saturating_add(RELATION_PAGE_BYTES - 1) / RELATION_PAGE_BYTES;
+    Some((pages, rows))
+}
+
+/// The size of one page of a relation's storage, which is the unit PostgreSQL reports a
+/// relation's size in: its own `BLCKSZ`, 8192 bytes by default, which is what
+/// `pg_class.relpages` counts and what the relation-size functions multiply it by.
+const RELATION_PAGE_BYTES: i64 = 8192;
 
 /// Seed `pg_roles` with the roles the instance was created with: the master user and the
 /// roles RDS provides ([`RDS_ROLES`]).
@@ -949,6 +1102,12 @@ pub fn role_statement(
         ));
     };
     refresh_roles(database, facts)?;
+    // A role RDS OWNS is not the session's to re-shape or remove: the master user is not a
+    // superuser, so such a statement is refused before anything is written and the role stays
+    // as it is ([`refused_on_an_rds_owned_role`]).
+    if let Some(refusal) = refused_on_an_rds_owned_role(database, facts, verb, &name) {
+        return Err(refusal);
+    }
     let exists = !database
         .execute_in(
             facts.connection_id,
@@ -1050,6 +1209,64 @@ fn role_missing(name: &str) -> EngineError {
         EngineErrorKind::UndefinedObject,
         format!("role \"{name}\" does not exist"),
     )
+}
+
+/// Whether `name` is one of the roles RDS itself owns on every instance ([`RDS_ROLES`]) —
+/// the superuser account it keeps and the predefined roles it grants from.
+fn is_an_rds_owned_role(name: &str) -> bool {
+    RDS_ROLES
+        .iter()
+        .any(|(role, _, _)| role.eq_ignore_ascii_case(name))
+}
+
+/// Whether the session's OWN user is a superuser on this server, as the role catalog records
+/// it.
+///
+/// The master user is not — "the user account you create … is not a PostgreSQL superuser" —
+/// and neither is any role a session creates ([`role_statement`]), so this is false for every
+/// session a client opens; it is read from the catalog rather than assumed, so a server whose
+/// catalog says otherwise is answered by what it says. A user the catalog does not hold holds
+/// no superuser attribute either, which is the `false` the unreadable case answers.
+fn session_is_a_superuser(database: &InstanceDatabase, facts: &SessionFacts) -> bool {
+    database
+        .execute_in(
+            facts.connection_id,
+            &facts.database,
+            "SELECT rolsuper FROM pg_roles WHERE rolname = ? AND rolsuper",
+            &[Some(facts.user.clone())],
+        )
+        .is_ok_and(|found| !found.rows.is_empty())
+}
+
+/// The refusal a statement that would ALTER or DROP a role RDS owns gets, or `None` for one
+/// that targets a role of the instance's own.
+///
+/// Amazon RDS withholds the superuser account: the master user is a member of
+/// `rds_superuser` and is not a superuser itself, so it cannot modify the roles RDS owns —
+/// `rdsadmin` and the predefined `rds_*` roles it grants from ([`RDS_ROLES`]). Such a
+/// statement is refused with PostgreSQL's insufficient-privilege condition and the sentence
+/// the managed server words it with, naming the role the statement named, and the role is
+/// left exactly as it was.
+fn refused_on_an_rds_owned_role(
+    database: &InstanceDatabase,
+    facts: &SessionFacts,
+    verb: &str,
+    name: &str,
+) -> Option<EngineError> {
+    let acted = match verb {
+        "ALTER" => "alter",
+        "DROP" => "drop",
+        // A `CREATE` of a role that is already there is answered as the duplicate it is, by
+        // the statement itself.
+        _ => return None,
+    };
+    if !is_an_rds_owned_role(name) || session_is_a_superuser(database, facts) {
+        return None;
+    }
+    Some(EngineError::new(
+        EngineErrorKind::InsufficientPrivilege,
+        format!("cannot {acted} \"{name}\""),
+    ))
 }
 
 /// How the embedded engine introduces a relation the database does not hold, and the two
@@ -1161,6 +1378,11 @@ pub fn function_result_type(function: &str) -> Option<&'static str> {
         // served by: the value they answer with is of that type.
         return Some("numeric");
     }
+    if function.eq_ignore_ascii_case(super::pg_numeric::SCALED_TEXT_FUNCTION) {
+        // The TEXT FORM of an exact-decimal column, which is what the cast it was put in
+        // place of asked for.
+        return Some("text");
+    }
     if let Some(named) = super::engine_time::function_result_type(function) {
         // The date and time functions each engine defines ([`super::engine_time`]), whose
         // own surface says what each of them answers with.
@@ -1184,6 +1406,9 @@ pub fn function_result_type(function: &str) -> Option<&'static str> {
         // so the column carries the boolean the function returns.
         "pg_has_role" => Some("boolean"),
         "pg_sleep" => Some("void"),
+        // The relation-size functions answer "the disk space used", which PostgreSQL reports
+        // as a `bigint` number of bytes.
+        "pg_relation_size" | "pg_table_size" | "pg_total_relation_size" => Some("bigint"),
         _ => None,
     }
 }
@@ -1200,6 +1425,11 @@ pub fn function_result_type(function: &str) -> Option<&'static str> {
 ///   privilege for itself, and otherwise it has them through being a member of that role.
 ///   Its two-argument form asks about the CURRENT user, which the session's own value is
 ///   substituted for before this runs (`super::dialect`).
+/// * `pg_relation_size(relation)` is "the disk space used by one fork of the relation" and
+///   `pg_table_size` / `pg_total_relation_size` the storage of the relation with what belongs
+///   to it; all three are the PAGES `pg_class` records for it ([`measured_storage`]) in bytes,
+///   because this engine holds a relation's rows in one store and has no second fork, no
+///   separate index storage and no out-of-line values of its own.
 ///
 /// Nothing is answered from the statement's text: the engine plans and runs the lookup like
 /// any other subquery, and a role the instance does not have resolves to nothing, as
@@ -1213,6 +1443,7 @@ pub fn catalog_function(function: &str) -> Option<&'static str> {
     match function.to_ascii_lowercase().as_str() {
         "pg_get_userbyid" => Some("pg_roles"),
         "pg_has_role" => Some("pg_auth_members"),
+        "pg_relation_size" | "pg_table_size" | "pg_total_relation_size" => Some("pg_class"),
         _ => None,
     }
 }
@@ -1239,8 +1470,35 @@ pub fn catalog_function_lookup(
         // records.
         ("pg_has_role", [role, _privilege]) => Some(has_role_lookup(session_user, role)),
         ("pg_has_role", [user, role, _privilege]) => Some(has_role_lookup(user, role)),
+        // The STORAGE the relation occupies, in bytes: the pages `pg_class` records for it,
+        // and nothing for a name this database holds no relation of — which is the NULL
+        // PostgreSQL answers for a relation that is not there.
+        (
+            "pg_relation_size" | "pg_table_size" | "pg_total_relation_size",
+            [relation],
+        ) => Some(relation_size_lookup(function, relation)),
+        // The same functions take a second argument naming WHICH fork of the relation to
+        // measure; this engine has one store per relation, so it is the same size.
+        ("pg_relation_size", [relation, _fork]) => {
+            Some(relation_size_lookup(function, relation))
+        }
         _ => None,
     }
+}
+
+/// The STORAGE `relation` occupies, in bytes: the pages `pg_class` records for it
+/// ([`measured_storage`]) multiplied by the page size, wrapped in the call of the function
+/// itself — which is what names the column after the function and reports it under the
+/// function's own type ([`function_result_type`]), exactly as the role lookup does.
+///
+/// A name this database holds no relation of contributes no row, so the lookup answers NULL,
+/// which is what PostgreSQL answers for a relation it does not have.
+fn relation_size_lookup(function: &str, relation: &str) -> String {
+    format!(
+        "{}((SELECT IFNULL(relpages, 0) * {RELATION_PAGE_BYTES} FROM pg_class \
+           WHERE relname = {relation}))",
+        function.to_ascii_lowercase()
+    )
 }
 
 /// Whether `user` has the privileges of `role`: it is that role, or it is a member of it, as
@@ -1266,7 +1524,7 @@ fn has_role_lookup(user: &str, role: &str) -> String {
 /// connection), so a statement that calls one is planned and run by the engine like any
 /// other — and so a function this list does not carry is refused as undefined rather than
 /// silently answered.
-pub const SERVER_FUNCTIONS: [(&str, i32); 13] = [
+pub const SERVER_FUNCTIONS: [(&str, i32); 16] = [
     ("pg_postmaster_start_time", 0),
     ("pg_is_in_recovery", 0),
     ("pg_backend_pid", 0),
@@ -1285,6 +1543,12 @@ pub const SERVER_FUNCTIONS: [(&str, i32); 13] = [
     // `pg_has_role`, as the ONE argument the lookup above leaves it: the truth of the
     // membership the engine resolved out of the role catalog.
     ("pg_has_role", 1),
+    // The RELATION-SIZE functions, as the ONE argument their own lookup leaves each of them:
+    // the bytes the relation occupies, resolved out of the relation catalog
+    // ([`relation_size_lookup`]).
+    ("pg_relation_size", 1),
+    ("pg_table_size", 1),
+    ("pg_total_relation_size", 1),
     // `char_length(text)` / `character_length(text)` — "the number of characters in the
     // string" (PostgreSQL, "String Functions and Operators"), and MySQL's `CHAR_LENGTH()`,
     // which "returns the length of the string measured in characters": the same count, under
@@ -1295,6 +1559,16 @@ pub const SERVER_FUNCTIONS: [(&str, i32); 13] = [
     // what each of them measures (see the registration in `super::sql_engine`).
     ("length", 1),
     ("octet_length", 1),
+];
+
+/// The relation-size functions this server defines, each answered out of the relation
+/// catalog ([`relation_size_lookup`]): PostgreSQL's `pg_relation_size`, "the disk space used
+/// by one fork of the relation", and the two that report the storage of the relation with what
+/// belongs to it.
+pub const RELATION_SIZE_FUNCTIONS: [&str; 3] = [
+    "pg_relation_size",
+    "pg_table_size",
+    "pg_total_relation_size",
 ];
 
 /// The server functions BOTH families define, under the same name and over the same values,

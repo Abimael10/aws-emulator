@@ -244,6 +244,195 @@ fn truncated() -> EngineError {
     )
 }
 
+/// The BINARY form of `value`, for a column declared `declared` — the bytes a
+/// `COPY … TO STDOUT WITH (FORMAT binary)` stream carries for the field, and `None` for SQL
+/// NULL, which that stream writes as a length of -1.
+///
+/// The form is the TYPE's own, which is why the column's declaration decides it: the integers
+/// and floats are big-endian, a boolean is one byte, `numeric` is the sequence of base-10000
+/// digits with a weight, a sign and a display scale that [`numeric_text`] reads, and the
+/// string types are their own bytes. A column the statement COMPUTED carries no declaration,
+/// so its value's own class decides the form, exactly as the row description reports such a
+/// column under the type of the value it carries.
+///
+/// `Err` for a declared type this endpoint does not WRITE in that format, which is a limit of
+/// this endpoint rather than a refusal of the statement: it names the type, so a client can
+/// ask for the text format instead.
+pub fn copy_field(
+    declared: Option<&str>,
+    value: &super::sql_engine::Cell,
+) -> Result<Option<Vec<u8>>, EngineError> {
+    use super::sql_engine::Cell;
+    if matches!(value, Cell::Null) {
+        return Ok(None);
+    }
+    let text = || match value {
+        Cell::Integer(number) => number.to_string(),
+        Cell::Real(number) => number.to_string(),
+        Cell::Text(text) => text.clone(),
+        Cell::Blob(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+        Cell::Null => String::new(),
+    };
+    let number = || match value {
+        Cell::Integer(number) => *number as f64,
+        Cell::Real(number) => *number,
+        other => text_of(other).trim().parse::<f64>().unwrap_or_default(),
+    };
+    let whole = || match value {
+        Cell::Integer(number) => *number,
+        Cell::Real(number) => *number as i64,
+        other => text_of(other).trim().parse::<i64>().unwrap_or_default(),
+    };
+    // The base of the declared type, without the precision or the length it carries.
+    let base = declared.map(|declared| {
+        declared
+            .trim()
+            .to_ascii_lowercase()
+            .split('(')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    });
+    let bytes = match base.as_deref() {
+        Some("smallint" | "int2") => i16::try_from(whole())
+            .unwrap_or_default()
+            .to_be_bytes()
+            .to_vec(),
+        Some("int" | "integer" | "int4" | "serial" | "oid") => i32::try_from(whole())
+            .unwrap_or_default()
+            .to_be_bytes()
+            .to_vec(),
+        Some("bigint" | "int8" | "bigserial") => whole().to_be_bytes().to_vec(),
+        Some("real" | "float4") => (number() as f32).to_bits().to_be_bytes().to_vec(),
+        Some("double precision" | "double" | "float8" | "float") => {
+            number().to_bits().to_be_bytes().to_vec()
+        }
+        Some("bool" | "boolean") => vec![u8::from(boolean(value))],
+        Some("numeric" | "decimal" | "dec" | "fixed") => numeric_bytes(&text())?,
+        Some(
+            "text" | "varchar" | "character varying" | "char" | "character" | "bpchar" | "name"
+            | "json" | "citext",
+        ) => text().into_bytes(),
+        Some("bytea" | "blob") => match value {
+            Cell::Blob(bytes) => bytes.clone(),
+            other => text_of(other).into_bytes(),
+        },
+        // A column the statement computed: the value's own class says what it is.
+        None => match value {
+            Cell::Integer(number) => number.to_be_bytes().to_vec(),
+            Cell::Real(number) => number.to_bits().to_be_bytes().to_vec(),
+            Cell::Text(text) => text.clone().into_bytes(),
+            Cell::Blob(bytes) => bytes.clone(),
+            Cell::Null => Vec::new(),
+        },
+        Some(named) => {
+            return Err(EngineError::new(
+                EngineErrorKind::FeatureNotSupported,
+                format!("this endpoint writes a column of type {named} in the text format only"),
+            )
+            .with_sqlstate("0A000"))
+        }
+    };
+    Ok(Some(bytes))
+}
+
+/// One value's own text, for the readings above that need it from a borrowed cell.
+fn text_of(value: &super::sql_engine::Cell) -> String {
+    use super::sql_engine::Cell;
+    match value {
+        Cell::Integer(number) => number.to_string(),
+        Cell::Real(number) => number.to_string(),
+        Cell::Text(text) => text.clone(),
+        Cell::Blob(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+        Cell::Null => String::new(),
+    }
+}
+
+/// Whether `value` is TRUE, in each of the forms a boolean column's value is held in: the
+/// engine's own 0 and 1, and the text forms both engines read as true.
+fn boolean(value: &super::sql_engine::Cell) -> bool {
+    use super::sql_engine::Cell;
+    match value {
+        Cell::Integer(number) => *number != 0,
+        Cell::Real(number) => *number != 0.0,
+        other => matches!(
+            text_of(other).trim().to_ascii_lowercase().as_str(),
+            "t" | "true" | "y" | "yes" | "on" | "1"
+        ),
+    }
+}
+
+/// The BINARY form of the `numeric` value `text` names: the base-10000 digits it carries, the
+/// weight of the first of them, its sign and the display scale its text has — the four fields
+/// [`numeric_text`] reads a value back out of.
+fn numeric_bytes(text: &str) -> Result<Vec<u8>, EngineError> {
+    let text = text.trim();
+    if text.eq_ignore_ascii_case("nan") {
+        let mut out = Vec::new();
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&0i16.to_be_bytes());
+        out.extend_from_slice(&NUMERIC_NAN.to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes());
+        return Ok(out);
+    }
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let (whole, fraction) = digits.split_once('.').unwrap_or((digits, ""));
+    if !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        || whole.len() + fraction.len() > NUMERIC_MAX_DIGITS
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::DataError,
+            format!("invalid input syntax for type numeric: \"{text}\""),
+        ));
+    }
+    // The digits are grouped in fours FROM the decimal point in both directions, which is
+    // what the weight then counts in.
+    let scale = fraction.len();
+    let leading = (NUMERIC_DIGIT_DIGITS - whole.len() % NUMERIC_DIGIT_DIGITS) % NUMERIC_DIGIT_DIGITS;
+    let trailing =
+        (NUMERIC_DIGIT_DIGITS - fraction.len() % NUMERIC_DIGIT_DIGITS) % NUMERIC_DIGIT_DIGITS;
+    let padded = format!("{}{whole}{fraction}{}", "0".repeat(leading), "0".repeat(trailing));
+    let mut groups: Vec<u16> = padded
+        .as_bytes()
+        .chunks(NUMERIC_DIGIT_DIGITS)
+        .map(|chunk| {
+            String::from_utf8_lossy(chunk)
+                .parse::<u16>()
+                .unwrap_or_default()
+        })
+        .collect();
+    let whole_groups = (whole.len() + leading) / NUMERIC_DIGIT_DIGITS;
+    let mut weight = i64::try_from(whole_groups).unwrap_or_default() - 1;
+    // The leading and trailing zero groups carry nothing: PostgreSQL's own form holds only
+    // the digits between the first and the last that is not zero, with the weight saying
+    // where they sit.
+    while groups.first() == Some(&0) {
+        groups.remove(0);
+        weight -= 1;
+    }
+    while groups.last() == Some(&0) {
+        groups.pop();
+    }
+    if groups.is_empty() {
+        // Zero carries no digits at all, and sits at weight zero.
+        weight = 0;
+    }
+    let mut out = Vec::with_capacity(8 + groups.len() * 2);
+    out.extend_from_slice(&u16::try_from(groups.len()).unwrap_or_default().to_be_bytes());
+    out.extend_from_slice(&i16::try_from(weight).unwrap_or_default().to_be_bytes());
+    out.extend_from_slice(&if negative { NUMERIC_NEGATIVE } else { 0u16 }.to_be_bytes());
+    out.extend_from_slice(&u16::try_from(scale).unwrap_or_default().to_be_bytes());
+    for group in groups {
+        out.extend_from_slice(&group.to_be_bytes());
+    }
+    Ok(out)
+}
+
 fn read_i16(bytes: &[u8]) -> Result<i16, EngineError> {
     let bytes = bytes.get(..2).ok_or_else(truncated)?;
     Ok(i16::from_be_bytes([bytes[0], bytes[1]]))

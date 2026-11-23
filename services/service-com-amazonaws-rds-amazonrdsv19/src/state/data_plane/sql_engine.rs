@@ -48,6 +48,15 @@ use super::session_transactions::{self, ClosedTransaction, OpenTransactions};
 /// How many rows one statement may hand back to a session.
 pub const MAX_RESULT_ROWS: usize = 10_000;
 
+/// How many rows one `COPY … TO STDOUT` may STREAM to a session.
+///
+/// A copy streams a whole relation rather than handing back a result set a client reads with
+/// a cursor — "COPY TO copies the contents of a table" — so it is not held to the result-set
+/// cap above; what bounds it is the bytes those rows render to
+/// ([`MAX_RESULT_BYTES`]) and this ceiling, which is well above the rows one bulk load
+/// carries and far below where the rendering would grow the process.
+pub const MAX_STREAMED_ROWS: usize = 100_000;
+
 /// How many bytes of result values one statement may hand back to a session, charged as
 /// each value is read out of the engine, so a statement that would build a larger answer
 /// is refused instead of allocating it.
@@ -76,7 +85,16 @@ const PROGRESS_HANDLER_OPS: std::os::raw::c_int = 1_000;
 /// mirror the ones this emulator's other SQL data plane uses
 /// (`service-com-amazonaws-rdsdata-rdsdataservice`), so the two cannot drift on what a
 /// statement may cost.
-pub const MAX_VALUE_BYTES: i32 = 1024 * 1024;
+///
+/// `MAX_VALUE_BYTES` is the largest single value the engine will HOLD or COMPUTE, and it is
+/// the same ceiling as the result budget below rather than a smaller one: concatenating or
+/// aggregating a table's text (`string_agg`, `||`, a digest over either) builds one value out
+/// of many rows, which is ordinary work on a PostgreSQL server — "the longest possible
+/// character string that can be stored is about 1 GB" — so what bounds such a statement is
+/// what this endpoint can hand a session back ([`MAX_RESULT_BYTES`]) and not a tighter bound
+/// on one value. Nothing a client sends can be that large anyway: a bound parameter is
+/// bounded by the protocol's own message cap, and the statement text by `MAX_SQL_BYTES`.
+pub const MAX_VALUE_BYTES: i32 = 8 * 1024 * 1024;
 const MAX_SQL_BYTES: i32 = 65_536;
 const MAX_EXPRESSION_DEPTH: i32 = 200;
 const MAX_COMPOUND_SELECT: i32 = 20;
@@ -198,11 +216,13 @@ pub struct EngineError {
     /// The error number and SQLSTATE the MySQL wire reports this refusal under, where the
     /// CONDITION names one of its own ([`EngineError::with_mysql_error`]).
     pub mysql_error: Option<(u16, &'static str)>,
-    /// The CONSTRAINT this refusal is about, where it is about one: the rule the row
-    /// violated, which the PostgreSQL wire reports as a FIELD of the error rather than only
-    /// inside its sentence — a client reads it to decide which unique or foreign-key rule it
-    /// broke ([`EngineError::with_constraint`]).
-    pub constraint: Option<String>,
+    /// What this refusal is ABOUT beside its sentence: the constraint the row violated and
+    /// where the server was when it failed, which PostgreSQL carries in FIELDS of its own
+    /// rather than inside the message ([`RefusalFields`]).
+    ///
+    /// Behind a box, so a refusal that is about neither of them costs one pointer rather than
+    /// two strings — this type is the `Err` of every statement and is moved on every refusal.
+    pub about: Option<Box<RefusalFields>>,
     /// What the server SAID about the statement before it failed: the messages a code
     /// block's earlier `RAISE` statements produced ([`super::pg_code_block`]), or `None` for
     /// a failure with nothing said before it — which is every other one.
@@ -213,6 +233,20 @@ pub struct EngineError {
     /// really produced. Behind a box, so a failure that said nothing costs one pointer
     /// rather than two vectors — this type is the `Err` of every statement.
     pub said: Option<Box<SaidBefore>>,
+}
+
+/// What a refusal is ABOUT beside its sentence, as the fields PostgreSQL carries each of them
+/// in ([`EngineError::about`]). A client reads them out of those fields rather than out of the
+/// message.
+#[derive(Debug, Clone, Default)]
+pub struct RefusalFields {
+    /// `n`, the CONSTRAINT: the rule the row violated — which unique or foreign-key rule it
+    /// broke ([`EngineError::with_constraint`]).
+    pub constraint: Option<String>,
+    /// `W`, the CONTEXT: where the server was when the statement failed, which a bulk load
+    /// fills with the table, the line and the column it stopped on
+    /// ([`EngineError::with_context`]).
+    pub context: Option<String>,
 }
 
 /// What the server said about a statement BEFORE it failed, on each of its two channels
@@ -235,9 +269,25 @@ impl EngineError {
             offset: None,
             sqlstate: None,
             mysql_error: None,
-            constraint: None,
+            about: None,
             said: None,
         }
+    }
+
+    /// The CONSTRAINT this refusal is about, where it is about one.
+    #[must_use]
+    pub fn constraint(&self) -> Option<&str> {
+        self.about
+            .as_ref()
+            .and_then(|about| about.constraint.as_deref())
+    }
+
+    /// WHERE the server was when the statement failed, where that is a place of its own.
+    #[must_use]
+    pub fn context(&self) -> Option<&str> {
+        self.about
+            .as_ref()
+            .and_then(|about| about.context.as_deref())
     }
 
     /// The messages the server said before this failure, in the order it said them.
@@ -278,7 +328,14 @@ impl EngineError {
     /// The same failure, naming the CONSTRAINT the row violated.
     #[must_use]
     pub fn with_constraint(mut self, constraint: impl Into<String>) -> Self {
-        self.constraint = Some(constraint.into());
+        self.about.get_or_insert_with(Box::default).constraint = Some(constraint.into());
+        self
+    }
+
+    /// The same failure, naming WHERE the server was when it happened ([`RefusalFields`]).
+    #[must_use]
+    pub fn with_context(mut self, context: impl Into<String>) -> Self {
+        self.about.get_or_insert_with(Box::default).context = Some(context.into());
         self
     }
 
@@ -654,7 +711,7 @@ impl InstanceDatabase {
         sql: &str,
         params: &[Option<String>],
     ) -> Result<ResultSet, EngineError> {
-        self.run_for(None, database, view, sql, params)
+        self.run_for(None, database, view, sql, params, MAX_RESULT_ROWS)
     }
 
     /// Run `sql` for the SESSION `session`, exactly as [`Self::execute_as`] runs it, and
@@ -669,7 +726,29 @@ impl InstanceDatabase {
         sql: &str,
         params: &[Option<String>],
     ) -> Result<ResultSet, EngineError> {
-        self.run_for(Some(session), database, view, sql, params)
+        self.run_for(Some(session), database, view, sql, params, MAX_RESULT_ROWS)
+    }
+
+    /// Run the query one `COPY … TO STDOUT` streams, exactly as [`Self::execute_for`] runs a
+    /// statement — bounded by the rows a copy streams ([`MAX_STREAMED_ROWS`]) rather than by
+    /// the result-set cap, because a copy streams a relation rather than handing back a
+    /// result set.
+    pub fn stream_for(
+        &self,
+        session: u32,
+        database: &str,
+        view: &ServerView,
+        sql: &str,
+        params: &[Option<String>],
+    ) -> Result<ResultSet, EngineError> {
+        self.run_for(
+            Some(session),
+            database,
+            view,
+            sql,
+            params,
+            MAX_STREAMED_ROWS,
+        )
     }
 
     /// Run a statement of the SERVER's own for the session `session`: the catalog rebuilds
@@ -687,11 +766,18 @@ impl InstanceDatabase {
         sql: &str,
         params: &[Option<String>],
     ) -> Result<ResultSet, EngineError> {
-        self.run_for(Some(session), database, &ServerView::default(), sql, params)
+        self.run_for(
+            Some(session),
+            database,
+            &ServerView::default(),
+            sql,
+            params,
+            MAX_RESULT_ROWS,
+        )
     }
 
     /// One statement, with its row changes recorded against `session`'s transaction when it
-    /// has one.
+    /// has one, and holding the rows it answers with to `row_ceiling`.
     ///
     /// The recording is turned on and off INSIDE the engine's own lock, which serialises the
     /// statements of every session on this endpoint: the rows one statement changes can
@@ -703,6 +789,7 @@ impl InstanceDatabase {
         view: &ServerView,
         sql: &str,
         params: &[Option<String>],
+        row_ceiling: usize,
     ) -> Result<ResultSet, EngineError> {
         let mut databases = self.lock();
         self.take_the_sessions_snapshot(&mut databases, session, database)?;
@@ -723,7 +810,7 @@ impl InstanceDatabase {
         )?;
         conn.progress_handler(PROGRESS_HANDLER_OPS, Some(move || Instant::now() >= deadline))
             .map_err(from_engine)?;
-        let answer = run_statement(conn, sql, params);
+        let answer = run_statement(conn, sql, params, row_ceiling);
         // The bound is removed once the statement is over. The next statement installs its
         // own, so a failure to remove this one cannot leave anything running unbounded.
         let _ = conn.progress_handler(PROGRESS_HANDLER_OPS, None::<fn() -> bool>);
@@ -1890,6 +1977,29 @@ fn register_server_functions(
     )
     .map_err(unavailable)?;
 
+    // The RELATION-SIZE functions, as the ONE argument their lookup leaves each of them: the
+    // bytes the relation occupies, which the engine resolved out of the relation catalog
+    // (`super::pg_server::relation_size_lookup`). The call is kept so the column is named
+    // after the function and reported under its own type, exactly as `pg_has_role` is; a
+    // relation the catalog holds no row for answers NULL, as PostgreSQL's own does.
+    for named in super::pg_server::RELATION_SIZE_FUNCTIONS {
+        conn.create_scalar_function(
+            named,
+            1,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            |context| match context.get_raw(0) {
+                ValueRef::Null => Ok(None),
+                ValueRef::Integer(bytes) => Ok(Some(bytes)),
+                ValueRef::Real(bytes) => Ok(Some(bytes as i64)),
+                ValueRef::Text(bytes) | ValueRef::Blob(bytes) => Ok(String::from_utf8_lossy(bytes)
+                    .trim()
+                    .parse::<i64>()
+                    .ok()),
+            },
+        )
+        .map_err(unavailable)?;
+    }
+
     // `md5(text)` — "Computes the MD5 hash of the argument, with the result written in
     // hexadecimal" on PostgreSQL, and the same digest under the same name on MySQL. The
     // digest is computed over the argument's own bytes, so what the client hashes is what
@@ -2000,6 +2110,7 @@ fn run_statement(
     conn: &Connection,
     sql: &str,
     params: &[Option<String>],
+    row_ceiling: usize,
 ) -> Result<ResultSet, EngineError> {
     let mut statement = conn.prepare(sql).map_err(from_engine)?;
     if statement.parameter_count() != params.len() {
@@ -2033,22 +2144,33 @@ fn run_statement(
     let mut bytes = 0usize;
     let mut cursor = statement.raw_query();
     while let Some(row) = cursor.next().map_err(from_engine)? {
-        if rows.len() >= MAX_RESULT_ROWS {
+        if rows.len() >= row_ceiling {
             return Err(EngineError::new(
                 EngineErrorKind::LimitExceeded,
-                format!("the result set is larger than this emulator serves ({MAX_RESULT_ROWS} rows)"),
+                format!("the result set is larger than this emulator serves ({row_ceiling} rows)"),
             ));
         }
         let mut values = Vec::with_capacity(columns.len());
         for index in 0..columns.len() {
-            let cell = match row.get_ref(index).map_err(from_engine)? {
-                ValueRef::Null => Cell::Null,
-                ValueRef::Integer(value) => Cell::Integer(value),
-                ValueRef::Real(value) => Cell::Real(value),
-                ValueRef::Text(bytes) => {
+            let value = row.get_ref(index).map_err(from_engine)?;
+            // A column DECLARED with an exact-decimal scale carries that scale: the engine
+            // holds such a value in its own affinity, so the digits its declaration gives it
+            // are put back here (`super::pg_numeric::as_the_declaration_holds_it`).
+            let scaled = columns
+                .get(index)
+                .and_then(|column| column.declared_type.as_deref())
+                .and_then(|declared| {
+                    super::pg_numeric::as_the_declaration_holds_it(declared, value)
+                });
+            let cell = match (scaled, value) {
+                (Some(scaled), _) => Cell::Text(scaled),
+                (None, ValueRef::Null) => Cell::Null,
+                (None, ValueRef::Integer(value)) => Cell::Integer(value),
+                (None, ValueRef::Real(value)) => Cell::Real(value),
+                (None, ValueRef::Text(bytes)) => {
                     Cell::Text(String::from_utf8_lossy(bytes).into_owned())
                 }
-                ValueRef::Blob(bytes) => Cell::Blob(bytes.to_vec()),
+                (None, ValueRef::Blob(bytes)) => Cell::Blob(bytes.to_vec()),
             };
             bytes = bytes.saturating_add(cell.byte_cost());
             if bytes > MAX_RESULT_BYTES {
@@ -2163,6 +2285,13 @@ fn value_type(value: ValueRef<'_>) -> Option<&'static str> {
 
 /// Classify what the engine refused, keeping ITS message.
 pub(super) fn from_engine(error: rusqlite::Error) -> EngineError {
+    // The ONE failure whose message is the BACKING STORE's own vocabulary rather than a
+    // condition either wire has: a value past the ceiling the store holds one under. It is
+    // reported as this endpoint's limit, in the words of the conditions beside it, so no
+    // store text ever reaches a client.
+    if let Some(refusal) = past_the_value_ceiling(&error) {
+        return refusal;
+    }
     // A statement the engine could not READ at all arrives as its own variant, carrying
     // the engine's bare message and where in the statement it stopped — which is what a
     // wire needs to word its own parse error. Classified by the failure inside it, so it
@@ -2190,6 +2319,32 @@ pub(super) fn from_engine(error: rusqlite::Error) -> EngineError {
         _ => EngineErrorKind::Internal,
     };
     EngineError::new(named_class(&message).unwrap_or(kind), message)
+}
+
+/// The refusal a failure that is the BACKING STORE's ceiling on ONE VALUE is reported as, or
+/// `None` for every other failure.
+///
+/// The store answers such a statement with a sentence of its own, naming its own kinds of
+/// value. No client of either wire has that vocabulary, and neither engine has that limit:
+/// what IS true is that this endpoint serves values up to [`MAX_VALUE_BYTES`], so the
+/// condition is the one each wire carries for a limit of the implementation
+/// ([`EngineErrorKind::LimitExceeded`] — PostgreSQL's `program_limit_exceeded`), worded the
+/// way this endpoint words the other bounds it holds a statement to.
+fn past_the_value_ceiling(error: &rusqlite::Error) -> Option<EngineError> {
+    let failure = match error {
+        rusqlite::Error::SqliteFailure(failure, _) => failure,
+        rusqlite::Error::SqlInputError { error: failure, .. } => failure,
+        _ => return None,
+    };
+    (failure.code == rusqlite::ErrorCode::TooBig).then(|| {
+        EngineError::new(
+            EngineErrorKind::LimitExceeded,
+            format!(
+                "the value is larger than this emulator serves ({} MiB)",
+                MAX_VALUE_BYTES / (1024 * 1024)
+            ),
+        )
+    })
 }
 
 /// The class the engine's own SENTENCE names, for the conditions whose wording says which
