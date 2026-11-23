@@ -28,6 +28,13 @@
 //! builders, a tagged template, and a Velocity request template), the values it binds
 //! (numbers, text, and text that is itself SQL), the rows it matches (one, several, none) and
 //! what the role's documents say.
+//!
+//! The helpers that set such a topology up — the router of the services that own it, the
+//! cluster with its database, the role the data source names, the Data API call a statement is
+//! run through, and the imports and response half a coded resolver shares — are shared with the
+//! suite that drives the same data source from a DISCOVERED schema
+//! ([`crate::graphql_api_introspection_driven_relational_resolver`]), so there is one reading of
+//! that setup rather than one per suite.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,12 +55,13 @@ const REGION: &str = "us-west-2";
 /// The engine the cluster of this suite runs, the database it holds and the master user it is
 /// created with.
 const ENGINE: &str = "aurora-mysql";
-const DATABASE: &str = "appdb";
+pub(crate) const DATABASE: &str = "appdb";
 const MASTER_USER: &str = "admin";
 
 /// The table every statement of this suite is about, and the rows it is created with.
-const TABLE: &str = "widgets";
-const SEEDED: &[(i64, &str)] = &[(1, "widget-alpha"), (2, "widget-beta"), (3, "gadget-gamma")];
+pub(crate) const TABLE: &str = "widgets";
+pub(crate) const SEEDED: &[(i64, &str)] =
+    &[(1, "widget-alpha"), (2, "widget-beta"), (3, "gadget-gamma")];
 
 /// How long a case waits for the clock to perform a schema creation, far past the service's
 /// own span, so a loaded machine still reaches it; and how long it leaves between two looks.
@@ -62,7 +70,7 @@ const POLL_SPACING: Duration = Duration::from_millis(50);
 
 /// The `runtime` every coded resolver of this suite is defined under. Source:
 /// `AppSyncRuntime`'s own values (`smithy_query(query="shape",shape="AppSyncRuntime")`).
-const RUNTIME: (&str, &str) = ("APPSYNC_JS", "1.0.0");
+pub(crate) const RUNTIME: (&str, &str) = ("APPSYNC_JS", "1.0.0");
 
 /// The name of the data source every resolver of this suite resolves against.
 const DATA_SOURCE: &str = "widgetsDb";
@@ -93,7 +101,7 @@ const SCHEMA: &str = "schema { query: Query mutation: Mutation }\n\
 /// The response half every coded resolver of this suite shares: it re-raises what went wrong
 /// with the call, so a failure reaches the caller, and otherwise reads the rows of the
 /// statement at `at`.
-fn responds_with_rows(at: usize, one: bool) -> String {
+pub(crate) fn responds_with_rows(at: usize, one: bool) -> String {
     let value = match one {
         true => "rows.length === 0 ? null : rows[0]",
         false => "rows",
@@ -109,7 +117,7 @@ fn responds_with_rows(at: usize, one: bool) -> String {
 
 /// The import every coded resolver of this suite begins with: the helpers AppSync's own
 /// relational-database resolvers import.
-const IMPORTS: &str = "import { util } from '@aws-appsync/utils';\n\
+pub(crate) const IMPORTS: &str = "import { util } from '@aws-appsync/utils';\n\
                        import { select, insert, update, remove, sql, createMySQLStatement, \
                        toJsonObject } from '@aws-appsync/utils/rds';\n";
 
@@ -679,7 +687,7 @@ const FIRST_BOUND_ID: i64 = 10;
 /// IAM over ONE engine: the cluster the data source names, the database its statements run
 /// against, the secret the call authenticates with and the documents it is authorized against
 /// all belong to those services.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -706,16 +714,16 @@ fn emulator() -> MultiServiceRouter {
 
 /// One cluster of this suite: the ARN a data source names it by and the ARN of the secret
 /// holding its login.
-struct Cluster {
-    arn: String,
-    secret_arn: String,
+pub(crate) struct Cluster {
+    pub(crate) arn: String,
+    pub(crate) secret_arn: String,
 }
 
 /// Create one DB cluster through the RDS control plane's own `CreateDBCluster`, with its HTTP
 /// endpoint on and RDS managing the master user password — so the secret is RDS's own — and
 /// create [`TABLE`] with the rows of [`SEEDED`] in it through the Data API's own
 /// `ExecuteStatement`.
-async fn given_cluster(router: &MultiServiceRouter, identifier: &str) -> Cluster {
+pub(crate) async fn given_cluster(router: &MultiServiceRouter, identifier: &str) -> Cluster {
     let created = rds(router)
         .create_db_cluster()
         .db_cluster_identifier(identifier)
@@ -780,7 +788,7 @@ async fn held(router: &MultiServiceRouter, cluster: &Cluster, id: i64) -> Option
 }
 
 /// Run one statement against `cluster` through the Data API, which must serve it.
-async fn execute(router: &MultiServiceRouter, cluster: &Cluster, sql: &str) -> Value {
+pub(crate) async fn execute(router: &MultiServiceRouter, cluster: &Cluster, sql: &str) -> Value {
     let request = http::Request::builder()
         .method("POST")
         .uri(format!("https://rds-data.{REGION}.amazonaws.com/Execute"))
@@ -925,7 +933,7 @@ async fn create_api(
 
 /// The authority a client dials out of a published URL: everything between the scheme and the
 /// resource path, which is what a socket is opened on.
-fn authority_of(published: &str) -> String {
+pub(crate) fn authority_of(published: &str) -> String {
     published
         .split_once("://")
         .map_or(published, |(_, rest)| rest)
@@ -1124,7 +1132,7 @@ async fn post(case: &str, api: &Api, document: &Value) -> Value {
 
 /// Create an IAM role called `role_name` carrying `policy` as its inline policy (when one is
 /// given), through IAM's OWN operations, and answer its ARN.
-async fn given_role(
+pub(crate) async fn given_role(
     router: &MultiServiceRouter,
     role_name: &str,
     policy: Option<&str>,
@@ -1165,7 +1173,7 @@ async fn given_role(
 }
 
 /// The document allowing the Data API action on one cluster and nothing else.
-fn allowing(cluster_arn: &str) -> String {
+pub(crate) fn allowing(cluster_arn: &str) -> String {
     statement("Allow", "rds-data:ExecuteStatement", cluster_arn)
 }
 
