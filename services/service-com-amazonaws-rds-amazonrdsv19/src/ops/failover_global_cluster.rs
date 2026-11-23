@@ -202,23 +202,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
         };
-        // WHICH operation this is decides the transient status the global database reports
-        // while the promotion runs: a request that allows data loss "triggers a global
-        // failover operation", and one that does not is the switchover this operation also
-        // serves ("If you don't specify AllowDataLoss, the global database cluster operation
-        // defaults to a switchover").
-        let in_status = if input.allow_data_loss == Some(true) {
-            crate::state::GLOBAL_CLUSTER_STATUS_FAILING_OVER
-        } else {
-            crate::state::GLOBAL_CLUSTER_STATUS_SWITCHING_OVER
-        };
+        // WHICH kind of promotion the request asked for is the one thing this operation's two
+        // flag members say, and it decides both the transient status the global database
+        // reports while the promotion runs and the kind of target a refusal tells the caller
+        // to choose another of ([`crate::state::asked_promotion_kind`]). Read from the
+        // request, never fixed to this operation's name: this one API serves both.
+        let asked =
+            crate::state::asked_promotion_kind(input.switchover, input.allow_data_loss);
         let promoted = state
             .lock()
             .promote_global_cluster_primary(
                 &region,
                 &input.global_cluster_identifier,
                 &input.target_db_cluster_identifier,
-                in_status,
+                asked,
             )
             .map_err(|rejection| -> FailoverGlobalClusterError {
                 match rejection {

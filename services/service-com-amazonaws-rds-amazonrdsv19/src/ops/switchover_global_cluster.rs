@@ -184,7 +184,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &region,
                 &input.global_cluster_identifier,
                 &input.target_db_cluster_identifier,
-                crate::state::GLOBAL_CLUSTER_STATUS_SWITCHING_OVER,
+                // This operation asks for a switchover and nothing else, which is both the
+                // transient status the global database reports while it runs and the kind of
+                // target a refusal points the caller at another of.
+                crate::state::GlobalPromotionKind::Switchover,
             )
             .map_err(|rejection| -> SwitchoverGlobalClusterError {
                 match rejection {

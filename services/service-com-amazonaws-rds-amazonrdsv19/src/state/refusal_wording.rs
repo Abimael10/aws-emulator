@@ -233,6 +233,37 @@ pub fn db_instance_not_found_colon_message(named: &str) -> String {
     format!("DBInstance not found: {named}")
 }
 
+/// The message `PromoteReadReplica` carries for a `DBInstanceIdentifier` that names no DB
+/// instance of the request's Region: `DB Instance not found: <id>`.
+///
+/// Amazon RDS words `DBInstanceNotFoundFault` per FRONT DOOR rather than from one crate-wide
+/// template — the report of an instance says `DBInstance <id> not found.`
+/// ([`db_instance_not_found_message`]), the calls that reach into one say `DBInstance not
+/// found: <id>` ([`db_instance_not_found_colon_message`]), and the sibling role change on the
+/// same resource words it its own way again — so the promotion answers the sentence THIS
+/// operation answers. The fixed text is the whole requirement; the only variable part is the
+/// `DBInstanceIdentifier` the request carried, in the spelling the caller wrote it in (only
+/// the lookup folds it, since the member "is stored as a lowercase string").
+pub fn promote_read_replica_not_found_message(named: &str) -> String {
+    format!("DB Instance not found: {named}")
+}
+
+/// The message `RebootDBCluster` carries for a `DBClusterIdentifier` that names no DB cluster
+/// of the request's Region: `The source cluster could not be found or cannot be accessed:
+/// <id>`.
+///
+/// This front door words `DBClusterNotFoundFault` per operation too: a call that REPORTS a
+/// cluster, or moves its lifecycle, states that the cluster is absent
+/// ([`crate::state::db_cluster_not_found_message`]), while the reboot states only what it can
+/// tell the caller about the cluster whose engine it would restart — it could not be found,
+/// or it cannot be reached — and deliberately does not distinguish the two. The only variable
+/// part is the cluster the request named, in the spelling it wrote it in, with an ARN reduced
+/// to the identifier it names as every reference of this member is
+/// ([`crate::state::db_cluster_lookup_identifier`]).
+pub fn reboot_cluster_source_not_found_message(named: &str) -> String {
+    format!("The source cluster could not be found or cannot be accessed: {named}")
+}
+
 /// What `RebootDBCluster` refuses an AURORA DB cluster with.
 ///
 /// "Use this operation only for a non-Aurora Multi-AZ DB cluster": Amazon RDS words this

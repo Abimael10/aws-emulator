@@ -394,7 +394,8 @@ async fn a_promotion_of_an_instance_it_cannot_be_performed_on_is_refused() {
         .await;
 
     // An identifier nothing created, in the spellings a member "stored as a lowercase
-    // string" folds together.
+    // string" folds together for the LOOKUP: the sentence still quotes the spelling the
+    // request wrote.
     for named in ["promote-absent", "PROMOTE-Absent"] {
         let case = format!("an absent instance named {named:?}");
         let refused = expect_error(
@@ -403,7 +404,7 @@ async fn a_promotion_of_an_instance_it_cannot_be_performed_on_is_refused() {
             404,
             "DBInstanceNotFound",
         );
-        let expected = format!("DBInstance {} not found.", named.to_ascii_lowercase());
+        let expected = format!("DB Instance not found: {named}");
         let message = text(&refused, "Message");
         assert_eq!(
             message, expected,

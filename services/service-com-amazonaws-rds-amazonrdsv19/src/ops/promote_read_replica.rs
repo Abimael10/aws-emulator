@@ -193,8 +193,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::request_region(ctx).map_err(PromoteReadReplicaError::validation)?;
         // `DBInstanceIdentifier` is "the DB instance identifier. This value is stored as a
         // lowercase string", so the lookup folds the way the stored key does — the same
-        // fold every instance-level front door of this service applies.
-        let identifier = input.db_instance_identifier.to_ascii_lowercase();
+        // fold every instance-level front door of this service applies. The fault below
+        // names `named`, the value the REQUEST carried: only the lookup folds it, so a
+        // caller matching the message against what it sent finds it there.
+        let named = input.db_instance_identifier.clone();
+        let identifier = named.to_ascii_lowercase();
 
         // The documented constraints of the values the REQUEST carries, decided before any
         // lookup: each is refused with the Query API error code the real service answers it
@@ -234,7 +237,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // signed for is in scope.
         let key = (region.clone(), identifier.clone());
         let Some(instance) = store.db_instances.get(&key) else {
-            return Err(not_found(&identifier));
+            return Err(not_found(&named));
         };
         // Only a READ REPLICA can be promoted: `DBInstanceIdentifier` "must match the
         // identifier of an existing read replica DB instance", and an instance is one
@@ -311,7 +314,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // would take the whole emulator down with it.
         let promoted = {
             let Some(record) = store.db_instances.get_mut(&key) else {
-                return Err(not_found(&identifier));
+                return Err(not_found(&named));
             };
             // The replica replicates from nothing from now on, which is what makes it a
             // standalone DB instance — and what makes its engine endpoint serve writes, as
@@ -356,13 +359,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// The modelled 404 for a `DBInstanceIdentifier` naming no DB instance of this region.
 ///
-/// The wording is the one this service's instance-lifecycle front doors answer — the stop
-/// and the start of a DB instance — since a promotion is the same kind of call on the same
-/// resource: it acts on the instance itself. RDS words this fault differently in other
-/// operations, which is why each handler keeps the wording its own API uses.
-fn not_found(identifier: &str) -> PromoteReadReplicaError {
+/// RDS words this one fault differently per operation, so the promotion carries the sentence
+/// THIS API answers rather than the wording a report or a lifecycle call of the same resource
+/// uses ([`crate::state::promote_read_replica_not_found_message`]). `named` is the value the
+/// request carried.
+fn not_found(named: &str) -> PromoteReadReplicaError {
     PromoteReadReplicaErrorModeled::DBInstanceNotFoundFault(DBInstanceNotFoundFault {
-        message: Some(format!("DBInstance {identifier} not found.")),
+        message: Some(crate::state::promote_read_replica_not_found_message(named)),
     })
     .into()
 }

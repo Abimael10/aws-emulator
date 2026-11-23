@@ -181,7 +181,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(cluster) = store.db_clusters.get(&key) else {
             return Err(RebootDBClusterErrorModeled::DBClusterNotFoundFault(
                 DBClusterNotFoundFault {
-                    message: Some(crate::state::db_cluster_not_found_message(named)),
+                    // RDS words this fault per operation: the reboot names the cluster whose
+                    // engine it would restart as one it "could not be found or cannot be
+                    // accessed", where a report of the same cluster states it is absent.
+                    message: Some(crate::state::reboot_cluster_source_not_found_message(
+                        named,
+                    )),
                 },
             )
             .into());
@@ -226,7 +231,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(record) = store.db_clusters.get_mut(&key) else {
                 return Err(RebootDBClusterErrorModeled::DBClusterNotFoundFault(
                     DBClusterNotFoundFault {
-                        message: Some(crate::state::db_cluster_not_found_message(named)),
+                        message: Some(crate::state::reboot_cluster_source_not_found_message(
+                            named,
+                        )),
                     },
                 )
                 .into());

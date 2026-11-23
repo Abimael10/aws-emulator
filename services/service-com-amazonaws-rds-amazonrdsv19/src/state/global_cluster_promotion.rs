@@ -12,17 +12,81 @@
 
 use super::*;
 
+/// Which kind of promotion of a global database's primary a request ASKED FOR, which is the
+/// kind of target its refusals name.
+///
+/// `SwitchoverGlobalCluster` asks for a switchover and nothing else; `FailoverGlobalCluster`
+/// serves both ("Although this operation can be used either to fail over or to switch over a
+/// global database cluster, its intended use is for global database failover"), and its
+/// `Switchover` member — "Specifies whether to switch over this global database cluster" — is
+/// what the request asks for one with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlobalPromotionKind {
+    /// A failover: the promotion `FailoverGlobalCluster` is for unless the request asks to
+    /// switch over instead.
+    Failover,
+    /// A switchover: `SwitchoverGlobalCluster`, and `FailoverGlobalCluster` where the
+    /// request's `Switchover` member asks for one.
+    Switchover,
+}
+
+impl GlobalPromotionKind {
+    /// The word a refusal names this kind of promotion by — the kind of TARGET the caller is
+    /// told to choose another of, so a request that asked to switch over is pointed at
+    /// another switchover target and one that asked to fail over at another failover target.
+    pub fn target_word(self) -> &'static str {
+        match self {
+            Self::Failover => "failover",
+            Self::Switchover => "switchover",
+        }
+    }
+
+    /// The transient status the global database reports while a promotion of this kind runs:
+    /// the two differ in WHY the primary moves, which is the one thing the records show of
+    /// it.
+    pub fn in_status(self) -> &'static str {
+        match self {
+            Self::Failover => GLOBAL_CLUSTER_STATUS_FAILING_OVER,
+            Self::Switchover => GLOBAL_CLUSTER_STATUS_SWITCHING_OVER,
+        }
+    }
+}
+
+/// Which kind of promotion a `FailoverGlobalCluster` request asked for, from the two members
+/// that say so.
+///
+/// "Switching over - Specify the Switchover parameter or omit it, but don't specify the
+/// AllowDataLoss parameter. Failing over - Specify the AllowDataLoss parameter and don't
+/// specify the Switchover parameter": where the request carries `Switchover` it says which
+/// one it asked for outright, and where it leaves that member out the other one decides —
+/// "Allowing data loss triggers a global failover operation", while "if you don't specify
+/// AllowDataLoss, the global database cluster operation defaults to a switchover".
+pub fn asked_promotion_kind(
+    switchover: Option<bool>,
+    allow_data_loss: Option<bool>,
+) -> GlobalPromotionKind {
+    match (switchover, allow_data_loss) {
+        (Some(true), _) => GlobalPromotionKind::Switchover,
+        (Some(false), _) => GlobalPromotionKind::Failover,
+        (None, Some(true)) => GlobalPromotionKind::Failover,
+        (None, _) => GlobalPromotionKind::Switchover,
+    }
+}
+
 /// What a promotion of a global database's primary refuses a `TargetDbClusterIdentifier`
 /// that names no DB cluster with.
 ///
 /// The member takes "the Amazon Resource Name (ARN) for the identifier so that Aurora can
 /// locate the cluster in its Amazon Web Services Region", and the refusal names the value
 /// the request wrote, in the spelling it wrote it in, then points the caller at the thing to
-/// change: another promotion target.
-pub fn global_cluster_promotion_target_missing_message(named: &str) -> String {
+/// change: another target of the kind the request asked for ([`GlobalPromotionKind`]).
+pub fn global_cluster_promotion_target_missing_message(
+    named: &str,
+    asked: GlobalPromotionKind,
+) -> String {
     format!(
-        "A DB cluster with ARN {named} doesn't exist. Choose another failover target and try \
-         again."
+        "A DB cluster with ARN {named} doesn't exist. Choose another {} target and try again.",
+        asked.target_word()
     )
 }
 
@@ -49,7 +113,12 @@ pub enum PromotionRejection {
 
 impl ComAmazonawsRdsAmazonrdsv19State {
     /// Promote the member DB cluster `target` names to be the PRIMARY of the global database
-    /// `global_cluster` names, reporting `in_status` while the promotion runs.
+    /// `global_cluster` names, for the kind of promotion `asked` the request asked for.
+    ///
+    /// `asked` is the whole of what the two operations differ in: it is the kind of target a
+    /// refusal names and the transient status the global database reports while the promotion
+    /// runs ([`GlobalPromotionKind`]), so one reading of the request decides both and the two
+    /// cannot disagree.
     ///
     /// `region` is the region the request was signed for, which is what a `target` naming a
     /// bare identifier resolves in; a global database spans regions, so a target named by its
@@ -68,7 +137,7 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         region: &str,
         global_cluster: &str,
         target: &str,
-        in_status: &str,
+        asked: GlobalPromotionKind,
     ) -> Result<GlobalClusterRecord, PromotionRejection> {
         // `CreateGlobalCluster` stores the identifier "as a lowercase string", so this
         // lookup folds the name the way every other lookup of it does.
@@ -104,7 +173,7 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         // none is the modelled `DBClusterNotFoundFault`, and nothing is promoted for it.
         let Some(cluster) = self.db_clusters.get(&target_key) else {
             return Err(PromotionRejection::DbClusterNotFound(
-                global_cluster_promotion_target_missing_message(target),
+                global_cluster_promotion_target_missing_message(target, asked),
             ));
         };
         let target_arn = cluster.arn();
@@ -150,7 +219,7 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         };
         record.member_cluster_arns.retain(|arn| *arn != target_arn);
         record.member_cluster_arns.insert(0, target_arn.clone());
-        record.status = in_status.to_string();
+        record.status = asked.in_status().to_string();
         record.pending_status = Some(PendingStatus::in_a_moment(GLOBAL_CLUSTER_STATUS_AVAILABLE));
         let promoted = record.clone();
         for key in self.global_member_keys(&[Some(target_arn), old_primary]) {
