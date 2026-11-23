@@ -24,9 +24,11 @@
 //! write reaches the caller, and nothing about it changes the inference.
 //!
 //! The write is made AS the deployment's execution role, like every other Amazon S3 call a
-//! SageMaker resource's work makes ([`super::s3_access`]): the decision is IAM's, asked of IAM
-//! through the shared reading, and an action IAM withholds from the role is one the endpoint
-//! does not perform.
+//! SageMaker resource's work makes ([`super::s3_access`]): the decision is IAM's, asked through
+//! the shared reading of an object write made as a role
+//! ([`super::s3_access::object_write_is_unauthorized`]) — the destination bucket's own policy
+//! refuses what it EXPLICITLY DENIES, and otherwise the grant the role itself carries decides —
+//! and a write IAM withholds from the role is one the endpoint does not perform.
 
 use super::*;
 
@@ -270,15 +272,13 @@ pub async fn capture_invocation(
     };
     let role_arn = settings.role_arn.clone().unwrap_or_default();
     let partition = arn_partition(&role_arn);
-    if ::service_common::iam_role::role_withholds_action(
-        ctx,
-        region,
-        &role_arn,
-        PUT_OBJECT_ACTION,
-        &object.object_arn(&partition),
-    )
-    .await
-    {
+    let client = s3_client(ctx, region);
+    // The ONE question this emulator asks about an Amazon S3 object a SageMaker resource's
+    // work writes AS its execution role ([`super::s3_access::object_write_is_unauthorized`]):
+    // the destination bucket's own policy refuses what it EXPLICITLY DENIES, and otherwise the
+    // grant the role itself carries decides. Asked here rather than restated, so a capture
+    // delivery and a job's output write cannot disagree about what IAM allows the same role.
+    if object_write_is_unauthorized(ctx, &client, region, &role_arn, &partition, &object).await {
         ::tracing::debug!(
             endpoint = ?invocation.endpoint_name,
             destination = ?object.uri(),
@@ -294,7 +294,6 @@ pub async fn capture_invocation(
     // One JSON record per line, so a reader takes the objects of the destination apart by
     // lines however many invocations each of them holds.
     document.push(b'\n');
-    let client = s3_client(ctx, region);
     match write_object(&client, &object, document).await {
         Ok(()) => true,
         Err(detail) => {

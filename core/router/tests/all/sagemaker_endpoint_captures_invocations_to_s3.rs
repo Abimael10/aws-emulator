@@ -60,7 +60,7 @@ const CAPTURE_MODE_INPUT_AND_OUTPUT: &str = "InputAndOutput";
 /// This is the form the boosting container uploads as its model file — the learner's
 /// parameters, its objective and the booster's trees as parallel arrays over each tree's nodes
 /// — so an endpoint deployed with it is served from the parameters written here.
-fn booster(objective: &str, threshold: f64, low: f64, high: f64) -> String {
+pub(crate) fn booster(objective: &str, threshold: f64, low: f64, high: f64) -> String {
     json!({
         "learner": {
             "learner_model_param": {
