@@ -1257,17 +1257,19 @@ fn inventory_configuration_id_wording(
 /// S3's `InvalidArgument` document names the field it rejected and the value that field
 /// carried (Amazon S3 API Reference, *Error responses*), which for a HEADER is the header as
 /// the API publishes it, for a QUERY PARAMETER the parameter as it publishes that, and the
-/// value as the request sent it. The two copy DIRECTIVES and the listings' `encoding-type`
-/// are that case; `x-amz-copy-source` is the one where the refusal is about the value being
-/// unreadable AS a reference, so the document names the FIELD in both halves — there is no
-/// text to echo that is not the caller's own.
+/// value as the request sent it. The two copy DIRECTIVES, the listings' `encoding-type` and
+/// the annotation listing's `max-annotation-results` are that case; `x-amz-copy-source` is the
+/// one where the refusal is about the value being unreadable AS a reference, so the document
+/// names the FIELD in both halves — there is no text to echo that is not the caller's own.
 ///
-/// Reached for a field of EVERY operation of this service, not only the ones served behind a
-/// door ([`ErasedServiceDefinition::refusal_response`] is where the pair is attached): the
-/// rows are the fields whose value the boundary itself can reject — the value is put into the
-/// form the member's pattern is applied to before the pattern sees it
+/// The rows are the fields whose value the BOUNDARY itself can reject — the value is put into
+/// the form the member's pattern is applied to before the pattern sees it
 /// ([`crate::state::canonical_copy_source`]), so what is left for the boundary to reject on
-/// the copies is one of these three headers.
+/// the copies is one of these three headers, and a page bound is rejected by the range its own
+/// member publishes. The pair can only be WRITTEN by this service's own renderer
+/// ([`ErasedServiceDefinition::refusal_response`] is where it is attached), which a boundary
+/// refusal reaches through the FRONT DOOR, so every operation binding a field named here is
+/// served behind that door ([`front_door`]).
 fn refused_argument(violation: &Violation) -> Option<crate::scaffolded::ErrorDetail> {
     let member = violation.path.split('.').next()?;
     let (name, value) = match member {
@@ -1285,6 +1287,15 @@ fn refused_argument(violation: &Violation) -> Option<crate::scaffolded::ErrorDet
         ),
         "encodingType" => (
             crate::state::ENCODING_TYPE_PARAMETER,
+            violation.value.clone().unwrap_or_default(),
+        ),
+        // `ListObjectAnnotations`' page bound, which the model binds to the query parameter
+        // [`crate::state::MAX_ANNOTATION_RESULTS_ARGUMENT`] and bounds with a range of its own,
+        // so a value outside that range is refused by the boundary: the document names the
+        // PARAMETER a caller has to fix — not the modelled member the value was bound to — and
+        // echoes the bound it asked for, exactly as it does for the three fields above.
+        "maxAnnotationResults" => (
+            crate::state::MAX_ANNOTATION_RESULTS_ARGUMENT,
             violation.value.clone().unwrap_or_default(),
         ),
         _ => return None,
@@ -1351,6 +1362,10 @@ const TAGGING_DIRECTIVE_HEADER: &str = "x-amz-tagging-directive";
 ///   `ListObjectVersions` and `ListMultipartUploads` — each of which binds the
 ///   `encoding-type` whose refusal names the parameter and echoes its value
 ///   ([`uri_value_wording`]).
+/// * `ListObjectAnnotations` — the listing of one object's annotations, whose page bound the
+///   model bounds with a range of its own, so the BOUNDARY refuses a value outside it and
+///   S3's document for that refusal names the query parameter and echoes the bound asked for
+///   ([`uri_value_wording`] again).
 ///
 /// Those last three groups are bucket-level calls, so they are served where their RECORD is
 /// built ([`management_events::audited_table`]), each with its door — and the listings with
@@ -1391,6 +1406,22 @@ fn front_door<Eng: Send + Sync + 'static>(
             crate::ops::update_object_encryption::UpdateObjectEncryption::new(Arc::clone(engine)),
             submitted_value_wording,
         )),
+    );
+    // The listing of one object's ANNOTATIONS, served behind a door for the same reason the
+    // four listings of what a bucket holds are: its page bound is refused by the range the
+    // model publishes for it, and S3's document for that refusal names the query parameter and
+    // echoes the bound asked for ([`uri_value_wording`] words it, [`refused_argument`] names
+    // the pair). It is a call on one object, so no management record may hold it either
+    // (see [`management_events`]).
+    table.add_operation(
+        crate::ops::list_object_annotations::ListObjectAnnotations::<Eng>::NAME,
+        Box::new(
+            FrontDoor::worded(
+                crate::ops::list_object_annotations::ListObjectAnnotations::new(Arc::clone(engine)),
+                submitted_value_wording,
+            )
+            .wording_uri(uri_value_wording),
+        ),
     );
     // What the account's CloudTrail delivers for the calls on an object's CONTENTS: one
     // recorder for every data-event row below and in [`request_metrics::serve_metered`], so

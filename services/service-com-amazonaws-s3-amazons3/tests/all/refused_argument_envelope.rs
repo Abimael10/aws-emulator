@@ -33,7 +33,11 @@
 //! * the not-found table over whether the request named a version at all, and over a key
 //!   carrying XML metacharacters — which the envelope has to escape, so a caller-chosen key
 //!   cannot break the document it is reported in — and over a COPY, whose refusal is about
-//!   its SOURCE rather than about the object the request addressed.
+//!   its SOURCE rather than about the object the request addressed;
+//! * the page-bound table over the two LISTINGS whose page bound the model publishes a range
+//!   for, over each end of each published range and one step past it, and over a value far
+//!   outside it, so a bound no page can be bounded by names the QUERY PARAMETER it arrived on
+//!   — not the modelled member it was bound to — and echoes the bound asked for.
 //!
 //! Every assertion drives a real HTTP request through the router (the harness the
 //! bucket-lifecycle and object suites in this crate own), so what is pinned is the wire
@@ -45,7 +49,9 @@ use service_com_amazonaws_s3_amazons3::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::bucket_lifecycle::{router, send, send_bytes, Answer};
+use super::list_buckets::list_buckets;
 use super::object_and_tagging_roundtrip::{bucket, get_object, put_object, text};
+use super::object_annotations::put_annotation;
 use super::object_legal_hold::lock_enabled_bucket;
 use super::object_retention::{now_seconds, put_object_retention};
 use super::object_versioning::{delete_object, head_object};
@@ -480,4 +486,176 @@ async fn an_object_scoped_not_found_names_the_key_and_the_version_it_addressed()
             text(&refused)
         );
     }
+}
+
+/// WHICH listing a page bound arrives on — the two this service publishes a range for, so a
+/// row can be dispatched without naming its parameter twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundedListing {
+    /// `ListObjectAnnotations`, whose bound caps a page of one object's annotations.
+    ObjectAnnotations,
+    /// `ListBuckets`, whose bound caps a page of the account's buckets.
+    Buckets,
+}
+
+/// One listing's page bound: the query parameter the value arrives on and the inclusive range
+/// the model publishes for it.
+///
+/// Each row is that member's own `@httpQuery` name and `@range`
+/// (`smithy_query(query="operation",operation="ListObjectAnnotations,ListBuckets")` reports
+/// `MaxAnnotationResults: {httpQuery: "max-annotation-results", range {min 1, max 1000}}` and
+/// `MaxBuckets: {httpQuery: "max-buckets", range {min 1, max 10000}}`) — not the modelled
+/// member name, which is what a refusal must NOT report.
+struct PageBound {
+    listing: BoundedListing,
+    argument: &'static str,
+    lowest: i32,
+    highest: i32,
+}
+
+/// The page bounds the table below spans: one per listing whose bound the model ranges.
+const PAGE_BOUNDS: [PageBound; 2] = [
+    PageBound {
+        listing: BoundedListing::ObjectAnnotations,
+        argument: "max-annotation-results",
+        lowest: 1,
+        highest: 1_000,
+    },
+    PageBound {
+        listing: BoundedListing::Buckets,
+        argument: "max-buckets",
+        lowest: 1,
+        highest: 10_000,
+    },
+];
+
+/// The bucket and key the annotation rows address.
+const PAGE_BOUND_BUCKET: &str = "argument-envelope-page-bounds";
+
+/// `GET /<bucket>/<key>?annotation&x-id=ListObjectAnnotations…` — `ListObjectAnnotations`.
+/// The `x-id` literal is what the model binds to separate this listing from
+/// `GetObjectAnnotation`, bound to the same method, path and `?annotation`.
+async fn list_annotations(router: &MultiServiceRouter, query: &str) -> Answer {
+    let uri = format!(
+        "/{PAGE_BOUND_BUCKET}/{KEY}?annotation&x-id=ListObjectAnnotations{query}"
+    );
+    send_bytes(router, "GET", &uri, &[], b"").await
+}
+
+/// The listing `bound` belongs to, asked for a page of `value` entries — `value` as TEXT, so
+/// a bound no integer member could hold travels exactly as a caller spelled it.
+async fn listed_with_page_bound(
+    router: &MultiServiceRouter,
+    bound: &PageBound,
+    value: &str,
+) -> Answer {
+    let query = format!("&{}={value}", bound.argument);
+    match bound.listing {
+        BoundedListing::ObjectAnnotations => list_annotations(router, &query).await,
+        BoundedListing::Buckets => list_buckets(router, &query).await,
+    }
+}
+
+/// The sentence S3 states for an integer argument outside the range that argument publishes:
+/// fixed text naming the PARAMETER and the two published bounds, and nothing of the value,
+/// which travels in the `<ArgumentValue>` beside it.
+fn bounds_message(bound: &PageBound) -> String {
+    format!(
+        "Argument {} must be an integer between {} and {}",
+        bound.argument, bound.lowest, bound.highest
+    )
+}
+
+#[tokio::test]
+async fn a_page_bound_outside_its_published_range_is_refused_by_name() {
+    let router = router();
+    bucket(&router, PAGE_BOUND_BUCKET).await;
+    let written = put_object(&router, PAGE_BOUND_BUCKET, KEY, BODY, &[]).await;
+    assert_eq!(
+        written.status, 200,
+        "the object must be stored first, got {} with body {:?}",
+        written.status,
+        text(&written)
+    );
+    let annotated = put_annotation(&router, PAGE_BOUND_BUCKET, KEY, "note", b"kept", &[]).await;
+    assert_eq!(
+        annotated.status, 200,
+        "the annotation must be stored first, got {} with body {:?}",
+        annotated.status,
+        text(&annotated)
+    );
+
+    for bound in &PAGE_BOUNDS {
+        let message = bounds_message(bound);
+        // The rows differ along WHERE outside the published range the bound falls: one step
+        // below the minimum, a negative bound, one step past the maximum, and a bound far
+        // past it.
+        let outside: Vec<(String, String)> = vec![
+            (
+                "one step below the published minimum".to_string(),
+                (bound.lowest - 1).to_string(),
+            ),
+            ("a negative bound".to_string(), "-1".to_string()),
+            (
+                "one step past the published maximum".to_string(),
+                (bound.highest + 1).to_string(),
+            ),
+            (
+                "far past the published maximum".to_string(),
+                (bound.highest.saturating_mul(1_000)).to_string(),
+            ),
+        ];
+        for (case, value) in outside {
+            let answer = listed_with_page_bound(&router, bound, &value).await;
+            assert_names_argument(
+                &answer,
+                &format!("{} {case}", bound.argument),
+                bound.argument,
+                &value,
+                &message,
+            );
+        }
+
+        // Each PUBLISHED bound is served, so every row above was refused for falling outside
+        // the range and not for naming a page size at all — and a served listing names no
+        // argument.
+        for (case, value) in [
+            ("the published minimum", bound.lowest),
+            ("the published maximum", bound.highest),
+        ] {
+            let served = listed_with_page_bound(&router, bound, &value.to_string()).await;
+            assert_eq!(
+                served.status,
+                200,
+                "case {} {case}: expected HTTP 200 for {}={value}, got {} with body {:?}",
+                bound.argument,
+                bound.argument,
+                served.status,
+                text(&served)
+            );
+            assert_eq!(
+                served.element("ArgumentName"),
+                None,
+                "case {} {case}: a served listing names no refused argument, got {:?}",
+                bound.argument,
+                served.element("ArgumentName")
+            );
+        }
+    }
+
+    // The refusals reported nothing and consumed nothing: the annotation the object carries
+    // still lists.
+    let listed = list_annotations(&router, "").await;
+    assert_eq!(
+        listed.status, 200,
+        "the listing must still be served, got {} with body {:?}",
+        listed.status,
+        text(&listed)
+    );
+    assert_eq!(
+        listed.elements("AnnotationName"),
+        vec!["note".to_string()],
+        "a refused page bound must leave the annotations as they were, got {:?}",
+        listed.elements("AnnotationName")
+    );
 }
