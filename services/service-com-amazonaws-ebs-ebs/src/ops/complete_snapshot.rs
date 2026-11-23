@@ -259,8 +259,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // record FINALISES
         // to: a snapshot whose declared count is the number of blocks that were written to
         // it completes, and one whose count disagrees was not filled as its producer
-        // claimed and finalises to `error`, which no read then resolves
-        // ([`crate::state::Snapshot::apply_completion`]).
+        // claimed and finalises to `error`, which no read then resolves and whose blocks the
+        // store therefore releases ([`crate::state::Snapshot::apply_completion`]).
         //
         // The status the snapshot is in when this request is ACCEPTED is what the 202
         // reports. `CompleteSnapshot` is modelled `@http(code: 202)` — Accepted — so the

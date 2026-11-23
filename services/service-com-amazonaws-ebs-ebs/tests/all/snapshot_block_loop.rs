@@ -2069,7 +2069,10 @@ const DEADLINE_CASES: &[DeadlineCase] = &[
 /// its modelled minimum is 10, so no request can reach a deadline inside a test and no test
 /// may wait for one. The store's schedule is recomputed afterwards, exactly as a handler
 /// does after moving a deadline, so the next call sees the clock this rewind created.
-fn elapse(
+///
+/// `pub(crate)` so a sibling suite whose rule is also about what the `Timeout` does drives
+/// the same rewind rather than growing a second copy of it.
+pub(crate) fn elapse(
     engine: &engine::InMemoryEngine,
     case: &str,
     snapshot_id: &str,

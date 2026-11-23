@@ -395,9 +395,28 @@ impl Snapshot {
             // completed"), which only a snapshot that completed has.
             self.completed_at = Some(now);
         } else {
-            self.status = SnapshotStatus::Error;
+            // The content is not the content its producer claimed, so the snapshot is
+            // finalised to `error` — and a snapshot in `error` keeps no block
+            // ([`Self::finalise_to_error`]).
+            self.finalise_to_error();
         }
         self.status
+    }
+
+    /// Finalise this snapshot to `error` and release every block it holds.
+    ///
+    /// `error` is TERMINAL: no read resolves such a snapshot ([`Self::is_readable`]), no
+    /// write is accepted into it ([`Self::accepts_writes`]) and no completion moves it on,
+    /// so nothing can ever reach its content again. Its bytes are therefore released here
+    /// — and with them the block tokens, which live on the entries — whichever fact
+    /// finalised it: a `Timeout` that elapsed while it was still pending, or a completion
+    /// declaring a different number of blocks from the number written into it. The
+    /// retention policy belongs to the STATUS, not to one route into it, so the blocks a
+    /// snapshot nothing can read holds never keep holding this store's budget
+    /// ([`ComAmazonawsEbsEbsState::stored_block_count`]).
+    pub fn finalise_to_error(&mut self) {
+        self.status = SnapshotStatus::Error;
+        self.blocks.clear();
     }
 
     /// Whether the READ path — the operations that report a snapshot's blocks — can see
@@ -524,7 +543,8 @@ impl ComAmazonawsEbsEbsState {
     /// A cancelled snapshot can never be completed, nor its blocks listed or fetched
     /// again, so this is also where their bytes are released (and with them their block
     /// tokens, which live on the entries): it is this store's retention policy, not just
-    /// a status flip.
+    /// a status flip, and it is the policy of the `error` status itself
+    /// ([`Snapshot::finalise_to_error`]) rather than of this route into it.
     pub fn apply_due_transitions(&mut self, now: SystemTime) {
         // Nothing is due yet, so do not walk the map on every request.
         if self.next_transition_due.is_none_or(|due| now < due) {
@@ -535,8 +555,7 @@ impl ComAmazonawsEbsEbsState {
                 continue;
             }
             if now >= snapshot.expiry_time {
-                snapshot.status = SnapshotStatus::Error;
-                snapshot.blocks.clear();
+                snapshot.finalise_to_error();
             }
         }
         self.refresh_transition_schedule();
@@ -642,6 +661,10 @@ impl ComAmazonawsEbsEbsState {
     }
 
     /// The blocks this store currently holds across every snapshot.
+    ///
+    /// What the storage guards are measured against, so it counts the entries that are
+    /// really resident: a snapshot finalised to `error` holds none
+    /// ([`Snapshot::finalise_to_error`]), so no unreachable content keeps the budget.
     pub fn stored_block_count(&self) -> usize {
         self.snapshots
             .values()
