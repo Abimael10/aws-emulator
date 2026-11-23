@@ -38,6 +38,7 @@ mod fourth_generation_xen_rows;
 mod general_purpose_nvme_rows;
 mod gpu_rows;
 mod intel_nvme_compute_rows;
+mod intel_storage_optimized_rows;
 mod memory_optimized_nvme_rows;
 mod network_optimized_rows;
 mod neuron_accelerated_rows;
@@ -4777,9 +4778,10 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
 /// families on the newest AWS Graviton hardware, the storage optimized Graviton ones, the
 /// fourth generation families on the Xen hypervisor and the memory optimized ones with local
 /// NVMe devices, the seventh generation graphics family, the block storage optimized memory
-/// one on the newest AWS Graviton hardware and the two storage optimized families on the Xen
-/// hypervisor. A row is reached by its instance type alone, so which table it is written in
-/// is nothing but where the figures of one group of families are kept together.
+/// one on the newest AWS Graviton hardware, the two storage optimized families on the Xen
+/// hypervisor and the two Intel storage optimized ones. A row is reached by its instance type
+/// alone, so which table it is written in is nothing but where the figures of one group of
+/// families are kept together.
 fn published_rows() -> impl Iterator<Item = &'static PublishedInstanceTypeFacts> {
     PUBLISHED_INSTANCE_TYPE_FACTS
         .iter()
@@ -4807,6 +4809,7 @@ fn published_rows() -> impl Iterator<Item = &'static PublishedInstanceTypeFacts>
             block_storage_optimized_graviton_memory_rows::BLOCK_STORAGE_OPTIMIZED_GRAVITON_MEMORY_INSTANCE_TYPE_FACTS,
         )
         .chain(xen_storage_optimized_rows::XEN_STORAGE_OPTIMIZED_INSTANCE_TYPE_FACTS)
+        .chain(intel_storage_optimized_rows::INTEL_STORAGE_OPTIMIZED_INSTANCE_TYPE_FACTS)
 }
 
 /// The published facts of `instance_type`, or `None` where the catalog holds no row for it

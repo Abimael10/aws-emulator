@@ -37,6 +37,8 @@ Traces: ebs-snapshot-lifecycle-and-block-listing#task#4.
 
 Neither cause is covered by an existing open ebs issue: 20261120T090942Z-ebs-listchangedblocks-wrong-behavior.md is about a ChangedBlock emitted with no SecondBlockToken, 20261119T102154Z-ebs-listsnapshotblocks-maintainability.md is about duplicated page-size/page-token code, and 20261119T102154Z-ebs-getsnapshotblock-wrong-behavior.md is about tokens resolving past their ExpiryTime. None of them changes which output members these two listings serialize.
 
+Since this was filed, CAUSE 1 has been closed by issues/things-that-now-work/20261109T074035Z-ebs-listchangedblocks-empty-snapshot-comparisons-answer-200-instead.md — ListChangedBlocks no longer serializes VolumeSize/BlockSize on a comparison that reports no changed block. CAUSE 2 is still open: services/service-com-amazonaws-ebs-ebs/src/ops/list_snapshot_blocks.rs:283 still computes `hands_out_block_tokens = !blocks.is_empty()` and :291 still gates `expiry_time` on it, so a fixer picking this up has only that cause to close.
+
 ## Evidence
 Replay of trace set simparity-wire-aws-v1 (61 steps, 59 passed, 2 mismatched):
 

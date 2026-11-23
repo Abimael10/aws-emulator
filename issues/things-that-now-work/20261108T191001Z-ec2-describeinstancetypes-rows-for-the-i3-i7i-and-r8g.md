@@ -425,6 +425,17 @@ Issue-Commit: e96438ac8652a0a4da19e4ddf11cb276239c17b7
 
 # DescribeInstanceTypes rows for the i3, i7i and r8g families omit modeled members and derive EBS, storage and vCPU facts
 
+> _Resolved: the i3 and i7i families now have their published rows in the ec2 instance-type
+> catalog (`state/instance_ids_and_instance_types/instance_type_catalog/intel_storage_optimized_rows.rs`),
+> and r8g already had its own. 413 of the 414 replay keys above are closed. ONE key is still
+> open and carries no published figure that satisfies it:
+> `ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="i7i.12xlarge"].networkInfo.networkPerformance`.
+> The row publishes the share the family's own ladder gives that size ("Up to 28.12 Gigabit",
+> 0.586 Gigabit per vCPU, the slope the sizes either side confirm); every other candidate tried
+> (18.75 / 28.12 / 25 plain, and "Up to" 10 / 25 / 28.13 / 28.125 / 30 / 37.5 / 56.25) closes
+> fewer of that row's recorded causes. A fixer picking that key up has only that one member to
+> close._
+
 > _Note: this issue was identified against the code base at commit `e96438ac8652a0a4da19e4ddf11cb276239c17b7`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

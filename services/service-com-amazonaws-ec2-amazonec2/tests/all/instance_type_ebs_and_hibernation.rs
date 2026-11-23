@@ -24,7 +24,8 @@
 //!    is supported"): the families the hibernation prerequisites name, from the generation
 //!    they name, below the published RAM bound, and not bare metal — local instance storage
 //!    does not disqualify a type, since the prerequisites list the `d` variants of those
-//!    same families.
+//!    same families, and a family the catalog publishes the answer for per type reports
+//!    THAT answer.
 //!
 //! Every row is a different instance type along what those rules generalise over — the
 //! family, the generation, the capability letters and the size — so the types the issue
@@ -280,8 +281,9 @@ async fn hibernation_support_follows_the_family_generation_and_ram() {
 
     // Rows: the named families at and above the generation the prerequisites name, with and
     // without the `d` capability letter (whose local storage does not disqualify a type),
-    // the published RAM bound either side of 150 GiB, a bare metal size, a family the
-    // prerequisites do not name, and a generation below the one they name.
+    // the published RAM bound either side of 150 GiB, a bare metal size, a storage family
+    // whose published answer the catalog holds per type — either side of the same RAM bound —
+    // a family the prerequisites do not name, and a generation below the one they name.
     let rows = [
         ("m5.large", true),
         ("m5d.large", true),
@@ -293,7 +295,8 @@ async fn hibernation_support_follows_the_family_generation_and_ram() {
         ("m5.12xlarge", false),
         ("m5.24xlarge", false),
         ("m5.metal", false),
-        ("i3.large", false),
+        ("i3.large", true),
+        ("i3.8xlarge", false),
         ("x2gd.medium", false),
         ("m1.small", false),
         ("t1.micro", false),

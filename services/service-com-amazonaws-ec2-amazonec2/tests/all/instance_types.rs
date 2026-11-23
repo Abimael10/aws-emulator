@@ -255,7 +255,9 @@ type FilterRow = (
 /// A family whose published memory-to-vCPU ratio differs from its family letter's has
 /// its own entry in the catalog's ratio table, which is why the `i3.large` row expects
 /// the published 15.25 GiB rather than its letter's 16 (see
-/// `crate::state::memory_mib_per_size_unit`).
+/// `crate::state::memory_mib_per_size_unit`), and a fact the catalog publishes per
+/// instance type — that row's On-Demand hibernation — is the published one rather than
+/// the one its family letter would give.
 #[tokio::test]
 async fn the_reported_facts_follow_the_instance_type_name() {
     let (router, _engine) = super::ec2_query::emulator();
@@ -429,7 +431,7 @@ async fn the_reported_facts_follow_the_instance_type_name() {
             false,
             Some("xen"),
             false,
-            false,
+            true,
             true,
         ),
         (

@@ -543,7 +543,7 @@ async fn a_type_with_no_published_row_is_still_described() {
     assert!(rows > 0, "the published table must hold rows, got {rows}");
 
     // Rows: families of four different shapes, none of them in the table above.
-    for instance_type in ["m5.large", "c6g.medium", "i3.2xlarge", "m5.metal"] {
+    for instance_type in ["m5.large", "c6g.medium", "i3en.2xlarge", "m5.metal"] {
         let case = instance_type;
         let body = described(case, &router, instance_type).await;
         let ebs_info = required(case, &body, "ebsInfo");
