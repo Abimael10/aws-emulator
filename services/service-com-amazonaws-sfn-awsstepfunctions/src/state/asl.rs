@@ -194,6 +194,10 @@ use super::integration::{Tasks, TASK_FAILED_ERROR};
 
 mod diagnose;
 mod echo;
+// The ONE rendering of an instant this service writes into a string a caller READS: one
+// concern in a file of its own, whose name stays reachable unqualified from here and from
+// the walk.
+mod instant;
 mod intrinsics;
 mod jsonpath;
 mod map_items;
@@ -235,6 +239,7 @@ use map_items::*;
 // reachable unqualified from here and from the walk, as they were when they lived in
 // this file.
 use echo::*;
+use instant::*;
 use intrinsics::*;
 // The order a definition writes its members in, which is the order the problems found
 // in them are reported in: one concern in a file of its own, reachable unqualified from
@@ -4597,13 +4602,6 @@ fn retry_entries<'a>(state: &'a Map<String, Value>, member: &str) -> &'a [Value]
 // ---------------------------------------------------------------------------
 // Time helpers
 // ---------------------------------------------------------------------------
-
-/// `time` as the ISO 8601 instant the context object reports.
-fn iso(time: SystemTime) -> String {
-    ::aws_smithy_types::DateTime::from_millis(super::epoch_millis(time))
-        .fmt(::aws_smithy_types::date_time::Format::DateTime)
-        .unwrap_or_default()
-}
 
 /// An ISO 8601 instant in whole milliseconds since the Unix epoch.
 ///
