@@ -227,8 +227,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             cutoff: held.cutoff,
             allow_unassociated_targets: held.allow_unassociated_targets,
             enabled: held.enabled,
-            created_date: Some(::aws_smithy_types::DateTime::from(held.created_date)),
-            modified_date: Some(::aws_smithy_types::DateTime::from(held.modified_date)),
+            created_date: Some(crate::state::wire_instant(held.created_date)),
+            modified_date: Some(crate::state::wire_instant(held.modified_date)),
         })
     }
 }

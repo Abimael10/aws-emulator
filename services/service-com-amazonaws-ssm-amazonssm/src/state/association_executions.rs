@@ -202,12 +202,12 @@ impl AssociationRunRecord {
             status: Some(self.status(now).to_string()),
             detailed_status: (!self.nodes.is_empty())
                 .then(|| self.detailed_status(now).to_string()),
-            created_time: Some(::aws_smithy_types::DateTime::from(self.started_at)),
+            created_time: Some(crate::state::wire_instant(self.started_at)),
             // "The date of the last execution": this execution ran once, so the date it has
             // is the instant it finished at — and a run that has not finished has none.
             last_execution_date: self
                 .has_finished(now)
-                .then(|| ::aws_smithy_types::DateTime::from(self.finished_at())),
+                .then(|| crate::state::wire_instant(self.finished_at())),
             resource_count_by_status: Some(self.resource_count_by_status(now)),
             // The alarms this execution was dispatched to watch are the ones the version it
             // applied carries, and none has been invoked.
@@ -245,7 +245,7 @@ impl AssociationRunRecord {
             detailed_status: Some(self.detailed_status(now).to_string()),
             last_execution_date: self
                 .has_finished(now)
-                .then(|| ::aws_smithy_types::DateTime::from(self.finished_at())),
+                .then(|| crate::state::wire_instant(self.finished_at())),
             output_source: None,
         }
     }

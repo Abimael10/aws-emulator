@@ -309,8 +309,8 @@ impl CloudConnectorRecord {
             display_name: Some(self.display_name.clone()),
             description: self.description.clone(),
             role_arn: Some(self.role_arn.clone()),
-            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
-            updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
+            created_at: Some(crate::state::wire_instant(self.created_at)),
+            updated_at: Some(crate::state::wire_instant(self.updated_at)),
         }
     }
 }

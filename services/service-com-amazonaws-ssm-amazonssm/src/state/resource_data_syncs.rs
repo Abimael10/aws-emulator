@@ -295,11 +295,9 @@ impl ResourceDataSyncRecord {
             s3_destination: self.s3_destination.clone(),
             last_sync_time: None,
             last_successful_sync_time: None,
-            sync_last_modified_time: Some(::aws_smithy_types::DateTime::from(
-                self.last_modified_time,
-            )),
+            sync_last_modified_time: Some(crate::state::wire_instant(self.last_modified_time)),
             last_status: None,
-            sync_created_time: Some(::aws_smithy_types::DateTime::from(self.created_time)),
+            sync_created_time: Some(crate::state::wire_instant(self.created_time)),
             last_sync_status_message: None,
         }
     }

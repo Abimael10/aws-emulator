@@ -224,7 +224,7 @@ impl InventoryDeletionRecord {
     /// message is reported beside the status, because there is nothing to say about a
     /// deletion that completed.
     pub fn to_status_item(&self) -> InventoryDeletionStatusItem {
-        let at = ::aws_smithy_types::DateTime::from(self.deleted_at);
+        let at = crate::state::wire_instant(self.deleted_at);
         InventoryDeletionStatusItem {
             deletion_id: Some(self.deletion_id.clone()),
             type_name: Some(self.type_name.clone()),

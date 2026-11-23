@@ -161,7 +161,7 @@ impl OpsItemEventRecord {
             created_by: Some(OpsItemIdentity {
                 arn: Some(self.created_by.clone()),
             }),
-            created_time: Some(::aws_smithy_types::DateTime::from(self.created_time)),
+            created_time: Some(crate::state::wire_instant(self.created_time)),
         }
     }
 }

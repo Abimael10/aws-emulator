@@ -450,7 +450,7 @@ pub fn snapshot_document(
 /// One instant of the document, rendered the way this service renders a timestamp a body
 /// carries as text (`::aws_smithy_types::date_time::Format::DateTime`).
 fn instant(at: SystemTime) -> String {
-    ::aws_smithy_types::DateTime::from(at)
+    crate::state::wire_instant(at)
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
         .unwrap_or_default()
 }

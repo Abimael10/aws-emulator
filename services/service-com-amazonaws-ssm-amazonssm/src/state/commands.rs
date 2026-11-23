@@ -279,7 +279,7 @@ fn cut_to(written: &str, ceiling: usize) -> String {
 /// (`GetCommandInvocationResult$ExecutionStartDateTime`), rendered by the one timestamp
 /// writer this tree formats a modelled instant with.
 pub fn iso8601(at: SystemTime) -> String {
-    ::aws_smithy_types::DateTime::from(at)
+    wire_instant(at)
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
         .unwrap_or_default()
 }
@@ -298,18 +298,9 @@ pub fn iso8601_elapsed(from: SystemTime, to: SystemTime) -> String {
 /// `at` as the modelled timestamp this service reports it in: the instant TRUNCATED to the
 /// millisecond it falls in ([`super::NANOS_PER_MILLISECOND`]).
 ///
-/// This protocol puts a `timestamp` on the wire as epoch seconds with a fraction, and the
-/// finest fraction AWS states one with is the millisecond — so the clock's nanosecond
-/// remainder is no part of the value, and dropping it is what keeps a reported instant in
-/// the form a client's parser reads. Truncated rather than rounded, so a reported instant
-/// never names one later than the call that stamped it.
-pub fn wire_instant(at: SystemTime) -> ::aws_smithy_types::DateTime {
-    let stamped = ::aws_smithy_types::DateTime::from(at);
-    ::aws_smithy_types::DateTime::from_secs_and_nanos(
-        stamped.secs(),
-        stamped.subsec_nanos() / super::NANOS_PER_MILLISECOND * super::NANOS_PER_MILLISECOND,
-    )
-}
+/// The crate's one timestamp writer ([`super::wire_instant`]), reachable under this path too
+/// because this tree's projections reach it here.
+pub use super::wire_instant;
 
 /// The `NotificationConfig` a command reports, from the one its send configured.
 ///

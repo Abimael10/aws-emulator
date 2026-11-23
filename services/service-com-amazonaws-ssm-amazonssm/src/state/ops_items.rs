@@ -566,10 +566,10 @@ impl OpsItemRecord {
         OpsItem {
             created_by: Some(self.created_by.clone()),
             ops_item_type: Some(self.ops_item_type.clone()),
-            created_time: Some(::aws_smithy_types::DateTime::from(self.created_time)),
+            created_time: Some(crate::state::wire_instant(self.created_time)),
             description: Some(self.description.clone()),
             last_modified_by: Some(self.last_modified_by.clone()),
-            last_modified_time: Some(::aws_smithy_types::DateTime::from(self.last_modified_time)),
+            last_modified_time: Some(crate::state::wire_instant(self.last_modified_time)),
             notifications: Some(self.notifications.clone()),
             priority: self.priority,
             related_ops_items: Some(self.related_ops_items.clone()),
@@ -604,9 +604,9 @@ impl OpsItemRecord {
     pub fn to_summary(&self) -> OpsItemSummary {
         OpsItemSummary {
             created_by: Some(self.created_by.clone()),
-            created_time: Some(::aws_smithy_types::DateTime::from(self.created_time)),
+            created_time: Some(crate::state::wire_instant(self.created_time)),
             last_modified_by: Some(self.last_modified_by.clone()),
-            last_modified_time: Some(::aws_smithy_types::DateTime::from(self.last_modified_time)),
+            last_modified_time: Some(crate::state::wire_instant(self.last_modified_time)),
             priority: self.priority,
             source: Some(self.source.clone()),
             status: Some(self.status.clone()),

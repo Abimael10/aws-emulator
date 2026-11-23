@@ -241,9 +241,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // registrations that name this baseline
                 // ([`crate::state::patch_groups`]).
                 patch_groups: Some(patch_groups),
-                created_date: Some(::aws_smithy_types::DateTime::from(record.created_date)),
+                created_date: Some(crate::state::wire_instant(record.created_date)),
                 // Equal to the created date until a write of this baseline moves it.
-                modified_date: Some(::aws_smithy_types::DateTime::from(record.modified_date)),
+                modified_date: Some(crate::state::wire_instant(record.modified_date)),
                 description: record.description.clone(),
                 sources: Some(record.sources.clone()),
                 available_security_updates_compliance_status: record

@@ -367,8 +367,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             approved_patches_enable_non_security: Some(record.approved_patches_enable_non_security),
             rejected_patches: Some(record.rejected_patches.clone()),
             rejected_patches_action: Some(record.rejected_patches_action.clone()),
-            created_date: Some(::aws_smithy_types::DateTime::from(record.created_date)),
-            modified_date: Some(::aws_smithy_types::DateTime::from(record.modified_date)),
+            created_date: Some(crate::state::wire_instant(record.created_date)),
+            modified_date: Some(crate::state::wire_instant(record.modified_date)),
             description: record.description.clone(),
             sources: Some(record.sources.clone()),
             available_security_updates_compliance_status: record

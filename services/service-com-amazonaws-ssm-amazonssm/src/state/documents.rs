@@ -1099,7 +1099,7 @@ impl DocumentRecord {
             display_name: version.display_name.clone(),
             version_name: version.version_name.clone(),
             owner: Some(self.owner.clone()),
-            created_date: Some(::aws_smithy_types::DateTime::from(version.created_date)),
+            created_date: Some(crate::state::wire_instant(version.created_date)),
             status: Some(version.status.clone()),
             // "A message returned by Amazon Web Services Systems Manager that explains
             // the Status value", which it sets for a failure; nothing here failed.

@@ -526,8 +526,8 @@ impl StepExecutionRecord {
             // "The maximum number of tries to run the action of the step": what the step's
             // own declaration asked for, and nothing where it asked for nothing.
             max_attempts: self.definition.max_attempts,
-            execution_start_time: self.started_at.map(::aws_smithy_types::DateTime::from),
-            execution_end_time: self.ended_at.map(::aws_smithy_types::DateTime::from),
+            execution_start_time: self.started_at.map(crate::state::wire_instant),
+            execution_end_time: self.ended_at.map(crate::state::wire_instant),
             step_status: Some(self.status.clone()),
             response_code: None,
             inputs: (!self.inputs.is_empty()).then(|| {
@@ -1589,7 +1589,7 @@ impl AutomationExecutionRecord {
             ::engine::emulator_account_id().to_string(),
         );
         variables.insert("global:REGION".to_string(), self.region.clone());
-        if let Ok(stamped) = ::aws_smithy_types::DateTime::from(now)
+        if let Ok(stamped) = crate::state::wire_instant(now)
             .fmt(::aws_smithy_types::date_time::Format::DateTime)
         {
             if let Some(date) = stamped.get(..10) {
@@ -1616,8 +1616,8 @@ impl AutomationExecutionRecord {
             automation_execution_id: Some(self.execution_id.clone()),
             document_name: Some(self.document_name.clone()),
             document_version: Some(self.document_version.clone()),
-            execution_start_time: Some(::aws_smithy_types::DateTime::from(self.started_at)),
-            execution_end_time: self.ended_at.map(::aws_smithy_types::DateTime::from),
+            execution_start_time: Some(crate::state::wire_instant(self.started_at)),
+            execution_end_time: self.ended_at.map(crate::state::wire_instant),
             automation_execution_status: Some(self.status.clone()),
             step_executions: (!self.steps.is_empty()).then(|| {
                 self.steps

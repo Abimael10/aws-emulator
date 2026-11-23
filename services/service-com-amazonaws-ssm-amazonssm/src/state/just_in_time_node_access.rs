@@ -198,7 +198,7 @@ impl VendedCredential {
             access_key_id: self.access_key_id.clone(),
             secret_access_key: self.secret_access_key.clone(),
             session_token: self.session_token.clone(),
-            expiration_time: ::aws_smithy_types::DateTime::from(self.expires_at),
+            expiration_time: crate::state::wire_instant(self.expires_at),
         }
     }
 }

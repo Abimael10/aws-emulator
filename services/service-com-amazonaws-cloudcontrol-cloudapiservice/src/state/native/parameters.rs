@@ -566,14 +566,11 @@ impl DesiredModel {
                     desired.tier = Some(requested);
                 }
                 DATA_TYPE => {
-                    let requested = text(property, value)?;
-                    if !ssm::PARAMETER_DATA_TYPES.contains(&requested.as_str()) {
-                        return Err(NativeRefusal::Invalid(format!(
-                            "{property} must be one of {}",
-                            ssm::PARAMETER_DATA_TYPES.join(" ")
-                        )));
-                    }
-                    desired.data_type = Some(requested);
+                    // `ParameterDataType` admits every data-type string of its length and
+                    // the owning service validates the VALUE under it rather than the data
+                    // type's spelling, so nothing here refuses a data type; the value's own
+                    // form is judged where the version is built ([`Self::version`]).
+                    desired.data_type = Some(text(property, value)?);
                 }
                 // Properties the OWNING service judges and enforces itself, which this path
                 // does not; see this module's header.
@@ -663,6 +660,17 @@ impl DesiredModel {
             .data_type
             .clone()
             .unwrap_or_else(|| ssm::DEFAULT_DATA_TYPE.to_string());
+        // A data type names the FORM its value has to be in, and a value outside the form
+        // the data type in force states is one the owning service refuses outright, so no
+        // version of it is stored here either (`ssm::parameter_data_types`).
+        if let Some(why) = ssm::parameter_data_types::value_rejection(&data_type, &value) {
+            return Err(NativeRefusal::Invalid(why));
+        }
+        // ...and a data type that service serves only on an advanced parameter may be
+        // declared only by a write the resolved tier is the advanced one for.
+        if let Some(why) = ssm::parameter_data_types::tier_rejection(&data_type, &tier) {
+            return Err(NativeRefusal::Invalid(why));
+        }
         // The data type in force carries the owning service's own validation of the value:
         // "If you submit an invalid AMI value, the PutParameter operation will return
         // success, but the asynchronous validation will fail and the parameter will not be

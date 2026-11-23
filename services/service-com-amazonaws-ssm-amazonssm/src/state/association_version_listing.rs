@@ -35,7 +35,7 @@ pub fn association_version_info(
         // ([`AssociationVersionRecord::document_name`]).
         association_id: Some(record.association_id.clone()),
         association_version: Some(version.version.to_string()),
-        created_date: Some(::aws_smithy_types::DateTime::from(version.created_at)),
+        created_date: Some(crate::state::wire_instant(version.created_at)),
         name: Some(version.document_name.clone()),
         document_version: version.document_version.clone(),
         parameters: (!version.parameters.is_empty()).then(|| {

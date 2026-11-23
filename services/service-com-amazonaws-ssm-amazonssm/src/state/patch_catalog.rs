@@ -283,7 +283,7 @@ impl PublishedPatch {
             id: Some(self.id.clone()),
             kb_number: self.kb_number.clone(),
             title: Some(self.title.clone()),
-            release_date: Some(::aws_smithy_types::DateTime::from(self.release_date)),
+            release_date: Some(crate::state::wire_instant(self.release_date)),
             vendor: self.vendor.clone(),
             product_family: self.product_family.clone(),
             product: Some(self.product.clone()),
@@ -418,9 +418,7 @@ impl EffectivePatchRecord {
             patch_status: Some(PatchStatus {
                 deployment_status: Some(self.deployment_status.to_string()),
                 compliance_level: self.compliance_level.clone(),
-                approval_date: self
-                    .approval_date
-                    .map(::aws_smithy_types::DateTime::from),
+                approval_date: self.approval_date.map(crate::state::wire_instant),
             }),
         }
     }

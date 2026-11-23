@@ -306,7 +306,7 @@ fn reported(
         source_result: value
             .as_ref()
             .map(|_| source_result(resolved, value.clone(), secret_binary)),
-        last_modified_date: Some(::aws_smithy_types::DateTime::from(resolved.created_date)),
+        last_modified_date: Some(crate::state::wire_instant(resolved.created_date)),
         arn: Some(resolved.arn.clone()),
         data_type: Some(DEFAULT_DATA_TYPE.to_string()),
     }

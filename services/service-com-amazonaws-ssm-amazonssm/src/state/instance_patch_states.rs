@@ -504,12 +504,12 @@ impl InstancePatchStateRecord {
             unreported_not_applicable_count: self.unreported_not_applicable_count,
             not_applicable_count: self.not_applicable_count,
             available_security_update_count: self.available_security_update_count,
-            operation_start_time: ::aws_smithy_types::DateTime::from(self.operation_start_time),
-            operation_end_time: ::aws_smithy_types::DateTime::from(self.operation_end_time),
+            operation_start_time: crate::state::wire_instant(self.operation_start_time),
+            operation_end_time: crate::state::wire_instant(self.operation_end_time),
             operation: self.operation.clone(),
             last_no_reboot_install_operation_time: self
                 .last_no_reboot_install_operation_time
-                .map(::aws_smithy_types::DateTime::from),
+                .map(crate::state::wire_instant),
             reboot_option: self.reboot_option.clone(),
             critical_non_compliant_count: self.critical_non_compliant_count,
             security_non_compliant_count: self.security_non_compliant_count,

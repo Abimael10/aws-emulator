@@ -1205,8 +1205,18 @@ async fn type_data_type_key_id_and_tag_rules() {
             "ValidationException",
         ),
         (
-            "unsupported DataType",
-            json!({ "Name": "/Types/bad", "Type": "String", "Value": "v", "DataType": "text/plain" }),
+            // `ParameterDataType` carries a LENGTH (0..128) and no enum and no pattern
+            // (`smithy_query(query="shape",shape="ParameterDataType")`), so what is refused
+            // is a data type outside that length; a data-type string inside it is a value
+            // the member admits, and what the service holds such a put to is its VALUE
+            // (`all/parameter_data_type_values.rs`).
+            "a DataType longer than the modelled length",
+            json!({
+                "Name": "/Types/bad",
+                "Type": "String",
+                "Value": "v",
+                "DataType": "x".repeat(129),
+            }),
             "ValidationException",
         ),
         (

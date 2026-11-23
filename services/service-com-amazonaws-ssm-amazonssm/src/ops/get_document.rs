@@ -277,7 +277,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(GetDocumentOutput {
             name: Some(record.name.clone()),
-            created_date: Some(::aws_smithy_types::DateTime::from(version.created_date)),
+            created_date: Some(crate::state::wire_instant(version.created_date)),
             display_name: version.display_name.clone(),
             version_name: version.version_name.clone(),
             document_version: Some(version.version.to_string()),

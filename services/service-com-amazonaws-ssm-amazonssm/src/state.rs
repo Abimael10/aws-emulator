@@ -502,6 +502,10 @@ pub mod ec2_managed_nodes;
 /// The validation a put of an `aws:ec2:image` parameter is held to, and the write that
 /// validation gates when the value is no image the account can see.
 pub mod parameter_image_validation;
+
+/// What a parameter's `DataType` says about its VALUE: the data types whose value form the
+/// service states, and the sentence a value that does not satisfy one is refused with.
+pub mod parameter_data_types;
 /// The `ParameterStringFilter` vocabulary both filter-taking parameter reads publish, how
 /// a filter matches a stored parameter, and the sentences a rejected filter is refused
 /// with. Re-exported, so every name stays reachable as `crate::state::<name>`.
@@ -817,10 +821,15 @@ pub fn inline_policies(policies: Option<&str>) -> Vec<ParameterInlinePolicy> {
         .collect()
 }
 
-/// The `DataType` values Parameter Store supports: "The following data type values are
-/// supported. text aws:ec2:image aws:ssm:integration" (`PutParameter`'s `DataType`
-/// doc).
-pub const PARAMETER_DATA_TYPES: &[&str] = &[
+/// The `DataType` values `PutParameter`'s own documentation lists: "The following data type
+/// values are supported. text aws:ec2:image aws:ssm:integration" (`PutParameter`'s
+/// `DataType` doc).
+///
+/// A LISTING rather than the set the wire admits: `ParameterDataType` is a plain string
+/// carrying only a length (0..128) and no enum or pattern, so a data type outside this
+/// listing is a value the member accepts and what the service holds such a put to is its
+/// VALUE ([`parameter_data_types`]).
+pub const DOCUMENTED_DATA_TYPES: &[&str] = &[
     DEFAULT_DATA_TYPE,
     DATA_TYPE_EC2_IMAGE,
     "aws:ssm:integration",
@@ -1352,7 +1361,7 @@ pub struct ParameterVersionRecord {
     pub value: String,
     /// A `ParameterType` value.
     pub type_: String,
-    /// A `ParameterDataType` value (see [`PARAMETER_DATA_TYPES`]).
+    /// A `ParameterDataType` value (see [`DOCUMENTED_DATA_TYPES`]).
     pub data_type: String,
     /// A `ParameterTier` value, already resolved (see [`resolve_tier`]).
     pub tier: String,
@@ -1402,7 +1411,7 @@ impl ParameterVersionRecord {
             // parameter that references another Amazon Web Services service. Nothing
             // in this store references one, so there is no source result to report.
             source_result: None,
-            last_modified_date: Some(::aws_smithy_types::DateTime::from(self.last_modified_date)),
+            last_modified_date: Some(wire_instant(self.last_modified_date)),
             arn: Some(record.arn()),
             data_type: Some(self.data_type.clone()),
         }
@@ -1420,14 +1429,17 @@ impl ParameterVersionRecord {
             r#type: Some(self.type_.clone()),
             // "Applies to SecureString parameters only", so only a version stored under
             // a key carries one.
-            key_id: self.key_id.clone(),
-            last_modified_date: Some(::aws_smithy_types::DateTime::from(self.last_modified_date)),
+            key_id: reported_text(self.key_id.clone()),
+            last_modified_date: Some(wire_instant(self.last_modified_date)),
             // As in [`Self::to_parameter_history`]: the principal the write that created
             // this version was signed for, recorded by that write and reported unchanged,
             // so two reads of one version report one writer.
-            last_modified_user: self.last_modified_user.clone(),
-            description: self.description.clone(),
-            allowed_pattern: self.allowed_pattern.clone(),
+            last_modified_user: reported_text(self.last_modified_user.clone()),
+            // An attribute the parameter carries no value for is reported as none rather
+            // than as empty text ([`reported_text`]): a parameter with no effective allowed
+            // pattern has no pattern member, and one with no description no description.
+            description: reported_text(self.description.clone()),
+            allowed_pattern: reported_text(self.allowed_pattern.clone()),
             version: self.version,
             tier: Some(self.tier.clone()),
             // "A list of policies associated with a parameter": the list the version
@@ -1451,16 +1463,18 @@ impl ParameterVersionRecord {
             // "The alias of the Key Management Service (KMS) key used to encrypt the
             // parameter. Applies to SecureString parameters only", so only a version
             // stored under one carries it.
-            key_id: self.key_id.clone(),
-            last_modified_date: Some(::aws_smithy_types::DateTime::from(self.last_modified_date)),
+            key_id: reported_text(self.key_id.clone()),
+            last_modified_date: Some(wire_instant(self.last_modified_date)),
             // "Amazon Resource Name (ARN) of the Amazon Web Services user who last
             // changed the parameter": the principal the write that created THIS version
             // was signed for, so an entry names the writer of the version it reports
             // rather than the writer of the newest one.
-            last_modified_user: self.last_modified_user.clone(),
-            description: self.description.clone(),
+            last_modified_user: reported_text(self.last_modified_user.clone()),
+            // As in [`Self::to_parameter_metadata`]: an attribute the version carries no
+            // value for is reported as none rather than as empty text.
+            description: reported_text(self.description.clone()),
             value: Some(self.value.clone()),
-            allowed_pattern: self.allowed_pattern.clone(),
+            allowed_pattern: reported_text(self.allowed_pattern.clone()),
             version: self.version,
             // "Labels assigned to the parameter version": the labels pointing at THIS
             // version, which is an empty list for a version no label points at — a
@@ -1749,10 +1763,42 @@ pub const DOCUMENT_TRANSITION_DELAY: Duration = Duration::from_secs(3);
 /// How many nanoseconds a millisecond is, which is the resolution this service states an
 /// instant at: a finer reading of the clock than what goes on the wire states a precision
 /// the value does not hold, so it is dropped rather than written. The one declaration of
-/// it, so the two places that quantise an instant — a maintenance window's rendered
-/// instants ([`maintenance_windows`]) and a command's reported ones
-/// ([`commands::wire_instant`]) — agree on what the resolution is.
+/// it, so every place that quantises an instant — a maintenance window's rendered
+/// instants ([`maintenance_windows`]) and the one writer every reported instant goes
+/// through ([`wire_instant`]) — agrees on what the resolution is.
 pub const NANOS_PER_MILLISECOND: u32 = 1_000_000;
+
+/// `at` as the timestamp a response reports it as: the instant TRUNCATED to the millisecond
+/// it falls in ([`NANOS_PER_MILLISECOND`]).
+///
+/// This protocol puts a `timestamp` on the wire as epoch seconds with a fraction, and the
+/// finest fraction AWS states one with is the millisecond — so the nanosecond remainder the
+/// host clock reads is no part of the value, and dropping it is what keeps a reported
+/// instant in the form a client's parser reads back. Truncated rather than rounded, so a
+/// reported instant never names one later than the call that stamped it.
+///
+/// THE one encoder for every instant this service reports, whichever plane reports it, so no
+/// operation's projection can state an instant at a precision another's does not.
+pub fn wire_instant(at: SystemTime) -> ::aws_smithy_types::DateTime {
+    let stamped = ::aws_smithy_types::DateTime::from(at);
+    ::aws_smithy_types::DateTime::from_secs_and_nanos(
+        stamped.secs(),
+        stamped.subsec_nanos() / NANOS_PER_MILLISECOND * NANOS_PER_MILLISECOND,
+    )
+}
+
+/// `value` as an OPTIONAL string member of a response: the text the resource carries, or
+/// nothing at all when it carries none.
+///
+/// An optional member reports a value the resource HAS; a resource that has none for it is
+/// serialized without the member rather than with the empty string, which is a value — a
+/// client telling "nothing configured" from "configured as empty" reads the two apart, and
+/// one that compiles a pattern or formats a description only when the member is present is
+/// handed no empty text to work on. An empty string supplied for such a member states no
+/// value, so it is reported as none.
+pub fn reported_text(value: Option<String>) -> Option<String> {
+    value.filter(|text| !text.is_empty())
+}
 
 /// The `PlatformType` values, in the order the modelled enum
 /// (`smithy_query(query="shape",shape="PlatformType")`) lists them — which is the order a
@@ -3497,7 +3543,7 @@ impl ManagedNodeRecord {
         resource_type: impl Into<String>,
         at: SystemTime,
     ) -> Self {
-        let at = ::aws_smithy_types::DateTime::from(at);
+        let at = wire_instant(at);
         Self {
             properties: InstanceProperty {
                 instance_id: Some(instance_id.into()),
@@ -3724,9 +3770,9 @@ impl ActivationRecord {
             iam_role: Some(self.iam_role.clone()),
             registration_limit: Some(self.registration_limit),
             registrations_count: Some(self.registrations_count),
-            expiration_date: Some(::aws_smithy_types::DateTime::from(self.expiration_date)),
+            expiration_date: Some(wire_instant(self.expiration_date)),
             expired: self.is_expired(now),
-            created_date: Some(::aws_smithy_types::DateTime::from(self.created_date)),
+            created_date: Some(wire_instant(self.created_date)),
             tags: (!self.tags.is_empty()).then(|| tagging::to_tag_list(&self.tags)),
         }
     }

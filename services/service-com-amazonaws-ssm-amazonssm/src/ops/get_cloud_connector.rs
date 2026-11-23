@@ -187,8 +187,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             role_arn: Some(record.role_arn.clone()),
             configuration: Some(record.configuration.clone()),
             config_connector_arn: Some(record.config_connector_arn.clone()),
-            created_at: Some(::aws_smithy_types::DateTime::from(record.created_at)),
-            updated_at: Some(::aws_smithy_types::DateTime::from(record.updated_at)),
+            created_at: Some(crate::state::wire_instant(record.created_at)),
+            updated_at: Some(crate::state::wire_instant(record.updated_at)),
         })
     }
 }

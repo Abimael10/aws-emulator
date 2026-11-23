@@ -219,8 +219,8 @@ impl AutomationExecutionRecord {
             document_name: Some(self.document_name.clone()),
             document_version: Some(self.document_version.clone()),
             automation_execution_status: Some(self.status.clone()),
-            execution_start_time: Some(::aws_smithy_types::DateTime::from(self.started_at)),
-            execution_end_time: self.ended_at.map(::aws_smithy_types::DateTime::from),
+            execution_start_time: Some(crate::state::wire_instant(self.started_at)),
+            execution_end_time: self.ended_at.map(crate::state::wire_instant),
             executed_by: Some(self.executed_by.clone()),
             // "An S3 bucket where execution information is stored": nothing has been
             // written to a bucket for this execution, so there is no file to name.

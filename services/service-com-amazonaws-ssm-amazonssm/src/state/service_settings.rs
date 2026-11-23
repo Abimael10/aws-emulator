@@ -364,7 +364,7 @@ impl ServiceSettingRecord {
         ServiceSetting {
             setting_id: Some(id.to_string()),
             setting_value: Some(self.value.clone()),
-            last_modified_date: Some(::aws_smithy_types::DateTime::from(self.last_modified_date)),
+            last_modified_date: Some(crate::state::wire_instant(self.last_modified_date)),
             last_modified_user: Some(self.last_modified_user.clone()),
             arn: Some(setting_arn(region, id)),
             status: Some(self.status.clone()),

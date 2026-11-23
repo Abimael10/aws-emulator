@@ -749,10 +749,8 @@ impl AssociationRecord {
             name: Some(version.document_name.clone()),
             instance_id: self.instance_id.clone(),
             association_version: Some(version.version.to_string()),
-            date: Some(::aws_smithy_types::DateTime::from(self.created_at)),
-            last_update_association_date: Some(::aws_smithy_types::DateTime::from(
-                self.updated_at(),
-            )),
+            date: Some(crate::state::wire_instant(self.created_at)),
+            last_update_association_date: Some(crate::state::wire_instant(self.updated_at())),
             // "The association status" is the result a managed node reports for the
             // association through `UpdateAssociationStatus`, held as that call supplied it
             // and unset until one has reported.
@@ -773,10 +771,10 @@ impl AssociationRecord {
             output_location: version.output_location.clone(),
             last_execution_date: self
                 .finished_run(now)
-                .map(|run| ::aws_smithy_types::DateTime::from(run.finished_at())),
+                .map(|run| crate::state::wire_instant(run.finished_at())),
             last_successful_execution_date: self
                 .finished_run(now)
-                .map(|run| ::aws_smithy_types::DateTime::from(run.finished_at())),
+                .map(|run| crate::state::wire_instant(run.finished_at())),
             association_name: version.association_name.clone(),
             max_errors: version.max_errors.clone(),
             max_concurrency: version.max_concurrency.clone(),
@@ -819,7 +817,7 @@ impl AssociationRecord {
                 .filter(|targets| !targets.is_empty()),
             last_execution_date: self
                 .finished_run(now)
-                .map(|run| ::aws_smithy_types::DateTime::from(run.finished_at())),
+                .map(|run| crate::state::wire_instant(run.finished_at())),
             overview: Some(self.overview(now)),
             schedule_expression: version.and_then(|version| version.schedule_expression.clone()),
             association_name: version.and_then(|version| version.association_name.clone()),
@@ -952,7 +950,7 @@ impl AssociationRecord {
             document_version: version.and_then(|version| version.document_version.clone()),
             association_version: Some(self.latest_version().to_string()),
             instance_id: Some(instance_id.to_string()),
-            execution_date: run.map(|run| ::aws_smithy_types::DateTime::from(run.started_at)),
+            execution_date: run.map(|run| crate::state::wire_instant(run.started_at)),
             // A node that has REPORTED on this association reports what it reported, a node
             // no run has reached reports the status of an association nothing has run, and a
             // run that reached it reports how far that run has got

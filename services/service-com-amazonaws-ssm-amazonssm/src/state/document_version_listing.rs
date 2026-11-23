@@ -31,7 +31,7 @@ pub fn document_version_info(
         display_name: version.display_name.clone(),
         document_version: Some(version.version.to_string()),
         version_name: version.version_name.clone(),
-        created_date: Some(::aws_smithy_types::DateTime::from(version.created_date)),
+        created_date: Some(crate::state::wire_instant(version.created_date)),
         // "An identifier for the default version of the document": the version a read that
         // names no selector resolves to ([`DocumentRecord::select`]) is the one this flags.
         is_default_version: version.version == record.default_version,

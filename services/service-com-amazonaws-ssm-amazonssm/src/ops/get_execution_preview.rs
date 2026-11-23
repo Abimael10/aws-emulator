@@ -172,7 +172,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             execution_preview_id: Some(held.preview_id.clone()),
             status: Some(held.status.clone()),
             status_message: held.status_message.clone(),
-            ended_at: held.ended_at().map(::aws_smithy_types::DateTime::from),
+            ended_at: held.ended_at().map(crate::state::wire_instant),
             execution_preview: held.execution_preview(),
         })
     }

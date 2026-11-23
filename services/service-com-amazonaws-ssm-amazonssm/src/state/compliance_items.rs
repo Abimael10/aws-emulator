@@ -399,7 +399,7 @@ impl ComplianceItemRecord {
                 .clone()
                 .unwrap_or_else(|| SEVERITY_UNSPECIFIED.to_string()),
             execution_summary: ComplianceExecutionSummary {
-                execution_time: ::aws_smithy_types::DateTime::from(report.operation_end_time),
+                execution_time: crate::state::wire_instant(report.operation_end_time),
                 // "An ID created by the system when `PutComplianceItems` was called" — no
                 // call wrote this item, so it carries no such id rather than one invented
                 // here.

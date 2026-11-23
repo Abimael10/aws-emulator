@@ -424,7 +424,7 @@ impl ManagedInstance {
         reported.instance_type = Some(self.instance_type);
         reported.key_name = self.key_name;
         reported.architecture = Some(self.architecture);
-        reported.launch_time = Some(::aws_smithy_types::DateTime::from(self.launch_time));
+        reported.launch_time = Some(crate::state::wire_instant(self.launch_time));
         reported.availability_zone = Some(self.availability_zone);
         reported.ping_status = Some(
             if self.reaches_service {

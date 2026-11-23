@@ -545,9 +545,9 @@ impl OpsMetadataRecord {
         OpsMetadata {
             resource_id: Some(self.resource_id.clone()),
             ops_metadata_arn: Some(self.arn.clone()),
-            last_modified_date: Some(::aws_smithy_types::DateTime::from(self.last_modified_at)),
+            last_modified_date: Some(crate::state::wire_instant(self.last_modified_at)),
             last_modified_user: Some(self.last_modified_user.clone()),
-            creation_date: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            creation_date: Some(crate::state::wire_instant(self.created_at)),
         }
     }
 }

@@ -270,7 +270,7 @@ impl PatchComplianceRow {
             classification: self.classification.clone(),
             severity: self.severity.clone(),
             state: self.state.clone(),
-            installed_time: ::aws_smithy_types::DateTime::from(self.installed_time),
+            installed_time: crate::state::wire_instant(self.installed_time),
             // "The IDs of one or more Common Vulnerabilities and Exposure (CVE) issues
             // that are resolved by the patch" (`PatchComplianceData$CVEIds`): the
             // catalogue Patch Manager publishes here names none, so none is reported.

@@ -13,6 +13,16 @@
 //! Implementing this operation also closes `issues/.../ssm-putparameter-stub.md`, which
 //! asks for exactly this handler; `GetParameter` needs it to have anything to read.
 //!
+//! ## The `DataType` names the form of the value
+//!
+//! `DataType` is a plain string with a length and no enum, so the data type a request
+//! declares is accepted whatever it names; what the put is held to is the VALUE under it,
+//! and the tier the data type may be declared in
+//! ([`crate::state::parameter_data_types`]). A data type that states a form refuses a
+//! value outside it outright, with the sentence naming the value; `aws:ec2:image` is the
+//! documented exception, validated asynchronously so the put answers success and the write
+//! lands nowhere.
+//!
 //! ## A `SecureString` is stored encrypted
 //!
 //! A `SecureString`'s `Value` is "encrypt[ed] ... with the KMS ID that you want to use"
@@ -635,7 +645,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // before this body runs. `Tier` is re-checked here all the same, because the
         // tier decides the content-size limit below and a value the model does not
         // declare must not be served as if it were the standard tier. `DataType` is a
-        // plain string, so its catalog is enforced here too.
+        // plain string carrying only a length, which the walk has already held it to, and
+        // what the service validates under it is the VALUE rather than the data type's own
+        // spelling ([`crate::state::parameter_data_types`]) — so nothing here refuses a
+        // data type.
         if let Some(requested) = input.tier.as_deref() {
             if !PARAMETER_TIER_VALUES.contains(&requested) {
                 return Err(crate::scaffolded::Scaffolded::validation(format!(
@@ -644,18 +657,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
         }
+        // A data type the request states nothing for is no data type: the member is
+        // "optional metadata" of the same kind as the rest, so an empty one leaves the
+        // parameter's own data type to be resolved below.
         let data_type = input
             .data_type
             .clone()
             .filter(|data_type| !data_type.is_empty());
-        if let Some(data_type) = data_type.as_deref() {
-            if !crate::state::PARAMETER_DATA_TYPES.contains(&data_type) {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "DataType '{data_type}' isn't supported; the supported data type values are {}",
-                    crate::state::PARAMETER_DATA_TYPES.join(" ")
-                )));
-            }
-        }
         // The `aws:ec2:image` data type's own validation — "that the specified AMI is
         // available in your Amazon Web Services account" — is the one the doc describes: "a
         // successful HTTP 200 response does not guarantee that your parameter was
@@ -831,6 +839,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let data_type = data_type
             .or_else(|| existing.as_ref().and_then(|held| held.data_type.clone()))
             .unwrap_or_else(|| crate::state::DEFAULT_DATA_TYPE.to_string());
+        // A data type names the FORM its value has to be in, so the value is held to the
+        // form the data type IN FORCE states — the one this request declared, else the one
+        // the parameter already carries — and a value outside it is refused outright: the
+        // caller's VALUE is what is wrong with such a request, and the sentence says so
+        // ([`crate::state::parameter_data_types`]). A data type that states no form takes
+        // whatever value the put carries. Decided before anything is written, so a refused
+        // put leaves the parameter exactly as it found it.
+        if let Some(why) = crate::state::parameter_data_types::value_rejection(
+            &data_type,
+            &input.value,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(why));
+        }
         let description = input
             .description
             .clone()
@@ -889,6 +910,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation(
                 crate::state::tier_downgrade_message(),
             ));
+        }
+        // A data type the service serves only on an advanced parameter may be declared only
+        // by a put the RESOLVED tier is the advanced one for, so the gate stands on the tier
+        // the put was served in rather than on the `Tier` member it named
+        // ([`crate::state::parameter_data_types::tier_rejection`]).
+        if let Some(why) = crate::state::parameter_data_types::tier_rejection(&data_type, &tier) {
+            return Err(crate::scaffolded::Scaffolded::validation(why));
         }
         let limit = crate::state::value_limit(&tier);
         if input.value.len() > limit {
