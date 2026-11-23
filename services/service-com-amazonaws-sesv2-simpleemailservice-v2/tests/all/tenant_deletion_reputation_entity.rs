@@ -46,9 +46,10 @@ const RESOURCE: &str = state::REPUTATION_ENTITY_TYPE_RESOURCE;
 /// only" (`smithy_query(query="shape",shape="TenantName")`).
 const MAX_TENANT_NAME_CHARS: usize = state::MAX_TENANT_NAME_CHARS;
 
-/// The `SendingStatus` a tenant's customer-managed record carries until the account
+/// The `SendingStatus` in force on a tenant's reputation entity until the account
 /// writes one, taken from the crate's own constant for exactly that invariant so the
-/// value is stated once.
+/// value is stated once. A tenant nobody has written to carries no status RECORD at
+/// all, so this is the aggregate status such an entity reports.
 const FRESH_TENANT_STATUS: &str = state::TENANT_SENDING_STATUS_CREATED;
 
 /// The reputation-entity and tenant-deletion calls this suite adds to the shared tenant
@@ -387,12 +388,25 @@ async fn a_deleted_tenants_reputation_entity_goes_with_the_tenant() {
                 survivor.status,
                 survivor.message()
             );
+            let entity = read_entity(&survivor);
+            match &survivor_written {
+                Some((written_name, _)) if written_name == name => assert_eq!(
+                    at(&entity, "/CustomerManagedStatus/Status"),
+                    expected,
+                    "case {case:?}: expected {name:?} to keep the status {expected:?} it was \
+                     written, got {entity:?}"
+                ),
+                // Nothing wrote this tenant's status, so it carries no record of one.
+                _ => assert!(
+                    entity.pointer("/CustomerManagedStatus").is_none(),
+                    "case {case:?}: expected {name:?} to carry no written status, got {entity:?}"
+                ),
+            }
             assert_eq!(
-                at(&read_entity(&survivor), "/CustomerManagedStatus/Status"),
+                at(&entity, "/SendingStatusAggregate"),
                 expected,
-                "case {case:?}: expected {name:?} to keep the status {expected:?} it carried, \
-                 got {:?}",
-                read_entity(&survivor)
+                "case {case:?}: expected {name:?} to keep the status {expected:?} in force, \
+                 got {entity:?}"
             );
         }
 
@@ -424,11 +438,19 @@ async fn a_deleted_tenants_reputation_entity_goes_with_the_tenant() {
             reread.status,
             reread.message()
         );
-        assert_eq!(
-            at(&read_entity(&reread), "/CustomerManagedStatus/Status"),
-            FRESH_TENANT_STATUS,
+        assert!(
+            read_entity(&reread)
+                .pointer("/CustomerManagedStatus")
+                .is_none(),
             "case {case:?}: expected the recreated tenant to carry none of the deleted \
-             tenant's status, got {:?}",
+             tenant's written status, got {:?}",
+            read_entity(&reread)
+        );
+        assert_eq!(
+            at(&read_entity(&reread), "/SendingStatusAggregate"),
+            FRESH_TENANT_STATUS,
+            "case {case:?}: expected the recreated tenant to carry the status a fresh \
+             tenant does, got {:?}",
             read_entity(&reread)
         );
         let after_recreate = references(&ses.list_entities().await);

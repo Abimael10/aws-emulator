@@ -159,8 +159,9 @@ struct CreateCase {
     tags: Vec<(&'static str, &'static str)>,
     /// The `SuppressionAttributes` the request carries, when it carries any.
     suppression: Option<Value>,
-    /// The `SuppressionScope` the stored tenant must report.
-    expected_scope: &'static str,
+    /// The `SuppressionScope` the stored tenant must report, or `None` when the tenant
+    /// must report no `SuppressionAttributes` at all because the request stated none.
+    expected_scope: Option<&'static str>,
     /// The `SuppressedReasons` the stored tenant must report, in order; empty means the
     /// member must be absent.
     expected_reasons: Vec<&'static str>,
@@ -174,9 +175,11 @@ fn create_cases() -> Vec<CreateCase> {
             name: "a".to_string(),
             tags: Vec::new(),
             suppression: None,
-            // `TenantSuppressionAttributes$SuppressionScope`: "if you don't specify a
-            // suppression scope, the tenant defaults to ACCOUNT scope".
-            expected_scope: "ACCOUNT",
+            // A create that states no preferences leaves the tenant with none of its
+            // own: it uses the account-level suppression list, which is what
+            // `TenantSuppressionAttributes$SuppressionScope` documents as the default,
+            // so there is nothing of the tenant's own to report.
+            expected_scope: None,
             expected_reasons: Vec::new(),
         },
         CreateCase {
@@ -184,7 +187,7 @@ fn create_cases() -> Vec<CreateCase> {
             name: format!("tenant-{}", "x".repeat(MAX_TENANT_NAME_CHARS - "tenant-".len())),
             tags: Vec::new(),
             suppression: None,
-            expected_scope: "ACCOUNT",
+            expected_scope: None,
             expected_reasons: Vec::new(),
         },
         CreateCase {
@@ -192,7 +195,7 @@ fn create_cases() -> Vec<CreateCase> {
             name: "Tenant_01-beta".to_string(),
             tags: vec![("team", "growth")],
             suppression: None,
-            expected_scope: "ACCOUNT",
+            expected_scope: None,
             expected_reasons: Vec::new(),
         },
         CreateCase {
@@ -200,7 +203,7 @@ fn create_cases() -> Vec<CreateCase> {
             name: "tagged-tenant".to_string(),
             tags: vec![("team", "growth"), ("env", "prod"), ("owner", "ops")],
             suppression: None,
-            expected_scope: "ACCOUNT",
+            expected_scope: None,
             expected_reasons: Vec::new(),
         },
         CreateCase {
@@ -208,7 +211,7 @@ fn create_cases() -> Vec<CreateCase> {
             name: "unicode-tags".to_string(),
             tags: vec![("тема", "Ωmega — 日本語")],
             suppression: None,
-            expected_scope: "ACCOUNT",
+            expected_scope: None,
             expected_reasons: Vec::new(),
         },
         CreateCase {
@@ -219,7 +222,7 @@ fn create_cases() -> Vec<CreateCase> {
                 "SuppressionScope": "TENANT",
                 "SuppressedReasons": ["BOUNCE"]
             })),
-            expected_scope: "TENANT",
+            expected_scope: Some("TENANT"),
             expected_reasons: vec!["BOUNCE"],
         },
         CreateCase {
@@ -230,7 +233,7 @@ fn create_cases() -> Vec<CreateCase> {
                 "SuppressionScope": "TENANT",
                 "SuppressedReasons": ["COMPLAINT", "BOUNCE"]
             })),
-            expected_scope: "TENANT",
+            expected_scope: Some("TENANT"),
             // `SuppressedReasons` is a list, so it is reported in the order supplied.
             expected_reasons: vec!["COMPLAINT", "BOUNCE"],
         },
@@ -239,7 +242,19 @@ fn create_cases() -> Vec<CreateCase> {
             name: "suppress-account".to_string(),
             tags: Vec::new(),
             suppression: Some(json!({"SuppressionScope": "ACCOUNT"})),
-            expected_scope: "ACCOUNT",
+            // Stated explicitly, so the tenant holds the preference and reports it,
+            // even though its value is the one the documented default resolves to.
+            expected_scope: Some("ACCOUNT"),
+            expected_reasons: Vec::new(),
+        },
+        CreateCase {
+            case: "a suppression structure naming neither member",
+            name: "suppress-empty".to_string(),
+            tags: Vec::new(),
+            suppression: Some(json!({})),
+            // The request stated preferences, so the tenant holds them; the scope it
+            // named no value for takes its documented default.
+            expected_scope: Some("ACCOUNT"),
             expected_reasons: Vec::new(),
         },
     ]
@@ -374,10 +389,10 @@ async fn a_created_tenant_round_trips_through_get_tenant() {
         assert_eq!(
             suppression
                 .and_then(|value| value.get("SuppressionScope"))
-                .and_then(Value::as_str)
-                .unwrap_or_default(),
+                .and_then(Value::as_str),
             case.expected_scope,
-            "case {:?}: CreateTenant must report the tenant's suppression scope, got {:?}",
+            "case {:?}: CreateTenant must report the suppression scope the tenant holds, \
+             and no SuppressionAttributes at all when it holds none, got {:?}",
             case.case,
             created.body
         );

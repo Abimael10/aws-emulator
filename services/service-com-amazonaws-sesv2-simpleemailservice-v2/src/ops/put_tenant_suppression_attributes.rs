@@ -171,7 +171,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Both members are resolved — and any value outside the modelled set refused —
         // before the store is touched, so a refused request leaves the tenant's
         // preferences exactly as they were.
-        let (suppressed_reasons, suppression_scope) = crate::state::tenant_suppression_preferences(
+        let preferences = crate::state::tenant_suppression_preferences(
             input.suppressed_reasons,
             input.suppression_scope,
         )
@@ -186,7 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        record.set_suppression_preferences(suppressed_reasons, suppression_scope);
+        record.set_suppression_preferences(preferences);
 
         // `PutTenantSuppressionAttributesResponse` carries no members: what was
         // persisted is read back with `GetTenant`.

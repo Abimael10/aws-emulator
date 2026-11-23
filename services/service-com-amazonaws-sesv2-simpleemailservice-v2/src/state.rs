@@ -73,6 +73,9 @@ mod pricing;
 /// The suppression-list plane: one suppressed address and how a list's entries are
 /// keyed.
 mod suppression;
+/// A tenant's reputation-entity status records and its suppression preferences: what
+/// each is held as while nothing has written it, and what a read reports it as.
+mod tenant_reputation;
 /// The account's Virtual Deliverability Manager configuration as a gate: whether the
 /// feature is on, and how a call that can only be answered from its data is refused
 /// while it is off.
@@ -103,6 +106,7 @@ pub use minted_ids::*;
 pub use pricing::*;
 pub use suppression::*;
 pub use templates::*;
+pub use tenant_reputation::*;
 pub use vdm::*;
 
 /// How long after `CreateEmailIdentity` an identity's `PENDING` -> `SUCCESS`
@@ -752,12 +756,13 @@ pub fn recommendation_key(recommendation: &crate::ops::types::Recommendation) ->
     )
 }
 
-/// The `StatusRecord$Status` of every entity's Amazon-SES-managed status record.
+/// The `SendingStatus` in force on an entity whose Amazon-SES-managed status record is
+/// unwritten.
 ///
-/// SES moves that status itself, on a reputation finding it raised against the
+/// SES writes that record itself, on a reputation finding it raised against the
 /// entity; nothing here raises one — no finding is observed or recorded anywhere in
-/// this service — so the Amazon-SES-managed status of every entity permits sending
-/// and the aggregate is decided by the customer-managed status alone.
+/// this service — so no entity carries such a record, the status Amazon SES permits is
+/// this one, and the aggregate is decided by the customer-managed status alone.
 pub const AWS_SES_MANAGED_SENDING_STATUS: &str = SENDING_STATUS_ENABLED;
 
 /// The aggregate `SendingStatus` of an entity whose two status records read
@@ -858,16 +863,16 @@ pub fn reputation_management_policy_name(policy: &str) -> Option<&'static str> {
         .find(|predefined| *predefined == name)
 }
 
-/// How this service words `BadRequestException` for a reputation management policy
-/// that names none of the predefined policies, stated once for every operation that
-/// takes one. The offending value is the only variable part, taken from the request.
-pub fn invalid_reputation_management_policy(policy: &str) -> String {
-    format!(
-        "Invalid reputation management policy: {policy}. The policy must be an Amazon SES-managed \
-         policy: {}.",
-        REPUTATION_MANAGEMENT_POLICIES.join(", ")
-    )
-}
+/// The fixed sentence SES refuses a reputation-entity write whose
+/// `ReputationEntityPolicy` names none of the predefined policies with, stated once for
+/// every operation that takes one.
+///
+/// It carries NO part of the request: the refusal is about the value naming no resource
+/// this surface can address — a caller does not author a reputation management policy,
+/// it selects one of the Amazon-SES-managed policies ([`REPUTATION_MANAGEMENT_POLICIES`])
+/// — exactly as [`UNSUPPORTED_RESOURCE_ARN`] is the fixed sentence for a `ResourceArn`
+/// in none of the forms its surface addresses.
+pub const INVALID_RESOURCE_IDENTIFIER: &str = "Provided resource identifier is invalid";
 
 /// The account and Region one call is scoped to, and the check that decides which
 /// resource ARNs that call may name.
@@ -920,9 +925,9 @@ impl CallerScope {
 /// account-level suppression list".
 pub const DEFAULT_SUPPRESSION_SCOPE: &str = "ACCOUNT";
 
-/// The `(SuppressedReasons, SuppressionScope)` pair a write of one tenant's
-/// `TenantSuppressionAttributes` stores, from the members the request carried, or
-/// the refusal wording for a value outside the modelled set.
+/// The `TenantSuppressionAttributes` a write of one tenant's preferences stores, from
+/// the members the request carried, or the refusal wording for a value outside the
+/// modelled set.
 ///
 /// Shared by every operation that writes a tenant's suppression preferences, so the
 /// preferences a tenant ends up with do not depend on which one wrote them: a member
@@ -932,10 +937,14 @@ pub const DEFAULT_SUPPRESSION_SCOPE: &str = "ACCOUNT";
 /// list automatically. Both enums carry their values as plain strings here, so the
 /// value set is the caller's to enforce; the wording is the service's shared one (see
 /// [`modelled_enum_value`]).
+///
+/// Resolving the members is not the same as HOLDING them: a tenant holds preferences
+/// only once a request states them, which is what the caller decides by calling this
+/// at all (see [`TenantSuppressionPreferences`]).
 pub fn tenant_suppression_preferences(
     suppressed_reasons: Option<Vec<String>>,
     suppression_scope: Option<String>,
-) -> Result<(Vec<String>, String), String> {
+) -> Result<TenantSuppressionPreferences, String> {
     let reasons = suppressed_reasons
         .unwrap_or_default()
         .into_iter()
@@ -955,7 +964,10 @@ pub fn tenant_suppression_preferences(
         )?,
         None => DEFAULT_SUPPRESSION_SCOPE.to_string(),
     };
-    Ok((reasons, scope))
+    Ok(TenantSuppressionPreferences {
+        suppressed_reasons: reasons,
+        suppression_scope: scope,
+    })
 }
 
 /// The `SuppressionOptions` a write of ONE configuration set's suppression list
@@ -1484,11 +1496,17 @@ impl ComAmazonawsSesv2SimpleemailserviceV2State {
         &self,
         scope: &CallerScope,
     ) -> Vec<crate::ops::types::ReputationEntity> {
+        // "The reputation impact ... representing the highest impact reputation finding
+        // currently active. Reputation findings can be retrieved using the
+        // `ListRecommendations` operation": the findings every entity's impact is read
+        // off are the account's own, derived once for the whole table so a listing and a
+        // read of one entity cannot disagree about which findings were active.
+        let findings = self.recommendations(scope);
         let mut entities: Vec<crate::ops::types::ReputationEntity> = self
             .tenants
             .values()
             .filter(|tenant| scope.covers_resource(&tenant.arn))
-            .map(TenantRecord::reputation_entity)
+            .map(|tenant| tenant.reputation_entity(&findings))
             .collect();
         // Ordered by reference, so a listing of them enumerates and pages
         // deterministically whatever order the resources were created in.
@@ -1889,20 +1907,25 @@ impl ComAmazonawsSesv2SimpleemailserviceV2State {
 
     /// Mint the next `TenantId`.
     ///
-    /// `TenantId` is documented only as "a unique identifier for the tenant" and
-    /// carries no modelled format, so the one guarantee this makes is that
-    /// documented one: uniqueness is structural, because the monotonic sequence
-    /// number is part of the id, so two tenants created in the same millisecond
-    /// still differ. The id is minted once, at create, and read back from the
-    /// record afterwards.
+    /// SES hands a tenant's id back in the documented form [`TENANT_ID_PREFIX`]
+    /// followed by [`TENANT_ID_HEX_DIGITS`] lowercase hexadecimal characters, which is
+    /// what a client that parses or validates one reads, so the id is minted in that
+    /// form. The hexadecimal part is derived from this store's monotonic counter, the
+    /// instant of the mint and the id's own domain ([`minted_hex`]), so two tenants
+    /// created in the same instant still differ; the id is minted once, at create, and
+    /// read back from the record afterwards.
     pub fn next_tenant_id(&mut self, now: SystemTime) -> String {
         self.tenant_sequence += 1;
-        let millis = now
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let sequence = self.tenant_sequence;
-        format!("{millis:016x}{sequence:016x}")
+        format!(
+            "{TENANT_ID_PREFIX}{}",
+            minted_hex(
+                b"Tenant__",
+                self.tenant_sequence,
+                now,
+                &[],
+                TENANT_ID_HEX_DIGITS
+            )
+        )
     }
 
     /// Mint the `JobId` of a new export job.
@@ -3015,19 +3038,22 @@ pub struct TenantRecord {
     pub created_at: SystemTime,
     /// Tags, in the order they were supplied.
     pub tags: Vec<(String, String)>,
-    /// `SendingStatus`: the status the account's own reputation decisions leave the
-    /// tenant in, which is the `CustomerManagedStatus` of the tenant's reputation
-    /// entity. `UpdateReputationEntityCustomerManagedStatus` is what writes it.
-    pub sending_status: String,
-    /// When [`Self::sending_status`] was last written, which is the
-    /// `StatusRecord$LastUpdatedTimestamp` of the customer-managed status record:
-    /// the tenant's creation instant until a caller first changes the status.
-    pub sending_status_updated_at: SystemTime,
-    /// `TenantSuppressionAttributes$SuppressedReasons`: the reasons an address is
-    /// added to this tenant's suppression list, in the order supplied.
-    pub suppressed_reasons: Vec<String>,
-    /// `TenantSuppressionAttributes$SuppressionScope`.
-    pub suppression_scope: String,
+    /// The customer-managed status record of this tenant's reputation entity: the
+    /// status the account's own reputation decisions left the tenant's sending in, and
+    /// when they did. `None` until `UpdateReputationEntityCustomerManagedStatus`
+    /// writes one — nothing has decided anything about this tenant's sending yet, so
+    /// there is no record of a decision to report.
+    pub customer_managed_status: Option<ReputationStatusRecord>,
+    /// The Amazon-SES-managed status record of this tenant's reputation entity: `None`
+    /// until Amazon SES itself stops or reinstates the tenant's sending on a reputation
+    /// finding of its own. Nothing here raises such a finding, so no record is written;
+    /// the status in force is then the one a resource SES has not acted on may send
+    /// under ([`AWS_SES_MANAGED_SENDING_STATUS`]).
+    pub aws_ses_managed_status: Option<ReputationStatusRecord>,
+    /// The suppression list preferences a request STATED for this tenant, or `None`
+    /// while none were stated: the tenant then uses the account-level suppression list,
+    /// which is the documented default, and has no preferences of its own to report.
+    pub suppression: Option<TenantSuppressionPreferences>,
     /// `ReputationEntity$ReputationManagementPolicy`: the ARN of the
     /// Amazon-SES-managed reputation management policy in force on this resource's
     /// reputation entity. The service's own default policy from the moment the
@@ -3037,9 +3063,10 @@ pub struct TenantRecord {
 }
 
 impl TenantRecord {
-    /// A tenant as `CreateTenant` stores it: sending enabled, the account-level
-    /// suppression list until a caller asks for a tenant-level one, and the
-    /// service's default reputation management policy.
+    /// A tenant as `CreateTenant` stores it: no status record on its reputation entity,
+    /// because nothing has decided anything about its sending yet; no suppression
+    /// preferences of its own until a request states them; and the service's default
+    /// reputation management policy.
     ///
     /// `region` is the Region the create executes in, which is the Region of the
     /// Amazon-SES-managed policy the resource's reputation entity starts under: the
@@ -3058,10 +3085,9 @@ impl TenantRecord {
             arn,
             created_at: now,
             tags: Vec::new(),
-            sending_status: TENANT_SENDING_STATUS_CREATED.to_string(),
-            sending_status_updated_at: now,
-            suppressed_reasons: Vec::new(),
-            suppression_scope: DEFAULT_SUPPRESSION_SCOPE.to_string(),
+            customer_managed_status: None,
+            aws_ses_managed_status: None,
+            suppression: None,
             reputation_management_policy: reputation_management_policy_arn(
                 region,
                 DEFAULT_REPUTATION_MANAGEMENT_POLICY,
@@ -3071,15 +3097,12 @@ impl TenantRecord {
 
     /// The modelled `TenantSuppressionAttributes` view of this record, shared by
     /// every operation that reports a tenant's suppression preferences, so a write
-    /// and the read after it cannot disagree.
-    pub fn suppression_attributes(&self) -> crate::ops::types::TenantSuppressionAttributes {
-        crate::ops::types::TenantSuppressionAttributes {
-            // A tenant that adds nothing automatically has no reason set at all,
-            // rather than an empty one.
-            suppressed_reasons: (!self.suppressed_reasons.is_empty())
-                .then(|| self.suppressed_reasons.clone()),
-            suppression_scope: Some(self.suppression_scope.clone()),
-        }
+    /// and the read after it cannot disagree — and absent for a tenant no request has
+    /// stated preferences for, whose list is the account's by default.
+    pub fn suppression_attributes(&self) -> Option<crate::ops::types::TenantSuppressionAttributes> {
+        self.suppression
+            .as_ref()
+            .map(TenantSuppressionPreferences::view)
     }
 
     /// The modelled `Tenant` view of this record, as `GetTenant` reports it.
@@ -3095,7 +3118,7 @@ impl TenantRecord {
             // alone: a tenant Amazon SES disabled may not send whatever the account
             // asked for.
             sending_status: Some(self.aggregate_sending_status()),
-            suppression_attributes: Some(self.suppression_attributes()),
+            suppression_attributes: self.suppression_attributes(),
         }
     }
 
@@ -3118,42 +3141,44 @@ impl TenantRecord {
         }
     }
 
-    /// The customer-managed status record of this tenant's reputation entity: the
-    /// status the account left it in, and when that status was written.
-    pub fn customer_managed_status(&self) -> crate::ops::types::StatusRecord {
-        crate::ops::types::StatusRecord {
-            status: Some(self.sending_status.clone()),
-            // `StatusCause` describes "the reason for a status change, such as
-            // automated actions taken due to reputation findings or manual status
-            // updates"; a status this account set carries no finding to describe.
-            cause: None,
-            last_updated_timestamp: Some(::aws_smithy_types::DateTime::from(
-                self.sending_status_updated_at,
-            )),
-        }
+    /// The customer-managed sending status in force on this tenant: the status the
+    /// account last wrote, or, while it has written none, the status a tenant may send
+    /// under from the moment it is created ([`TENANT_SENDING_STATUS_CREATED`]).
+    pub fn customer_managed_sending_status(&self) -> &str {
+        self.customer_managed_status
+            .as_ref()
+            .map_or(TENANT_SENDING_STATUS_CREATED, |record| {
+                record.status.as_str()
+            })
     }
 
-    /// The Amazon-SES-managed status record of this tenant's reputation entity.
-    ///
-    /// See [`AWS_SES_MANAGED_SENDING_STATUS`]: nothing here raises a reputation
-    /// finding, so this record has permitted sending since the tenant was created.
-    pub fn aws_ses_managed_status(&self) -> crate::ops::types::StatusRecord {
-        crate::ops::types::StatusRecord {
-            status: Some(AWS_SES_MANAGED_SENDING_STATUS.to_string()),
-            cause: None,
-            last_updated_timestamp: Some(::aws_smithy_types::DateTime::from(self.created_at)),
-        }
+    /// The Amazon-SES-managed sending status in force on this tenant: the status Amazon
+    /// SES last wrote, or, while it has written none, the status it permits a resource
+    /// it has raised no finding against ([`AWS_SES_MANAGED_SENDING_STATUS`]).
+    pub fn aws_ses_managed_sending_status(&self) -> &str {
+        self.aws_ses_managed_status
+            .as_ref()
+            .map_or(AWS_SES_MANAGED_SENDING_STATUS, |record| {
+                record.status.as_str()
+            })
     }
 
-    /// The aggregate sending status of this tenant's reputation entity, over its two
-    /// status records — see [`aggregate_sending_status`].
+    /// The aggregate sending status of this tenant's reputation entity, over the two
+    /// statuses in force on it — see [`aggregate_sending_status`].
     pub fn aggregate_sending_status(&self) -> String {
-        aggregate_sending_status(&self.sending_status, AWS_SES_MANAGED_SENDING_STATUS)
+        aggregate_sending_status(
+            self.customer_managed_sending_status(),
+            self.aws_ses_managed_sending_status(),
+        )
     }
 
     /// The modelled `ReputationEntity` view of this tenant, as
-    /// `ListReputationEntities` reports it.
-    pub fn reputation_entity(&self) -> crate::ops::types::ReputationEntity {
+    /// `ListReputationEntities` and `GetReputationEntity` report it, over the account's
+    /// reputation `findings`.
+    pub fn reputation_entity(
+        &self,
+        findings: &[crate::ops::types::Recommendation],
+    ) -> crate::ops::types::ReputationEntity {
         crate::ops::types::ReputationEntity {
             // "For resource-type entities, this is the Amazon Resource Name (ARN) of
             // the resource."
@@ -3164,33 +3189,36 @@ impl TenantRecord {
             // `UpdateReputationEntityPolicy` applies another — so the member is read
             // off the record rather than left absent.
             reputation_management_policy: Some(self.reputation_management_policy.clone()),
-            customer_managed_status: Some(self.customer_managed_status()),
-            aws_ses_managed_status: Some(self.aws_ses_managed_status()),
+            // Each status record is reported only once its own owner has written it: a
+            // record nothing wrote would tell a client a decision was taken about this
+            // entity's sending when none was.
+            customer_managed_status: self
+                .customer_managed_status
+                .as_ref()
+                .map(ReputationStatusRecord::view),
+            aws_ses_managed_status: self
+                .aws_ses_managed_status
+                .as_ref()
+                .map(ReputationStatusRecord::view),
             sending_status_aggregate: Some(self.aggregate_sending_status()),
-            // "The reputation impact reflects the highest impact reputation finding
-            // for the entity": with no finding against the entity there is no
-            // highest one, so the member is absent rather than a level nothing
-            // computed.
-            reputation_impact: None,
+            reputation_impact: Some(reputation_impact(findings, &self.arn)),
         }
     }
 
-    /// Write this tenant's suppression preferences, as a request that carries
+    /// Write this tenant's suppression preferences, as a request that states
     /// `TenantSuppressionAttributes` asks for.
     ///
     /// Both members are replaced together: the preferences a request states are the
     /// tenant's whole preferences afterwards, never merged with what was there.
-    pub fn set_suppression_preferences(&mut self, suppressed_reasons: Vec<String>, scope: String) {
-        self.suppressed_reasons = suppressed_reasons;
-        self.suppression_scope = scope;
+    pub fn set_suppression_preferences(&mut self, preferences: TenantSuppressionPreferences) {
+        self.suppression = Some(preferences);
     }
 
     /// Write the customer-managed sending status of this tenant's reputation entity,
-    /// as `UpdateReputationEntityCustomerManagedStatus` asks for, and stamp when it
-    /// was written.
+    /// as `UpdateReputationEntityCustomerManagedStatus` asks for: the status, the cause
+    /// that write is ([`CUSTOMER_MANAGED_STATUS_CAUSE`]) and when it was written.
     pub fn set_customer_managed_sending_status(&mut self, status: String, now: SystemTime) {
-        self.sending_status = status;
-        self.sending_status_updated_at = now;
+        self.customer_managed_status = Some(ReputationStatusRecord::manually_updated(status, now));
     }
 
     /// Apply the reputation management policy `policy` to this resource's reputation
@@ -3259,12 +3287,14 @@ impl TenantResourceAssociationRecord {
     }
 
     /// The modelled `TenantResource` view of this association, as
-    /// `ListTenantResources` reports it: the resource's ARN and the `ResourceType`
-    /// that ARN names, which is read off the ARN rather than stored beside it so one
-    /// record cannot disagree with itself about what it points at.
+    /// `ListTenantResources` reports it: the resource's ARN and the resource type that
+    /// ARN names, which is read off the ARN rather than stored beside it so one
+    /// record cannot disagree with itself about what it points at. The token reported
+    /// for a kind is the one SES reports ([`reported_tenant_resource_type`]).
     pub fn tenant_resource_view(&self) -> crate::ops::types::TenantResource {
         crate::ops::types::TenantResource {
-            resource_type: tenant_resource_type(&self.resource_arn).map(ToString::to_string),
+            resource_type: reported_tenant_resource_type(&self.resource_arn)
+                .map(ToString::to_string),
             resource_arn: Some(self.resource_arn.clone()),
         }
     }

@@ -15,7 +15,7 @@
 //! `ListResourceTenants` for that `ResourceArn` reports the tenant it was made for,
 //! with the tenant's own id and the instant it was associated, and
 //! `ListTenantResources` for that `TenantName` reports the resource, under the
-//! `ResourceType` its ARN names. The tables below span what the rule generalises
+//! resource-type token its ARN names. The tables below span what the rule generalises
 //! over: the kind of resource the ARN names, the partition, region, account and
 //! separator it carries, the form of the tenant name, how many tenants share one
 //! resource and how many resources one tenant holds, the order associations are made
@@ -939,14 +939,14 @@ async fn the_association_table_stops_growing_at_its_ceiling() {
     );
 }
 
-/// What the association surface admits as a `ResourceArn`, and the modelled
-/// `ResourceType` an admitted one is reported as.
+/// What the association surface admits as a `ResourceArn`, and the resource-type token
+/// an admitted one is reported as.
 struct ResourceArnCase {
     /// What this row varies, named in every assertion.
     case: &'static str,
     /// The `ResourceArn` the association is asked for.
     resource_arn: String,
-    /// The `ResourceType` the resource is listed as, or `None` when the ARN names no
+    /// The resource type the resource is listed as, or `None` when the ARN names no
     /// resource a tenant can hold and the association is refused.
     resource_type: Option<&'static str>,
 }
@@ -963,43 +963,44 @@ const NOT_AN_SES_RESOURCE: &str = "Provided ARN is not in SES resource ARN forma
 /// `CONFIGURATION_SET` and `EMAIL_TEMPLATE`), each written as the ARN SES addresses
 /// that kind with, and spanning what varies between two ARNs of one kind — the
 /// partition, the Region, the account, the separator before the resource id, and the
-/// id itself. Every other row names something a tenant cannot hold: another vendor's
-/// resource, an SES resource of another kind, an ARN naming no resource at all, and a
-/// value that is no ARN.
+/// id itself. The token each kind is REPORTED under is the resource-type token its own
+/// ARN carries, which is what SES is recorded serving. Every other row names something
+/// a tenant cannot hold: another vendor's resource, an SES resource of another kind, an
+/// ARN naming no resource at all, and a value that is no ARN.
 fn resource_arn_cases() -> Vec<ResourceArnCase> {
     vec![
         ResourceArnCase {
             case: "a configuration set",
             resource_arn: format!("arn:aws:ses:us-east-1:{ACCOUNT_ID}:configuration-set/nightly"),
-            resource_type: Some("CONFIGURATION_SET"),
+            resource_type: Some("configuration-set"),
         },
         ResourceArnCase {
             case: "an email identity that is an address",
             resource_arn: format!("arn:aws:ses:us-east-1:{ACCOUNT_ID}:identity/sender@example.com"),
-            resource_type: Some("EMAIL_IDENTITY"),
+            resource_type: Some("identity"),
         },
         ResourceArnCase {
             case: "an email identity that is a domain, in another Region",
             resource_arn: format!("arn:aws:ses:eu-west-1:{ACCOUNT_ID}:identity/example.com"),
-            resource_type: Some("EMAIL_IDENTITY"),
+            resource_type: Some("identity"),
         },
         ResourceArnCase {
             case: "an email template",
             resource_arn: format!("arn:aws:ses:us-east-1:{ACCOUNT_ID}:template/welcome"),
-            resource_type: Some("EMAIL_TEMPLATE"),
+            resource_type: Some("template"),
         },
         ResourceArnCase {
             case: "an email template in another partition, under another account",
             resource_arn: "arn:aws-us-gov:ses:us-gov-west-1:111122223333:template/welcome"
                 .to_string(),
-            resource_type: Some("EMAIL_TEMPLATE"),
+            resource_type: Some("template"),
         },
         ResourceArnCase {
             // AWS writes a resource field in either form, `<type>/<id>` and
             // `<type>:<id>`, so both name the same kind of resource.
             case: "a configuration set whose id follows a colon",
             resource_arn: format!("arn:aws:ses:us-east-1:{ACCOUNT_ID}:configuration-set:colon"),
-            resource_type: Some("CONFIGURATION_SET"),
+            resource_type: Some("configuration-set"),
         },
         ResourceArnCase {
             case: "another vendor's resource",

@@ -275,38 +275,29 @@ async fn every_tracked_resource_has_an_entity_whose_status_records_are_reported(
             RESOURCE,
             "case {case:?}: every entity is of the one modelled type, got {entity:?}"
         );
-        assert_eq!(
-            member(&entity, "/CustomerManagedStatus/Status"),
-            "ENABLED",
-            "case {case:?}: a resource nobody has acted on may send, got {entity:?}"
+        assert!(
+            entity.pointer("/CustomerManagedStatus").is_none(),
+            "case {case:?}: a resource whose sending nobody has decided anything about \
+             carries no customer-managed status record, got {entity:?}"
         );
-        assert_eq!(
-            member(&entity, "/AwsSesManagedStatus/Status"),
-            "ENABLED",
-            "case {case:?}: no finding was raised, so the Amazon-SES-managed status \
-             permits sending, got {entity:?}"
+        assert!(
+            entity.pointer("/AwsSesManagedStatus").is_none(),
+            "case {case:?}: no finding was raised, so Amazon SES has written no status \
+             record of its own, got {entity:?}"
         );
         assert_eq!(
             member(&entity, "/SendingStatusAggregate"),
             "ENABLED",
-            "case {case:?}: both records permit sending, so the aggregate does, got \
-             {entity:?}"
+            "case {case:?}: both statuses in force permit sending, so the aggregate \
+             does, got {entity:?}"
         );
-        for record in ["/CustomerManagedStatus", "/AwsSesManagedStatus"] {
-            assert!(
-                entity
-                    .pointer(&format!("{record}/LastUpdatedTimestamp"))
-                    .and_then(Value::as_f64)
-                    .is_some(),
-                "case {case:?}: {record} must report when it was last written, got \
-                 {entity:?}"
-            );
-        }
-        // "The reputation impact reflects the highest impact reputation finding for the
-        // entity": with no finding against the entity there is no highest one.
-        assert!(
-            entity.pointer("/ReputationImpact").is_none(),
-            "case {case:?}: an entity with no finding reports no impact, got {entity:?}"
+        // "The reputation impact ... representing the highest impact reputation finding
+        // currently active": with no finding against the entity the level is NONE.
+        assert_eq!(
+            member(&entity, "/ReputationImpact"),
+            "NONE",
+            "case {case:?}: an entity with no active finding reports no impact level, \
+             got {entity:?}"
         );
     }
 }
@@ -356,11 +347,10 @@ async fn a_customer_managed_status_change_is_what_the_listing_reports() {
             "case {case:?}: the listing must report the status that was written, got \
              {entity:?}"
         );
-        assert_eq!(
-            member(&entity, "/AwsSesManagedStatus/Status"),
-            "ENABLED",
-            "case {case:?}: writing the customer-managed status leaves the \
-             Amazon-SES-managed status unchanged, got {entity:?}"
+        assert!(
+            entity.pointer("/AwsSesManagedStatus").is_none(),
+            "case {case:?}: writing the customer-managed status leaves Amazon SES's own \
+             status record unwritten, got {entity:?}"
         );
         assert_eq!(
             member(&entity, "/SendingStatusAggregate"),
@@ -862,10 +852,9 @@ async fn a_status_write_outside_the_modelled_input_is_refused_and_stores_nothing
     // Not one of the refused writes reached the entity.
     let listed = ses.list_entities(json!({})).await;
     let entity = entity_for(&listed, &reference);
-    assert_eq!(
-        member(&entity, "/CustomerManagedStatus/Status"),
-        "ENABLED",
-        "case {:?}: a refused write must leave the entity's status as it was, got {entity:?}",
+    assert!(
+        entity.pointer("/CustomerManagedStatus").is_none(),
+        "case {:?}: a refused write must leave the entity's status unwritten, got {entity:?}",
         "every refused write"
     );
     assert_eq!(
@@ -899,27 +888,27 @@ async fn a_read_of_one_entity_reports_the_entry_a_listing_of_it_reports() {
     .await;
 
     // One row per resource, each left in a different `SendingStatus` (including one left
-    // exactly as created, which nothing wrote to): the read must report the status the
-    // account last wrote and the aggregate the two records imply, with the
-    // Amazon-SES-managed record permitting sending throughout.
+    // exactly as created, which nothing wrote to): the read must report the record the
+    // account's own write left, and the aggregate the statuses in force imply, with
+    // Amazon SES having written no status record of its own throughout.
     let rows = [
-        ("a resource nobody has acted on", None, "ENABLED", "ENABLED"),
+        ("a resource nobody has acted on", None, None, "ENABLED"),
         (
             "a resource whose sending was prevented",
             Some("DISABLED"),
-            "DISABLED",
+            Some("DISABLED"),
             "DISABLED",
         ),
         (
             "a resource whose sending was reinstated",
             Some("REINSTATED"),
-            "REINSTATED",
+            Some("REINSTATED"),
             "REINSTATED",
         ),
         (
             "a resource whose sending was allowed again",
             Some("ENABLED"),
-            "ENABLED",
+            Some("ENABLED"),
             "ENABLED",
         ),
     ];
@@ -957,39 +946,48 @@ async fn a_read_of_one_entity_reports_the_entry_a_listing_of_it_reports() {
             "case {case:?}: every entity is of the one modelled type, got {entity:?}"
         );
         assert_eq!(
-            member(&entity, "/CustomerManagedStatus/Status"),
+            entity
+                .pointer("/CustomerManagedStatus/Status")
+                .and_then(Value::as_str),
             customer,
-            "case {case:?}: the read must report the status the account last wrote, got \
-             {entity:?}"
+            "case {case:?}: the read must report the status the account wrote, and no \
+             customer-managed record at all when it wrote none, got {entity:?}"
         );
-        assert_eq!(
-            member(&entity, "/AwsSesManagedStatus/Status"),
-            "ENABLED",
-            "case {case:?}: no finding was raised, so the Amazon-SES-managed status \
-             permits sending, got {entity:?}"
+        assert!(
+            entity.pointer("/AwsSesManagedStatus").is_none(),
+            "case {case:?}: no finding was raised, so Amazon SES has written no status \
+             record of its own, got {entity:?}"
         );
         assert_eq!(
             member(&entity, "/SendingStatusAggregate"),
             aggregate,
-            "case {case:?}: the aggregate must follow both records, got {entity:?}"
+            "case {case:?}: the aggregate must follow the statuses in force, got {entity:?}"
         );
-        for record in ["/CustomerManagedStatus", "/AwsSesManagedStatus"] {
+        if customer.is_some() {
+            // A record the account wrote states the status, why it changed and when.
+            assert_eq!(
+                member(&entity, "/CustomerManagedStatus/Cause"),
+                state::CUSTOMER_MANAGED_STATUS_CAUSE,
+                "case {case:?}: a status the account set itself states that as its \
+                 cause, got {entity:?}"
+            );
             assert!(
                 entity
-                    .pointer(&format!("{record}/LastUpdatedTimestamp"))
+                    .pointer("/CustomerManagedStatus/LastUpdatedTimestamp")
                     .and_then(Value::as_f64)
                     .is_some(),
-                "case {case:?}: {record} must report when it was last written, got \
-                 {entity:?}"
+                "case {case:?}: the record must report when it was written, got {entity:?}"
             );
         }
-        // "The reputation impact reflects the highest impact reputation finding for the
-        // entity": with no finding against the entity there is no highest one. A policy
-        // is always in force, though — the service's own default until a caller applies
-        // another.
-        assert!(
-            entity.pointer("/ReputationImpact").is_none(),
-            "case {case:?}: an entity with no finding reports no impact, got {entity:?}"
+        // "The reputation impact ... representing the highest impact reputation finding
+        // currently active": with no finding against the entity the level is NONE. A
+        // policy is always in force, though — the service's own default until a caller
+        // applies another.
+        assert_eq!(
+            member(&entity, "/ReputationImpact"),
+            state::REPUTATION_IMPACT_NONE,
+            "case {case:?}: an entity with no active finding reports no impact level, \
+             got {entity:?}"
         );
         assert_eq!(
             member(&entity, "/ReputationManagementPolicy"),
@@ -1136,10 +1134,15 @@ async fn a_read_of_an_entity_no_call_reaches_is_refused_and_changes_nothing() {
     // Not one of the refused reads touched the entity it failed to reach.
     let read = ses.get_entity(RESOURCE, &reference).await;
     let entity = read_entity(&read);
-    assert_eq!(
-        member(&entity, "/CustomerManagedStatus/Status"),
-        "ENABLED",
+    assert!(
+        entity.pointer("/CustomerManagedStatus").is_none(),
         "case {:?}: a refused read must leave the entity as it was, got {entity:?}",
+        "every refused read"
+    );
+    assert_eq!(
+        member(&entity, "/SendingStatusAggregate"),
+        "ENABLED",
+        "case {:?}: a refused read must leave the status in force as it was, got {entity:?}",
         "every refused read"
     );
     assert_eq!(

@@ -165,13 +165,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Reputation management policies are Amazon Web Services Amazon SES-managed
         // (predefined policies). You can select from none, standard, and strict
         // policies": a caller does not author a policy, it selects one, so a value
-        // naming none of the predefined policies names nothing to apply and is refused
-        // on the input — before any lookup and before any write.
+        // naming none of the predefined policies names no resource this surface can
+        // address and is refused on the input — before any lookup and before any write
+        // — with the fixed sentence SES states for an unusable resource identifier.
         let policy = input.reputation_entity_policy;
         if crate::state::reputation_management_policy_name(&policy).is_none() {
-            return Err(bad_request(
-                crate::state::invalid_reputation_management_policy(&policy),
-            ));
+            return Err(bad_request(crate::state::INVALID_RESOURCE_IDENTIFIER));
         }
 
         let reference = input.reputation_entity_reference;

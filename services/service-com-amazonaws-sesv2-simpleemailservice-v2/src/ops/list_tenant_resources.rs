@@ -257,12 +257,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .tenant_resource_associations
             .values()
             .filter(|record| record.belongs_to(tenant))
-            .map(crate::state::TenantResourceAssociationRecord::tenant_resource_view)
-            .filter(|resource| {
-                resource_type
-                    .as_deref()
-                    .is_none_or(|wanted| resource.resource_type.as_deref() == Some(wanted))
+            // The filter value is the `ResourceType` the model binds, which is what the
+            // REQUEST names a kind by, so a row is kept by the modelled kind its ARN
+            // names — not by the token the row is REPORTED under.
+            .filter(|record| {
+                resource_type.as_deref().is_none_or(|wanted| {
+                    crate::state::tenant_resource_type(&record.resource_arn) == Some(wanted)
+                })
             })
+            .map(crate::state::TenantResourceAssociationRecord::tenant_resource_view)
             .collect();
         let start = match resume_after.as_deref() {
             None => 0,

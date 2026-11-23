@@ -496,8 +496,10 @@ async fn a_policy_outside_the_predefined_set_is_refused_and_changes_nothing() {
         );
         assert_eq!(
             refused.message(),
-            state::invalid_reputation_management_policy(&policy),
-            "case {case:?}: expected the refusal to name the policy it was given, got {:?}",
+            state::INVALID_RESOURCE_IDENTIFIER,
+            "case {case:?}: expected the refusal to read \
+             {:?}, got {:?}",
+            state::INVALID_RESOURCE_IDENTIFIER,
             refused.message()
         );
         assert_eq!(

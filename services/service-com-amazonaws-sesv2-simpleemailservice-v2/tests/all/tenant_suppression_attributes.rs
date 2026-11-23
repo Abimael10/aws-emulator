@@ -10,9 +10,10 @@
 //! REPLACES both stored members with the ones the request carries, so a member the
 //! request leaves out takes its documented default (`ACCOUNT` scope, and no reason at
 //! all) rather than keeping what was there; a read of that tenant then reports exactly
-//! the stored pair, and a request naming a value outside a member's modelled value set,
-//! a `TenantName` outside the documented form, or a tenant the account does not hold is
-//! refused with the modelled error for that class and stores nothing.
+//! the stored pair, and no `SuppressionAttributes` at all for a tenant no write has
+//! stated preferences for; and a request naming a value outside a member's modelled
+//! value set, a `TenantName` outside the documented form, or a tenant the account does
+//! not hold is refused with the modelled error for that class and stores nothing.
 //!
 //! The tables below span what the rule generalises over: how many reasons the request
 //! names (none, one, every one, the same one twice), which ones and in which order, each
@@ -71,7 +72,8 @@ async fn reported_attributes(ses: &Ses, name: &str) -> Value {
 }
 
 /// The `TenantSuppressionAttributes` body a stored pair is reported as: the scope is
-/// always present, and the reasons only when the tenant adds something automatically.
+/// always present once a write has stated the preferences, and the reasons only when
+/// the tenant adds something automatically.
 fn attributes(scope: &str, reasons: &[&str]) -> Value {
     let mut value = json!({"SuppressionScope": scope});
     if !reasons.is_empty() {
@@ -400,9 +402,11 @@ async fn a_put_touches_only_the_tenant_it_names() {
             attributes("TENANT", &["BOUNCE"]),
         ),
         (
+            // Nothing stated this tenant's preferences, so it holds none and reports
+            // none: it uses the account-level list, which is the documented default.
             "a tenant the put did not name",
             "second",
-            attributes("ACCOUNT", &[]),
+            Value::Null,
         ),
     ] {
         let reported = reported_attributes(&ses, tenant).await;

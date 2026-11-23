@@ -184,23 +184,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "You can optionally specify SuppressionAttributes to configure tenant-level
-        // suppression at creation time": the preferences the request states are stored,
-        // and a member it leaves out takes its documented default — the same resolution
-        // `PutTenantSuppressionAttributes` applies, so the two writes cannot disagree
-        // about what a tenant's preferences are. Resolved before anything is minted, so
-        // a refused request leaves the account exactly as it was.
-        let requested = input.suppression_attributes.unwrap_or_default();
-        let (suppressed_reasons, suppression_scope) = crate::state::tenant_suppression_preferences(
-            requested.suppressed_reasons,
-            requested.suppression_scope,
-        )
-        .map_err(|message| {
-            CreateTenantError::from(CreateTenantErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: Some(message),
-                },
-            ))
-        })?;
+        // suppression at creation time": the preferences a request STATES are stored,
+        // with a member it leaves out taking its documented default — the same
+        // resolution `PutTenantSuppressionAttributes` applies, so the two writes cannot
+        // disagree about what a tenant's preferences are. A request that states no
+        // preferences at all stores none: the tenant then uses the account-level
+        // suppression list, which is what the scope defaults to, and reports no
+        // preferences of its own. Resolved before anything is minted, so a refused
+        // request leaves the account exactly as it was.
+        let requested = match input.suppression_attributes {
+            None => None,
+            Some(stated) => Some(
+                crate::state::tenant_suppression_preferences(
+                    stated.suppressed_reasons,
+                    stated.suppression_scope,
+                )
+                .map_err(|message| {
+                    CreateTenantError::from(CreateTenantErrorModeled::BadRequestException(
+                        BadRequestException {
+                            message: Some(message),
+                        },
+                    ))
+                })?,
+            ),
+        };
 
         // The ARN carries the region the request was signed for, so a tenant minted
         // in one region does not claim another's, and the account whose tenant names
@@ -245,7 +252,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into_iter()
             .map(|tag| (tag.key, tag.value))
             .collect();
-        record.set_suppression_preferences(suppressed_reasons, suppression_scope);
+        if let Some(preferences) = requested {
+            record.set_suppression_preferences(preferences);
+        }
 
         // Everything reported comes from ONE projection of the record that was just
         // persisted — the same `TenantRecord::view` `GetTenant` answers with — so the
