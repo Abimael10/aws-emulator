@@ -46,7 +46,11 @@ use crate::stack_fleet_lifecycle::{assert_error, Emulator};
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// The Region every case below signs for.
-const REGION: &str = "us-east-1";
+///
+/// Shared with the other suites in this target
+/// (`tests/all/app_block_builder_slot_invariant.rs`), so every association case signs for
+/// the same Region.
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The only `AppBlockBuilderPlatformType` the model declares, and the only value
 /// `CreateAppBlockBuilder.Platform` documents.
@@ -80,7 +84,10 @@ fn app_block_arn(name: &str) -> String {
 }
 
 /// Create an app block builder of `name`.
-async fn create_builder(emulator: &Emulator, case: &str, name: &str) {
+///
+/// Shared with the other suites in this target
+/// (`tests/all/app_block_builder_slot_invariant.rs`).
+pub(crate) async fn create_builder(emulator: &Emulator, case: &str, name: &str) {
     emulator
         .ok(
             case,
@@ -134,7 +141,10 @@ async fn create_app_block(
 }
 
 /// The associations a read of `selector` reports.
-async fn associated(emulator: &Emulator, case: &str, selector: Value) -> Vec<Value> {
+///
+/// Shared with the other suites in this target
+/// (`tests/all/app_block_builder_slot_invariant.rs`).
+pub(crate) async fn associated(emulator: &Emulator, case: &str, selector: Value) -> Vec<Value> {
     let payload = emulator
         .ok(
             case,
@@ -813,12 +823,18 @@ async fn a_refused_association_leaves_the_admitted_edges_untouched() {
 /// The wire code AWS answers a request the service does not permit with
 /// (`OperationNotPermittedException`, `httpError` 400 —
 /// `smithy_query(query="operation", operation="AssociateAppBlockBuilderAppBlock")`).
-const NOT_PERMITTED_CODE: &str = "OperationNotPermittedException";
+///
+/// Shared with the other suites in this target
+/// (`tests/all/app_block_builder_slot_invariant.rs`).
+pub(crate) const NOT_PERMITTED_CODE: &str = "OperationNotPermittedException";
 
 /// The sentence the service states for an app block builder whose one app block slot is
 /// already taken, read from the crate so the test tracks the wording rather than a copy of
 /// it.
-fn slot_taken_sentence() -> String {
+///
+/// Shared with the other suites in this target
+/// (`tests/all/app_block_builder_slot_invariant.rs`).
+pub(crate) fn slot_taken_sentence() -> String {
     service_com_amazonaws_appstream_photonadminproxyservice::state::app_block_builder_app_block_slot_taken_message()
 }
 
@@ -834,7 +850,14 @@ async fn associate(emulator: &Emulator, case: &str, builder: &str, app_block_arn
 }
 
 /// A builder-packaged app block of `name`, carrying an application package already.
-async fn create_associable_app_block(emulator: &Emulator, case: &str, name: &str) -> String {
+///
+/// Shared with the other suites in this target
+/// (`tests/all/app_block_builder_slot_invariant.rs`).
+pub(crate) async fn create_associable_app_block(
+    emulator: &Emulator,
+    case: &str,
+    name: &str,
+) -> String {
     create_app_block(
         emulator,
         case,
