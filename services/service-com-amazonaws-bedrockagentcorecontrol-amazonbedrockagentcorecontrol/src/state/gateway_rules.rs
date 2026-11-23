@@ -8,11 +8,12 @@
 //! (`/gateways/{gatewayIdentifier}/rules/{ruleId}`), so the create and every
 //! later read answer from this one shape and cannot drift.
 
+use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Action, Condition, CreateGatewayRuleOutput, GetGatewayRuleOutput, ResourceNotFoundException,
-    SystemManagedBlock, ValidationException,
+    Action, Condition, CreateGatewayRuleOutput, GatewayRuleDetail, GetGatewayRuleOutput,
+    ResourceNotFoundException, SystemManagedBlock, ValidationException,
 };
 
 use super::{
@@ -105,6 +106,42 @@ pub fn refusal_for_gateway_rule_write(
 ) -> Option<ValidationException> {
     let status = gateway.status_at(now);
     (status != STATUS_READY).then(|| gateway_not_ready_for_rule(gateway_identifier, status))
+}
+
+/// The modelled validation error a write of a gateway's rules gets when the
+/// `priority` it asks for is one a rule of that same gateway already holds
+/// ("Priority 500 conflicts with an existing rule").
+///
+/// The sentence is fixed and the priority is its only variable part — the value
+/// the request's `priority` member carried, rendered as the integer it is.
+/// `reason` is [`super::VALIDATION_REASON_RESOURCE_CONFLICT`] and there is no
+/// `fieldList`: the member itself satisfies every modelled constraint, it is the
+/// rule already holding that priority that refuses it.
+pub fn gateway_rule_priority_conflict(priority: i32) -> ValidationException {
+    ValidationException {
+        message: format!("Priority {priority} conflicts with an existing rule"),
+        reason: VALIDATION_REASON_RESOURCE_CONFLICT.to_string(),
+        field_list: None,
+    }
+}
+
+/// The rule this gateway already holds at `priority`, if one does.
+///
+/// "Rules are evaluated in order of priority, with lower numbers evaluated
+/// first" (`smithy_query doc shape=CreateGatewayRuleRequest member=priority`):
+/// the priority is the gateway's rule-EVALUATION key, so one gateway holds at
+/// most one rule at any priority — two rules at one priority would leave which
+/// of them is evaluated there undecidable. The scope is the one gateway: the
+/// rules of a DIFFERENT gateway are evaluated in their own order, so the same
+/// priority is free on each.
+///
+/// Shared by every write of a gateway's rules, so they cannot disagree about
+/// which priorities one gateway's rule set can hold.
+pub fn rule_holding_priority(
+    rules: &BTreeMap<String, GatewayRuleRecord>,
+    priority: i32,
+) -> Option<&GatewayRuleRecord> {
+    rules.values().find(|held| held.priority == priority)
 }
 
 /// How many rules one gateway will hold.
@@ -215,6 +252,25 @@ impl GatewayRuleRecord {
             created_at: timestamp(self.created_at),
             status: self.status_at(now).to_string(),
             system: self.system(),
+        }
+    }
+
+    /// This rule as one entry of a LISTING of its gateway's rules — the same
+    /// members [`Self::get_output`] reports, off the same record, so a rule read
+    /// one at a time and the same rule read out of the list cannot disagree.
+    pub fn detail(&self, gateway_arn: &str, now: SystemTime) -> GatewayRuleDetail {
+        let read = self.get_output(gateway_arn, now);
+        GatewayRuleDetail {
+            rule_id: read.rule_id,
+            gateway_arn: read.gateway_arn,
+            priority: read.priority,
+            conditions: read.conditions,
+            actions: read.actions,
+            description: read.description,
+            created_at: read.created_at,
+            status: read.status,
+            system: read.system,
+            updated_at: read.updated_at,
         }
     }
 

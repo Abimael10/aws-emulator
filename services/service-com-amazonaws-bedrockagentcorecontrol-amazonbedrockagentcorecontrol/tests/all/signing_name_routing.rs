@@ -235,7 +235,7 @@ async fn requests_on_its_own_routes_reach_this_service() {
     let router = router();
 
     // (case, method, uri, body, expected status, expected error code)
-    let rows: [(&str, &str, &str, Value, u16, &str); 6] = [
+    let rows: [(&str, &str, &str, Value, u16, &str); 7] = [
         (
             "CreateGateway, implemented",
             "POST",
@@ -258,9 +258,17 @@ async fn requests_on_its_own_routes_reach_this_service() {
             "",
         ),
         (
-            "ListGatewayRules, still scaffolded",
+            "ListGatewayRules on a gateway that does not exist, implemented",
             "GET",
             "/gateways/my-gateway-abcdefghij/rules",
+            Value::Null,
+            404,
+            "ResourceNotFoundException",
+        ),
+        (
+            "DeleteGatewayRule, still scaffolded",
+            "DELETE",
+            "/gateways/my-gateway-abcdefghij/rules/0123abcd-4567-89ef-0123-456789abcdef",
             Value::Null,
             501,
             "NotImplemented",

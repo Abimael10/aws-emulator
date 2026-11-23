@@ -814,17 +814,21 @@ async fn a_gateway_holds_a_bounded_number_of_rules() {
 
     let router = router();
     let gateway_id = gateway(&router, "createrulequota").await;
-    let body = Submitted {
-        priority: 1,
-        conditions: None,
-        actions: vec![static_route("orders")],
-        description: None,
-    }
-    .body();
+    // One gateway holds at most one rule at any priority, so the loop asks for a priority
+    // no rule it already got accepted holds: what it meets is the quota, not a collision.
+    let body = |taken: usize| {
+        Submitted {
+            priority: i64::try_from(taken).expect("the attempt count fits a priority") + 1,
+            conditions: None,
+            actions: vec![static_route("orders")],
+            description: None,
+        }
+        .body()
+    };
 
     let mut accepted: Vec<String> = Vec::new();
     let refused = loop {
-        let answer = create_rule(&router, &gateway_id, &body).await;
+        let answer = create_rule(&router, &gateway_id, &body(accepted.len())).await;
         if answer.status != 202 {
             break answer;
         }

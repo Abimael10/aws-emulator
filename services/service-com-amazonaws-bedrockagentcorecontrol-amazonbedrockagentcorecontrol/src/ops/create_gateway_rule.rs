@@ -4,7 +4,9 @@
 //! Implemented: creates one rule on the gateway the path names and stores it
 //! there, so the create and every later read of the rule answer from that one
 //! record. The gateway has to have reached READY first: a rule write against a
-//! gateway in any other lifecycle status is refused.
+//! gateway in any other lifecycle status is refused. The rule's priority is the
+//! order the gateway evaluates it in, so a priority a sibling rule of the same
+//! gateway already holds is refused too, and nothing is stored for it.
 //!
 //! ## Shape of an operation
 //!
@@ -236,6 +238,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let gateway_id = gateway.gateway_id.clone();
         let gateway_arn = gateway.gateway_arn.clone();
+        // A rule's priority is the order the gateway EVALUATES it in, so one
+        // gateway holds at most one rule at any priority: a second rule at a
+        // priority a sibling already holds would leave which of the two is
+        // evaluated there undecidable, and is refused before anything is minted
+        // or stored. The scope is this one gateway — another gateway's rules are
+        // evaluated in their own order, so the same priority is free on it.
+        if crate::state::rule_holding_priority(&gateway.rules, input.priority).is_some() {
+            return Err(CreateGatewayRuleErrorModeled::ValidationException(
+                crate::state::gateway_rule_priority_conflict(input.priority),
+            )
+            .into());
+        }
         // The rules one gateway holds are bounded, so a caller looping on create
         // meets the modelled quota instead of this process's memory limit.
         if gateway.rules.len() >= crate::state::MAX_RULES_PER_GATEWAY {
