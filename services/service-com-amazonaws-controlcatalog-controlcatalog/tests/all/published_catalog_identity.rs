@@ -32,6 +32,13 @@
 //! controls the catalog publishes under their `SH.` designators are served under their
 //! published control ARNs and, having been released together, with one release instant.
 //!
+//! The last two tests carry the WORDING half of the rule across every kind the catalog
+//! publishes — domain, objective, common control and control: an entry whose published
+//! description the catalog records is served with that text, character for character,
+//! and with ONE such text wherever the catalog reports the entry (an unfiltered listing,
+//! the filter that narrows to its parent, and, for a control, the read that resolves its
+//! ARN). A description composed from the entry's subject is what those two tests refuse.
+//!
 //! Each test is a TABLE spanning the class rather than one entry picked by hand: the rows
 //! differ in catalog kind (domain, objective, common control), in whether the entry's
 //! published identifier is recorded, and — for the generated rows — cover every entry the
@@ -50,10 +57,10 @@ use crate::control_catalog::{at_path, catalog_arn, catalog_kind_arn, drain, Emul
 /// `arn:{PARTITION}:controlcatalog:::objective/{identifier}` it names the entry by, and
 /// the name it publishes for it. `domain` is the name of the domain an objective belongs
 /// to, and `None` for a domain itself. `description` is the paragraph the catalog
-/// publishes for the entry, as a recorded response of the taxonomy listings quotes it in
-/// full, and `None` for an entry whose recorded quote is clipped or absent — so no
-/// paragraph is reconstructed here; such an entry still has to be served with a
-/// description, which the test below checks separately.
+/// publishes for the entry, as a recorded response of the taxonomy listings quotes it,
+/// and `None` for an entry whose recorded quote is absent — so no paragraph is written
+/// here that the publication's own wording does not carry; such an entry still has to be
+/// served with a description, which the test below checks separately.
 struct PublishedEntry {
     kind: &'static str,
     identifier: &'static str,
@@ -66,6 +73,10 @@ struct PublishedEntry {
 const DOMAIN: &str = "domain";
 /// The `objective` kind, as a catalog ARN spells it.
 const OBJECTIVE: &str = "objective";
+/// The `common-control` kind, as a catalog ARN spells it.
+const COMMON_CONTROL: &str = "common-control";
+/// The `control` kind, as a catalog ARN spells it.
+const CONTROL: &str = "control";
 
 /// The name of the domain the published objectives below belong to.
 const ASSET_MANAGEMENT: &str = "Asset management";
@@ -104,7 +115,12 @@ const PUBLISHED_ENTRIES: &[PublishedEntry] = &[
         identifier: "884eyhr622uy73h6i1mjb9lfb",
         name: "Data protection",
         domain: None,
-        description: None,
+        description: Some(
+            "This control domain focuses on data protection measures and practices used \
+             to safeguard information, including confidentiality, integrity, and \
+             availability, while ensuring compliance with applicable laws and regulations \
+             governing data handling, cryptography, and encryption key management.",
+        ),
     },
     PublishedEntry {
         kind: DOMAIN,
@@ -213,6 +229,8 @@ fn listing_for(kind: &str) -> (&'static str, &'static str) {
     match kind {
         DOMAIN => ("/domains", "Domains"),
         OBJECTIVE => ("/objectives", "Objectives"),
+        COMMON_CONTROL => ("/common-controls", "CommonControls"),
+        CONTROL => ("/list-controls", "Controls"),
         other => panic!("case {other}: the table only names kinds a listing serves"),
     }
 }
@@ -504,4 +522,284 @@ async fn published_security_hub_controls_carry_their_published_identity() {
         "case Security Hub controls: controls the catalog released together must share \
          one CreateTime, got {release_instants:?}"
     );
+}
+
+/// One entry outside the taxonomy listings whose published DESCRIPTION the catalog
+/// records: a common control, or a control.
+///
+/// Source: the Control Catalog's own published records — the opaque identifier its ARN
+/// carries, and the text it publishes as the entry's description (for a Security
+/// Hub-implemented control, the sentence the catalog publishes for that control; for a
+/// common control, the paragraph the common-control library publishes under its
+/// objective). The rows span what the rule generalises over: both kinds, descriptions of
+/// one sentence and of several, the two implementing surfaces a control is published
+/// over, and four different owning objectives — and most of them are entries no step this
+/// suite was written for named, so the rule is asserted beyond the cited ones.
+struct PublishedDescription {
+    kind: &'static str,
+    identifier: &'static str,
+    description: &'static str,
+}
+
+/// Common controls and controls whose published description the catalog records.
+const PUBLISHED_DESCRIPTIONS: &[PublishedDescription] = &[
+    PublishedDescription {
+        kind: COMMON_CONTROL,
+        identifier: "1ukpmkewk4i92tjmhsvewi4y7",
+        description: "Maintain an asset inventory of organization authorized and \
+                      existing hardware, software, and media. Where possible, utilize \
+                      automated tools to facilitate the discovery and ongoing tracking \
+                      of such assets.",
+    },
+    PublishedDescription {
+        kind: COMMON_CONTROL,
+        identifier: "7encqm6cfsw704eoahh3ujr7y",
+        description: "Assign a value to assets based on their cost, replacement value, \
+                      or other relevant factors.",
+    },
+    PublishedDescription {
+        kind: COMMON_CONTROL,
+        identifier: "ez1ccu4xkxrmlekcvjqo3jk59",
+        description: "Monitor and optimize the performance and security of assets, \
+                      including hardware and software.",
+    },
+    PublishedDescription {
+        kind: COMMON_CONTROL,
+        identifier: "ez4hcdf2fpirhuyojurkval9w",
+        description: "Schedule and track maintenance activities for assets, including \
+                      preventive maintenance and repairs.",
+    },
+    PublishedDescription {
+        kind: COMMON_CONTROL,
+        identifier: "aaaq1vhzpslfrk1o4hvgk3ti4",
+        description: "Assess potential security and compliance risks as part of the \
+                      asset acquisition process.",
+    },
+    PublishedDescription {
+        kind: COMMON_CONTROL,
+        identifier: "eboqkjlzo44e0ia5wba1770tw",
+        description: "Configure assets securely prior to deployment in the environment. \
+                      Confirm the proper integration of new assets with existing systems.",
+    },
+    PublishedDescription {
+        kind: COMMON_CONTROL,
+        identifier: "bme9uq29isv0jdrdy4yj2c702",
+        description: "Retire and dispose of assets, including media, that are no longer \
+                      needed. Securely erase or destroy any sensitive data before asset \
+                      disposal.",
+    },
+    PublishedDescription {
+        kind: COMMON_CONTROL,
+        identifier: "1nxqoydhsjdyboc4frsrrmev",
+        description: "Define, document, implement, and maintain a formal process for \
+                      submitting and approving change requests. Change requests should \
+                      outline the proposed changes, their impact, and any associated \
+                      risks. The requests should then be reviewed and approved by the \
+                      appropriate stakeholders, ensuring that changes are properly \
+                      assessed, authorized, and tracked.",
+    },
+    PublishedDescription {
+        kind: COMMON_CONTROL,
+        identifier: "8xy67kb7kojr38ozqpmrm60d7",
+        description: "Implement an automated change deployment pipeline that automates \
+                      deployment of systems, software, and infrastructure as code (IaC) \
+                      to production environments through a controlled and consistent \
+                      process. Enforce automated security controls, perform validation \
+                      checks, and provide a rollback mechanism in case of deployment \
+                      failures.",
+    },
+    PublishedDescription {
+        kind: CONTROL,
+        identifier: "ezfflnh8xgshxb78grtt5sjc5",
+        description: "This AWS control checks whether the root user access key is \
+                      available.",
+    },
+    PublishedDescription {
+        kind: CONTROL,
+        identifier: "6g3gbim493yofkc9eg6vvnahm",
+        description: "This AWS control checks whether AWS Multi-Factor Authentication \
+                      (MFA) is enabled for all AWS Identity and Access Management (IAM) \
+                      users that use a console password.",
+    },
+    PublishedDescription {
+        kind: CONTROL,
+        identifier: "435u8u4w5bsf02tkxga5jisbc",
+        description: "This AWS control checks that there is at least one multi-region \
+                      AWS CloudTrail trail includes read and write management events.",
+    },
+    PublishedDescription {
+        kind: CONTROL,
+        identifier: "624yg0j9d8swiglwfc1m4kvnm",
+        description: "This AWS control checks whether CloudTrail log file validation is \
+                      enabled.",
+    },
+    PublishedDescription {
+        kind: CONTROL,
+        identifier: "62smpoz33dsy0oa7u1iwa58lz",
+        description: "This AWS control checks whether Amazon GuardDuty is enabled in \
+                      your AWS account and region.",
+    },
+];
+
+/// Page sizes the listings below are walked with: the listing's own default page, and a
+/// size that splits every one of them across several pages, so a resumed walk has to
+/// carry the published wording too.
+const WORDING_PAGE_SIZES: [Option<u32>; 2] = [None, Some(7)];
+
+/// Every entry whose published description the catalog records, as
+/// `(kind, identifier, published description)` — the taxonomy rows above whose paragraph
+/// is recorded, plus the common controls and controls of [`PUBLISHED_DESCRIPTIONS`].
+fn recorded_descriptions() -> Vec<(&'static str, &'static str, &'static str)> {
+    PUBLISHED_ENTRIES
+        .iter()
+        .filter_map(|row| {
+            row.description
+                .map(|description| (row.kind, row.identifier, description))
+        })
+        .chain(
+            PUBLISHED_DESCRIPTIONS
+                .iter()
+                .map(|row| (row.kind, row.identifier, row.description)),
+        )
+        .collect()
+}
+
+/// Every entry whose published description the catalog records is served with THAT text,
+/// character for character, by the listing that publishes it — at the listing's own page
+/// size and at one that splits it across pages.
+///
+/// The rows span all four kinds the catalog publishes (domain, objective, common control
+/// and control), descriptions of one sentence and of several, and both surfaces a control
+/// is implemented over. A description the emulator composes from the entry's subject —
+/// shorter, re-worded, or naming the implementing rule — fails this test, which is the
+/// point of it: the catalog is a publication, and its text is published content rather
+/// than something to be summarised.
+#[tokio::test]
+async fn every_recorded_entry_is_served_with_the_catalogs_published_description() {
+    let emulator = Emulator::new();
+    let rows = recorded_descriptions();
+    assert!(
+        rows.len() > 10,
+        "case table: the published-wording rows must span the catalog, got {}",
+        rows.len()
+    );
+
+    for page_size in WORDING_PAGE_SIZES {
+        let mut listings: BTreeMap<&str, BTreeMap<String, Value>> = BTreeMap::new();
+        for (kind, _, _) in &rows {
+            if !listings.contains_key(kind) {
+                let (path, items_key) = listing_for(kind);
+                listings.insert(
+                    kind,
+                    listed_by_arn(&emulator, path, items_key, page_size).await,
+                );
+            }
+        }
+
+        for (kind, identifier, published) in &rows {
+            let arn = catalog_kind_arn(kind, identifier);
+            let case = format!("{kind} {identifier} maxResults={page_size:?}");
+            let entry = listings[kind]
+                .get(&arn)
+                .unwrap_or_else(|| panic!("case {case}: the catalog must publish {arn}"));
+            assert_eq!(
+                entry["Description"].as_str(),
+                Some(*published),
+                "case {case}: expected the catalog's published description \
+                 {published:?}, got {:?}",
+                entry["Description"]
+            );
+        }
+    }
+}
+
+/// One published description per entry, wherever the catalog reports it: an objective and
+/// a common control carry the same text in the listing narrowed to their parent as in the
+/// unfiltered one, and a control carries the same text in `GetControl` as in
+/// `ListControls`.
+///
+/// The rows are the same table as above, so this adds the agreement BETWEEN the readers of
+/// one entry: a client that re-reads a catalog entry through the filter it harvested the
+/// parent ARN from, or through the ARN itself, must not be handed a second wording.
+#[tokio::test]
+async fn a_published_description_is_one_text_wherever_the_catalog_reports_it() {
+    let emulator = Emulator::new();
+    let mut compared_kinds: BTreeSet<&str> = BTreeSet::new();
+
+    for (kind, identifier, published) in recorded_descriptions() {
+        let arn = catalog_kind_arn(kind, identifier);
+        let case = format!("{kind} {identifier}");
+        let (path, items_key) = listing_for(kind);
+        let listed = listed_by_arn(&emulator, path, items_key, None).await;
+        let entry = listed
+            .get(&arn)
+            .unwrap_or_else(|| panic!("case {case}: the catalog must publish {arn}"));
+
+        // The second reader of this entry: the filter that narrows to its parent, or —
+        // for a control — the read that resolves its ARN.
+        let second = match kind {
+            CONTROL => emulator
+                .ok("/get-control", &format!(r#"{{"ControlArn":"{arn}"}}"#))
+                .await,
+            OBJECTIVE => {
+                let domain_arn = at_path(entry, &["Domain", "Arn"])
+                    .unwrap_or_else(|| panic!("case {case}: an objective reports its domain"));
+                let body =
+                    format!(r#"{{"ObjectiveFilter":{{"Domains":[{{"Arn":"{domain_arn}"}}]}}}}"#);
+                one_of(&emulator, path, items_key, &body, &arn, &case).await
+            }
+            COMMON_CONTROL => {
+                let objective_arn = at_path(entry, &["Objective", "Arn"]).unwrap_or_else(|| {
+                    panic!("case {case}: a common control reports its objective")
+                });
+                let body = format!(
+                    r#"{{"CommonControlFilter":{{"Objectives":[{{"Arn":"{objective_arn}"}}]}}}}"#
+                );
+                one_of(&emulator, path, items_key, &body, &arn, &case).await
+            }
+            // A domain is served by one reader only, so there is no second wording of it
+            // to disagree with; the listing itself is covered by the test above.
+            _ => continue,
+        };
+
+        assert_eq!(
+            second["Description"].as_str(),
+            Some(published),
+            "case {case}: the second reader of the entry must report the published \
+             description {published:?}, got {:?}",
+            second["Description"]
+        );
+        assert_eq!(
+            second["Description"], entry["Description"],
+            "case {case}: two readers of one entry must report one description, got {:?} \
+             and {:?}",
+            second["Description"], entry["Description"]
+        );
+        compared_kinds.insert(kind);
+    }
+
+    for kind in [OBJECTIVE, COMMON_CONTROL, CONTROL] {
+        assert!(
+            compared_kinds.contains(kind),
+            "case table: the rows must reach a {kind} with two readers, saw \
+             {compared_kinds:?}"
+        );
+    }
+}
+
+/// The one entry `arn` names in the listing at `path` narrowed by `body`, or a panic
+/// naming the case.
+async fn one_of(
+    emulator: &Emulator,
+    path: &str,
+    items_key: &str,
+    body: &str,
+    arn: &str,
+    case: &str,
+) -> Value {
+    let items = drain(emulator, path, items_key, None, body).await;
+    items
+        .into_iter()
+        .find(|item| at_path(item, &["Arn"]) == Some(arn))
+        .unwrap_or_else(|| panic!("case {case}: the filtered listing must serve {arn}"))
 }

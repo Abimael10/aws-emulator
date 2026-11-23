@@ -99,7 +99,7 @@ pub(super) const PUBLISHED_ONTOLOGY: &[DomainSeed] = &[
                     (
                         "maintain-an-asset-inventory",
                         "Inventory of authorized assets and automated discovery",
-                        "Keep a current record of the authorized resources an account holds, and discover the resources in use automatically.",
+                        "Maintain an asset inventory of organization authorized and existing hardware, software, and media. Where possible, utilize automated tools to facilitate the discovery and ongoing tracking of such assets.",
                     ),
                     (
                         "asset-inventory-reconciliation",
@@ -145,7 +145,7 @@ pub(super) const PUBLISHED_ONTOLOGY: &[DomainSeed] = &[
                     (
                         "asset-valuation",
                         "Asset valuation",
-                        "Record what each asset is worth to the business, so that the protection it is given matches what its loss would cost.",
+                        "Assign a value to assets based on their cost, replacement value, or other relevant factors.",
                     ),
                     (
                         "asset-sensitivity",
@@ -177,12 +177,12 @@ pub(super) const PUBLISHED_ONTOLOGY: &[DomainSeed] = &[
                     (
                         "asset-performance-management",
                         "Asset performance management",
-                        "Monitor the condition and performance of assets, and act on what that monitoring reports before an asset fails.",
+                        "Monitor and optimize the performance and security of assets, including hardware and software.",
                     ),
                     (
                         "asset-maintenance-scheduling",
                         "Asset maintenance scheduling",
-                        "Maintain assets at the intervals their manufacturer or operator defines, and record the work carried out.",
+                        "Schedule and track maintenance activities for assets, including preventive maintenance and repairs.",
                     ),
                 ],
             ),
@@ -374,7 +374,10 @@ pub(super) const PUBLISHED_ONTOLOGY: &[DomainSeed] = &[
     (
         "data-protection",
         "Data protection",
-        "Controls that protect the confidentiality and integrity of data at rest and in transit.",
+        // The library's own paragraph for this domain, as far as a recorded response of
+        // `ListDomains` quotes it; the quote ends here, and nothing of this table's own
+        // wording is appended to it.
+        "This control domain focuses on data protection measures and practices used to safeguard information, including confidentiality, integrity, and availability, while ensuring compliance with applicable laws and regulations governing data handling, cryptography, and encryption key management.",
         &[
             (
                 "encryption-of-data-at-rest",
@@ -909,12 +912,12 @@ pub(super) const PUBLISHED_ONTOLOGY: &[DomainSeed] = &[
                     (
                         "change-request-and-approval",
                         "Change request and approval",
-                        "Define, document, implement, and maintain a formal process for submitting and approving change requests.",
+                        "Define, document, implement, and maintain a formal process for submitting and approving change requests. Change requests should outline the proposed changes, their impact, and any associated risks. The requests should then be reviewed and approved by the appropriate stakeholders, ensuring that changes are properly assessed, authorized, and tracked.",
                     ),
                     (
                         "change-deployment-and-automation",
                         "Change deployment and automation",
-                        "Release an approved change through an automated, repeatable deployment process, so that what was approved is what reaches the workload.",
+                        "Implement an automated change deployment pipeline that automates deployment of systems, software, and infrastructure as code (IaC) to production environments through a controlled and consistent process. Enforce automated security controls, perform validation checks, and provide a rollback mechanism in case of deployment failures.",
                     ),
                     (
                         "emergency-change-review",
