@@ -938,6 +938,15 @@ pub fn error_message(body: &Value) -> String {
         .to_string()
 }
 
+/// The `Cause` a scaling activity carries for the alarm transition that caused it: "a simple
+/// description of what caused the scaling activity to happen" (`ScalingActivity$Cause`), which
+/// names the alarm that moved into `ALARM` and the policy its action list named.
+///
+/// Spelled HERE, once, so every suite that reads an activity's cause reads one wording.
+pub fn alarm_triggered_cause(alarm_name: &str, policy_name: &str) -> String {
+    format!("monitor alarm {alarm_name} in state ALARM triggered policy {policy_name}")
+}
+
 /// How many hexadecimal digits a scalable target's own identifier carries.
 const TARGET_ID_HEX_DIGITS: usize = 32;
 

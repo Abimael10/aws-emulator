@@ -62,6 +62,17 @@
 //! whichever `AdjustmentType` states them and however many steps the configuration carries
 //! ([`each_alarm_action_applies_exactly_one_step_adjustment`]).
 //!
+//! A SUSPENDED direction changes only whether an action is performed, never what it computes:
+//! "DynamicScalingInSuspended […] Whether scale in by a target tracking scaling policy or a step
+//! scaling policy is suspended" (`SuspendedState`), and the same for scale out. So while the
+//! direction is suspended the capacity holds where it is, and the first action after the
+//! suspension is lifted is still ONE adjustment — applied to the capacity the target holds THEN,
+//! whatever the other direction moved it to meanwhile, and clamped only into the registered
+//! window ([`a_resumed_scale_in_applies_the_single_step_to_the_capacity_in_force`] and the rows
+//! beside it, and
+//! [`a_resumed_scale_in_under_a_published_series_applies_one_step`] over the series a client
+//! really publishes).
+//!
 //! Every case goes through the same front door a client uses — the policy, the alarm, the
 //! breach and the read-back of the ECS service are all requests — so nothing reaches into a
 //! state struct and a capacity that is not computed from persisted state cannot pass.
@@ -70,7 +81,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::emulator::{Emulator, PolicyAlarm};
+use crate::emulator::{alarm_triggered_cause, Emulator, PolicyAlarm};
 
 /// The namespace an `ecs:service:DesiredCount` target is registered in.
 const NAMESPACE: &str = "ecs";
@@ -438,8 +449,7 @@ async fn an_alarm_breach_executes_the_policy_clamped_into_the_registered_window(
             json!(expected_description),
             "case {case:?}: expected Description {expected_description:?}, got {activity:?}"
         );
-        let expected_cause =
-            format!("monitor alarm {alarm_name} in state ALARM triggered policy step-policy");
+        let expected_cause = alarm_triggered_cause(&alarm_name, "step-policy");
         assert_eq!(
             activity["Cause"],
             json!(expected_cause),
@@ -1002,15 +1012,17 @@ async fn alarm_state(emulator: &Emulator, alarm_name: &str, case: &str) -> Strin
         .to_string()
 }
 
-/// Let the breach UP and drive it back, so the alarm transitions into `ALARM` afresh — the state
-/// change that executes the actions it names again.
+/// Keep publishing a datapoint `breach` past the threshold until CloudWatch's own evaluation
+/// reports `alarm_name` in `ALARM`.
 ///
-/// The letting up is `SetAlarmState`, the way a client moves an alarm without waiting for a
-/// series to age out of its evaluation range; the return is the alarm's OWN evaluation of the
-/// still-breaching datapoints, so what comes back is a transition CloudWatch decided and the
-/// breach it carries is the measurement that decided it.
-async fn given_fresh_transition(emulator: &Emulator, alarm_name: &str, breach: f64, case: &str) {
-    emulator.set_alarm_state(alarm_name, "OK").await;
+/// The poll is the TEST waiting for that evaluation: what comes back is a transition CloudWatch
+/// decided, and the breach it carries is the measurement that decided it.
+async fn await_alarm_while_publishing(
+    emulator: &Emulator,
+    alarm_name: &str,
+    breach: f64,
+    case: &str,
+) {
     let deadline = std::time::Instant::now() + CONTINUING_WAIT;
     loop {
         publish_breach(emulator, breach, case).await;
@@ -1024,6 +1036,17 @@ async fn given_fresh_transition(emulator: &Emulator, alarm_name: &str, breach: f
         );
         tokio::time::sleep(CONTINUING_POLL).await;
     }
+}
+
+/// Let the breach UP and drive it back, so the alarm transitions into `ALARM` afresh — the state
+/// change that executes the actions it names again.
+///
+/// The letting up is `SetAlarmState`, the way a client moves an alarm without waiting for a
+/// series to age out of its evaluation range; the return is the alarm's OWN evaluation of the
+/// still-breaching datapoints ([`await_alarm_while_publishing`]).
+async fn given_fresh_transition(emulator: &Emulator, alarm_name: &str, breach: f64, case: &str) {
+    emulator.set_alarm_state(alarm_name, "OK").await;
+    await_alarm_while_publishing(emulator, alarm_name, breach, case).await;
 }
 
 /// How long one fresh transition is watched before a row raises another.
@@ -2771,18 +2794,20 @@ const PER_ACTION_CATALOG: &[PerActionRow] = &[
 ];
 
 /// Every DISTINCT `desiredCount` the ECS service was reported at on its way to `expected`, in the
-/// order they were read, stopping as soon as it is reported there.
+/// order they were read, stopping as soon as it is reported there — or when `budget` is up.
 ///
 /// The poll is the TEST waiting for the clock that executes a breach, so a row whose capacity
 /// overshoots the step it was owed fails on the readings it collected rather than on how fast the
-/// host ran.
+/// host ran. The caller states the budget, because what a leg waits for the clock to do differs
+/// in how much of this service's own collecting it has to span; every one of them is generous.
 async fn readings_until(
     emulator: &Emulator,
     cluster: &str,
     service: &str,
     expected: i64,
+    budget: Duration,
 ) -> Vec<i64> {
-    let deadline = std::time::Instant::now() + CLOCK_WAIT;
+    let deadline = std::time::Instant::now() + budget;
     let mut readings: Vec<i64> = Vec::new();
     loop {
         let count = emulator.ecs_desired_count(cluster, service).await;
@@ -2796,11 +2821,16 @@ async fn readings_until(
     }
 }
 
-/// Every distinct `desiredCount` the service was reported at over the WHOLE wait: what an action
-/// that must move no capacity is held to, since a movement it was not owed would arrive on one of
-/// the clock's wake-ups inside it.
-async fn readings_while_held(emulator: &Emulator, cluster: &str, service: &str) -> Vec<i64> {
-    let deadline = std::time::Instant::now() + CLOCK_WAIT;
+/// Every distinct `desiredCount` the service was reported at over the WHOLE of `watch`: what an
+/// action that must move no capacity is held to, since a movement it was not owed would arrive on
+/// one of the clock's wake-ups inside it.
+async fn readings_while_held(
+    emulator: &Emulator,
+    cluster: &str,
+    service: &str,
+    watch: Duration,
+) -> Vec<i64> {
+    let deadline = std::time::Instant::now() + watch;
     let mut readings: Vec<i64> = Vec::new();
     loop {
         let count = emulator.ecs_desired_count(cluster, service).await;
@@ -2872,9 +2902,9 @@ async fn drive_per_action(row: &PerActionRow) {
         // already sits at — is watched for the whole wait instead, because what it must do is
         // nothing.
         let readings = if expected == held {
-            readings_while_held(&emulator, cluster, service).await
+            readings_while_held(&emulator, cluster, service, CLOCK_WAIT).await
         } else {
-            readings_until(&emulator, cluster, service, expected).await
+            readings_until(&emulator, cluster, service, expected, CLOCK_WAIT).await
         };
         let reached = readings.last().copied().unwrap_or(held);
         assert_eq!(
@@ -2929,6 +2959,511 @@ async fn each_alarm_action_applies_exactly_one_step_adjustment() {
     for row in PER_ACTION_CATALOG {
         drive_per_action(row).await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// A direction whose suspension is LIFTED still applies one adjustment
+// ---------------------------------------------------------------------------
+
+/// How long the suspended leg is WATCHED for a movement that must not happen.
+///
+/// Wider than the span over which this service collects the triggers of one scalable target
+/// before it decides between them, so a capacity that holds for the whole watch is one the
+/// suspension held rather than one no decision had been taken on yet; the scaling clock wakes up
+/// many times inside it. Generous, so a loaded machine cannot turn a slow pass into a pass that
+/// never happened.
+const SUSPENDED_WATCH: Duration = Duration::from_secs(15);
+
+/// How long a leg that MUST move capacity is given to be observed at the capacity it moved to.
+///
+/// The TEST waiting for the clock that executes a breach: nothing in the emulator sleeps for a
+/// leg, so a leg that never arrives fails on the readings it collected rather than on how fast
+/// the host ran.
+const RESUMED_BUDGET: Duration = Duration::from_secs(60);
+
+/// The two policies of each row: the one whose direction the registration suspends, and the one
+/// in the other direction, which is what moves the capacity the resumed action is computed from.
+const HELD_POLICY: &str = "held-policy";
+/// See [`HELD_POLICY`].
+const OTHER_POLICY: &str = "other-policy";
+
+/// The alarm wired to each of them.
+const HELD_ALARM: &str = "held-alarm";
+/// See [`HELD_ALARM`].
+const OTHER_ALARM: &str = "other-alarm";
+
+/// One suspend-move-resume scenario: the window, the capacity the ECS service starts at, the
+/// direction that is suspended and the two policies, and the capacity each of the two actions
+/// lands on.
+struct ResumedRow {
+    case: &'static str,
+    /// The `desiredCount` the ECS service is created with.
+    starting: i64,
+    min: i64,
+    max: i64,
+    /// Whether SCALE IN is the suspended direction; otherwise scale out is.
+    suspend_scale_in: bool,
+    /// How the suspended policy's steps are interpreted (`AdjustmentType`).
+    held_adjustment_type: &'static str,
+    /// The suspended policy's own steps.
+    held_steps: &'static [Step],
+    /// The steps of the policy in the other direction, which is never suspended.
+    other_steps: &'static [Step],
+    /// The capacity the other direction's one action lands on.
+    after_other: i64,
+    /// The capacity the resumed direction's one action lands on, from [`Self::after_other`].
+    after_resume: i64,
+}
+
+impl ResumedRow {
+    /// The `SuspendedState` member this row suspends and then resumes.
+    fn suspension_member(&self) -> &'static str {
+        if self.suspend_scale_in {
+            // "DynamicScalingInSuspended — Whether scale in by a target tracking scaling policy
+            // or a step scaling policy is suspended."
+            "DynamicScalingInSuspended"
+        } else {
+            // "DynamicScalingOutSuspended — Whether scale out by a target tracking scaling
+            // policy or a step scaling policy is suspended."
+            "DynamicScalingOutSuspended"
+        }
+    }
+
+    /// The `ComparisonOperator` of the alarm that triggers the suspended policy: the side of the
+    /// threshold a breach of its direction is on.
+    fn held_comparison(&self) -> &'static str {
+        if self.suspend_scale_in {
+            "LessThanThreshold"
+        } else {
+            "GreaterThanThreshold"
+        }
+    }
+
+    /// The `ComparisonOperator` of the other direction's alarm.
+    fn other_comparison(&self) -> &'static str {
+        if self.suspend_scale_in {
+            "GreaterThanThreshold"
+        } else {
+            "LessThanThreshold"
+        }
+    }
+}
+
+/// The rows differ in the direction that is suspended, in the size and the `AdjustmentType` of
+/// the adjustment the resumed action applies, in whether that adjustment lands inside the
+/// registered window or past its floor, and in whether the resumed action is a NEW transition or
+/// the one the suspension held.
+const RESUMED_SCALE_IN: ResumedRow = ResumedRow {
+    case: "scale in resumed at the ceiling",
+    starting: 2,
+    min: 1,
+    max: 3,
+    suspend_scale_in: true,
+    held_adjustment_type: "ChangeInCapacity",
+    held_steps: &[Step { lower: None, upper: Some(0.0), adjustment: -1 }],
+    other_steps: &[Step { lower: Some(0.0), upper: None, adjustment: 1 }],
+    after_other: 3,
+    after_resume: 2,
+};
+
+/// See [`RESUMED_SCALE_IN`].
+const RESUMED_SCALE_IN_PAST_THE_FLOOR: ResumedRow = ResumedRow {
+    case: "scale in resumed past the floor",
+    starting: 3,
+    min: 2,
+    max: 5,
+    suspend_scale_in: true,
+    held_adjustment_type: "ChangeInCapacity",
+    held_steps: &[Step { lower: None, upper: Some(0.0), adjustment: -4 }],
+    other_steps: &[Step { lower: Some(0.0), upper: None, adjustment: 2 }],
+    after_other: 5,
+    // 5 - 4 is below the registered floor, and an adjustment that undershoots a bound is
+    // performed AT the bound.
+    after_resume: 2,
+};
+
+/// See [`RESUMED_SCALE_IN`].
+const RESUMED_SCALE_OUT: ResumedRow = ResumedRow {
+    case: "scale out resumed from the floor",
+    starting: 2,
+    min: 1,
+    max: 6,
+    suspend_scale_in: false,
+    held_adjustment_type: "ChangeInCapacity",
+    held_steps: &[Step { lower: Some(0.0), upper: None, adjustment: 2 }],
+    other_steps: &[Step { lower: None, upper: Some(0.0), adjustment: -1 }],
+    after_other: 1,
+    after_resume: 3,
+};
+
+/// See [`RESUMED_SCALE_IN`].
+const RESUMED_PERCENTAGE_SCALE_IN: ResumedRow = ResumedRow {
+    case: "percentage scale in resumed",
+    starting: 4,
+    min: 1,
+    max: 12,
+    suspend_scale_in: true,
+    held_adjustment_type: "PercentChangeInCapacity",
+    held_steps: &[Step { lower: None, upper: Some(0.0), adjustment: -25 }],
+    other_steps: &[Step { lower: Some(0.0), upper: None, adjustment: 4 }],
+    after_other: 8,
+    // A quarter OF THE CAPACITY IN FORCE: 25% of 8 is 2 units, taken toward zero — a quarter of
+    // the capacity the target held when the suspension began would be 1.
+    after_resume: 6,
+};
+
+/// Register one row's target, with `suspended` as the state of the direction it suspends.
+async fn register_suspension(
+    emulator: &Emulator,
+    resource_id: &str,
+    row: &ResumedRow,
+    suspended: bool,
+    capacities: bool,
+) {
+    let case = row.case;
+    let mut request = target(resource_id);
+    if capacities {
+        request["MinCapacity"] = json!(row.min);
+        request["MaxCapacity"] = json!(row.max);
+    }
+    request["SuspendedState"] = json!({row.suspension_member(): suspended});
+    let (status, body) = emulator.call("RegisterScalableTarget", request).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected RegisterScalableTarget to answer 200 for \
+         {}={suspended}, got {status} {body:?}",
+        row.suspension_member()
+    );
+}
+
+/// Drive one row end to end: suspend a direction, breach it (nothing moves), move the capacity
+/// with the OTHER direction, lift the suspension and breach the held direction again.
+async fn drive_resumed(row: &ResumedRow) {
+    let case = row.case;
+    let emulator = Emulator::empty();
+    let cluster = "resumed";
+    let service = "web";
+    let resource_id = emulator
+        .given_ecs_service(cluster, service, row.starting)
+        .await;
+    register_suspension(&emulator, &resource_id, row, true, true).await;
+
+    let held_arn = put_step_policy(
+        &emulator,
+        &resource_id,
+        HELD_POLICY,
+        json!({
+            "AdjustmentType": row.held_adjustment_type,
+            // Neither policy acts twice inside its own wait, so the wait a previous activity is
+            // given does not come into any row; it is named rather than defaulted.
+            "Cooldown": 0,
+            "StepAdjustments": step_adjustments(row.held_steps),
+        }),
+        case,
+    )
+    .await;
+    let other_arn = put_step_policy(
+        &emulator,
+        &resource_id,
+        OTHER_POLICY,
+        json!({
+            "AdjustmentType": "ChangeInCapacity",
+            "Cooldown": 0,
+            "StepAdjustments": step_adjustments(row.other_steps),
+        }),
+        case,
+    )
+    .await;
+    for (alarm_name, policy_arn, comparison_operator) in [
+        (HELD_ALARM, &held_arn, row.held_comparison()),
+        (OTHER_ALARM, &other_arn, row.other_comparison()),
+    ] {
+        emulator
+            .given_policy_alarm(&PolicyAlarm {
+                name: alarm_name,
+                policy_arn,
+                metric_namespace: METRIC_NAMESPACE,
+                metric_name: METRIC_NAME,
+                threshold: THRESHOLD,
+                comparison_operator,
+            })
+            .await;
+    }
+
+    // LEG ONE: the suspended direction's alarm breaches, and the capacity holds where it is —
+    // watched for the whole wait, so a movement arriving on any of the clock's wake-ups inside
+    // it fails here.
+    emulator.set_alarm_state(HELD_ALARM, "ALARM").await;
+    let readings = readings_while_held(&emulator, cluster, service, SUSPENDED_WATCH).await;
+    assert_eq!(
+        readings,
+        vec![row.starting],
+        "case {case:?}: expected the suspended direction to leave the desiredCount at {}, got \
+         {readings:?}",
+        row.starting
+    );
+    let listed = activities(&emulator, &resource_id, case).await;
+    assert!(
+        listed.is_empty(),
+        "case {case:?}: expected a suspended direction to record no scaling activity, got \
+         {listed:?}"
+    );
+
+    // LEG TWO: the OTHER direction, which is not suspended, applies its own single adjustment.
+    // The series the two alarms watch cannot be on both sides of the threshold at once, so the
+    // suspended direction's alarm leaves `ALARM` as this one enters it.
+    emulator.set_alarm_state(HELD_ALARM, "OK").await;
+    emulator.set_alarm_state(OTHER_ALARM, "ALARM").await;
+    let readings =
+        readings_until(&emulator, cluster, service, row.after_other, RESUMED_BUDGET).await;
+    let reached = readings.last().copied().unwrap_or(row.starting);
+    assert_eq!(
+        reached, row.after_other,
+        "case {case:?}: expected the other direction's action to move the desiredCount to {}, \
+         got {reached:?} after reading {readings:?}",
+        row.after_other
+    );
+
+    // LEG THREE: the suspension is lifted, and the held direction's action applies ONE
+    // adjustment to the capacity the target holds NOW.
+    register_suspension(&emulator, &resource_id, row, false, false).await;
+    emulator.set_alarm_state(OTHER_ALARM, "OK").await;
+    emulator.set_alarm_state(HELD_ALARM, "ALARM").await;
+    let readings =
+        readings_until(&emulator, cluster, service, row.after_resume, RESUMED_BUDGET).await;
+    let reached = readings.last().copied().unwrap_or(row.after_other);
+    assert_eq!(
+        reached, row.after_resume,
+        "case {case:?}: expected the resumed action to move the desiredCount from {} to {}, got \
+         {reached:?} after reading {readings:?}",
+        row.after_other, row.after_resume
+    );
+    // And nothing on the way past that single adjustment: every capacity the resource was
+    // reported at lies between the one it held when the action was raised and the one that
+    // adjustment asks for, so an action that applied two steps' worth — or collapsed to a
+    // bound the adjustment does not reach — fails here.
+    let (low, high) = (
+        row.after_other.min(row.after_resume),
+        row.after_other.max(row.after_resume),
+    );
+    let outside: Vec<i64> = readings
+        .iter()
+        .copied()
+        .filter(|count| *count < low || *count > high)
+        .collect();
+    assert!(
+        outside.is_empty(),
+        "case {case:?}: expected the resumed action to move the desiredCount no further than {} \
+         from {}, got {outside:?} among {readings:?}",
+        row.after_resume,
+        row.after_other
+    );
+
+    // The log says exactly what the capacity did: one movement per action that moved it, oldest
+    // first, and none for the action the suspension held.
+    let moved = movement_descriptions(&emulator, &resource_id, case).await;
+    assert_eq!(
+        moved,
+        vec![
+            format!("Setting desired count to {}.", row.after_other),
+            format!("Setting desired count to {}.", row.after_resume),
+        ],
+        "case {case:?}: expected one activity for the other direction and one for the resumed \
+         action, got {moved:?}"
+    );
+    // Each of them names the alarm that caused it and the policy that alarm triggered.
+    let mut listed = activities(&emulator, &resource_id, case).await;
+    listed.reverse();
+    let causes: Vec<String> = listed
+        .iter()
+        .map(|activity| activity["Cause"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(
+        causes,
+        vec![
+            alarm_triggered_cause(OTHER_ALARM, OTHER_POLICY),
+            alarm_triggered_cause(HELD_ALARM, HELD_POLICY),
+        ],
+        "case {case:?}: expected each activity to name its own alarm and policy, got {causes:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_resumed_scale_in_applies_the_single_step_to_the_capacity_in_force() {
+    drive_resumed(&RESUMED_SCALE_IN).await;
+}
+
+#[tokio::test]
+async fn a_resumed_scale_in_past_the_floor_moves_to_the_floor() {
+    drive_resumed(&RESUMED_SCALE_IN_PAST_THE_FLOOR).await;
+}
+
+#[tokio::test]
+async fn a_resumed_scale_out_applies_the_single_step_to_the_capacity_in_force() {
+    drive_resumed(&RESUMED_SCALE_OUT).await;
+}
+
+#[tokio::test]
+async fn a_resumed_percentage_scale_in_is_a_percentage_of_the_capacity_in_force() {
+    drive_resumed(&RESUMED_PERCENTAGE_SCALE_IN).await;
+}
+
+/// How far below and above the threshold the published series sits in
+/// [`a_resumed_scale_in_under_a_published_series_applies_one_step`].
+///
+/// Well inside each direction's step — the interval of a step is an interval of the DIFFERENCE
+/// between the metric and the alarm's threshold — so the step that fires is the one the
+/// configuration states for that side rather than the value at the boundary between them.
+const PUBLISHED_BELOW: f64 = -30.0;
+/// See [`PUBLISHED_BELOW`].
+const PUBLISHED_ABOVE: f64 = 30.0;
+
+/// The same rule under a series a client really publishes, which is what grades the two alarms
+/// into `ALARM` one after the other: the suspended scale-in holds the capacity where the
+/// scale-out left it, and the first scale-in after the resume is ONE step from there — never the
+/// floor, and never a second step while the same breach goes on.
+#[tokio::test]
+async fn a_resumed_scale_in_under_a_published_series_applies_one_step() {
+    let case = "scale in resumed under a published series";
+    let emulator = Emulator::empty();
+    let cluster = "published";
+    let service = "web";
+    let starting = 2;
+    let (floor, ceiling) = (1, 3);
+    let resource_id = emulator
+        .given_ecs_service(cluster, service, starting)
+        .await;
+    let mut registration = target(&resource_id);
+    registration["MinCapacity"] = json!(floor);
+    registration["MaxCapacity"] = json!(ceiling);
+    registration["SuspendedState"] = json!({"DynamicScalingInSuspended": true});
+    let (status, body) = emulator.call("RegisterScalableTarget", registration).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected RegisterScalableTarget to answer 200, got {status} {body:?}"
+    );
+
+    let out_arn = put_step_policy(
+        &emulator,
+        &resource_id,
+        OTHER_POLICY,
+        json!({
+            "AdjustmentType": "ChangeInCapacity",
+            "Cooldown": 0,
+            "StepAdjustments": [{"MetricIntervalLowerBound": 0.0, "ScalingAdjustment": 1}],
+        }),
+        case,
+    )
+    .await;
+    let in_arn = put_step_policy(
+        &emulator,
+        &resource_id,
+        HELD_POLICY,
+        json!({
+            "AdjustmentType": "ChangeInCapacity",
+            "Cooldown": 0,
+            "StepAdjustments": [{"MetricIntervalUpperBound": 0.0, "ScalingAdjustment": -1}],
+        }),
+        case,
+    )
+    .await;
+    given_continuing_alarm(&emulator, OTHER_ALARM, &out_arn, "GreaterThanThreshold", case).await;
+    given_continuing_alarm(&emulator, HELD_ALARM, &in_arn, "LessThanThreshold", case).await;
+
+    // LEG ONE: the series sits BELOW the threshold, so the scale-in alarm grades it into
+    // `ALARM` — and the suspended direction moves nothing for the whole watch.
+    await_alarm_while_publishing(&emulator, HELD_ALARM, PUBLISHED_BELOW, case).await;
+    let held = watch_while_breaching(
+        &emulator,
+        cluster,
+        service,
+        PUBLISHED_BELOW,
+        starting,
+        SUSPENDED_WATCH,
+        case,
+    )
+    .await;
+    assert_eq!(
+        held, starting,
+        "case {case:?}: expected the suspended scale-in to leave the desiredCount at {starting}, \
+         got {held:?}"
+    );
+
+    // LEG TWO: the series goes ABOVE the threshold, the scale-out alarm grades it into `ALARM`,
+    // and its one step takes the capacity to the registered ceiling.
+    await_alarm_while_publishing(&emulator, OTHER_ALARM, PUBLISHED_ABOVE, case).await;
+    let out = await_while_breaching(
+        &emulator,
+        cluster,
+        service,
+        PUBLISHED_ABOVE,
+        ceiling,
+        CONTINUING_WAIT,
+        case,
+    )
+    .await;
+    assert_eq!(
+        out, ceiling,
+        "case {case:?}: expected the scale-out leg to reach the ceiling {ceiling}, got {out:?}"
+    );
+
+    // LEG THREE: the suspension is lifted and the series goes below the threshold again. The
+    // scale-in that follows applies the ONE step its configuration states to the capacity in
+    // force: one task off the ceiling, not the floor the two steps' worth would reach.
+    let mut resume = target(&resource_id);
+    resume["SuspendedState"] = json!({"DynamicScalingInSuspended": false});
+    let (status, body) = emulator.call("RegisterScalableTarget", resume).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected the resuming registration to answer 200, got {status} {body:?}"
+    );
+    await_alarm_while_publishing(&emulator, HELD_ALARM, PUBLISHED_BELOW, case).await;
+    let fell = await_while_breaching(
+        &emulator,
+        cluster,
+        service,
+        PUBLISHED_BELOW,
+        ceiling - 1,
+        CONTINUING_WAIT,
+        case,
+    )
+    .await;
+    assert_eq!(
+        fell,
+        ceiling - 1,
+        "case {case:?}: expected the resumed scale-in to take the desiredCount from {ceiling} to \
+         {}, got {fell:?}",
+        ceiling - 1
+    );
+    // And it stays there while the same breach goes on: one transition is one action, so no
+    // second step follows from the metric going on breaching.
+    let settled = watch_while_breaching(
+        &emulator,
+        cluster,
+        service,
+        PUBLISHED_BELOW,
+        ceiling - 1,
+        SUSPENDED_WATCH,
+        case,
+    )
+    .await;
+    assert_eq!(
+        settled,
+        ceiling - 1,
+        "case {case:?}: expected the capacity to hold at {} while the series went on breaching, \
+         got {settled:?}",
+        ceiling - 1
+    );
+
+    let moved = movement_descriptions(&emulator, &resource_id, case).await;
+    assert_eq!(
+        moved,
+        vec![
+            format!("Setting desired count to {ceiling}."),
+            format!("Setting desired count to {}.", ceiling - 1),
+        ],
+        "case {case:?}: expected the scale-out and the one resumed scale-in, got {moved:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
