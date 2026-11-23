@@ -56,6 +56,11 @@ const API_ID_DIMENSION: &str = "ApiId";
 const STAGE_DIMENSION: &str = "Stage";
 const ROUTE_DIMENSION: &str = "Route";
 
+/// The three series a stage publishes once per CALL, each carrying 1 for the one class that
+/// call earned and 0 for the two it did not — in the order a failing assertion names them:
+/// the client's own failure, the route's execution, and the integration's own.
+pub(crate) const ERROR_SERIES: [&str; 3] = ["ClientError", "ExecutionError", "IntegrationError"];
+
 /// How long a case waits for the series to reach the values the traffic owes them, and how
 /// often it looks again: the last call of a connection (`$disconnect`) is served after the
 /// client has closed, so what is waited for is a datapoint the traffic ALREADY owes rather
@@ -174,9 +179,16 @@ pub(crate) const ECHO_HANDLER: &str = "import json\n\
 pub(crate) const OK_HANDLER: &str = "def lambda_handler(event, context):\n\
      \x20   return {\"statusCode\": 200}\n";
 
-/// A handler that RAISES, so its route's integration produces no reply at all.
-const RAISING_HANDLER: &str = "def lambda_handler(event, context):\n\
+/// A handler that RAISES, so its route's integration produces no reply at all: the function
+/// RAN and ended in an unhandled error.
+pub(crate) const RAISING_HANDLER: &str = "def lambda_handler(event, context):\n\
      \x20   raise RuntimeError(\"this route fails\")\n";
+
+/// The function ARN a route fronts a backend that does not exist with: a well-formed Lambda
+/// ARN of a function nothing created, so the invocation the gateway makes is refused by Lambda
+/// itself and no backend ever answers it.
+pub(crate) const ABSENT_FUNCTION_ARN: &str =
+    "arn:aws:lambda:us-east-1:000000000000:function:never-created";
 
 /// A `$connect` handler that REFUSES the connection with a client-error status, which is what
 /// a backend that does not admit a client answers.
@@ -276,6 +288,53 @@ pub(crate) async fn given_stage(
     detailed: bool,
 ) {
     given_configured_stage(emulator, case, api_id, stage, detailed.then_some(true), &[]).await;
+}
+
+/// Create every stage `stages` names and release ONE deployment to them all: the first stage
+/// is deployed to, and each later stage is created pinned to that same `DeploymentId`.
+///
+/// The shape a client gets by deploying an api once and pointing several stages at that
+/// deployment — where each stage still carries, and publishes, its own traffic.
+pub(crate) async fn given_stages_on_one_deployment(
+    emulator: &MultiServiceRouter,
+    case: &str,
+    api_id: &str,
+    stages: &[&str],
+) {
+    let (first, rest) = stages
+        .split_first()
+        .unwrap_or_else(|| panic!("case {case:?}: at least one stage must be named"));
+    created(
+        emulator,
+        case,
+        "CreateStage",
+        &format!("/v2/apis/{api_id}/stages"),
+        json!({ "stageName": first }),
+    )
+    .await;
+    let deployment = created(
+        emulator,
+        case,
+        "CreateDeployment",
+        &format!("/v2/apis/{api_id}/deployments"),
+        json!({ "stageName": first }),
+    )
+    .await;
+    let deployment_id = text(&deployment, "deploymentId");
+    assert!(
+        !deployment_id.is_empty(),
+        "case {case:?}: CreateDeployment must answer a deploymentId, got {deployment}"
+    );
+    for stage in rest {
+        created(
+            emulator,
+            case,
+            "CreateStage",
+            &format!("/v2/apis/{api_id}/stages"),
+            json!({ "stageName": stage, "deploymentId": deployment_id }),
+        )
+        .await;
+    }
 }
 
 /// Create one stage of `api_id` and release a deployment to it, stating

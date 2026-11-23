@@ -30,13 +30,9 @@
 use crate::http_api_backend_dispatch::given_function;
 use crate::websocket_stage_metrics::{
     closed, counter, emulator, given_api, given_route, given_stage, latency_samples, per_route,
-    reached, samples, Expected,
+    reached, samples, Expected, ABSENT_FUNCTION_ARN, ERROR_SERIES, RAISING_HANDLER,
 };
 use crate::websocket_transport_data_plane::{exchange, exchanged_reply, handshake_at, ClientSocket};
-
-/// The three series a stage publishes once per call, in the order a failing assertion names
-/// them.
-const ERROR_SERIES: [&str; 3] = ["ClientError", "ExecutionError", "IntegrationError"];
 
 /// What the function a route fronts does when it is called.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,10 +53,6 @@ enum Backend {
 const ANSWERING_HANDLER: &str = "def lambda_handler(event, context):\n\
      \x20   return {\"statusCode\": 200}\n";
 
-/// A handler that RAISES, so its route's integration produces no reply at all.
-const RAISING_HANDLER: &str = "def lambda_handler(event, context):\n\
-     \x20   raise RuntimeError(\"this route fails\")\n";
-
 /// A handler that refuses the caller with a client-error status of its own.
 const CLIENT_REFUSING_HANDLER: &str = "def lambda_handler(event, context):\n\
      \x20   return {\"statusCode\": 403, \"body\": \"denied\"}\n";
@@ -68,11 +60,6 @@ const CLIENT_REFUSING_HANDLER: &str = "def lambda_handler(event, context):\n\
 /// A handler that refuses the caller with a server-error status of its own.
 const SERVER_REFUSING_HANDLER: &str = "def lambda_handler(event, context):\n\
      \x20   return {\"statusCode\": 503, \"body\": \"busy\"}\n";
-
-/// The function ARN a route fronts a backend that does not exist with: a well-formed Lambda
-/// ARN of a function nothing created, so the invocation the gateway makes is refused by Lambda
-/// itself and no backend ever answers it.
-const ABSENT_FUNCTION_ARN: &str = "arn:aws:lambda:us-east-1:000000000000:function:never-created";
 
 /// One row of the table: the api a case stands up, the traffic it drives, and the series that
 /// traffic owes.
