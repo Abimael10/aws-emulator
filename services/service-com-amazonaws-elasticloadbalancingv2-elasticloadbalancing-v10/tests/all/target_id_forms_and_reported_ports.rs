@@ -21,14 +21,22 @@
 //!   port for a target when you register it"), so the port of a reported target is the one
 //!   the request named, else the target group's own — for a target that is registered and
 //!   for one that is not, since the port is what decides WHICH registration a request is
-//!   about.
+//!   about. It follows from the group and the request alone, so a target group whose target
+//!   type carries no port of its own (`TargetDescription$Port` "is not used if the target is
+//!   a Lambda function") reports none, and
+//!   `TargetHealthDescription$HealthCheckPort` is the group's health-check configuration read
+//!   against that same target: the configured port, else the port that target receives
+//!   traffic on.
 //!
 //! The rows differ along what the rules generalise over: the group's target type, the form
 //! the offending id takes (an id of another target type, a near miss of the right form, a
-//! value of no form at all), whether a well-formed id was ever registered, and whether the
-//! request names a port of its own.
+//! value of no form at all), whether a well-formed id was ever registered, whether the
+//! request names a port of its own, the group's own port (the default, a port no default
+//! picks, each published bound of the modelled port range, and a group that has none),
+//! whether the group configures a health-check port of its own, and how many targets one
+//! read names.
 
-use crate::provisioning_loop::{action, call, emulator, first_text, members, p, Reply};
+use crate::provisioning_loop::{account, action, call, emulator, first_text, members, p, Reply, REGION};
 use crate::target_group_attributes_and_modification::unescaped;
 use crate::target_group_health_check_port::create_group;
 use smithy_server_runtime::MultiServiceRouter;
@@ -91,13 +99,20 @@ const FORM_ROWS: &[FormRow] = &[
 ];
 
 /// One target as `DescribeTargetHealth` reports it: its id, the port traffic to it goes
-/// to, and the health state and reason it is under.
+/// to, the port its health check runs against, and the health state and reason it is under.
+///
+/// `pub(crate)` with [`reported_for`] and [`target_group_on`] because the sibling suite that
+/// asks the same rule of a read naming SEVERAL targets
+/// (`crate::health_read_reported_target_port`) reads a health row exactly so: one harness
+/// shared by these two suites, so neither can drift on how a row is read or on how the group
+/// under it is created.
 #[derive(Debug, PartialEq, Eq)]
-struct ReportedTarget {
-    id: Option<String>,
-    port: Option<String>,
-    state: Option<String>,
-    reason: Option<String>,
+pub(crate) struct ReportedTarget {
+    pub(crate) id: Option<String>,
+    pub(crate) port: Option<String>,
+    pub(crate) health_check_port: Option<String>,
+    pub(crate) state: Option<String>,
+    pub(crate) reason: Option<String>,
 }
 
 /// The status, code and message of a refusal, as a caller reads them.
@@ -109,24 +124,41 @@ fn refusal(reply: &Reply) -> (u16, String, String) {
     )
 }
 
-/// A target group of `target_type` on port 80, the shape each row starts from.
+/// A target group of `target_type` on port 80, the shape each form row starts from.
 async fn target_group(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
     target_type: &str,
 ) -> String {
-    let fields = vec![
-        p("Protocol", "HTTP"),
-        p("Port", "80"),
-        p("VpcId", "vpc-1"),
-        p("TargetType", target_type),
-    ];
+    target_group_on(router, case, name, target_type, Some("80"), None).await
+}
+
+/// A target group of `target_type` on `port`, checking `health_check_port` — the shape the
+/// port rows vary. A group whose target type carries no port of its own is in no network and
+/// speaks no protocol, so it names neither.
+pub(crate) async fn target_group_on(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+    target_type: &str,
+    port: Option<&str>,
+    health_check_port: Option<&str>,
+) -> String {
+    let mut fields = vec![p("TargetType", target_type)];
+    if let Some(port) = port {
+        fields.push(p("Protocol", "HTTP"));
+        fields.push(p("Port", port));
+        fields.push(p("VpcId", "vpc-1"));
+    }
+    if let Some(health_check_port) = health_check_port {
+        fields.push(p("HealthCheckPort", health_check_port));
+    }
     create_group(router, case, name, &fields).await
 }
 
 /// Drive one `Targets`-taking operation with a single target.
-async fn one_target(
+pub(crate) async fn one_target(
     router: &MultiServiceRouter,
     operation: &str,
     arn: &str,
@@ -142,18 +174,33 @@ async fn one_target(
     call(router, &form).await
 }
 
-/// Every target the health read reports for `arn`, in the order it reports them.
+/// Every target the health read reports for `arn`, in the order it reports them — the whole
+/// group where `named` names nothing, else that one target.
 async fn reported_targets(
     router: &MultiServiceRouter,
     arn: &str,
     named: Option<(&str, Option<&str>)>,
 ) -> Vec<ReportedTarget> {
+    let named: Vec<(String, Option<&str>)> = named
+        .map(|(id, port)| vec![(id.to_string(), port)])
+        .unwrap_or_default();
+    reported_for(router, arn, &named).await
+}
+
+/// Every target the health read reports for `arn` when it names the `(id, port)` targets of
+/// `named`, in the order it reports them. An empty `named` is the unfiltered read.
+pub(crate) async fn reported_for(
+    router: &MultiServiceRouter,
+    arn: &str,
+    named: &[(String, Option<&str>)],
+) -> Vec<ReportedTarget> {
     let mut form = action("DescribeTargetHealth");
     form.push(p("TargetGroupArn", arn));
-    if let Some((id, port)) = named {
-        form.push(p("Targets.member.1.Id", id));
+    for (index, (id, port)) in named.iter().enumerate() {
+        let at = index + 1;
+        form.push(p(&format!("Targets.member.{at}.Id"), id));
         if let Some(port) = port {
-            form.push(p("Targets.member.1.Port", port));
+            form.push(p(&format!("Targets.member.{at}.Port"), port));
         }
     }
     let reply = call(router, &form).await;
@@ -164,11 +211,17 @@ async fn reported_targets(
     );
     members(&reply.body, "TargetHealthDescriptions")
         .iter()
-        .map(|description| ReportedTarget {
-            id: first_text(description, "Id"),
-            port: first_text(description, "Port"),
-            state: first_text(description, "State"),
-            reason: first_text(description, "Reason"),
+        .map(|description| {
+            // The target's own id and port are read out of its `Target`, so neither can be
+            // confused with the health-check port reported beside it.
+            let target = first_text(description, "Target").unwrap_or_default();
+            ReportedTarget {
+                id: first_text(&target, "Id"),
+                port: first_text(&target, "Port"),
+                health_check_port: first_text(description, "HealthCheckPort"),
+                state: first_text(description, "State"),
+                reason: first_text(description, "Reason"),
+            }
         })
         .collect()
 }
@@ -264,12 +317,14 @@ async fn a_well_formed_target_that_was_never_registered_is_still_a_no_op_to_dere
 }
 
 /// One row of the reported-port table: the case, the id the read names, the port it names,
-/// the port the answer must carry, and the health state and reason that target is under.
+/// the port and the health-check port the answer must carry, and the health state and reason
+/// that target is under.
 struct PortRow {
     case: &'static str,
     id: &'static str,
     names_port: Option<&'static str>,
     reports_port: &'static str,
+    reports_health_check_port: &'static str,
     state: &'static str,
     reason: &'static str,
 }
@@ -299,6 +354,7 @@ async fn a_reported_target_carries_the_port_the_request_named_else_the_groups_ow
             id: registered,
             names_port: None,
             reports_port: "80",
+            reports_health_check_port: "80",
             state: "unused",
             reason: "Target.NotInUse",
         },
@@ -307,6 +363,7 @@ async fn a_reported_target_carries_the_port_the_request_named_else_the_groups_ow
             id: registered,
             names_port: Some("80"),
             reports_port: "80",
+            reports_health_check_port: "80",
             state: "unused",
             reason: "Target.NotInUse",
         },
@@ -315,6 +372,7 @@ async fn a_reported_target_carries_the_port_the_request_named_else_the_groups_ow
             id: never,
             names_port: None,
             reports_port: "80",
+            reports_health_check_port: "80",
             state: "unused",
             reason: "Target.NotRegistered",
         },
@@ -323,6 +381,9 @@ async fn a_reported_target_carries_the_port_the_request_named_else_the_groups_ow
             id: never,
             names_port: Some("8080"),
             reports_port: "8080",
+            // This group configures no health-check port, so the probe runs against the port
+            // that target receives traffic on.
+            reports_health_check_port: "8080",
             state: "unused",
             reason: "Target.NotRegistered",
         },
@@ -334,12 +395,210 @@ async fn a_reported_target_carries_the_port_the_request_named_else_the_groups_ow
             vec![ReportedTarget {
                 id: Some(row.id.to_string()),
                 port: Some(row.reports_port.to_string()),
+                health_check_port: Some(row.reports_health_check_port.to_string()),
                 state: Some(row.state.to_string()),
                 reason: Some(row.reason.to_string()),
             }],
-            "case {}: expected the port {:?} on the reported target",
+            "case {}: expected the port {:?} on the reported target, got {reported:?}",
             row.case,
             row.reports_port
         );
     }
 }
+
+/// One row of the group-port table: the group the read is made against, the target it names,
+/// and the row that read must answer.
+struct GroupPortRow {
+    case: &'static str,
+    /// The group's `TargetType`.
+    target_type: &'static str,
+    /// The group's own `Port`, absent for a target type that carries none.
+    group_port: Option<&'static str>,
+    /// The group's `HealthCheckPort`, absent where the group leaves it to the traffic port.
+    group_health_check_port: Option<&'static str>,
+    /// The target the read names, and whether it is registered first.
+    id: TargetId,
+    registered: bool,
+    /// The `Port` the read names beside the id, or `None` for an id-only read.
+    names_port: Option<&'static str>,
+    /// The `Target$Port` and `HealthCheckPort` the answer must carry.
+    reports_port: Option<&'static str>,
+    reports_health_check_port: Option<&'static str>,
+    reason: &'static str,
+}
+
+/// How a group-port row writes the id it reads about: a literal of the group's target type,
+/// or — for a `lambda` group, whose targets are function ARNs — a function of this account.
+enum TargetId {
+    Literal(&'static str),
+    Function(&'static str),
+}
+
+impl TargetId {
+    /// The value the request carries.
+    fn resolve(&self) -> String {
+        match self {
+            TargetId::Literal(id) => (*id).to_string(),
+            TargetId::Function(name) => {
+                format!("arn:aws:lambda:{REGION}:{}:function:{name}", account())
+            }
+        }
+    }
+}
+
+/// The published range of every port member the model types as an integer
+/// (`smithy_query(query="shape",shape="Port")`: `range 1..65535`), whose bounds the group ports
+/// below are drawn from — so the rule is asked of a group port no default could have supplied.
+const LOW_BOUND: &str = "1";
+const HIGH_BOUND: &str = "65535";
+
+/// The groups and reads the rule is asked of beyond the default-port group above: the port the
+/// group is on, down to a group that has none, crossed with the target type, the health-check
+/// configuration, whether the read names a port and whether the id is registered.
+fn group_port_rows() -> Vec<GroupPortRow> {
+    vec![
+        GroupPortRow {
+            case: "an unregistered instance read by id alone, on a port no default picks",
+            target_type: "instance",
+            group_port: Some("44300"),
+            group_health_check_port: Some("4000"),
+            id: TargetId::Literal("i-0123456789abcdef0"),
+            registered: false,
+            names_port: None,
+            reports_port: Some("44300"),
+            reports_health_check_port: Some("4000"),
+            reason: "Target.NotRegistered",
+        },
+        GroupPortRow {
+            case: "an unregistered instance read on a port of its own",
+            target_type: "instance",
+            group_port: Some("44300"),
+            group_health_check_port: Some("4000"),
+            id: TargetId::Literal("i-0123456789abcdef0"),
+            registered: false,
+            names_port: Some("44301"),
+            reports_port: Some("44301"),
+            reports_health_check_port: Some("4000"),
+            reason: "Target.NotRegistered",
+        },
+        GroupPortRow {
+            case: "an unregistered instance on a group at the low bound of the port range",
+            target_type: "instance",
+            group_port: Some(LOW_BOUND),
+            group_health_check_port: None,
+            id: TargetId::Literal("i-00000000000000044"),
+            registered: false,
+            names_port: None,
+            reports_port: Some(LOW_BOUND),
+            reports_health_check_port: Some(LOW_BOUND),
+            reason: "Target.NotRegistered",
+        },
+        GroupPortRow {
+            case: "an unregistered instance on a group at the high bound of the port range",
+            target_type: "instance",
+            group_port: Some(HIGH_BOUND),
+            group_health_check_port: None,
+            id: TargetId::Literal("i-00000000000000055"),
+            registered: false,
+            names_port: None,
+            reports_port: Some(HIGH_BOUND),
+            reports_health_check_port: Some(HIGH_BOUND),
+            reason: "Target.NotRegistered",
+        },
+        GroupPortRow {
+            case: "an unregistered address read by id alone",
+            target_type: "ip",
+            group_port: Some("8081"),
+            group_health_check_port: Some("9090"),
+            id: TargetId::Literal("10.0.0.77"),
+            registered: false,
+            names_port: None,
+            reports_port: Some("8081"),
+            reports_health_check_port: Some("9090"),
+            reason: "Target.NotRegistered",
+        },
+        GroupPortRow {
+            case: "a registered instance read by id alone",
+            target_type: "instance",
+            group_port: Some("44300"),
+            group_health_check_port: Some("4000"),
+            id: TargetId::Literal("i-00000000000000066"),
+            registered: true,
+            names_port: None,
+            reports_port: Some("44300"),
+            reports_health_check_port: Some("4000"),
+            reason: "Target.NotInUse",
+        },
+        GroupPortRow {
+            case: "a registered address read by id alone",
+            target_type: "ip",
+            group_port: Some("8081"),
+            group_health_check_port: None,
+            id: TargetId::Literal("10.0.0.9"),
+            registered: true,
+            names_port: None,
+            reports_port: Some("8081"),
+            reports_health_check_port: Some("8081"),
+            reason: "Target.NotInUse",
+        },
+        GroupPortRow {
+            case: "an unregistered function on a group that has no port of its own",
+            target_type: "lambda",
+            group_port: None,
+            group_health_check_port: None,
+            id: TargetId::Function("never-registered"),
+            registered: false,
+            names_port: None,
+            // A Lambda function is invoked rather than connected to, so neither the group nor
+            // the read supplies a port and the row carries none.
+            reports_port: None,
+            reports_health_check_port: None,
+            reason: "Target.NotRegistered",
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_reported_target_carries_its_own_groups_port_whatever_that_port_is() {
+    // The port the rule defaults to is the GROUP's, read off the group under the read: a port
+    // no default picks, each bound of the published range, and a target type that carries no
+    // port at all.
+    let (router, _engine) = emulator();
+
+    for (index, row) in group_port_rows().iter().enumerate() {
+        let name = format!("group-port-{index}");
+        let arn = target_group_on(
+            &router,
+            row.case,
+            &name,
+            row.target_type,
+            row.group_port,
+            row.group_health_check_port,
+        )
+        .await;
+        let id = row.id.resolve();
+        if row.registered {
+            let reply = one_target(&router, "RegisterTargets", &arn, &id, None).await;
+            assert_eq!(
+                reply.status, 200,
+                "case {}: the registration must be accepted, got {} body {}",
+                row.case, reply.status, reply.body
+            );
+        }
+
+        let reported = reported_for(&router, &arn, &[(id.clone(), row.names_port)]).await;
+        let expected = vec![ReportedTarget {
+            id: Some(id.clone()),
+            port: row.reports_port.map(str::to_string),
+            health_check_port: row.reports_health_check_port.map(str::to_string),
+            state: Some("unused".to_string()),
+            reason: Some(row.reason.to_string()),
+        }];
+        assert_eq!(
+            reported, expected,
+            "case {}: expected {expected:?}, got {reported:?}",
+            row.case
+        );
+    }
+}
+
