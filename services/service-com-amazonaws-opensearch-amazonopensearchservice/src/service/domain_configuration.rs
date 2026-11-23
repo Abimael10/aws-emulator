@@ -373,6 +373,54 @@ pub fn stored_access_policies(document: Option<String>) -> Option<String> {
     Some(::service_common::json_document::minified(&document))
 }
 
+/// The hours of the day a daily automated snapshot can be taken at.
+///
+/// `SnapshotOptions$AutomatedSnapshotStartHour` is "the time, in UTC format, when
+/// OpenSearch Service takes a daily automated snapshot of the specified domain" — an
+/// hour of the day, so the values it admits are the 24 hours a day has and one outside
+/// them names no time at all. The model declares no `@range` for the member, so the
+/// request boundary admits every integer and this is where that bound is stated.
+const AUTOMATED_SNAPSHOT_HOUR_RANGE: ::std::ops::RangeInclusive<i32> = 0..=23;
+
+/// The member chain the refusal below names, as a boundary refusal spells the position.
+const AUTOMATED_SNAPSHOT_HOUR_PATH: [&str; 2] = ["SnapshotOptions", "AutomatedSnapshotStartHour"];
+
+/// Why the snapshot options a request carries are not ones the service can hold, or
+/// `None` for options it can — the ONE statement of that rule, so the create path and
+/// the update path judge the same options alike.
+///
+/// The only thing to judge is WHEN the daily snapshot is taken: an hour outside
+/// [`AUTOMATED_SNAPSHOT_HOUR_RANGE`] is no hour of the day, so the request is refused
+/// rather than a domain being created or changed around a schedule that could never come
+/// round. A request that carries no options, or options naming no hour, asks for the
+/// service's own default (`0` hours), so there is nothing to refuse.
+///
+/// Stated as the constraint report every value outside its member's bounds is refused
+/// with ([`crate::service::validation::nested_constraint_report`]), naming the bound the
+/// value broke, so a caller cannot tell this bound from one the model's traits carry.
+pub fn snapshot_options_refusal(options: Option<&SnapshotOptions>) -> Option<ValidationException> {
+    let hour = options?.automated_snapshot_start_hour?;
+    if AUTOMATED_SNAPSHOT_HOUR_RANGE.contains(&hour) {
+        return None;
+    }
+    let kind = if hour < *AUTOMATED_SNAPSHOT_HOUR_RANGE.start() {
+        ::aws_smithy_schema_server::ViolationKind::MinValue(
+            AUTOMATED_SNAPSHOT_HOUR_RANGE.start().to_string(),
+        )
+    } else {
+        ::aws_smithy_schema_server::ViolationKind::MaxValue(
+            AUTOMATED_SNAPSHOT_HOUR_RANGE.end().to_string(),
+        )
+    };
+    Some(ValidationException {
+        message: Some(crate::service::validation::nested_constraint_report(
+            &AUTOMATED_SNAPSHOT_HOUR_PATH,
+            &hour.to_string(),
+            kind,
+        )),
+    })
+}
+
 /// The refusal a request earns for naming an EBS performance member the volume type it
 /// asks for does not provision, or `None` when every member it named applies to that
 /// type.

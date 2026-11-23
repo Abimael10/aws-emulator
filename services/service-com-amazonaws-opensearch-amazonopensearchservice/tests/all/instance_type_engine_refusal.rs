@@ -32,14 +32,15 @@ use super::domain_lifecycle::{
 
 /// Pairings the service does not offer: an instance type together with an engine
 /// release that does not run it, one row per family the published instance-type
-/// catalog gates on a release (the UltraWarm family, the Graviton families and the
-/// OpenSearch-only family), each asked on a release before its gate and, where the
-/// family is gated across both engine lines, on each line.
+/// catalog gates on a release (the UltraWarm family, the Graviton families, the
+/// OpenSearch-only family and the burstable family offered on the Elasticsearch line
+/// alone), each asked on a release that does not offer it and, where the family is gated
+/// across both engine lines, on each line.
 ///
 /// Source of the rows: the catalog `ListInstanceTypeDetails` publishes, which
 /// [`the_published_catalog_agrees_about_every_row`] below reads for each row rather
 /// than this suite asserting the gates against themselves.
-const UNOFFERED: [(&str, &str); 8] = [
+const UNOFFERED: [(&str, &str); 10] = [
     ("Elasticsearch_5.1", "ultrawarm1.medium.search"),
     ("Elasticsearch_6.7", "ultrawarm1.xlarge.search"),
     ("Elasticsearch_7.1", "c6g.large.search"),
@@ -48,18 +49,21 @@ const UNOFFERED: [(&str, &str); 8] = [
     ("Elasticsearch_7.10", "or1.large.search"),
     ("OpenSearch_1.3", "or1.medium.search"),
     ("OpenSearch_2.3", "or1.medium.search"),
+    ("OpenSearch_1.0", "t2.micro.search"),
+    ("OpenSearch_2.11", "t2.small.search"),
 ];
 
 /// Pairings the service DOES offer, as the counterpart of each row above: the release
 /// each gated family is offered from, a later release of the same line, and an
 /// ungated family on an early release.
-const OFFERED: [(&str, &str); 6] = [
+const OFFERED: [(&str, &str); 7] = [
     ("Elasticsearch_6.8", "ultrawarm1.medium.search"),
     ("Elasticsearch_7.9", "c6g.large.search"),
     ("Elasticsearch_7.10", "t4g.small.search"),
     ("OpenSearch_2.11", "or1.medium.search"),
     ("OpenSearch_2.19", "or1.large.search"),
     ("Elasticsearch_5.1", "m5.large.search"),
+    ("Elasticsearch_7.10", "t2.medium.search"),
 ];
 
 /// This suite's OWN statement of the refusal text: the fixed sentence, whose single
@@ -207,6 +211,33 @@ async fn the_limits_read_refuses_an_unoffered_pairing_by_naming_the_type_alone()
     }
 }
 
+/// The cluster configuration one OFFERED row is created with, and the `ClusterConfig`
+/// member the row's instance type lands in: an instance type is provisioned in a tier
+/// its published roles let it serve, so the UltraWarm family is named as the WARM tier
+/// (on top of the dedicated master nodes that tier rests on) and every other family as
+/// the data nodes. The role rule itself is [`super::node_role_scope`]'s.
+fn offered_cluster(instance_type: &str) -> (Value, &'static str) {
+    if instance_type.starts_with("ultrawarm1.") {
+        return (
+            json!({
+                "InstanceType": "m5.large.search",
+                "InstanceCount": 2,
+                "DedicatedMasterEnabled": true,
+                "DedicatedMasterType": "m5.large.search",
+                "DedicatedMasterCount": 3,
+                "WarmEnabled": true,
+                "WarmType": instance_type,
+                "WarmCount": 2,
+            }),
+            "WarmType",
+        );
+    }
+    (
+        json!({ "InstanceType": instance_type, "InstanceCount": 2 }),
+        "InstanceType",
+    )
+}
+
 #[tokio::test]
 async fn create_refuses_the_same_pairing_with_the_same_text_and_stores_nothing() {
     let emulator = Emulator::new();
@@ -241,11 +272,12 @@ async fn create_refuses_the_same_pairing_with_the_same_text_and_stores_nothing()
     for (row, (version, instance_type)) in OFFERED.into_iter().enumerate() {
         let name = domain_name("create-offered", row);
         let case = format!("CreateDomain({name}, {version}, {instance_type})");
+        let (cluster, member) = offered_cluster(instance_type);
         let answer = emulator
             .create(json!({
                 "DomainName": name,
                 "EngineVersion": version,
-                "ClusterConfig": { "InstanceType": instance_type, "InstanceCount": 2 },
+                "ClusterConfig": cluster,
             }))
             .await;
         assert_eq!(
@@ -257,9 +289,10 @@ async fn create_refuses_the_same_pairing_with_the_same_text_and_stores_nothing()
         // created with.
         let read = emulator.describe(&name).await;
         assert_eq!(
-            read.body["DomainStatus"]["ClusterConfig"]["InstanceType"],
+            read.body["DomainStatus"]["ClusterConfig"][member],
             json!(instance_type),
-            "case {case}: expected the stored cluster to run the created type, got {:?}",
+            "case {case}: expected the stored cluster to run the created type at {member}, \
+             got {:?}",
             read.body["DomainStatus"]["ClusterConfig"]
         );
         assert_eq!(

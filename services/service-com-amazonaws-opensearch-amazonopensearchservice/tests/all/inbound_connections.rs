@@ -38,7 +38,7 @@ use super::cross_cluster_connections::{
     connections, create_connection, created_domain, delete_domain,
     describe_connections as describe_outbound, domain_info, reported, reported_ids, ACCOUNT, REGION,
 };
-use super::domain_lifecycle::{error_code, Answer, Emulator, PREFIX, SETTLE_WAIT};
+use super::domain_lifecycle::{error_code, poll_until, Answer, Emulator, PREFIX, SETTLE_WAIT};
 
 /// `DescribeInboundConnections`: `POST /opensearch/cc/inboundConnection/search`.
 pub(crate) async fn describe_inbound(emulator: &Emulator, body: Value) -> Answer {
@@ -76,7 +76,8 @@ struct Row {
 /// The table of connections whose inbound view is asserted: the mode omitted and
 /// named either way, no properties / an endpoint / a cross-cluster-search property,
 /// and a source reference naming its account and Region in full, partly or not at
-/// all.
+/// all. The source of an outbound connection is a domain of the CALLER's account, so
+/// every row's local reference names that account or none.
 fn rows() -> Vec<Row> {
     vec![
         Row {
@@ -89,10 +90,10 @@ fn rows() -> Vec<Row> {
             properties: None,
         },
         Row {
-            case: "a source in another account and Region, mode named",
+            case: "a source in another Region of the caller's account, mode named",
             alias: "inbound-cross-account",
-            local: domain_info("in-source-b", Some("210987654321"), Some("eu-west-1")),
-            expected_local: domain_info("in-source-b", Some("210987654321"), Some("eu-west-1")),
+            local: domain_info("in-source-b", Some(ACCOUNT), Some("eu-west-1")),
+            expected_local: domain_info("in-source-b", Some(ACCOUNT), Some("eu-west-1")),
             mode: Some(CONNECTION_MODE_DIRECT),
             expected_mode: CONNECTION_MODE_DIRECT,
             properties: Some(json!({ "CrossClusterSearch": { "SkipUnavailable": "ENABLED" } })),
@@ -109,8 +110,8 @@ fn rows() -> Vec<Row> {
         Row {
             case: "a source naming the owner but not the Region",
             alias: "inbound-owner-only",
-            local: domain_info("in-source-d", Some("210987654321"), None),
-            expected_local: domain_info("in-source-d", Some("210987654321"), Some(REGION)),
+            local: domain_info("in-source-d", Some(ACCOUNT), None),
+            expected_local: domain_info("in-source-d", Some(ACCOUNT), Some(REGION)),
             mode: Some(CONNECTION_MODE_DIRECT),
             expected_mode: CONNECTION_MODE_DIRECT,
             properties: Some(json!({ "CrossClusterSearch": { "SkipUnavailable": "DISABLED" } })),
@@ -393,15 +394,18 @@ async fn the_inbound_report_is_narrowed_by_every_documented_filter_name() {
         created_domain(&emulator, domain).await;
     }
 
-    // Three connections differing in source domain, source account, source Region and
-    // destination domain, so each filter name below picks a different subset. Every
-    // source reference names a domain the registry resolves, so each connection
-    // reaches the status that gives it an inbound view.
+    // Three connections differing in source domain, source Region and destination
+    // domain, so each filter name below picks a different subset. The source of an
+    // outbound connection is a domain of the CALLER's account, so the source account is
+    // the same for all three — named explicitly on one of them — and the owner-id filter
+    // is made selective by a value no connection carries instead. Every source reference
+    // names a domain the registry resolves, so each connection reaches the status that
+    // gives it an inbound view.
     let fixtures: Vec<(&str, Value, &str)> = vec![
         ("to-one", domain_info("flt-source-a", None, None), "dst-one"),
         (
             "to-two",
-            domain_info("flt-source-a", Some("210987654321"), Some("eu-west-1")),
+            domain_info("flt-source-a", Some(ACCOUNT), Some("eu-west-1")),
             "dst-two",
         ),
         (
@@ -424,7 +428,15 @@ async fn the_inbound_report_is_narrowed_by_every_documented_filter_name() {
         .await;
         ids.push(id);
     }
-    tokio::time::sleep(SETTLE_WAIT).await;
+    // A created request is `VALIDATING`, and the clock owes it the status that gives it
+    // an inbound view: the case waits for THAT condition to hold of every connection it
+    // created rather than for a fixed stretch of time.
+    let created = ids.len();
+    poll_until("the inbound view of every created connection", || async {
+        let report = describe_inbound(&emulator, json!({})).await;
+        reported_ids(&report, "the inbound report").len() == created
+    })
+    .await;
 
     // The filter names AWS documents as available for this operation, each on a value
     // the fixtures above make selective, plus the cases that fix the combining rules.
@@ -442,8 +454,16 @@ async fn the_inbound_report_is_narrowed_by_every_documented_filter_name() {
         ),
         (
             "local-domain-info.owner-id",
-            json!({ "Filters": [{ "Name": "local-domain-info.owner-id", "Values": ["210987654321"] }] }),
-            vec![1],
+            json!({ "Filters": [{ "Name": "local-domain-info.owner-id", "Values": [ACCOUNT] }] }),
+            vec![0, 1, 2],
+        ),
+        (
+            "local-domain-info.owner-id of another account",
+            json!({ "Filters": [{
+                "Name": "local-domain-info.owner-id",
+                "Values": ["210987654321"],
+            }] }),
+            vec![],
         ),
         (
             "local-domain-info.region",

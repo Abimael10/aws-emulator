@@ -39,14 +39,16 @@ fn unavailable_message(instance_type: &str) -> String {
     )
 }
 
-/// The hot-tier instance types warm storage is NOT offered for: the BURSTABLE families,
-/// at the sizes the published catalog offers them in
+/// The hot-tier instance types warm storage is NOT offered for: the BURSTABLE families
+/// the listing release offers, at the sizes the published catalog offers them in
 /// (`smithy_query(query="shape",shape="OpenSearchPartitionInstanceType")` lists them, and
 /// `ListInstanceTypeDetails` reports `WarmEnabled` false for each — which is the same
-/// capability this rule reads).
+/// capability this rule reads). The burstable family the service offers on the
+/// Elasticsearch line alone is not among them, since this suite reads ONE OpenSearch
+/// release.
 const WITHOUT_WARM_STORAGE: [&str; 6] = [
-    "t2.small.search",
-    "t2.medium.search",
+    "t3.nano.search",
+    "t3.micro.search",
     "t3.small.search",
     "t3.medium.search",
     "t3.large.search",

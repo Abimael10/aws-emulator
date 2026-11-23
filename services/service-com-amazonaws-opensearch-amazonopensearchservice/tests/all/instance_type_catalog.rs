@@ -97,6 +97,14 @@ const PREVIOUS_GENERATION_FAMILIES: [&str; 8] = ["c4", "d2", "i2", "m3", "m4", "
 
 /// The family that serves the warm tier, which the catalog publishes apart from the
 /// hot-tier families.
+/// The instance families the service offers on the ELASTICSEARCH line alone: the
+/// burstable previous generation, which the T3 family replaced for the OpenSearch
+/// engine. The rows are instance types, so the premise of each is read off the published
+/// catalog by [`the_elasticsearch_only_family_is_offered_on_that_line_alone`] rather than
+/// asserted against the service's own table.
+pub(crate) const ELASTICSEARCH_ONLY: [&str; 3] =
+    ["t2.micro.search", "t2.small.search", "t2.medium.search"];
+
 const WARM_FAMILY: &str = "ultrawarm1";
 
 /// The families whose instances hold the domain's data and are never master-eligible:
@@ -382,9 +390,11 @@ async fn the_listing_is_published_in_the_catalogs_documented_order() {
     }
 
     // The catalog is not filtered by instance GENERATION: a previous-generation family
-    // is published for a current release too, after the current generations.
+    // is published for a current release too, after the current generations — every one
+    // of them but the burstable generation the service retired with the Elasticsearch
+    // line ([`ELASTICSEARCH_ONLY`]).
     let current = instance_types(&whole_listing(&emulator, "OpenSearch_2.19", "").await);
-    for previous_generation in ["c4.4xlarge.search", "m4.large.search", "t2.micro.search"] {
+    for previous_generation in ["c4.4xlarge.search", "m4.large.search", "r4.2xlarge.search"] {
         assert!(
             current.contains(&previous_generation.to_string()),
             "case {previous_generation} on OpenSearch_2.19: expected the catalog to carry \
@@ -446,7 +456,8 @@ async fn the_listing_is_the_catalog_the_named_release_offers() {
 
     // A release offers at least what an earlier release of the line offers: a family is
     // introduced for a release and is offered from it onwards, so the catalog grows
-    // along the succession and never loses an entry.
+    // along the succession and loses an entry only where the later release's ENGINE does
+    // not offer the family at all ([`ELASTICSEARCH_ONLY`]).
     for earlier in VERSIONS {
         for later in VERSIONS {
             let succeeds = if parse(earlier).0 == parse(later).0 {
@@ -465,11 +476,38 @@ async fn the_listing_is_the_catalog_the_named_release_offers() {
                 instance_types(&whole_listing(&emulator, later, "").await)
                     .into_iter()
                     .collect();
-            let lost: Vec<&String> = earlier_types.difference(&later_types).collect();
+            let lost: Vec<&String> = earlier_types
+                .difference(&later_types)
+                .filter(|instance_type| {
+                    !(is_opensearch(later) && ELASTICSEARCH_ONLY.contains(&instance_type.as_str()))
+                })
+                .collect();
             assert!(
                 lost.is_empty(),
                 "case {earlier} -> {later}: expected a release to offer every instance \
                  type an earlier one offers, lost {lost:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_elasticsearch_only_family_is_offered_on_that_line_alone() {
+    let emulator = Emulator::new();
+
+    // Every release of the version table, so the premise of [`ELASTICSEARCH_ONLY`] is
+    // read off the published catalog on both engine lines: offered on each Elasticsearch
+    // release, however early or late, and on no OpenSearch release.
+    for version in VERSIONS {
+        let offered = instance_types(&whole_listing(&emulator, version, "").await);
+        for instance_type in ELASTICSEARCH_ONLY {
+            let carried = offered.contains(&instance_type.to_string());
+            assert_eq!(
+                carried,
+                !is_opensearch(version),
+                "case {instance_type} on {version}: expected the family to be offered on \
+                 the Elasticsearch line alone, got carried={carried} among {} entries",
+                offered.len()
             );
         }
     }
@@ -668,6 +706,11 @@ async fn a_feature_available_on_one_release_stays_available_on_a_later_one() {
                 let instance_type = instance_types(std::slice::from_ref(entry))
                     .pop()
                     .expect("one entry has one InstanceType");
+                // A family the later release's engine does not offer at all has no
+                // successor entry to carry a feature forward ([`ELASTICSEARCH_ONLY`]).
+                if is_opensearch(later) && ELASTICSEARCH_ONLY.contains(&instance_type.as_str()) {
+                    continue;
+                }
                 let case = format!("{instance_type}: {earlier} -> {later}");
                 let successor = later_listing
                     .iter()
@@ -1161,8 +1204,11 @@ async fn retrieve_azs_reports_the_zones_of_the_listing_region() {
     }
 
     // The catalog itself does not depend on the domain: a scoped listing reports the
-    // same instance types as an unscoped one.
-    let scoped = instance_types(&whole_listing(&emulator, version, &format!("domainName={name}")).await);
+    // same instance types as an unscoped one. Naming a domain asks for that domain's
+    // zones, so the scoped read enables the flag that reports them.
+    let scoped = instance_types(
+        &whole_listing(&emulator, version, &format!("domainName={name}&retrieveAZs=true")).await,
+    );
     let unscoped = instance_types(&whole_listing(&emulator, version, "").await);
     assert_eq!(
         scoped, unscoped,
@@ -1179,9 +1225,16 @@ async fn a_request_naming_no_domain_or_no_release_is_refused() {
     let version = "OpenSearch_2.11";
 
     // A `domainName` the account holds no domain for names no resource, over a table of
-    // names inside the member's own length bounds.
+    // names inside the member's own length bounds. Naming a domain asks for that domain's
+    // Availability Zone information, so every scoped read below enables the retrieve-AZ
+    // flag ([`super::instance_type_az_scope`] holds the refusal of one that does not).
     for absent in ["nosuch", "absent-domain", "zzz"] {
-        let answer = list(&emulator, version, &format!("domainName={absent}")).await;
+        let answer = list(
+            &emulator,
+            version,
+            &format!("domainName={absent}&retrieveAZs=true"),
+        )
+        .await;
         assert_eq!(
             answer.status, RECORDED_NOT_FOUND_STATUS,
             "case {absent}: expected HTTP {RECORDED_NOT_FOUND_STATUS}, got {} {:?}",
@@ -1198,7 +1251,12 @@ async fn a_request_naming_no_domain_or_no_release_is_refused() {
     // A deleted domain holds no record either, so the same refusal follows a delete.
     let name = "transient-domain";
     emulator.create(json!({ "DomainName": name })).await;
-    let before = list(&emulator, version, &format!("domainName={name}")).await;
+    let before = list(
+        &emulator,
+        version,
+        &format!("domainName={name}&retrieveAZs=true"),
+    )
+    .await;
     assert_eq!(
         before.status, 200,
         "case created domain: expected HTTP 200, got {} {:?}",
@@ -1207,7 +1265,12 @@ async fn a_request_naming_no_domain_or_no_release_is_refused() {
     emulator
         .call("DELETE", &format!("{PREFIX}/opensearch/domain/{name}"), None)
         .await;
-    let after = list(&emulator, version, &format!("domainName={name}")).await;
+    let after = list(
+        &emulator,
+        version,
+        &format!("domainName={name}&retrieveAZs=true"),
+    )
+    .await;
     assert_eq!(
         after.status, RECORDED_NOT_FOUND_STATUS,
         "case deleted domain: expected HTTP {RECORDED_NOT_FOUND_STATUS}, got {} {:?}",
@@ -1247,6 +1310,7 @@ async fn reading_the_catalog_changes_nothing() {
     list(&emulator, version, "maxResults=3").await;
     list(&emulator, version, "instanceType=m5.large.search").await;
     list(&emulator, version, "retrieveAZs=true").await;
+    list(&emulator, version, "domainName=nosuch&retrieveAZs=true").await;
     list(&emulator, version, "domainName=nosuch").await;
     list(&emulator, "Elasticsearch_1.5", "").await;
 

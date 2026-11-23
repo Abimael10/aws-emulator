@@ -158,6 +158,9 @@ json-patch = { version = "4.2", default-features = false }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs` in the single integration-test target's
+# root, so a suite is picked up by being added rather than by being listed.
+automod = { workspace = true }
 # The Amazon SNS and Amazon SQS services, mounted beside this one on ONE shared engine by
 # the alerting suite: a monitor trigger's notification is published to an SNS topic and
 # read back off the SQS queue subscribed to it, so what the suite asserts is where a client

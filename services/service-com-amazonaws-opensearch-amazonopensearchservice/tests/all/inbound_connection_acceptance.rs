@@ -205,7 +205,9 @@ struct Row {
 
 /// The table of connections accepted: the mode omitted and named either way, no
 /// properties / an endpoint / a cross-cluster-search property, and a source reference
-/// naming its account and Region in full, partly or not at all.
+/// naming its account and Region in full, partly or not at all. The source of an
+/// outbound connection is a domain of the CALLER's account, so every row's local
+/// reference names that account or none.
 fn rows() -> Vec<Row> {
     vec![
         Row {
@@ -219,11 +221,11 @@ fn rows() -> Vec<Row> {
             properties: None,
         },
         Row {
-            case: "a source in another account and Region, mode named",
+            case: "a source in another Region of the caller's account, mode named",
             alias: "accept-cross-account",
             source: "acc-source-b",
-            local: domain_info("acc-source-b", Some("210987654321"), Some("eu-west-1")),
-            expected_local: domain_info("acc-source-b", Some("210987654321"), Some("eu-west-1")),
+            local: domain_info("acc-source-b", Some(ACCOUNT), Some("eu-west-1")),
+            expected_local: domain_info("acc-source-b", Some(ACCOUNT), Some("eu-west-1")),
             mode: Some(CONNECTION_MODE_DIRECT),
             expected_mode: CONNECTION_MODE_DIRECT,
             properties: Some(json!({ "CrossClusterSearch": { "SkipUnavailable": "ENABLED" } })),

@@ -195,6 +195,11 @@ pub(super) enum OfferedReleases {
     /// From an OpenSearch release onwards, and on no Elasticsearch release: a family
     /// the service publishes for the OpenSearch engine alone.
     SinceOpenSearch((u32, u32)),
+    /// On the Elasticsearch releases alone — a family the service RETIRED with that
+    /// engine line and offers on no OpenSearch release, so a cluster or a limits read
+    /// pairing it with an OpenSearch release names an instance type the service does
+    /// not offer.
+    ElasticsearchOnly,
 }
 
 /// One family of the published instance-type catalog: the instance types the service
@@ -221,6 +226,7 @@ impl CatalogFamily {
             OfferedReleases::Every => true,
             OfferedReleases::SinceElasticsearch(release) => version.since_elasticsearch(release),
             OfferedReleases::SinceOpenSearch(release) => version.opensearch_at_least(release),
+            OfferedReleases::ElasticsearchOnly => !version.is_opensearch(),
         }
     }
 }
@@ -744,11 +750,16 @@ pub(super) const INSTANCE_TYPE_CATALOG: &[CatalogFamily] = &[
         roles: ROLES_DATA_AND_MASTER,
         releases: OfferedReleases::Every,
     },
+    // The one previous-generation family the service offers on the Elasticsearch line
+    // alone: the burstable T2 instances predate the OpenSearch engine and the T3 family
+    // replaced them for it, so no OpenSearch release offers them. Every other previous
+    // generation is still offered on both lines ([`PREVIOUS_GENERATION_FAMILIES`]) —
+    // the catalog is not filtered by instance generation, only by what a release offers.
     CatalogFamily {
         family: "t2",
         instance_types: &["t2.micro.search", "t2.small.search", "t2.medium.search"],
         roles: ROLES_DATA_AND_MASTER,
-        releases: OfferedReleases::Every,
+        releases: OfferedReleases::ElasticsearchOnly,
     },
     // The UltraWarm tier.
     CatalogFamily {
@@ -1905,22 +1916,202 @@ pub fn unoffered_instance_type_refusal(
 /// storage for the cluster", and a `NodeConfig`'s type with "whether a specific node
 /// type is active or inactive".
 pub(super) fn provisioned_instance_types(cluster: &ClusterConfig) -> Vec<&str> {
-    let mut types: Vec<&str> = Vec::new();
-    types.extend(cluster.instance_type.as_deref());
+    provisioned_nodes(cluster)
+        .into_iter()
+        .map(|(instance_type, _)| instance_type)
+        .collect()
+}
+
+/// Every node `cluster` provisions, as the instance type it runs on paired with the
+/// ROLE that node serves — the one reading of a cluster configuration's tiers, which
+/// [`provisioned_instance_types`] is the instance-type half of.
+///
+/// The role each tier provisions its nodes in is the tier itself:
+/// `ClusterConfig$InstanceType` is the "instance type of data nodes in the cluster",
+/// `DedicatedMasterType` the type "of the dedicated master nodes in the cluster",
+/// `WarmType` the type "for the cluster's warm nodes", and a node option's
+/// `NodeConfig$Type` the type "of a particular node within the cluster" for the
+/// `NodeOption$NodeType` the option names. A tier that is turned off provisions no node
+/// and so contributes none.
+fn provisioned_nodes(cluster: &ClusterConfig) -> Vec<(&str, &'static str)> {
+    let mut nodes: Vec<(&str, &'static str)> = Vec::new();
+    nodes.extend(
+        cluster
+            .instance_type
+            .as_deref()
+            .map(|instance_type| (instance_type, INSTANCE_ROLE_DATA)),
+    );
     if cluster.dedicated_master_enabled.unwrap_or(false) {
-        types.extend(cluster.dedicated_master_type.as_deref());
+        nodes.extend(
+            cluster
+                .dedicated_master_type
+                .as_deref()
+                .map(|instance_type| (instance_type, INSTANCE_ROLE_MASTER)),
+        );
     }
     if cluster.warm_enabled.unwrap_or(false) {
-        types.extend(cluster.warm_type.as_deref());
+        nodes.extend(
+            cluster
+                .warm_type
+                .as_deref()
+                .map(|instance_type| (instance_type, INSTANCE_ROLE_ULTRAWARM)),
+        );
     }
     for option in cluster.node_options.iter().flatten() {
         if let Some(config) = option.node_config.as_ref() {
             if config.enabled.unwrap_or(false) {
-                types.extend(config.r#type.as_deref());
+                nodes.extend(config.r#type.as_deref().map(|instance_type| {
+                    (instance_type, node_option_role(option.node_type.as_deref()))
+                }));
             }
         }
     }
-    types
+    nodes
+}
+
+/// `NodeOptionsNodeType`'s one modelled value
+/// (`smithy_query(query="shape",shape="NodeOptionsNodeType")`), which names the
+/// dedicated coordinator role.
+const NODE_TYPE_COORDINATOR: &str = "coordinator";
+
+/// The role a node option provisions its nodes in: the coordinator role for the one
+/// node type the model names, and the data role for an option naming no node type at
+/// all — such an option names no role of its own.
+fn node_option_role(node_type: Option<&str>) -> &'static str {
+    match node_type {
+        Some(NODE_TYPE_COORDINATOR) => INSTANCE_ROLE_COORDINATOR,
+        _ => INSTANCE_ROLE_DATA,
+    }
+}
+
+/// The refusal for the first node `cluster` would provision on an instance type that
+/// cannot serve that node's ROLE, or `None` when every tier names a type published for
+/// the role it provisions.
+///
+/// Which roles an instance type can be provisioned in is published per instance type
+/// ([`instance_roles`], the set `InstanceTypeDetails$InstanceRole` reports — "whether
+/// the instance acts as a data node, a dedicated master node, or an UltraWarm node"), so
+/// an instance type named for a tier its published roles do not carry describes a node
+/// the service cannot provision: the warm-tier family as the cluster's data nodes, a
+/// data-only family as the dedicated masters, or a family that serves no coordinator
+/// role as a coordinator node option.
+///
+/// The refusal is the service's one wording for an instance type it cannot provision
+/// ([`invalid_instance_type`]), the same text an instance type the engine release does
+/// not offer is refused with ([`cluster_instance_type_refusal`]): both say the type named
+/// cannot run the node the request asked for.
+pub fn instance_role_refusal(cluster: &ClusterConfig) -> Option<InvalidTypeException> {
+    provisioned_nodes(cluster)
+        .into_iter()
+        .find(|(instance_type, role)| {
+            // A type the catalog publishes no entry for has no published roles at all;
+            // that is the engine-release gate's refusal to state
+            // ([`cluster_instance_type_refusal`]), not this rule's.
+            publishes_instance_type(instance_type) && !instance_roles(instance_type).contains(role)
+        })
+        .map(|(instance_type, _)| invalid_instance_type(instance_type))
+}
+
+/// How many Availability Zones a cluster turned on with a standby zone is placed in.
+///
+/// `ClusterConfig$MultiAZWithStandbyEnabled` is "a boolean that indicates whether a
+/// multi-AZ domain is turned on with a standby AZ": one of the domain's zones is held in
+/// reserve ([`super::STANDBY_ZONES`]) while the others serve traffic, so such a domain is
+/// placed in the largest number of zones the service places a cluster in — the top of
+/// [`super::ZONE_COUNT_RANGE`] — and a deployment with fewer zones has none to hold back.
+fn standby_zone_requirement() -> i32 {
+    *super::ZONE_COUNT_RANGE.end()
+}
+
+/// Whether `cluster` is placed in the Availability Zones a standby zone takes, and the
+/// refusal naming that requirement otherwise.
+///
+/// A standby zone is one of the domain's own zones held in reserve, so a cluster asking
+/// for one has to be zone-aware across [`standby_zone_requirement`] zones: one that asks
+/// for a standby without zone awareness at all — a single-zone deployment, whatever its
+/// node count — or with fewer zones than that describes a topology the service does not
+/// provision, and the request is refused rather than stored. How the data nodes are
+/// spread across those zones is the rule above ([`zone_awareness_refusal`]), and the
+/// create and the update paths apply both alike.
+pub fn multi_az_with_standby_refusal(
+    cluster: Option<&ClusterConfig>,
+) -> Option<ValidationException> {
+    let cluster = cluster?;
+    if cluster.multi_az_with_standby_enabled != Some(true) {
+        return None;
+    }
+    let required = standby_zone_requirement();
+    if requested_zone_count(cluster) == Some(required) {
+        return None;
+    }
+    Some(ValidationException {
+        message: Some(format!(
+            "You must enable zone awareness with {required} Availability Zones to use \
+             Multi-AZ with Standby."
+        )),
+    })
+}
+
+/// Whether the per-volume performance figures `ebs` asks for are inside the range the
+/// service publishes for the pairing, and the refusal naming the bounds otherwise.
+///
+/// `EBSOptions$Iops` is "the baseline input/output (I/O) performance of EBS volumes
+/// attached to data nodes" and `Throughput` "the throughput (in MiB/s)" of the same
+/// volumes; the service publishes a range for each per volume sub-type and instance type
+/// ([`iops_range`], [`throughput_range`] — the figures `DescribeInstanceTypeLimits`
+/// reports as that pairing's minimum and maximum), so a figure outside it asks for
+/// performance the service does not provision for that volume. Like a volume SIZE outside
+/// its published range ([`ebs_volume_size_refusal`]) that is a published LIMIT of the
+/// pairing rather than a malformed request, so the refusal is the modelled
+/// `LimitExceededException` and the sentence is the one that bound is stated in: the
+/// bounds, and the pairing they are published for.
+///
+/// A sub-type the figure does not apply to at all publishes no range
+/// ([`crate::service::domain_configuration::ebs_performance_refusal`] refuses the figure
+/// itself), options with no volume attach nothing, and a request carrying neither figure
+/// asks for the service's own baseline.
+pub fn ebs_performance_bounds_refusal(
+    ebs: Option<&EBSOptions>,
+    instance_type: Option<&str>,
+    engine_version: &str,
+) -> Option<LimitExceededException> {
+    let ebs = ebs?;
+    if !ebs.ebs_enabled.unwrap_or(false) {
+        return None;
+    }
+    let sub_type = ebs.volume_type.as_deref().unwrap_or(VOLUME_TYPE_GP2);
+    // Without an instance type the volume attaches to nothing, so only the sub-type's own
+    // range bounds the figure: no family named is no attachment to narrow it by.
+    let paired = instance_type.unwrap_or("");
+    for (member, figure, range) in [
+        ("Iops", ebs.iops, iops_range(paired, sub_type)),
+        (
+            "Throughput",
+            ebs.throughput,
+            throughput_range(paired, sub_type),
+        ),
+    ] {
+        let (Some(figure), Some((minimum, maximum))) = (figure, range) else {
+            continue;
+        };
+        let figure = i64::from(figure);
+        if (minimum..=maximum).contains(&figure) {
+            continue;
+        }
+        let message = match instance_type {
+            Some(instance_type) => format!(
+                "{member} must be between {minimum} and {maximum} for {instance_type} instance \
+                 type and version {engine_version}"
+            ),
+            None => format!(
+                "{member} must be between {minimum} and {maximum} for version {engine_version}"
+            ),
+        };
+        return Some(LimitExceededException {
+            message: Some(message),
+        });
+    }
+    None
 }
 
 /// The refusal for the first instance type `cluster` provisions a node on that

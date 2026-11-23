@@ -478,8 +478,32 @@ fn invalid_role_arn(role_arn: &str) -> String {
 /// caller cannot tell a constraint this service checks itself from one the model's traits
 /// carry. `member` is the member's name as the MODEL spells it.
 pub(crate) fn constraint_report(member: &str, value: &str, kind: ViolationKind) -> String {
+    report_at(constraints::path::member(member), value, kind)
+}
+
+/// The same report for a member NESTED inside an input structure, named by the chain of
+/// members that reaches it (`["SnapshotOptions", "AutomatedSnapshotStartHour"]`).
+///
+/// The path is the one a boundary refusal states for that position: each member spelled
+/// as `constraints::path` spells it, joined by the step the validating walk takes into a
+/// structure's member — so a constraint a handler checks inside a container reads like
+/// one the model's traits carry there.
+pub(crate) fn nested_constraint_report(
+    members: &[&str],
+    value: &str,
+    kind: ViolationKind,
+) -> String {
+    let path: Vec<String> = members
+        .iter()
+        .map(|member| constraints::path::member(member))
+        .collect();
+    report_at(path.join("."), value, kind)
+}
+
+/// One clause's report at an already-spelled member path.
+fn report_at(path: String, value: &str, kind: ViolationKind) -> String {
     let violation = Violation {
-        path: constraints::path::member(member),
+        path,
         kind,
         value: Some(value.to_owned()),
         sensitive: false,

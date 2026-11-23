@@ -522,6 +522,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // ... and every node runs in the ROLE its tier provisions it in, which is
+        // published per instance type too, so a tier naming a type whose published roles
+        // do not carry that role describes a node the service cannot provision and is
+        // refused with the same wording ([`crate::state::instance_role_refusal`]) — by
+        // the same rule the update path applies.
+        if let Some(cluster) = input.cluster_config.as_ref() {
+            if let Some(refusal) = crate::state::instance_role_refusal(cluster) {
+                return Err(CreateDomainErrorModeled::InvalidTypeException(refusal).into());
+            }
+        }
+
         // The storage a domain is created with has to be storage the service publishes
         // for the instance type the domain runs on: a volume sized outside that
         // published range asks for storage the service does not offer for that instance
@@ -529,6 +540,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request, so it is refused with the modelled `LimitExceededException` and no
         // domain is created.
         if let Some(refusal) = crate::state::ebs_volume_size_refusal(
+            input.ebs_options.as_ref(),
+            input
+                .cluster_config
+                .as_ref()
+                .and_then(|cluster| cluster.instance_type.as_deref()),
+            &engine_version,
+        ) {
+            return Err(CreateDomainErrorModeled::LimitExceededException(refusal).into());
+        }
+
+        // ... and the per-volume performance figures it is created with have to be inside
+        // the range the service publishes for that same pairing: a baseline or a
+        // throughput outside it asks for performance the service does not provision for
+        // the volume, which is the same published LIMIT
+        // ([`crate::state::ebs_performance_bounds_refusal`]), by the same rule the update
+        // path applies.
+        if let Some(refusal) = crate::state::ebs_performance_bounds_refusal(
             input.ebs_options.as_ref(),
             input
                 .cluster_config
@@ -588,6 +616,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::data_node_count_refusal(input.cluster_config.as_ref()),
             crate::state::zone_count_refusal(input.cluster_config.as_ref()),
             crate::state::zone_awareness_refusal(input.cluster_config.as_ref()),
+            // ... and a standby zone is one of the domain's own zones held in reserve, so
+            // a cluster asking for one has to be placed in the zones that takes
+            // ([`crate::state::multi_az_with_standby_refusal`]), by the same rule the
+            // update path applies.
+            crate::state::multi_az_with_standby_refusal(input.cluster_config.as_ref()),
+            // An automated snapshot is taken at an hour of the day, so a value that names
+            // no hour schedules nothing
+            // ([`crate::service::domain_configuration::snapshot_options_refusal`]), by the
+            // same rule the update path applies.
+            crate::service::domain_configuration::snapshot_options_refusal(
+                input.snapshot_options.as_ref(),
+            ),
             // ... and a VPC-access domain is reached through one subnet per Availability
             // Zone it is placed in, so a request whose `VPCOptions$SubnetIds` is not as
             // long as the cluster's zone count describes a placement the service does not

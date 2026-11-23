@@ -774,6 +774,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // ... and every node of the merged cluster runs in the ROLE its tier provisions
+        // it in, so a change that would leave a tier on an instance type whose published
+        // roles do not carry that role is refused for the same reason the create path
+        // refuses it ([`crate::state::instance_role_refusal`]).
+        if let Some(refusal) = crate::state::instance_role_refusal(&merged.cluster_config) {
+            return Err(UpdateDomainConfigErrorModeled::InvalidTypeException(refusal).into());
+        }
+
         // The storage a domain runs on has to be storage the service publishes for the
         // instance type it runs on, and the update is judged on the MERGED record: a
         // request that resizes the volume is checked against the instance type the
@@ -784,6 +792,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // too — it reports what applying the change would do, and this change cannot be
         // applied.
         if let Some(refusal) = crate::state::ebs_volume_size_refusal(
+            merged.ebs_options.as_ref(),
+            merged.cluster_config.instance_type.as_deref(),
+            &merged.engine_version,
+        ) {
+            return Err(UpdateDomainConfigErrorModeled::LimitExceededException(refusal).into());
+        }
+
+        // ... and the per-volume performance figures the change would leave the domain
+        // with have to be inside the range published for the MERGED pairing, for the same
+        // reason and with the same refusal the create path states
+        // ([`crate::state::ebs_performance_bounds_refusal`]): a request that only changes
+        // the instance type is checked against the figures the domain keeps.
+        if let Some(refusal) = crate::state::ebs_performance_bounds_refusal(
             merged.ebs_options.as_ref(),
             merged.cluster_config.instance_type.as_deref(),
             &merged.engine_version,
@@ -808,6 +829,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::data_node_count_refusal(Some(&merged.cluster_config)),
             crate::state::zone_count_refusal(Some(&merged.cluster_config)),
             crate::state::zone_awareness_refusal(Some(&merged.cluster_config)),
+            // ... and a standby zone is one of the domain's own zones held in reserve, so
+            // a change that would leave the cluster asking for a standby without the
+            // zones that takes is refused for the same reason the create path refuses it.
+            crate::state::multi_az_with_standby_refusal(Some(&merged.cluster_config)),
+            // ... and the daily automated snapshot is taken at an hour of the day, so a
+            // change naming a value that is no hour is refused for the same reason the
+            // create path refuses it.
+            crate::service::domain_configuration::snapshot_options_refusal(
+                merged.snapshot_options.as_ref(),
+            ),
             // ... and a VPC-access domain names one subnet per Availability Zone it is
             // placed in, so a change that would leave it with a subnet list the merged
             // cluster's zone count does not match is refused for the same reason the create

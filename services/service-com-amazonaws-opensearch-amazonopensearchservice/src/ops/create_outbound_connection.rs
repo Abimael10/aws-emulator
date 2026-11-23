@@ -101,6 +101,13 @@ use crate::state::{
     CONNECTION_STATUS_VALIDATION_FAILED, CONNECTION_STORE_QUOTA, PROVISIONING,
 };
 
+/// What the service answers a request whose LOCAL domain is owned by another account.
+///
+/// Fully FIXED text: it states which account the local domain has to belong to rather
+/// than echoing either account id, which is how the service words it.
+const LOCAL_OWNER_MUST_BE_CALLER: &str =
+    "OwnerId for local domain should be the same as caller account id.";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -179,6 +186,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let local = domain_reference("LocalDomainInfo", input.local_domain_info, &region)?;
         let remote = domain_reference("RemoteDomainInfo", input.remote_domain_info, &region)?;
+
+        // The LOCAL domain of an outbound connection is the source the CALLER connects
+        // FROM, so its `AWSDomainInformation$OwnerId` is the caller's own account: a
+        // reference naming another account names no domain this caller holds, and the
+        // request is refused rather than a connection being requested out of an account
+        // the caller does not sign for. The REMOTE side is the other half of a
+        // cross-account connection, so its owner is not held to the caller's account.
+        if local
+            .owner_id
+            .as_deref()
+            .is_some_and(|owner| owner != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                LOCAL_OWNER_MUST_BE_CALLER,
+            ));
+        }
 
         let mut store = state.lock();
         // Materialises only what the clock already owed every connection at this

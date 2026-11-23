@@ -100,6 +100,14 @@ use super::types::*;
 /// The largest value `MaxResults` takes: it is `@range(max: 100)`.
 const MAX_PAGE_SIZE: i32 = 100;
 
+/// What the service answers a catalog read that asks for Availability Zone information
+/// without enabling the retrieve-AZ flag.
+///
+/// Fully FIXED text with no variable part: it states the flag that has to be enabled and
+/// echoes nothing of the request, which is how the service words it.
+const RETRIEVE_AZ_FLAG_REQUIRED: &str =
+    "Retrieve AZ flag need to be enabled to get Instance Type AZ information.";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -212,11 +220,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // "The name of the domain" — an optional scope, so a request that names one
-        // names an account resource that has to exist, and the Availability Zones
-        // reported are those of THAT domain's Region. A request that names no domain
-        // is answered for the Region it was signed for. Reading the store leaves it
-        // exactly as it was: this operation reports a published catalog.
+        // "The name of the domain" — an optional scope whose ONLY effect on this read is
+        // which Region's Availability Zones are reported: the catalog itself is the named
+        // release's and is the same scoped or unscoped. Naming a domain is therefore
+        // asking for that domain's Availability Zone information, which this operation
+        // reports only when the retrieve-AZ flag asks for it — so a scoped read that does
+        // not enable the flag asks for AZ information the answer would not carry, and is
+        // refused rather than answered with an unscoped listing. Stated before the domain
+        // is resolved: what the request asked for is judged before an account resource is
+        // looked up.
+        if input.domain_name.is_some() && input.retrieve_a_zs != Some(true) {
+            return Err(ListInstanceTypeDetailsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(RETRIEVE_AZ_FLAG_REQUIRED.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The Availability Zones reported are those of THAT domain's Region, so a request
+        // that names one names an account resource that has to exist. A request that names
+        // no domain is answered for the Region it was signed for. Reading the store leaves
+        // it exactly as it was: this operation reports a published catalog.
         let region = match input.domain_name.as_deref() {
             None => crate::state::request_region(ctx.parts()),
             Some(domain_name) => {
