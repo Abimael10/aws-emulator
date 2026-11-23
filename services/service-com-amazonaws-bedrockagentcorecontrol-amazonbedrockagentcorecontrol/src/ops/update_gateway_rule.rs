@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateGatewayRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateGatewayRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateGatewayRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reconfigures one rule the gateway in the path already holds, from
+//! the stored record every read of that rule answers from. The members this
+//! `PATCH` carries replace what the rule held and the ones it omits leave that
+//! part of the rule alone; the changed rule reports `UPDATING` until the clock
+//! owes it `ACTIVE` again. A rule whose own previous write is still settling
+//! takes no further change — that is the modelled `ConflictException` — and a
+//! priority a SIBLING rule of the same gateway already holds is refused, because
+//! the priority is the order the gateway evaluates its rules in.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +177,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateGatewayRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateGatewayRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateGatewayRule"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateGatewayRuleErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the gateway store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A gateway whose deletion the clock has already made due is gone before
+        // this call looks for it, and the rules it held with it: the removal was
+        // owed at this instant whether or not anybody called.
+        store.expire_deleted_gateways_and_targets(now);
+
+        let gateway = store.gateways.get(&input.gateway_identifier).ok_or_else(|| {
+            UpdateGatewayRuleErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY),
+            )
+        })?;
+        // An update reconfigures a rule the gateway ALREADY holds, it does not
+        // mint one, so a `ruleId` naming no rule of this gateway is the modelled
+        // 404 for the rule — named by the id the path carried, in the one sentence
+        // every operation that resolves a rule reports a missing one with. The
+        // child the path names is resolved before the gateway's own lifecycle
+        // status is judged, the way this service's other update of a gateway's
+        // children resolves it.
+        let stored = gateway.rules.get(&input.rule_id).ok_or_else(|| {
+            UpdateGatewayRuleErrorModeled::ResourceNotFoundException(
+                crate::state::gateway_rule_not_found(&input.rule_id),
+            )
+        })?;
+        // A rule decides how the gateway ROUTES the requests it fronts, so the
+        // gateway has to be routable before its rules are written: the one
+        // precondition `crate::state` puts on every write of a gateway's rules, so
+        // the create and this change cannot disagree about which gateway takes
+        // one.
+        if let Some(refusal) =
+            crate::state::refusal_for_gateway_rule_write(&input.gateway_identifier, gateway, now)
+        {
+            return Err(UpdateGatewayRuleErrorModeled::ValidationException(refusal).into());
+        }
+        // The rule's own last write has to have taken effect before the next one
+        // is accepted: a change arriving while the clock still owes the rule a
+        // transition collides with the write already under way, which is the
+        // modelled 409, and the rule keeps the configuration it has.
+        if let Some(conflict) = crate::state::refusal_for_gateway_rule_change(stored, now) {
+            return Err(UpdateGatewayRuleErrorModeled::ConflictException(conflict).into());
+        }
+        // The priority is the order the gateway evaluates its rules in, so one
+        // gateway holds at most one rule at any priority — the same rule the
+        // create enforces, decided by the one helper both share. A rule keeping
+        // or repeating its OWN priority collides with nothing; only a sibling
+        // already holding the asked-for priority refuses the change, and nothing
+        // is written for it.
+        if let Some(priority) = input.priority {
+            if crate::state::rule_holding_priority_other_than(
+                &gateway.rules,
+                priority,
+                Some(&input.rule_id),
+            )
+            .is_some()
+            {
+                return Err(UpdateGatewayRuleErrorModeled::ValidationException(
+                    crate::state::gateway_rule_priority_conflict(priority),
+                )
+                .into());
+            }
+        }
+        let gateway_id = gateway.gateway_id.clone();
+        let gateway_arn = gateway.gateway_arn.clone();
+
+        // The write, under the lock this call already holds: the gateway and its
+        // rule were both resolved above, so this cannot miss — and an update must
+        // never report a success for a change that was dropped, so a miss is a
+        // server error rather than a 202 nothing was written for.
+        let Some(held) = store.gateways.get_mut(&gateway_id) else {
+            return Err(
+                UpdateGatewayRuleErrorModeled::InternalServerException(InternalServerException {
+                    message: Some(format!(
+                        "gateway {gateway_id} is no longer held by the gateway store"
+                    )),
+                })
+                .into(),
+            );
+        };
+        // The gateway's configuration includes the rules it evaluates, so
+        // reconfiguring one touches the gateway too — the same bookkeeping the
+        // create does when it adds one.
+        held.updated_at = now;
+        let Some(record) = held.rules.get_mut(&input.rule_id) else {
+            return Err(
+                UpdateGatewayRuleErrorModeled::InternalServerException(InternalServerException {
+                    message: Some(format!(
+                        "rule {} is no longer held by gateway {gateway_id}",
+                        input.rule_id
+                    )),
+                })
+                .into(),
+            );
+        };
+        record.apply_change(
+            input.priority,
+            input.conditions,
+            input.actions,
+            input.description,
+            now,
+        );
+
+        Ok(record.update_output(&gateway_arn, now))
     }
 }

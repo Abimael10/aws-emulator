@@ -12,8 +12,9 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Action, Condition, CreateGatewayRuleOutput, GatewayRuleDetail, GetGatewayRuleOutput,
-    ResourceNotFoundException, SystemManagedBlock, ValidationException,
+    Action, Condition, ConflictException, CreateGatewayRuleOutput, GatewayRuleDetail,
+    GetGatewayRuleOutput, ResourceNotFoundException, SystemManagedBlock, UpdateGatewayRuleOutput,
+    ValidationException,
 };
 
 use super::{
@@ -25,6 +26,7 @@ use super::{
 /// (`smithy_query shape=GatewayRuleStatus`).
 pub const GATEWAY_RULE_STATUS_CREATING: &str = "CREATING";
 pub const GATEWAY_RULE_STATUS_ACTIVE: &str = "ACTIVE";
+pub const GATEWAY_RULE_STATUS_UPDATING: &str = "UPDATING";
 
 /// How long a freshly created rule stays in its transient status (`CREATING`)
 /// before the clock owes it `ACTIVE`.
@@ -141,7 +143,69 @@ pub fn rule_holding_priority(
     rules: &BTreeMap<String, GatewayRuleRecord>,
     priority: i32,
 ) -> Option<&GatewayRuleRecord> {
-    rules.values().find(|held| held.priority == priority)
+    rule_holding_priority_other_than(rules, priority, None)
+}
+
+/// The rule OTHER THAN `except` this gateway already holds at `priority`, if one
+/// does.
+///
+/// The same evaluation-order rule [`rule_holding_priority`] decides, for a write
+/// that reconfigures a rule the gateway already holds: a rule keeping — or
+/// repeating — its own priority collides with nothing, because it is the one rule
+/// evaluated there, so only a SIBLING holding that priority refuses the change.
+/// `except` is the `ruleId` the request addressed, and `None` is a write that
+/// reconfigures no stored rule.
+pub fn rule_holding_priority_other_than<'rules>(
+    rules: &'rules BTreeMap<String, GatewayRuleRecord>,
+    priority: i32,
+    except: Option<&str>,
+) -> Option<&'rules GatewayRuleRecord> {
+    rules
+        .values()
+        .find(|held| held.priority == priority && except.is_none_or(|id| held.rule_id != id))
+}
+
+/// The modelled conflict a change asked of one gateway rule owes while the rule's
+/// own write is still under way: its create, or a previous change, has not taken
+/// effect yet, so this one would overwrite a version that is still being applied.
+///
+/// The sentence has no variable part: it names the collision and what the caller
+/// does about it rather than the rule it was asked of, because an optimistic lock
+/// is held by the write in flight and not by anything the request could name. It
+/// is the wording this API gives that error class, so a client that matches on it
+/// reads the same text the real service sends.
+pub fn gateway_rule_lock_conflict() -> ConflictException {
+    ConflictException {
+        message: Some(GATEWAY_RULE_LOCK_CONFLICT.to_string()),
+    }
+}
+
+/// What a write that loses to a change already being applied is told: that the
+/// resource is locked by a concurrent write, and to retry once that write has
+/// finished.
+const GATEWAY_RULE_LOCK_CONFLICT: &str =
+    "Failed to update the resource due to an existing lock. This means that there was a \
+     concurrent request that updated the resource. Retry the request after the other request \
+     has completed.";
+
+/// The refusal a change of one STORED rule owes while that rule is still settling,
+/// or `None` when the rule can take it.
+///
+/// A rule's status is the state of the write that last touched it, and the
+/// transition out of a transient one is owed by the clock: while that transition
+/// is still owed, the write that set it is still being applied, so a further
+/// change to the same rule would race it. That is the optimistic lock the real
+/// service reports with the modelled `ConflictException` (HTTP 409), and the rule
+/// keeps the configuration it has. Only a rule the clock has settled into
+/// [`GATEWAY_RULE_STATUS_ACTIVE`] takes one.
+///
+/// Shared by every write that reconfigures a stored rule, so they cannot put
+/// different preconditions on the same rule.
+pub fn refusal_for_gateway_rule_change(
+    rule: &GatewayRuleRecord,
+    now: SystemTime,
+) -> Option<ConflictException> {
+    (rule.status_at(now) != GATEWAY_RULE_STATUS_ACTIVE).then(gateway_rule_lock_conflict)
 }
 
 /// How many rules one gateway will hold.
@@ -228,6 +292,48 @@ impl GatewayRuleRecord {
         }
     }
 
+    /// Apply one submitted change to this stored rule.
+    ///
+    /// `UpdateGatewayRule` "updates a gateway rule's priority, conditions,
+    /// actions, or description" over `PATCH`, and every one of those four members
+    /// is optional on the request while two of them are `@required` on its
+    /// response (`smithy_query operation=UpdateGatewayRule`): a member the request
+    /// CARRIES replaces what the rule held, and one it omits leaves that part of
+    /// the rule as it was. So a request carrying one member changes that one
+    /// thing, and the response reports the rule as it now stands rather than a
+    /// default this call invented for a member nobody submitted.
+    ///
+    /// The id the rule is addressed by and the instant it was created are not
+    /// touched. The change is not in effect at once: the rule reports
+    /// [`GATEWAY_RULE_STATUS_UPDATING`] until the clock owes it
+    /// [`GATEWAY_RULE_STATUS_ACTIVE`] again, exactly as a created one reports
+    /// `CREATING`.
+    pub fn apply_change(
+        &mut self,
+        priority: Option<i32>,
+        conditions: Option<Vec<Condition>>,
+        actions: Option<Vec<Action>>,
+        description: Option<String>,
+        now: SystemTime,
+    ) {
+        if let Some(priority) = priority {
+            self.priority = priority;
+        }
+        if let Some(conditions) = conditions {
+            self.conditions = Some(conditions);
+        }
+        if let Some(actions) = actions {
+            self.actions = actions;
+        }
+        if let Some(description) = description {
+            self.description = Some(description);
+        }
+        self.updated_at = now;
+        self.transient_status = GATEWAY_RULE_STATUS_UPDATING.to_string();
+        self.settled_status = GATEWAY_RULE_STATUS_ACTIVE.to_string();
+        self.settles_at = now + GATEWAY_RULE_SETTLE_DELAY;
+    }
+
     /// The `system` block this rule reports, for a rule an automated process
     /// manages, and `None` for one a caller created.
     pub fn system(&self) -> Option<SystemManagedBlock> {
@@ -291,6 +397,25 @@ impl GatewayRuleRecord {
             status: created.status,
             system: created.system,
             updated_at: Some(timestamp(self.updated_at)),
+        }
+    }
+
+    /// This rule as `UpdateGatewayRule`'s response envelope — the same members a
+    /// read of it reports, off the same record, so the change this call made is
+    /// reported exactly as the next read of the rule reports it.
+    pub fn update_output(&self, gateway_arn: &str, now: SystemTime) -> UpdateGatewayRuleOutput {
+        let read = self.get_output(gateway_arn, now);
+        UpdateGatewayRuleOutput {
+            rule_id: read.rule_id,
+            gateway_arn: read.gateway_arn,
+            priority: read.priority,
+            conditions: read.conditions,
+            actions: read.actions,
+            description: read.description,
+            created_at: read.created_at,
+            status: read.status,
+            system: read.system,
+            updated_at: read.updated_at,
         }
     }
 }
