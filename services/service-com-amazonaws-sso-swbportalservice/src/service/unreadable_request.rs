@@ -82,8 +82,8 @@ impl Unreadable {
 /// refusal is re-derived from the same request the router passes back into
 /// [`ErasedOperation::run`].
 pub(super) struct UnreadableRequest<Eng> {
-    /// The SAME shared engine the generated entry threaded into every operation, for the
-    /// one write every portal request makes (see [`ErasedOperation::run`] below). The
+    /// The SAME shared engine the generated entry threaded into every operation, for the one
+    /// write a request this service refuses makes (see [`ErasedOperation::run`] below). The
     /// refusal itself reads nothing out of it.
     engine: Arc<Eng>,
 }
@@ -106,20 +106,18 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for UnreadableRequest<Eng> {
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
-            // The one write every portal request makes, and only what the clock already
-            // owed: a minted role credential past its advertised expiration is spent at
-            // that instant, whether or not the request that happens to arrive next is one
-            // this service will serve, so it is ended here exactly as the authentication
-            // gate and every handler end it. Nothing about the refusal below changes
-            // because this ran.
-            if let Some(state) = crate::state::service_state(&*self.engine) {
-                let mut state = state.lock();
-                crate::state::end_expired_credentials(
-                    &mut state,
-                    ctx.credential_store(),
-                    SystemTime::now(),
-                );
-            }
+            // The one write a portal request this service reads or refuses makes, and only
+            // what the clock already owed: a minted role credential past its advertised
+            // expiration is spent at that instant, whether or not the request that happens
+            // to arrive next is one this service will serve, so it is ended here exactly as
+            // the authentication gate and every handler end it — through the one reading of
+            // that sweep ([`crate::state::sweep_expired_credentials`]). Nothing about the
+            // refusal below changes because this ran.
+            crate::state::sweep_expired_credentials(
+                &*self.engine,
+                ctx.credential_store(),
+                SystemTime::now(),
+            );
             let protocol = svc.definition().wire_protocol(req).protocol();
             // The same decision `override_operation` made, re-derived from the same
             // request: this operation is reached only when it answered `Some`, so the

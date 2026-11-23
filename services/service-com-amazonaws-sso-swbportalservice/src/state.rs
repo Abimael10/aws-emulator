@@ -27,7 +27,9 @@
 //! ([`store_unavailable`], and [`store_unavailable_response`] for those same seams),
 //! stamping an expiry without risking an overflow panic ([`expiry_after`]),
 //! ending the minted role credentials the clock has made spent
-//! ([`end_expired_credentials`]), cutting a sorted listing into a page with an opaque
+//! ([`end_expired_credentials`], reached through [`sweep_expired_credentials`] by the
+//! seams in [`crate::service`] that answer a request without a handler),
+//! cutting a sorted listing into a page with an opaque
 //! cursor ([`page_of`]), and wording the refusal when the `nextToken` presented to such a
 //! listing is not one it issued ([`invalid_cursor`]).
 
@@ -594,6 +596,34 @@ pub fn end_expired_credentials(
     // After the credentials, so a record still speaking for a usable credential is kept
     // and every other expired record is reclaimed.
     state.expire_sessions(now);
+}
+
+/// [`end_expired_credentials`] for a caller holding no store: reach this service's store in
+/// `engine`, hold it for exactly this sweep, and end what the clock had already made spent
+/// at `now`.
+///
+/// A handler already holds the store for its own work and calls
+/// [`end_expired_credentials`] directly. The seams of [`crate::service`] that answer a
+/// request WITHOUT reaching a handler — the one that refuses a request presenting no usable
+/// session, and the one that refuses a request whose wire value no modelled value can be
+/// read from — hold it for nothing else, and the reclaim is owed at the instant the clock
+/// made it due whatever request happens to arrive next, so they run it through here: one
+/// reading of that sweep for every such seam, beside the rule it materialises, rather than a
+/// copy of it per seam. A seam the framework hands no
+/// [`OperationContext`](smithy_server_runtime::OperationContext) has no credential store to
+/// end a credential in, so it runs no sweep at all.
+///
+/// A store that cannot be reached holds no credential to end, and it materialises only what
+/// the clock already owed, so no response changes because this ran.
+pub fn sweep_expired_credentials<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    credential_store: &::emulator_server::CredentialStore,
+    now: SystemTime,
+) {
+    if let Some(state) = service_state(engine) {
+        let mut state = state.lock();
+        end_expired_credentials(&mut state, credential_store, now);
+    }
 }
 
 /// Whether the CLOCK has made a sign-in record spent at `now`: its own expiry has passed

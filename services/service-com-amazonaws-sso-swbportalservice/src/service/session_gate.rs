@@ -147,19 +147,18 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for SessionGate<Eng> {
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
         Box::pin(async move {
-            // The one write every portal request makes, and only what the clock already
-            // owed: a minted role credential past its advertised expiration is spent at
-            // that instant, whether or not the request that happens to arrive next is one
-            // this service will serve, so it is ended here exactly as each handler ends
-            // it. Nothing about the refusal below changes because this ran.
-            if let Some(state) = crate::state::service_state(&*self.engine) {
-                let mut state = state.lock();
-                crate::state::end_expired_credentials(
-                    &mut state,
-                    ctx.credential_store(),
-                    SystemTime::now(),
-                );
-            }
+            // The one write a portal request this service reads or refuses makes, and only
+            // what the clock already owed: a minted role credential past its advertised
+            // expiration is spent at that instant, whether or not the request that happens
+            // to arrive next is one this service will serve, so it is ended here exactly as
+            // each handler ends it — through the one reading of that sweep
+            // ([`crate::state::sweep_expired_credentials`]). Nothing about the refusal below
+            // changes because this ran.
+            crate::state::sweep_expired_credentials(
+                &*self.engine,
+                ctx.credential_store(),
+                SystemTime::now(),
+            );
             let protocol = svc.definition().wire_protocol(req).protocol();
             match self.presented_session(req) {
                 // Nothing resolved the presented token, so the refusal says what is true

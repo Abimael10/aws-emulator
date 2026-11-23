@@ -16,6 +16,11 @@
 //!
 //! The second test covers the arithmetic every expiry here is stamped with: a sum the
 //! platform's clock type cannot represent saturates rather than panicking.
+//!
+//! The third covers the same clock rule at the two seams that answer a request BEFORE any
+//! handler runs — the authentication gate and the unreadable-value refusal: each ends what
+//! the clock already owed exactly as a handler does, and the refusal each of them answers is
+//! unchanged by it.
 
 use http::{Response, StatusCode};
 use service_com_amazonaws_sso_swbportalservice::state::{self, ROLE_SESSION_DURATION};
@@ -369,6 +374,162 @@ fn an_expiry_saturates_instead_of_overflowing() {
         assert!(
             state::epoch_millis(stamped) >= state::epoch_millis(*at),
             "case {case:?}: the stamped expiry must be at or after {at:?}, got {stamped:?}"
+        );
+    }
+}
+
+/// Which seam answers a row's request without reaching a handler. Each of them refuses a
+/// portal request before any handler runs, and each runs the same reclaim on its way.
+#[derive(Debug, Clone, Copy)]
+enum Seam {
+    /// The authentication gate: a request naming a modelled operation and presenting a
+    /// token that names no sign-in session at all.
+    AuthenticationGate,
+    /// The unreadable-request refusal: an AUTHENTICATED request carrying a page bound no
+    /// value of the modelled member's type can be read from.
+    UnreadableValue,
+}
+
+impl Seam {
+    /// The refusal this seam answers with: the status and the modelled error code, which
+    /// the sweep leaves exactly as they were.
+    fn refusal(self) -> (StatusCode, &'static str) {
+        match self {
+            Seam::AuthenticationGate => (StatusCode::UNAUTHORIZED, "UnauthorizedException"),
+            Seam::UnreadableValue => (StatusCode::BAD_REQUEST, "InvalidRequestException"),
+        }
+    }
+}
+
+/// The request a row sends, as the portal's own routes spell it.
+#[derive(Debug, Clone, Copy)]
+enum Sent {
+    Get(&'static str),
+    Logout,
+}
+
+/// Send the row's request.
+async fn send(portal: &Portal, sent: Sent, token: &str) -> Response<bytes::Bytes> {
+    match sent {
+        Sent::Get(uri) => portal.get(uri, Some(token)).await,
+        Sent::Logout => portal.logout(Some(token)).await,
+    }
+}
+
+/// RULE: a minted role credential ends at the expiration its response advertised whichever
+/// seam of this service the next request happens to reach — including the seams that answer
+/// a request before any handler runs, which end it exactly as a handler does and answer the
+/// same refusal they always did.
+#[tokio::test]
+async fn a_request_refused_before_any_handler_still_ends_a_due_credential() {
+    // Rows: each seam, over every route that reaches it — the four operations the
+    // authentication gate refuses an unknown token on, and both listings that bind a page
+    // bound the unreadable-value refusal answers.
+    let rows: &[(&str, Seam, Sent, &str)] = &[
+        (
+            "an unknown token lists its accounts",
+            Seam::AuthenticationGate,
+            Sent::Get("/assignment/accounts"),
+            UNKNOWN,
+        ),
+        (
+            "an unknown token lists one account's roles",
+            Seam::AuthenticationGate,
+            Sent::Get("/assignment/roles?account_id=444444444444"),
+            UNKNOWN,
+        ),
+        (
+            "an unknown token asks for a role credential",
+            Seam::AuthenticationGate,
+            Sent::Get("/federation/credentials?account_id=444444444444&role_name=ReadOnly"),
+            UNKNOWN,
+        ),
+        (
+            "an unknown token logs out",
+            Seam::AuthenticationGate,
+            Sent::Logout,
+            UNKNOWN,
+        ),
+        (
+            "an authenticated account listing carries a word as its page bound",
+            Seam::UnreadableValue,
+            Sent::Get("/assignment/accounts?max_result=not-a-number"),
+            HOLDER,
+        ),
+        (
+            "an authenticated role listing carries a decimal as its page bound",
+            Seam::UnreadableValue,
+            Sent::Get("/assignment/roles?account_id=444444444444&max_result=1.5"),
+            HOLDER,
+        ),
+    ];
+
+    for (case, seam, sent, token) in rows {
+        let portal = Portal::new();
+        portal.sign_in(HOLDER, ASSIGNED);
+
+        // Two credentials of the same session: the one made due below, and one that stays
+        // inside its own duration throughout.
+        let (due_key_id, _) = fetch_credential(&portal, HOLDER, DUE, case).await;
+        let (kept_key_id, kept_expiration) =
+            fetch_credential(&portal, HOLDER, STILL_VALID, case).await;
+
+        // Put the clock past the first one's expiration, and check it is still held: what
+        // ends it below is the seam's own reclaim and nothing that ran earlier.
+        let now_millis = state::epoch_millis(SystemTime::now());
+        {
+            let store = portal.state();
+            let mut store = store.lock();
+            let record = store
+                .issued_credentials
+                .get_mut(&credential_key(HOLDER, DUE))
+                .unwrap_or_else(|| panic!("case {case:?}: the minted credential must be stored"));
+            record.expiration_millis = Due::Ago(1).expiration_millis(now_millis);
+        }
+
+        let response = send(&portal, *sent, token).await;
+        let (expected_status, expected_code) = seam.refusal();
+        assert_eq!(
+            (response.status(), error_code(&response)),
+            (expected_status, expected_code.to_string()),
+            "case {case:?}: {seam:?} must answer {expected_status} {expected_code}, got {} {:?}",
+            response.status(),
+            body_text(&response)
+        );
+
+        // The reclaim the clock owed was made by the seam that refused the request, and
+        // nothing else was.
+        let now = SystemTime::now();
+        let store = portal.state();
+        let store = store.lock();
+        assert!(
+            !store
+                .issued_credentials
+                .contains_key(&credential_key(HOLDER, DUE)),
+            "case {case:?}: {seam:?} must end the due credential, still holding {:?}",
+            store.issued_credentials.get(&credential_key(HOLDER, DUE))
+        );
+        assert!(
+            store.signed_in_subject(&due_key_id, now).is_none(),
+            "case {case:?}: the due access key must speak for nobody, got {:?}",
+            store.signed_in_subject(&due_key_id, now)
+        );
+        let kept = store
+            .issued_credentials
+            .get(&credential_key(HOLDER, STILL_VALID))
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: a credential inside its own duration must be kept")
+            });
+        assert_eq!(
+            (kept.access_key_id.as_str(), kept.expiration_millis),
+            (kept_key_id.as_str(), kept_expiration),
+            "case {case:?}: the kept credential must be unchanged, got {kept:?}"
+        );
+        assert_eq!(
+            store.signed_in_subject(&kept_key_id, now),
+            Some(subject_of(HOLDER).as_str()),
+            "case {case:?}: the kept access key must still speak for its session"
         );
     }
 }
