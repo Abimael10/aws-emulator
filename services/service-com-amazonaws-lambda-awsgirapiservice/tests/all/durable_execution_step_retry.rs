@@ -20,6 +20,11 @@
 //! two, three, and none configured at all), which attempt the work starts returning on
 //! (the first, the second, the third, never), and how many steps the execution reached.
 //!
+//! The fixtures below — the durable function, the two reads and the checkpoint reading — are
+//! `pub(crate)`, so a sibling suite driving the same operations
+//! ([`crate::durable_execution_polled_to_terminal`]) reads them off the same wire rather than
+//! rebuilding a harness that could disagree with this one.
+//!
 //! No row waits for a span of wall clock: a synchronous invocation of a durable function is
 //! answered once its run has finished, so the execution is read straight afterwards. The
 //! `Timeout` and the `ExecutionTimeout` every function here runs under are far above what its
@@ -39,30 +44,30 @@ use crate::function_lifecycle::{
 };
 
 /// Where `Invoke` is bound.
-const FUNCTIONS_URI: &str = "/2015-03-31/functions";
+pub(crate) const FUNCTIONS_URI: &str = "/2015-03-31/functions";
 
 /// The request header `Invoke$DurableExecutionName` is bound to, and the response header
 /// `Invoke$DurableExecutionArn` is bound to.
-const NAME_HEADER: &str = "x-amz-durable-execution-name";
-const ARN_HEADER: &str = "x-amz-durable-execution-arn";
+pub(crate) const NAME_HEADER: &str = "x-amz-durable-execution-name";
+pub(crate) const ARN_HEADER: &str = "x-amz-durable-execution-arn";
 
 /// The header a run that FAILED is signalled on (`Invoke$FunctionError`).
 const FUNCTION_ERROR_HEADER: &str = "x-amz-function-error";
 
 /// The `ExecutionStatus` values a settled execution carries (`smithy_query(query="shape",
 /// shape="ExecutionStatus")`).
-const SUCCEEDED: &str = "SUCCEEDED";
-const FAILED: &str = "FAILED";
+pub(crate) const SUCCEEDED: &str = "SUCCEEDED";
+pub(crate) const FAILED: &str = "FAILED";
 
 /// The model's `EventType` values for what happens to a STEP (`smithy_query(query="shape",
 /// shape="EventType")`).
-const STEP_STARTED: &str = "StepStarted";
-const STEP_SUCCEEDED: &str = "StepSucceeded";
-const STEP_FAILED: &str = "StepFailed";
+pub(crate) const STEP_STARTED: &str = "StepStarted";
+pub(crate) const STEP_SUCCEEDED: &str = "StepSucceeded";
+pub(crate) const STEP_FAILED: &str = "StepFailed";
 
 /// The `ErrorType` the durable-execution programming model fails an execution with once a
 /// step's attempts are spent.
-const CALLABLE_RUNTIME_ERROR: &str = "CallableRuntimeError";
+pub(crate) const CALLABLE_RUNTIME_ERROR: &str = "CallableRuntimeError";
 
 /// The module every package below holds its handler in.
 const HANDLER_MODULE: &str = "lambda_function.py";
@@ -140,7 +145,7 @@ fn package(source: &str) -> Vec<u8> {
 }
 
 /// A durable function running `source`, brought to the state an invocation needs.
-async fn create_durable_function(
+pub(crate) async fn create_durable_function(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
     name: &str,
@@ -170,7 +175,7 @@ async fn create_durable_function(
 }
 
 /// `GetDurableExecution` on `arn`.
-async fn get_execution(router: &MultiServiceRouter, arn: &str) -> Answer {
+pub(crate) async fn get_execution(router: &MultiServiceRouter, arn: &str) -> Answer {
     json_call(
         router,
         "GET",
@@ -184,7 +189,7 @@ async fn get_execution(router: &MultiServiceRouter, arn: &str) -> Answer {
 }
 
 /// `GetDurableExecutionHistory` on `arn`.
-async fn get_history(router: &MultiServiceRouter, arn: &str) -> Answer {
+pub(crate) async fn get_history(router: &MultiServiceRouter, arn: &str) -> Answer {
     json_call(
         router,
         "GET",
@@ -199,7 +204,7 @@ async fn get_history(router: &MultiServiceRouter, arn: &str) -> Answer {
 
 /// One checkpoint the history reported for a STEP: its event type, the step's name and the
 /// attempt it is of (`RetryDetails$CurrentAttempt`, which a scheduled step carries none of).
-fn step_checkpoints(history: &Value) -> Vec<(String, String, i64)> {
+pub(crate) fn step_checkpoints(history: &Value) -> Vec<(String, String, i64)> {
     history
         .get("Events")
         .and_then(Value::as_array)
