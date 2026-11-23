@@ -171,21 +171,16 @@ pub fn default_permission_version_not_deletable_message(arn: &str, version: i32)
     )
 }
 
-/// The message of the `OperationNotPermittedException` a version delete renders when
-/// the version it names is still attached to a resource share.
+/// The message every `OperationNotPermittedException` a version delete answers with
+/// because the version it names is still attached to a resource share carries.
 ///
-/// "You can't delete a version if it is attached to any resource shares"
-/// (`DeletePermissionVersion$permissionVersion`) is the fixed text of this refusal
-/// class; the version the request named and one share governed by it are what the
-/// message takes from the request and from this store.
-pub fn permission_version_attached_to_share_message(
-    arn: &str,
-    version: i32,
-    shares: &[String],
-) -> String {
-    let attached = shares.first().map(String::as_str).unwrap_or_default();
-    format!(
-        "Version {version} of permission {arn} is attached to resource share {attached}. You \
-         can't delete a version if it is attached to any resource shares."
-    )
-}
+/// RAM words this refusal class with one fixed pair of sentences — the state of the
+/// version ("The version you specify must not be attached to any resource share",
+/// `DeletePermissionVersion`) followed by what undoes it — and interpolates nothing
+/// from the request or from this store into it: not the permission, not the version
+/// number and not any of the shares, of which there may be any number. It is therefore
+/// a constant and not a template, identical for every permission, every version and
+/// every share.
+pub const PERMISSION_VERSION_ATTACHED_TO_SHARE_MESSAGE: &str =
+    "The customer-managed permission version is associated to resource shares. Remove all \
+     associations of this permission version and try again.";

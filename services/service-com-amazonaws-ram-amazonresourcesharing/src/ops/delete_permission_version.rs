@@ -354,11 +354,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     DeletePermissionVersionErrorModeled::OperationNotPermittedException(
                         OperationNotPermittedException {
                             message:
-                                crate::state::permission_version_attached_to_share_message(
-                                    &input.permission_arn,
-                                    input.permission_version,
-                                    &attached,
-                                ),
+                                crate::state::PERMISSION_VERSION_ATTACHED_TO_SHARE_MESSAGE
+                                    .to_string(),
                         },
                     )
                     .into(),

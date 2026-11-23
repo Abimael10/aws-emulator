@@ -44,6 +44,14 @@
 //! So those rows vary along HOW MANY versions the permission carries, WHICH of them is
 //! deleted, WHICH resource type it is for, WHAT a `clientToken` answers for, and WHICH
 //! rule a refused version delete breaks.
+//!
+//! The third rule, which the attached-version rows at the end pin: the refusal of the
+//! delete of a version a live resource share is governed by is worded with ONE fixed
+//! text that interpolates nothing from the request or from the store — the same text for
+//! every permission, every version and every share. So those rows vary along WHICH
+//! version of the permission the shares are governed by, HOW MANY shares are governed by
+//! it, HOW MANY versions the permission carries and WHICH resource type it is for, and
+//! every one of them must be answered the identical sentence.
 
 use std::time::{Duration, Instant};
 
@@ -910,8 +918,10 @@ fn on_the_delete_path(status: &str) -> bool {
 }
 
 /// One row of the refused-version-delete table: the version delete a caller may not
-/// make, the modelled error that refusal is worded with, and what its message must name
-/// — so a refusal is about what the caller asked for.
+/// make, the modelled error that refusal is worded with, and a part its message must
+/// carry — the value the refusal is about for a class whose wording names what the
+/// caller asked for, and the whole fixed text for the one class that names nothing from
+/// the request (see [`ATTACHED_VERSION_REFUSAL_MESSAGE`]).
 struct VersionRefusalRow {
     case: &'static str,
     permission_arn: String,
@@ -1256,7 +1266,10 @@ async fn a_version_delete_a_caller_may_not_make_is_refused_and_changes_nothing()
             permission_version: FIRST_PERMISSION_VERSION,
             client_token: None,
             expected_code: "OperationNotPermittedException",
-            must_name: share_arn.clone(),
+            // This refusal class is worded with fixed text that interpolates nothing —
+            // neither the permission, nor the version, nor any of the shares — so the
+            // whole of it is what the message must carry.
+            must_name: ATTACHED_VERSION_REFUSAL_MESSAGE.to_string(),
         },
         VersionRefusalRow {
             case: "a version of a permission Amazon Web Services manages",
@@ -1364,6 +1377,20 @@ async fn a_version_delete_a_caller_may_not_make_is_refused_and_changes_nothing()
         );
     }
 
+    // The refusal of the version a share is governed by names neither that share nor the
+    // permission whose version it is: nothing in its wording comes from the request or
+    // from the store.
+    let (_, attached_refusal) =
+        delete_permission_version(&router, &attached_arn, FIRST_PERMISSION_VERSION, None).await;
+    let worded = error_message(&attached_refusal);
+    for named in [&share_arn, &attached_arn] {
+        assert!(
+            !worded.contains(named.as_str()),
+            "case {case:?}: the refusal of an attached version carries no value from the request \
+             or the store, got {worded:?}, which names {named:?}"
+        );
+    }
+
     // Nothing above deleted anything: both live permissions still carry every version
     // they were written, none of them on the delete path.
     for (row, arn, versions) in [
@@ -1462,4 +1489,240 @@ async fn repeating_a_version_delete_deletes_nothing_further() {
         "case {case:?}: the default version is untouched by the delete of another version, got \
          {default:?}"
     );
+}
+
+/// The text this service refuses the delete of a permission version a live resource
+/// share is still governed by with.
+///
+/// Two fixed sentences and nothing else: `OperationNotPermittedException` carries a
+/// `message` and no other member
+/// (`smithy_query(query="shape",shape="OperationNotPermittedException")`), and this
+/// refusal class is worded without any value from the request or the store in it — not
+/// the permission, not the version number, and none of the shares, of which there may be
+/// any number. So it is the same text for every permission, every version and every
+/// share.
+const ATTACHED_VERSION_REFUSAL_MESSAGE: &str =
+    "The customer-managed permission version is associated to resource shares. Remove all \
+     associations of this permission version and try again.";
+
+/// Actions of the CodeBuild namespace a permission for a CodeBuild resource type may
+/// grant, one more of which each successive version of a row allows.
+const CODEBUILD_ACTIONS: &[&str] = &[
+    "codebuild:ListProjects",
+    "codebuild:BatchGetProjects",
+    "codebuild:ListBuildsForProject",
+];
+
+/// The same for the Image Builder namespace.
+const IMAGEBUILDER_ACTIONS: &[&str] = &["imagebuilder:ListComponents", "imagebuilder:GetComponent"];
+
+/// One row of the attached-version table: a permission for `resource_type` carrying
+/// `versions` versions, with `shares` live resource shares created while version
+/// `attached_version` was its default — so that is the version those shares are governed
+/// by, and the one whose delete they block.
+struct AttachedVersionRow {
+    case: &'static str,
+    name: &'static str,
+    resource_type: &'static str,
+    /// One more of these actions is allowed by each successive version, so no two
+    /// versions of the row's permission carry the same template.
+    actions: &'static [&'static str],
+    versions: i32,
+    attached_version: i32,
+    shares: usize,
+    /// A version that is neither the default nor one a share is governed by, when the
+    /// row has one: its delete is served, so the refusal is about the attachment and not
+    /// about the permission.
+    free_version: Option<i32>,
+}
+
+/// The version of each permission `ListResourceSharePermissions` reports for a share:
+/// the version of that permission the share is governed by.
+async fn share_permission_versions(
+    router: &MultiServiceRouter,
+    case: &str,
+    share_arn: &str,
+) -> Vec<String> {
+    let (status, body) = call(
+        router,
+        "POST",
+        "/listresourcesharepermissions",
+        Some(&json!({"resourceShareArn": share_arn})),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 listing the permissions of {share_arn}, got {status} \
+         with {body:?}"
+    );
+    body.get("permissions")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("case {case:?}: the list reported no permissions, got {body:?}"))
+        .iter()
+        .map(|permission| field(case, permission, "version"))
+        .collect()
+}
+
+#[tokio::test]
+async fn the_refusal_of_an_attached_permission_version_carries_one_fixed_text() {
+    // Each resource type below is one `ListResourceTypes` reports as taking a customer
+    // managed permission (`RESOURCE_TYPES`), and each row's actions are of that type's
+    // own service namespace.
+    let rows = [
+        AttachedVersionRow {
+            case: "one share on the first of two versions",
+            name: "AttachedComponentReader",
+            resource_type: "imagebuilder:Component",
+            actions: IMAGEBUILDER_ACTIONS,
+            versions: 2,
+            attached_version: FIRST_PERMISSION_VERSION,
+            shares: 1,
+            free_version: None,
+        },
+        AttachedVersionRow {
+            case: "two shares on the middle of three versions",
+            name: "AttachedProjectReader",
+            resource_type: "codebuild:Project",
+            actions: CODEBUILD_ACTIONS,
+            versions: 3,
+            attached_version: FIRST_PERMISSION_VERSION + 1,
+            shares: 2,
+            free_version: Some(FIRST_PERMISSION_VERSION),
+        },
+        AttachedVersionRow {
+            case: "three shares on the first of three versions",
+            name: "AttachedDatabaseReader",
+            resource_type: "glue:Database",
+            // The Glue actions this file already names, of which a row takes as many as
+            // it writes versions.
+            actions: &GLUE_ACTIONS,
+            versions: 3,
+            attached_version: FIRST_PERMISSION_VERSION,
+            shares: 3,
+            free_version: Some(FIRST_PERMISSION_VERSION + 1),
+        },
+    ];
+
+    for row in &rows {
+        let case = row.case;
+        let (router, _engine) = emulator_with_engine();
+        let arn = customer(row.name);
+        let mut share_arns: Vec<String> = Vec::new();
+
+        // Write the versions in order, and create the row's shares while the version
+        // they must be governed by is still the permission's default: "existing resource
+        // shares continue to use their original permission versions".
+        for version in FIRST_PERMISSION_VERSION..FIRST_PERMISSION_VERSION + row.versions {
+            let allowed = (version - FIRST_PERMISSION_VERSION + 1) as usize;
+            let template = policy_template(&row.actions[..allowed]);
+            if version == FIRST_PERMISSION_VERSION {
+                let (status, minted) = create_permission(
+                    &router,
+                    &json!({
+                        "name": row.name,
+                        "resourceType": row.resource_type,
+                        "policyTemplate": template,
+                    }),
+                )
+                .await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected HTTP 200 minting {}, got {status} with {minted:?}",
+                    row.name
+                );
+            } else {
+                let (status, written) = create_permission_version(
+                    &router,
+                    &json!({"permissionArn": arn, "policyTemplate": template}),
+                )
+                .await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected HTTP 200 writing version {version}, got {status} \
+                     with {written:?}"
+                );
+            }
+            if version != row.attached_version {
+                continue;
+            }
+            for index in 0..row.shares {
+                let share = create_ok(
+                    &router,
+                    case,
+                    &json!({
+                        "name": format!("{}-share-{index}", row.name),
+                        "permissionArns": [arn],
+                    }),
+                )
+                .await;
+                share_arns.push(arn_of(case, &share));
+            }
+        }
+
+        // The shares really are governed by the version the row blocks the delete of.
+        for share_arn in &share_arns {
+            assert_eq!(
+                share_permission_versions(&router, case, share_arn).await,
+                vec![row.attached_version.to_string()],
+                "case {case:?}: {share_arn} is governed by version {}",
+                row.attached_version
+            );
+        }
+
+        let (status, refused) =
+            delete_permission_version(&router, &arn, row.attached_version, None).await;
+        assert_eq!(
+            (status, error_code(&refused)),
+            (400, "OperationNotPermittedException".to_string()),
+            "case {case:?}: expected a 400 OperationNotPermittedException deleting the attached \
+             version {}, got {status} with {refused:?}",
+            row.attached_version
+        );
+        let worded = error_message(&refused);
+        assert_eq!(
+            worded, ATTACHED_VERSION_REFUSAL_MESSAGE,
+            "case {case:?}: expected the fixed refusal text \
+             {ATTACHED_VERSION_REFUSAL_MESSAGE:?}, got {worded:?}"
+        );
+        // The wording carries no value from the request or the store, so none of the
+        // permission, the version number or any of the shares appears in it.
+        for named in std::iter::once(arn.clone())
+            .chain(std::iter::once(row.attached_version.to_string()))
+            .chain(share_arns.iter().cloned())
+        {
+            assert!(
+                !worded.contains(named.as_str()),
+                "case {case:?}: the refusal names nothing from the request or the store, got \
+                 {worded:?}, which carries {named:?}"
+            );
+        }
+
+        // The refusal wrote nothing: every version the permission was written is still
+        // one it carries, and none of them is on the delete path.
+        let listed = version_statuses(&router, case, &arn).await;
+        assert_eq!(
+            numbers_of(&listed),
+            (FIRST_PERMISSION_VERSION..FIRST_PERMISSION_VERSION + row.versions)
+                .map(|version| version.to_string())
+                .collect::<Vec<_>>(),
+            "case {case:?}: a refused version delete takes no version away, got {listed:?}"
+        );
+        assert!(
+            !listed
+                .iter()
+                .any(|(_, status)| on_the_delete_path(status)),
+            "case {case:?}: a refused version delete puts no version on the delete path, got \
+             {listed:?}"
+        );
+
+        // And the refusal is about the attachment: a version of the same permission no
+        // share is governed by, and that is not the default, is deleted.
+        if let Some(free) = row.free_version {
+            assert_eq!(
+                delete_version_ok(&router, case, &arn, free, None).await,
+                PERMISSION_STATUS_DELETING,
+                "case {case:?}: the delete of the unattached version {free} is served"
+            );
+        }
+    }
 }
