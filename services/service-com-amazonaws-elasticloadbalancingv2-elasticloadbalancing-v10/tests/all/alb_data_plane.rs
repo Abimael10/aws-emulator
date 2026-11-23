@@ -153,7 +153,7 @@ pub(crate) async fn create_load_balancer(router: &MultiServiceRouter, name: &str
 
 /// Create the HTTP:80 listener whose default action is the fixed response above, and
 /// answer its ARN.
-async fn create_listener(router: &MultiServiceRouter, lb_arn: &str) -> String {
+pub(crate) async fn create_listener(router: &MultiServiceRouter, lb_arn: &str) -> String {
     let mut form = action("CreateListener");
     form.push(p("LoadBalancerArn", lb_arn));
     form.push(p("Protocol", "HTTP"));
@@ -180,7 +180,7 @@ async fn create_listener(router: &MultiServiceRouter, lb_arn: &str) -> String {
 
 /// Add one rule at `priority` carrying `fields`, which must be accepted. Answers the ARN
 /// the create minted, which is what a later `ModifyRule` of that rule names.
-async fn add_rule(
+pub(crate) async fn add_rule(
     router: &MultiServiceRouter,
     case: &str,
     listener_arn: &str,
@@ -203,7 +203,11 @@ async fn add_rule(
 }
 
 /// A `fixed-response` action's fields, under `prefix`.
-fn fixed_response(status: &str, body: &str, content_type: Option<&str>) -> Vec<(String, String)> {
+pub(crate) fn fixed_response(
+    status: &str,
+    body: &str,
+    content_type: Option<&str>,
+) -> Vec<(String, String)> {
     let mut fields = vec![
         p("Actions.member.1.Type", "fixed-response"),
         p("Actions.member.1.FixedResponseConfig.StatusCode", status),
@@ -219,7 +223,7 @@ fn fixed_response(status: &str, body: &str, content_type: Option<&str>) -> Vec<(
 }
 
 /// One condition on a path pattern, which most rows carry so they match one path each.
-fn path_pattern(pattern: &str) -> Vec<(String, String)> {
+pub(crate) fn path_pattern(pattern: &str) -> Vec<(String, String)> {
     vec![
         p("Conditions.member.1.Field", "path-pattern"),
         p("Conditions.member.1.Values.member.1", pattern),
@@ -1325,10 +1329,10 @@ const TARGET_UNREACHABLE: u16 = 502;
 /// The network the registered address belongs to, and the address itself: the shape an
 /// `awsvpc` workload's own address has — a private address inside one subnet of one VPC, held
 /// by a network interface of the account.
-const WORKLOAD_VPC: &str = "vpc-0aa1b2c3d4e5f6071";
+pub(crate) const WORKLOAD_VPC: &str = "vpc-0aa1b2c3d4e5f6071";
 const WORKLOAD_SUBNET: &str = "subnet-0aa1b2c3d4e5f6071";
 const WORKLOAD_ZONE: &str = "us-west-2a";
-const WORKLOAD_ADDRESS: &str = "10.80.1.10";
+pub(crate) const WORKLOAD_ADDRESS: &str = "10.80.1.10";
 
 /// The cadence the groups below are health-checked at: the shortest interval
 /// `HealthCheckIntervalSeconds` admits ("the range is 5-300"), so the verdict a row waits for
@@ -1351,7 +1355,7 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(60);
 ///
 /// Written through the inventory's own writer seam, so the interface is the record EC2's own
 /// readers answer with rather than a value this suite made up.
-fn seed_workload_interface(engine: &Arc<engine::InMemoryEngine>) {
+pub(crate) fn seed_workload_interface(engine: &Arc<engine::InMemoryEngine>) {
     let state = ec2::service_state(&**engine).expect("the shared engine holds an EC2 inventory");
     let mut store = state.lock();
     store.vpcs.insert(
@@ -1388,7 +1392,11 @@ fn seed_workload_interface(engine: &Arc<engine::InMemoryEngine>) {
 
 /// Create an `ip` target group in `vpc` — the target type a workload addressed by its own
 /// private address is registered under — and answer its ARN.
-async fn ip_target_group(router: &MultiServiceRouter, name: &str, vpc: &str) -> String {
+pub(crate) async fn ip_target_group(
+    router: &MultiServiceRouter,
+    name: &str,
+    vpc: &str,
+) -> String {
     let mut form = action("CreateTargetGroup");
     form.push(p("Name", name));
     form.push(p("Protocol", "HTTP"));
@@ -1411,7 +1419,12 @@ async fn ip_target_group(router: &MultiServiceRouter, name: &str, vpc: &str) -> 
 }
 
 /// Register `address` with the target group `arn` names.
-async fn register_address(router: &MultiServiceRouter, case: &str, arn: &str, address: &str) {
+pub(crate) async fn register_address(
+    router: &MultiServiceRouter,
+    case: &str,
+    arn: &str,
+    address: &str,
+) {
     let mut form = action("RegisterTargets");
     form.push(p("TargetGroupArn", arn));
     form.push(p("Targets.member.1.Id", address));
@@ -1424,7 +1437,7 @@ async fn register_address(router: &MultiServiceRouter, case: &str, arn: &str, ad
 }
 
 /// A `forward` action's fields, naming the one target group it forwards to.
-fn forward_to(target_group_arn: &str) -> Vec<(String, String)> {
+pub(crate) fn forward_to(target_group_arn: &str) -> Vec<(String, String)> {
     vec![
         p("Actions.member.1.Type", "forward"),
         p("Actions.member.1.TargetGroupArn", target_group_arn),
@@ -1448,7 +1461,7 @@ async fn described_dns_name(router: &MultiServiceRouter, case: &str, arn: &str) 
 
 /// Wait until every registration of the group `arn` names reports `wanted`, looking again
 /// rather than sleeping for the span the checks take, and answer the states it reported.
-async fn health_reaching(
+pub(crate) async fn health_reaching(
     router: &MultiServiceRouter,
     case: &str,
     arn: &str,

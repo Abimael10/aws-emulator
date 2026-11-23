@@ -5,7 +5,9 @@
 //! The rule under test: **every request an Application Load Balancer answers is counted into
 //! that family's own metric namespace as a side effect of answering it — one request processed
 //! under the load balancer's own dimension, and one under the `TargetGroup` + `LoadBalancer`
-//! pair of the group that answered — and the status the request ended in is counted into the
+//! pair of the group that answered, for a request the load balancer CHOSE A TARGET for (which
+//! is `RequestCount`'s own reporting criterion, and so leaves a request the load balancer
+//! answered itself out of that series) — and the status the request ended in is counted into the
 //! class series of whichever end PRODUCED it: a status the TARGET answered into
 //! `HTTPCode_Target_<n>XX_Count` and into none of the load balancer's own, a status the LOAD
 //! BALANCER generated itself into `HTTPCode_ELB_<n>XX_Count` and the series of that one status
@@ -52,8 +54,8 @@ use crate::provisioning_loop::{action, call, p};
 /// The namespace an Application Load Balancer's metrics live in, and the dimensions its series
 /// are keyed by — Elastic Load Balancing's published metric identities for that family.
 const APPLICATION_NAMESPACE: &str = "AWS/ApplicationELB";
-const LOAD_BALANCER_DIMENSION: &str = "LoadBalancer";
-const TARGET_GROUP_DIMENSION: &str = "TargetGroup";
+pub(crate) const LOAD_BALANCER_DIMENSION: &str = "LoadBalancer";
+pub(crate) const TARGET_GROUP_DIMENSION: &str = "TargetGroup";
 
 /// Every COUNT series this suite windows, written out here rather than read off the
 /// implementation: the request counter, the two action counters, the load-balancer-generated
@@ -177,7 +179,7 @@ fn lambda_emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 
 /// The `app/<name>/<id>` suffix of a load balancer ARN, which is how an Elastic Load Balancing
 /// dimension names it.
-fn load_balancer_dimension(arn: &str) -> String {
+pub(crate) fn load_balancer_dimension(arn: &str) -> String {
     arn.split_once(":loadbalancer/")
         .map(|(_, suffix)| suffix.to_string())
         .unwrap_or_else(|| panic!("a load balancer ARN names its family and name: {arn}"))
@@ -185,7 +187,7 @@ fn load_balancer_dimension(arn: &str) -> String {
 
 /// The `targetgroup/<name>/<id>` suffix of a target group ARN, which is how that dimension
 /// names it.
-fn target_group_dimension(arn: &str) -> String {
+pub(crate) fn target_group_dimension(arn: &str) -> String {
     arn.split_once(":targetgroup/")
         .map(|(_, suffix)| format!("targetgroup/{suffix}"))
         .unwrap_or_else(|| panic!("a target group ARN names its resource type: {arn}"))
@@ -194,7 +196,7 @@ fn target_group_dimension(arn: &str) -> String {
 /// The `Sum` of every datapoint one series holds, as the metric store holds them — and 0.0 for
 /// a series the store holds none of, which is what a reader folds for a period no such request
 /// fell in.
-fn series_sum(
+pub(crate) fn series_sum(
     engine: &Arc<engine::InMemoryEngine>,
     metric: &str,
     dimensions: &[(&str, String)],
@@ -217,7 +219,7 @@ fn series_sum(
 }
 
 /// How many datapoints one series holds.
-fn series_len(
+pub(crate) fn series_len(
     engine: &Arc<engine::InMemoryEngine>,
     metric: &str,
     dimensions: &[(&str, String)],
@@ -239,7 +241,7 @@ fn series_len(
 /// Every watched series' `Sum` under one dimension set, so a row asserts the WHOLE catalog at
 /// once: a series the rows so far gave no value reads 0.0, which is what pins "nothing else was
 /// counted".
-fn watched_sums(
+pub(crate) fn watched_sums(
     engine: &Arc<engine::InMemoryEngine>,
     dimensions: &[(&str, String)],
 ) -> BTreeMap<&'static str, f64> {
@@ -250,7 +252,7 @@ fn watched_sums(
 }
 
 /// The expected whole catalog: every watched series at 0.0 except the ones `counted` names.
-fn expected(counted: &[(&'static str, f64)]) -> BTreeMap<&'static str, f64> {
+pub(crate) fn expected(counted: &[(&'static str, f64)]) -> BTreeMap<&'static str, f64> {
     let mut sums: BTreeMap<&'static str, f64> =
         WATCHED.iter().map(|metric| (*metric, 0.0)).collect();
     for (metric, value) in counted {
@@ -301,8 +303,9 @@ struct GeneratedRow {
 }
 
 /// RULE: a status the LOAD BALANCER generated itself is counted into its own class series and
-/// into the series of that one status, into no target series at all, and the terminating action
-/// that produced it is counted where that action has a series of its own.
+/// into the series of that one status, into no target series at all, and into no request
+/// processed — the load balancer chose no target for such a request — while the terminating
+/// action that produced it is counted where that action has a series of its own.
 #[tokio::test]
 async fn a_load_balancer_generated_status_counts_as_an_elb_code() {
     let (router, engine) = crate::provisioning_loop::emulator();
@@ -363,18 +366,17 @@ async fn a_load_balancer_generated_status_counts_as_an_elb_code() {
 
     let rows: &[GeneratedRow] = &[
         GeneratedRow {
-            case: "a fixed-response success: counted as a request and as the action, in no \
-                   class series",
+            case: "a fixed-response success: counted as the action alone, in no class series \
+                   and as no request processed",
             path: "/ok",
             status: 200,
-            counted: &[("RequestCount", 1.0), ("HTTP_Fixed_Response_Count", 1.0)],
+            counted: &[("HTTP_Fixed_Response_Count", 1.0)],
         },
         GeneratedRow {
             case: "a client error from the listener's default action",
             path: "/nothing-matches",
             status: 404,
             counted: &[
-                ("RequestCount", 2.0),
                 ("HTTP_Fixed_Response_Count", 2.0),
                 ("HTTPCode_ELB_4XX_Count", 1.0),
             ],
@@ -384,7 +386,6 @@ async fn a_load_balancer_generated_status_counts_as_an_elb_code() {
             path: "/gone",
             status: 503,
             counted: &[
-                ("RequestCount", 3.0),
                 ("HTTP_Fixed_Response_Count", 3.0),
                 ("HTTPCode_ELB_4XX_Count", 1.0),
                 ("HTTPCode_ELB_5XX_Count", 1.0),
@@ -396,7 +397,6 @@ async fn a_load_balancer_generated_status_counts_as_an_elb_code() {
             path: "/moved",
             status: 302,
             counted: &[
-                ("RequestCount", 4.0),
                 ("HTTP_Fixed_Response_Count", 3.0),
                 ("HTTP_Redirect_Count", 1.0),
                 ("HTTPCode_ELB_3XX_Count", 1.0),
@@ -410,7 +410,6 @@ async fn a_load_balancer_generated_status_counts_as_an_elb_code() {
             path: "/gone",
             status: 503,
             counted: &[
-                ("RequestCount", 5.0),
                 ("HTTP_Fixed_Response_Count", 4.0),
                 ("HTTP_Redirect_Count", 1.0),
                 ("HTTPCode_ELB_3XX_Count", 1.0),

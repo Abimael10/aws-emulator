@@ -133,3 +133,56 @@ Smithy consulted (model services/service-com-amazonaws-elasticloadbalancingv2-el
 7. Cause 6: create an HTTP listener rule with a redirect action using Host='#{host}', Path='/moved#{path}', Query='orig=#{query}', and GET it. Expect the Location host to equal the request's host; the emulator emits another host.
 8. Cause 7: deploy a stack with two AWS::ElasticLoadBalancingV2::ListenerRule resources, then update it so both carry the same Priority. Expect the resource failure to carry HandlerErrorCode AlreadyExists and the `Priority '<priority>' is currently in use` wording; the emulator reports ResourceConflict / "One or more priorities not found".
 9. Re-replay the ids in trace_ids to confirm the fix.
+
+## Resolution
+
+Cause 3 and the weighted/sticky/zero-weight/XFF stages of Cause 5 were already closed by work
+that landed after this report was filed (their replay keys now pass). The metric stage of
+Cause 5 is implemented here. The rest is blocked, and re-files as live failures until the
+blockers below are lifted.
+
+* Cause 5, metric stage (FIXED) — `RequestCount` is now counted only where the load balancer
+  CHOSE A TARGET for the request, which is that series' own reporting criterion, so a minute
+  in which every request was answered by a `fixed-response` or `redirect` action, or by a
+  `forward` whose groups held no target, publishes the load-balancer-generated class and
+  status counts and no request processed
+  (`elasticloadbalancingv2 src/service/request_metrics.rs`). Covered by
+  `tests/all/alb_request_count_counts_a_chosen_target.rs`.
+* Cause 3, and Cause 5's weighted/sticky, zero-weight and `xff_header_processing` stages
+  (ALREADY FIXED) — the replay keys
+  `elbv2attr-deep-elbv2-1-mtls-passthrough-clientcert-chain`,
+  `elbv2attr-deep-elbv2-1-mtls-passthrough-forged-clientcert-header-stripped`,
+  `forward-weighted-and-sticky-target-groups-data-plane`,
+  `zero-weight-target-group-is-never-selected` and
+  `xff-header-processing-mode-changes-what-the-target-receives` all pass on the current tree.
+* Cause 1, and Cause 6 with it (BLOCKED, vendor) — `DNSName` can only become a bare host once
+  a load balancer answers on the ports its LISTENERS declare. The core owns the socket, the
+  bind interface and the port: `vendor/server/src/listeners.rs` binds through
+  `bind_tokio`/`bind_std` from `bind_ip_from_env()` and `listener_port_range_from_env()`, and
+  `Listeners::tcp_plaintext` takes no requested port, so a service crate cannot ask for port
+  80 or 443 on a host of its own. Needed in the core: a listener API that accepts a requested
+  port, or a per-resource loopback address, so two load balancers can both answer on a
+  listener port. Cause 6's check compares the substituted `#{host}` against the whole
+  published value, so it cannot pass while that value carries `:<port>`.
+* Cause 2, Cause 4 and Cause 5's instance-target and CloudFormation stages (BLOCKED,
+  platform) — each needs the server a REGISTERED target runs to answer a request computed
+  from it (`?s=<seconds>` sleeps, a body marker per target, an unhealthy target that stops
+  answering). The emulator serves a registration whose workload another service started (an
+  Amazon ECS container, or an instance whose user data installs and starts a packaged server
+  — `elasticloadbalancingv2 src/state/target_servers.rs`), but these recordings' instances
+  bring their server up as interpreter code holding a socket, which needs an execution and
+  socket seam INSIDE the guest that this emulator does not have; dialling the address a
+  registration names is request-configured outbound forwarding, which the engine contract
+  forbids in the production path (`vendor/engine/src/lib.rs`). Nothing was re-worded: such a
+  forward still earns the 502 a load balancer gives a target it cannot connect to.
+* Cause 7 (NOT A DEFECT as reported) — the `HandlerErrorCode` for a priority a rule already
+  holds is already `AlreadyExists`, for the create and the update path alike
+  (`cloudformation src/state/provisioning/owner.rs`, pinned by that crate's
+  `tests/all/elbv2_rule_priority_collision.rs` and
+  `tests/all/elbv2_rule_priority_collision_update.rs`). The wording this report asks for
+  contradicts the recording: the suite's own `elbv2.set-rule-priorities-conflict-with-existing-fails`
+  check requires `SetRulePriorities` to answer `PriorityInUse` with the entirely fixed text
+  `One or more priorities not found` (see
+  `issues/things-that-do-not-work/20261113T153150Z-elbv2-3-net-new-causes-the-setrulepriorities-priorityinuse.md`,
+  Cause 1), which is what this service answers. Its check now fails later, on the stack
+  never reaching a terminal status, which is that same filing's Cause 3.

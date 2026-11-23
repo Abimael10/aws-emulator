@@ -16,7 +16,12 @@
 //! what it was answered with ([`super::data_plane::Observed`]) — so the series and the
 //! load balancer's own access log cannot disagree about a request:
 //!
-//! * the request itself is one request PROCESSED ([`REQUEST_COUNT`]);
+//! * the request itself is one request PROCESSED ([`REQUEST_COUNT`]) — but only where the
+//!   load balancer CHOSE A TARGET for it, which is that series' own reporting criterion, so a
+//!   request the load balancer answered itself (a `fixed-response` or a `redirect` action, a
+//!   refusal at the edge, a refused framing, a `forward` whose groups had no target to send it
+//!   to) is counted into the load balancer's own class series and into neither this series nor
+//!   the target's;
 //! * the status it ended in is counted into the class series of whichever end PRODUCED it: a
 //!   status the TARGET answered goes to that end's class count ([`TARGET_CLASS_COUNTS`]) and
 //!   to none of the load balancer's, and a status the LOAD BALANCER generated itself goes to
@@ -84,8 +89,9 @@ use crate::state::{
     ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State as ElbState, LoadBalancerFamily,
 };
 
-/// "The number of requests processed over IPv4 and IPv6": one per request the load balancer
-/// answered, and one for the target group it reached where it reached one.
+/// "The number of requests processed over IPv4 and IPv6. This metric is only incremented for
+/// requests where the load balancer node was able to choose a target": one per request a target
+/// was chosen for, and one for the target group it was chosen from.
 pub const REQUEST_COUNT: &str = "RequestCount";
 
 /// "The time elapsed, in seconds, after the request leaves the load balancer until a response
@@ -185,6 +191,20 @@ pub(super) struct Answered<'a> {
     pub(super) actions: &'a [String],
 }
 
+impl Answered<'_> {
+    /// Whether the load balancer CHOSE A TARGET for this request: a `forward` resolved one of
+    /// its groups to a registration to send the request to, which is the group the answer
+    /// carries.
+    ///
+    /// False for every answer the load balancer produced on its own — a terminating action of
+    /// the listener, a refusal ahead of the rules, and a `forward` whose groups held no target
+    /// to send the request to — and true for a target that was chosen and then answered
+    /// nothing, which is a target the load balancer picked and could not reach.
+    fn chose_a_target(&self) -> bool {
+        self.target_group_arn.is_some()
+    }
+}
+
 /// Count one answered request into the series it belongs to.
 ///
 /// The store is read under ONE lock that is released before the metric store is touched, so no
@@ -250,9 +270,13 @@ fn datapoints(
         stamp: epoch_secs(now),
         published: Vec::new(),
     };
-    // The request itself.
-    counted.load_balancer(REQUEST_COUNT, 1.0, COUNT_UNIT);
-    counted.target_group(REQUEST_COUNT, 1.0, COUNT_UNIT);
+    // The request itself, where the load balancer chose a target for it: that is the whole of
+    // this series' reporting criterion, so a request it answered on its own is no request
+    // processed here however the client was answered ([`REQUEST_COUNT`]).
+    if answered.chose_a_target() {
+        counted.load_balancer(REQUEST_COUNT, 1.0, COUNT_UNIT);
+        counted.target_group(REQUEST_COUNT, 1.0, COUNT_UNIT);
+    }
     // The terminating action that answered, where it has a series of its own — read against
     // the very `Action$Type` values the plane performs them under, so a renamed action cannot
     // leave a series uncounted.
