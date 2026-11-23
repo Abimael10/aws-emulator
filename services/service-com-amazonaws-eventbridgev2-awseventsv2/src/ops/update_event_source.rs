@@ -280,8 +280,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             source.configuration = configuration;
             modified = true;
         }
-        if let Some(description) = input.description.clone() {
-            source.description = Some(description);
+        if input.description.is_some() {
+            source.description = crate::state::stored_description(input.description.as_deref());
             modified = true;
         }
         // `LastModifiedTime` reports a modification of the resource, so it moves

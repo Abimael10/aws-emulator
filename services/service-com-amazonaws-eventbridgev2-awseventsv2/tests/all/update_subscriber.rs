@@ -626,7 +626,9 @@ async fn an_update_writes_the_members_it_carries_and_leaves_the_rest_alone() {
             },
             |facts| Facts {
                 batch: Some((Some(1), Some(300))),
-                retry: Some((Some(0), Some(86_400), None)),
+                // `RetryStrategy` was not named, so the policy the subscriber
+                // retries under takes the documented default for it.
+                retry: Some((Some(0), Some(86_400), Some("ALL".to_string()))),
                 on_failure: Some(format!("arn:aws:sqs:{REGION}:{ACCOUNT}:updated-failures")),
                 log_level: Some("INFO".to_string()),
                 ..facts

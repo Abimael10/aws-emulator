@@ -256,8 +256,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `RetentionPeriodInDays` leaves the bus on the service default — the
         // same value a create naming no storage configuration leaves it on.
         let mut modified = false;
-        if let Some(description) = input.description.clone() {
-            bus.description = Some(description);
+        if input.description.is_some() {
+            bus.description = crate::state::stored_description(input.description.as_deref());
             modified = true;
         }
         if let Some(encryption_configuration) = input.encryption_configuration.clone() {

@@ -308,7 +308,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name: input.name.clone(),
             account_id: ::engine::emulator_account_id().to_string(),
             region,
-            description: input.description.clone(),
+            description: crate::state::stored_description(input.description.as_deref()),
             encryption_configuration: input.encryption_configuration.clone(),
             // A bus always has an effective retention period, so an
             // unspecified one takes the service default here, where the bus is
@@ -395,7 +395,7 @@ fn matches_stored(bus: &crate::state::EventBus, input: &CreateEventBusInput) -> 
         .collect();
 
     bus.name == input.name
-        && bus.description == input.description
+        && bus.description == crate::state::stored_description(input.description.as_deref())
         && stored_kms == requested_kms
         && stored_retention == requested_retention
         && bus.tags == requested_tags

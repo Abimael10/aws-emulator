@@ -321,7 +321,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             account_id: ::engine::emulator_account_id().to_string(),
             region: region.clone(),
             configuration: input.configuration.clone(),
-            description: input.description.clone(),
+            description: crate::state::stored_description(input.description.as_deref()),
             // Provisioning is synchronous for an EventSource, so it is
             // operational as soon as this call returns.
             state: crate::state::EventSourceLifecycleState::Active,
@@ -376,7 +376,7 @@ fn matches_stored(source: &crate::state::EventSource, input: &CreateEventSourceI
 
     source.name == input.name
         && source.event_bus_arn == input.event_bus_arn
-        && source.description == input.description
+        && source.description == crate::state::stored_description(input.description.as_deref())
         && source.tags == requested_tags
         && crate::state::same_event_source_configuration(
             &source.configuration,

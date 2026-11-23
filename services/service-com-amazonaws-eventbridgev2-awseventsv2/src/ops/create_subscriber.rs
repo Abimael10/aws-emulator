@@ -444,14 +444,14 @@ fn create(
         &input.name,
         &crate::state::new_subscriber_id(state.next_id_seed(), now),
     );
-    let subscriber = crate::state::Subscriber {
+    let mut subscriber = crate::state::Subscriber {
         arn: arn.clone(),
         name: input.name.clone(),
         event_bus_arn: bus_arn,
         account_id: ::engine::emulator_account_id().to_string(),
         region: region.clone(),
         invoke_configuration: input.invoke_configuration.clone(),
-        description: input.description.clone(),
+        description: crate::state::stored_description(input.description.as_deref()),
         filter_configuration: input.filter_configuration.clone(),
         ordering_type: input
             .r#type
@@ -479,6 +479,12 @@ fn create(
         client_token: input.client_token.clone(),
         next_sequence_number,
     };
+
+    // A subscriber batches, retries, transforms and reads its filters whether or
+    // not the create named those members, so the service's own defaults are
+    // settled onto the record here — once, where it is written — and every later
+    // read projects them.
+    subscriber.settle_effective_configuration();
 
     // The subscriber carries its own `ClientToken` (above), which is the replay
     // record a later retry is matched against, so there is nothing else to write
@@ -529,16 +535,24 @@ fn matches_stored(subscriber: &crate::state::Subscriber, input: &CreateSubscribe
         .collect();
     let requested_state = crate::state::SubscriberRunState::from_wire(input.state.as_deref());
 
+    // Compared against what a create carrying this request WOULD store, not
+    // against the request as submitted: a member the service settles itself —
+    // the description it keeps, the language a filter configuration is read in —
+    // is the same for both requests when both named the same thing, so a replay
+    // of the create that minted this subscriber is still a replay.
+    let requested_filters =
+        crate::state::effective_filter_configuration(input.filter_configuration.as_ref());
+
     subscriber.name == input.name
         && subscriber.event_bus_arn == input.event_bus_arn
-        && subscriber.description == input.description
+        && subscriber.description == crate::state::stored_description(input.description.as_deref())
         && subscriber.tags == requested_tags
         && requested_state.is_some_and(|state| state == subscriber.state)
         && subscriber.invoke_configuration.target_arn == input.invoke_configuration.target_arn
         && subscriber.invoke_configuration.role_arn == input.invoke_configuration.role_arn
         && same_filters(
             subscriber.filter_configuration.as_ref(),
-            input.filter_configuration.as_ref(),
+            requested_filters.as_ref(),
         )
         && input
             .r#type

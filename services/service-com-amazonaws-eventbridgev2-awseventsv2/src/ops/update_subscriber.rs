@@ -316,7 +316,12 @@ fn apply(
 
     // A `Transformer` and a universal target are mutually exclusive, read
     // against the target configuration this update LEAVES the subscriber with:
-    // either member may be the one the request changes.
+    // either member may be the one the request changes. What a caller ASKED for
+    // is what can conflict — the request's own transformer, or the one the
+    // subscriber was configured with — while the transformer the SERVICE applies
+    // to a subscriber that configured none is not a configuration, so an update
+    // that makes such a subscriber's target universal is served and leaves it
+    // the transformation that target takes (none).
     let universal_target = match input.invoke_configuration.as_ref() {
         Some(requested) => requested.universal_target_parameters.clone(),
         None => subscriber
@@ -326,7 +331,10 @@ fn apply(
     };
     let transformer = match input.transformer.as_ref() {
         Some(requested) => Some(requested.clone()),
-        None => subscriber.transformer.clone(),
+        None => subscriber
+            .transformer
+            .clone()
+            .filter(|held| !crate::state::is_default_transformer(held)),
     };
     if let Some(reason) =
         crate::state::transformer_fault(universal_target.as_ref(), transformer.as_ref())
@@ -359,8 +367,8 @@ fn apply(
     // that IS carried replaces the stored value wholesale rather than being
     // merged into it.
     let mut modified = false;
-    if let Some(description) = input.description.clone() {
-        subscriber.description = Some(description);
+    if input.description.is_some() {
+        subscriber.description = crate::state::stored_description(input.description.as_deref());
         modified = true;
     }
     if let Some(requested) = input.invoke_configuration.as_ref() {
@@ -402,6 +410,12 @@ fn apply(
         modified |= requested != subscriber.state;
         subscriber.state = requested;
     }
+    // Whatever this update wrote, the subscriber still batches, retries,
+    // transforms and reads its filters, so the service's own defaults are
+    // settled again over the members it leaves behind: a configuration the
+    // request carried in part takes the default for every member it did not
+    // name.
+    subscriber.settle_effective_configuration();
     // `LastModifiedTime` reports a modification of the resource, so it moves for
     // an update that carries something to apply and stands still for one that
     // carries nothing at all.

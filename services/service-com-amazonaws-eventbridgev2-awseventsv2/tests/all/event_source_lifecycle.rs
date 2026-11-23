@@ -539,9 +539,17 @@ async fn a_created_event_source_is_stored_and_reads_back() {
             "case {case:?}: EventBusArn must be read back from state, got {:?}",
             described.event_bus_arn
         );
+        // The description the source KEEPS: free text holding no
+        // non-whitespace character describes nothing, so the read reports none.
+        let kept_description = input
+            .description
+            .as_deref()
+            .filter(|description| !description.trim().is_empty());
         assert_eq!(
-            described.description, input.description,
-            "case {case:?}: Description must be read back from state, got {:?}",
+            described.description.as_deref(),
+            kept_description,
+            "case {case:?}: Description must be read back from state as {kept_description:?}, \
+             got {:?}",
             described.description
         );
         assert_eq!(
@@ -1277,7 +1285,7 @@ async fn an_update_applies_what_it_carries_and_replaces_the_configuration_wholes
             ),
         ),
         (
-            "description and configuration together",
+            "description and configuration together, the description describing nothing",
             UpdateEventSourceInput {
                 event_source_arn: arn.clone(),
                 configuration: Some(aws_service_configuration(
@@ -1287,7 +1295,9 @@ async fn an_update_applies_what_it_carries_and_replaces_the_configuration_wholes
                 )),
                 description: Some(String::new()),
             },
-            expected_source(Some(""), "aws.lambda", None, Some(&dead_letter_queue)),
+            // Free text holding no non-whitespace character describes nothing,
+            // so the update leaves the source with no description at all.
+            expected_source(None, "aws.lambda", None, Some(&dead_letter_queue)),
         ),
         (
             "no member carried at all",
@@ -1295,7 +1305,7 @@ async fn an_update_applies_what_it_carries_and_replaces_the_configuration_wholes
                 event_source_arn: arn.clone(),
                 ..Default::default()
             },
-            expected_source(Some(""), "aws.lambda", None, Some(&dead_letter_queue)),
+            expected_source(None, "aws.lambda", None, Some(&dead_letter_queue)),
         ),
     ];
 

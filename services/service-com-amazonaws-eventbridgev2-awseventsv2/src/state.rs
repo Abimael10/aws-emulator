@@ -17,6 +17,8 @@
 //! [`pagination`] is the one reading of the page size and the page token every
 //! List operation shares, and the `tags` module resolves one taggable ARN
 //! against all three registries, because tagging spans them.
+//! [`subscriber_configuration`] settles the delivery members the service itself
+//! fills in for a subscriber whose request named none.
 
 mod event_expressions;
 mod event_sources;
@@ -24,6 +26,7 @@ mod forwarding;
 mod pagination;
 mod publishing;
 mod resource_policies;
+mod subscriber_configuration;
 pub mod subscriber_delivery;
 mod subscribers;
 mod tags;
@@ -34,6 +37,7 @@ pub use forwarding::*;
 pub use pagination::*;
 pub use publishing::*;
 pub use resource_policies::*;
+pub use subscriber_configuration::*;
 pub use subscribers::*;
 pub use tags::*;
 
@@ -872,6 +876,22 @@ fn base36(mut value: u128, width: usize) -> String {
 /// transition due immediately rather than unwinding a handler.
 pub fn lifecycle_due(now: SystemTime) -> SystemTime {
     now.checked_add(LIFECYCLE_SPAN).unwrap_or(now)
+}
+
+/// The free-text description a resource of this service KEEPS for the
+/// `Description` a request carried.
+///
+/// `Description` is "Free-text description. Used by every resource type that
+/// has one: event buses, subscribers, and event sources", and text that holds
+/// no non-whitespace character describes nothing: a request carrying such a
+/// value leaves the resource with NO description rather than with a blank one,
+/// so a read of it reports no description at all. The one reading of the
+/// member, shared by every create and update that writes one, so no two
+/// resources of this service keep a blank description differently.
+pub fn stored_description(requested: Option<&str>) -> Option<String> {
+    requested
+        .filter(|description| !description.trim().is_empty())
+        .map(str::to_string)
 }
 
 /// A `SystemTime` as the modelled `Timestamp` type, at the resolution this

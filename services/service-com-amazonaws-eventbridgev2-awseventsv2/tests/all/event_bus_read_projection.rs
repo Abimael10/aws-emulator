@@ -343,36 +343,54 @@ async fn every_bus_reports_an_effective_storage_configuration() {
 
 /// RULE: a read of a bus reports its free-text description — what the bus holds,
 /// and the empty string for a bus holding none — on every read projection that
-/// carries the member.
+/// carries the member; and a `Description` holding no non-whitespace character
+/// describes nothing, so the bus keeps none for it.
 ///
-/// The rows span a bus with no description, one created with the empty string, and
-/// descriptions at one character and at the modelled maximum length (512).
+/// The rows span a bus with no description, one created with the empty string,
+/// one created with whitespace alone, and descriptions at one character and at
+/// the modelled maximum length (512).
 #[tokio::test]
 async fn a_bus_read_reports_its_description_as_empty_rather_than_absent() {
     let harness = Harness::new();
     let longest = "d".repeat(DESCRIPTION_MAX_LEN);
 
-    let rows: Vec<(&str, Option<String>, &str)> = vec![
-        ("no description", None, ""),
+    // (case, the Description the create carries, the description the bus KEEPS,
+    // what every read of it reports)
+    let rows: Vec<(&str, Option<String>, Option<&str>, &str)> = vec![
+        ("no description", None, None, ""),
         (
             "a description created as the empty string",
             Some(String::new()),
+            None,
             "",
         ),
-        ("a one-character description", Some("x".to_string()), "x"),
+        (
+            "a description of whitespace alone",
+            Some("   ".to_string()),
+            None,
+            "",
+        ),
+        (
+            "a one-character description",
+            Some("x".to_string()),
+            Some("x"),
+            "x",
+        ),
         (
             "a description carrying spaces and punctuation",
             Some("bus for the v2 probe: east".to_string()),
+            Some("bus for the v2 probe: east"),
             "bus for the v2 probe: east",
         ),
         (
             "a description at the modelled maximum length",
             Some(longest.clone()),
+            Some(longest.as_str()),
             longest.as_str(),
         ),
     ];
 
-    for (index, (case, description, expected)) in rows.into_iter().enumerate() {
+    for (index, (case, description, kept, expected)) in rows.into_iter().enumerate() {
         let name = format!("described-{index}");
         let created = harness
             .create(
@@ -388,12 +406,13 @@ async fn a_bus_read_reports_its_description_as_empty_rather_than_absent() {
             .event_bus_arn
             .clone()
             .unwrap_or_else(|| panic!("case {case:?}: expected an EventBusArn, got None"));
-        // The create answers the description as SUBMITTED: a create that named
-        // none carries no member at all.
+        // The create answers the description the bus KEEPS: a create that named
+        // none, or named text that describes nothing, carries no member at all.
         assert_eq!(
-            created.description, description,
-            "case {case:?}: expected CreateEventBus to answer the submitted description \
-             {description:?}, got {:?}",
+            created.description.as_deref(),
+            kept,
+            "case {case:?}: expected CreateEventBus to answer the kept description {kept:?}, \
+             got {:?}",
             created.description
         );
 

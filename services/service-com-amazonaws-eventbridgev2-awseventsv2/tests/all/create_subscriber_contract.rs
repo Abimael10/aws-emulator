@@ -608,10 +608,18 @@ fn assert_stored(
         "case {case:?}: a subscriber nobody has revoked must report no Revoked, got {:?}",
         described.revoked
     );
+    // The description the subscriber KEEPS: `Description` is free text, so a
+    // value holding no non-whitespace character describes nothing and the read
+    // reports no description for it.
+    let kept_description = requested
+        .description
+        .as_deref()
+        .filter(|description| !description.trim().is_empty());
     assert_eq!(
-        described.description, requested.description,
-        "case {case:?}: expected Description {:?}, got {:?}",
-        requested.description, described.description
+        described.description.as_deref(),
+        kept_description,
+        "case {case:?}: expected Description {kept_description:?}, got {:?}",
+        described.description
     );
     let invoked = described
         .invoke_configuration
@@ -645,28 +653,62 @@ fn assert_stored(
         "case {case:?}: expected the OnFailureConfiguration the request named, got {:?}",
         described.on_failure_configuration
     );
-    assert_eq!(
-        described
-            .retry_policy
-            .as_ref()
-            .map(|policy| (policy.max_retry_attempts, policy.max_event_age_in_seconds)),
+    // The retry policy and the batching the subscriber actually delivers under:
+    // every member the request did not name carries the service's default, so a
+    // read reports an effective value for each of them. The defaults are spelled
+    // out here rather than read off the implementation, so a default changed to
+    // a wrong value fails this suite.
+    // Source: `smithy_query(query="shape", shape="RetryPolicy")` — MaxRetryAttempts
+    // "default: 5", MaxEventAgeInSeconds "default: 300", RetryStrategy "Default: ALL".
+    let expected_retry = (
         requested
             .retry_policy
             .as_ref()
-            .map(|policy| (policy.max_retry_attempts, policy.max_event_age_in_seconds)),
-        "case {case:?}: expected the RetryPolicy the request named, got {:?}",
+            .and_then(|policy| policy.max_retry_attempts)
+            .or(Some(5)),
+        requested
+            .retry_policy
+            .as_ref()
+            .and_then(|policy| policy.max_event_age_in_seconds)
+            .or(Some(300)),
+        requested
+            .retry_policy
+            .as_ref()
+            .and_then(|policy| policy.retry_strategy.clone())
+            .or_else(|| Some("ALL".to_string())),
+    );
+    assert_eq!(
+        described.retry_policy.as_ref().map(|policy| (
+            policy.max_retry_attempts,
+            policy.max_event_age_in_seconds,
+            policy.retry_strategy.clone()
+        )),
+        Some(expected_retry.clone()),
+        "case {case:?}: expected the effective RetryPolicy {expected_retry:?}, got {:?}",
         described.retry_policy
+    );
+    // `BatchConfiguration` documents no default, so these are the values this
+    // service applies, inside the members' published `@range`s (MaxBatchSize
+    // 1..500, MaxBatchWindowInSeconds 0..300).
+    let expected_batch = (
+        requested
+            .batch_configuration
+            .as_ref()
+            .and_then(|batch| batch.max_batch_size)
+            .or(Some(10)),
+        requested
+            .batch_configuration
+            .as_ref()
+            .and_then(|batch| batch.max_batch_window_in_seconds)
+            .or(Some(0)),
     );
     assert_eq!(
         described
             .batch_configuration
             .as_ref()
             .map(|batch| (batch.max_batch_size, batch.max_batch_window_in_seconds)),
-        requested
-            .batch_configuration
-            .as_ref()
-            .map(|batch| (batch.max_batch_size, batch.max_batch_window_in_seconds)),
-        "case {case:?}: expected the BatchConfiguration the request named, got {:?}",
+        Some(expected_batch),
+        "case {case:?}: expected the effective BatchConfiguration {expected_batch:?}, got {:?}",
         described.batch_configuration
     );
     assert_eq!(
@@ -681,16 +723,21 @@ fn assert_stored(
         "case {case:?}: expected the LogConfiguration the request named, got {:?}",
         described.log_configuration
     );
+    // A subscriber whose target takes a transformation always has one: the
+    // request's, or `TransformerType::RAW` — the event untouched — for a request
+    // that named none.
+    let expected_transformer = requested
+        .transformer
+        .as_ref()
+        .and_then(|transformer| transformer.r#type.clone())
+        .unwrap_or_else(|| "RAW".to_string());
     assert_eq!(
         described
             .transformer
             .as_ref()
-            .map(|transformer| transformer.r#type.clone()),
-        requested
-            .transformer
-            .as_ref()
-            .map(|transformer| transformer.r#type.clone()),
-        "case {case:?}: expected the Transformer the request named, got {:?}",
+            .and_then(|transformer| transformer.r#type.clone()),
+        Some(expected_transformer.clone()),
+        "case {case:?}: expected the effective Transformer {expected_transformer:?}, got {:?}",
         described.transformer
     );
 }
