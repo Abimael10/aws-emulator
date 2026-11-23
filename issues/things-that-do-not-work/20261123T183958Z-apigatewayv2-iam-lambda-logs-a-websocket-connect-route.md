@@ -1,0 +1,36 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: apigatewayv2__iam__lambda__logs.websocket-header-mapping-connect-only
+Issue-Key: apigatewayv2__iam__lambda__logs.websocket-header-mapping-connect-only|_poll_until#10|Timeout|last = probe()
+Issue-Commit: 7b09e9bd4e85e10a661e0eed3332c336e107cfb0
+
+# apigatewayv2__iam__lambda__logs: a WebSocket $connect route's request-parameter header mapping is unobservable — the handshake never delivers the mapped header to the backend and the check reaches no verdict (1 cause)
+
+> _Note: this issue was identified against the code base at commit `7b09e9bd4e85e10a661e0eed3332c336e107cfb0`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateRoute
+
+## Description
+One net-new root cause in the apigatewayv2 WEBSOCKET data plane.
+
+Cause 1 of 1: a WEBSOCKET $connect route that declares a route-level request parameter, plus the sibling integration's RequestParameters mapping that sources it into a backend header, never takes effect on the wire, so neither the mapping nor the documented $connect-only restriction on route-level request parameters can be graded. Failing check: apigatewayv2__iam__lambda__logs.websocket-header-mapping-connect-only.
+AWS: Smithy (com.amazonaws.apigatewayv2#ApiGatewayV2): CreateRoute (POST /v2/apis/{ApiId}/routes, 201) accepts RequestParameters (RouteParameters: map of __string to ParameterConstraints{Required: __boolean}, jsonName requestParameters) and echoes it in CreateRouteResult; GetRoute round-trips the same map, and GetIntegration round-trips the integration's RequestParameters map (e.g. 'integration.request.header.<dst>' -> 'route.request.header.<src>'). CreateRoute's modelled errors are BadRequestException 400, ConflictException 409, NotFoundException 404, TooManyRequestsException 429. The rest is recorded behavior only (the WebSocket data plane is not modelled): a $connect handshake that carries the declared source header completes the RFC 6455 upgrade and the integration delivers that header's value to the backend under the mapped destination header name; and declaring the identical route-level request parameter on a NON-$connect route (here route key 'ping') is refused with BadRequestException and the message 'Request parameters are only supported for the $connect route in WEBSOCKET APIs' — that message is entirely fixed text, with no value taken from the request — while the same route key with no request parameters is accepted.
+Emulator: no verdict — the replay detail is 'Error: Check timed out after 60.0s'. The scenario stalls before its assertions complete: after the control-plane round-trips it attempts the wss $connect handshake and then polls the HTTP backend's log for the event bearing the mapped header, and that event never appears inside the harness budget, so the mapping leg, the non-$connect BadRequestException refusal and its positive control are all ungradeable. Hypothesis: the front door still cannot complete an RFC 6455 upgrade for a deployed WEBSOCKET stage, as recorded by the open issues 20261111T090000Z-apigatewayv2-iam-lambda-logs-the-front-door-cannot-upgrade-the-connect-handshake.md and 20261111T103332Z-apigatewayv2-iam-lambda-logs-the-websocket-connect-flow.md (neither carries this check's replay key, so they do not cover it); nothing in the model or the recording states a cause beyond that.
+Why: a client that uses WebSocket data mapping to forward a handshake header (authorization context, tenant id, client version) into its backend sees the mapping accepted by the control plane and then silently not applied — the backend receives no mapped header, and the application cannot tell a mapping bug from a never-upgraded connection. The companion refusal matters too: code that relies on AWS rejecting route-level request parameters outside $connect gets no 400 here, so a template that AWS refuses appears valid.
+Fix: the WEBSOCKET execute-api front door — completing the $connect upgrade for a deployed stage and applying the route's and the integration's RequestParameters header mapping on the handshake request before it is dispatched to the integration — plus CreateRoute's validation path that must refuse RequestParameters on a non-$connect route of a WEBSOCKET API with BadRequestException and AWS's exact fixed message.
+Traces: apigatewayv2__iam__lambda__logs.websocket-header-mapping-connect-only.
+
+## Evidence
+Check apigatewayv2__iam__lambda__logs.websocket-header-mapping-connect-only — verdict mismatch, detail 'Error: Check timed out after 60.0s'.
+Expected (AWS): GetRoute returns RequestParameters == {'route.request.header.<src>': {'Required': False}} for the $connect route and GetIntegration returns RequestParameters['integration.request.header.<dst>'] == 'route.request.header.<src>'; a $connect handshake sent with the <src> header completes and the HTTP backend logs an event whose headers contain <dst> with the value the client sent; CreateRoute(RouteKey='ping', RequestParameters={'route.request.header.<src>': {'Required': False}}) is refused with Code 'BadRequestException' and Message 'Request parameters are only supported for the $connect route in WEBSOCKET APIs' (fixed text, no variable part); CreateRoute(RouteKey='ping') with no request parameters succeeds and carries an empty RequestParameters map.
+Actual (emulator): no verdict inside the harness cap — the backend event for the handshake never appears, so the mapped-header assertion is never reached and the refusal assertions after it never run. The header names and the marker value are this run's values; the requirement is that the mapped header reaches the backend and that the non-$connect declaration is refused with that code and that exact message.
+
+## Steps to Reproduce
+1. Boot the emulator. Create an HTTP-backend Lambda that logs the request headers it receives, and a fixed-Allow WebSocket REQUEST authorizer Lambda.
+2. Create a WEBSOCKET API with RouteSelectionExpression '$request.body.action'. Create a $connect route declaring RequestParameters {'route.request.header.x-sim2real-src': {'Required': False}} and an integration whose RequestParameters map {'integration.request.header.x-sim2real-dst': 'route.request.header.x-sim2real-src'} targets the HTTP backend; deploy a stage.
+3. Confirm GetRoute and GetIntegration round-trip both maps (these passed).
+4. Open a wss handshake to the stage carrying header x-sim2real-src: <marker>. AWS completes the upgrade and the backend logs an event whose headers contain x-sim2real-dst: <marker>. Observe that the emulator produces no such event.
+5. Call CreateRoute(RouteKey='ping', RequestParameters={'route.request.header.x-sim2real-src': {'Required': False}}): AWS refuses with BadRequestException 'Request parameters are only supported for the $connect route in WEBSOCKET APIs'. Then CreateRoute(RouteKey='ping') with a plain integration target and no request parameters: AWS accepts it with an empty RequestParameters map.
+6. Re-replay apigatewayv2__iam__lambda__logs.websocket-header-mapping-connect-only.
