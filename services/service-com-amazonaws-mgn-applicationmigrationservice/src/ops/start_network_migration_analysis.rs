@@ -162,6 +162,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // IAM decides authorization ahead of this service's own state, so it is decided
+        // first, against the definition ARN the request's own id names: an identity whose
+        // policies do not allow this action is refused rather than told whether that
+        // definition exists, and starts nothing.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::network_migration_definition_arn(
+                &crate::state::request_region(ctx.parts()),
+                &input.network_migration_definition_id,
+            ),
+        )
+        .map_err(StartNetworkMigrationAnalysisErrorModeled::AccessDeniedException)?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             StartNetworkMigrationAnalysisErrorModeled::InternalServerException(
                 crate::state::state_unavailable(),

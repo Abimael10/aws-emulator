@@ -61,7 +61,11 @@ const DEFAULT_REGION: &str = "us-east-1";
 
 /// The `arnNamespace` / sigv4 name of this service, as the service's Smithy model
 /// records it (`smithy_query(query="service_info")` -> `awsService.arnNamespace`).
-const ARN_NAMESPACE: &str = "mgn";
+///
+/// Public because it is also the namespace this service's IAM actions are published under
+/// (`mgn:<OperationName>`), which `crate::service::authorization` asks IAM about: the ARNs
+/// this service mints and the actions a refusal names must spell one namespace.
+pub const ARN_NAMESPACE: &str = "mgn";
 
 /// The `applicationID` prefix the model's `^app-[0-9a-zA-Z]{17}$` pattern requires.
 const APPLICATION_ID_PREFIX: &str = "app-";

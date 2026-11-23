@@ -141,7 +141,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // IAM decides authorization ahead of this service's own state, so it is decided
+        // first, against the ARN the request CARRIED: an identity whose policies do not
+        // allow this action is refused rather than told whether that resource exists, and
+        // is told nothing about its tags.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.resource_arn,
+        )
+        .map_err(ListTagsForResourceErrorModeled::AccessDeniedException)?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListTagsForResourceErrorModeled::InternalServerException(
                 crate::state::state_unavailable(),

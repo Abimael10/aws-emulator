@@ -286,7 +286,10 @@ impl Emulator {
 
 /// Percent-encode one `application/x-www-form-urlencoded` component, leaving only
 /// RFC 3986's unreserved characters literal.
-fn form_encode(value: &str) -> String {
+///
+/// Shared with the sibling suites that drive IAM's awsQuery wire, so one encoding rule
+/// serves every one of them (`request_authorization.rs`).
+pub(crate) fn form_encode(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {
@@ -300,7 +303,10 @@ fn form_encode(value: &str) -> String {
 }
 
 /// The text of every `<tag>` element of an awsQuery XML answer.
-fn elements(body: &str, tag: &str) -> Vec<String> {
+///
+/// Shared with the sibling suites that read one back, for the same reason
+/// [`form_encode`] is.
+pub(crate) fn elements(body: &str, tag: &str) -> Vec<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let mut found = Vec::new();

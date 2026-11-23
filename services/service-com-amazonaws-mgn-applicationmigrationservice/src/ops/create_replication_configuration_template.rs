@@ -9,7 +9,10 @@
 //! call initializes the account a request acts on, and this operation — which models
 //! `UninitializedAccountException` — refuses with it while the account is uninitialized.
 //! The gate is evaluated AFTER the modelled field constraints (which the framework
-//! refuses at the boundary, ahead of this handler) and ahead of every other check.
+//! refuses at the boundary, ahead of this handler) and AFTER the caller's IAM
+//! authorization (`crate::service::authorization`, which answers the modelled
+//! `AccessDeniedException` (403) for an identity no policy allows the action to), and
+//! ahead of every other check.
 //!
 //! The operation is not `@idempotent` and models no idempotency token, so a repeat is
 //! not replayed: it meets the account's quota instead. The service admits
@@ -241,6 +244,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        let region = crate::state::request_region(ctx.parts());
+        // IAM decides authorization ahead of the account's business state, so this is the
+        // FIRST thing the handler does: an identity whose identity-based policies do not
+        // allow this action is refused with the modelled `AccessDeniedException` before the
+        // account-initialization gate and before the per-account quota below, and nothing
+        // is minted for it. The create names no template, so it is judged against every
+        // template of the account — the resource-type ARN IAM writes for a request that
+        // addresses no id of its own.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::replication_configuration_template_arn(
+                &region,
+                crate::service::authorization::ANY_ID,
+            ),
+        )
+        .map_err(CreateReplicationConfigurationTemplateErrorModeled::AccessDeniedException)?;
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateReplicationConfigurationTemplateErrorModeled::InternalServerException(
                 crate::state::state_unavailable(),
@@ -249,7 +271,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // This operation carries no `accountID` member, so a template lives in the
         // account the request was signed for — the emulator's own canonical account.
         let account = crate::state::account_key(None);
-        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
 
         // The account gate is evaluated ahead of every other check: the modelled field

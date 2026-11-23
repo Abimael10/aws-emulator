@@ -33,6 +33,10 @@ service-common = { path = "../common" }
 # so the role this service asks IAM to file and the role IAM files are one record rather
 # than two spellings of one.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# The STS store, for the identity an access key id speaks for: the principal
+# `sts:GetCallerIdentity` answers for the credentials a request signed with, which is the
+# identity `src/service/authorization.rs` evaluates this account's IAM policies for.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

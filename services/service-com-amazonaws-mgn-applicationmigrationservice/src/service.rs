@@ -64,6 +64,12 @@
 //! the SDK connector, both of which serve `dispatch`'s response unchanged) delivers, and is
 //! pinned by `tests/all/empty_output_success_status.rs`.
 
+/// Whether IAM lets a request perform the action it asks for: the authorization step every
+/// operation whose model declares `AccessDeniedException` runs ahead of this service's own
+/// state, so an identity the account's policies do not grant the action to is refused
+/// before the account-initialization gate and before every quota.
+pub mod authorization;
+
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema::Schema;
 use aws_smithy_schema_server::{ProtocolError, ServerProtocol};

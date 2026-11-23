@@ -145,7 +145,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // IAM decides authorization ahead of this service's own state, so it is decided
+        // first: an identity whose policies do not allow this action is told it is not
+        // authorized rather than told what the account holds. The listing addresses no
+        // definition of its own, so it is judged against every resource.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            crate::service::authorization::ANY_RESOURCE,
+        )
+        .map_err(ListNetworkMigrationDefinitionsErrorModeled::AccessDeniedException)?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListNetworkMigrationDefinitionsErrorModeled::InternalServerException(
                 crate::state::state_unavailable(),

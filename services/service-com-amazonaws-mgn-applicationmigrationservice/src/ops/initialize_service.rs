@@ -148,6 +148,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `InitializeService` models no input or output members; the account it
         // initializes is the caller's own.
         let _ = &input;
+        // IAM decides authorization ahead of this service's own state, so it is decided
+        // first: an identity whose policies do not allow this action initializes nothing.
+        // The action supports no resource-level permission — it addresses the account
+        // rather than a resource of this service — so it is judged against every resource.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            crate::service::authorization::ANY_RESOURCE,
+        )
+        .map_err(InitializeServiceErrorModeled::AccessDeniedException)?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             InitializeServiceErrorModeled::InternalServerException(crate::state::state_unavailable())
         })?;

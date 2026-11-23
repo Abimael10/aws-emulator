@@ -176,6 +176,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `resourceArn`'s length bound, and every tag key's and value's own, are refused
         // at the boundary BEFORE this handler runs — as is one request carrying more
         // pairs than the modelled `TagsMap` admits.
+        //
+        // IAM decides authorization ahead of this service's own state, so it is decided
+        // first, against the ARN the request CARRIED: an identity whose policies do not
+        // allow this action is refused rather than told whether that resource exists, and
+        // writes no tag.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.resource_arn,
+        )
+        .map_err(TagResourceErrorModeled::AccessDeniedException)?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             TagResourceErrorModeled::InternalServerException(crate::state::state_unavailable())
         })?;
