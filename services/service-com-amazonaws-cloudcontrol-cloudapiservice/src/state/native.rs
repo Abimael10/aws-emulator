@@ -118,6 +118,59 @@ pub const HANDLER_ERROR_INVALID_REQUEST: &str = "InvalidRequest";
 /// service generated an error, and the handler has no verdict of its own for it.
 pub const HANDLER_ERROR_GENERAL_SERVICE_EXCEPTION: &str = "GeneralServiceException";
 
+/// WHERE the identifiers a resource operation reports lead, for a type whose primary
+/// identifier is an ADDRESS the owning service announces rather than a name.
+///
+/// Such an identifier is a handle a client keeps and hands back — to this API, and to the
+/// owning service's own operations — so it has to be the address that service would report
+/// to the SAME caller: a client reaching this emulator at its own endpoint is announced that
+/// endpoint by every service of it, and an identifier naming anything else cannot be joined
+/// against the handle that client already holds.
+///
+/// A reader that has no request to answer for ([`Self::published`]) takes each owning
+/// service's own published form instead, which is the address it announces when nothing was
+/// asked.
+#[derive(Debug, Clone, Default)]
+pub struct Announced {
+    /// The `host[:port]` Amazon SQS reports a queue url at for this caller, or `None` for a
+    /// reader with no request behind it.
+    sqs_endpoint: Option<String>,
+}
+
+impl Announced {
+    /// What the owning services announce to the caller of THIS request: for Amazon SQS, the
+    /// endpoint that service's own operations report a queue url at
+    /// (`sqs::reported_endpoint_authority`), so the url this API reports for a queue is the
+    /// string `CreateQueue` and `GetQueueUrl` answer that caller with.
+    #[must_use]
+    pub fn to_this_caller(
+        ctx: &::smithy_server_runtime::OperationContext<'_>,
+        region: &str,
+    ) -> Self {
+        Self {
+            sqs_endpoint: Some(
+                ::service_com_amazonaws_sqs_amazonsqs::state::reported_endpoint_authority(
+                    ctx, region,
+                ),
+            ),
+        }
+    }
+
+    /// What those services publish with no request to read: each type's provider then
+    /// composes the owning service's own published form.
+    #[must_use]
+    pub fn published() -> Self {
+        Self::default()
+    }
+
+    /// The `host[:port]` a queue url this reader reports must name, when one was read off
+    /// the request.
+    #[must_use]
+    pub fn sqs_endpoint(&self) -> Option<&str> {
+        self.sqs_endpoint.as_deref()
+    }
+}
+
 /// What one resource type's owning service answers about its resources.
 ///
 /// A provider holds the handle to that service's state, so every answer here is read from
@@ -201,12 +254,36 @@ impl ::std::fmt::Debug for NativeResources {
 }
 
 impl NativeResources {
+    /// The providers whose owning store THIS engine carries, each answering with the
+    /// identifiers the owning service ANNOUNCES to the caller of THIS request
+    /// ([`Announced`]): call it with a handler's `&*self.engine` and that handler's context.
+    ///
+    /// A resource's identifier is the owning service's to report, and for a type whose
+    /// identifier is an ADDRESS that service announces one that leads back to the endpoint
+    /// the caller reached. Reporting the address that service would have reported is what
+    /// lets a client join the identifier this API tracks against the handle it holds.
+    pub fn announced_to<Eng: Send + Sync + 'static>(
+        engine: &Eng,
+        ctx: &::smithy_server_runtime::OperationContext<'_>,
+        region: &str,
+    ) -> Self {
+        Self::built(engine, Announced::to_this_caller(ctx, region))
+    }
+
     /// The providers whose owning store THIS engine carries: call it with a handler's
     /// `&*self.engine`.
     ///
     /// A store the engine does not carry contributes no provider, so its type falls back
     /// to this service's own store rather than resolving to nothing.
+    ///
+    /// The identifiers are the ones each owning service publishes with no request to read
+    /// ([`Announced::published`]) — for a caller that holds a context, [`Self::announced_to`]
+    /// is the reading.
     pub fn for_engine<Eng: Send + Sync + 'static>(engine: &Eng) -> Self {
+        Self::built(engine, Announced::published())
+    }
+
+    fn built<Eng: Send + Sync + 'static>(engine: &Eng, announced: Announced) -> Self {
         let mut providers: Vec<Box<dyn NativeResourceProvider>> = Vec::new();
         if let Some(provider) = log_groups::LogGroupProvider::for_engine(engine) {
             providers.push(Box::new(provider));
@@ -220,7 +297,7 @@ impl NativeResources {
         if let Some(provider) = destinations::DestinationProvider::for_engine(engine) {
             providers.push(Box::new(provider));
         }
-        if let Some(provider) = queues::QueueProvider::for_engine(engine) {
+        if let Some(provider) = queues::QueueProvider::for_engine(engine, &announced) {
             providers.push(Box::new(provider));
         }
         if let Some(provider) = topics::TopicProvider::for_engine(engine) {

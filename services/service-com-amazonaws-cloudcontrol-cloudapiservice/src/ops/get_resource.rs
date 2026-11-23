@@ -248,7 +248,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // account and Amazon Web Services Region", so a resource of a type whose owning
         // service holds one namespace per Region is resolved THERE.
         let region = crate::state::request_region(ctx.parts());
-        let native = crate::state::native::NativeResources::for_engine(&*self.engine);
+        let native =
+            crate::state::native::NativeResources::announced_to(&*self.engine, ctx, &region);
         // "Primary identifiers can be specified as a string or JSON"
         // (`GetResource$Identifier`): the reference the request carried is read as the
         // identifier the resource answers to before anything is resolved, so a request may

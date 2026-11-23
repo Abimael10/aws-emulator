@@ -261,7 +261,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // listing reports the resources of one account and Region, so a type whose owning
         // service holds one namespace per Region is enumerated THERE.
         let region = crate::state::request_region(ctx.parts());
-        let native = crate::state::native::NativeResources::for_engine(&*self.engine);
+        let native =
+            crate::state::native::NativeResources::announced_to(&*self.engine, ctx, &region);
         // What this store owes an OWNING service's own API, carried out before the store is
         // locked ([`crate::state::owning_api::settle`]).
         crate::state::owning_api::settle(&*self.engine, ctx, now).await;

@@ -47,7 +47,7 @@ use ::std::time::SystemTime;
 use ::serde_json::{Map, Value};
 use ::service_com_amazonaws_sqs_amazonsqs::state as sqs;
 
-use super::{require_value, NativeRefusal, NativeResourceProvider, SqsState};
+use super::{require_value, Announced, NativeRefusal, NativeResourceProvider, SqsState};
 
 /// The `TypeName` this provider stands behind.
 pub const TYPE_NAME: &str = "AWS::SQS::Queue";
@@ -74,13 +74,50 @@ const TAGS: &str = "Tags";
 pub struct QueueProvider {
     /// The owning service's store. A handle, so every answer is read from the live store.
     state: ::engine::ServiceState<SqsState>,
+    /// The `host[:port]` the queue urls this provider reports name, read off what the
+    /// owning service announces to this caller ([`Announced::sqs_endpoint`]); `None` for a
+    /// reader with no request behind it, whose urls take that service's published form.
+    announced: Option<String>,
 }
 
 impl QueueProvider {
     /// The provider for the Amazon SQS store THIS engine carries, or `None` when it
     /// carries none.
-    pub fn for_engine<Eng: Send + Sync + 'static>(engine: &Eng) -> Option<Self> {
-        sqs::service_state(engine).map(|state| Self { state })
+    pub fn for_engine<Eng: Send + Sync + 'static>(
+        engine: &Eng,
+        announced: &Announced,
+    ) -> Option<Self> {
+        sqs::service_state(engine).map(|state| Self {
+            state,
+            announced: announced.sqs_endpoint().map(str::to_string),
+        })
+    }
+
+    /// The url THIS provider reports for the queue called `name` in `region`: the queue's
+    /// `/<accountId>/<QueueName>` path on the endpoint the owning service announces to this
+    /// caller, and that service's published form for a reader with no request behind it.
+    ///
+    /// The ONE place this provider composes a queue url, so the identifier it tracks, the
+    /// identifier it lists and the `QueueUrl` property of the model it reports cannot name
+    /// three different addresses for one queue.
+    fn url(&self, region: &str, name: &str) -> String {
+        match &self.announced {
+            Some(authority) => {
+                sqs::queue_url_at(authority, ::engine::emulator_account_id(), name)
+            }
+            None => sqs::queue_url(region, name),
+        }
+    }
+
+    /// How a refusal states what the type's primary identifier has to be, for a create
+    /// whose identifier names no queue: in the form of a url THIS reader reports, so the
+    /// example a caller is shown is an address it can really use.
+    fn queue_url_requirement(&self) -> String {
+        format!(
+            "must be the url of a queue of this account in the form {}, or the queue's ARN \
+             or name",
+            self.url("<region>", "<QueueName>")
+        )
     }
 }
 
@@ -96,22 +133,26 @@ impl NativeResourceProvider for QueueProvider {
     /// The url the queue a create describes will answer to.
     ///
     /// The type's primary identifier is read-only in its schema, so no desired state
-    /// carries it: the queue's url is the owning service's to assign, and it assigns the
-    /// one built from the Region and the queue's name. A model that names no name is a
-    /// resource whose name the provider picks ([`generated_name`]), the same way a template
-    /// that declares none leaves the name to CloudFormation.
+    /// carries it: the queue's url is the owning service's to assign, and this is the url
+    /// that service reports for it to this caller ([`QueueProvider::url`]). A model that
+    /// names no name is a resource whose name the provider picks ([`generated_name`]), the
+    /// same way a template that declares none leaves the name to CloudFormation.
     fn assigned_identifier(&self, region: &str, properties: &Value) -> Option<String> {
         let name = properties
             .get(QUEUE_NAME)
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| generated_name(properties));
-        Some(sqs::queue_url(region, &name))
+        Some(self.url(region, &name))
     }
 
     fn read(&self, region: &str, identifier: &str) -> Option<Value> {
         let name = queue_name(region, identifier)?;
-        self.state.lock().queue(region, &name).map(model)
+        let url = self.url(region, &name);
+        self.state
+            .lock()
+            .queue(region, &name)
+            .map(|queue| model(queue, &url))
     }
 
     fn list(&self, region: &str, after: Option<&str>, limit: usize) -> Vec<(String, Value)> {
@@ -121,7 +162,10 @@ impl NativeResourceProvider for QueueProvider {
         let store = self.state.lock();
         store
             .queues_in(region)
-            .map(|queue| (sqs::queue_url(region, &queue.name), model(queue)))
+            .map(|queue| {
+                let url = self.url(region, &queue.name);
+                (url.clone(), model(queue, &url))
+            })
             .filter(|(url, _)| after.is_none_or(|after| url.as_str() > after))
             .take(limit)
             .collect()
@@ -137,15 +181,15 @@ impl NativeResourceProvider for QueueProvider {
         let Some(name) = queue_name(region, identifier) else {
             return Err(NativeRefusal::Invalid(format!(
                 "{IDENTIFIER_PROPERTY} {}",
-                queue_url_requirement()
+                self.queue_url_requirement()
             )));
         };
         // The name a queue is created under is the OWNING service's to accept, so nothing
         // is created here under a name that service's own API would refuse.
         let arn = sqs::queue_arn(region, &name);
         // The url the queue will answer to, whichever way the reference that reached this
-        // call spelled it: the owning service assigns it from the Region and the name.
-        let url = sqs::queue_url(region, &name);
+        // call spelled it: the one the owning service reports for it to this caller.
+        let url = self.url(region, &name);
         let desired = DesiredModel::read(&name, &arn, &url, properties)?;
         let fifo = desired.designates_fifo();
         if let Some(why) = sqs::queue_name_refusal(&name, fifo) {
@@ -178,7 +222,7 @@ impl NativeResourceProvider for QueueProvider {
             return Err(NativeRefusal::Rejected(why));
         }
         let queue = sqs::Queue::created(region, &name, attributes, desired.tags, at);
-        let created = model(&queue);
+        let created = model(&queue, &url);
         store.insert_queue(queue);
         Ok(created)
     }
@@ -193,11 +237,7 @@ impl NativeResourceProvider for QueueProvider {
         let name = queue_name(region, identifier).ok_or(NativeRefusal::NotFound)?;
         let mut store = self.state.lock();
         let held = store.queue(region, &name).ok_or(NativeRefusal::NotFound)?;
-        let (arn, url, was_fifo) = (
-            held.arn.clone(),
-            sqs::queue_url(region, &name),
-            held.is_fifo(),
-        );
+        let (arn, url, was_fifo) = (held.arn.clone(), self.url(region, &name), held.is_fifo());
         let (held_attributes, held_tags) = (held.attributes.clone(), held.tags.clone());
         let desired = DesiredModel::read(&name, &arn, &url, properties)?;
         // "You can provide this attribute only during queue creation. You can't change it
@@ -245,7 +285,7 @@ impl NativeResourceProvider for QueueProvider {
             queue.reapply_delay_seconds();
         }
         queue.materialise_due(at);
-        Ok(model(queue))
+        Ok(model(queue, &url))
     }
 
     fn delete(&self, region: &str, identifier: &str, at: SystemTime) -> Result<(), NativeRefusal> {
@@ -314,22 +354,25 @@ fn redrive_refusal(
 /// no queue of this type at all.
 ///
 /// The references a resource of this type answers to are the ones the type's schema
-/// DECLARES: its `primaryIdentifier` `/properties/QueueUrl` — the url Amazon SQS assigns,
-/// built from the Region, this emulator's account and the queue's name — and its
-/// `additionalIdentifiers`, `/properties/Arn` and `/properties/QueueName`. Each is resolved
-/// to the one queue it names, and whichever of them addressed it, every answer reports the
-/// queue's own assigned url.
+/// DECLARES: its `primaryIdentifier` `/properties/QueueUrl` — a url of this account, which
+/// names its queue by the `/<accountId>/<QueueName>` path it carries and not by its
+/// authority, exactly as the owning service resolves one ([`sqs::queue_name_from_url`]) —
+/// and its `additionalIdentifiers`, `/properties/Arn` and `/properties/QueueName`. Each is
+/// resolved to the one queue it names, and whichever of them addressed it, every answer
+/// reports the url the owning service announces for that queue.
 ///
-/// A value that is none of the three — a url or an ARN of another account or Region, a url
-/// whose path is empty, a name no queue carries — names no queue, which is what a read of
-/// it reports as not found.
+/// Resolving a url by its path rather than by the whole string is what lets a client hand
+/// back a handle it was given at one endpoint of this emulator through another: the two
+/// strings name one queue.
+///
+/// A value that is none of the three — a url or an ARN of another account, a url whose path
+/// is empty, a name no queue carries — names no queue, which is what a read of it reports as
+/// not found.
 fn queue_name(region: &str, identifier: &str) -> Option<String> {
-    // The url: resolved by the `/<accountId>/<QueueName>` path the owning service resolves
-    // one by ([`sqs::queue_name_from_url`]), then held to the url THIS Region assigns.
-    if let Some(name) = sqs::queue_name_from_url(identifier)
-        .filter(|name| sqs::queue_url(region, name) == identifier)
-    {
-        return Some(name.to_string());
+    // The url: resolved by the `/<accountId>/<QueueName>` pair the owning service resolves
+    // one by, so only a value carrying a path reaches it — an ARN carries none.
+    if identifier.contains('/') {
+        return sqs::queue_name_from_url(identifier).map(str::to_string);
     }
     // The ARN, which the owning service builds from the same Region, account and name.
     if let Some(name) = identifier
@@ -342,16 +385,6 @@ fn queue_name(region: &str, identifier: &str) -> Option<String> {
     // And the name itself, which carries none of the separators either of the two above
     // is built with.
     (!identifier.is_empty() && !identifier.contains([':', '/'])).then(|| identifier.to_string())
-}
-
-/// How a refusal states what the type's primary identifier has to be, for a create whose
-/// identifier names no queue.
-fn queue_url_requirement() -> String {
-    format!(
-        "must be the url of a queue of this account in the form {}, or the queue's ARN or \
-         name",
-        sqs::queue_url("<region>", "<QueueName>")
-    )
 }
 
 /// The name a create picks for a queue whose model names none — the shared rule, carrying
@@ -390,12 +423,13 @@ fn attribute_property(property: &str) -> Option<&'static sqs::AttributeSpec> {
 /// carries, and only those it HAS: a queue carries the attributes its create supplied and
 /// the documented defaults of those that apply to it, so that is what a read reports, in
 /// each property's own declared form.
-fn model(queue: &sqs::Queue) -> Value {
+///
+/// `url` is the queue's `QueueUrl` property, which is its primary identifier, so it is
+/// passed in from the ONE place this provider composes one ([`QueueProvider::url`]) rather
+/// than built again here.
+fn model(queue: &sqs::Queue, url: &str) -> Value {
     let mut model = Map::new();
-    model.insert(
-        IDENTIFIER_PROPERTY.to_string(),
-        Value::from(sqs::queue_url(&queue.region, &queue.name)),
-    );
+    model.insert(IDENTIFIER_PROPERTY.to_string(), Value::from(url));
     model.insert(ARN.to_string(), Value::from(queue.arn.clone()));
     model.insert(QUEUE_NAME.to_string(), Value::from(queue.name.clone()));
     // The encryption a queue is under is reported by the owning service whether or not its

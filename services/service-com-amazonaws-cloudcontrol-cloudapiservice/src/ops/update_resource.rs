@@ -444,7 +444,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // owning service holds one namespace per Region, this is the Region the resource is
         // resolved in and the one the patch is applied in.
         let region = crate::state::request_region(ctx.parts());
-        let native = crate::state::native::NativeResources::for_engine(&*self.engine);
+        let native =
+            crate::state::native::NativeResources::announced_to(&*self.engine, ctx, &region);
         // "Primary identifiers can be specified as a string or JSON": the reference the
         // request carried is read as the identifier the resource answers to before anything
         // is resolved, the way every operation that takes an `Identifier` reads it.

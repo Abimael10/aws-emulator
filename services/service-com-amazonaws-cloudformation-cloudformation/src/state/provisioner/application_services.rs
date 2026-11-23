@@ -1751,13 +1751,12 @@ pub(super) const QUEUE_DOES_NOT_EXIST: &str = "QueueDoesNotExist";
 /// the last segment of the queue url its `Ref` resolves to — and the attribute map
 /// [`queue_attributes`] reads off the declared properties.
 ///
-/// The url the create answers with is reported back as the resource's `QueueUrl`
-/// attribute. It is the SAME url the type's published return values computed
-/// (`https://sqs.<region>.amazonaws.com/<account>/<name>`), because both are built from
-/// the one account id this emulator mints and the queue's own name — and SQS resolves a
-/// `QueueUrl` by exactly that pair (`queue_name_from_url` in its own state module), so
-/// the handle the stack publishes addresses the queue this call created however a client
-/// reaches SQS.
+/// The url the create ANSWERED is what the resource takes as its physical id and its
+/// `QueueUrl` attribute, because the url is Amazon SQS's to report and `Ref` "returns the
+/// queue URL": the handle the stack publishes is then the same string that service serves
+/// for the queue, whichever of them a client compares it against, rather than one composed
+/// here from the name. A create that reports no url at all leaves the resource with the id
+/// the naming rules computed, which is the only id there is to publish then.
 ///
 /// The queue carries the tags the declaration asks for plus the ones CloudFormation gives
 /// the resource ([`tags_of`]), as `CreateQueue`'s own `tags` map — less the
@@ -1789,12 +1788,18 @@ pub(super) async fn create_queue(
     )
     .await?;
     let mut attributes = BTreeMap::new();
-    if let Some(url) = reported.get("QueueUrl").and_then(Value::as_str) {
-        attributes.insert("QueueUrl".to_string(), url.to_string());
+    let reported_url = reported
+        .get("QueueUrl")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    if let Some(url) = &reported_url {
+        attributes.insert("QueueUrl".to_string(), url.clone());
     }
-    // The queue was created under the name CloudFormation decided, and its url is built
-    // from that name.
-    Ok(Created::attributes(attributes))
+    // The url Amazon SQS answered IS this resource's identity: `Ref` returns the queue url.
+    Ok(Created {
+        physical_resource_id: reported_url,
+        attributes,
+    })
 }
 
 /// Apply a changed `AWS::SQS::Queue` declaration to the queue that already exists.
