@@ -2,20 +2,22 @@
 
 //! @op DeleteDirectory
 //!
-//! IMPLEMENTED: deletes one directory of this account. The teardown is COMPLETE when this
-//! operation answers: everything the directory was given is released inside the call, in
-//! the services that own it, and the directory's own record goes with it
-//! (`crate::state::directory_deletion`), so nothing of the directory is left for a later
-//! call to finish and nothing is owed to the clock.
+//! IMPLEMENTED: deletes one directory of this account. The directory leaves SERVICE inside
+//! the call: everything it was given is released there, in the services that own it, and its
+//! record leaves the account's directories (`crate::state::directory_deletion`), so every
+//! call that must resolve the id to a live directory is refused from that instant.
 //!
-//! What a client does with that: the FIRST read after the delete already answers for a
-//! directory this account no longer has — an id it HAD, which is what makes a later
-//! reporting call filtered by that id an empty page rather than a refusal, while every call
-//! that must resolve the id to a live directory is refused with the modelled "specified
-//! entity could not be found".
+//! The teardown itself is what the clock finishes: the record stays READABLE through
+//! `DescribeDirectories` in the modelled `Deleting` stage, reaches the chain's terminal
+//! `Deleted` one transition span later and leaves the account's records one span after that.
 //!
-//! A repeated delete therefore finds nothing to delete, and is refused the way a delete of
-//! an id that was never there is.
+//! What a client does with that: it polls the directory's stage to watch its own delete run
+//! — `Deleting`, then `Deleted`, then an empty page for an id this account HAD, which is
+//! what makes a reporting call filtered by that id an empty page rather than a refusal,
+//! while an id the account never held is refused.
+//!
+//! A repeated delete finds nothing to delete, and is refused the way a delete of an id that
+//! was never there is.
 //!
 //! The teardown releases what the create provisioned for the directory in ANOTHER
 //! service: the network interfaces the directory's servers answered on and the domain
@@ -155,13 +157,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut store = state.lock();
             store.advance_clock(now);
 
-            // The delete TAKES THE DIRECTORY AWAY: this call releases everything it was
-            // given (below) and its record goes with them, so there is nothing left for the
-            // clock to finish (see `crate::state::directory_deletion`). An id no directory is
-            // stored under — one this account never had, and one a delete already took — is
+            // The delete TAKES THE DIRECTORY OUT OF SERVICE: this call releases everything
+            // it was given (below), and the record it leaves behind reports the stage the
+            // teardown starts in until the clock has worked through the rest of the chain
+            // (see `crate::state::directory_deletion`). An id no directory is stored under —
+            // one this account never had, and one a delete already took out of service — is
             // the modelled "specified entity could not be found".
             let teardown = store
-                .tear_down_directory(&input.directory_id)
+                .tear_down_directory(&input.directory_id, now)
                 .ok_or_else(|| {
                     DeleteDirectoryErrorModeled::EntityDoesNotExistException(
                         crate::state::refusal(crate::state::no_such_directory(&input.directory_id)),

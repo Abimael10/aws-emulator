@@ -9,9 +9,11 @@
 //! configuration with lock state `locked`; an unlock request is completed only for a
 //! `locked` rule, and it persists lock state `pending_unlock` with a lock end time one
 //! configured unlock delay away. Every other lock or unlock request is refused with its
-//! modelled error and changes nothing — a lock request against a locked rule is refused
-//! only when it names ANOTHER unlock delay, which `tests/all/lock_rule_idempotence.rs`
-//! owns together with the repeat of a lock request the rule already satisfies.
+//! modelled error and changes nothing — a lock request against a rule whose lock still
+//! forbids modifying it is refused only when it names ANOTHER unlock delay, which
+//! `tests/all/lock_rule_idempotence.rs` (the `locked` rule) and
+//! `tests/all/lock_rule_unlock_delay_protection.rs` (the rule still serving its unlock
+//! delay) own, together with the repeat of a lock request the rule already satisfies.
 //!
 //! Each case drives the service through the real router, exactly as a signed SDK
 //! request would, and every row states its own case so a failure names the input.
@@ -460,10 +462,12 @@ async fn unlock_rule_starts_the_configured_unlock_delay_and_locking_again_cancel
             );
         }
 
-        // Locking again inside the unlock delay returns the rule to `locked` and leaves
-        // no lock end time behind — the only transitions a locked rule has are between
-        // `locked` and `unlocked`.
-        let relock = lock_configuration(UNLOCK_DELAY_MAX);
+        // Locking again inside the unlock delay, under the delay the rule is serving,
+        // returns the rule to `locked` and leaves no lock end time behind — the only
+        // transitions a locked rule has are between `locked` and `unlocked`. A re-lock
+        // naming ANOTHER delay would change the lock the rule is still protected by, and
+        // is refused (`tests/all/lock_rule_unlock_delay_protection.rs`).
+        let relock = lock_configuration(unlock_delay);
         let (status, relocked) =
             lock_rule(&router, &identifier, json!({ "LockConfiguration": relock })).await;
         assert_eq!(
@@ -607,10 +611,12 @@ async fn an_unlocked_rule_can_be_locked_again_and_then_modified_once_more() {
     seen.push(locked["LockState"].as_str().unwrap_or_default().to_string());
     let (_, unlocked) = unlock_rule(&router, &identifier).await;
     seen.push(unlocked["LockState"].as_str().unwrap_or_default().to_string());
+    // The re-lock names the delay the rule is serving: that is the request which returns
+    // a rule inside its unlock delay to `locked`.
     let (_, relocked) = lock_rule(
         &router,
         &identifier,
-        json!({ "LockConfiguration": lock_configuration(UNLOCK_DELAY_MAX) }),
+        json!({ "LockConfiguration": lock_configuration(UNLOCK_DELAY_MIN) }),
     )
     .await;
     seen.push(relocked["LockState"].as_str().unwrap_or_default().to_string());

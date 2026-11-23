@@ -251,6 +251,24 @@ pub const SNAPSHOTTABLE_DIRECTORY_TYPES: [&str; 2] = [TYPE_SIMPLE_AD, "Microsoft
 /// The stage a created directory reaches once [`TRANSITION_SPAN`] has elapsed.
 pub const STAGE_ACTIVE: &str = "Active";
 
+/// The stage a directory is in while the teardown `DeleteDirectory` started runs: the
+/// `Deleting` value of the modelled `DirectoryStage` enum
+/// (`smithy_query(query="shape",shape="DirectoryStage")`).
+///
+/// A delete does NOT hand back a directory that is already gone: the request is accepted
+/// and the directory stays readable in THIS stage while it is torn down, reaching
+/// [`STAGE_DELETED`] and then leaving the account's records on the clock's own schedule.
+/// That window is what a delete-and-wait client reads its own deletion off, so it is
+/// owed to the clock rather than to any later call (`advance_clock` materialises both
+/// steps).
+pub const STAGE_DELETING: &str = "Deleting";
+
+/// The stage a torn-down directory reaches once [`TRANSITION_SPAN`] has elapsed in
+/// [`STAGE_DELETING`]: the `Deleted` value of the same modelled enum, the terminal stage
+/// of the teardown chain, which the record reports for one more span before it leaves the
+/// account's records.
+pub const STAGE_DELETED: &str = "Deleted";
+
 /// The stage a directory that is in service but degraded reports: the `Impaired` value of
 /// the modelled `DirectoryStage` enum
 /// (`smithy_query(query="shape",shape="DirectoryStage")`).
@@ -2670,6 +2688,24 @@ impl Directory {
         }
     }
 
+    /// Forget the network this service PROVISIONED for this directory's servers in Amazon
+    /// EC2 — the domain controller security group and the server interfaces — because the
+    /// teardown has released them there.
+    ///
+    /// Why a record whose teardown has run drops them: a `SecurityGroupId` or a server
+    /// address this service reports must name a resource the service that OWNS it still
+    /// holds, so a directory whose group and interfaces are gone names neither while it
+    /// reports the rest of its teardown.
+    pub fn forget_provisioned_network(&mut self) {
+        if let Some(settings) = self.vpc_settings.as_mut() {
+            settings.security_group_id = None;
+        }
+        if let Some(settings) = self.connect_settings.as_mut() {
+            settings.security_group_id = None;
+        }
+        self.provisioned_network_interfaces.clear();
+    }
+
     /// The subnets this directory's servers are placed across: the `SubnetIds` the create
     /// named, in the order it named them, read from whichever settings block this
     /// directory's type reports its placement as ([`Self::vpc_id`]).
@@ -3586,6 +3622,21 @@ pub struct ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// ([`Self::remember_deleted_directory`]), which drops the earliest-created id once the
     /// bound is reached — so a create/delete cycle cannot grow this store without end.
     pub deleted_directories: BTreeMap<String, u64>,
+    /// The directories whose teardown is still running, keyed by `DirectoryId`: the record
+    /// `DeleteDirectory` took out of [`Self::directories`], kept READABLE while the clock
+    /// works through the teardown chain ([`STAGE_DELETING`], [`STAGE_DELETED`], then gone).
+    ///
+    /// Why it is a store of its own rather than a stage of the live one: a directory being
+    /// torn down is no longer one the account HOLDS — every call whose subject has to be a
+    /// live directory is refused for it, it counts towards no directory limit and it serves
+    /// no DNS — but it is still one the account can DESCRIBE, which is what a client polling
+    /// its own delete reads the teardown off. Keeping it here is what lets both be true
+    /// without every lookup having to exclude a stage.
+    ///
+    /// Bounded by the chain itself: a record leaves on the second transition the delete
+    /// owes ([`directory_deletion`]), so the store holds only the teardowns of the last
+    /// span.
+    pub deleting_directories: BTreeMap<String, Directory>,
     /// Drives [`Self::mint_directory_id`]; see there for how an id is derived from it.
     id_seed: u64,
     /// Drives [`Self::mint_assessment_id`], the way [`Self::id_seed`] drives the
@@ -3899,6 +3950,11 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// `UpdateSettings` ran, a domain controller's status when the placement or the
     /// retirement of it ran.
     pub fn advance_clock(&mut self, now: SystemTime) {
+        // The stage chain a DELETE owes, for the records it took out of service: the
+        // teardown walks `Deleting` then `Deleted` and the record then leaves the account's
+        // describable set, each step on the clock's own schedule
+        // ([`Self::advance_directory_teardowns`]).
+        self.advance_directory_teardowns(now);
         for directory in self.directories.values_mut() {
             // The stage a create owes is a CHAIN — `Requested`, then `Creating` for the
             // build window, then `Active` — so every step the clock has already made due
@@ -4162,6 +4218,20 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// Directories in creation order — the order `DescribeDirectories` pages over.
     pub fn directories_in_creation_order(&self) -> Vec<&Directory> {
         let mut ordered: Vec<&Directory> = self.directories.values().collect();
+        ordered.sort_by_key(|directory| directory.seq);
+        ordered
+    }
+
+    /// Every directory the account can still DESCRIBE, in creation order: the ones it
+    /// holds, and the ones whose teardown is still running
+    /// ([`Self::deleting_directories`]), which report the stage the teardown has reached
+    /// until their records leave.
+    pub fn describable_directories_in_creation_order(&self) -> Vec<&Directory> {
+        let mut ordered: Vec<&Directory> = self
+            .directories
+            .values()
+            .chain(self.deleting_directories.values())
+            .collect();
         ordered.sort_by_key(|directory| directory.seq);
         ordered
     }

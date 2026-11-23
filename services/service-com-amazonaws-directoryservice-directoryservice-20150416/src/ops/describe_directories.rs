@@ -239,12 +239,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stating that one directory does not exist: the two ds not-found families are
         // worded differently.
         //
-        // An id of a directory this account HAD and has since deleted is NOT such a value:
-        // the filter named something that was there, so it narrows this reporting call to
-        // nothing and the page is served empty (HTTP 200). That is what a client polling
-        // this listing to confirm its own `DeleteDirectory` finished reads the deletion
-        // off, and it is this operation's reading alone: a MUTATION of a deleted id still
-        // refuses, since there is no directory to act on.
+        // An id of a directory this account HAD is NOT such a value: the filter named
+        // something that was there, so it narrows this reporting call to the record the
+        // teardown still has — the `Deleting` then `Deleted` stage chain a delete owes — and
+        // to nothing at all once that record has left, which is served as an empty page
+        // (HTTP 200). That is what a client polling this listing to confirm its own
+        // `DeleteDirectory` finished reads the deletion off, and it is this operation's
+        // reading alone: a MUTATION of a deleted id still refuses, since there is no live
+        // directory to act on.
         if let Some(filtered_ids) = input.directory_ids.as_ref() {
             // Scanned in FILTER order (the caller's list), not in the order the lookup set
             // above holds them, so the nth name in the diagnostic answers the nth id the
@@ -269,9 +271,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // Every directory the request asks for, in creation order, from the cursor on.
+        // Every directory the request asks for, in creation order, from the cursor on: the
+        // ones the account holds and the ones whose teardown is still running, which report
+        // the stage it has reached.
         let mut selected: Vec<(u64, DirectoryDescription)> = store
-            .directories_in_creation_order()
+            .describable_directories_in_creation_order()
             .into_iter()
             .filter(|directory| directory.seq > after_seq)
             .filter(|directory| {

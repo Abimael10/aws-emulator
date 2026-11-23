@@ -23,10 +23,10 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The `X-Amz-Target` prefix: the service shape's name, `DirectoryService_20150416`.
 const TARGET_PREFIX: &str = "DirectoryService_20150416";
 
-/// Comfortably longer than anything a delete leaves to wait for — which is nothing: a delete
-/// takes the directory away inside the call (`crate::directory_deletion` is that rule's own
-/// suite) — with margin for a loaded test machine, so a case that waits this long after a
-/// delete is one the directory's record has LEFT the store in.
+/// Comfortably longer than the whole teardown a delete starts — the two stages the clock owes
+/// it (`crate::directory_deletion` is that rule's own suite) — with margin for a loaded test
+/// machine, so a case that waits this long after a delete is one the directory's record has
+/// LEFT the store in.
 ///
 /// DERIVED from the span the service itself publishes rather than restated, so a change to
 /// it moves every wait in the crate with it.
@@ -37,9 +37,9 @@ pub(crate) const PAST_THE_TEARDOWN: Duration = TRANSITION_SPAN
 /// Delete the directory `directory_id` and confirm the account no longer holds it, so a
 /// caller that asserts on its absence does so against a read and not against a span of time.
 ///
-/// The delete takes the directory away within the call, so the poll settles on its first
-/// look; it is kept as a poll rather than a single read so a case about what the account no
-/// longer holds reads the CONDITION it is about.
+/// The delete takes the directory out of service within the call and the clock then works
+/// through the teardown the record reports, so the poll waits for the CONDITION a case about
+/// what the account no longer holds is about rather than for a span of time.
 pub(crate) async fn delete_directory_and_wait(
     router: &MultiServiceRouter,
     directory_id: &str,

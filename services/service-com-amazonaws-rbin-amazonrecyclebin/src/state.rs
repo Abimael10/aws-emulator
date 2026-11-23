@@ -420,18 +420,28 @@ impl Rule {
         self.lock_configuration.is_some() || self.lock_state.is_some()
     }
 
+    /// Whether the lock in force on the rule names exactly the unlock delay `requested`
+    /// asks for, whatever lock state the rule has reached.
+    ///
+    /// This is what tells a lock request that leaves the lock in force ALONE from one
+    /// that would CHANGE it. A `pending_unlock` rule is still serving the delay its lock
+    /// configuration carries, so a request naming that same delay changes no lock, while
+    /// one naming another delay would shorten or lengthen the period the lock was taken
+    /// under.
+    pub fn holds_unlock_delay(&self, requested: &LockConfiguration) -> bool {
+        self.lock_configuration
+            .as_ref()
+            .is_some_and(|held| same_unlock_delay(&held.unlock_delay, &requested.unlock_delay))
+    }
+
     /// Whether the rule is `locked` under exactly the lock `requested` asks for — the
     /// unlock delay already in force.
     ///
-    /// This is what tells a lock request that asks for the state the rule is already in
-    /// from one that would CHANGE the lock in force: the first is satisfied by the
-    /// stored rule, the second is the request a lock conflict refuses.
+    /// This is the lock request that asks for the state the rule is ALREADY in, so it is
+    /// satisfied by the stored rule rather than changing it.
     pub fn locked_with(&self, requested: &LockConfiguration) -> bool {
         self.lock_state.as_deref() == Some(LOCK_STATE_LOCKED)
-            && self
-                .lock_configuration
-                .as_ref()
-                .is_some_and(|held| same_unlock_delay(&held.unlock_delay, &requested.unlock_delay))
+            && self.holds_unlock_delay(requested)
     }
 
     /// Assign `tags` to the rule, as [`upsert_tags`] defines assigning.
@@ -773,8 +783,12 @@ pub enum BlockingCondition {
     /// answer to "why was this refused", so the stored lock-state token stays out of the
     /// message.
     Locked,
-    /// The rule is already `locked` under a DIFFERENT unlock delay than the request
-    /// asked for, so completing the request would change the lock in force.
+    /// The lock in force on the rule names a DIFFERENT unlock delay than the request
+    /// asked for, so completing the request would change that lock.
+    ///
+    /// Reported while the lock still forbids modifying the rule — `locked`, and
+    /// `pending_unlock` with the delay still running, which is the same rule
+    /// [`Self::Locked`] covers for a modify or a delete.
     DifferentUnlockDelay,
     /// The rule has no lock to release: it has never been locked, is `unlocked`, or is
     /// already serving its unlock delay.

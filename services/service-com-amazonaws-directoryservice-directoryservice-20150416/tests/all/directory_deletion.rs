@@ -9,22 +9,26 @@
 //! struct, so an answer that is not computed from persisted state cannot pass.
 //!
 //! The rule under test, asserted over a TABLE of directories rather than one recorded call:
-//! a delete takes the directory away INSIDE the call. Everything the directory was given is
-//! released by the time the delete answers — the interfaces its servers answered on and the
-//! group they sat behind, in the service that owns them (`crate::directory_server_interfaces`
-//! and `crate::directory_network_release` assert that half), and the entry the data plane
-//! reads — so the record that describes them goes with them and nothing is left for a later
-//! call to finish. The FIRST read after the delete therefore answers for a directory this
-//! account no longer holds: a reporting call that takes the id as a FILTER narrows to an
-//! empty page, the unfiltered inventory does not name it, and every call that has to resolve
-//! the id to a live directory is refused — while an id this account was NEVER issued is
-//! refused with the other sentence, which is what lets a client tell its own completed
-//! deletion from an id that was never there.
+//! a delete takes the directory OUT OF SERVICE inside the call. Everything the directory was
+//! given is released by the time the delete answers — the interfaces its servers answered on
+//! and the group they sat behind, in the service that owns them
+//! (`crate::directory_server_interfaces` and `crate::directory_network_release` assert that
+//! half), and the entry the data plane reads — and the record leaves the account's
+//! directories with them, so every call that has to resolve the id to a live directory is
+//! refused from that instant, while an id this account was NEVER issued is refused with the
+//! other sentence, which is what lets a client tell its own deletion from an id that was
+//! never there.
 //!
-//! No case waits for anything here: that there is nothing to wait for is the rule. The rows
-//! differ along what the two creates persist — create operation, directory type, size,
-//! edition and network type — and every pass keeps a control directory in the same store, so
-//! a teardown is shown to be per-directory rather than per-store.
+//! What the delete does NOT do is make the directory vanish from the account's reporting: the
+//! teardown is REPORTED, through the modelled `Deleting` stage the delete answers in and the
+//! chain's terminal `Deleted`, and only once the record has left does the id FILTER the
+//! reporting call to an empty page and stop being named by the unfiltered inventory. That is
+//! the window a delete-and-wait client polls, so each case here waits for the CONDITION it is
+//! about rather than for a span of time.
+//!
+//! The rows differ along what the two creates persist — create operation, directory type,
+//! size, edition and network type — and every pass keeps a control directory in the same
+//! store, so a teardown is shown to be per-directory rather than per-store.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -33,7 +37,11 @@ use crate::directory_lifecycle::{
     await_in_service, call, create_directory, describe_all, descriptions, minimal_create, ok,
     service, string, PASSWORD, STAGE_ACTIVE,
 };
+use crate::harness::{poll_until_absent, poll_until_reported, POLL_DEADLINE};
 use crate::microsoft_ad::{create_microsoft_ad, minimal_microsoft_ad};
+use service_com_amazonaws_directoryservice_directoryservice_20150416::state::{
+    STAGE_DELETED, STAGE_DELETING,
+};
 
 /// Well-formed `DirectoryId`s (`^d-[0-9a-f]{10}$`) this account is never issued, so each one
 /// reaches a read as a value the account has NEVER held — neither stored nor deleted. Varied
@@ -247,7 +255,7 @@ async fn refused_as_absent(
 }
 
 #[tokio::test]
-async fn a_delete_takes_the_directory_away_in_the_call() {
+async fn a_delete_takes_the_directory_out_of_service_and_reports_its_teardown() {
     let router = service();
     let rows = rows();
 
@@ -288,9 +296,47 @@ async fn a_delete_takes_the_directory_away_in_the_call() {
 
         delete(&router, id, case).await;
 
-        // The FIRST read after the delete, with nothing waited for: the account no longer
-        // holds the directory. The id FILTERS the reporting call to an empty page, which is
-        // what a delete-and-wait client reads its own deletion off.
+        // The FIRST read after the delete, with nothing waited for: the directory is still
+        // described, in the stage its teardown starts in — the window a delete-and-wait
+        // client polls.
+        assert_eq!(
+            reported_stage(&router, id, case).await.as_deref(),
+            Some(STAGE_DELETING),
+            "case {case:?}: expected the teardown's first stage straight after the delete"
+        );
+        // Every call whose subject has to be a live directory is refused from that same
+        // instant, with the sentence for an id that resolves to no directory and the
+        // refusal's own request id: the directory has left service, however long its
+        // teardown is still reported for.
+        for (operation, body) in calls_needing_a_live_directory(id) {
+            refused_with(&router, operation, body, &does_not_exist(id), case).await;
+        }
+        // ...and the tag calls, which name the same id as a RESOURCE, are refused too: the
+        // tags that hung off the directory went with it.
+        for (operation, body) in tag_calls(id) {
+            refused_as_absent(&router, operation, body, case).await;
+        }
+
+        // The stage after that one is the terminal stage of the modelled chain, reached by
+        // the clock alone — the polls only read.
+        let settled = poll_until_reported(
+            case,
+            &format!("{id} to leave {STAGE_DELETING}"),
+            POLL_DEADLINE,
+            || reported_stage(&router, id, case),
+            |observed: &Option<String>| observed.as_deref() != Some(STAGE_DELETING),
+        )
+        .await;
+        assert_eq!(
+            settled.as_deref(),
+            Some(STAGE_DELETED),
+            "case {case:?}: expected the teardown to reach the chain's terminal stage, got \
+             {settled:?}"
+        );
+        // ...and the end of the teardown is the record leaving the account's records: the id
+        // then FILTERS the reporting call to an empty page, which is what a delete-and-wait
+        // client reads its own completed deletion off.
+        poll_until_absent(&router, id, case).await;
         assert_eq!(
             page_for(&router, id, case).await,
             Vec::<Value>::new(),
@@ -307,15 +353,10 @@ async fn a_delete_takes_the_directory_away_in_the_call() {
             "case {case:?}: expected {id} to be absent from the account's inventory, got \
              {inventory:?}"
         );
-        // Every call whose subject has to be a live directory is refused, with the sentence
-        // for an id that resolves to no directory and the refusal's own request id.
+        // The calls that must resolve the id to a live directory are refused past the
+        // teardown as well, in the same words.
         for (operation, body) in calls_needing_a_live_directory(id) {
             refused_with(&router, operation, body, &does_not_exist(id), case).await;
-        }
-        // ...and the tag calls, which name the same id as a RESOURCE, are refused too: the
-        // tags that hung off the directory went with it.
-        for (operation, body) in tag_calls(id) {
-            refused_as_absent(&router, operation, body, case).await;
         }
     }
 
@@ -339,6 +380,9 @@ async fn a_deleted_id_is_told_apart_from_one_the_account_was_never_issued() {
     await_in_service(&router, &deleted, case).await;
 
     delete(&router, &deleted, case).await;
+    // An id whose teardown is still being reported is still described, so the narrowing
+    // below is asserted once the record has LEFT — the condition, not a span of time.
+    poll_until_absent(&router, &deleted, case).await;
 
     // An id this account HAD: the reporting call filtered by it is SERVED, with an empty
     // page, and a live id beside it is still reported.

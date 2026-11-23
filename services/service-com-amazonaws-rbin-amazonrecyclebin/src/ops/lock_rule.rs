@@ -5,9 +5,9 @@
 //! persisting the requested lock configuration and the `locked` lock state in
 //! [`crate::state`] — and answers with the STORED record (HTTP 200). A request naming
 //! the unlock delay already in force on a locked rule asks for the state that rule is
-//! already in, so it is completed out of the stored record too; only a request that
-//! would CHANGE the lock in force is refused. This is the ONLY file to touch for this
-//! operation.
+//! already in, so it is completed out of the stored record too; a request that would
+//! CHANGE the lock in force on a rule whose lock still forbids modifying it is refused.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -223,10 +223,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if rule.locked_with(&input.lock_configuration) {
             return Ok(stored_lock_response(rule));
         }
-        // What is left is a request that would CHANGE the lock in force on a rule that is
-        // already locked — a different unlock delay — and a locked rule "can't be
-        // modified", so the lock request can't be completed.
-        if rule.lock_state.as_deref() == Some(crate::state::LOCK_STATE_LOCKED) {
+        // What is left is a request that would CHANGE the lock in force — another unlock
+        // delay than the one the rule holds — so it can be completed only while the
+        // rule's lock does not forbid modifying it. A `locked` rule "can't be modified",
+        // and one that has been unlocked but is still inside its unlock delay can be
+        // modified "only after the unlock delay period has expired": in both the lock in
+        // force is one the caller cannot change yet, so the lock request can't be
+        // completed — the same predicate `UpdateRule` and `DeleteRule` refuse on. A
+        // request naming the delay the rule is already serving changes no lock, so it is
+        // not this request: it is the documented re-lock below.
+        if rule.is_lock_protected(now) && !rule.holds_unlock_delay(&input.lock_configuration) {
             return Err(LockRuleErrorModeled::ConflictException(
                 crate::state::rule_state_conflict(
                     crate::state::BlockedAction::Lock,
@@ -237,10 +243,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Locking takes effect at once: the rule holds the requested lock configuration
-        // and its lock state becomes `locked`. Any unlock delay still being served is
-        // cancelled — locking during the unlock delay period returns the rule to
-        // `locked`, and a locked rule has no lock end time left to report.
+        // The rule's lock no longer forbids modifying it — it has never been locked, is
+        // `unlocked`, or is being re-locked under the very delay it is serving — so the
+        // lock request is served. Locking takes effect at once: the rule holds the
+        // requested lock configuration and its lock state becomes `locked`. Any unlock
+        // delay still being served is cancelled — locking during the unlock delay period
+        // returns the rule to `locked`, and a locked rule has no lock end time left to
+        // report.
         rule.lock_configuration = Some(input.lock_configuration);
         rule.lock_state = Some(crate::state::LOCK_STATE_LOCKED.to_string());
         rule.lock_end_time = None;
