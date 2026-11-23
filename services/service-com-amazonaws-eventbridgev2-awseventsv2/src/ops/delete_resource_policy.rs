@@ -206,15 +206,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this delete sees the registry as of now.
         state.settle_lifecycles(now);
 
-        // A delete resolves the whole ARN, identifier segment included: an
-        // identifier this service minted names a bus that is not there, and one
-        // it never handed out names no resource of this service at all.
-        let refusal = state.bus_read_refusal(&input.resource_arn);
-        let Some(bus) = state.event_buses.get_mut(&input.resource_arn) else {
-            return Err(
-                DeleteResourcePolicyErrorModeled::ResourceNotFoundException(refusal).into(),
-            );
-        };
+        // The bus this delete addresses, when the store holds one there. The
+        // delete is addressed at the POLICY, not at the bus: an ARN naming no
+        // bus of this store holds no policy under any name either, which is the
+        // same "nothing to delete" as a bus holding none, so the bus is resolved
+        // only to reach the policy and never refused on its own.
+        let bus = state.event_buses.get_mut(&input.resource_arn);
 
         // The caller's precondition, checked against the revision the store holds
         // right now; a policy that is not there satisfies no precondition at all,
@@ -222,7 +219,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // carrying no precondition deletes unconditionally, which makes deleting
         // a policy that is not there an idempotent success.
         if let Some(expected) = input.expected_revision_id.as_deref() {
-            if !crate::state::revision_matches(bus.resource_policy(policy_name), expected) {
+            let current = bus
+                .as_deref()
+                .and_then(|bus| bus.resource_policy(policy_name));
+            if !crate::state::revision_matches(current, expected) {
                 return Err(DeleteResourcePolicyErrorModeled::ConflictException(
                     crate::state::revision_conflict(),
                 )
@@ -233,7 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The policy leaves the store, and the response reports the revision the
         // store held for it — absent when it held none, since then no policy was
         // deleted.
-        let removed = bus.remove_resource_policy(policy_name);
+        let removed = bus.and_then(|bus| bus.remove_resource_policy(policy_name));
 
         Ok(DeleteResourcePolicyOutput {
             revision_id: removed.map(|policy| policy.revision_id),

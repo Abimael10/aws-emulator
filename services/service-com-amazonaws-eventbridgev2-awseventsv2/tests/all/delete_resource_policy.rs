@@ -5,16 +5,17 @@
 //! RULE: a delete detaches the policy its `ResourceArn` and `PolicyName`
 //! address, answers the revision the store held for it, and leaves the bus
 //! holding nothing under that name, so every later read reports the policy gone;
-//! a delete that finds no such policy removes nothing and answers no revision,
-//! which makes an unconditional delete idempotent. A delete conditioned on
-//! `ExpectedRevisionId` is applied only when that value is the policy's current
-//! revision and is otherwise refused with `ConflictException`, leaving what is
-//! stored untouched; the `NO_POLICY` sentinel is not a value the precondition
-//! can carry and is refused with `InvalidInputException`. A policy name outside
-//! the two the service admits is refused with `InvalidInputException`; the
-//! Resource Access Manager policy is refused to the bus owner with
-//! `AccessDeniedException`; and an ARN that addresses no stored bus with
-//! `ResourceNotFoundException`. Nothing is detached by a refused delete.
+//! a delete that finds no such policy removes nothing and answers no revision —
+//! an ARN naming no bus of this store holds no policy either, so it is answered
+//! the same way — which makes an unconditional delete idempotent. A delete
+//! conditioned on `ExpectedRevisionId` is applied only when that value is the
+//! policy's current revision and is otherwise refused with `ConflictException`,
+//! leaving what is stored untouched; the `NO_POLICY` sentinel is not a value the
+//! precondition can carry and is refused with `InvalidInputException`. A policy
+//! name outside the two the service admits is refused with
+//! `InvalidInputException`, and the Resource Access Manager policy is refused to
+//! the bus owner with `AccessDeniedException`. Nothing is detached by a refused
+//! delete.
 //!
 //! The rows span that class rather than one recorded delete: documents differing
 //! in the shape of their `Statement`, their statement count, their character set
@@ -22,9 +23,11 @@
 //! differing in which revision they name; every policy name the model admits and
 //! several it does not; and ARNs that address no bus of this store.
 //!
-//! Nothing here waits on the wall clock.
+//! Nothing here waits on the wall clock: the one lifecycle span a row needs is
+//! waited out by polling for the condition it owes.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use engine::InMemoryEngine;
 use smithy_server_runtime::{
@@ -34,15 +37,20 @@ use smithy_server_runtime::{
 use service_com_amazonaws_eventbridgev2_awseventsv2 as eventsv2;
 
 use eventsv2::ops::create_event_bus::CreateEventBus;
+use eventsv2::ops::delete_event_bus::DeleteEventBus;
 use eventsv2::ops::delete_resource_policy::{DeleteResourcePolicy, DeleteResourcePolicyError};
+use eventsv2::ops::describe_event_bus::DescribeEventBus;
 use eventsv2::ops::get_resource_policy::{GetResourcePolicy, GetResourcePolicyError};
 use eventsv2::ops::list_resource_policies::{ListResourcePolicies, ListResourcePoliciesError};
 use eventsv2::ops::put_resource_policy::{PutResourcePolicy, PutResourcePolicyError};
 use eventsv2::ops::types::{
-    CreateEventBusInput, DeleteResourcePolicyInput, DeleteResourcePolicyOutput,
-    GetResourcePolicyInput, GetResourcePolicyOutput, ListResourcePoliciesInput,
-    ListResourcePoliciesOutput, PutResourcePolicyInput, PutResourcePolicyOutput,
+    CreateEventBusInput, DeleteEventBusInput, DeleteResourcePolicyInput,
+    DeleteResourcePolicyOutput, DescribeEventBusInput, GetResourcePolicyInput,
+    GetResourcePolicyOutput, ListResourcePoliciesInput, ListResourcePoliciesOutput,
+    PutResourcePolicyInput, PutResourcePolicyOutput,
 };
+
+use crate::modelled_input_refusal::{POLL_DEADLINE, POLL_INTERVAL};
 
 /// The account segment every emulated ARN carries.
 const ACCOUNT: &str = "000000000000";
@@ -140,6 +148,43 @@ impl Harness {
             .unwrap_or_else(|e| panic!("case {case:?}: CreateEventBus must succeed, got {e:?}"))
             .event_bus_arn
             .unwrap_or_else(|| panic!("case {case:?}: CreateEventBus reported no EventBusArn"))
+    }
+
+    /// The bus deleted and gone from the registry: the delete starts the span
+    /// the clock owes its disappearance, and the loop looks again until a read
+    /// no longer resolves it. It waits for that CONDITION rather than for a
+    /// fixed time, and stops as soon as it holds.
+    async fn forget_bus(&self, case: &str, bus: &str) {
+        DeleteEventBus::new(Arc::clone(&self.engine))
+            .handle(
+                DeleteEventBusInput {
+                    event_bus_arn: bus.to_string(),
+                },
+                &self.ctx(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("case {case:?}: DeleteEventBus must succeed, got {e:?}"));
+
+        let deadline = Instant::now() + POLL_DEADLINE;
+        loop {
+            let resolved = DescribeEventBus::new(Arc::clone(&self.engine))
+                .handle(
+                    DescribeEventBusInput {
+                        event_bus_arn: bus.to_string(),
+                    },
+                    &self.ctx(),
+                )
+                .await;
+            if resolved.is_err() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "case {case:?}: the bus {bus:?} must leave the registry, but a read still \
+                 resolves it"
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
     }
 
     async fn put(
@@ -636,57 +681,179 @@ async fn a_delete_admits_only_the_policy_the_bus_owner_writes() {
     );
 }
 
-/// RULE, the resource a delete addresses: a delete resolves the whole
-/// `EventBusArn`, so one that addresses no bus of this store is refused with
-/// `ResourceNotFoundException` rather than answered as an idempotent delete.
+/// RULE, the policy a delete addresses: an unconditional delete reports what it
+/// removed, so every ARN holding no policy under the requested name — a bus this
+/// store holds and one it does not — answers 200 with no `RevisionId` rather
+/// than a refusal.
 #[tokio::test]
-async fn a_delete_addressed_at_no_stored_bus_is_refused() {
+async fn an_unconditional_delete_of_a_policy_that_is_not_there_succeeds() {
     let harness = Harness::new();
 
-    // Each row is a well-formed `EventBusArn` — its pattern is where the id
-    // segment's `[a-z0-9]{25}` comes from — that addresses nothing.
-    let cases: Vec<(&str, String)> = vec![
+    // A bus this store really holds, and one it has held and retired: both are
+    // addressed exactly like the ARNs below, which is what makes the rows about
+    // the POLICY rather than about the shape of the value.
+    let held = harness
+        .bus("a bus this store holds", "policy-delete-present-bus")
+        .await;
+    let retired = harness
+        .bus("a bus this store retired", "policy-delete-retired-bus")
+        .await;
+    let retired_document = account_policy(&retired, ACCOUNT);
+    harness
+        .put_default("the retired bus's policy", &retired, &retired_document)
+        .await;
+    harness
+        .forget_bus("a bus this store retired", &retired)
+        .await;
+
+    // Rows spanning what the rule generalises over: whether the ARN names a bus
+    // of this store at all, and which part of a well-formed `EventBusArn` —
+    // its pattern is where the id segment's `[a-z0-9]{25}` comes from — names
+    // something else. Each names no attached policy.
+    let cases: Vec<(&str, String, Option<&str>)> = vec![
+        ("a bus this store holds, holding no policy", held.clone(), None),
+        (
+            "a bus this store holds, the policy named rather than defaulted",
+            held.clone(),
+            Some(DEFAULT_POLICY),
+        ),
+        (
+            "a bus this store minted and has retired, policy and all",
+            retired.clone(),
+            None,
+        ),
         (
             "an identifier this service never minted",
             format!("arn:aws:events:{REGION}:{ACCOUNT}:event-busv2/absent/aaaaaaaaaaaaaaaaaaaaaaaaa"),
+            None,
         ),
         (
             "a bus of another region",
             format!("arn:aws:events:eu-west-1:{ACCOUNT}:event-busv2/absent/bbbbbbbbbbbbbbbbbbbbbbbbb"),
+            Some(DEFAULT_POLICY),
         ),
         (
             "a bus of another account",
             format!("arn:aws:events:{REGION}:111111111111:event-busv2/absent/ccccccccccccccccccccccccc"),
+            None,
+        ),
+        (
+            "a bus name no create of this store ever used",
+            format!("arn:aws:events:{REGION}:{ACCOUNT}:event-busv2/never-created/ddddddddddddddddddddddddd"),
+            None,
         ),
     ];
 
-    for (case, arn) in cases {
-        let Err(error) = harness
+    for (case, arn, policy_name) in cases {
+        let served = harness
             .delete(DeleteResourcePolicyInput {
                 resource_arn: arn.clone(),
+                policy_name: policy_name.map(str::to_string),
                 ..Default::default()
             })
             .await
-        else {
-            panic!("case {case:?}: deleting on {arn:?} must be refused")
-        };
-        assert_refusal(case, &error, "ResourceNotFoundException", 404);
+            .unwrap_or_else(|e| {
+                panic!("case {case:?}: deleting on {arn:?} must succeed, got {e:?}")
+            });
+        assert_eq!(
+            served.revision_id, None,
+            "case {case:?}: a delete that removed nothing must report no RevisionId, got \
+             {served:?}"
+        );
+
+        // Repeating it answers the same thing: the success says nothing was
+        // there, so nothing about the store changed.
+        let again = harness
+            .delete(DeleteResourcePolicyInput {
+                resource_arn: arn.clone(),
+                policy_name: policy_name.map(str::to_string),
+                ..Default::default()
+            })
+            .await
+            .unwrap_or_else(|e| {
+                panic!("case {case:?}: the repeated delete on {arn:?} must succeed, got {e:?}")
+            });
+        assert_eq!(
+            again.revision_id, None,
+            "case {case:?}: the repeated delete must report no RevisionId, got {again:?}"
+        );
     }
 
-    // The same ARN shape, but naming a bus this store really holds: that one is
-    // served, which is what makes the rows above about the RESOURCE rather than
-    // about the shape of the value.
-    let case = "a bus this store holds";
-    let bus = harness.bus(case, "policy-delete-present-bus").await;
-    let served = harness
+    // The success is about what was attached, not about the ARN: a bus this
+    // store holds WITH a policy still answers the revision it removed.
+    let case = "a policy really attached";
+    let document = account_policy(&held, ACCOUNT);
+    let revision = harness.put_default(case, &held, &document).await;
+    let deleted = harness
         .delete(DeleteResourcePolicyInput {
-            resource_arn: bus.clone(),
+            resource_arn: held.clone(),
             ..Default::default()
         })
         .await
         .unwrap_or_else(|e| panic!("case {case:?}: DeleteResourcePolicy must succeed, got {e:?}"));
     assert_eq!(
-        served.revision_id, None,
-        "case {case:?}: a bus holding no policy must report no RevisionId, got {served:?}"
+        deleted.revision_id.as_deref(),
+        Some(revision.as_str()),
+        "case {case:?}: the delete must report the revision it removed, got {deleted:?}"
     );
+}
+
+/// RULE, the precondition on a policy that is not there: `ExpectedRevisionId`
+/// names a revision that must exist, so a conditional delete addressed where no
+/// policy is attached — an ARN naming no bus of this store included — is the
+/// conflict the member documents, while the sentinel it may not carry stays the
+/// invalid parameter it is.
+#[tokio::test]
+async fn a_conditional_delete_of_a_policy_that_is_not_there_is_refused() {
+    let harness = Harness::new();
+    let held = harness.bus("a bus this store holds", "policy-delete-condition-absent").await;
+    let absent =
+        format!("arn:aws:events:{REGION}:{ACCOUNT}:event-busv2/absent/eeeeeeeeeeeeeeeeeeeeeeeee");
+
+    // Rows differing in whether the ARN names a bus of this store, and in the
+    // precondition the request carries.
+    let cases: Vec<(&str, String, &str, &str, u16)> = vec![
+        (
+            "a bus this store holds, a revision it never minted",
+            held.clone(),
+            "not-a-revision-this-store-minted",
+            "ConflictException",
+            409,
+        ),
+        (
+            "a bus this store holds, the sentinel a delete may not carry",
+            held.clone(),
+            NO_POLICY,
+            "InvalidInputException",
+            400,
+        ),
+        (
+            "no bus of this store, a revision it never minted",
+            absent.clone(),
+            "not-a-revision-this-store-minted",
+            "ConflictException",
+            409,
+        ),
+        (
+            "no bus of this store, the sentinel a delete may not carry",
+            absent.clone(),
+            NO_POLICY,
+            "InvalidInputException",
+            400,
+        ),
+    ];
+
+    for (case, arn, expected, code, status) in cases {
+        let Err(error) = harness
+            .delete(DeleteResourcePolicyInput {
+                resource_arn: arn.clone(),
+                expected_revision_id: Some(expected.to_string()),
+                ..Default::default()
+            })
+            .await
+        else {
+            panic!("case {case:?}: the delete on {arn:?} expecting {expected:?} must be refused")
+        };
+        assert_refusal(case, &error, code, status);
+    }
 }
