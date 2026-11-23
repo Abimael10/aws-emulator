@@ -901,7 +901,7 @@ async fn a_target_that_names_no_cluster_of_this_account_is_an_authorization_refu
     );
 
     // A well-formed cluster ARN of THIS account names a cluster the account could
-    // hold, so it is resolved rather than denied: absent, it is the parameter
+    // hold, so it is resolved rather than denied: absent, it is the not-found
     // refusal; present and ready, the call is served. Nothing was registered by
     // any of the denials above.
     let absent = format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/absent/{GHOST_ID}");
@@ -913,8 +913,8 @@ async fn a_target_that_names_no_cluster_of_this_account_is_an_authorization_refu
         .await;
     assert_eq!(
         (reply.status, reply.error_code()),
-        (400, "BadRequestException"),
-        "case an absent cluster of this account: expected the parameter refusal, got {} {}",
+        (404, "NotFoundException"),
+        "case an absent cluster of this account: expected the not-found refusal, got {} {}",
         reply.status,
         reply.body
     );

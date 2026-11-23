@@ -539,8 +539,9 @@ async fn the_cardinality_gates_answer_before_the_rest_of_the_request() {
         .await;
     assert_eq!(
         (reply.status, reply.at("/invalidParameter").as_str()),
-        (BAD_REQUEST_STATUS, Some("KafkaClusters[1]")),
-        "case an entry that identifies nothing: expected the entry to be blamed, got {} {}",
+        (BAD_REQUEST_STATUS, Some("kafkaClusters")),
+        "case an entry that identifies nothing: expected the member the entries came in to be \
+         blamed, got {} {}",
         reply.status,
         reply.body
     );

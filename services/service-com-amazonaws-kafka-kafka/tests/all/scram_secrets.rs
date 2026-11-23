@@ -545,8 +545,8 @@ async fn a_value_that_is_not_a_secret_arn_is_refused_and_stores_nothing() {
             assert_bad_request(&associated, &case);
             assert_eq!(
                 associated.at("/invalidParameter").as_str(),
-                Some("SecretArnList"),
-                "case {case}: expected the refusal to name SecretArnList, got {}",
+                Some("secretArnList"),
+                "case {case}: expected the refusal to name secretArnList, got {}",
                 associated.body
             );
 
@@ -688,8 +688,8 @@ async fn a_cluster_that_does_not_authenticate_sasl_scram_holds_no_secrets() {
         );
         assert_eq!(
             reply.at("/invalidParameter").as_str(),
-            Some("ClusterArn"),
-            "case {case}: expected the refusal to name ClusterArn, got {}",
+            Some("clusterArn"),
+            "case {case}: expected the refusal to name clusterArn, got {}",
             reply.body
         );
         let stored = listed(&list(&emulator, &cluster, "").await, case);

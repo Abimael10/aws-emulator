@@ -248,7 +248,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ) {
                 return Err(UpdateReplicationInfoErrorModeled::BadRequestException(
                     BadRequestException {
-                        invalid_parameter: Some(format!("TopicReplication.{}", reason.member)),
+                        invalid_parameter: Some(reason.member.to_string()),
                         message: Some(reason.message),
                     },
                 )
@@ -287,18 +287,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(replicator) =
             state.settled_replicator_in(&region, &input.replicator_arn, now)
         else {
-            return Err(
-                UpdateReplicationInfoErrorModeled::NotFoundException(NotFoundException {
-                    invalid_parameter: Some(crate::state::REPLICATOR_ARN_MEMBER.to_string()),
-                    // The refusal names the input member that resolved to nothing
-                    // and says nothing about this endpoint's own state — the same
-                    // form every replicator operation resolves an ARN with.
-                    message: Some(crate::state::parameter_not_found_message(
-                        crate::state::REPLICATOR_ARN_MEMBER,
-                    )),
-                })
-                .into(),
-            );
+            // The two absences the replicator surface tells apart, as the reader
+            // and the delete answer them: a reference this endpoint could not act
+            // on — another Region's ARN, or one this Region held and released — is
+            // reported as a fault of the parameter that carries it, while an ARN
+            // of this Region that was never minted is the plain not-found.
+            let at_fault =
+                crate::state::replicator_reference_at_fault(&state, &region, &input.replicator_arn);
+            return Err(UpdateReplicationInfoErrorModeled::NotFoundException(
+                crate::state::replicator_resolves_to_nothing(at_fault),
+            )
+            .into());
         };
         // A quoted version must be the one the replicator is actually at; a stale
         // one means the caller is changing a configuration it has not seen the

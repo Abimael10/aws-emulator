@@ -159,8 +159,8 @@ fn assert_refused_with(reply: &Reply, case: &str, expected: &str) {
     );
     assert_eq!(
         reply.at("/invalidParameter").as_str(),
-        Some("ClusterArn"),
-        "case {case}: expected the refusal to name ClusterArn, got {}",
+        Some("clusterArn"),
+        "case {case}: expected the refusal to name clusterArn, got {}",
         reply.body
     );
 }

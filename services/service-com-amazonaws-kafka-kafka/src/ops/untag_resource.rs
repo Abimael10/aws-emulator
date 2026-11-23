@@ -179,7 +179,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         // Resolved exactly as `TagResource` resolves it, through the one shared
-        // lookup, so the two operations answer the same ARN the same way.
+        // lookup, and refused in the same two ways: a `ResourceArn` this service
+        // cannot accept as the ARN of a resource it TAGS is the caller's own
+        // input to fix, while a well-formed ARN of a taggable kind that names
+        // nothing this region holds is the modelled miss.
         let tags = match state.resource_tags_mut_in(
             &region,
             &input.resource_arn,
@@ -187,16 +190,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             Ok(tags) => tags,
             Err(crate::state::TagTargetRejected::NotAnArn) => {
-                return Err(
-                    UntagResourceErrorModeled::BadRequestException(BadRequestException {
-                        invalid_parameter: Some("ResourceArn".to_string()),
-                        message: Some(format!(
-                            "{} is not a valid Amazon MSK resource ARN.",
-                            input.resource_arn
-                        )),
-                    })
-                    .into(),
-                );
+                return Err(UntagResourceErrorModeled::BadRequestException(
+                    crate::state::invalid_tag_resource_arn(),
+                )
+                .into());
             }
             Err(crate::state::TagTargetRejected::NoSuchResource) => {
                 return Err(
@@ -226,7 +223,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(
                 UntagResourceErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some("TagKeys".to_string()),
+                    invalid_parameter: Some("tagKeys".to_string()),
                     message: Some(reason),
                 })
                 .into(),

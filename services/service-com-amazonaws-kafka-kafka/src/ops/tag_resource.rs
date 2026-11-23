@@ -175,9 +175,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let mut state = state.lock();
 
-        // The resource is resolved first: a tagging call against an ARN this
-        // region holds nothing for is refused as a miss whatever its tag map
-        // contains.
+        // The resource is resolved first: a tag write against an ARN this
+        // endpoint cannot act on is refused whatever its tag map contains.
+        //
+        // A `ResourceArn` this service cannot accept as the ARN of a resource it
+        // TAGS is the caller's own input to fix, in the service's fixed sentence
+        // for one ([`crate::state::invalid_tag_resource_arn`]): unparseable, not
+        // shaped like the kind it names, or naming a kind no API of this service
+        // gives a `Tags` member. A well-formed ARN of a taggable kind that names
+        // nothing this region holds is the different, modelled miss — a resource
+        // that may yet appear.
         let tags = match state.resource_tags_mut_in(
             &region,
             &input.resource_arn,
@@ -185,16 +192,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             Ok(tags) => tags,
             Err(crate::state::TagTargetRejected::NotAnArn) => {
-                return Err(
-                    TagResourceErrorModeled::BadRequestException(BadRequestException {
-                        invalid_parameter: Some("ResourceArn".to_string()),
-                        message: Some(format!(
-                            "{} is not a valid Amazon MSK resource ARN.",
-                            input.resource_arn
-                        )),
-                    })
-                    .into(),
-                );
+                return Err(TagResourceErrorModeled::BadRequestException(
+                    crate::state::invalid_tag_resource_arn(),
+                )
+                .into());
             }
             Err(crate::state::TagTargetRejected::NoSuchResource) => {
                 return Err(
@@ -220,7 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(
                 TagResourceErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some("Tags".to_string()),
+                    invalid_parameter: Some("tags".to_string()),
                     message: Some(reason),
                 })
                 .into(),

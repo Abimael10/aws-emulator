@@ -255,10 +255,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             std::time::SystemTime::now(),
         ) else {
             return Err(
-                ListNodesErrorModeled::NotFoundException(NotFoundException {
-                    invalid_parameter: Some("ClusterArn".to_string()),
-                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
-                })
+                ListNodesErrorModeled::NotFoundException(crate::state::resource_not_found(
+                    crate::state::CLUSTER_ARN_MEMBER,
+                ))
                 .into(),
             );
         };

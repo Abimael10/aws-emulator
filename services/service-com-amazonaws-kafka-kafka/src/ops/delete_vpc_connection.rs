@@ -163,7 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !crate::state::is_vpc_connection_arn(&input.arn) {
             return Err(
                 DeleteVpcConnectionErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some("Arn".to_string()),
+                    invalid_parameter: Some(crate::state::VPC_CONNECTION_ARN_MEMBER.to_string()),
                     message: Some(crate::state::BAD_REQUEST_MESSAGE.to_string()),
                 })
                 .into(),
@@ -176,7 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(
                 DeleteVpcConnectionErrorModeled::NotFoundException(NotFoundException {
-                    invalid_parameter: Some("Arn".to_string()),
+                    invalid_parameter: Some(crate::state::VPC_CONNECTION_ARN_MEMBER.to_string()),
                     message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 })
                 .into(),

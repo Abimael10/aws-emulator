@@ -453,7 +453,7 @@ async fn a_vpc_connection_is_refused_resources_of_another_vpc() {
                 &foreign.subnets,
                 std::slice::from_ref(&home.group),
             ),
-            parameter: "ClientSubnets",
+            parameter: "clientSubnets",
             message: subnet_outside_vpc(&foreign.subnets[0], &home.vpc),
         },
         RefusalRow {
@@ -468,7 +468,7 @@ async fn a_vpc_connection_is_refused_resources_of_another_vpc() {
                 ],
                 std::slice::from_ref(&home.group),
             ),
-            parameter: "ClientSubnets",
+            parameter: "clientSubnets",
             message: subnet_outside_vpc(&foreign.subnets[1], &home.vpc),
         },
         RefusalRow {
@@ -483,7 +483,7 @@ async fn a_vpc_connection_is_refused_resources_of_another_vpc() {
                 ],
                 std::slice::from_ref(&home.group),
             ),
-            parameter: "ClientSubnets",
+            parameter: "clientSubnets",
             message: subnet_outside_vpc(&foreign.subnets[0], &home.vpc),
         },
         RefusalRow {
@@ -494,7 +494,7 @@ async fn a_vpc_connection_is_refused_resources_of_another_vpc() {
                 &home.subnets,
                 std::slice::from_ref(&foreign.group),
             ),
-            parameter: "ClientSubnets",
+            parameter: "clientSubnets",
             message: subnet_outside_vpc(&home.subnets[0], &foreign.vpc),
         },
         RefusalRow {
@@ -505,7 +505,7 @@ async fn a_vpc_connection_is_refused_resources_of_another_vpc() {
                 &home.subnets,
                 std::slice::from_ref(&foreign.group),
             ),
-            parameter: "SecurityGroups",
+            parameter: "securityGroups",
             message: group_outside_vpc(&foreign.group, &home.vpc),
         },
         RefusalRow {
@@ -516,7 +516,7 @@ async fn a_vpc_connection_is_refused_resources_of_another_vpc() {
                 &home.subnets,
                 &[home.group.clone(), foreign.group.clone()],
             ),
-            parameter: "SecurityGroups",
+            parameter: "securityGroups",
             message: group_outside_vpc(&foreign.group, &home.vpc),
         },
     ];

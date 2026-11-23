@@ -713,7 +713,7 @@ async fn msk_placement_subnets_resolve_against_ec2() {
             // As many subnets as the target cluster is placed in, so what refuses this is
             // the id EC2 does not hold rather than the placement's cardinality.
             body: connection_body(&provisioned, &network.vpc, &unknown_first),
-            parameter: "ClientSubnets",
+            parameter: "clientSubnets",
             cluster_name: None,
             // `CreateVpcConnection` reads the SHAPE of each id it is given itself, so a
             // value that is no subnet id at all never reaches the resolution gate: that

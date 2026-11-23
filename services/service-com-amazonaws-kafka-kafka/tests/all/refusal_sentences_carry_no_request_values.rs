@@ -328,12 +328,12 @@ impl Pattern {
         }
     }
 
-    /// The `TopicReplication` member the refusal names.
+    /// The `TopicReplication` member the refusal names, by its wire name.
     fn member(&self) -> &'static str {
         if self.exclude {
-            "TopicsToExclude"
+            "topicsToExclude"
         } else {
-            "TopicsToReplicate"
+            "topicsToReplicate"
         }
     }
 }
@@ -405,9 +405,7 @@ async fn an_invalid_topic_pattern_is_refused_with_the_pattern_quoted_in_the_sent
                 400,
                 "BadRequestException",
                 expected.as_str(),
-                Some(
-                    format!("ReplicationInfoList[0].TopicReplication.{}", row.member()).as_str()
-                ),
+                Some(row.member()),
             ),
             "case CreateReplicator/{case}: expected {expected:?}, got {} {}",
             refused.status,
@@ -498,7 +496,7 @@ async fn an_invalid_topic_pattern_is_refused_with_the_pattern_quoted_in_the_sent
                 400,
                 "BadRequestException",
                 expected.as_str(),
-                Some(format!("TopicReplication.{}", row.member()).as_str()),
+                Some(row.member()),
             ),
             "case UpdateReplicationInfo/{case}: expected {expected:?}, got {} {}",
             refused.status,

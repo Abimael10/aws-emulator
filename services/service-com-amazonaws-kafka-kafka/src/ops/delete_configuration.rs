@@ -242,7 +242,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !holders.is_empty() {
             return Err(
                 DeleteConfigurationErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some("Arn".to_string()),
+                    invalid_parameter: Some(
+                        crate::state::configuration_arn::CONFIGURATION_ARN_MEMBER.to_string(),
+                    ),
                     message: Some(crate::state::CONFIGURATION_IN_USE_MESSAGE.to_string()),
                 })
                 .into(),

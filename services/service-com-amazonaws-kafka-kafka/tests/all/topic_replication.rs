@@ -992,28 +992,29 @@ async fn a_pattern_list_that_selects_no_topics_is_refused() {
     // Each row is a pattern list the service could not select topics by: an
     // unparsable regular expression in either member, a pattern longer than the
     // model's member allows, or more patterns than one flow may carry. `member` is
-    // the `TopicReplication` member the refusal must name, or `None` where the
+    // the `TopicReplication` member the refusal must name, by its wire name, or
+    // `None` where the
     // refusal is the modelled constraint on the member itself.
     let rows: Vec<(&str, Value, Option<&str>)> = vec![
         (
             "an unclosed character class",
             json!({ "topicsToReplicate": ["orders[", ".*"] }),
-            Some("TopicsToReplicate"),
+            Some("topicsToReplicate"),
         ),
         (
             "an unclosed group",
             json!({ "topicsToReplicate": ["(orders"] }),
-            Some("TopicsToReplicate"),
+            Some("topicsToReplicate"),
         ),
         (
             "an unparsable exclusion",
             json!({ "topicsToReplicate": [".*"], "topicsToExclude": ["*"] }),
-            Some("TopicsToExclude"),
+            Some("topicsToExclude"),
         ),
         (
             "more patterns than a flow may carry",
             json!({ "topicsToReplicate": too_many }),
-            Some("TopicsToReplicate"),
+            Some("topicsToReplicate"),
         ),
         (
             "a pattern one character past the model's length",
@@ -1045,12 +1046,10 @@ async fn a_pattern_list_that_selects_no_topics_is_refused() {
         );
         match member {
             Some(member) => {
-                let expected_member =
-                    format!("ReplicationInfoList[0].TopicReplication.{member}");
                 assert_eq!(
                     reply.at("/invalidParameter").as_str().unwrap_or_default(),
-                    expected_member,
-                    "case {case}: expected the refusal to name {expected_member}, got {}",
+                    member,
+                    "case {case}: expected the refusal to name {member}, got {}",
                     reply.body
                 );
             }
@@ -1103,7 +1102,7 @@ async fn a_pattern_list_that_selects_no_topics_is_refused() {
     );
     assert_eq!(
         refused.at("/invalidParameter").as_str().unwrap_or_default(),
-        "TopicReplication.TopicsToReplicate",
+        "topicsToReplicate",
         "case an unparsable pattern in an update: expected the refusal to name the member, got {}",
         refused.body
     );

@@ -507,11 +507,13 @@ async fn create_refuses_a_request_it_cannot_act_on() {
     let elsewhere = emulator.vpc_connection_target_in("eu-west-1", "other-region").await;
     let valid = ConnectionRequest::to(&target);
 
-    // Rows: one per way a request can be unusable, plus the shapes that must
+    // Rows: one per way a request can be unusable, with the HTTP status the
+    // service answers it (400 for a body member it cannot act on, 404 for a
+    // target cluster this endpoint holds none of), plus the shapes that must
     // still be ACCEPTED (both published EC2 id lengths, every authentication
     // type) so the refusal is not merely a blanket no.
-    let mut rows: Vec<(ConnectionRequest, bool)> = vec![
-        (valid.clone(), true),
+    let mut rows: Vec<(ConnectionRequest, u16)> = vec![
+        (valid.clone(), 200),
         (
             ConnectionRequest {
                 vpc_id: "vpc-0123456789abcdef0",
@@ -523,7 +525,7 @@ async fn create_refuses_a_request_it_cannot_act_on() {
                 security_groups: vec!["sg-0123456789abcdef0"],
                 ..valid.clone()
             },
-            true,
+            200,
         ),
         // An authentication type outside the published set, in each way it can
         // miss: unknown, wrong case, empty.
@@ -532,21 +534,21 @@ async fn create_refuses_a_request_it_cannot_act_on() {
                 authentication: "SASL",
                 ..valid.clone()
             },
-            false,
+            400,
         ),
         (
             ConnectionRequest {
                 authentication: "sasl_iam",
                 ..valid.clone()
             },
-            false,
+            400,
         ),
         (
             ConnectionRequest {
                 authentication: "",
                 ..valid.clone()
             },
-            false,
+            400,
         ),
         // EC2 ids: one digit short, one long, non-hex, upper case, no suffix,
         // and no prefix at all.
@@ -555,73 +557,75 @@ async fn create_refuses_a_request_it_cannot_act_on() {
                 vpc_id: "vpc-0a1b2c3",
                 ..valid.clone()
             },
-            false,
+            400,
         ),
         (
             ConnectionRequest {
                 vpc_id: "vpc-0a1b2c3d4",
                 ..valid.clone()
             },
-            false,
+            400,
         ),
         (
             ConnectionRequest {
                 vpc_id: "vpc-0a1b2c3g",
                 ..valid.clone()
             },
-            false,
+            400,
         ),
         (
             ConnectionRequest {
                 vpc_id: "vpc-0A1B2C3D",
                 ..valid.clone()
             },
-            false,
+            400,
         ),
         (
             ConnectionRequest {
                 vpc_id: "vpc-",
                 ..valid.clone()
             },
-            false,
+            400,
         ),
         (
             ConnectionRequest {
                 vpc_id: "0a1b2c3d",
                 ..valid.clone()
             },
-            false,
+            400,
         ),
         (
             ConnectionRequest {
                 client_subnets: vec!["subnet-0a1b2c3d", "sg-0a1b2c3d"],
                 ..valid.clone()
             },
-            false,
+            400,
         ),
         (
             ConnectionRequest {
                 client_subnets: Vec::new(),
                 ..valid.clone()
             },
-            false,
+            400,
         ),
         (
             ConnectionRequest {
                 security_groups: vec!["0a1b2c3d"],
                 ..valid.clone()
             },
-            false,
+            400,
         ),
         (
             ConnectionRequest {
                 security_groups: Vec::new(),
                 ..valid.clone()
             },
-            false,
+            400,
         ),
         // Target cluster: a well-formed cluster ARN nothing holds, and a live
-        // cluster belonging to ANOTHER region. A value that is not a cluster ARN
+        // cluster belonging to ANOTHER region. Neither resolves to a cluster of
+        // this endpoint, so each is the service's NOT-FOUND refusal rather than a
+        // complaint about the body. A value that is not a cluster ARN
         // at all never reaches this validation — the authorization decision over
         // the resource the request names answers it first
         // (`vpc_connection_admission.rs`).
@@ -632,14 +636,14 @@ async fn create_refuses_a_request_it_cannot_act_on() {
                 ),
                 ..valid.clone()
             },
-            false,
+            404,
         ),
         (
             ConnectionRequest {
                 target_cluster_arn: elsewhere.clone(),
                 ..valid.clone()
             },
-            false,
+            404,
         ),
     ];
     for authentication in VPC_CONNECTION_AUTHENTICATION_TYPES {
@@ -648,14 +652,14 @@ async fn create_refuses_a_request_it_cannot_act_on() {
                 authentication,
                 ..valid.clone()
             },
-            true,
+            200,
         ));
     }
 
     let mut accepted = Vec::new();
-    for (request, is_accepted) in &rows {
+    for (request, expected_status) in &rows {
         let reply = emulator.create_vpc_connection(request).await;
-        if *is_accepted {
+        if *expected_status == 200 {
             assert_eq!(
                 reply.status, 200,
                 "case {request:?}: expected the create to succeed, got {} {}",
@@ -669,10 +673,18 @@ async fn create_refuses_a_request_it_cannot_act_on() {
             );
             continue;
         }
+        // The code goes with the status: a body member the service cannot act on
+        // is its `BadRequestException`, a target cluster this endpoint holds none
+        // of is its `NotFoundException`.
+        let expected_code = if *expected_status == 404 {
+            "NotFoundException"
+        } else {
+            "BadRequestException"
+        };
         assert_eq!(
             (reply.status, reply.error_code()),
-            (400, "BadRequestException"),
-            "case {request:?}: expected a 400 BadRequestException, got {} {}",
+            (*expected_status, expected_code),
+            "case {request:?}: expected a {expected_status} {expected_code}, got {} {}",
             reply.status,
             reply.body
         );

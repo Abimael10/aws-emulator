@@ -188,10 +188,11 @@ fn name_conflict() -> CreateReplicatorError {
 
 /// The refusal a `ReplicationInfoList` entry that does not name one end of its
 /// replication earns: HTTP 400 `BadRequestException` carrying that end's fixed
-/// sentence, naming the entry it came in as the invalid parameter.
-fn unnamed_end_refusal(index: usize, message: String) -> CreateReplicatorError {
+/// sentence, naming the member the entries came in — by its wire name, which is
+/// how this service names the parameter at fault.
+fn unnamed_end_refusal(message: String) -> CreateReplicatorError {
     CreateReplicatorErrorModeled::BadRequestException(BadRequestException {
-        invalid_parameter: Some(format!("ReplicationInfoList[{index}]")),
+        invalid_parameter: Some("replicationInfoList".to_string()),
         message: Some(message),
     })
     .into()
@@ -276,7 +277,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.replication_info_list.len() > crate::state::MAX_FLOWS_PER_REPLICATOR {
             return Err(
                 CreateReplicatorErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some("ReplicationInfoList".to_string()),
+                    invalid_parameter: Some("replicationInfoList".to_string()),
                     message: Some(format!(
                         "ReplicationInfoList may hold at most {} entries, not {}.",
                         crate::state::MAX_FLOWS_PER_REPLICATOR,
@@ -303,7 +304,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(
                 CreateReplicatorErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some("Tags".to_string()),
+                    invalid_parameter: Some("tags".to_string()),
                     message: Some(reason),
                 })
                 .into(),
@@ -314,11 +315,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Apache Kafka one identifies no cluster at all, so it has no alias to
         // prefix replicated topic names with and no replication can be set up
         // against it.
-        for (index, cluster) in input.kafka_clusters.iter().enumerate() {
+        for cluster in &input.kafka_clusters {
             if crate::state::kafka_cluster_alias(cluster).is_none() {
                 return Err(CreateReplicatorErrorModeled::BadRequestException(
                     BadRequestException {
-                        invalid_parameter: Some(format!("KafkaClusters[{index}]")),
+                        invalid_parameter: Some("kafkaClusters".to_string()),
                         message: Some(
                             "Each Kafka cluster must be identified, by an Amazon MSK cluster \
                              ARN or by an Apache Kafka cluster id."
@@ -374,7 +375,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        for (index, info) in input.replication_info_list.iter().enumerate() {
+        for info in &input.replication_info_list {
             // Each end of a flow is named EXACTLY once, by its Amazon MSK cluster
             // ARN or by its Apache Kafka cluster id, and resolves to the alias
             // every reader of a replicator reports it under — the same rule, in
@@ -390,7 +391,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // named the cluster — so the entry they came in is what the
                 // refusal names. The source end is settled first, so an entry
                 // that names neither end is answered about the source.
-                Err(message) => return Err(unnamed_end_refusal(index, message)),
+                Err(message) => return Err(unnamed_end_refusal(message)),
             };
             let target = match crate::state::replication_end_alias(
                 crate::state::TARGET_REPLICATION_END,
@@ -398,7 +399,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 info.target_kafka_cluster_id.as_deref(),
             ) {
                 Ok(alias) => alias,
-                Err(message) => return Err(unnamed_end_refusal(index, message)),
+                Err(message) => return Err(unnamed_end_refusal(message)),
             };
             // The two ends of a flow are two clusters, so a flow whose ends
             // resolve to one cluster names it twice — the same condition the
@@ -407,7 +408,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if source == target {
                 return Err(CreateReplicatorErrorModeled::BadRequestException(
                     BadRequestException {
-                        invalid_parameter: Some(format!("ReplicationInfoList[{index}]")),
+                        invalid_parameter: Some("kafkaClusters".to_string()),
                         message: Some(
                             crate::state::DUPLICATE_KAFKA_CLUSTERS_MESSAGE.to_string(),
                         ),
@@ -428,10 +429,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ) {
                 return Err(CreateReplicatorErrorModeled::BadRequestException(
                     BadRequestException {
-                        invalid_parameter: Some(format!(
-                            "ReplicationInfoList[{index}].TopicReplication.{}",
-                            reason.member
-                        )),
+                        // The member at fault, by its wire name: the pattern
+                        // list is what the service could not read, and the
+                        // refusal names it as the API spells it.
+                        invalid_parameter: Some(reason.member.to_string()),
                         message: Some(reason.message),
                     },
                 )

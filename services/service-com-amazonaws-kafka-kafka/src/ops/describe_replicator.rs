@@ -210,19 +210,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 std::time::SystemTime::now(),
             );
             let Some(settled) = settled else {
-                return Err(
-                    DescribeReplicatorErrorModeled::NotFoundException(NotFoundException {
-                        invalid_parameter: Some(crate::state::REPLICATOR_ARN_MEMBER.to_string()),
-                        // The refusal names the input member that resolved to
-                        // nothing and says nothing about this endpoint's own
-                        // state: which region looked, and what it holds, is not
-                        // the caller's business and not part of the refusal.
-                        message: Some(crate::state::parameter_not_found_message(
-                            crate::state::REPLICATOR_ARN_MEMBER,
-                        )),
-                    })
-                    .into(),
+                // The two absences the registry tells apart: a replicator this
+                // region HELD and released is reported as a fault of the
+                // parameter that still names it, one it never minted with the
+                // service's fixed sentence alone. Both name the input member in
+                // `invalidParameter`, and neither says anything about this
+                // endpoint's own state — which region looked, and what it holds,
+                // is not part of the refusal.
+                let at_fault = crate::state::replicator_reference_at_fault(
+                    &state,
+                    &region,
+                    &input.replicator_arn,
                 );
+                return Err(DescribeReplicatorErrorModeled::NotFoundException(
+                    crate::state::replicator_resolves_to_nothing(at_fault),
+                )
+                .into());
             };
             settled.clone()
         };

@@ -510,13 +510,15 @@ impl ComAmazonawsKafkaKafkaState {
                 .replicator_in(region, arn)
                 .map(|replicator| &replicator.tags)
                 .ok_or(TagTargetRejected::NoSuchResource),
-            // Another MSK resource type: a well-formed ARN of a kind no
-            // registry here carries a tag set for yet — the creates that accept
-            // `Tags` for them (`CreateConfiguration`, `CreateVpcConnection`, …)
-            // are still scaffolds — so this region holds no such taggable
-            // resource. That is a miss, not a malformed request, and this arm is
-            // the one place to extend when one of those registries starts
-            // storing tags.
+            VPC_CONNECTION_RESOURCE_TYPE => self
+                .vpc_connection_in(region, arn)
+                .map(|connection| &connection.tags)
+                .ok_or(TagTargetRejected::NoSuchResource),
+            // Unreachable: `resource_type_of_arn` admits only the kinds this
+            // service tags, each of which has an arm above. A kind it does not
+            // tag never reaches here — it is the input refusal
+            // ([`TagTargetRejected::NotAnArn`]) — so this arm is a backstop
+            // rather than an answer anybody can be given.
             _ => Err(TagTargetRejected::NoSuchResource),
         }
     }
@@ -542,6 +544,13 @@ impl ComAmazonawsKafkaKafkaState {
                 .replicator_mut_in(region, arn)
                 .map(|replicator| &mut replicator.tags)
                 .ok_or(TagTargetRejected::NoSuchResource),
+            VPC_CONNECTION_RESOURCE_TYPE => self
+                .vpc_connections
+                .get_mut(arn)
+                .filter(|connection| connection.region == region)
+                .map(|connection| &mut connection.tags)
+                .ok_or(TagTargetRejected::NoSuchResource),
+            // Unreachable, for the reason the reader above gives.
             _ => Err(TagTargetRejected::NoSuchResource),
         }
     }
@@ -1293,7 +1302,9 @@ impl ComAmazonawsKafkaKafkaState {
     }
 
     /// Remove the replicator `arn` names from every index, handing it back. The
-    /// one removal path, for the same reason.
+    /// one removal path, for the same reason — and the one place a release is
+    /// remembered ([`Self::replicator_was_held`]), so a reference to a replicator
+    /// this registry knew and let go is never answered as one it never minted.
     pub fn unregister_replicator(&mut self, arn: &str) -> Option<Replicator> {
         let replicator = self.replicators.remove(arn)?;
         self.replicator_arn_by_name
@@ -1306,7 +1317,22 @@ impl ComAmazonawsKafkaKafkaState {
                 }
             }
         }
+        self.released_replicators.remember(&replicator.region, arn);
         Some(replicator)
+    }
+
+    /// Whether this registry once held the replicator `arn` names in `region` and
+    /// holds it no longer.
+    ///
+    /// A replicator operation that cannot resolve its ARN asks this to tell the
+    /// two absences apart, the way the channel surface does
+    /// ([`Self::channel_was_held`]): a replicator this region held and released
+    /// is a resource of the service's own that is gone, while an ARN it never
+    /// minted is a reference the request got wrong, and the replicator APIs word
+    /// the two differently. The record it reads is bounded and Region-scoped by
+    /// [`replicator_releases::ReleasedReplicators`].
+    pub fn replicator_was_held(&self, region: &str, arn: &str) -> bool {
+        self.released_replicators.was_held(region, arn)
     }
 
     /// Every topic the cluster `cluster_arn` names reports to a reader at `now`:

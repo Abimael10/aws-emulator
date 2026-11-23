@@ -253,13 +253,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.cluster_arn,
             std::time::SystemTime::now(),
         ) else {
-            return Err(
-                ListScramSecretsErrorModeled::NotFoundException(NotFoundException {
-                    invalid_parameter: Some("ClusterArn".to_string()),
-                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
-                })
-                .into(),
-            );
+            return Err(ListScramSecretsErrorModeled::NotFoundException(
+                crate::state::resource_not_found(crate::state::CLUSTER_ARN_MEMBER),
+            )
+            .into());
         };
 
         // A cluster's SCRAM secrets are credentials its brokers authenticate
@@ -269,7 +266,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !crate::state::scram_secrets_served_from_cluster_state(&cluster.state) {
             return Err(
                 ListScramSecretsErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some("ClusterArn".to_string()),
+                    invalid_parameter: Some(crate::state::CLUSTER_ARN_MEMBER.to_string()),
                     message: Some(crate::state::invalid_cluster_state_for_scram_message(
                         crate::state::SCRAM_SECRET_ACTION_LIST,
                     )),

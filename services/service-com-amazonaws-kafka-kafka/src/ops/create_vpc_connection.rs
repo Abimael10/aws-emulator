@@ -101,6 +101,9 @@
 //! * `ServiceUnavailableException` (HTTP 503) — Returns information about an error.
 //! * `TooManyRequestsException` (HTTP 429) — Returns information about an error.
 //! * `UnauthorizedException` (HTTP 401) — Returns information about an error.
+//! * `NotFoundException` (HTTP 404) — widened in through `extra_errors` (see below): the
+//!   refusal a `TargetClusterArn` that resolves to no cluster of this endpoint earns,
+//!   which this operation's own `errors` list omits.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -116,12 +119,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-kafka-kafka.json");
 // here — hence the `CreateVpcConnectionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.kafka#CreateVpcConnection")]
+// `NotFoundException` is widened in through `extra_errors`: `TargetClusterArn` is a
+// reference to a cluster this endpoint may not hold, and this SERVICE models the shape
+// for exactly that case (`com.amazonaws.kafka#NotFoundException`, HTTP 404) — it is
+// simply not listed on this operation, and the service answers the code whatever its
+// published model lists.
+#[smithy_macros::operation_error(
+    "com.amazonaws.kafka#CreateVpcConnection",
+    extra_errors = ["NotFoundException"]
+)]
 #[derive(Debug)]
 pub enum CreateVpcConnectionErrorModeled {
     BadRequestException(BadRequestException),
     ForbiddenException(ForbiddenException),
     InternalServerErrorException(InternalServerErrorException),
+    NotFoundException(NotFoundException),
     ServiceUnavailableException(ServiceUnavailableException),
     TooManyRequestsException(TooManyRequestsException),
     UnauthorizedException(UnauthorizedException),
@@ -204,6 +216,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = std::time::SystemTime::now();
 
+        // A value that is not shaped like an MSK cluster ARN names no cluster at
+        // all, so it is a request this service cannot read rather than a resource
+        // that is not there: the line every cluster-scoped operation of this
+        // service draws between its 400 and its 404, drawn here too and before
+        // anything is resolved.
+        if !crate::state::is_cluster_arn(&input.target_cluster_arn) {
+            return Err(bad_request(
+                crate::state::TARGET_CLUSTER_ARN_MEMBER,
+                crate::state::UNRESOLVED_REFERENCE_MESSAGE.to_string(),
+            ));
+        }
+
         // The TARGET CLUSTER is what decides whether a VPC connection can be made
         // at all, so it is resolved and asked BEFORE the rest of the body is
         // validated: a caller that wired up private connectivity before the
@@ -224,14 +248,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // whether or not anybody called.
             let Some(cluster) = state.settled_cluster_in(&region, &input.target_cluster_arn, now)
             else {
-                // `CreateVpcConnection` models no `NotFoundException`, so a
-                // reference this endpoint cannot resolve is refused as a bad
-                // parameter, in the service's one fixed sentence for one — which
-                // carries nothing of the request.
-                return Err(bad_request(
-                    crate::state::TARGET_CLUSTER_ARN_MEMBER,
-                    crate::state::UNRESOLVED_REFERENCE_MESSAGE.to_string(),
-                ));
+                // A reference this endpoint resolves no cluster for is a
+                // resource that is not there, not a request that cannot be
+                // read: the create is refused as a not-found, in the service's
+                // one fixed sentence for one, blaming the cluster the request
+                // asked to be connected to. The shape is widened in through
+                // `extra_errors` above, since this operation's own model does
+                // not list it.
+                return Err(cluster_not_found());
             };
             cluster_admits_connection(
                 &*self.engine,
@@ -248,13 +272,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // anything is minted.
         if !crate::state::is_ec2_resource_id("vpc", &input.vpc_id) {
             return Err(bad_request(
-                "VpcId",
+                "vpcId",
                 format!("'{}' is not a valid VPC id.", input.vpc_id),
             ));
         }
         if input.client_subnets.is_empty() {
             return Err(bad_request(
-                "ClientSubnets",
+                "clientSubnets",
                 "ClientSubnets must name at least one subnet.".to_string(),
             ));
         }
@@ -264,13 +288,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .find(|subnet| !crate::state::is_ec2_resource_id("subnet", subnet))
         {
             return Err(bad_request(
-                "ClientSubnets",
+                "clientSubnets",
                 format!("'{subnet}' is not a valid subnet id."),
             ));
         }
         if input.security_groups.is_empty() {
             return Err(bad_request(
-                "SecurityGroups",
+                "securityGroups",
                 "SecurityGroups must name at least one security group.".to_string(),
             ));
         }
@@ -280,7 +304,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .find(|group| !crate::state::is_ec2_resource_id("sg", group))
         {
             return Err(bad_request(
-                "SecurityGroups",
+                "securityGroups",
                 format!("'{group}' is not a valid security group id."),
             ));
         }
@@ -295,7 +319,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::network::placement_subnet_refusal(ctx, &region, &input.client_subnets)
                 .await
         {
-            return Err(bad_request("ClientSubnets", reason));
+            return Err(bad_request("clientSubnets", reason));
         }
 
         // And the VPC those subnets and security groups belong to: a VPC connection's
@@ -313,7 +337,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .await
         {
-            return Err(bad_request("ClientSubnets", reason));
+            return Err(bad_request("clientSubnets", reason));
         }
         if let Some(reason) = crate::state::network::security_group_outside_vpc_refusal(
             ctx,
@@ -323,7 +347,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .await
         {
-            return Err(bad_request("SecurityGroups", reason));
+            return Err(bad_request("securityGroups", reason));
         }
 
         let mut state = state.lock();
@@ -342,12 +366,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.authentication,
                 &input.client_subnets,
             )?,
-            None => {
-                return Err(bad_request(
-                    crate::state::TARGET_CLUSTER_ARN_MEMBER,
-                    crate::state::UNRESOLVED_REFERENCE_MESSAGE.to_string(),
-                ))
-            }
+            None => return Err(cluster_not_found()),
         }
 
         // The monotonic counter is what makes each connection's ARN distinct; it
@@ -428,6 +447,22 @@ fn bad_request(parameter: &str, message: String) -> CreateVpcConnectionError {
     .into()
 }
 
+/// The refusal a create whose `TargetClusterArn` resolves to no cluster of this
+/// endpoint earns: the service's `NotFoundException` (HTTP 404), carrying its one
+/// fixed sentence for a resource it does not hold and blaming the cluster the
+/// request named — reported as the CLUSTER's own ARN member, which is what the
+/// service calls the parameter at fault here, and which is the same thing every
+/// cluster-scoped operation tells a caller about a cluster that is not there.
+///
+/// Built in one place, so the lookup before the body is validated and the one
+/// under the lock the connection is registered with cannot answer differently.
+fn cluster_not_found() -> CreateVpcConnectionError {
+    CreateVpcConnectionErrorModeled::NotFoundException(crate::state::resource_not_found(
+        crate::state::CLUSTER_ARN_MEMBER,
+    ))
+    .into()
+}
+
 /// Every decision the TARGET CLUSTER takes about this create, in Amazon MSK's
 /// order: the authorization decision the cluster's own resource-based policy takes
 /// part in, then its state, then the client authentication the connection asks for
@@ -466,7 +501,7 @@ fn cluster_admits_connection<Eng: Send + Sync + 'static>(
     let authentication_types = crate::state::VPC_CONNECTION_AUTHENTICATION_TYPES;
     if !authentication_types.contains(&authentication) {
         return Err(bad_request(
-            "Authentication",
+            "authentication",
             format!(
                 "Authentication must be one of {}, not '{authentication}'.",
                 authentication_types.join(", ")
@@ -496,7 +531,7 @@ fn cluster_admits_connection<Eng: Send + Sync + 'static>(
         client_subnets,
     ) {
         return Err(bad_request(
-            "ClientSubnets",
+            "clientSubnets",
             crate::state::vpc_connection_admission::CLIENT_SUBNET_COUNT_MESSAGE.to_string(),
         ));
     }

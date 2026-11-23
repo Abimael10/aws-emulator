@@ -230,13 +230,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.cluster_arn,
             std::time::SystemTime::now(),
         ) else {
-            return Err(
-                BatchDisassociateScramSecretErrorModeled::NotFoundException(NotFoundException {
-                    invalid_parameter: Some("ClusterArn".to_string()),
-                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
-                })
-                .into(),
-            );
+            return Err(BatchDisassociateScramSecretErrorModeled::NotFoundException(
+                crate::state::resource_not_found(crate::state::CLUSTER_ARN_MEMBER),
+            )
+            .into());
         };
 
         // A cluster authenticates SASL/SCRAM clients only where its client
@@ -250,7 +247,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 BatchDisassociateScramSecretErrorModeled::BadRequestException(
                     BadRequestException {
-                        invalid_parameter: Some("ClusterArn".to_string()),
+                        invalid_parameter: Some(crate::state::CLUSTER_ARN_MEMBER.to_string()),
                         message: Some(crate::state::SASL_SCRAM_NOT_ENABLED_MESSAGE.to_string()),
                     },
                 )

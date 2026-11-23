@@ -192,17 +192,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.replicator_arn,
             std::time::SystemTime::now(),
         ) else {
-            return Err(
-                DeleteReplicatorErrorModeled::NotFoundException(NotFoundException {
-                    invalid_parameter: Some(crate::state::REPLICATOR_ARN_MEMBER.to_string()),
-                    // The refusal names the input member that resolved to nothing,
-                    // and nothing about this endpoint's own state.
-                    message: Some(crate::state::parameter_not_found_message(
-                        crate::state::REPLICATOR_ARN_MEMBER,
-                    )),
-                })
-                .into(),
-            );
+            // The two absences the replicator surface tells apart: a reference
+            // this endpoint could not act on — another Region's ARN, or one this
+            // Region held and released — is reported as a fault of the parameter
+            // that carries it, while an ARN of this Region that was never minted
+            // is the plain not-found.
+            let at_fault =
+                crate::state::replicator_reference_at_fault(&state, &region, &input.replicator_arn);
+            return Err(DeleteReplicatorErrorModeled::NotFoundException(
+                crate::state::replicator_resolves_to_nothing(at_fault),
+            )
+            .into());
         };
 
         // A supplied version must be the one the replicator is actually at; a

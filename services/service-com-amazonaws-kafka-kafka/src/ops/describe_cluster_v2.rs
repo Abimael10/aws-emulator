@@ -193,7 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(
                 DescribeClusterV2ErrorModeled::NotFoundException(NotFoundException {
-                    invalid_parameter: Some("ClusterArn".to_string()),
+                    invalid_parameter: Some(crate::state::CLUSTER_ARN_MEMBER.to_string()),
                     // The service's ONE sentence for a resource it does not
                     // hold ([`crate::state::RESOURCE_NOT_FOUND_MESSAGE`]),
                     // which the V1 reader and every other operation that

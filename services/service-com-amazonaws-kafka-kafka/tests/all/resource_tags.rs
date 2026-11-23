@@ -5,9 +5,13 @@
 //! so these suites dispatch over exactly the path every other suite here does.
 //!
 //! RULE under test: the tagging operations treat `ResourceArn` as the identity of a
-//! PERSISTED resource. A value that is not an ARN of an MSK resource is refused
-//! with the modelled 400 `BadRequestException`; a well-formed MSK resource ARN this
-//! endpoint's region holds no resource for is refused with the modelled 404
+//! PERSISTED resource of a kind this service TAGS. A value the service cannot
+//! accept as the ARN of one — not an ARN of an MSK resource, not shaped like the
+//! kind it names, or naming a kind no API of this service gives a `Tags` member
+//! (a configuration, a cluster operation) — is refused with the modelled 400
+//! `BadRequestException` in one fixed sentence; a well-formed ARN of a TAGGABLE
+//! kind this endpoint's region holds no resource for is refused with the modelled
+//! 404
 //! `NotFoundException`; and for a resource that does exist the tag set is a stored
 //! map ON that resource — `TagResource` merges the submitted pairs (overwriting a
 //! key already present), `UntagResource` removes exactly the keys it names and
@@ -58,6 +62,14 @@ use crate::kafka_harness::{
 /// as a requirement is the 404 and the `NotFoundException` code; the text is
 /// asserted so the three operations cannot drift apart from each other.
 const NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
+/// The text the tagging operations answer a `ResourceArn` they cannot accept as
+/// the ARN of a taggable MSK resource with. RECORDED behaviour, mirroring
+/// `state::INVALID_TAG_RESOURCE_ARN_MESSAGE`: fixed end to end, so no part of
+/// the refused value is echoed back into it. Written out here rather than
+/// imported, so the form is pinned by the suite instead of by the code under
+/// test.
+const INVALID_RESOURCE_ARN_MESSAGE: &str = "Invalid input resource arn";
 
 /// The shared harness plus the calls this suite's rule needs: the three tagging
 /// operations and the creates that seed a resource to tag. Everything else —
@@ -652,10 +664,12 @@ async fn an_arn_naming_no_resource_is_not_found() {
         dropped.status, dropped.body
     );
 
-    // The rows differ along the resource TYPE in the ARN (every taggable MSK
+    // The rows differ along the resource TYPE in the ARN (every TAGGABLE MSK
     // resource kind, not only the cluster the issue cited), the partition, the
     // cluster id, and how the resource came to be missing (never created, or
-    // deleted).
+    // deleted). A kind this service tags NOTHING of — a configuration, a cluster
+    // operation — is not a row here: it is the input refusal, which
+    // `a_value_that_is_not_a_taggable_msk_resource_arn_is_a_bad_request` walks.
     let rows: Vec<(&str, String)> = vec![
         (
             "never-created-cluster",
@@ -666,20 +680,12 @@ async fn an_arn_naming_no_resource_is_not_found() {
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/absent/abcdef12-3456-7890-abcd-ef1234567890-99"),
         ),
         (
-            "configuration",
-            format!("arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/absent/22222222-2222-2222-2222-222222222222-2"),
-        ),
-        (
             "replicator",
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:replicator/absent/33333333-3333-3333-3333-333333333333-3"),
         ),
         (
             "vpc-connection",
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:vpc-connection/{ACCOUNT}/absent/44444444-4444-4444-4444-444444444444-4"),
-        ),
-        (
-            "cluster-operation",
-            format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster-operation/absent/55555555-5555-5555-5555-555555555555-5"),
         ),
         (
             "other-partition",
@@ -762,18 +768,36 @@ async fn an_arn_naming_no_resource_is_not_found() {
     );
 }
 
-/// RULE: a `ResourceArn` that is not an ARN of an MSK resource is a 400
-/// `BadRequestException` — the request the service cannot parse, as distinct from
-/// the resource it cannot find.
+/// RULE: a `ResourceArn` this service cannot accept as the ARN of a resource it
+/// TAGS is a 400 `BadRequestException` carrying one fixed sentence — the request
+/// the caller has to fix, as distinct from the resource it cannot find.
 #[tokio::test]
-async fn a_value_that_is_not_an_msk_resource_arn_is_a_bad_request() {
-    // The rows differ along HOW the value fails to be an MSK resource ARN: not an
-    // ARN at all, too few ARN fields, another service's namespace, an empty
-    // required field, no resource type, no resource id, and a cluster ARN whose id
-    // path has the wrong number of segments.
+async fn a_value_that_is_not_a_taggable_msk_resource_arn_is_a_bad_request() {
+    // The rows differ along HOW the value fails to be the ARN of a taggable MSK
+    // resource: not an ARN at all, too few ARN fields, another service's
+    // namespace, an empty required field, no resource type, no resource id, a
+    // cluster ARN whose id path has the wrong number of segments — and a
+    // well-formed ARN of a kind no API of this service gives a `Tags` member
+    // (`Configuration` and `ClusterOperationInfo` model none:
+    // `smithy_query(query="shape",shape="Configuration")`), which is the same
+    // refusal whether or not that resource exists.
     let rows: Vec<(&str, String)> = vec![
         ("not-an-arn", "not-an-arn-at-all".to_string()),
         ("bare-word", "cluster".to_string()),
+        (
+            "configuration",
+            format!(
+                "arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/absent/\
+                 22222222-2222-2222-2222-222222222222-2"
+            ),
+        ),
+        (
+            "cluster-operation",
+            format!(
+                "arn:aws:kafka:{REGION}:{ACCOUNT}:cluster-operation/absent/\
+                 55555555-5555-5555-5555-555555555555-5"
+            ),
+        ),
         (
             "too-few-fields",
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}"),
@@ -820,29 +844,29 @@ async fn a_value_that_is_not_an_msk_resource_arn_is_a_bad_request() {
     for (case, arn) in &rows {
         let tagged = emulator.tag(arn, &[("env", "prod")]).await;
         assert_eq!(
-            (tagged.status, tagged.error_code()),
-            (400, "BadRequestException"),
+            (tagged.status, tagged.error_code(), message(&tagged)),
+            (400, "BadRequestException", INVALID_RESOURCE_ARN_MESSAGE),
             "case {case} ({arn:?}): expected TagResource to answer 400 BadRequestException, got {} {}",
             tagged.status,
             tagged.body
         );
         assert!(
-            message(&tagged).contains(arn.as_str()),
-            "case {case}: the refusal must name the value it refused, got {:?}",
+            !message(&tagged).contains(arn.as_str()),
+            "case {case}: the refusal must carry no part of the value it refused, got {:?}",
             message(&tagged)
         );
         let removed = emulator.untag(arn, &["env"]).await;
         assert_eq!(
-            (removed.status, removed.error_code()),
-            (400, "BadRequestException"),
+            (removed.status, removed.error_code(), message(&removed)),
+            (400, "BadRequestException", INVALID_RESOURCE_ARN_MESSAGE),
             "case {case} ({arn:?}): expected UntagResource to answer 400 BadRequestException, got {} {}",
             removed.status,
             removed.body
         );
         let listed = emulator.list_tags(arn).await;
         assert_eq!(
-            (listed.status, listed.error_code()),
-            (400, "BadRequestException"),
+            (listed.status, listed.error_code(), message(&listed)),
+            (400, "BadRequestException", INVALID_RESOURCE_ARN_MESSAGE),
             "case {case} ({arn:?}): expected ListTagsForResource to answer 400 BadRequestException, got {} {}",
             listed.status,
             listed.body

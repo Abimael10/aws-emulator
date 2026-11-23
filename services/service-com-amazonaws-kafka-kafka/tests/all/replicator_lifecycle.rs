@@ -45,12 +45,17 @@ const INVALID_CLUSTER_MESSAGE: &str =
     "The specified Amazon MSK Cluster does not exist. Cluster ARN: ";
 
 /// The message a replicator operation refuses an ARN it cannot resolve with:
-/// MSK's replicator APIs name the INPUT MEMBER at fault and then the service's
-/// fixed not-found sentence (whose apostrophe is U+2019), and say nothing about
-/// the serving endpoint — not the region that looked, and not the ARN itself.
-/// Written out here rather than built from the handler's own helper, so the form
-/// is pinned by the suite instead of by the code under test.
-const NOT_FOUND_MESSAGE: &str =
+/// the service's ONE fixed not-found sentence (whose apostrophe is U+2019) and
+/// nothing else — the member at fault travels in `invalidParameter`, and nothing
+/// about the serving endpoint, neither the region that looked nor the ARN itself,
+/// is in the text. Written out here rather than built from the handler's own
+/// helper, so the form is pinned by the suite instead of by the code under test.
+const NOT_FOUND_MESSAGE: &str = "The requested resource doesn\u{2019}t exist.";
+
+/// The same refusal for a replicator this region HELD and released: the
+/// replicator APIs report a reference of their own that is gone as a fault of the
+/// parameter that still names it, in this framing around the same sentence.
+const RELEASED_MESSAGE: &str =
     "Invalid parameter replicatorArn: The requested resource doesn\u{2019}t exist.";
 
 /// Sleep past the emulator's own `CREATING` -> `RUNNING` span, so a later read sees
@@ -1115,12 +1120,12 @@ async fn a_request_past_a_per_replicator_ceiling_is_refused() {
     // `crate::replicator_input_cardinality` tests on both sides of that count.
     let rows = vec![
         (
-            "ReplicationInfoList",
+            "replicationInfoList",
             sized("flows-at", 2, MAX_FLOWS_PER_REPLICATOR, 0),
             sized("flows-past", 2, MAX_FLOWS_PER_REPLICATOR + 1, 0),
         ),
         (
-            "Tags",
+            "tags",
             sized("tags-at", 2, 1, MAX_TAGS_PER_REPLICATOR),
             sized("tags-past", 2, 1, MAX_TAGS_PER_REPLICATOR + 1),
         ),
@@ -1184,12 +1189,13 @@ async fn a_kafka_cluster_that_identifies_nothing_is_refused() {
     // the FIRST of two, the SECOND of two (so the check is per entry, not only on
     // the first), and one carrying every member a `KafkaCluster` models EXCEPT a
     // cluster identity. Each row names the two entries a replicator spans, so the
-    // answer is about the entry that identifies nothing.
+    // answer is about the entry that identifies nothing — reported against the
+    // member the entries came in, by its wire name.
     let rows: Vec<(&str, Vec<Value>, &str)> = vec![
         (
             "first-entry",
             vec![json!({}), ClusterRef::msk("identified-target").to_json()],
-            "KafkaClusters[0]",
+            "kafkaClusters",
         ),
         (
             "second-entry",
@@ -1201,7 +1207,7 @@ async fn a_kafka_cluster_that_identifies_nothing_is_refused() {
                     },
                 }),
             ],
-            "KafkaClusters[1]",
+            "kafkaClusters",
         ),
         (
             "everything-but-identity",
@@ -1220,7 +1226,7 @@ async fn a_kafka_cluster_that_identifies_nothing_is_refused() {
                 }),
                 ClusterRef::msk("identified-target").to_json(),
             ],
-            "KafkaClusters[0]",
+            "kafkaClusters",
         ),
     ];
 
@@ -1496,16 +1502,18 @@ async fn a_deleted_replicator_is_gone_from_every_reader() {
                 read_again.error_code(),
                 read_again.error_message()
             ),
-            (404, "NotFoundException", NOT_FOUND_MESSAGE),
-            "case {case}: a deleted replicator must read as missing, got {} {}",
+            (404, "NotFoundException", RELEASED_MESSAGE),
+            "case {case}: a deleted replicator must read as a reference the service released, \
+             got {} {}",
             read_again.status,
             read_again.body
         );
         let twice = delete(&emulator, &arn, None).await;
         assert_eq!(
             (twice.status, twice.error_code(), twice.error_message()),
-            (404, "NotFoundException", NOT_FOUND_MESSAGE),
-            "case {case}: a repeated delete must answer as for an ARN never issued, got {} {}",
+            (404, "NotFoundException", RELEASED_MESSAGE),
+            "case {case}: a repeated delete must answer as for a replicator the service \
+             released, got {} {}",
             twice.status,
             twice.body
         );

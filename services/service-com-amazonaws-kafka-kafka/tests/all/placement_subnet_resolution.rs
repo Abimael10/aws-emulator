@@ -237,7 +237,7 @@ async fn a_create_may_name_at_most_the_placement_ceiling_of_subnets() {
                     "clientSubnets": subnets,
                     "securityGroups": ["sg-0a1b2c3d"],
                 }),
-                "ClientSubnets",
+                "clientSubnets",
             ),
         ];
 

@@ -205,6 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         let region = crate::state::request_region(ctx.parts());
+        let now = std::time::SystemTime::now();
 
         // A value that is not a cluster ARN at all is a request the service
         // cannot act on; `NotFoundException` is reserved for a well-formed ARN
@@ -214,6 +215,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !crate::state::is_cluster_arn(&input.cluster_arn) {
             return Err(BatchAssociateScramSecretErrorModeled::BadRequestException(
                 crate::state::invalid_cluster_arn(),
+            )
+            .into());
+        }
+
+        // The CLUSTER the call acts on is resolved before anything in the body
+        // is looked at: the batch names secrets of one cluster, so a request
+        // whose cluster this endpoint holds none of acts on nothing, and the
+        // caller is told about the cluster rather than sent to correct a member
+        // of a request that could not have been served anyway. Resolved through
+        // the settling lookup, as every operation that reaches a cluster does,
+        // so this writer and the readers agree about which clusters this
+        // endpoint holds and about what the clock already owed them; the lock is
+        // taken for the lookup alone and released again, because the admission
+        // below calls out over the in-process callback and no mutex may be held
+        // across it.
+        if state
+            .lock()
+            .settled_cluster_in_mut(&region, &input.cluster_arn, now)
+            .is_none()
+        {
+            return Err(BatchAssociateScramSecretErrorModeled::NotFoundException(
+                crate::state::resource_not_found(crate::state::CLUSTER_ARN_MEMBER),
             )
             .into());
         }
@@ -230,7 +253,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(
                 BatchAssociateScramSecretErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some("SecretArnList".to_string()),
+                    invalid_parameter: Some("secretArnList".to_string()),
                     // The service's fixed sentence for this condition, so the
                     // offending entry is not echoed back into it.
                     message: Some(crate::state::SECRET_ARN_INVALID_MESSAGE.to_string()),
@@ -256,22 +279,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .await;
 
         let mut state = state.lock();
-        // Resolved through the settling lookup, as every operation that reaches
-        // a cluster does, so this writer and the readers agree about which
-        // clusters this endpoint holds and about what the clock already owed
-        // them.
-        let Some(cluster) = state.settled_cluster_in_mut(
-            &region,
-            &input.cluster_arn,
-            std::time::SystemTime::now(),
-        ) else {
-            return Err(
-                BatchAssociateScramSecretErrorModeled::NotFoundException(NotFoundException {
-                    invalid_parameter: Some("ClusterArn".to_string()),
-                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
-                })
-                .into(),
-            );
+        // Resolved again, under the lock the association is written with: the
+        // cluster has to still be there to be written to, and another request
+        // may have taken it out while the admission above was resolved. Through
+        // the same settling lookup, so this writer and the readers agree about
+        // which clusters this endpoint holds.
+        let Some(cluster) = state.settled_cluster_in_mut(&region, &input.cluster_arn, now) else {
+            return Err(BatchAssociateScramSecretErrorModeled::NotFoundException(
+                crate::state::resource_not_found(crate::state::CLUSTER_ARN_MEMBER),
+            )
+            .into());
         };
 
         // A cluster's SCRAM secrets are credentials its brokers authenticate
@@ -283,7 +300,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !crate::state::scram_secrets_served_from_cluster_state(&cluster.state) {
             return Err(
                 BatchAssociateScramSecretErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some("ClusterArn".to_string()),
+                    invalid_parameter: Some(crate::state::CLUSTER_ARN_MEMBER.to_string()),
                     message: Some(crate::state::invalid_cluster_state_for_scram_message(
                         crate::state::SCRAM_SECRET_ACTION_ASSOCIATE,
                     )),
@@ -298,7 +315,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !cluster.sasl_scram_enabled() {
             return Err(
                 BatchAssociateScramSecretErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some("ClusterArn".to_string()),
+                    invalid_parameter: Some(crate::state::CLUSTER_ARN_MEMBER.to_string()),
                     message: Some(crate::state::SASL_SCRAM_NOT_ENABLED_MESSAGE.to_string()),
                 })
                 .into(),
@@ -313,7 +330,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 BatchAssociateScramSecretErrorModeled::TooManyRequestsException(
                     TooManyRequestsException {
-                        invalid_parameter: Some("SecretArnList".to_string()),
+                        invalid_parameter: Some("secretArnList".to_string()),
                         message: Some(format!(
                             "The cluster {} holds {} SCRAM secret(s) and the request adds {} more, \
                              which would give it {}; a cluster may hold at most {} SCRAM secrets.",

@@ -43,10 +43,10 @@ const TARGET_UNNAMED_MESSAGE: &str =
     "Must specify either targetKafkaClusterArn or targetKafkaClusterId for the target cluster.";
 
 /// The message this service's replicator APIs refuse an ARN they cannot resolve
-/// with: the input member at fault, then the fixed not-found sentence (whose
-/// apostrophe is U+2019, as the service writes it).
-const NOT_FOUND_MESSAGE: &str =
-    "Invalid parameter replicatorArn: The requested resource doesn\u{2019}t exist.";
+/// with: the service's one fixed not-found sentence (whose apostrophe is U+2019,
+/// as the service writes it) and nothing else — the input member at fault travels
+/// in `invalidParameter`.
+const NOT_FOUND_MESSAGE: &str = "The requested resource doesn\u{2019}t exist.";
 
 /// A well-formed Amazon MSK cluster ARN in the signing region that no cluster
 /// holds — enough for a request that is refused on its BODY, which never resolves
@@ -414,8 +414,8 @@ async fn a_created_replication_that_does_not_name_an_end_is_refused() {
         );
         assert_eq!(
             reply.at("/invalidParameter").as_str(),
-            Some("ReplicationInfoList[0]"),
-            "case {case}: the refusal must name the entry at fault, got {}",
+            Some("replicationInfoList"),
+            "case {case}: the refusal must name the member the entries came in, got {}",
             reply.body
         );
         // A refused create registers nothing, so the name it asked for is still
