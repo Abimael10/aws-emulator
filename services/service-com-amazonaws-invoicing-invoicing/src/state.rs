@@ -2061,8 +2061,9 @@ pub fn invoice_profile(account_id: &str) -> InvoiceProfile {
 /// found travels in its own member instead of being spliced into the prose, so a client
 /// can read it mechanically and a client matching the documented sentence still matches.
 ///
-/// The procurement-portal-preference plane words its own 404 from the REQUEST instead;
-/// see [`no_such_procurement_portal_preference`].
+/// The procurement-portal-preference plane and the INVOICE registry word their own 404s
+/// from the REQUEST instead; see [`no_such_procurement_portal_preference`] and
+/// [`no_such_invoice`].
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The resource could not be found.";
 
 /// The 404 an operation of the INVOICE-UNIT or TAG plane answers for an ARN that is not
@@ -2077,7 +2078,7 @@ pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The resource could not be found.";
 /// reporting member of this model holds. Such an ARN leaves the member ABSENT rather than
 /// being cut down to the bound — a truncated ARN names a different resource — which is the
 /// same answer this service gives for an identifier that member's `@pattern` does not
-/// admit ([`no_such_resource_unnamed`]). An ARN from a member the model already caps at
+/// admit ([`no_such_invoice`]). An ARN from a member the model already caps at
 /// 256, as every `InvoiceUnitArn` input of the invoice-unit plane is, is reported whole.
 pub fn no_such_resource(arn: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
@@ -2122,16 +2123,38 @@ pub fn no_such_procurement_portal_preference(arn: &str) -> ResourceNotFoundExcep
     }
 }
 
-/// The 404 a reader answers for a resource named by something that is NOT an ARN — an
-/// invoice id, say: the same constant message, with the ARN member left unset.
+/// The kind of resource the INVOICE registry's refusals name, as the recorded 404s of
+/// this plane spell it — the resource an `InvoiceId` names
+/// ([`ComAmazonawsInvoicingInvoicingState::invoices`]).
+const INVOICE_KIND: &str = "Invoice";
+
+/// The 404 a reader of the INVOICE registry answers for an `InvoiceId` no stored invoice
+/// is keyed under, whichever operation of the plane resolved that identifier.
 ///
-/// That member is modelled `InvoiceUnitArnString`, whose `@pattern` admits only an ARN
-/// (`smithy_query(query="shape", shape="ResourceNotFoundException")`), so a
-/// non-ARN identifier cannot be reported in it without answering a value the model
-/// says that member never holds.
-pub fn no_such_resource_unnamed() -> ResourceNotFoundException {
+/// Recorded behaviour: this plane's message is BUILT FROM THE REQUEST — it names the kind
+/// of resource that was asked about and the exact `InvoiceId` the request supplied — so a
+/// client that fans a read out over a list of invoice ids can tell WHICH id was rejected,
+/// rather than the constant sentence the shape's documentation gives
+/// ([`RESOURCE_NOT_FOUND_MESSAGE`], which the invoice-unit and tag planes' own recorded
+/// bodies carry). It travels under the key those planes key their text with
+/// ([`MessageKey::ModelMemberName`]), which is the member name the model spells.
+///
+/// The ARN member is left ABSENT: it is modelled `InvoiceUnitArnString`, whose `@pattern`
+/// admits only an ARN (`smithy_query(query="shape", shape="ResourceNotFoundException")`),
+/// and an `InvoiceId` is not one — reporting it there would answer a value the model says
+/// that member never holds, which is why the identifier is named in the prose instead.
+///
+/// Held to the bound the model gives the member it travels in
+/// ([`crate::service::validation::bounded_message`]), as every message this service words
+/// from a request is: `InvoiceId` is a `StringWithoutNewLine` of up to 1024 characters
+/// (`smithy_query(query="operation", operation="GetInvoicePDF")`) while the `message` it
+/// is spliced into is a `BasicString` capped at the same 1024, so a legal request can name
+/// an invoice whose sentence does not fit the member that reports it.
+pub fn no_such_invoice(invoice_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+        message: Some(crate::service::validation::bounded_message(format!(
+            "{INVOICE_KIND} {invoice_id} does not exist"
+        ))),
         resource_id: None,
         message_key: MessageKey::ModelMemberName,
     }

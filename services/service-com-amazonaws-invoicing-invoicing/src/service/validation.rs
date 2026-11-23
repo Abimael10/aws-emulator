@@ -147,7 +147,7 @@ pub(crate) const MAX_REPORTED_ARN_LENGTH: usize = 256;
 /// about. The member is optional, so leaving it out — "the resource is not named back
 /// here" — is an answer the model admits where an over-long ARN is not, and it is the
 /// choice this service already makes for an identifier that member's `@pattern` does not
-/// admit (see [`crate::state::no_such_resource_unnamed`]).
+/// admit (see [`crate::state::no_such_invoice`]).
 pub(crate) fn reportable_resource_arn(arn: &str) -> Option<String> {
     let length = arn.chars().count();
     (MIN_REPORTED_ARN_LENGTH..=MAX_REPORTED_ARN_LENGTH)

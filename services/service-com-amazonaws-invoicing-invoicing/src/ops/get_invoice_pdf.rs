@@ -179,9 +179,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(invoice) = store.invoices.get(&input.invoice_id) else {
                 // The request names a RESOURCE, so an id the registry does not hold is
                 // the modelled 404 — the same refusal every reader of this plane answers
-                // for an identifier that resolves to nothing.
+                // for an identifier that resolves to nothing, naming the invoice that
+                // was asked about ([`crate::state::no_such_invoice`]).
                 return Err(GetInvoicePDFErrorModeled::ResourceNotFoundException(
-                    crate::state::no_such_resource_unnamed(),
+                    crate::state::no_such_invoice(&input.invoice_id),
                 )
                 .into());
             };

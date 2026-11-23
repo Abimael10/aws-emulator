@@ -367,8 +367,9 @@ const DOCUMENTED_NOT_FOUND_MESSAGE: &str = "The resource could not be found.";
 
 /// RULE 2: a `ResourceNotFoundException` of the procurement-portal-preference plane names
 /// the KIND of resource asked about and the exact ARN the request supplied, whichever of
-/// that plane's operations answers and whatever the ARN — while the invoice-unit and tag
-/// planes keep the documented sentence their own recorded bodies carry.
+/// that plane's operations answers and whatever the ARN — as does the INVOICE plane for the
+/// `InvoiceId` it was asked about — while the invoice-unit and tag planes keep the
+/// documented sentence their own recorded bodies carry.
 #[tokio::test]
 async fn a_404_states_the_message_its_plane_answers_with() {
     let router = emulator();
@@ -491,12 +492,12 @@ async fn a_404_states_the_message_its_plane_answers_with() {
         }
     }
     // An identifier that is NOT an ARN: `ListInvoiceSummaries` names one invoice by its
-    // `InvoiceId`, and the registry holds none, so every id is absent — answered by the
-    // invoice plane's documented sentence.
+    // `InvoiceId`, and the registry holds none, so every id is absent — and the INVOICE
+    // plane words its 404 from the request, naming the invoice that was asked about.
     for invoice_id in ["INV-999", "INV-001", "0"] {
         cases.push(NotFoundCase {
             operation: "ListInvoiceSummaries",
-            expected_message: DOCUMENTED_NOT_FOUND_MESSAGE.to_string(),
+            expected_message: format!("Invoice {invoice_id} does not exist"),
             request: json!({"Selector": {"ResourceType": "INVOICE_ID", "Value": invoice_id}}),
         });
     }

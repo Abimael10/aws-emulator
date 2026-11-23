@@ -513,7 +513,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Selected::Invoice(invoice_id) => {
                 let Some(invoice) = store.invoices.get(invoice_id) else {
                     return Err(ListInvoiceSummariesErrorModeled::ResourceNotFoundException(
-                        crate::state::no_such_resource_unnamed(),
+                        crate::state::no_such_invoice(invoice_id),
                     )
                     .into());
                 };

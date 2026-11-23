@@ -19,7 +19,8 @@
 //! this emulator — with the instant that URL's own signature stops verifying — for the
 //! invoice document and for each supplemental document the invoice was issued with, in the
 //! stored order; the document served at each address is rendered from that stored invoice;
-//! and an `InvoiceId` the registry does not hold is the modelled `ResourceNotFoundException`.
+//! and an `InvoiceId` the registry does not hold is the modelled `ResourceNotFoundException`,
+//! whose message names the invoice that was asked about.
 //! Each address names the account whose invoices it serves, and an address naming another
 //! account is served no document.
 //! The rows differ along what the rule generalises over: how many supplemental documents an
@@ -582,8 +583,58 @@ async fn the_reported_expiry_is_the_expiry_of_the_url_it_was_reported_with() {
     }
 }
 
-/// RULE: an `InvoiceId` the registry does not hold is the modelled 404, and the read
-/// leaves the registry exactly as it found it.
+/// The model's own maximum for the `message` a refusal travels in
+/// (`smithy_query(query="shape", shape="ResourceNotFoundException,BasicString")`:
+/// `BasicString`, `len 0..1024`) — the same 1024 an `InvoiceId` may itself run to, so the
+/// sentence wrapped around one at that length does not fit the member reporting it.
+const MAX_MESSAGE_LENGTH: usize = 1024;
+
+/// The sentence the invoice plane owes for an `InvoiceId` nothing is stored under: the
+/// fixed text wrapping the id the request supplied, held to the bound of the member that
+/// reports it.
+fn not_found_message(invoice_id: &str) -> String {
+    let text = format!("Invoice {invoice_id} does not exist");
+    match text.char_indices().nth(MAX_MESSAGE_LENGTH) {
+        Some((end, _)) => text[..end].to_string(),
+        None => text,
+    }
+}
+
+/// One `ListInvoiceSummaries` call naming ONE invoice by its `InvoiceId` — the other
+/// reader that resolves an id against the same registry, so the refusal below is driven
+/// through both of them.
+async fn list_one_invoice(router: &MultiServiceRouter, invoice_id: &str) -> (u16, Value) {
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("x-amz-target", "Invoicing.ListInvoiceSummaries")
+        .header("content-type", "application/x-amz-json-1.0")
+        .body(bytes::Bytes::from(
+            serde_json::to_vec(
+                &json!({"Selector": {"ResourceType": "INVOICE_ID", "Value": invoice_id}}),
+            )
+            .expect("the request body serializes"),
+        ))
+        .expect("a valid request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let parsed = if response.body().is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(response.body()).unwrap_or(Value::Null)
+    };
+    (status, parsed)
+}
+
+/// RULE: an `InvoiceId` no stored invoice is keyed under is the modelled 404 whose message
+/// NAMES the invoice that was asked about — the fixed text around the id the request
+/// supplied, whichever reader of the registry resolved it — and the refused read leaves
+/// the registry exactly as it found it.
+///
+/// The rows differ along what the rule generalises over: the form of the id (another id
+/// shape, a seeded id differing only by case, by a trailing space, by a path separator)
+/// and its length, including the modelled maximum, where the wrapped sentence overruns the
+/// member that reports it.
 #[tokio::test]
 async fn an_invoice_id_the_registry_does_not_hold_is_the_modelled_404() {
     let (router, engine) = emulator();
@@ -601,27 +652,79 @@ async fn an_invoice_id_the_registry_does_not_hold_is_the_modelled_404() {
         "INV-001/supplement".to_string(),
         "Z".repeat(INVOICE_ID_MAX_LENGTH),
     ];
-    for invoice_id in unknown {
-        let (status, body) = get_invoice_pdf(&router, &invoice_id).await;
-        assert_eq!(
-            status, 404,
-            "case {invoice_id:?}: expected HTTP 404, got {status} {body}"
-        );
-        assert_eq!(
-            error_code(&body),
-            "ResourceNotFoundException",
-            "case {invoice_id:?}: expected the modelled 404, got {body}"
-        );
-        assert_eq!(
-            text_member(&body, "message").as_deref(),
-            Some(service_com_amazonaws_invoicing_invoicing::state::RESOURCE_NOT_FOUND_MESSAGE),
-            "case {invoice_id:?}: expected this plane's own not-found wording, got {body}"
-        );
-        assert!(
-            body.get("InvoicePDF").is_none(),
-            "case {invoice_id:?}: a refusal reports no document, got {body}"
+    let mut messages: Vec<String> = Vec::new();
+    for invoice_id in &unknown {
+        for (operation, (status, body)) in [
+            ("GetInvoicePDF", get_invoice_pdf(&router, invoice_id).await),
+            (
+                "ListInvoiceSummaries",
+                list_one_invoice(&router, invoice_id).await,
+            ),
+        ] {
+            let case = format!("{operation} on an id of {} characters", invoice_id.len());
+            assert_eq!(
+                status, 404,
+                "case {case}: expected HTTP 404, got {status} {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "ResourceNotFoundException",
+                "case {case}: expected the modelled 404, got {body}"
+            );
+            let expected = not_found_message(invoice_id);
+            let actual = text_member(&body, "message").unwrap_or_default();
+            assert_eq!(
+                actual, expected,
+                "case {case}: expected the message to name the invoice asked about, got \
+                 {actual:?}"
+            );
+            assert!(
+                actual.chars().count() <= MAX_MESSAGE_LENGTH,
+                "case {case}: the message must fit the modelled {MAX_MESSAGE_LENGTH} \
+                 characters, got {}",
+                actual.chars().count()
+            );
+            // The identifier is NOT an ARN, so the shape's ARN member reports nothing
+            // rather than a value its `@pattern` never admits. That member is checked
+            // under BOTH spellings — the key this service's `ResourceNotFoundException`
+            // bodies carry (`resourceId`) and the name the model spells
+            // (`resourceName`) — so the check cannot pass by naming a key no body uses.
+            for key in ["resourceId", "resourceName"] {
+                assert_eq!(
+                    text_member(&body, key),
+                    None,
+                    "case {case}: a non-ARN identifier is not reported in the ARN member \
+                     {key:?}, got {body}"
+                );
+            }
+            assert!(
+                body.get("InvoicePDF").is_none(),
+                "case {case}: a refusal reports no document, got {body}"
+            );
+            messages.push(actual);
+        }
+    }
+
+    // Worded from the request: no two ids are refused with the same sentence, and none is
+    // the constant the invoice-unit and tag planes answer with.
+    for message in &messages {
+        assert_ne!(
+            message.as_str(),
+            service_com_amazonaws_invoicing_invoicing::state::RESOURCE_NOT_FOUND_MESSAGE,
+            "the invoice plane words its 404 from the request, got {message:?}"
         );
     }
+    let mut distinct = messages.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        unknown.len(),
+        "the message must differ with the invoice asked about, got {} distinct of {}",
+        distinct.len(),
+        messages.len()
+    );
+
     assert_eq!(
         invoice_count(&engine),
         before,
