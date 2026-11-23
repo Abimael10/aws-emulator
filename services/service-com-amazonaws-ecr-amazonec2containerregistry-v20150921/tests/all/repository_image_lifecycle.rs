@@ -178,7 +178,7 @@ async fn a_created_repository_is_described_from_what_was_stored() {
         );
         assert_eq!(
             at(&repository, "/repositoryUri"),
-            json!(published_repository_uri(&name)),
+            json!(published_repository_uri(REGION, &name)),
             "case {case:?}: expected the URI a client pushes and pulls this repository at, got \
              {:?}",
             at(&repository, "/repositoryUri")

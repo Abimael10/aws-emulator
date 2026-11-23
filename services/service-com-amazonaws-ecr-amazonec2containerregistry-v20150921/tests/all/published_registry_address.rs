@@ -15,14 +15,16 @@
 //!   nowhere either; the endpoint the caller is already talking to is the one address it can
 //!   reach. This suite is what varies that endpoint.
 //! * `Repository$repositoryUri` ("The URI for the repository. You can use this URI for
-//!   container image `push` and `pull` operations") is that same address with the
-//!   repository's own name as the path and no scheme: a container client splits it on the
-//!   first `/` and dials what is ahead of it, so it carries the endpoint this emulator
-//!   answers that caller at and never a registry host name composed over that address — no
-//!   resolver answers for a name under an address, and nothing here answers for a name AWS
-//!   serves. Which registry HOLDS the repository is reported beside it by the members that
-//!   carry that identity (`registryId` and the ARN), and those are labels off the stored
-//!   record that no reader's endpoint moves.
+//!   container image `push` and `pull` operations") is read two ways at once: a container
+//!   client splits it on the first `/` and dials what is ahead of it, while every consumer
+//!   that derives a reference from it parses that authority for the registry holding the
+//!   repository. So it carries the registry host layout AWS publishes — the owning account's
+//!   id, the two fixed labels and the holding Region — spelled in the ZONE and on the PORT of
+//!   the endpoint this emulator answers that caller at, and never a name in a zone AWS serves
+//!   its own registries in, which resolves nowhere near this process. Which registry HOLDS the
+//!   repository is reported beside it by the members that carry that identity (`registryId`
+//!   and the ARN) as well, and those are labels off the stored record that no reader's
+//!   endpoint moves.
 //!
 //! The class the rule generalises over is the endpoint the call arrived on crossed with the
 //! repository name and the operation reporting it, so the rows span the endpoint forms a
@@ -53,8 +55,8 @@ use service_com_amazonaws_ecr_amazonec2containerregistry_v20150921::EmulatedServ
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::wire::{
-    at, endpoint_host, given_layer, ok, registry_get, registry_host_in,
-    ANNOUNCED_REGISTRY_ENDPOINT, REGION, REGISTRY_ID,
+    at, endpoint_host, given_layer, ok, published_registry_authority_at, registry_get,
+    registry_host_in, ANNOUNCED_REGISTRY_ENDPOINT, REGION, REGISTRY_ID,
 };
 
 /// One endpoint a caller reaches this emulator on: where the endpoint travels (the `Host`
@@ -74,11 +76,18 @@ impl Endpoint {
         format!("https://{}", self.announced_endpoint)
     }
 
-    /// The URI the repository `name` is reported at to such a call: the endpoint this
-    /// emulator answers that caller's registry requests at, followed by the repository's own
-    /// name as the path.
-    fn repository_uri(&self, name: &str) -> String {
-        format!("{}/{name}", self.announced_endpoint)
+    /// The authority a repository of `region`'s registry is published at to such a call: the
+    /// registry host layout AWS publishes, spelled in the zone and on the port of the
+    /// endpoint this emulator answers that caller's registry requests at.
+    fn published_authority(&self, region: &str) -> String {
+        published_registry_authority_at(&self.announced_endpoint, region)
+    }
+
+    /// The URI the repository `name` of `region`'s registry is reported at to such a call:
+    /// the authority it is published at ([`Endpoint::published_authority`]), followed by the
+    /// repository's own name as the path.
+    fn repository_uri(&self, region: &str, name: &str) -> String {
+        format!("{}/{name}", self.published_authority(region))
     }
 }
 
@@ -308,7 +317,7 @@ async fn every_reported_repository_uri_names_an_endpoint_this_emulator_answers_o
         for name in REPOSITORY_NAMES {
             let case = format!("{}, repository {name}", endpoint.case);
             // The registry that HOLDS the repository, plus the repository's own name.
-            let expected = endpoint.repository_uri(name);
+            let expected = endpoint.repository_uri(REGION, name);
 
             let created = call_at(
                 &router,
@@ -330,9 +339,10 @@ async fn every_reported_repository_uri_names_an_endpoint_this_emulator_answers_o
                 .split_once('/')
                 .unwrap_or_else(|| panic!("case {case:?}: {created_uri:?} names no path"));
             assert_eq!(
-                authority, endpoint.announced_endpoint,
-                "case {case:?}: expected the host of {created_uri:?} to be the endpoint this \
-                 emulator answers this caller's registry requests at, got {authority:?}"
+                authority,
+                endpoint.published_authority(REGION),
+                "case {case:?}: expected the host of {created_uri:?} to be the registry \
+                 authority this emulator publishes to this caller, got {authority:?}"
             );
             assert_ne!(
                 authority,
@@ -440,7 +450,7 @@ async fn a_repository_uri_names_the_endpoint_the_read_itself_arrived_on() {
     .await;
     let registry_id = text(creating.case, &created, "/repository/registryId");
     let created_uri = text(creating.case, &created, "/repository/repositoryUri");
-    let expected = creating.repository_uri(name);
+    let expected = creating.repository_uri(REGION, name);
     assert_eq!(
         created_uri, expected,
         "case {:?}: expected the create to report {expected:?}, got {created_uri:?}",
@@ -450,7 +460,7 @@ async fn a_repository_uri_names_the_endpoint_the_read_itself_arrived_on() {
     for endpoint in &endpoints {
         let listed = call_at(&router, endpoint, "DescribeRepositories", &json!({})).await;
         let listed_uri = text(endpoint.case, &listed, "/repositories/0/repositoryUri");
-        let expected = endpoint.repository_uri(name);
+        let expected = endpoint.repository_uri(REGION, name);
         assert_eq!(
             listed_uri, expected,
             "case {:?}: expected the read to report {expected:?}, got {listed_uri:?}",
@@ -502,7 +512,7 @@ async fn a_pull_at_the_reported_repository_uri_reaches_this_registry() {
         )
         .await;
         let reported = text(case, &created, "/repository/repositoryUri");
-        let expected = endpoint.repository_uri(name);
+        let expected = endpoint.repository_uri(REGION, name);
         assert_eq!(
             reported, expected,
             "case {case:?}: expected repositoryUri to be {expected:?}, got {reported:?}"
@@ -598,9 +608,9 @@ async fn the_login_url_never_names_a_zone_aws_publishes_its_own_endpoints_in() {
         let proxy_endpoint = text(case, &issued, "/authorizationData/0/proxyEndpoint");
         let token = text(case, &issued, "/authorizationData/0/authorizationToken");
 
-        // The repository URI is published on the endpoint this caller reached, with the
-        // repository as its path.
-        let expected = endpoint.repository_uri(name);
+        // The repository URI is published on the registry authority anchored on the endpoint
+        // this caller reached, with the repository as its path.
+        let expected = endpoint.repository_uri(REGION, name);
         assert_eq!(
             reported, expected,
             "case {case:?}: expected repositoryUri to be {expected:?}, got {reported:?}"
@@ -650,24 +660,24 @@ async fn the_login_url_never_names_a_zone_aws_publishes_its_own_endpoints_in() {
 const HOLDING_REGIONS: [&str; 3] = ["us-west-2", "eu-west-1", "cn-north-1"];
 
 /// The label run every Amazon ECR registry host carries between the owning account's id and
-/// the Region (`AuthorizationData$proxyEndpoint`'s registry URL format). An authority
-/// composed out of that layout carries it; an address does not.
+/// the Region (`AuthorizationData$proxyEndpoint`'s registry URL format). The authority this
+/// registry publishes carries it, because that is the layout every reader parses.
 const REGISTRY_LABEL_RUN: &str = ".dkr.ecr.";
 
 #[tokio::test]
-async fn the_published_address_is_the_endpoint_the_call_arrived_on_whichever_registry_holds_it() {
-    // The rule, read across BOTH things the published address could be taken from: the
-    // endpoint the call arrived on (which decides it) and the registry that holds the
-    // repository (which does not). A client DIALS the authority ahead of the first '/', so
-    // every row requires an address this emulator is reached at — the registry API answers
-    // there — and no name composed out of the registry host layout, which no resolver
-    // answers for.
+async fn the_published_authority_names_the_holding_registry_in_the_zone_the_call_arrived_on() {
+    // The rule, read across BOTH things the published authority is composed from: the
+    // registry that HOLDS the repository (its account and Region are the leading labels a
+    // reader parses) and the endpoint the call arrived on (whose zone and port are what a
+    // client dials). Every row therefore requires the registry layout AND an authority this
+    // emulator's registry API answers at, and no name in a zone AWS serves its own
+    // endpoints in.
     for endpoint in endpoints() {
         for region in HOLDING_REGIONS {
             let router = emulator();
             for name in REPOSITORY_NAMES {
                 let case = format!("{}, {region}, repository {name}", endpoint.case);
-                let expected = endpoint.repository_uri(name);
+                let expected = endpoint.repository_uri(region, name);
 
                 let created = call_at_in_region(
                     &router,
@@ -692,9 +702,11 @@ async fn the_published_address_is_the_endpoint_the_call_arrived_on_whichever_reg
                      name {name:?}, got {path:?}"
                 );
                 assert!(
-                    !authority.to_ascii_lowercase().contains(REGISTRY_LABEL_RUN),
-                    "case {case:?}: {created_uri:?} carries a registry host name of this \
-                     emulator's own invention, which no resolver answers for"
+                    authority
+                        .to_ascii_lowercase()
+                        .starts_with(&format!("{REGISTRY_ID}{REGISTRY_LABEL_RUN}{region}.")),
+                    "case {case:?}: expected the leading labels of {created_uri:?} to name \
+                     the registry holding the repository, got {authority:?}"
                 );
                 for suffix in AWS_ENDPOINT_DNS_SUFFIXES {
                     assert!(
@@ -705,8 +717,9 @@ async fn the_published_address_is_the_endpoint_the_call_arrived_on_whichever_reg
                     );
                 }
 
-                // The registry that HOLDS the repository is reported beside the address,
-                // off the stored record, so the address carries none of that identity.
+                // The registry that HOLDS the repository is reported beside the address as
+                // well, off the stored record, so the two readings of the one identity
+                // agree.
                 let registry_id = text(&case, &created, "/repository/registryId");
                 let arn = text(&case, &created, "/repository/repositoryArn");
                 assert_eq!(

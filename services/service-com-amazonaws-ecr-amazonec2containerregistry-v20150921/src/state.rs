@@ -2261,22 +2261,27 @@ impl Repo {
 
     /// The `Repository` every operation that reports this repository returns.
     ///
-    /// `repositoryUri` is composed here rather than stored on the record, from the endpoint
-    /// this emulator answers THIS caller's registry requests at
-    /// (`published_registry_endpoint`, read with [`announced_registry_endpoint`]) and the
-    /// record's own name ([`repository_uri`], and see
-    /// [`registry_address`](crate::state::registry_address)): the member is a push and pull
-    /// target a container client DIALS, so it carries the address that client reaches this
-    /// process at and never a registry name composed on it, which nothing resolves. Which
-    /// registry HOLDS the repository is reported beside it by the members that carry that
-    /// identity, read off the record and moved by no reader: `registryId`, and the ARN, which
-    /// names the Region.
+    /// `repositoryUri` is composed here rather than stored on the record, from this record's
+    /// own registry — its account id and its Region — and its name, anchored on the endpoint
+    /// this emulator answers THIS caller's registry requests at (`published_registry_endpoint`,
+    /// read with [`announced_registry_endpoint`]): the member is both PARSED for the registry
+    /// that holds the repository and DIALLED as a push and pull target, so it carries the
+    /// registry host layout AWS publishes spelled in the zone and on the port that caller
+    /// reaches this process at ([`published_registry_authority`], and see
+    /// [`registry_address`](crate::state::registry_address)). Which registry HOLDS the
+    /// repository is reported beside it by the members that carry that identity, read off the
+    /// record and moved by no reader: `registryId`, and the ARN, which names the Region.
     pub fn to_repository(&self, published_registry_endpoint: &str) -> Repository {
+        let published_authority = published_registry_authority(
+            published_registry_endpoint,
+            &self.registry_id,
+            &self.region,
+        );
         Repository {
             repository_arn: Some(self.arn.clone()),
             registry_id: Some(self.registry_id.clone()),
             repository_name: Some(self.name.clone()),
-            repository_uri: Some(repository_uri(published_registry_endpoint, &self.name)),
+            repository_uri: Some(repository_uri(&published_authority, &self.name)),
             created_at: Some(reported_instant(self.created_at)),
             image_tag_mutability: Some(self.image_tag_mutability.clone()),
             image_tag_mutability_exclusion_filters: if self
