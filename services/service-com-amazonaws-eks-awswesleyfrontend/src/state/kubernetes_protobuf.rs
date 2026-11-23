@@ -224,6 +224,15 @@ fn metadata_document(metadata: Option<&ObjectMeta>) -> Map<String, Value> {
             metadata.generate_name.as_deref(),
         );
         put_text(&mut projected, "namespace", metadata.namespace.as_deref());
+        // The revision a write states it is to be made at, which a client writing
+        // this encoding states here ([`super::kubernetes_resource_versions`]): a
+        // member dropped on the way in would turn a versioned write into an
+        // unconditional one.
+        put_text(
+            &mut projected,
+            "resourceVersion",
+            metadata.resource_version.as_deref(),
+        );
         put_text_map(&mut projected, "labels", &metadata.labels);
         put_text_map(&mut projected, "annotations", &metadata.annotations);
         put_texts(&mut projected, "finalizers", &metadata.finalizers);

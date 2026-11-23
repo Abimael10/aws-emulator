@@ -96,6 +96,10 @@ pub struct EventObject {
     pub name: String,
     /// Its `metadata.uid`.
     pub uid: String,
+    /// The revision the write that recorded this event was stamped with
+    /// ([`super::kubernetes_resource_versions`]), filled in by the store that
+    /// records it.
+    pub resource_version: u64,
     pub involved_kind: String,
     pub involved_name: String,
     pub involved_uid: String,
@@ -118,6 +122,10 @@ impl EventObject {
         Self {
             name: event_name(&recorded),
             uid: new_object_uid(),
+            // Stamped by the store when the event is recorded in a namespace
+            // ([`super::kubernetes_objects::ClusterObjects::record_event`]), which
+            // is the write that stores it.
+            resource_version: 0,
             involved_kind: recorded.involved_kind.to_string(),
             involved_name: recorded.involved_name.to_string(),
             involved_uid: recorded.involved_uid.to_string(),
@@ -156,6 +164,9 @@ impl EventObject {
                 "name": self.name,
                 "namespace": namespace,
                 "uid": self.uid,
+                "resourceVersion": super::kubernetes_resource_versions::rendered(
+                    self.resource_version,
+                ),
                 "creationTimestamp": at,
             },
             "involvedObject": involved,
@@ -210,7 +221,7 @@ impl super::kubernetes_objects::ClusterObjects {
     /// dropped: there is nothing for it to be about. One already recorded is kept
     /// as it was recorded, which is what makes recording it again — a second read
     /// materialising the same clock-owed step — change nothing a caller sees.
-    pub fn record_event(&mut self, namespace: &str, event: EventObject) {
+    pub fn record_event(&mut self, namespace: &str, mut event: EventObject) {
         let Some(held) = self.namespaces.get_mut(namespace) else {
             return;
         };
@@ -230,6 +241,12 @@ impl super::kubernetes_objects::ClusterObjects {
                 None => break,
             }
         }
+        // The write that stores the event, so it stands at this store's next
+        // revision ([`super::kubernetes_resource_versions`]). Drawn only once the
+        // event is one this namespace does not already hold, so recording the same
+        // event again — what a second read materialising one clock-owed step does
+        // — leaves the one already recorded exactly as it was.
+        event.resource_version = self.versions.next();
         held.events.insert(event.name.clone(), event);
     }
 

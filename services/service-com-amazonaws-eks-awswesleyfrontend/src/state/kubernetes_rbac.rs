@@ -268,6 +268,10 @@ pub enum RbacBody {
 pub struct RbacObject {
     pub uid: String,
     pub created_at: SystemTime,
+    /// The revision the write that last stored this object was stamped with, which
+    /// a client hands back to update it
+    /// ([`super::kubernetes_resource_versions`]).
+    pub resource_version: u64,
     pub body: RbacBody,
 }
 
@@ -286,6 +290,12 @@ impl RbacObject {
             metadata.insert("namespace".to_string(), ::serde_json::json!(namespace));
         }
         metadata.insert("uid".to_string(), ::serde_json::json!(self.uid));
+        metadata.insert(
+            "resourceVersion".to_string(),
+            ::serde_json::json!(super::kubernetes_resource_versions::rendered(
+                self.resource_version
+            )),
+        );
         metadata.insert(
             "creationTimestamp".to_string(),
             ::serde_json::json!(rfc3339_seconds(self.created_at)),

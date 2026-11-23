@@ -21,6 +21,7 @@ use super::kubernetes_metadata::{invalid_member, string_value_map, ObjectMetadat
 use super::kubernetes_objects::{
     manifest_name, new_object_uid, ApiRefusal, ClusterObjects, CORE_API_VERSION,
 };
+use super::kubernetes_resource_versions::admits_write;
 use super::*;
 
 /// How many ConfigMaps one namespace holds.
@@ -42,12 +43,19 @@ pub const MAX_CONFIG_MAPS_PER_NAMESPACE: usize = 256;
 /// base64 text that carries them — which is what the API server measures.
 pub const MAX_CONFIG_MAP_BYTES: usize = 1024 * 1024;
 
+/// The resource a ConfigMap is addressed and refused by.
+pub const CONFIG_MAPS_RESOURCE: &str = "configmaps";
+
 /// One ConfigMap: the configuration a client stored under a name, as it reads
 /// back.
 #[derive(Debug)]
 pub struct ConfigMapObject {
     pub uid: String,
     pub created_at: SystemTime,
+    /// The revision the write that last stored this ConfigMap was stamped with,
+    /// which a client hands back to update it
+    /// ([`super::kubernetes_resource_versions`]).
+    pub resource_version: u64,
     /// The labels and annotations the manifest carried.
     pub metadata: ObjectMetadata,
     /// `data`: the UTF-8 configuration values, by key.
@@ -71,8 +79,13 @@ impl ConfigMapObject {
         document.insert("apiVersion".to_string(), ::serde_json::json!(CORE_API_VERSION));
         document.insert(
             "metadata".to_string(),
-            self.metadata
-                .render(name, Some(namespace), &self.uid, self.created_at),
+            self.metadata.render(
+                name,
+                Some(namespace),
+                &self.uid,
+                self.created_at,
+                self.resource_version,
+            ),
         );
         if !self.data.is_empty() {
             document.insert("data".to_string(), ::serde_json::json!(self.data));
@@ -107,6 +120,7 @@ impl ClusterObjects {
             )));
         }
         let metadata = ObjectMetadata::from_manifest("ConfigMap", &name, manifest)?;
+        let resource_version = self.versions.next();
         // The manifest is read and validated first — a refused manifest stores
         // nothing wherever it was addressed — and only then is the namespace
         // resolved: an object cannot be created in a namespace that does not
@@ -116,11 +130,11 @@ impl ClusterObjects {
             .get_mut(namespace)
             .ok_or_else(|| ApiRefusal::not_found("namespaces", namespace))?;
         if held.config_maps.contains_key(&name) {
-            return Err(ApiRefusal::already_exists("configmaps", &name));
+            return Err(ApiRefusal::already_exists(CONFIG_MAPS_RESOURCE, &name));
         }
         if held.config_maps.len() >= MAX_CONFIG_MAPS_PER_NAMESPACE {
             return Err(ApiRefusal::too_many(
-                "configmaps",
+                CONFIG_MAPS_RESOURCE,
                 MAX_CONFIG_MAPS_PER_NAMESPACE,
             ));
         }
@@ -129,6 +143,7 @@ impl ClusterObjects {
             ConfigMapObject {
                 uid: new_object_uid(),
                 created_at: now,
+                resource_version,
                 metadata,
                 data,
                 binary_data,
@@ -147,6 +162,12 @@ impl ClusterObjects {
     /// cannot store what a create would have refused; a manifest naming a
     /// different object than the path addresses is refused the way the API server
     /// refuses one, before anything is written.
+    ///
+    /// A manifest carrying a `metadata.resourceVersion` asks for the write to be
+    /// made only while the object still stands at that revision
+    /// ([`super::kubernetes_resource_versions`]), so one carrying a revision the
+    /// object has moved on from is refused and the stored object is left as it
+    /// was.
     pub fn replace_config_map(
         &mut self,
         namespace: &str,
@@ -176,10 +197,21 @@ impl ClusterObjects {
         let config_map = held
             .config_maps
             .get_mut(name)
-            .ok_or_else(|| ApiRefusal::not_found("configmaps", name))?;
+            .ok_or_else(|| ApiRefusal::not_found(CONFIG_MAPS_RESOURCE, name))?;
+        admits_write(
+            CONFIG_MAPS_RESOURCE,
+            // The core group, which a refusal names no group for.
+            None,
+            name,
+            config_map.resource_version,
+            manifest,
+        )?;
+        let resource_version = self.versions.next();
         // The object's own identity is the create's: a replace changes what it
         // carries, not which object it is, so the uid and the creation instant
-        // stand.
+        // stand. The revision does NOT: the object has been written, so it stands
+        // at the revision of this write.
+        config_map.resource_version = resource_version;
         config_map.metadata = metadata;
         config_map.data = data;
         config_map.binary_data = binary_data;
@@ -196,7 +228,7 @@ impl ClusterObjects {
             .namespace(namespace)?
             .config_maps
             .get(name)
-            .ok_or_else(|| ApiRefusal::not_found("configmaps", name))?;
+            .ok_or_else(|| ApiRefusal::not_found(CONFIG_MAPS_RESOURCE, name))?;
         Ok(config_map.to_json(namespace, name))
     }
 

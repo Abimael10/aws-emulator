@@ -42,6 +42,7 @@ use super::kubernetes_objects::{
     DEFAULT_SERVICE_ACCOUNT,
 };
 use super::kubernetes_pod_spec::admitted_pod_spec;
+use super::kubernetes_resource_versions::admits_write;
 use super::ComAmazonawsEksAwswesleyfrontendState as ServiceStore;
 
 /// The API group the workload objects live in.
@@ -182,6 +183,10 @@ pub type WorkloadScope = BTreeMap<(WorkloadResource, String), WorkloadObject>;
 pub struct WorkloadObject {
     pub uid: String,
     pub created_at: SystemTime,
+    /// The revision the write that last stored this workload was stamped with,
+    /// which a client hands back to update it
+    /// ([`super::kubernetes_resource_versions`]).
+    pub resource_version: u64,
     /// The labels and annotations the manifest carried.
     pub metadata: ObjectMetadata,
     /// The workload's `spec` AS ADMITTED: the one the manifest carried, with the
@@ -396,6 +401,7 @@ impl ClusterObjects {
         self.namespace(namespace)?;
         let spec = admitted_workload_spec(resource, &name, manifest)?;
         let metadata = ObjectMetadata::from_manifest(resource.kind(), &name, manifest)?;
+        let resource_version = self.versions.next();
         let held = self
             .namespaces
             .get_mut(namespace)
@@ -420,6 +426,7 @@ impl ClusterObjects {
             WorkloadObject {
                 uid: new_object_uid(),
                 created_at: now,
+                resource_version,
                 metadata,
                 spec,
                 pods: BTreeSet::new(),
@@ -461,6 +468,7 @@ impl ClusterObjects {
                 Some(namespace),
                 &workload.uid,
                 workload.created_at,
+                workload.resource_version,
             ),
             "spec": workload.spec,
             "status": workload_status(resource, desired, running.len(), ready),
@@ -510,6 +518,11 @@ impl ClusterObjects {
     /// A replaced template is a new revision, so the pods of the old one are
     /// replaced by pods of the new one; a replaced replica count is converged to by
     /// creating or removing pods of the same revision.
+    ///
+    /// A manifest carrying a `metadata.resourceVersion` asks for the write to be
+    /// made only while the workload still stands at that revision
+    /// ([`super::kubernetes_resource_versions`]), so one carrying a revision it has
+    /// moved on from is refused and nothing of the workload or its pods changes.
     pub fn replace_workload(
         &mut self,
         resource: WorkloadResource,
@@ -531,9 +544,17 @@ impl ClusterObjects {
                 .workloads
                 .get_mut(&key)
                 .ok_or_else(|| ApiRefusal::not_found(resource.resource(), name))?;
+            admits_write(
+                resource.resource(),
+                Some(APPS_API_GROUP),
+                name,
+                workload.resource_version,
+                manifest,
+            )?;
             let rolled = workload.template() != spec.get("template").unwrap_or(&spec);
             workload.spec = spec;
             workload.metadata = metadata;
+            workload.resource_version = self.versions.next();
             rolled
         };
         if rolled {
@@ -749,9 +770,17 @@ impl ClusterObjects {
                 Some(held) => {
                     let rolled = held.spec != spec;
                     held.spec = spec;
+                    // A write of the workload, so it stands at a new revision;
+                    // an add-on whose workload has not changed leaves the one it
+                    // already stood at, which is what makes converging again
+                    // change nothing a client reads.
+                    if rolled {
+                        held.resource_version = self.versions.next();
+                    }
                     rolled
                 }
                 None => {
+                    let resource_version = self.versions.next();
                     let Some(held) = self.namespaces.get_mut(&workload.namespace) else {
                         continue;
                     };
@@ -760,6 +789,7 @@ impl ClusterObjects {
                         WorkloadObject {
                             uid: new_object_uid(),
                             created_at: now,
+                            resource_version,
                             metadata: workload.object_metadata(),
                             spec,
                             pods: BTreeSet::new(),

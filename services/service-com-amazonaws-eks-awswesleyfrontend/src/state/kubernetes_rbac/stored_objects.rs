@@ -13,6 +13,8 @@
 
 use super::*;
 
+use crate::state::kubernetes_resource_versions::admits_write;
+
 /// The body a manifest of `resource` carries, or the `Status` the API server
 /// refuses a manifest it cannot read as that resource with.
 pub(super) fn body_from_manifest(
@@ -251,6 +253,7 @@ impl ClusterObjects {
     ) -> Result<::serde_json::Value, ApiRefusal> {
         let name = manifest_name(manifest, resource.kind())?;
         let body = body_from_manifest(resource, manifest)?;
+        let resource_version = self.versions.next();
         let scope = self.rbac_scope_mut(resource, namespace)?;
         if scope.contains_key(&(resource, name.clone())) {
             return Err(ApiRefusal::already_exists(resource.resource(), &name));
@@ -271,6 +274,7 @@ impl ClusterObjects {
             RbacObject {
                 uid: new_object_uid(),
                 created_at: now,
+                resource_version,
                 body,
             },
         );
@@ -279,6 +283,12 @@ impl ClusterObjects {
 
     /// `PUT` of an RBAC object: replace what the object holds, keeping the identity
     /// the create minted for it, which is what an update of an object does.
+    ///
+    /// A manifest carrying a `metadata.resourceVersion` asks for the write to be
+    /// made only while the object still stands at that revision
+    /// ([`super::super::kubernetes_resource_versions`]), so one carrying a revision
+    /// the object has moved on from is refused and the rules it holds are left as
+    /// they were.
     pub fn replace_rbac_object(
         &mut self,
         resource: RbacResource,
@@ -287,11 +297,20 @@ impl ClusterObjects {
         manifest: &::serde_json::Value,
     ) -> Result<::serde_json::Value, ApiRefusal> {
         let body = body_from_manifest(resource, manifest)?;
+        let resource_version = self.versions.next();
         let scope = self.rbac_scope_mut(resource, namespace)?;
         let held = scope
             .get_mut(&(resource, name.to_string()))
             .ok_or_else(|| ApiRefusal::not_found(resource.resource(), name))?;
+        admits_write(
+            resource.resource(),
+            Some(RBAC_API_GROUP),
+            name,
+            held.resource_version,
+            manifest,
+        )?;
         held.body = body;
+        held.resource_version = resource_version;
         self.rbac_object_json(resource, namespace, name)
     }
 

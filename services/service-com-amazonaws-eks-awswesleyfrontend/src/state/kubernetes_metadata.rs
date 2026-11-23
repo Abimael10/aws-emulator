@@ -8,8 +8,9 @@
 //! annotations the manifest carried are kept on the record and reported back by
 //! the create and by every later read — a client that labels a workload and then
 //! selects on that label reads its own label back. The members the server itself
-//! owns (the name, the namespace, the minted `uid` and the creation instant) are
-//! rendered beside them from the record rather than from the manifest.
+//! owns (the name, the namespace, the minted `uid`, the creation instant and the
+//! revision the write that stored the object was stamped with) are rendered beside
+//! them from the record rather than from the manifest.
 //!
 //! One renderer for every object kind of [`super::kubernetes_objects`], so a
 //! Namespace, a ServiceAccount, a Pod and a ConfigMap cannot disagree about what
@@ -62,8 +63,9 @@ impl ObjectMetadata {
     }
 
     /// This object's `metadata` as a client reads it: what the server owns (the
-    /// name, the namespace of a namespaced object, the uid it minted and the
-    /// instant it created the object) and what the client submitted.
+    /// name, the namespace of a namespaced object, the uid it minted, the instant
+    /// it created the object and the revision `resource_version` of the write that
+    /// last stored it) and what the client submitted.
     ///
     /// An empty label or annotation map is left out rather than reported as an
     /// empty object, which is how the API server reports an object carrying
@@ -75,6 +77,7 @@ impl ObjectMetadata {
         namespace: Option<&str>,
         uid: &str,
         created_at: SystemTime,
+        resource_version: u64,
     ) -> ::serde_json::Value {
         let mut metadata = ::serde_json::Map::new();
         metadata.insert("name".to_string(), ::serde_json::json!(name));
@@ -82,6 +85,12 @@ impl ObjectMetadata {
             metadata.insert("namespace".to_string(), ::serde_json::json!(namespace));
         }
         metadata.insert("uid".to_string(), ::serde_json::json!(uid));
+        // The revision this object stands at, which a client hands back to write
+        // it ([`super::kubernetes_resource_versions`]).
+        metadata.insert(
+            "resourceVersion".to_string(),
+            ::serde_json::json!(kubernetes_resource_versions::rendered(resource_version)),
+        );
         metadata.insert(
             "creationTimestamp".to_string(),
             ::serde_json::json!(kubernetes_objects::rfc3339_seconds(created_at)),

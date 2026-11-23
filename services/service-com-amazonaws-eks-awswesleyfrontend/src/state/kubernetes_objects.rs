@@ -34,6 +34,7 @@ use super::kubernetes_image_pull::{
 use super::kubernetes_lists::{listed, ListRequest};
 use super::kubernetes_metadata::ObjectMetadata;
 use super::kubernetes_pod_spec::admitted_pod_spec;
+use super::kubernetes_resource_versions::ResourceVersions;
 use super::*;
 
 use super::kubernetes_rbac::RbacScope;
@@ -113,6 +114,11 @@ pub struct ClusterObjects {
     /// ([`super::kubernetes_rbac`]). Bounded by
     /// [`super::kubernetes_rbac::MAX_RBAC_OBJECTS_PER_SCOPE`] per resource.
     pub cluster_rbac: RbacScope,
+    /// The revision every write of these objects is stamped with, and which each
+    /// object reports as its `metadata.resourceVersion`
+    /// ([`super::kubernetes_resource_versions`]). One counter per cluster, so no
+    /// two objects of it carry one revision.
+    pub versions: ResourceVersions,
 }
 
 /// One namespace and the objects inside it.
@@ -120,6 +126,8 @@ pub struct ClusterObjects {
 pub struct NamespaceObject {
     pub uid: String,
     pub created_at: SystemTime,
+    /// The revision the write that last stored this namespace was stamped with.
+    pub resource_version: u64,
     /// The labels and annotations the manifest carried.
     pub metadata: ObjectMetadata,
     /// The service accounts of this namespace, by name. Bounded by
@@ -152,17 +160,21 @@ impl NamespaceObject {
     /// service account Kubernetes creates in every namespace.
     ///
     /// The ONE constructor, so the namespaces a cluster is created with and the
-    /// ones a client creates afterwards hold the same objects.
-    fn new(metadata: ObjectMetadata, now: SystemTime) -> Self {
+    /// ones a client creates afterwards hold the same objects — and both the
+    /// namespace and the account inside it are stamped with the revision of the
+    /// write that stored them, as every object of this store is.
+    fn new(metadata: ObjectMetadata, now: SystemTime, versions: &ResourceVersions) -> Self {
         Self {
             uid: new_object_uid(),
             created_at: now,
+            resource_version: versions.next(),
             metadata,
             service_accounts: [(
                 DEFAULT_SERVICE_ACCOUNT.to_string(),
                 ServiceAccountObject {
                     uid: new_object_uid(),
                     created_at: now,
+                    resource_version: versions.next(),
                     metadata: ObjectMetadata::default(),
                 },
             )]
@@ -183,6 +195,8 @@ impl NamespaceObject {
 pub struct ServiceAccountObject {
     pub uid: String,
     pub created_at: SystemTime,
+    /// The revision the write that last stored this account was stamped with.
+    pub resource_version: u64,
     /// The labels and annotations the manifest carried — among them the ones a
     /// client puts on an account to bind it to an IAM role.
     pub metadata: ObjectMetadata,
@@ -288,6 +302,8 @@ const POD_START_ERROR_EXIT_CODE: i64 = 128;
 pub struct PodObject {
     pub uid: String,
     pub created_at: SystemTime,
+    /// The revision the write that stored this pod was stamped with.
+    pub resource_version: u64,
     /// The labels and annotations the manifest carried.
     pub metadata: ObjectMetadata,
     /// The service account the pod runs as: `spec.serviceAccountName`, or the
@@ -643,16 +659,18 @@ impl ClusterObjects {
     /// uids are minted, never derived from a request.
     #[must_use]
     pub fn for_new_cluster(now: SystemTime) -> Self {
+        let versions = ResourceVersions::default();
         let mut namespaces = BTreeMap::new();
         for name in INITIAL_NAMESPACES {
             namespaces.insert(
                 name.to_string(),
-                NamespaceObject::new(ObjectMetadata::default(), now),
+                NamespaceObject::new(ObjectMetadata::default(), now, &versions),
             );
         }
         Self {
             namespaces,
             cluster_rbac: BTreeMap::new(),
+            versions,
         }
     }
 
@@ -689,6 +707,7 @@ impl ClusterObjects {
             NamespaceObject::new(
                 ObjectMetadata::from_manifest("Namespace", &name, manifest)?,
                 now,
+                &self.versions,
             ),
         );
         self.namespace_json(&name)
@@ -705,6 +724,7 @@ impl ClusterObjects {
                 None,
                 &namespace.uid,
                 namespace.created_at,
+                namespace.resource_version,
             ),
             "spec": {},
             "status": { "phase": "Active" },
@@ -732,6 +752,7 @@ impl ClusterObjects {
         // namespace that does not exist.
         self.namespace(namespace)?;
         let metadata = ObjectMetadata::from_manifest("ServiceAccount", &name, manifest)?;
+        let resource_version = self.versions.next();
         let held = self
             .namespaces
             .get_mut(namespace)
@@ -750,6 +771,7 @@ impl ClusterObjects {
             ServiceAccountObject {
                 uid: new_object_uid(),
                 created_at: now,
+                resource_version,
                 metadata,
             },
         );
@@ -775,6 +797,7 @@ impl ClusterObjects {
                 Some(namespace),
                 &account.uid,
                 account.created_at,
+                account.resource_version,
             ),
         }))
     }
@@ -835,6 +858,7 @@ impl ClusterObjects {
         // stored until it has been admitted, so a refused create writes nothing.
         let spec = admitted_pod_spec(&name, manifest, &service_account_name)?;
         let metadata = ObjectMetadata::from_manifest("Pod", &name, manifest)?;
+        let resource_version = self.versions.next();
         let held = self
             .namespaces
             .get_mut(namespace)
@@ -850,6 +874,7 @@ impl ClusterObjects {
             PodObject {
                 uid: new_object_uid(),
                 created_at: now,
+                resource_version,
                 metadata,
                 service_account_name,
                 spec,
@@ -912,7 +937,13 @@ impl ClusterObjects {
         Ok(::serde_json::json!({
             "kind": "Pod",
             "apiVersion": CORE_API_VERSION,
-            "metadata": pod.metadata.render(name, Some(namespace), &pod.uid, pod.created_at),
+            "metadata": pod.metadata.render(
+                name,
+                Some(namespace),
+                &pod.uid,
+                pod.created_at,
+                pod.resource_version,
+            ),
             // The spec this create was admitted with, read back unchanged.
             "spec": pod.spec,
             // What the pod has reached on the node it was bound to.
@@ -1145,6 +1176,34 @@ impl ApiRefusal {
             status: 409,
             reason: "AlreadyExists",
             message: format!("{resource} \"{name}\" already exists"),
+            resource: Some((resource.to_string(), name.to_string())),
+        }
+    }
+
+    /// The `Status` a write of an object that has been written since the client
+    /// read it is answered with: `409 Conflict`, in the sentence apimachinery
+    /// words a failed optimistic-concurrency check in — the sentence a client
+    /// retries its update loop on
+    /// ([`super::kubernetes_resource_versions`]).
+    ///
+    /// The sentence names the resource the way apimachinery names a qualified one:
+    /// the plural resource of the core group as it stands, and the resource of any
+    /// other group followed by that group — so an object of `apps` is named
+    /// `<resource>.apps`. `api_group` is the group the resource belongs to, and
+    /// `None` the core group, which has no name.
+    #[must_use]
+    pub fn conflict(resource: &str, api_group: Option<&str>, name: &str) -> Self {
+        let qualified = match api_group {
+            Some(api_group) => format!("{resource}.{api_group}"),
+            None => resource.to_string(),
+        };
+        Self {
+            status: 409,
+            reason: "Conflict",
+            message: format!(
+                "Operation cannot be fulfilled on {qualified} \"{name}\": the object has been \
+                 modified; please apply your changes to the latest version and try again"
+            ),
             resource: Some((resource.to_string(), name.to_string())),
         }
     }

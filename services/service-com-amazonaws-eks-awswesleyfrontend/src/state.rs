@@ -4883,6 +4883,7 @@ pub mod kubernetes_openapi;
 pub mod kubernetes_pod_spec;
 pub mod kubernetes_protobuf;
 pub mod kubernetes_rbac;
+pub mod kubernetes_resource_versions;
 pub mod kubernetes_self_subject_review;
 pub mod kubernetes_subject_access_review;
 pub mod kubernetes_version_info;
