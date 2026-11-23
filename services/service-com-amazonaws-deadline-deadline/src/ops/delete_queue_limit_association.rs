@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteQueueLimitAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteQueueLimitAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Takes a queue-limit association out of this service's store, so every later read of the
+//! three ids its path names is the 404 for an association nothing holds and the limit it
+//! referenced is free to be deleted.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteQueueLimitAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The association hangs off its queue, keyed by `limitId`, exactly as the model's path
+//! (`/2023-10-12/farms/{farmId}/queue-limit-associations/{queueId}/{limitId}`) reaches it,
+//! so a delete naming an unheld farm, an unheld queue of that farm, an unheld limit of that
+//! farm or a pair that queue is not associated with removes nothing and answers a 404 naming
+//! the level that is missing.
+//!
+//! The operation's own documentation states the precondition: the association is stopped
+//! through `UpdateQueueLimitAssociation`, the status does not change immediately, and
+//! `GetQueueLimitAssociation` is polled for `STOPPED` before the delete. An association in
+//! any other status is still subjecting the queue's work to the limit, or still winding that
+//! usage down, so the delete is refused as a conflict over the status it is in
+//! ([`crate::state::queue_limit_association_not_stopped`]) and removes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +160,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteQueueLimitAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteQueueLimitAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteQueueLimitAssociation"))
+        // The deletion is driven entirely by the path's ids and by the stored association,
+        // so nothing is read off the request's metadata.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteQueueLimitAssociationErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+        let mut store = state.lock();
+
+        // An association joins a queue and a limit OF ONE FARM, so each missing level is a
+        // 404 naming that level and nothing is removed.
+        if store.farm(&input.farm_id).is_none() {
+            return Err(
+                DeleteQueueLimitAssociationErrorModeled::ResourceNotFoundException(
+                    crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+                )
+                .into(),
+            );
+        }
+        if store.queue(&input.farm_id, &input.queue_id).is_none() {
+            return Err(
+                DeleteQueueLimitAssociationErrorModeled::ResourceNotFoundException(
+                    crate::state::not_found(crate::state::RESOURCE_TYPE_QUEUE, &input.queue_id),
+                )
+                .into(),
+            );
+        }
+        // Every level the path names is reported as itself: a limitId no limit of this farm
+        // carries is the LIMIT that can't be found, because an association exists only where
+        // that limit does.
+        if store.limit(&input.farm_id, &input.limit_id).is_none() {
+            return Err(
+                DeleteQueueLimitAssociationErrorModeled::ResourceNotFoundException(
+                    crate::state::not_found(crate::state::RESOURCE_TYPE_LIMIT, &input.limit_id),
+                )
+                .into(),
+            );
+        }
+        // Past that, the association is identified by the three ids of its path, so a held
+        // limit this queue is not associated with is the association that can't be found.
+        // The stop the clock already finished is materialised before the status is read, so
+        // a delete asked for after it is due is not refused for a status nothing holds.
+        let Some(association) = store.settled_queue_limit_association(
+            &input.farm_id,
+            &input.queue_id,
+            &input.limit_id,
+        ) else {
+            return Err(
+                DeleteQueueLimitAssociationErrorModeled::ResourceNotFoundException(
+                    crate::state::queue_limit_association_not_found(
+                        &input.farm_id,
+                        &input.queue_id,
+                        &input.limit_id,
+                    ),
+                )
+                .into(),
+            );
+        };
+        // Still subjecting the queue's work to the limit, or still winding that usage down:
+        // the association can't be taken out from under that work.
+        if !association.stopped() {
+            let status = association.status.clone();
+            return Err(DeleteQueueLimitAssociationErrorModeled::ConflictException(
+                crate::state::queue_limit_association_not_stopped(
+                    &input.farm_id,
+                    &input.queue_id,
+                    &input.limit_id,
+                    &status,
+                ),
+            )
+            .into());
+        }
+
+        let Some(queue) = store.queue_mut(&input.farm_id, &input.queue_id) else {
+            return Err(
+                DeleteQueueLimitAssociationErrorModeled::ResourceNotFoundException(
+                    crate::state::not_found(crate::state::RESOURCE_TYPE_QUEUE, &input.queue_id),
+                )
+                .into(),
+            );
+        };
+        queue.limit_associations.remove(&input.limit_id);
+
+        Ok(DeleteQueueLimitAssociationOutput {})
     }
 }

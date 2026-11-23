@@ -44,8 +44,12 @@ fn limits_path(farm_id: &str) -> String {
     format!("/2023-10-12/farms/{farm_id}/limits")
 }
 
-/// Single-limit path, from `smithy_query(query="operation", operation="GetLimit")`.
-fn limit_path(farm_id: &str, limit_id: &str) -> String {
+/// Single-limit path, from `smithy_query(query="operation", operation="GetLimit")` — the
+/// same path `DeleteLimit` takes.
+///
+/// `pub(crate)` so every suite in this test target reads and deletes a limit at the same
+/// path.
+pub(crate) fn limit_path(farm_id: &str, limit_id: &str) -> String {
     format!("/2023-10-12/farms/{farm_id}/limits/{limit_id}")
 }
 

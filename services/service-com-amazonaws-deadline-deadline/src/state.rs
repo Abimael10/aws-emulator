@@ -1863,57 +1863,86 @@ pub fn limit_in_use_by_queues(limit_id: &str) -> crate::ops::types::ConflictExce
     in_use_by_queues(RESOURCE_TYPE_LIMIT, limit_id, "Limit")
 }
 
+/// The 409 this service answers when a resource it only lets go of once that resource has
+/// stopped is deleted before it has.
+///
+/// The resource whose delete was refused is the resource in conflict, and the status it is
+/// in is the one value the sentence varies on — read from the store, never from the request.
+/// `display_noun` is how this service names that resource in prose. One place to change: the
+/// fixed text is the wording of this error class, not of one operation.
+fn not_stopped(
+    display_noun: &str,
+    resource_type: &str,
+    resource_id: &str,
+    status: &str,
+) -> crate::ops::types::ConflictException {
+    crate::ops::types::ConflictException {
+        message: format!("{display_noun} is in {status} status and cannot be deleted."),
+        // From `smithy_query(query="shape", shape="ConflictExceptionReason")`:
+        // CONFLICT_EXCEPTION, CONCURRENT_MODIFICATION, RESOURCE_ALREADY_EXISTS,
+        // RESOURCE_IN_USE, STATUS_CONFLICT. What conflicts is the status the resource is
+        // in, not another caller's hold on it.
+        reason: "STATUS_CONFLICT".to_string(),
+        resource_id: resource_id.to_string(),
+        resource_type: resource_type.to_string(),
+        context: None,
+    }
+}
+
 /// The 409 this service answers when a queue-fleet association is deleted before it has
 /// stopped.
 ///
 /// An association that is not [`QUEUE_FLEET_ASSOCIATION_STATUS_STOPPED`] is still holding
 /// the queue's work on the fleet — scheduling it (`ACTIVE`) or draining it (the two
 /// `STOP_SCHEDULING_AND_*` statuses) — so the association itself is the resource in
-/// conflict and the status it is in is the one value the message varies on; it is read from
-/// the store, never from the request.
+/// conflict. See [`not_stopped`] for the class.
 pub fn queue_fleet_association_not_stopped(
     farm_id: &str,
     queue_id: &str,
     fleet_id: &str,
     status: &str,
 ) -> crate::ops::types::ConflictException {
-    let resource_id = queue_fleet_association_id(farm_id, queue_id, fleet_id);
-    crate::ops::types::ConflictException {
-        message: format!("QueueFleetAssociation is in {status} status and cannot be deleted."),
-        // From `smithy_query(query="shape", shape="ConflictExceptionReason")`:
-        // CONFLICT_EXCEPTION, CONCURRENT_MODIFICATION, RESOURCE_ALREADY_EXISTS,
-        // RESOURCE_IN_USE, STATUS_CONFLICT. What conflicts is the status the association
-        // is in, not another caller's hold on it.
-        reason: "STATUS_CONFLICT".to_string(),
-        resource_id,
-        resource_type: RESOURCE_TYPE_QUEUE_FLEET_ASSOCIATION.to_string(),
-        context: None,
-    }
+    not_stopped(
+        "QueueFleetAssociation",
+        RESOURCE_TYPE_QUEUE_FLEET_ASSOCIATION,
+        &queue_fleet_association_id(farm_id, queue_id, fleet_id),
+        status,
+    )
+}
+
+/// The 409 this service answers when a queue-limit association is deleted before it has
+/// stopped.
+///
+/// `smithy_query(query="doc", shape="DeleteQueueLimitAssociation")` states the
+/// precondition: the association is stopped through `UpdateQueueLimitAssociation` and the
+/// status does not change immediately, so an association that is not
+/// [`QUEUE_LIMIT_ASSOCIATION_STATUS_STOPPED`] is still subjecting the queue's work to the
+/// limit (`ACTIVE`) or winding that usage down (the two `STOP_LIMIT_USAGE_AND_*` statuses)
+/// and is the resource in conflict. The same class as for the queue's other association:
+/// see [`not_stopped`].
+pub fn queue_limit_association_not_stopped(
+    farm_id: &str,
+    queue_id: &str,
+    limit_id: &str,
+    status: &str,
+) -> crate::ops::types::ConflictException {
+    not_stopped(
+        "QueueLimitAssociation",
+        RESOURCE_TYPE_QUEUE_LIMIT_ASSOCIATION,
+        &queue_limit_association_id(farm_id, queue_id, limit_id),
+        status,
+    )
 }
 
 /// The 409 this service answers when a worker that has started is deleted before it has
 /// stopped.
 ///
 /// A worker [`Worker::deletable`] is false for is still registered with the fleet's
-/// scheduler, so the worker itself is the resource in conflict and the status it is in is
-/// the one value the message varies on; it is read from the store, never from the request.
-/// Worded the way this crate words the same refusal for the other resource this service only
-/// lets go of once it has stopped (see [`queue_fleet_association_not_stopped`]). One place to
-/// change: the sentence this error class carries is not recoverable from the replay harness,
-/// which reports only what the emulator answered, so it is this crate's own wording for the
-/// class until a recording names it.
+/// scheduler, so the worker itself is the resource in conflict. Worded the way this crate
+/// words the same refusal for every other resource this service only lets go of once it has
+/// stopped: see [`not_stopped`].
 pub fn worker_not_stopped(worker_id: &str, status: &str) -> crate::ops::types::ConflictException {
-    crate::ops::types::ConflictException {
-        message: format!("Worker is in {status} status and cannot be deleted."),
-        // From `smithy_query(query="shape", shape="ConflictExceptionReason")`:
-        // CONFLICT_EXCEPTION, CONCURRENT_MODIFICATION, RESOURCE_ALREADY_EXISTS,
-        // RESOURCE_IN_USE, STATUS_CONFLICT. What conflicts is the status the worker is in,
-        // not another caller's hold on it.
-        reason: "STATUS_CONFLICT".to_string(),
-        resource_id: worker_id.to_string(),
-        resource_type: RESOURCE_TYPE_WORKER.to_string(),
-        context: None,
-    }
+    not_stopped("Worker", RESOURCE_TYPE_WORKER, worker_id, status)
 }
 
 /// The 409 this service answers when an update is asked for a job that has been archived.

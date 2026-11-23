@@ -86,7 +86,9 @@ async fn ask_for_status(
 
 /// Ask for `status` and fail the test unless the update was accepted with the modelled empty
 /// response.
-async fn update(
+///
+/// `pub(crate)` so the delete suite stops an association exactly the way this one does.
+pub(crate) async fn update(
     emulator: &Emulator,
     case: &str,
     farm_id: &str,
@@ -108,7 +110,9 @@ async fn update(
 
 /// Read the association until it reports `wanted`, or until [`POLL_DEADLINE`] passes — the
 /// loop a client polling for a clock-owed status runs. Answers the document that reported it.
-async fn poll_until_status(
+///
+/// `pub(crate)` so the delete suite waits for the stop the same way.
+pub(crate) async fn poll_until_status(
     emulator: &Emulator,
     case: &str,
     farm_id: &str,
