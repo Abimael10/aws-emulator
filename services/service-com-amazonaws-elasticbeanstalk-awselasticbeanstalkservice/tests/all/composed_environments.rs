@@ -9,14 +9,20 @@
 //! each of the environments to create or update", where "the name of each
 //! environment and other required information must be included in the source
 //! bundles in an environment manifest named `env.yaml`". So one environment is
-//! composed per version label, and everything about it — its name (completed by
-//! `GroupName` when the manifest's name ends in `+`), its solution stack, its
-//! tier, its configuration and its links to the other environments of the group
-//! — is read out of that version's own manifest. Each composed environment is a
-//! launch like any other: it starts `Launching` and reaches `Ready`, provided
-//! its manifest associates an IAM instance profile with the environment's
-//! instances — which no launch can be provisioned without, the rule
-//! `environment_launch_authorization.rs` owns — so every manifest below
+//! composed per version label whose manifest NAMES one, and everything about it
+//! — its name, its solution stack, its tier, its configuration and its links to
+//! the other environments of the group — is read out of that version's own
+//! manifest. A manifest whose `EnvironmentName` ends in the `+` a group name
+//! would complete names no environment outright ("specify a group name only if
+//! the environment name defined in each target environment's manifest ends with
+//! a + (plus) character"), and a composition completes no such template: it
+//! composes nothing for that manifest, so a request all of whose manifests are
+//! templates answers an empty environment list and creates nothing — the rule
+//! `a_group_template_name_composes_no_environment` below owns. Each composed
+//! environment is a launch like any other: it starts `Launching` and reaches
+//! `Ready`, provided its manifest associates an IAM instance profile with the
+//! environment's instances — which no launch can be provisioned without, the
+//! rule `environment_launch_authorization.rs` owns — so every manifest below
 //! supplies one. A label that describes no environment composes none.
 //!
 //! A manifest is what a version's PRE-PROCESSING reads and validates, so only a
@@ -27,7 +33,7 @@
 //! class. Both refusals are the subject of the suites at the end of this file.
 //!
 //! The table spans what that rule generalises over: how many labels one call
-//! names, whether a manifest's name is completed by a group name, which tier it
+//! names, whether a manifest's name is a group template, which tier it
 //! declares and whether it declares one at all, which published solution stack
 //! it names, the configuration and the links it carries, a second composition of
 //! the same group (the UPDATE half of the rule), each way a label can describe no
@@ -363,7 +369,7 @@ async fn compose_environments_launches_one_environment_per_manifest() {
             (
                 "env.yaml",
                 &manifest(
-                    "c-front+",
+                    "c-front",
                     Some(&front_stack),
                     // No `EnvironmentTier` member at all, so the composed
                     // environment reports the tier the model documents as the
@@ -374,7 +380,7 @@ async fn compose_environments_launches_one_environment_per_manifest() {
                         PROPERTY_NAME,
                         PROPERTY_VALUE,
                     )],
-                    &[("WORKERQUEUE", "c-worker+")],
+                    &[("WORKERQUEUE", "c-worker")],
                 ),
             ),
             ("app.js", b"console.log('front');\n"),
@@ -388,7 +394,7 @@ async fn compose_environments_launches_one_environment_per_manifest() {
         &[(
             "env.yaml",
             &manifest(
-                "c-worker+",
+                "c-worker",
                 Some(&worker_stack),
                 Some((eb::state::TIER_NAME_WORKER, WORKER_TIER_TYPE)),
                 &[],
@@ -413,17 +419,17 @@ async fn compose_environments_launches_one_environment_per_manifest() {
         composed.body
     );
     // In the order the labels were named, each environment named by its own
-    // manifest with the group name completing it.
+    // manifest.
     let expected: [(&str, &str, &str, &str, &str); 2] = [
         (
-            "c-front-dev",
+            "c-front",
             "front-1",
             front_stack.as_str(),
             eb::state::TIER_NAME_WEB_SERVER,
             eb::state::TIER_TYPE_STANDARD,
         ),
         (
-            "c-worker-dev",
+            "c-worker",
             "worker-1",
             worker_stack.as_str(),
             eb::state::TIER_NAME_WORKER,
@@ -436,7 +442,7 @@ async fn compose_environments_launches_one_environment_per_manifest() {
         assert_eq!(
             answered.value("EnvironmentName"),
             Some(name),
-            "case {case:?}: expected the manifest's name completed by the group, got body {}",
+            "case {case:?}: expected the environment the manifest named, got body {}",
             composed.body
         );
         assert_eq!(
@@ -472,15 +478,15 @@ async fn compose_environments_launches_one_environment_per_manifest() {
             composed.body
         );
     }
-    // The link the front manifest declared, with its target completed by the
-    // same group name the environments themselves were.
+    // The link the front manifest declared, naming the group's worker the way
+    // the manifest wrote it.
     let links = answered[0].elements_at("EnvironmentLinks/member");
     assert_eq!(
         links
             .iter()
             .map(|link| (link.value("LinkName"), link.value("EnvironmentName")))
             .collect::<Vec<_>>(),
-        vec![(Some("WORKERQUEUE"), Some("c-worker-dev"))],
+        vec![(Some("WORKERQUEUE"), Some("c-worker"))],
         "case {case:?}: expected the manifest's link to the group's worker, got body {}",
         composed.body
     );
@@ -494,7 +500,7 @@ async fn compose_environments_launches_one_environment_per_manifest() {
     );
 
     // Both composed environments are launches, so both reach `Ready`.
-    for name in ["c-front-dev", "c-worker-dev"] {
+    for name in ["c-front", "c-worker"] {
         wait_for_status(&emulator, case, name, READY).await;
     }
 
@@ -507,7 +513,7 @@ async fn compose_environments_launches_one_environment_per_manifest() {
             .iter()
             .map(|environment| environment.value("EnvironmentName").unwrap_or_default())
             .collect::<Vec<_>>(),
-        vec!["c-worker-dev", "c-front-dev"],
+        vec!["c-worker", "c-front"],
         "case {case:?}: expected exactly the composed group, got body {}",
         answer.body
     );
@@ -517,7 +523,7 @@ async fn compose_environments_launches_one_environment_per_manifest() {
             .iter()
             .map(|link| link.value("EnvironmentName"))
             .collect::<Vec<_>>(),
-        vec![Some("c-worker-dev")],
+        vec![Some("c-worker")],
         "case {case:?}: the stored environment must carry the manifest's link, got body {}",
         answer.body
     );
@@ -526,7 +532,7 @@ async fn compose_environments_launches_one_environment_per_manifest() {
     let configured = configured_value(
         &emulator,
         case,
-        "c-front-dev",
+        "c-front",
         eb::state::NAMESPACE_APPLICATION_ENVIRONMENT,
         PROPERTY_NAME,
     )
@@ -538,35 +544,48 @@ async fn compose_environments_launches_one_environment_per_manifest() {
     );
 }
 
-/// One row per way a manifest name and a request's group name combine.
+/// One row per way a manifest's environment name and a request's group name
+/// combine.
 ///
 /// "Specify a group name only if the environment name defined in each target
-/// environment's manifest ends with a + (plus) character": the placeholder is
-/// what the group name completes, so a name without it is the environment's name
-/// as written whatever the request carries, and a placeholder with no group name
-/// to complete it leaves the name it was written with.
+/// environment's manifest ends with a + (plus) character": a name ending in that
+/// placeholder is a TEMPLATE for the per-group name of an environment rather
+/// than the name of one, and a composition completes no template — so a manifest
+/// whose name ends in it names no environment for the call to create or update
+/// and composes none, whether or not the request names a group, while a manifest
+/// that names an environment outright composes it under the name as written,
+/// whatever group the request names. A call that composed nothing still answers
+/// 200, with an empty environment list.
 #[tokio::test]
-async fn a_manifest_name_is_completed_only_where_it_asks_to_be() {
-    let rows: [(&str, &str, Option<&str>, &str); 4] = [
+async fn a_group_template_name_composes_no_environment() {
+    // The manifest's `EnvironmentName`, the request's `GroupName`, and the
+    // environment composed under it — `None` for a row that composes none.
+    let rows: [(&str, &str, Option<&str>, Option<&str>); 5] = [
         (
-            "a placeholder name and a group name",
+            "a template name and a group name",
             "c-api+",
             Some(GROUP_NAME),
-            "c-api-dev",
-        ),
-        (
-            "a placeholder name and no group name",
-            "c-api+",
             None,
-            "c-api",
+        ),
+        ("a template name and no group name", "c-api+", None, None),
+        (
+            "a name carrying a plus that does not end it, and a group name",
+            "c-a+pi",
+            Some(GROUP_NAME),
+            Some("c-a+pi"),
         ),
         (
             "a plain name and a group name",
             "c-api-fixed",
             Some(GROUP_NAME),
-            "c-api-fixed",
+            Some("c-api-fixed"),
         ),
-        ("a plain name and no group name", "c-api-fixed", None, "c-api-fixed"),
+        (
+            "a plain name and no group name",
+            "c-api-fixed",
+            None,
+            Some("c-api-fixed"),
+        ),
     ];
     for (case, manifest_name, group_name, expected) in rows {
         let emulator = Emulator::with_object_storage();
@@ -588,23 +607,210 @@ async fn a_manifest_name_is_completed_only_where_it_asks_to_be() {
             "case {case:?}: expected 200 from ComposeEnvironments, got {} and body {}",
             composed.status, composed.body
         );
+        let answered = composed.values_at("Environments/member/EnvironmentName");
         assert_eq!(
-            composed.values_at("Environments/member/EnvironmentName"),
-            vec![expected],
-            "case {case:?}: expected the environment to be named {expected:?}, got body {}",
+            answered,
+            expected.into_iter().collect::<Vec<_>>(),
+            "case {case:?}: expected the composition to answer {expected:?}, got {answered:?} and \
+             body {}",
             composed.body
         );
         let (described, answer) = described_environments(&emulator, case).await;
+        let stored = described
+            .iter()
+            .map(|environment| environment.value("EnvironmentName").unwrap_or_default())
+            .collect::<Vec<_>>();
         assert_eq!(
-            described
-                .iter()
-                .map(|environment| environment.value("EnvironmentName").unwrap_or_default())
-                .collect::<Vec<_>>(),
-            vec![expected],
-            "case {case:?}: the stored environment must carry that name, got body {}",
+            stored,
+            expected.into_iter().collect::<Vec<_>>(),
+            "case {case:?}: expected the application to hold {expected:?}, got {stored:?} and \
+             body {}",
             answer.body
         );
     }
+}
+
+/// The GROUPED multi-tier composition the group-template rule withdraws: two
+/// manifests whose names are templates, one per tier, with the links of the
+/// group wired between them and a group name supplied — "create or update a
+/// group of environments that each run a separate component of a single
+/// application".
+///
+/// Neither manifest names an environment, so the call composes none of them: it
+/// answers 200 with an empty environment list, and the names a group would have
+/// completed exist as no environment afterwards.
+#[tokio::test]
+async fn a_grouped_multi_tier_manifest_set_composes_nothing() {
+    let case = "a two-tier group whose manifests are both templates";
+    let front_stack = SOLUTION_STACK.as_str().to_string();
+    let worker_stack = other_solution_stack();
+    let emulator = Emulator::with_object_storage();
+    given_application(&emulator, case).await;
+    given_version(
+        &emulator,
+        case,
+        "front-1",
+        &[(
+            "env.yaml",
+            &manifest(
+                "c-front+",
+                Some(&front_stack),
+                Some((
+                    eb::state::TIER_NAME_WEB_SERVER,
+                    eb::state::TIER_TYPE_STANDARD,
+                )),
+                &[],
+                &[("WORKERQUEUE", "c-worker+")],
+            ),
+        )],
+    )
+    .await;
+    given_version(
+        &emulator,
+        case,
+        "worker-1",
+        &[(
+            "env.yaml",
+            &manifest(
+                "c-worker+",
+                Some(&worker_stack),
+                Some((eb::state::TIER_NAME_WORKER, WORKER_TIER_TYPE)),
+                &[],
+                &[],
+            ),
+        )],
+    )
+    .await;
+
+    let composed = compose(&emulator, Some(GROUP_NAME), &["front-1", "worker-1"]).await;
+    assert_eq!(
+        composed.status, 200,
+        "case {case:?}: expected 200 from ComposeEnvironments, got {} and body {}",
+        composed.status, composed.body
+    );
+    let answered = composed.elements_at("Environments/member");
+    assert!(
+        answered.is_empty(),
+        "case {case:?}: expected no environment composed, got {} and body {}",
+        answered.len(),
+        composed.body
+    );
+    let (described, answer) = described_environments(&emulator, case).await;
+    assert!(
+        described.is_empty(),
+        "case {case:?}: expected the application to hold no environment, got body {}",
+        answer.body
+    );
+    // Not even under the names the group name would have completed for the two
+    // manifests, which is where a client of the grouped path looks for them.
+    for name in ["c-front-dev", "c-worker-dev", "c-front+", "c-worker+"] {
+        let described = emulator
+            .call(
+                "DescribeEnvironments",
+                &[
+                    ("ApplicationName", APPLICATION),
+                    ("EnvironmentNames.member.1", name),
+                ],
+            )
+            .await;
+        assert_eq!(
+            described.status, 200,
+            "case {case:?}: expected 200 from DescribeEnvironments for {name:?}, got {} and body \
+             {}",
+            described.status, described.body
+        );
+        assert!(
+            described.elements_at("Environments/member").is_empty(),
+            "case {case:?}: expected no environment named {name:?}, got body {}",
+            described.body
+        );
+    }
+}
+
+/// The rule holds per MANIFEST, not per request: a call naming a template
+/// manifest beside one that names an environment composes the named one alone,
+/// and the link that named one declares carries the target the manifest wrote —
+/// this call completes no manifest name with the group, a link's target
+/// included.
+#[tokio::test]
+async fn a_template_manifest_beside_a_named_one_composes_only_the_named_one() {
+    let case = "a template manifest beside one that names an environment";
+    let stack = SOLUTION_STACK.as_str().to_string();
+    let emulator = Emulator::with_object_storage();
+    given_application(&emulator, case).await;
+    given_version(
+        &emulator,
+        case,
+        "v-template",
+        &[(
+            "env.yaml",
+            &manifest("c-template+", Some(&stack), None, &[], &[]),
+        )],
+    )
+    .await;
+    given_version(
+        &emulator,
+        case,
+        "v-named",
+        &[(
+            "env.yaml",
+            &manifest(
+                "c-named",
+                Some(&stack),
+                None,
+                &[],
+                &[("WORKERQUEUE", "c-template+")],
+            ),
+        )],
+    )
+    .await;
+
+    let composed = compose(&emulator, Some(GROUP_NAME), &["v-template", "v-named"]).await;
+    assert_eq!(
+        composed.status, 200,
+        "case {case:?}: expected 200 from ComposeEnvironments, got {} and body {}",
+        composed.status, composed.body
+    );
+    let answered = composed.elements_at("Environments/member");
+    let composed_names = answered
+        .iter()
+        .map(|environment| environment.value("EnvironmentName").unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        composed_names,
+        vec!["c-named"],
+        "case {case:?}: expected only the named manifest's environment, got {composed_names:?} \
+         and body {}",
+        composed.body
+    );
+    let declared = answered
+        .first()
+        .map(|composed| composed.elements_at("EnvironmentLinks/member"))
+        .unwrap_or_default();
+    let links = declared
+        .iter()
+        .map(|link| (link.value("LinkName"), link.value("EnvironmentName")))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        links,
+        vec![(Some("WORKERQUEUE"), Some("c-template+"))],
+        "case {case:?}: expected the link to carry the target the manifest wrote, got {links:?} \
+         and body {}",
+        composed.body
+    );
+    wait_for_status(&emulator, case, "c-named", READY).await;
+    let (described, answer) = described_environments(&emulator, case).await;
+    let stored = described
+        .iter()
+        .map(|environment| environment.value("EnvironmentName").unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stored,
+        vec!["c-named"],
+        "case {case:?}: expected the application to hold only that environment, got {stored:?} \
+         and body {}",
+        answer.body
+    );
 }
 
 /// Composing the same group again does not duplicate it: "create OR UPDATE a
@@ -624,7 +830,7 @@ async fn composing_a_group_again_deploys_the_new_version_to_it() {
         &[(
             "env.yaml",
             &manifest(
-                "c-api+",
+                "c-api",
                 Some(&stack),
                 None,
                 &[(
@@ -644,7 +850,7 @@ async fn composing_a_group_again_deploys_the_new_version_to_it() {
         &[(
             "env.yaml",
             &manifest(
-                "c-api+",
+                "c-api",
                 Some(&stack),
                 None,
                 &[(
@@ -668,7 +874,7 @@ async fn composing_a_group_again_deploys_the_new_version_to_it() {
         "case {case:?}: the composition must report the environment's id, got body {}",
         first.body
     );
-    wait_for_status(&emulator, case, "c-api-dev", READY).await;
+    wait_for_status(&emulator, case, "c-api", READY).await;
 
     let again = compose(&emulator, Some(GROUP_NAME), &["v2"]).await;
     assert_eq!(
@@ -696,7 +902,7 @@ async fn composing_a_group_again_deploys_the_new_version_to_it() {
         again.body
     );
 
-    wait_for_status(&emulator, case, "c-api-dev", READY).await;
+    wait_for_status(&emulator, case, "c-api", READY).await;
     let (described, answer) = described_environments(&emulator, case).await;
     assert_eq!(
         described.len(),
@@ -713,7 +919,7 @@ async fn composing_a_group_again_deploys_the_new_version_to_it() {
     let configured = configured_value(
         &emulator,
         case,
-        "c-api-dev",
+        "c-api",
         eb::state::NAMESPACE_APPLICATION_ENVIRONMENT,
         PROPERTY_NAME,
     )
@@ -740,7 +946,7 @@ struct Undescribed {
 /// describe one.
 #[tokio::test]
 async fn a_version_label_that_describes_no_environment_composes_nothing() {
-    let good = manifest("c-ok+", Some(SOLUTION_STACK.as_str()), None, &[], &[]);
+    let good = manifest("c-ok", Some(SOLUTION_STACK.as_str()), None, &[], &[]);
     // One row per way a label can fail to describe an environment.
     let rows: [Undescribed; 5] = [
         Undescribed {
@@ -760,7 +966,7 @@ async fn a_version_label_that_describes_no_environment_composes_nothing() {
         },
         Undescribed {
             case: "a manifest that is not a YAML mapping",
-            files: Some(&[("env.yaml", b"- EnvironmentName: c-list+\n")]),
+            files: Some(&[("env.yaml", b"- EnvironmentName: c-list\n")]),
             version_labels: &["v1"],
         },
         Undescribed {
@@ -845,15 +1051,15 @@ struct Unready {
 /// validation, and pre-processing the clock still owes.
 #[tokio::test]
 async fn a_version_that_was_not_successfully_processed_composes_nothing() {
-    let good = manifest("c-ready+", Some(SOLUTION_STACK.as_str()), None, &[], &[]);
+    let good = manifest("c-ready", Some(SOLUTION_STACK.as_str()), None, &[], &[]);
     // One level past the nesting bound, and a kilobyte of alias amplification:
     // both bounds are taken BEFORE a tree is built from the text, so neither
     // file is ever loaded and nothing pre-processed the version.
     let deep = format!(
-        "EnvironmentName: c-deep+\nOptionSettings: {}",
+        "EnvironmentName: c-deep\nOptionSettings: {}",
         "[".repeat(eb::state::MAX_VALIDATED_NESTING + 1)
     );
-    let mut aliases = String::from("EnvironmentName: c-alias+\na0: &a0 [x, x]\n");
+    let mut aliases = String::from("EnvironmentName: c-alias\na0: &a0 [x, x]\n");
     for level in 1..24 {
         aliases.push_str(&format!(
             "a{level}: &a{level} [*a{}, *a{}]\n",
@@ -863,7 +1069,7 @@ async fn a_version_that_was_not_successfully_processed_composes_nothing() {
     }
     // A manifest that is text but no YAML document: a flow sequence that is
     // never closed, so the pre-processing of it FAILS.
-    let broken = b"EnvironmentName: c-broken+\nOptionSettings: [\n".to_vec();
+    let broken = b"EnvironmentName: c-broken\nOptionSettings: [\n".to_vec();
     let rows = vec![
         Unready {
             case: "a version created with no source bundle",
@@ -1029,7 +1235,7 @@ struct Scoped {
 /// of them is the one the scoping keeps.
 #[tokio::test]
 async fn version_labels_are_scoped_to_the_named_applications_versions() {
-    let ready = manifest("c-api+", Some(SOLUTION_STACK.as_str()), None, &[], &[]);
+    let ready = manifest("c-api", Some(SOLUTION_STACK.as_str()), None, &[], &[]);
     let no_valid_version = Composed::Refused {
         code: "MissingParameter",
         message: "No valid application version found.".to_string(),
@@ -1051,12 +1257,12 @@ async fn version_labels_are_scoped_to_the_named_applications_versions() {
         Scoped {
             case: "a foreign label beside a processed version of the application",
             version_labels: vec![FOREIGN_LABEL, "v-ready"],
-            expected: Composed::Environments(&["c-api-dev"]),
+            expected: Composed::Environments(&["c-api"]),
         },
         Scoped {
             case: "a label no version carries beside a processed version of the application",
             version_labels: vec!["v-never", "v-ready"],
-            expected: Composed::Environments(&["c-api-dev"]),
+            expected: Composed::Environments(&["c-api"]),
         },
         Scoped {
             case: "a foreign label beside an unprocessed version of the application",

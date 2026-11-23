@@ -24,8 +24,12 @@
 //! `GroupName` is "the name of the group to which the target environments
 //! belong. Specify a group name only if the environment name defined in each
 //! target environment's manifest ends with a + (plus) character": such a name is
-//! a TEMPLATE for a per-group environment name, which is what
-//! [`composed_environment_name`] completes.
+//! a TEMPLATE for a per-group environment name rather than a name
+//! ([`is_group_name_template`]). A COMPOSITION does not complete one — a
+//! manifest whose name is a template names no environment for it to create or
+//! update, so it composes none — while the operations that take an
+//! `EnvironmentName` of their own and fall back to a manifest for it complete it
+//! with [`composed_environment_name`].
 //!
 //! Split out of [`super`], which holds the store the environments live in; the
 //! record a composed launch produces is [`super::environment_launch`]'s, shared
@@ -122,14 +126,32 @@ pub fn environment_manifest(bundle: &ApplicationBundle) -> Option<EnvironmentMan
     })
 }
 
-/// The name a composed environment carries, for the `manifest_name` its own
-/// manifest declares and the `group_name` the request named.
+/// Whether `manifest_name` is a TEMPLATE for a per-group environment name
+/// rather than the name of an environment: "specify a group name only if the
+/// environment name defined in each target environment's manifest ends with a +
+/// (plus) character", so a name ending in that placeholder is one a group would
+/// have to complete and names no environment on its own.
+pub fn is_group_name_template(manifest_name: &str) -> bool {
+    manifest_name.ends_with(GROUP_NAME_PLACEHOLDER)
+}
+
+/// The name an environment launched from `manifest_name` carries where the
+/// operation launching it completes a group template, for the `group_name` the
+/// request named.
 ///
 /// A manifest name ending in the group-name placeholder is completed by the
 /// group: the placeholder is dropped and the group name is appended to it, so
-/// one application composed into two groups has two environments per manifest.
+/// one application launched into two groups has two environments per manifest.
 /// A name that does not end in it is the environment's name as written, and a
 /// request that named no group has no group to complete one with.
+///
+/// `GroupName` is "the name of the group to which the target environment
+/// belongs. Specify a group name only if the environment's name is specified in
+/// an environment manifest and not with the environment name parameter", so this
+/// is the completion the operations that name an environment through a manifest
+/// INSTEAD of through their own `EnvironmentName` parameter perform. A
+/// composition names every environment through a manifest, and composes no
+/// environment for a template name at all ([`is_group_name_template`]).
 pub fn composed_environment_name(manifest_name: &str, group_name: Option<&str>) -> String {
     match manifest_name.strip_suffix(GROUP_NAME_PLACEHOLDER) {
         Some(stem) => match group_name {
@@ -153,7 +175,9 @@ pub struct ComposedEnvironment<'a> {
     /// specifying one or more application source bundles that belong to the
     /// target application".
     pub version_label: &'a str,
-    /// The environment's name, as [`composed_environment_name`] completed it.
+    /// The environment's name, as its own manifest declared it — a complete
+    /// name, since a composition composes nothing for a group template
+    /// ([`is_group_name_template`]).
     pub environment_name: &'a str,
     pub manifest: &'a EnvironmentManifest,
     /// The links this environment reports, with every target already resolved
