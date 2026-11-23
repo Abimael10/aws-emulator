@@ -23,6 +23,10 @@
 //! the state of the record (`CREATED`, `DELETING`, `DELETED`) and the Region the request
 //! is signed for.
 //!
+//! `DeleteEnvironment` applies the same rule and is pinned here too, by cases of its own
+//! ([`delete_row`]) rather than by a row of that table: it is the operation that MOVES a
+//! record through the states the table is judged against.
+//!
 //! The two readers that deliberately report a finished environment, `GetEnvironment` and
 //! `ListEnvironments`, are NOT part of this rule and are pinned by
 //! `tests/all/environment_lifecycle.rs`.
@@ -530,6 +534,188 @@ async fn no_operation_that_acts_on_an_environment_addresses_one_of_another_regio
             &fixture,
         )
         .await;
+    }
+}
+
+/// The `DeleteEnvironment` request that asks about `fixture`'s environment, and the
+/// refusal it answers for an environment no request can address.
+///
+/// `DeleteEnvironment` acts on an environment and applies the one rule above, but it
+/// cannot be a row of [`rows`]: it is the operation that MOVES a record through the
+/// states the other rows are judged against, so a run of the table would take the
+/// environment the next row addresses away with it. Its cases vary the same two axes the
+/// table's tests do — the state the record has reached and the Region the request is
+/// signed for.
+fn delete_row(fixture: &Fixture) -> Row {
+    Row {
+        operation: "DeleteEnvironment",
+        request: json!({ "environmentId": fixture.environment }),
+        refusal: Refusal::EnvironmentNotFound,
+    }
+}
+
+/// The state `GetEnvironment` reports for `fixture`'s environment, with its `modifiedAt`
+/// stamp — the reader that is outside the rule, so it answers for the record itself and
+/// not for what addresses it.
+async fn stored_record(router: &Emulator, case: &str, fixture: &Fixture) -> (String, f64) {
+    let (status, body) = call_in_region(
+        router,
+        REGION,
+        "GetEnvironment",
+        &json!({ "environmentId": fixture.environment }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: GetEnvironment expected HTTP 200, got {status} ({}) {body}",
+        error_type(&body)
+    );
+    let state = member(&body["environment"], "environmentState");
+    let modified_at = body["environment"]["modifiedAt"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("case {case:?}: no modifiedAt in {body}"));
+    (state, modified_at)
+}
+
+#[tokio::test]
+async fn delete_environment_addresses_a_record_until_it_has_reached_deleted() {
+    let router = emulator();
+    let fixture = fixture(
+        &router,
+        "addressing-delete-states",
+        ("eipalloc-del1", "eipalloc-del2"),
+        false,
+    )
+    .await;
+    let row = delete_row(&fixture);
+
+    // CREATED: the record resolves, so the delete does its own work and accepts the
+    // deletion.
+    let (status, body) = call_in_region(&router, REGION, row.operation, &row.request).await;
+    assert_eq!(
+        status, 200,
+        "case a CREATED environment: expected HTTP 200, got {status} ({}) {body}",
+        error_type(&body)
+    );
+    assert_eq!(
+        body["environment"]["environmentState"],
+        json!("DELETING"),
+        "case a CREATED environment: expected DELETING, got {}",
+        body["environment"]["environmentState"]
+    );
+    let deleting_modified_at = body["environment"]["modifiedAt"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("case a CREATED environment: no modifiedAt in {body}"));
+
+    // DELETING: the record is on its way out but still addressed, which is where the
+    // rule draws its line — the `@idempotent` repeat reports it as it stands rather than
+    // refusing it.
+    let (status, body) = call_in_region(&router, REGION, row.operation, &row.request).await;
+    assert_eq!(
+        status, 200,
+        "case a DELETING environment: expected HTTP 200, got {status} ({}) {body}",
+        error_type(&body)
+    );
+    assert_eq!(
+        body["environment"]["environmentState"],
+        json!("DELETING"),
+        "case a DELETING environment: expected DELETING, got {}",
+        body["environment"]["environmentState"]
+    );
+    assert_eq!(
+        body["environment"]["modifiedAt"].as_f64(),
+        Some(deleting_modified_at),
+        "case a DELETING environment: the repeat must not move modifiedAt from \
+         {deleting_modified_at}, got {}",
+        body["environment"]["modifiedAt"]
+    );
+
+    // DELETED: once the transition the clock owes comes due the environment is gone, so
+    // no request that acts on it addresses it — this one no more than its siblings.
+    settle(&router);
+    let (settled_state, settled_modified_at) =
+        stored_record(&router, "a DELETED environment", &fixture).await;
+    assert_eq!(
+        settled_state, "DELETED",
+        "case a DELETED environment: expected the record to have settled on DELETED, got \
+         {settled_state:?}"
+    );
+    assert_refused(&router, "a DELETED environment", REGION, &row, &fixture).await;
+
+    // And the refused delete wrote nothing: the record still stands exactly as the
+    // settled transition left it.
+    let (state, modified_at) =
+        stored_record(&router, "a DELETED environment, afterwards", &fixture).await;
+    assert_eq!(
+        state, settled_state,
+        "case a DELETED environment, afterwards: the refused delete must leave the record \
+         in {settled_state:?}, got {state:?}"
+    );
+    assert_eq!(
+        modified_at, settled_modified_at,
+        "case a DELETED environment, afterwards: the refused delete must not move \
+         modifiedAt from {settled_modified_at}, got {modified_at}"
+    );
+}
+
+#[tokio::test]
+async fn delete_environment_addresses_no_record_of_another_region() {
+    let router = emulator();
+    let fixture = fixture(
+        &router,
+        "addressing-delete-region",
+        ("eipalloc-delfar1", "eipalloc-delfar2"),
+        false,
+    )
+    .await;
+    let row = delete_row(&fixture);
+
+    // The Region half of the same rule: a live record asked about at another endpoint of
+    // this service resolves to nothing there, and nothing about it changes.
+    assert_refused(
+        &router,
+        "another Region's endpoint, a CREATED environment",
+        OTHER_REGION,
+        &row,
+        &fixture,
+    )
+    .await;
+    let (state, _) = stored_record(
+        &router,
+        "another Region's endpoint, a CREATED environment",
+        &fixture,
+    )
+    .await;
+    assert_eq!(
+        state, "CREATED",
+        "case another Region's endpoint, a CREATED environment: the refused delete must \
+         leave the record in \"CREATED\", got {state:?}"
+    );
+
+    // The same at each state the record goes through: the deletion is accepted at the
+    // endpoint the environment lives at, and the other endpoint addresses neither the
+    // DELETING record nor the DELETED one.
+    let (status, body) = call_in_region(&router, REGION, row.operation, &row.request).await;
+    assert_eq!(
+        status, 200,
+        "case the delete at its own endpoint: expected HTTP 200, got {status} ({}) {body}",
+        error_type(&body)
+    );
+    // Each pass: the state the record has reached by then, and the case naming it. What
+    // the record is is read at its own endpoint, so each pass is judged against the
+    // state it says it is about.
+    for (expected_state, case) in [
+        ("DELETING", "another Region's endpoint, a DELETING environment"),
+        ("DELETED", "another Region's endpoint, a DELETED environment"),
+    ] {
+        let (state, _) = stored_record(&router, case, &fixture).await;
+        assert_eq!(
+            state, expected_state,
+            "case {case:?}: expected the record to be {expected_state:?}, got {state:?}"
+        );
+        assert_refused(&router, case, OTHER_REGION, &row, &fixture).await;
+        // Which settles the deletion, so the next pass judges the DELETED record.
+        settle(&router);
     }
 }
 

@@ -23,7 +23,9 @@
 //! with `ValidationException` and nothing about it changes. `@idempotent`: deleting an
 //! environment that is already going away reports the record as it stands and starts
 //! nothing new. An id this service holds no environment for is a
-//! `ResourceNotFoundException`.
+//! `ResourceNotFoundException`, and so is one whose record has reached `DELETED`: that
+//! environment is gone, so this operation addresses it no more than its siblings do
+//! ([`crate::state::ComAmazonawsEvsAmazonelasticvmwareserviceState::live_environment_in_region_mut`]).
 //!
 //! ## Shape of an operation
 //!
@@ -191,21 +193,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.materialise_due_transitions();
 
-        // Regional resource: an environment can only be deleted at the endpoint of the
-        // Region it was created in.
+        // The rule every handler that acts on an environment shares: an environment is a
+        // regional resource, so it can only be deleted at the endpoint of the Region it
+        // was created in, and one that has reached DELETED is gone — "The resource might
+        // not be specified correctly, or it may have a `state` of `DELETED`"
+        // (`ResourceNotFoundException` doc) — so no request that acts on it resolves it,
+        // this one included. A record that is only on its way out (DELETING) is still
+        // addressed, which is what the `@idempotent` repeat below reports.
         let environment = state
-            .environment_in_region_mut(&region, &input.environment_id)
+            .live_environment_in_region_mut(&region, &input.environment_id)
             .ok_or_else(|| {
                 DeleteEnvironmentErrorModeled::ResourceNotFoundException(
                     crate::state::environment_not_found(&input.environment_id),
                 )
             })?;
 
-        // `@idempotent`: an environment that is already DELETING or DELETED is
-        // reported as it stands, so a repeated call neither restarts the transition
-        // nor moves `modifiedAt`.
-        let already_going_away = environment.state == crate::state::STATE_DELETING
-            || environment.state == crate::state::STATE_DELETED;
+        // `@idempotent`: an environment whose deletion has already been accepted is
+        // reported as it stands, so a repeated call neither restarts the transition nor
+        // moves `modifiedAt`. `DELETING` is the one such state a request still resolves:
+        // the `DELETED` the transition settles on is addressed by nothing (above).
+        let already_going_away = environment.state == crate::state::STATE_DELETING;
 
         // "Amazon EVS environments will only be enabled for deletion once the hosts are
         // deleted. You can delete hosts using the DeleteEnvironmentHost action."
