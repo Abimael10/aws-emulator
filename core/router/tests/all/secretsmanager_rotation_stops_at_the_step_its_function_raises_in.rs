@@ -204,6 +204,13 @@ impl Row {
         self.fail_at.is_empty()
     }
 
+    /// Whether this row's function gets THROUGH the step that creates the candidate, which is
+    /// what decides whether a version exists under the id the rotation staked: a function that
+    /// raises in `createSecret` itself creates none.
+    fn stages_a_candidate(&self) -> bool {
+        self.fail_at != ROTATION_STEPS[0]
+    }
+
     /// The log group this row's invocations are delivered to.
     fn log_group(&self) -> String {
         format!("{DEFAULT_GROUP_PREFIX}{}", self.id)
@@ -556,14 +563,27 @@ async fn a_rotation_stops_at_the_step_its_function_cannot_complete() {
                 "case {case:?}: expected {PREVIOUS_STAGE} on the version the rotation replaced, \
                  got {described}"
             );
-        } else {
-            // The candidate stays a candidate: the id the rotation staked, whether its own
-            // `createSecret` step has created that version yet or not.
+        } else if row.stages_a_candidate() {
+            // The candidate its `createSecret` step wrote stays a candidate: a version exists
+            // under that id, carrying the label the function staged it under.
             assert_eq!(
                 staged_versions(&described, PENDING_STAGE),
                 vec![candidate.clone()],
                 "case {case:?}: expected the candidate to keep only {PENDING_STAGE}, got \
                  {described}"
+            );
+        } else {
+            // ...while a function that raised in the step that CREATES the candidate created
+            // no version for the label to be attached to: "During rotation, Secrets Manager
+            // creates an AWSPENDING version ID before creating the new secret version"
+            // (`DescribeSecretResponse$VersionIdsToStages`, Secrets Manager's Smithy model),
+            // so the id that rotation reserved goes back with the rotation and the secret is
+            // left as the rotation found it.
+            assert_eq!(
+                staged_versions(&described, PENDING_STAGE),
+                Vec::<String>::new(),
+                "case {case:?}: expected no {PENDING_STAGE} once a rotation that created no \
+                 version was over, got {described}"
             );
         }
 

@@ -3007,19 +3007,32 @@ impl Secret {
     /// Record that the rotation of generation `generation` ENDED without finishing, because its
     /// rotation function ran a step and did not complete it ([`rotation_stopped`]).
     ///
-    /// Nothing else moves: the staging labels are where that function left them — the candidate
-    /// still `AWSPENDING`, `AWSCURRENT` on the version it was on — and `LastRotatedDate` stays
-    /// unset, because no rotation completed. What this records is that there is no longer a
-    /// rotation of this secret in flight, which is what lets the call that re-drives that
-    /// rotation be served rather than refused for it.
+    /// Every version stays where that function left it: a candidate it CREATED keeps the
+    /// `AWSPENDING` label it wrote, `AWSCURRENT` stays on the version it was on, and
+    /// `LastRotatedDate` stays unset, because no rotation completed. What this records is that
+    /// there is no longer a rotation of this secret in flight, which is what lets the call that
+    /// re-drives that rotation be served rather than refused for it.
+    ///
+    /// The one thing it gives back is the id this service RESERVED for the version the rotation
+    /// function never created: "During rotation, Secrets Manager creates an AWSPENDING version
+    /// ID before creating the new secret version" (`DescribeSecretResponse$VersionIdsToStages`,
+    /// this service's Smithy model) — the reservation belongs to the rotation, and a rotation
+    /// that is over has no version under it for the label to be attached to. So a rotation whose
+    /// function could not complete its FIRST step leaves the secret exactly as it found it, and
+    /// the next `RotateSecret` starts a rotation of it rather than being refused for a candidate
+    /// nothing will ever create ([`rotation_in_progress`]).
     ///
     /// A generation that is no longer this secret's current one is a rotation it has already
     /// moved on from (cancelled, resumed or replaced), and records nothing.
     ///
     /// [`rotation_stopped`]: Secret::rotation_stopped
+    /// [`rotation_in_progress`]: Secret::rotation_in_progress
     pub fn stop_rotation(&mut self, generation: u64) {
         if self.rotation_generation == generation {
             self.rotation_stopped = true;
+            if self.reserved_pending_version_id().is_some() {
+                self.pending_rotation_version_id = None;
+            }
         }
     }
 

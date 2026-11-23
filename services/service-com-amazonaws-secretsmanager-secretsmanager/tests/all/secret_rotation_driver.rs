@@ -23,8 +23,10 @@
 //!   attached to the same version as AWSCURRENT, then any later invocation of RotateSecret
 //!   assumes that a previous rotation request is still in progress and returns an error."
 //! * **A step that fails leaves the rotation unfinished.** The current value is still
-//!   readable, `AWSPENDING` still names the version the rotation staked, and
-//!   `LastRotatedDate` stays unset.
+//!   readable, `LastRotatedDate` stays unset, and what the rotation left is what its function
+//!   wrote: a candidate the function created keeps `AWSPENDING`, while a rotation whose
+//!   function could not complete its first step created none, so the id it reserved for that
+//!   version is given back with the rotation.
 //!
 //! The rows span what the rules generalise over rather than one recorded request: how the
 //! function's grant is written (unscoped, scoped to this secret, scoped to its account,
@@ -488,6 +490,23 @@ async fn attempted(router: &MultiServiceRouter, case: &str, secret_id: &str) -> 
         );
         tokio::time::sleep(LOOK_INTERVAL).await;
     }
+}
+
+/// Wait until no version of `secret_id` carries `AWSPENDING` any more, and answer what
+/// `DescribeSecret` reported last: the state a rotation whose function created no version
+/// leaves once that rotation is OVER, which is a moment after the attempt the function
+/// recorded before it raised.
+async fn without_a_candidate(router: &MultiServiceRouter, case: &str, secret_id: &str) -> Value {
+    let looks = ROTATION_WAIT.as_millis() / LOOK_INTERVAL.as_millis().max(1);
+    let mut last = Value::Null;
+    for _ in 0..looks {
+        last = described(router, case, secret_id).await;
+        if staged_versions(&last, PENDING_STAGE).is_empty() {
+            return last;
+        }
+        tokio::time::sleep(LOOK_INTERVAL).await;
+    }
+    last
 }
 
 /// The value of the tag `key` in a `DescribeSecret` answer, when it carries one.
@@ -1001,28 +1020,37 @@ async fn configured_rotation(router: &MultiServiceRouter, index: usize, row: &Co
             settled
         }
         Settles::FailsOnItsFirstStep => {
-            // The step the function raised on is the FIRST of the documented four, and
-            // once it has run the rotation is over: there is no state left to wait for.
-            let (step, settled) = attempted(router, case, &name).await;
+            // The step the function raised on is the FIRST of the documented four, so the
+            // rotation ends at it: what the row then waits for is the END of that rotation,
+            // which comes a moment after the attempt the function recorded before it raised.
+            let (step, attempt) = attempted(router, case, &name).await;
             assert_eq!(
                 step, ROTATION_STEPS[0],
                 "case {case:?}: expected the rotation to be driven from its first step, \
-                 got {step:?}"
+                 got {step:?} in {attempt}"
             );
-            // "When rotation is unsuccessful, the AWSPENDING staging label might be
-            // attached to an empty secret version": the label still names the version
-            // the rotation staked, that version holds no value, and nothing stamped the
-            // secret as rotated.
+            // "During rotation, Secrets Manager creates an AWSPENDING version ID before
+            // creating the new secret version" (`DescribeSecretResponse$VersionIdsToStages`):
+            // the id this rotation staked was a RESERVATION for the version its function
+            // would create, and that function created none — so once the rotation is over
+            // the secret holds no staging label for it, no version exists under the id the
+            // call reported, and nothing stamped the secret as rotated.
+            let settled = without_a_candidate(router, case, &name).await;
             assert_eq!(
                 staged_versions(&settled, PENDING_STAGE),
-                vec![version_id.clone()],
-                "case {case:?}: expected {PENDING_STAGE} still staked on {version_id}, got \
-                 {settled}"
+                Vec::<String>::new(),
+                "case {case:?}: expected no {PENDING_STAGE} left by a rotation whose function \
+                 created no version, got {settled}"
+            );
+            assert!(
+                settled["VersionIdsToStages"].get(&version_id).is_none(),
+                "case {case:?}: expected no version {version_id} to be reported once the \
+                 rotation that reserved it was over, got {settled}"
             );
             assert_eq!(
                 value_at(router, case, &name, PENDING_STAGE).await,
                 None,
-                "case {case:?}: expected the staked version to hold no value, got {settled}"
+                "case {case:?}: expected no staked version to serve a value, got {settled}"
             );
             assert!(
                 settled.get("LastRotatedDate").is_none(),

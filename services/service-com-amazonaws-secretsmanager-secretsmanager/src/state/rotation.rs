@@ -53,11 +53,18 @@
 //! per step, and a step it RAN and did not complete ends the rotation there: that step's answer
 //! is the customer's own code's, so the steps before it are not run through a second time
 //! behind a client watching the function — what is left is the state the real service leaves a
-//! failed rotation in (the current value still readable, `AWSPENDING` still staked,
-//! `LastRotatedDate` unset), and that END is RECORDED on the secret
+//! failed rotation in (the current value still readable, the candidate that function CREATED
+//! still `AWSPENDING`, `LastRotatedDate` unset), and that END is RECORDED on the secret
 //! ([`super::Secret::stop_rotation`]), which is what makes the rotation one a later call may
 //! re-drive by naming its candidate rather than one every later call is refused for
-//! (`crate::ops::rotate_secret`). The reattempt the refusal of a call asking for a FURTHER
+//! (`crate::ops::rotate_secret`). A rotation whose function could not complete its FIRST step
+//! created no candidate at all, so the id this service reserved for it is given back with that
+//! same record: "During rotation, Secrets Manager creates an `AWSPENDING` version ID before
+//! creating the new secret version" (`DescribeSecretResponse$VersionIdsToStages`, this
+//! service's Smithy model) — the reservation is the rotation's, and such a secret is left as
+//! the rotation found it, so the next `RotateSecret` starts a rotation of it.
+//!
+//! The reattempt the refusal of a call asking for a FURTHER
 //! rotation speaks of is the SCHEDULE's: "if rotation fails, Secrets Manager retries the entire
 //! rotation process multiple times. If rotation is unsuccessful, this date may be in the past"
 //! (`DescribeSecretResponse$NextRotationDate`, this service's Smithy model) — a date, not a
@@ -593,8 +600,9 @@ fn stamp_rotated<Eng: Send + Sync + 'static>(engine: &Arc<Eng>, rotation: &Rotat
 /// did not complete ([`super::Secret::stop_rotation`]).
 ///
 /// It is recorded against the rotation's own generation, so a secret that has since moved on to
-/// another rotation keeps what that one is doing. Nothing else about the secret moves: the state
-/// a failed rotation leaves is the one its function left.
+/// another rotation keeps what that one is doing. No version about the secret moves: the state a
+/// failed rotation leaves is the one its function left, down to the candidate it staged — and
+/// where it staged none, the id this rotation reserved for it is given back with the record.
 fn stamp_stopped<Eng: Send + Sync + 'static>(engine: &Arc<Eng>, rotation: &Rotation) {
     let Some(state) = super::service_state(&**engine) else {
         return;

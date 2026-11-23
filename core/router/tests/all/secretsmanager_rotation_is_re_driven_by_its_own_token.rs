@@ -27,14 +27,18 @@
 //! untested candidate is never promoted — and this suite starts where that one ends.
 //!
 //! The rows span what the rule generalises over: WHICH step the earlier rotation stopped at, so
-//! the candidate the re-drive names is in turn one no version exists for yet (the rotation's
-//! function could not even create it), one staged but untested, and one that passed its test and
-//! was never promoted; and whether the re-driving call names the secret by name or by ARN. Every
-//! row also pins the boundary: a call carrying a token of its OWN is still refused, with the
-//! fixed sentence, and mints nothing. The other half of that boundary — a rotation still IN
-//! FLIGHT, whose candidate not even its own token may re-drive — is pinned where a rotation that
-//! reaches no function is driven, in the Secrets Manager crate's own
-//! `secret_rotation::a_started_rotation_stages_awspending_and_leaves_awscurrent_alone`.
+//! the candidate the re-drive names is in turn one staged but not yet in force in the service
+//! that owns the credential, one staged but untested, and one that passed its test and was never
+//! promoted; and whether the re-driving call names the secret by name or by ARN. Every row also
+//! pins the boundary: a call carrying a token of its OWN is still refused, with the fixed
+//! sentence, and mints nothing. The other half of that boundary — a rotation still IN FLIGHT,
+//! whose candidate not even its own token may re-drive — is pinned where a rotation that reaches
+//! no function is driven, in the Secrets Manager crate's own
+//! `secret_rotation::a_started_rotation_stages_awspending_and_leaves_awscurrent_alone`. A
+//! rotation whose function raised in `createSecret` leaves no candidate at all — the id it
+//! reserved for the version that function never created goes back with the rotation — so there
+//! is nothing of it to re-drive and the next call starts a rotation of its own, which
+//! [`crate::secretsmanager_rotation_schedule_starves_its_function`] pins.
 //!
 //! Four crates have to agree — CloudFormation deploys the rotation functions and the role they
 //! run as, IAM answers for that role and for the grant Secrets Manager invokes them under,
@@ -161,9 +165,9 @@ struct Row {
 
 const ROWS: &[Row] = &[
     Row {
-        case: "a candidate no version exists for, left by a function that raised in createSecret",
-        fail_at: "createSecret",
-        id: "uncreated",
+        case: "a candidate staged but not yet in force, left by a function that raised in setSecret",
+        fail_at: "setSecret",
+        id: "unset",
         by_arn: false,
     },
     Row {
