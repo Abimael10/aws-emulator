@@ -1214,12 +1214,14 @@ pub const MESSAGE_BACKUP_SELECTION_NOT_FOUND: &str = "Cannot find Backup selecti
 /// ([`MESSAGE_VAULT_ALREADY_EXISTS`]) — fixed, and with no observed `Code`.
 pub const MESSAGE_PLAN_ALREADY_EXISTS: &str = "Backup plan with the same name already exists";
 
-/// The sentence AWS states for "a resource selection of this name already
-/// exists in the named plan", worded as this service words the same condition
-/// for a plan ([`MESSAGE_PLAN_ALREADY_EXISTS`]) — fixed, and with no observed
-/// `Code`.
+/// `Code` for "the named plan already holds a resource selection stating this
+/// same selection document".
+pub const ERROR_CODE_SELECTION_ALREADY_EXISTS: &str = "ERROR_1301";
+/// The sentence AWS states for that condition — FIXED text: it names WHAT
+/// already exists, the selection DOCUMENT the create restated, and takes
+/// nothing from the request.
 pub const MESSAGE_SELECTION_ALREADY_EXISTS: &str =
-    "Backup selection with the same name already exists";
+    "Backup selection with the same selection document already exists";
 
 /// The sentence AWS states for "the framework asked about is not one this
 /// account holds": fixed text around the framework the call addressed and the
@@ -2199,12 +2201,14 @@ pub fn plan_already_exists() -> AlreadyExistsException {
     }
 }
 
-/// The modelled refusal for a create naming a selection the plan already holds.
+/// The modelled refusal for a create restating a selection document the plan
+/// already holds, with the condition's own token.
 ///
 /// `Arn` and `CreatorRequestId` are left UNSET for the reason given on
 /// [`vault_already_exists`].
 pub fn selection_already_exists() -> AlreadyExistsException {
     AlreadyExistsException {
+        code: Some(ERROR_CODE_SELECTION_ALREADY_EXISTS.to_string()),
         message: Some(MESSAGE_SELECTION_ALREADY_EXISTS.to_string()),
         ..Default::default()
     }
@@ -4052,13 +4056,30 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
             .find(|selection| selection.creator_request_id.as_deref() == Some(creator_request_id))
     }
 
-    /// Whether the named plan already holds a selection of this display name. A
-    /// selection is displayed by its `SelectionName` within its plan, so two
-    /// selections of one plan cannot share one.
-    pub fn holds_backup_selection_named(&self, plan_id: &str, name: &str) -> bool {
+    /// Whether the named plan already holds a resource selection stating the
+    /// same selection DOCUMENT as `document`.
+    ///
+    /// What makes one selection of a plan the same as another is the document it
+    /// states — the whole `BackupSelection` body the create was given — and NOT
+    /// its `SelectionName`: a plan may hold two selections that share a display
+    /// name while assigning different resources, different exclusions,
+    /// different tag conditions or acting under a different role, and each of
+    /// them is a selection of its own with its own `SelectionId`. Only a create
+    /// restating a document the plan already holds adds nothing, so only that
+    /// one is the conflict ([`selection_already_exists`]).
+    ///
+    /// Compared in the STORED form ([`stored_backup_selection`]) — which is
+    /// what the caller hands in — so two creates that differ only in how the
+    /// same selection was stated (a grammar left out rather than stated empty,
+    /// a tag operator spelled in another letter case) state ONE document.
+    pub fn holds_backup_selection_document(
+        &self,
+        plan_id: &str,
+        document: &BackupSelection,
+    ) -> bool {
         self.backup_selections_of(plan_id)
             .into_iter()
-            .any(|selection| selection.selection.selection_name == name)
+            .any(|held| &held.selection == document)
     }
 
     /// Resolve a framework for a read, by the name it is stored under.

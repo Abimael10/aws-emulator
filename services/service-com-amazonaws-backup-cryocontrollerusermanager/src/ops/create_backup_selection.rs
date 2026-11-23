@@ -11,8 +11,12 @@
 //! Backup addresses one by, so the body is stored under that pair, value for
 //! value. A
 //! create that repeats a `CreatorRequestId` answers with the selection that
-//! token made; any OTHER create naming a selection the plan already holds is
-//! refused with `AlreadyExistsException`. A `BackupPlanId` naming no live plan
+//! token made; any OTHER create restating a selection DOCUMENT the plan already
+//! holds is refused with `AlreadyExistsException`, while one stating a document
+//! the plan does not hold is a selection of its own even where it shares a
+//! `SelectionName` with one the plan holds
+//! ([`crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::holds_backup_selection_document`]).
+//! A `BackupPlanId` naming no live plan
 //! of this account is a bad parameter value — this operation models no
 //! not-found error — so nothing is stored for a plan that does not exist.
 //!
@@ -272,6 +276,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The body as it is STORED, which is also the form the conflict below
+        // is decided in: a grammar the request left out and a tag operator's
+        // letter case are completed HERE, so two creates stating one selection
+        // the two ways cannot read as two documents
+        // (`crate::state::stored_backup_selection`).
+        let document = crate::state::stored_backup_selection(selection);
+
         let mut store = state.lock();
 
         // A repeated `CreatorRequestId` replays the selection that token created:
@@ -303,10 +314,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // A selection is displayed by its name within its plan, so a create that
-        // is not the replay above and names one the plan already holds is
-        // refused, and the refusal discloses nothing about the stored selection.
-        if store.holds_backup_selection_named(&input.backup_plan_id, &selection.selection_name) {
+        // What makes a create the duplicate of a selection the plan already
+        // holds is the DOCUMENT it states, not the display name it carries: a
+        // create restating a document the plan holds adds nothing and is
+        // refused, while one stating a document the plan does not hold is a
+        // selection of its own — so a plan can hold two selections that share a
+        // `SelectionName` and assign different resources, each with its own
+        // `SelectionId`. The refusal discloses nothing about the stored
+        // selection.
+        if store.holds_backup_selection_document(&input.backup_plan_id, &document) {
             return Err(CreateBackupSelectionErrorModeled::AlreadyExistsException(
                 crate::state::selection_already_exists(),
             )
@@ -338,7 +354,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Stored with the `Conditions` structure completed, so every read
             // of the selection reports all four operator lists
             // (`crate::state::stored_backup_selection`).
-            selection: crate::state::stored_backup_selection(selection),
+            selection: document,
             creator_request_id: input.creator_request_id,
             creation_date: now,
         };

@@ -165,8 +165,11 @@ pub struct ScanSetting {
     pub scanner_role_arn: Option<String>,
 }
 
+// `PartialEq`/`Eq`: what makes one resource selection of a plan the same as
+// another is the DOCUMENT it states, so the stored bodies are compared member
+// for member (`crate::state`'s `holds_backup_selection_document`).
 #[smithy_macros::smithy(shape = "com.amazonaws.backup#BackupSelection")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BackupSelection {
     pub selection_name: String,
     pub iam_role_arn: String,
@@ -189,7 +192,7 @@ pub struct BackupSelection {
     shape = "com.amazonaws.backup#Condition",
     skip_validation = ["ConditionType"]
 )]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Condition {
     pub condition_type: String,
     pub condition_key: String,
@@ -197,7 +200,7 @@ pub struct Condition {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.backup#Conditions")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Conditions {
     pub string_equals: Option<Vec<ConditionParameter>>,
     pub string_not_equals: Option<Vec<ConditionParameter>>,
@@ -206,7 +209,7 @@ pub struct Conditions {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.backup#ConditionParameter")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConditionParameter {
     pub condition_key: Option<String>,
     pub condition_value: Option<String>,
