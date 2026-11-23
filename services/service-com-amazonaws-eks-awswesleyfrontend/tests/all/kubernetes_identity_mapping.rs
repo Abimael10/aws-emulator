@@ -37,7 +37,9 @@ use serde_json::json;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cluster_lifecycle::minimal_request;
-use crate::kubernetes_api::{dial, dial_with, kubeconfig_of, poll_until_active, ApiAnswer, Kubeconfig};
+use crate::kubernetes_api::{
+    bearer_token, dial, dial_with, kubeconfig_of, poll_until_active, ApiAnswer, Kubeconfig,
+};
 use crate::wire::{
     call, call_as, emulator_with_identity, encode_label, query, xml_element, Answer,
     DEFAULT_ACCESS_KEY_ID,
@@ -73,28 +75,6 @@ fn pod_reader_binding() -> serde_json::Value {
         },
         "subjects": [{ "kind": "Group", "name": CONFIG_MAP_GROUP }],
     })
-}
-
-/// The bearer token a kubeconfig's credential plugin builds for the credential
-/// `access_key_id`: `k8s-aws-v1.` followed by the base64url form of a presigned
-/// `sts:GetCallerIdentity` request, whose SigV4 credential scope names that key.
-///
-/// The base64url form is written out here (the two alphabet substitutions and the
-/// dropped padding of RFC 7515 §2) rather than taken from the crate's own codec,
-/// so the token this client presents is built the way a credential plugin builds
-/// one rather than by the code that reads it.
-fn bearer_token(access_key_id: &str) -> String {
-    let url = format!(
-        "https://sts.{REGION}.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15\
-         &X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={access_key_id}%2F20260101%2F\
-         {REGION}%2Fsts%2Faws4_request&X-Amz-Date=20260101T000000Z&X-Amz-Expires=60\
-         &X-Amz-SignedHeaders=host%3Bx-k8s-aws-id&X-Amz-Signature=0000"
-    );
-    let encoded = aws_smithy_types::base64::encode(url.as_bytes())
-        .replace('+', "-")
-        .replace('/', "_")
-        .replace('=', "");
-    format!("Bearer k8s-aws-v1.{encoded}")
 }
 
 /// One session of one role: the role IAM holds and the credential STS minted for a

@@ -340,6 +340,10 @@ fn served_origin(config: &Kubeconfig) -> String {
 
 /// One request to the cluster's published Kubernetes API address, with the path layout the
 /// Kubernetes API publishes, answered as the status and the parsed body.
+///
+/// It presents the ACCOUNT's own credential as the bearer token a kubeconfig's credential
+/// plugin builds: an API server authenticates every request, so a client of one presents a
+/// token.
 fn kubernetes(
     client: &reqwest::blocking::Client,
     origin: &str,
@@ -350,6 +354,13 @@ fn kubernetes(
     let response = client
         .post(format!("{origin}{path}"))
         .header("content-type", "application/json")
+        .header(
+            "authorization",
+            format!(
+                "Bearer {}",
+                crate::eks_wire::account_kubernetes_bearer_token()
+            ),
+        )
         .body(body.to_string())
         .send()
         .unwrap_or_else(|error| {

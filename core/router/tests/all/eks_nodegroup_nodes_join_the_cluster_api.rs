@@ -78,9 +78,9 @@ struct ApiAnswer {
 }
 
 /// One request to that address, the way a kubeconfig-built client makes it: one
-/// HTTP/1.1 exchange on the port the cluster published, carrying no credential —
-/// which is the account's own published one, the principal that created the
-/// cluster and administers it.
+/// HTTP/1.1 exchange on the port the cluster published, presenting the ACCOUNT's
+/// own credential — the principal that created the cluster and administers it.
+/// An API server authenticates every request, so a client of one presents a token.
 fn k8s(
     runtime: &tokio::runtime::Runtime,
     endpoint: &str,
@@ -105,8 +105,9 @@ fn k8s(
                 panic!("{what}: the published address must accept: {error}")
             });
         let request = format!(
-            "{method} {path} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\n\
-             Content-Length: 0\r\nConnection: close\r\n\r\n"
+            "{method} {path} HTTP/1.1\r\nHost: {authority}\r\nAuthorization: Bearer {}\r\n\
+             Content-Type: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            crate::eks_wire::account_kubernetes_bearer_token()
         );
         stream
             .write_all(request.as_bytes())

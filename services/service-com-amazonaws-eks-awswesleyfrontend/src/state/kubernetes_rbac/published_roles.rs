@@ -98,9 +98,10 @@ pub(super) fn non_resource_url_matches(pattern: &str, path: &str) -> bool {
 }
 
 /// The identity a request is authorized as: the username the cluster's access entry
-/// maps the IAM principal to, the Kubernetes groups it carries, and the access
-/// policies associated to that entry.
-#[derive(Debug, Clone)]
+/// maps the IAM principal to, the Kubernetes groups it carries, the access
+/// policies associated to that entry, and the IAM principal the credential itself
+/// spoke for.
+#[derive(Debug, Clone, Default)]
 pub struct SubjectIdentity {
     pub username: String,
     /// The groups, as a SET: a binding's subjects are matched against them once per
@@ -114,6 +115,16 @@ pub struct SubjectIdentity {
     /// One grant per access policy the entry associates, in the scope it was
     /// associated with.
     pub grants: Vec<AccessPolicyGrant>,
+    /// The ARN of the IAM principal the request's credential spoke for — the one
+    /// `sts:GetCallerIdentity` answers for it, which is what the cluster's mapping
+    /// was looked up under. Reported as the authenticating authority's own
+    /// information about the identity
+    /// ([`super::kubernetes_self_subject_review`]) rather than used in a decision:
+    /// what an identity MAY do is decided by its username and groups alone.
+    pub principal_arn: String,
+    /// The name of the assumed-role session the credential was minted for, and
+    /// `None` for a long-term credential, which names no session.
+    pub session_name: Option<String>,
 }
 
 /// One access policy an access entry associates, and where it applies.

@@ -275,7 +275,10 @@ impl Emulator {
 
     /// One request to the cluster's published Kubernetes API address, as a client
     /// built from its kubeconfig makes it: one HTTP/1.1 exchange on the port the
-    /// cluster published, carrying the bearer token when the row presents one.
+    /// cluster published, carrying the bearer token the row presents — and the
+    /// ACCOUNT's own credential when the row names none, which is the principal
+    /// that created the cluster and administers it. An API server authenticates
+    /// every request, so a client of one always presents a token.
     pub(crate) async fn k8s(
         &self,
         endpoint: &str,
@@ -300,9 +303,10 @@ impl Emulator {
                 panic!("case {case:?}: the published address must accept: {error}")
             });
         let payload = body.map(|body| body.to_string()).unwrap_or_default();
-        let authorization = token
-            .map(|token| format!("Authorization: Bearer {token}\r\n"))
-            .unwrap_or_default();
+        let presented = token
+            .map(str::to_string)
+            .unwrap_or_else(crate::eks_wire::account_kubernetes_bearer_token);
+        let authorization = format!("Authorization: Bearer {presented}\r\n");
         let request = format!(
             "{method} {path} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\n\
              {authorization}Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
@@ -434,32 +438,16 @@ impl Emulator {
 }
 
 /// The bearer token a kubeconfig's credential plugin builds for the credential
-/// `access_key_id`: `k8s-aws-v1.` followed by the base64url form of a presigned
-/// `sts:GetCallerIdentity` request, whose SigV4 credential scope names that key.
+/// `access_key_id`, from the one builder every suite that dials a published cluster
+/// endpoint shares ([`crate::eks_wire::kubernetes_bearer_token`]).
 pub(crate) fn bearer_token(access_key_id: &str) -> String {
-    bearer_token_for_url(&format!(
-        "https://sts.{REGION}.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15\
-         &X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={access_key_id}%2F20260101%2F\
-         {REGION}%2Fsts%2Faws4_request&X-Amz-Date=20260101T000000Z&X-Amz-Expires=60\
-         &X-Amz-SignedHeaders=host%3Bx-k8s-aws-id&X-Amz-Signature=0000"
-    ))
+    crate::eks_wire::kubernetes_bearer_token(access_key_id)
 }
 
 /// A token of the documented form carrying `url`, for the rows that present one whose
 /// URL is not a credential this server can read.
-///
-/// The base64url form is written out here rather than taken from the workspace's one
-/// codec (`service_common::jwt::encode_base64url`, which the production side of this
-/// change decodes with) for the reason `query_wire.rs` gives for its own encoder:
-/// `core/router/Cargo.toml` is a pinned path in this repository, so this test crate can
-/// take no dependency at all. The two alphabet substitutions and the dropped padding
-/// are RFC 7515 §2's definition.
 fn bearer_token_for_url(url: &str) -> String {
-    let encoded = aws_smithy_types::base64::encode(url.as_bytes())
-        .replace('+', "-")
-        .replace('/', "_")
-        .replace('=', "");
-    format!("k8s-aws-v1.{encoded}")
+    format!("k8s-aws-v1.{}", crate::eks_wire::base64url(url))
 }
 
 /// The namespace the rows address, created through the API by the cluster's creator.

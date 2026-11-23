@@ -103,6 +103,9 @@ use super::kubernetes_openapi;
 use super::kubernetes_protobuf;
 use super::kubernetes_rbac::{self as rbac, RbacResource};
 use super::kubernetes_self_subject_review as self_review;
+use super::kubernetes_subject_access_review as access_review;
+use super::kubernetes_version_info;
+use super::kubernetes_workloads::{self as workloads, WorkloadResource};
 use super::pod_identity_plane::AuthPlane;
 use super::ComAmazonawsEksAwswesleyfrontendState as ServiceStore;
 
@@ -509,6 +512,10 @@ async fn answer(
             .map(str::to_string)
     };
     let authorization = header_value(::http::header::AUTHORIZATION);
+    let cluster_id = ::http::header::HeaderName::from_static(
+        super::kubernetes_authentication::CLUSTER_ID_HEADER,
+    );
+    let cluster_id = header_value(cluster_id);
     let user_agent = header_value(::http::header::USER_AGENT);
     let accept = header_value(::http::header::ACCEPT);
     let query = request.uri().query().map(str::to_string);
@@ -553,6 +560,7 @@ async fn answer(
                 method: method.as_str(),
                 path: &path,
                 authorization: authorization.as_deref(),
+                cluster_id: cluster_id.as_deref(),
                 user_agent: user_agent.as_deref(),
                 query: query.as_deref(),
                 accept: accept.as_deref(),
@@ -591,6 +599,10 @@ pub struct ApiRequest<'request> {
     pub path: &'request str,
     /// The `Authorization` header, which is where the credential travels.
     pub authorization: Option<&'request str>,
+    /// The `x-k8s-aws-id` header, which is where a client names the CLUSTER its
+    /// bearer token was built for
+    /// ([`super::kubernetes_authentication::CLUSTER_ID_HEADER`]).
+    pub cluster_id: Option<&'request str>,
     /// The `User-Agent`, which the audit record names.
     pub user_agent: Option<&'request str>,
     /// The query string, which is where a list states the chunk it asks for.
@@ -672,9 +684,24 @@ pub fn serve(
             delivery: None,
         };
     };
-    let access_key_id = authentication::presented_access_key_id(request.authorization);
-    let caller =
-        access_key_id.and_then(|access_key_id| principals.caller(&access_key_id, received_at));
+    // WHO the request speaks for: the credential its bearer token was built from,
+    // resolved against the registries the other services of this emulator wrote.
+    //
+    // A token is bound to ONE cluster — the plugin signs the cluster's name into the
+    // presigned request it carries, and a client that names the cluster beside the
+    // token sends it under the same name — so a token built for ANOTHER cluster
+    // speaks for nobody here, however good the credential behind it is.
+    let caller = authentication::presented_token(request.authorization).and_then(|presented| {
+        let names_another_cluster = presented
+            .cluster_name
+            .as_deref()
+            .or(request.cluster_id)
+            .is_some_and(|named| named != key.1);
+        if names_another_cluster {
+            return None;
+        }
+        principals.caller(&presented.access_key_id, received_at)
+    });
 
     let authenticated = match caller {
         Some(caller) => {
@@ -808,7 +835,12 @@ fn route(
                 ::serde_json::json!({
                     "kind": "APIGroupList",
                     "apiVersion": super::kubernetes_objects::CORE_API_VERSION,
-                    "groups": [rbac::api_group_entry(), self_review::api_group_entry()],
+                    "groups": [
+                        workloads::api_group_entry(),
+                        rbac::api_group_entry(),
+                        self_review::api_group_entry(),
+                        access_review::api_group_entry(),
+                    ],
                 }),
             ));
         }
@@ -844,8 +876,23 @@ fn route(
                 .map(|document| (200, document))
                 .ok_or_else(|| ApiRefusal::no_such_path(path));
         }
-        // The discovery documents of the two groups beside the core API this server
+        // The discovery documents of the groups beside the core API this server
         // serves: a client reads them before it addresses a group at all.
+        ["apis", group] if *group == workloads::APPS_API_GROUP => {
+            return Ok((200, workloads::api_group_document()));
+        }
+        ["apis", group, version]
+            if *group == workloads::APPS_API_GROUP
+                && *version == workloads::APPS_GROUP_VERSION =>
+        {
+            return Ok((200, workloads::api_resource_list_document()));
+        }
+        ["apis", group, version, rest @ ..]
+            if *group == workloads::APPS_API_GROUP
+                && *version == workloads::APPS_GROUP_VERSION =>
+        {
+            return route_apps(state, key, request, rest, now);
+        }
         ["apis", group] if *group == rbac::RBAC_API_GROUP => {
             return Ok((200, rbac::api_group_document()));
         }
@@ -885,6 +932,38 @@ fn route(
             let store = state.lock();
             plane(&store, key)?;
             return Ok((201, self_review::self_subject_review(identity)));
+        }
+        ["apis", group] if *group == access_review::AUTHORIZATION_API_GROUP => {
+            return Ok((200, access_review::api_group_document()));
+        }
+        ["apis", group, version]
+            if *group == access_review::AUTHORIZATION_API_GROUP
+                && *version == access_review::AUTHORIZATION_GROUP_VERSION =>
+        {
+            return Ok((200, access_review::api_resource_list_document()));
+        }
+        // A client asks the API server whether it MAY do something by creating a
+        // self subject access review, and the answer is the decision the same
+        // authorizer takes on the request it describes.
+        ["apis", group, version, resource]
+            if *group == access_review::AUTHORIZATION_API_GROUP
+                && *version == access_review::AUTHORIZATION_GROUP_VERSION
+                && *resource == access_review::SELF_SUBJECT_ACCESS_REVIEWS_RESOURCE =>
+        {
+            if method != ::http::Method::POST.as_str() {
+                return Err(ApiRefusal::method_not_allowed(method, path));
+            }
+            let review = read_manifest(content_type, body)?;
+            let reviewed = access_review::reviewed_attributes(&review)
+                .ok_or_else(|| ApiRefusal::invalid(access_review::NO_ATTRIBUTES_MESSAGE))?;
+            let store = state.lock();
+            let objects = &plane(&store, key)?.objects;
+            return Ok((
+                201,
+                access_review::self_subject_access_review(
+                    objects, identity, &review, &reviewed,
+                ),
+            ));
         }
         _ => {}
     }
@@ -986,16 +1065,12 @@ fn route(
     // scheduled onto one, and so is any pod that was admitted while the cluster
     // had none. They are read from the control plane's own records before the
     // objects are borrowed to write them.
-    let nodes = store.scheduler_nodes(&key.0, &key.1);
+    let nodes = settled(&mut store, key, now)?;
 
     let objects = &mut plane_mut(&mut store, key)?.objects;
     // The chunk a list asks for, read once: every collection below answers one
     // chunk of itself ([`super::kubernetes_lists`]).
     let list_request = ListRequest::from_query(query);
-    // The clock-owed moves of this cluster's objects, materialised before any of
-    // them is reported: each was due at a stored instant whether or not anybody
-    // called.
-    objects.materialize_due_transitions(now, &nodes);
     match (method, rest) {
         (method, ["namespaces"]) if method == ::http::Method::POST.as_str() => {
             let document = read_manifest(content_type, body)?;
@@ -1106,6 +1181,101 @@ fn route(
         // everything under a namespace is a resource it serves.
         (method, ["namespaces", ..]) => Err(ApiRefusal::method_not_allowed(method, path)),
         _ => Err(ApiRefusal::no_such_path(path)),
+    }
+}
+
+/// Settle everything this cluster is owed before any of its objects is reported,
+/// and hand back the nodes a pod of it can run on.
+///
+/// Two kinds of work are owed here, and both were owed at this instant whether or
+/// not anybody called: the clock-owed moves of the cluster's own objects (a pending
+/// pod bound to a node that has appeared, a pod whose containers were owed their
+/// start), and the workloads its installed add-ons own
+/// ([`super::kubernetes_workloads::managed_workloads`]) — one per add-on the
+/// control plane reports as installed, converged against the nodes the cluster
+/// holds. So two callers read the same cluster, and a read changes nothing a later
+/// caller would not have seen.
+fn settled(
+    store: &mut ServiceStore,
+    key: &(String, String),
+    now: SystemTime,
+) -> Result<Vec<super::kubernetes_nodes::ClusterNode>, ApiRefusal> {
+    let nodes = store.scheduler_nodes(&key.0, &key.1);
+    let managed = workloads::managed_workloads(store, &key.0, &key.1, now);
+    let objects = &mut plane_mut(store, key)?.objects;
+    objects.materialize_due_transitions(now, &nodes);
+    objects.materialize_managed_workloads(&managed, now);
+    objects.reconcile_workloads(now, &nodes);
+    Ok(nodes)
+}
+
+/// Route one request to `apps/v1`: the workload resources the group serves, each of
+/// them in a namespace.
+///
+/// `rest` is the path under the group version, so a workload is addressed as
+/// `["namespaces", ns, resource]` or `["namespaces", ns, resource, name]`. A
+/// workload resource addressed outside a namespace is a path the group does not
+/// serve, because both its resources are namespaced.
+fn route_apps(
+    state: &::engine::ServiceState<ServiceStore>,
+    key: &(String, String),
+    request: &ApiRequest<'_>,
+    rest: &[&str],
+    now: SystemTime,
+) -> Result<(u16, ::serde_json::Value), ApiRefusal> {
+    let (method, path, body) = (request.method, request.path, request.body);
+    let (namespace, addressed) = match rest {
+        ["namespaces", namespace, addressed @ ..] if !addressed.is_empty() => {
+            (*namespace, addressed)
+        }
+        _ => return Err(ApiRefusal::no_such_path(path)),
+    };
+    let (Some(resource), name) = (
+        addressed
+            .first()
+            .and_then(|segment| WorkloadResource::from_segment(segment)),
+        addressed.get(1).copied(),
+    ) else {
+        return Err(ApiRefusal::no_such_path(path));
+    };
+    if addressed.len() > 2 {
+        return Err(ApiRefusal::no_such_path(path));
+    }
+    let mut store = state.lock();
+    let nodes = settled(&mut store, key, now)?;
+    let list_request = ListRequest::from_query(request.query);
+    let objects = &mut plane_mut(&mut store, key)?.objects;
+    match (method, name) {
+        (method, None) if method == ::http::Method::POST.as_str() => {
+            let manifest = read_manifest(request.content_type, body)?;
+            Ok((
+                201,
+                objects.create_workload(resource, namespace, &manifest, now, &nodes)?,
+            ))
+        }
+        (method, None) if method == ::http::Method::GET.as_str() => Ok((
+            200,
+            objects.workload_list_json(
+                resource,
+                namespace,
+                &selected(list_request?, &NAMESPACED_FIELD_SELECTORS)?,
+                &nodes,
+            )?,
+        )),
+        (method, Some(name)) if method == ::http::Method::GET.as_str() => {
+            Ok((200, objects.workload_json(resource, namespace, name, &nodes)?))
+        }
+        (method, Some(name)) if method == ::http::Method::PUT.as_str() => {
+            let manifest = read_manifest(request.content_type, body)?;
+            Ok((
+                200,
+                objects.replace_workload(resource, namespace, name, &manifest, now, &nodes)?,
+            ))
+        }
+        (method, Some(name)) if method == ::http::Method::DELETE.as_str() => {
+            Ok((200, objects.delete_workload(resource, namespace, name, &nodes)?))
+        }
+        (method, _) => Err(ApiRefusal::method_not_allowed(method, path)),
     }
 }
 
@@ -1395,27 +1565,37 @@ fn read_yaml_manifest(body: &[u8]) -> Result<::serde_json::Value, ApiRefusal> {
 /// the version the cluster was created at by default
 /// ([`super::DEFAULT_KUBERNETES_VERSION`]), which is what the control plane would have
 /// stored.
+///
+/// The patch level and the release day are the published calendar's for that version
+/// — the same values `DescribeClusterVersions` reports — so the build this document
+/// names is the build of the version the control plane says the cluster runs
+/// ([`super::kubernetes_version_info`]).
 fn version_document(
     state: &::engine::ServiceState<ServiceStore>,
     key: &(String, String),
 ) -> ::serde_json::Value {
-    let version = {
+    let (version, patch_version, released_at) = {
         let store = state.lock();
-        store
+        let version = store
             .clusters
             .get(key)
             .and_then(|record| record.version.clone())
-            .unwrap_or_else(|| super::DEFAULT_KUBERNETES_VERSION.to_string())
+            .unwrap_or_else(|| super::DEFAULT_KUBERNETES_VERSION.to_string());
+        let row = store
+            .cluster_versions
+            .iter()
+            .find(|row| row.cluster_version == version);
+        let patch_version = row.map_or_else(
+            // A version the published calendar does not carry still reports a
+            // patch-level build, at the initial patch level of its own minor
+            // version — the level the calendar publishes every version it carries
+            // at.
+            || format!("{version}.0"),
+            super::ClusterVersionRecord::kubernetes_patch_version,
+        );
+        (version, patch_version, row.map(|row| row.release_date))
     };
-    let mut parts = version.split('.');
-    let major = parts.next().unwrap_or_default().to_string();
-    let minor = parts.next().unwrap_or_default().to_string();
-    ::serde_json::json!({
-        "major": major,
-        "minor": minor,
-        "gitVersion": format!("v{version}"),
-        "platform": "emulator",
-    })
+    kubernetes_version_info::version_document(&version, &patch_version, released_at)
 }
 
 /// `Ok(())` when `accept` admits the encoding the published documents are written

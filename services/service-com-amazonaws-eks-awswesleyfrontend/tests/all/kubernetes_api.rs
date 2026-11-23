@@ -204,7 +204,68 @@ pub(crate) async fn dial_as(
     content_type: &str,
     body: Option<&serde_json::Value>,
 ) -> ApiAnswer {
-    dial_with(config, case, method, path, content_type, None, body).await
+    dial_with(
+        config,
+        case,
+        method,
+        path,
+        content_type,
+        Some(&account_bearer_token()),
+        body,
+    )
+    .await
+}
+
+/// The bearer token a kubeconfig's credential plugin builds for the credential
+/// `access_key_id`: `k8s-aws-v1.` followed by the base64url form of a presigned
+/// `sts:GetCallerIdentity` request, whose SigV4 credential scope names that key.
+///
+/// The base64url form is written out here (the two alphabet substitutions and the
+/// dropped padding of RFC 7515 §2) rather than taken from the crate's own codec,
+/// so the token this client presents is built the way a credential plugin builds
+/// one rather than by the code that reads it.
+pub(crate) fn bearer_token(access_key_id: &str) -> String {
+    token_of(&presigned_caller_identity(access_key_id, None))
+}
+
+/// The same token, BOUND to the cluster `cluster`: the plugin names the cluster the
+/// token is built for in the presigned request, which is what makes a token usable
+/// at one cluster.
+pub(crate) fn bearer_token_for_cluster(access_key_id: &str, cluster: &str) -> String {
+    token_of(&presigned_caller_identity(access_key_id, Some(cluster)))
+}
+
+/// The presigned `sts:GetCallerIdentity` request a token carries, scoped to
+/// `access_key_id` and naming `cluster` when the plugin bound one into it.
+fn presigned_caller_identity(access_key_id: &str, cluster: Option<&str>) -> String {
+    let bound = cluster
+        .map(|cluster| format!("&x-k8s-aws-id={cluster}"))
+        .unwrap_or_default();
+    format!(
+        "https://sts.{REGION}.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15\
+         &X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={access_key_id}%2F20260101%2F\
+         {REGION}%2Fsts%2Faws4_request&X-Amz-Date=20260101T000000Z&X-Amz-Expires=60\
+         &X-Amz-SignedHeaders=host%3Bx-k8s-aws-id&X-Amz-Signature=0000{bound}"
+    )
+}
+
+/// `url` as the token a client presents it in.
+fn token_of(url: &str) -> String {
+    let encoded = aws_smithy_types::base64::encode(url.as_bytes())
+        .replace('+', "-")
+        .replace('/', "_")
+        .replace('=', "");
+    format!("Bearer k8s-aws-v1.{encoded}")
+}
+
+/// The token a client built from the ACCOUNT's own published credential presents,
+/// which is the caller every dialler here is unless it says otherwise.
+///
+/// A Kubernetes API server authenticates every request from the bearer token it
+/// carries, so a client of one presents a token; a request with none is anonymous
+/// and is refused ([`crate::kubernetes_anonymous_requests`]).
+pub(crate) fn account_bearer_token() -> String {
+    bearer_token(crate::wire::DEFAULT_ACCESS_KEY_ID)
 }
 
 /// The same request again, PRESENTING a credential: the `Authorization` header a

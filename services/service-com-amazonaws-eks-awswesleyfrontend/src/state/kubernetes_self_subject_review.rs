@@ -94,10 +94,14 @@ pub fn api_resource_list_document() -> ::serde_json::Value {
 ///
 /// The username and the groups are the ones the cluster's mapping resolved for
 /// the credential the request presented, so this answer and the identity every
-/// other answer on this address is decided under are one value. The object
-/// carries no name — a self subject review is not stored, it is computed for the
-/// request that asked — which is what Kubernetes reports as a null creation
-/// timestamp.
+/// other answer on this address is decided under are one value. Beside them the
+/// `extra` map carries what the AUTHENTICATING authority knows about the identity,
+/// which on Amazon EKS is the IAM principal the credential spoke for: `arn` and
+/// `canonicalArn` name that principal, and `sessionName` the assumed-role session
+/// the credential was minted for — empty for a long-term credential, which names
+/// none. Nothing of the CREDENTIAL itself is reported. The object carries no name —
+/// a self subject review is not stored, it is computed for the request that asked —
+/// which is what Kubernetes reports as a null creation timestamp.
 #[must_use]
 pub fn self_subject_review(identity: &SubjectIdentity) -> ::serde_json::Value {
     ::serde_json::json!({
@@ -108,6 +112,11 @@ pub fn self_subject_review(identity: &SubjectIdentity) -> ::serde_json::Value {
             "userInfo": {
                 "username": identity.username,
                 "groups": identity.groups.iter().collect::<Vec<&String>>(),
+                "extra": {
+                    "arn": [identity.principal_arn],
+                    "canonicalArn": [identity.principal_arn],
+                    "sessionName": [identity.session_name.clone().unwrap_or_default()],
+                },
             },
         },
     })

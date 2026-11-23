@@ -34,7 +34,7 @@ use k8s_pb::apimachinery::pkg::util::intstr::IntOrString;
 use prost::Message as _;
 use service_com_amazonaws_eks_awswesleyfrontend::state::kubernetes_api::READ_MEDIA_TYPES;
 
-use crate::kubernetes_api::{dial, dial_bytes, ApiAnswer, Kubeconfig};
+use crate::kubernetes_api::{account_bearer_token, dial, dial_bytes, ApiAnswer, Kubeconfig};
 use crate::kubernetes_cluster_resources::published_cluster;
 
 /// The media type a client states when it wrote the body in the Kubernetes
@@ -88,7 +88,16 @@ async fn post(
     content_type: &str,
     payload: &[u8],
 ) -> ApiAnswer {
-    dial_bytes(config, case, "POST", path, content_type, None, payload).await
+    dial_bytes(
+        config,
+        case,
+        "POST",
+        path,
+        content_type,
+        Some(&account_bearer_token()),
+        payload,
+    )
+    .await
 }
 
 /// RULE: a namespace create is read in every media type this server advertises as

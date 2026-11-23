@@ -28,7 +28,7 @@ use service_com_amazonaws_eks_awswesleyfrontend::state::kubernetes_pod_spec::MAX
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::certificate_authority::REGION;
-use crate::kubernetes_api::{dial, provisioned_cluster, Kubeconfig};
+use crate::kubernetes_api::{account_bearer_token, dial, provisioned_cluster, Kubeconfig};
 use crate::wire::emulator;
 
 /// One request to the cluster's published address IN THE CLEAR, stating the
@@ -38,7 +38,9 @@ use crate::wire::emulator;
 ///
 /// The address answers both a TLS client and one that verifies nothing (the first
 /// byte of the connection says which), so this reaches the same server the TLS
-/// cases do.
+/// cases do. It presents the account's own credential, because an API server
+/// authenticates every request before it negotiates anything
+/// ([`crate::kubernetes_anonymous_requests`]).
 async fn dial_accepting(config: &Kubeconfig, case: &str, path: &str, accept: &str) -> (u16, Value) {
     let authority = config
         .endpoint
@@ -55,8 +57,9 @@ async fn dial_accepting(config: &Kubeconfig, case: &str, path: &str, accept: &st
         .await
         .unwrap_or_else(|error| panic!("case {case:?}: the address must accept: {error}"));
     let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {authority}\r\nAccept: {accept}\r\nContent-Length: 0\r\n\
-         Connection: close\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: {authority}\r\nAuthorization: {}\r\nAccept: {accept}\r\n\
+         Content-Length: 0\r\nConnection: close\r\n\r\n",
+        account_bearer_token()
     );
     stream
         .write_all(request.as_bytes())

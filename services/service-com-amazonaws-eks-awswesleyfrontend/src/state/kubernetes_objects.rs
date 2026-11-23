@@ -37,6 +37,7 @@ use super::kubernetes_pod_spec::admitted_pod_spec;
 use super::*;
 
 use super::kubernetes_rbac::RbacScope;
+use super::kubernetes_workloads::WorkloadScope;
 
 /// The namespaces a cluster's API server starts with, as Kubernetes creates them
 /// with the cluster: the one objects are created in by default, and the three the
@@ -140,6 +141,10 @@ pub struct NamespaceObject {
     /// ([`super::kubernetes_events`]). Bounded by
     /// [`super::kubernetes_events::MAX_EVENTS_PER_NAMESPACE`].
     pub events: BTreeMap<String, EventObject>,
+    /// The `apps/v1` workloads of this namespace — its Deployments and DaemonSets
+    /// — keyed by resource and name ([`super::kubernetes_workloads`]). Bounded by
+    /// [`super::kubernetes_workloads::MAX_WORKLOADS_PER_NAMESPACE`] per resource.
+    pub workloads: WorkloadScope,
 }
 
 impl NamespaceObject {
@@ -167,6 +172,7 @@ impl NamespaceObject {
             config_maps: BTreeMap::new(),
             events: BTreeMap::new(),
             rbac: RbacScope::new(),
+            workloads: WorkloadScope::new(),
         }
     }
 }
@@ -383,6 +389,22 @@ impl PodObject {
     #[must_use]
     pub fn has_concluded(&self) -> bool {
         self.phase == POD_PHASE_FAILED
+    }
+
+    /// Whether every container of this pod is READY, which is what a workload
+    /// controller counts an available replica by
+    /// ([`super::kubernetes_workloads`]).
+    ///
+    /// Read off the container statuses this pod reports rather than stated, so the
+    /// readiness a workload counts and the readiness a client reads off the pod are
+    /// one answer. A pod with no container status reports nothing ready.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        let statuses = self.container_statuses();
+        !statuses.is_empty()
+            && statuses.iter().all(|status| {
+                status.get("ready").and_then(::serde_json::Value::as_bool) == Some(true)
+            })
     }
 
     /// The id the registry resolved one container's image to when the node's
@@ -1350,7 +1372,7 @@ pub(super) fn manifest_name(
 
 /// The five characters Kubernetes appends to a `generateName`, drawn from the
 /// alphabet it draws them from.
-fn generated_name_suffix() -> String {
+pub(super) fn generated_name_suffix() -> String {
     const ALPHABET: &[u8] = b"bcdfghjklmnpqrstvwxz2456789";
     new_object_uid()
         .bytes()

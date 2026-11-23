@@ -111,7 +111,7 @@ pub(crate) fn instance(id: &str, zone: &str, instance_type: &str, address: &str)
 
 /// Create the node group `name` of `cluster` and wait for it to report `ACTIVE`,
 /// which is when its nodes have joined the cluster.
-async fn active_nodegroup(router: &MultiServiceRouter, cluster: &str, name: &str) {
+pub(crate) async fn active_nodegroup(router: &MultiServiceRouter, cluster: &str, name: &str) {
     let created = create_nodegroup_in(
         router,
         REGION,

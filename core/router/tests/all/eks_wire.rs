@@ -239,6 +239,44 @@ pub(crate) fn role_arn(name: &str) -> String {
     format!("arn:aws:iam::{}:role/{name}", engine::emulator_account_id())
 }
 
+/// The base64url form of `text`: the two alphabet substitutions and the dropped
+/// padding of RFC 7515 §2.
+///
+/// Written out here rather than taken from the workspace's one codec for the reason
+/// `query_wire.rs` gives for its own encoder: `core/router/Cargo.toml` is a pinned
+/// path in this repository, so this test crate can take no dependency at all.
+pub(crate) fn base64url(text: &str) -> String {
+    aws_smithy_types::base64::encode(text.as_bytes())
+        .replace('+', "-")
+        .replace('/', "_")
+        .replace('=', "")
+}
+
+/// The bearer token a kubeconfig's credential plugin builds for the credential
+/// `access_key_id`: `k8s-aws-v1.` followed by the base64url form of a presigned
+/// `sts:GetCallerIdentity` request, whose SigV4 credential scope names that key.
+///
+/// A cluster's Kubernetes API server authenticates every request from the token it
+/// carries, so every suite that dials a published cluster endpoint presents one.
+pub(crate) fn kubernetes_bearer_token(access_key_id: &str) -> String {
+    format!(
+        "k8s-aws-v1.{}",
+        base64url(&format!(
+            "https://sts.{REGION}.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15\
+             &X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={access_key_id}%2F20260101%2F\
+             {REGION}%2Fsts%2Faws4_request&X-Amz-Date=20260101T000000Z&X-Amz-Expires=60\
+             &X-Amz-SignedHeaders=host%3Bx-k8s-aws-id&X-Amz-Signature=0000"
+        ))
+    )
+}
+
+/// The token a client built from the ACCOUNT's own published credential presents,
+/// which is the caller a suite dials a cluster's Kubernetes API as unless it names
+/// another.
+pub(crate) fn account_kubernetes_bearer_token() -> String {
+    kubernetes_bearer_token(DEFAULT_ACCESS_KEY_ID)
+}
+
 /// A `CreateCluster` body naming `subnets`, and nothing else beyond the required members.
 pub(crate) fn cluster_body(name: &str, subnets: &[String]) -> serde_json::Value {
     serde_json::json!({

@@ -19,13 +19,21 @@
 //! the session the access key id was minted for — a role session speaks for its
 //! ROLE, the permanent principal an access entry can be filed under — else the IAM
 //! user that holds the long-term key, else the credential this emulator publishes at
-//! start. A request that presents no credential at all therefore speaks for that
-//! published credential's principal, exactly as an unsigned call to any other
-//! emulated service does; this service never checks a signature, which is the
-//! emulator's own authentication layer's work.
+//! start.
 //!
-//! A principal NEITHER mapping of the cluster names authenticates as nobody, and is
-//! answered the `401 Unauthorized` the API server answers a credential it cannot map.
+//! A Kubernetes API server AUTHENTICATES every request it serves, and the credential
+//! of a request to this one is the bearer token it carries and nothing else: a
+//! request with no `Authorization` header presents no credential, so it speaks for
+//! NOBODY rather than for whichever principal an unsigned AWS call would be
+//! attributed to. An anonymous request is answered the `401 Unauthorized` below
+//! before anything is routed.
+//!
+//! A token is bound to ONE cluster: the plugin signs the cluster's name into the
+//! presigned request under `x-k8s-aws-id` ([`CLUSTER_ID_HEADER`]), so a token built
+//! for another cluster speaks for nobody at this one however good its credential is.
+//!
+//! A principal NEITHER mapping of the cluster names authenticates as nobody too, and
+//! is answered that same `401 Unauthorized`.
 //!
 //! There are two mappings, and [`authenticate`] consults them in the order Amazon
 //! EKS does: the cluster's ACCESS ENTRIES, then its `aws-auth` ConfigMap for a
@@ -44,6 +52,26 @@ const EKS_BEARER_TOKEN_PREFIX: &str = "k8s-aws-v1.";
 
 /// The scheme a bearer token is presented under in the `Authorization` header.
 const BEARER_SCHEME: &str = "Bearer ";
+
+/// The name the CLUSTER a bearer token was built for is bound into the token under.
+///
+/// A kubeconfig's credential plugin signs `x-k8s-aws-id` into the presigned
+/// `sts:GetCallerIdentity` request the token carries, so one token is usable at one
+/// cluster: that is what stops a token built for one cluster from being replayed at
+/// another. A client that names the cluster beside the token sends it under the same
+/// name.
+pub const CLUSTER_ID_HEADER: &str = "x-k8s-aws-id";
+
+/// What one presented bearer token names: the credential it was built from, and the
+/// cluster it was built FOR when the token names one.
+#[derive(Debug, Clone)]
+pub struct PresentedToken {
+    /// The access key id the token's presigned URL is scoped to.
+    pub access_key_id: String,
+    /// The cluster the token is bound to ([`CLUSTER_ID_HEADER`]), and `None` for a
+    /// token whose URL names none.
+    pub cluster_name: Option<String>,
+}
 
 /// The registries that answer which IAM principal an access key id speaks for, held
 /// for as long as the cluster's API address is open.
@@ -85,21 +113,15 @@ impl ApiServerPrincipals {
     /// credential that speaks for nobody — one naming a session whose window has
     /// run out.
     ///
+    /// `access_key_id` is the credential a request PRESENTED
+    /// ([`presented_access_key_id`]); a request that presented none never reaches
+    /// here, because it authenticates as nobody.
+    ///
     /// Reading only: no session is minted, moved or pruned here — a request to a
     /// cluster's API server is not what expires a credential. Call it with no store
     /// of THIS service held: it takes the other services' locks.
     #[must_use]
     pub fn caller(&self, access_key_id: &str, now: SystemTime) -> Option<ApiCaller> {
-        // A request that presents NO credential names no session and no key any
-        // registry holds, so it speaks for the identity this emulator publishes and
-        // neither of the other services' stores is asked at all: the common request on
-        // this address does not queue behind their locks.
-        if access_key_id == no_credential_key_id() {
-            return Some(ApiCaller::of(
-                sts_store::long_term_identity(None, access_key_id).arn,
-                None,
-            ));
-        }
         if let Some(sessions) = &self.sessions {
             let store = sessions.lock();
             if let Some(session) = store.session(access_key_id) {
@@ -176,8 +198,8 @@ impl ApiCaller {
     }
 }
 
-/// The access key id the `Authorization` header of a Kubernetes API request presents,
-/// and `None` for a header this server cannot read a credential out of at all.
+/// What the `Authorization` header of a Kubernetes API request PRESENTS, and `None`
+/// for a header this server cannot read a credential out of at all.
 ///
 /// The token is `k8s-aws-v1.` followed by the base64url form of a presigned
 /// `sts:GetCallerIdentity` URL, so the credential it was built from is the one that
@@ -185,21 +207,20 @@ impl ApiCaller {
 /// service in this tree reads them with: `service_common::jwt::decode_base64url` for
 /// the segment, the one base64url codec of this workspace, and
 /// `service_common::request_access_key_id` for the scope, so a token and a presigned
-/// call resolve to one credential.
+/// call resolve to one credential. The CLUSTER the token was built for is read off
+/// the same URL ([`CLUSTER_ID_HEADER`]).
 ///
-/// A request carrying NO `Authorization` header presents no credential, which reads as
-/// the sentinel that reader answers for an unsigned request — the identity an unsigned
-/// call to any other emulated service is served as. A header that IS there but carries
-/// no credential this server can read — another scheme, a token of another version, a
-/// segment that is not base64url, a URL with no credential scope — is answered
-/// `None`, which the caller turns into the `401 Unauthorized` the API server answers a
-/// credential it cannot map: a presented token that reads as nothing is not the same
-/// thing as presenting none.
+/// A request carrying NO `Authorization` header presents no credential at all, and a
+/// header that IS there but carries no credential this server can read — another
+/// scheme, a token of another version, a segment that is not base64url, a URL with no
+/// credential scope — presents nothing either. Both are answered `None`, which the
+/// caller turns into the `401 Unauthorized` the API server answers a request it cannot
+/// authenticate: the Kubernetes API is reached with a bearer token, so a request that
+/// carries none speaks for nobody rather than for the principal an unsigned AWS call
+/// would be attributed to.
 #[must_use]
-pub fn presented_access_key_id(authorization: Option<&str>) -> Option<String> {
-    let Some(header) = authorization else {
-        return Some(no_credential_key_id());
-    };
+pub fn presented_token(authorization: Option<&str>) -> Option<PresentedToken> {
+    let header = authorization?;
     let token = header
         .strip_prefix(BEARER_SCHEME)
         .and_then(|token| token.trim().strip_prefix(EKS_BEARER_TOKEN_PREFIX))?;
@@ -213,12 +234,26 @@ pub fn presented_access_key_id(authorization: Option<&str>) -> Option<String> {
     let access_key_id = ::service_common::request_access_key_id(&parts);
     // The scope the presigned URL carries, and nothing when it carries none: that URL
     // is the whole credential the token presents.
-    (access_key_id != no_credential_key_id()).then_some(access_key_id)
+    if access_key_id == no_credential_key_id() {
+        return None;
+    }
+    let cluster_name = parts.uri.query().and_then(|query| {
+        query.split('&').find_map(|pair| {
+            let (name, value) = pair.split_once('=')?;
+            name.eq_ignore_ascii_case(CLUSTER_ID_HEADER)
+                .then(|| value.to_string())
+        })
+    });
+    Some(PresentedToken {
+        access_key_id,
+        cluster_name,
+    })
 }
 
-/// What [`presented_access_key_id`] answers for a request that presents no
-/// credential: the sentinel the one reader answers for a request carrying none,
-/// taken from that reader rather than restated here.
+/// The sentinel the one credential reader of this workspace answers for a request
+/// that carries no credential scope, taken from that reader rather than restated
+/// here: a presigned URL whose scope reads as this names no credential, so the token
+/// built from it presents none.
 fn no_credential_key_id() -> String {
     let (parts, ()) = ::http::Request::new(()).into_parts();
     ::service_common::request_access_key_id(&parts)
@@ -261,6 +296,8 @@ pub fn authenticate(
             username: caller.username(&entry.username),
             groups: SubjectIdentity::authenticated_groups(&entry.kubernetes_groups),
             grants,
+            principal_arn: caller.principal_arn.clone(),
+            session_name: caller.session_name.clone(),
         });
     }
     if cluster.authenticates_through_config_map() {
@@ -277,6 +314,8 @@ pub fn authenticate(
                 // ENTRY, so a principal mapped this way carries none and what it
                 // may do is decided by the cluster's own RBAC objects alone.
                 grants: Vec::new(),
+                principal_arn: caller.principal_arn.clone(),
+                session_name: caller.session_name.clone(),
             });
         }
     }
