@@ -1488,6 +1488,26 @@ pub fn same_restore_account(
         || (left.account_alias.is_some() && left.account_alias == right.account_alias)
 }
 
+/// Why an account that holds no access to a snapshot is refused
+/// `AccessToSnapshotDeniedFault`, naming the account that is not authorized and
+/// then the snapshot it is not authorized for.
+///
+/// Amazon Redshift's own wording for this error class: the fixed text `The
+/// account ` + ` is not authorized to access the snapshot `, with exactly two
+/// variable parts — the account and the snapshot, in that order — and NO
+/// trailing punctuation. The fault shape's documentation sentence ("The owner of
+/// the specified snapshot has not authorized your account to access the
+/// snapshot.") is documentation and not a wire message, so it is not what the
+/// refusal carries. ONE function for every operation that reports this fault, the
+/// way [`invalid_snapshot_state_message`] serves every operation whose
+/// precondition is an available snapshot: `RevokeSnapshotAccess` (an account the
+/// snapshot holds no grant for) and `RestoreFromClusterSnapshot` (a snapshot the
+/// request says another account owns) both word it through here, so the wording
+/// cannot drift between them.
+pub fn access_to_snapshot_denied_message(account: &str, snapshot_identifier: &str) -> String {
+    format!("The account {account} is not authorized to access the snapshot {snapshot_identifier}")
+}
+
 /// How many cluster subnet groups the account's own groups may number before
 /// `CreateClusterSubnetGroup` refuses with the modelled
 /// `ClusterSubnetGroupQuotaExceededFault`.

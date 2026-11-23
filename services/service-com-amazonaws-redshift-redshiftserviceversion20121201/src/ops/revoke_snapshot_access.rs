@@ -263,10 +263,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Only an authorization the snapshot HOLDS can be released, and the
         // snapshot RESOLVED here, so the refusal is the authorization-specific
-        // one rather than a not-found: `AccessToSnapshotDeniedFault` is "the
-        // owner of the specified snapshot has not authorized your account to
-        // access the snapshot", which is exactly an account that was never
-        // authorized or whose grant an earlier revoke already released. Nothing
+        // `AccessToSnapshotDeniedFault` rather than a not-found: that fault is
+        // exactly an account that was never authorized or whose grant an earlier
+        // revoke already released. It is worded through
+        // [`st::access_to_snapshot_denied_message`], which names the account the
+        // request asked for and the snapshot it holds no access to. Nothing
         // is written on this path, so every other account's grant on the
         // snapshot stays as it was and the unauthorized account is not added.
         // Unlike the grant path this operation asserts nothing about the
@@ -283,11 +284,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 RevokeSnapshotAccessErrorModeled::AccessToSnapshotDeniedFault(
                     AccessToSnapshotDeniedFault {
-                        message: Some(format!(
-                            "The owner of the specified snapshot {} has not authorized your \
-                             account {} to access the snapshot.",
-                            snapshot.snapshot_identifier.as_deref().unwrap_or_default(),
-                            input.account_with_restore_access
+                        message: Some(st::access_to_snapshot_denied_message(
+                            &input.account_with_restore_access,
+                            snapshot_identifier.unwrap_or_else(|| {
+                                snapshot
+                                    .snapshot_identifier
+                                    .as_deref()
+                                    .unwrap_or_default()
+                            }),
                         )),
                     },
                 )

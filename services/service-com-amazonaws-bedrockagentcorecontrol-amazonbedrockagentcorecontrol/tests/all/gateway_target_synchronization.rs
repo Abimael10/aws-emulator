@@ -281,14 +281,15 @@ fn create_body(name: &str, configuration: &Value) -> Value {
 }
 
 /// True when `later` is strictly after `earlier`, whichever form the protocol rendered the
-/// timestamp in: epoch seconds compare numerically, and an RFC 3339 instant compares
-/// lexically (that encoding sorts in chronological order).
+/// timestamp in — read as the instant each names
+/// ([`crate::agent_runtime_lifecycle::epoch_seconds`]) rather than compared in the form it
+/// arrived in, because an RFC 3339 rendering carries only the fractional-second digits it
+/// needs and so does not sort lexically.
 fn timestamp_after(later: &Value, earlier: &Value) -> bool {
-    match (later, earlier) {
-        (Value::Number(later), Value::Number(earlier)) => {
-            later.as_f64().unwrap_or_default() > earlier.as_f64().unwrap_or_default()
-        }
-        (Value::String(later), Value::String(earlier)) => later > earlier,
+    use crate::agent_runtime_lifecycle::epoch_seconds;
+
+    match (epoch_seconds(later), epoch_seconds(earlier)) {
+        (Some(later), Some(earlier)) => later > earlier,
         _ => false,
     }
 }

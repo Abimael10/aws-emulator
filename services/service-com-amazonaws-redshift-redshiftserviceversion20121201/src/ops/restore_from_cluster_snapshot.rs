@@ -577,14 +577,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RestoreFromCluste
         // own. This emulator holds one account's snapshots and models no
         // cross-account restore authorization, so a request naming any other
         // owner is refused with the modelled access fault rather than served
-        // from the local record.
+        // from the local record — worded through
+        // [`st::access_to_snapshot_denied_message`], the one sentence this fault
+        // class carries, naming the account that holds no access to the snapshot
+        // (this caller's own) and the snapshot the request named.
         if let Some(owner) = input.owner_account.as_deref() {
             if owner != ::engine::emulator_account_id() {
                 return Err(
                     RestoreFromClusterSnapshotErrorModeled::AccessToSnapshotDeniedFault(
                         AccessToSnapshotDeniedFault {
-                            message: Some(format!(
-                                "The owner of the specified snapshot, account {owner}, has not authorized this account to access it."
+                            message: Some(st::access_to_snapshot_denied_message(
+                                ::engine::emulator_account_id(),
+                                snapshot_identifier.or(snapshot_arn).unwrap_or_default(),
                             )),
                         },
                     )

@@ -160,15 +160,35 @@ fn is_modelled_runtime_id(id: &str) -> bool {
 }
 
 /// True when `later` is at or after `earlier`, whichever form the protocol
-/// rendered the timestamp in: epoch seconds compare numerically, and an RFC 3339
-/// instant compares lexically (that encoding sorts in chronological order).
+/// rendered the timestamp in.
 fn timestamp_at_or_after(later: &Value, earlier: &Value) -> bool {
-    match (later, earlier) {
-        (Value::Number(later), Value::Number(earlier)) => {
-            later.as_f64().unwrap_or_default() >= earlier.as_f64().unwrap_or_default()
-        }
-        (Value::String(later), Value::String(earlier)) => later >= earlier,
+    match (epoch_seconds(later), epoch_seconds(earlier)) {
+        (Some(later), Some(earlier)) => later >= earlier,
         _ => false,
+    }
+}
+
+/// The instant a rendered timestamp names, in seconds since the epoch, or `None`
+/// for a value that is no timestamp at all.
+///
+/// Both renderings are read as the INSTANT they name rather than compared in the
+/// form they arrived in: epoch seconds are already a number, and an RFC 3339
+/// instant is parsed, because that encoding carries only the fractional-second
+/// digits it needs (`…09.3Z` beside `…09.30492Z`) and so does NOT sort
+/// lexically.
+///
+/// `pub(crate)` because the gateway-synchronization suite compares its own pair
+/// of timestamps by the same rule.
+pub(crate) fn epoch_seconds(rendered: &Value) -> Option<f64> {
+    match rendered {
+        Value::Number(seconds) => seconds.as_f64(),
+        Value::String(instant) => ::aws_smithy_types::DateTime::from_str(
+            instant,
+            ::aws_smithy_types::date_time::Format::DateTime,
+        )
+        .ok()
+        .map(|parsed| parsed.as_secs_f64()),
+        _ => None,
     }
 }
 

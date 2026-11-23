@@ -121,16 +121,16 @@ async fn a_revoke_for_an_ungranted_account_is_denied_and_changes_no_grant() {
             answer.error_code(),
             answer.body
         );
+        // The refusal carries the ONE sentence this fault class words: the
+        // account the request named, then the snapshot it holds no access to.
         let message = answer.text("Message").unwrap_or_default();
-        assert!(
-            message.contains("has not authorized your account"),
-            "case {label}: expected the access-denied wording, got {message:?}"
-        );
-        assert!(
-            message.contains(SNAPSHOT) && message.contains(case.account),
-            "case {label}: expected the snapshot {SNAPSHOT} and the account {} in the message, \
-             got {message:?}",
+        let expected = format!(
+            "The account {} is not authorized to access the snapshot {SNAPSHOT}",
             case.account
+        );
+        assert_eq!(
+            message, expected,
+            "case {label}: expected the message {expected:?}, got {message:?}"
         );
 
         // The refusal is SCOPED: nothing about the set changed, so no other
