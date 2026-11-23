@@ -339,6 +339,10 @@ pub use instance_health::{
 /// group's `DesiredCapacityType` counts its capacity in.
 pub mod instance_requirements;
 
+/// What still HOLDS a group and what the clock is still settling on it: the two facts a
+/// delete that was not asked to force itself tells apart.
+pub mod group_teardown;
+
 /// What ONE scaling activity records: the step it reports, the milestone that step is at,
 /// and the placement of the instance it moved.
 pub mod activity_records;

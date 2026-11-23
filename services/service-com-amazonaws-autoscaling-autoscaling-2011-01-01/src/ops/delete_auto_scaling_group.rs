@@ -3,9 +3,11 @@
 //! @op DeleteAutoScalingGroup
 //!
 //! Removes a stored group and its instances, terminating the account's own Amazon EC2
-//! instances the group was holding ([`crate::state::ec2_instances`]). A group that
-//! still holds instances or capacity is `ResourceInUseFault` unless `ForceDelete` is
-//! set, and a group whose deletion protection forbids the delete is refused.
+//! instances the group was holding ([`crate::state::ec2_instances`]). A group that still
+//! HOLDS instances or capacity is `ResourceInUseFault` unless `ForceDelete` is set, a group
+//! whose only remaining change is one the clock is still carrying out is the transient
+//! `ScalingActivityInProgressFault` ([`crate::state::group_teardown`]), and a group whose
+//! deletion protection forbids the delete is refused.
 //!
 //! ## Shape of an operation
 //!
@@ -221,12 +223,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let arn = group.arn.clone();
         let region = group.region.clone();
-        let instance_count = group.instances.len();
+        // The instances that still HOLD the group, and the ones the clock is already taking
+        // out of it: what the group still holds is what a non-forced delete is refused for,
+        // and a change still being carried out is a wait rather than something the caller has
+        // to undo ([`crate::state::group_teardown`]).
         let instance_ids: Vec<String> = group
-            .instances
-            .iter()
+            .holding_instances()
             .map(|instance| instance.instance_id.clone())
             .collect();
+        let instance_count = instance_ids.len();
+        let holds_instances_or_capacity = group.holds_instances_or_capacity();
+        let warm_pool_in_use = group.warm_pool_holds_instances();
+        let settling = group.is_settling();
         // The instances the group's warm pool holds, which the force delete takes with the
         // group: "if the group has a warm pool, the force delete option also deletes the
         // warm pool" (this operation's own documentation). They are the account's own
@@ -237,15 +245,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .map(|instance| instance.instance_id.clone())
             .collect();
-        // Where the group had placed each of them, read off its own record before the
-        // group is removed: the lifecycle event a forced delete's terminations publish
-        // reports the placement the group held, which is gone once the group is.
+        // Where the group had placed each of the instances it still holds, read off its own
+        // record before the group is removed: the lifecycle event a forced delete's
+        // terminations publish reports the placement the group held, which is gone once the
+        // group is.
         let instance_zones: Vec<Option<String>> = group
-            .instances
-            .iter()
+            .holding_instances()
             .map(|instance| Some(instance.availability_zone.clone()))
             .collect();
-        let desired_capacity = group.desired_capacity;
         let protection = group.deletion_protection.clone().unwrap_or_default();
         // Whether the group's own instance lifecycle policy keeps the instances an abandoned
         // termination would otherwise take — the standing instruction a forced delete would
@@ -300,14 +307,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::state::group_configuration::force_delete_retention_error());
         }
 
-        // A group that still has instances, or still asks for capacity, is in use:
-        // only `ForceDelete` terminates what is left along with the group. The instances
-        // of its warm pool count among them — they are instances of the group, in a state
-        // other than `Terminated` — so a group whose pool is holding instances is in use
-        // even when the group's own capacity is zero.
-        if (instance_count > 0 || !warm_pool_instance_ids.is_empty() || desired_capacity > 0)
-            && !force_delete
-        {
+        // A group that still HOLDS instances, or still asks for capacity, is in use: only
+        // `ForceDelete` terminates what is left along with the group. The instances of its
+        // warm pool count among them — they are instances of the group, in a state other than
+        // `Terminated` — so a group whose pool is keeping instances is in use even when the
+        // group's own capacity is zero. A member already on its way OUT of the group holds it
+        // no longer ([`crate::state::group_teardown`]): it is leaving on its own, so it is
+        // the wait below rather than this refusal.
+        if holds_instances_or_capacity && !force_delete {
             crate::state::audit(
                 ctx.parts(),
                 "DeleteAutoScalingGroup",
@@ -318,12 +325,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ResourceInUseFault {
                     // The sentence Amazon EC2 Auto Scaling states for this error class,
                     // which names neither the group nor any instance of it — followed, for
-                    // a group whose warm pool is what is still holding instances, by the
+                    // a group whose warm pool is what is still keeping instances, by the
                     // sentence it states about that pool.
-                    message: Some(in_use_message(!warm_pool_instance_ids.is_empty())),
+                    message: Some(in_use_message(warm_pool_in_use)),
                 },
             )
             .into());
+        }
+
+        // Nothing is left in the group but a change the clock is still carrying out — a
+        // member being released or terminated, an instance the warm pool is terminating, a
+        // capacity change waiting for a cooldown. "If the group has instances or scaling
+        // activities in progress, you must specify the option to force the deletion in order
+        // for it to succeed" (this operation's own documentation): without `ForceDelete` the
+        // delete waits for that activity, which is the TRANSIENT error class the model
+        // declares for it, so the documented teardown converges on a retry instead of
+        // standing refused.
+        if settling && !force_delete {
+            crate::state::audit(
+                ctx.parts(),
+                "DeleteAutoScalingGroup",
+                &name,
+                "refused: a scaling activity of the group is still in progress",
+            );
+            return Err(
+                DeleteAutoScalingGroupErrorModeled::ScalingActivityInProgressFault(
+                    ScalingActivityInProgressFault {
+                        message: Some(SCALING_ACTIVITY_IN_PROGRESS_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
         }
 
         state.groups.remove(&name);
@@ -433,3 +465,13 @@ fn in_use_message(warm_pool_in_use: bool) -> String {
     }
     message
 }
+
+/// The sentence Amazon EC2 Auto Scaling states when a delete is refused because a scaling
+/// activity of the group is still in progress.
+///
+/// Fixed text: the error class says that an activity of the group is still running, not which
+/// one, so the sentence has NO variable part — it names neither the group nor the instance the
+/// activity is moving.
+const SCALING_ACTIVITY_IN_PROGRESS_MESSAGE: &str =
+    "You cannot delete an AutoScalingGroup while there are scaling activities in progress for \
+     that group.";
