@@ -327,16 +327,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         let options: Vec<RecommendedOptionProjectedMetric> = instance
-            .candidates
-            .iter()
-            // The candidates the preferences in force admit: the crate's one rule for which
-            // candidate types a recommendation consists of
-            // ([`crate::state::InstanceConfiguration::option_admitted`]) — the request's
+            // The options the instance's recommendation consists of: the crate's one selection
+            // of the candidates the preferences in force admit
+            // ([`crate::state::ObservedInstance::admitted_options`]) — the request's
             // `cpuVendorArchitectures`, which restricts nothing when it states none, and the
-            // account's preferred-resource lists, resolved for this instance the way the
-            // reader of its recommendation resolves them — so this projection covers exactly
-            // the options that reader reports.
-            .filter(|candidate| candidate.option_admitted(&preferences, &requested_architectures))
+            // account's preferred-resource lists, resolved for this instance the way the reader
+            // of its recommendation resolves them — so this projection covers exactly the
+            // options that reader reports, in the same order.
+            .admitted_options(&preferences, &requested_architectures)
+            .into_iter()
             .enumerate()
             .map(|(index, candidate)| {
                 let projected: Vec<ProjectedMetric> = instance

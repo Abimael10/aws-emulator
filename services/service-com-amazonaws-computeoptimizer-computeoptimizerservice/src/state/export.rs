@@ -1128,21 +1128,15 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
                 continue;
             };
             let preferences = self.effective_preferences(&arn, parsed);
-            // The candidates the preferences in force admit, and "the CPU vendor and
-            // architecture for an instance or Auto Scaling group recommendations" the exported
-            // options then consist of: the crate's one rule for which candidate configurations
-            // a recommendation consists of ([`GroupConfiguration::option_admitted`]), which is
-            // what the reader of these recommendations applies — "when you specify AWS_ARM64
-            // with an ExportAutoScalingGroupRecommendations request, Compute Optimizer exports
-            // recommendations that consist of Graviton instance types only", and the account's
-            // preferred-resource lists.
-            let options: Vec<&GroupConfiguration> = group
-                .candidates
-                .iter()
-                .filter(|candidate| {
-                    candidate.option_admitted(&preferences, requested_architectures)
-                })
-                .collect();
+            // The options the exported recommendation consists of, and "the CPU vendor and
+            // architecture for an instance or Auto Scaling group recommendations" they then
+            // consist of: the crate's one selection of the candidate configurations the
+            // preferences in force admit ([`AnalyzedAutoScalingGroup::admitted_options`]),
+            // which is what the reader of these recommendations applies — "when you specify
+            // AWS_ARM64 with an ExportAutoScalingGroupRecommendations request, Compute
+            // Optimizer exports recommendations that consist of Graviton instance types only",
+            // and the account's preferred-resource lists.
+            let options = group.admitted_options(&preferences, requested_architectures);
             let architectures = stated_architectures(
                 options.iter().map(|option| option.architecture.as_str()),
             );
@@ -1197,21 +1191,15 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
             let arn = instance.instance_arn(region);
             let preferences =
                 self.effective_preferences_for(&arn, RESOURCE_TYPE_EC2_INSTANCE, account_id);
-            // The candidates the preferences in force admit, and "the CPU vendor and
-            // architecture for an instance or Auto Scaling group recommendations" the exported
-            // options then consist of: the crate's one rule for which candidate types a
-            // recommendation consists of ([`InstanceConfiguration::option_admitted`]), which is
-            // what the reader of these recommendations applies — "when you specify AWS_ARM64
-            // with an ExportEC2InstanceRecommendations request, Compute Optimizer exports
+            // The options the exported recommendation consists of, and "the CPU vendor and
+            // architecture for an instance or Auto Scaling group recommendations" they then
+            // consist of: the crate's one selection of the candidate types the preferences in
+            // force admit ([`ObservedInstance::admitted_options`]), which is what the reader of
+            // these recommendations applies — "when you specify AWS_ARM64 with an
+            // ExportEC2InstanceRecommendations request, Compute Optimizer exports
             // recommendations that consist of Graviton instance types only", and the account's
             // preferred-resource lists.
-            let options: Vec<&InstanceConfiguration> = instance
-                .candidates
-                .iter()
-                .filter(|candidate| {
-                    candidate.option_admitted(&preferences, requested_architectures)
-                })
-                .collect();
+            let options = instance.admitted_options(&preferences, requested_architectures);
             let architectures =
                 stated_architectures(options.iter().map(|option| option.architecture.as_str()));
             // "Describes if an Amazon EC2 instance is idle": it is exactly when this service

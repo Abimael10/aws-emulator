@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What a STORED preferred-resource preference does to the recommendation candidates.
+//! What a preference does to the recommendation candidates: the preferred-resource lists an
+//! account STORES, and the CPU vendor architectures a REQUEST asks for.
 //!
 //! The rule under test: `PreferredResource` is "the preference to control which resource type
 //! values are considered when generating rightsizing recommendations", whose exclude list
@@ -22,6 +23,12 @@
 //! wildcard, the catch-all — and the combinations of the two lists, up to a preference that
 //! leaves no candidate at all.
 //!
+//! The architecture preference a request carries is the other half of the same admission: one
+//! rule decides which candidates an answer reports as options, so every surface of one analysis
+//! — the recommendation reader, the projection of an option's metrics, the export file and the
+//! Auto Scaling group reader — reports the same options under the same preference, which is
+//! what the last test below drives over the model's whole architecture enum.
+//!
 //! Every call goes through the shared wire harness, i.e. the dispatch a client reaches the
 //! emulator through; the analysis is made due by moving the stored enrollment instant back a
 //! span, so nothing here depends on how fast the host runs.
@@ -33,7 +40,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
     admits, analysed_emulator, call, cell, create_bucket, effective_for,
-    exported_recommendation_rows, group_recommendations, narrowed_group_options,
+    exported_recommendation_rows_asking, group_recommendations, narrowed_group_options,
     preferred_resource_entry, put_preference, reported_group_options, store_for_each_group,
     strings, ACCOUNT,
 };
@@ -348,12 +355,22 @@ async fn exported_option_types(
     router: &MultiServiceRouter,
     case: &str,
 ) -> BTreeMap<String, Vec<String>> {
-    let rows = exported_recommendation_rows(
+    exported_option_types_asking(router, case, None).await
+}
+
+/// The same export, asked for under the `cpuVendorArchitectures` preference `asked`.
+async fn exported_option_types_asking(
+    router: &MultiServiceRouter,
+    case: &str,
+    asked: Option<&Value>,
+) -> BTreeMap<String, Vec<String>> {
+    let rows = exported_recommendation_rows_asking(
         router,
         case,
         "ExportEC2InstanceRecommendations",
         BUCKET,
         &[ARN_COLUMN, OPTION_COLUMN],
+        asked,
     )
     .await;
     let (header, data) = rows
@@ -429,5 +446,287 @@ async fn a_group_recommendation_reports_only_the_configurations_the_preference_l
         saw_narrowed,
         "the table must hold a row that narrows the baseline configurations, or it proves \
          nothing"
+    );
+}
+
+/// One row of the architecture table: the case, and the `cpuVendorArchitectures` the request
+/// asks for — `None` where it states no preference at all.
+type ArchitectureRow<'a> = (&'a str, Option<&'a [&'a str]>);
+
+/// Read every instance recommendation under the request preference `asked`, asserting the call
+/// was served.
+async fn instance_recommendations_asking(
+    router: &MultiServiceRouter,
+    case: &str,
+    asked: Option<&Value>,
+) -> Value {
+    let mut request = json!({"maxResults": 100});
+    if let Some(preference) = asked {
+        request["recommendationPreferences"] = preference.clone();
+    }
+    let (status, body) = call(router, "GetEC2InstanceRecommendations", request.clone()).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected 200 from {request}, got {status}: {body}"
+    );
+    body
+}
+
+/// Read every Auto Scaling group recommendation under the request preference `asked`.
+async fn group_recommendations_asking(
+    router: &MultiServiceRouter,
+    case: &str,
+    asked: Option<&Value>,
+) -> Value {
+    let mut request = json!({"maxResults": 100});
+    if let Some(preference) = asked {
+        request["recommendationPreferences"] = preference.clone();
+    }
+    let (status, body) = call(router, "GetAutoScalingGroupRecommendations", request.clone()).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected 200 from {request}, got {status}: {body}"
+    );
+    body
+}
+
+/// The instance types the projection of `instance_arn`'s metrics covers, in the order it reports
+/// them, asserting on the way that each option's `rank` is its position among the options
+/// reported ("the top recommendation option is ranked as 1", and "the projected metric rank
+/// correlates to the recommendation option rank").
+async fn projected_option_types(
+    router: &MultiServiceRouter,
+    case: &str,
+    instance_arn: &str,
+    asked: Option<&Value>,
+) -> Vec<String> {
+    let mut request = json!({
+        "instanceArn": instance_arn,
+        "stat": "Maximum",
+        "period": 3_600,
+        "startTime": 1_761_000_000_i64,
+        "endTime": 1_761_003_600_i64,
+    });
+    if let Some(preference) = asked {
+        request["recommendationPreferences"] = preference.clone();
+    }
+    let (status, body) = call(
+        router,
+        "GetEC2RecommendationProjectedMetrics",
+        request.clone(),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected 200 from {request}, got {status}: {body}"
+    );
+    let options = body["recommendedOptionProjectedMetrics"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    for (index, option) in options.iter().enumerate() {
+        let position = i64::try_from(index).unwrap_or(i64::MAX) + 1;
+        assert_eq!(
+            option["rank"].as_i64(),
+            Some(position),
+            "case {case:?}: expected the option at position {position} of {instance_arn} to be \
+             ranked {position}, got {option}"
+        );
+    }
+    options
+        .iter()
+        .map(|option| {
+            option["recommendedInstanceType"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
+/// Whether `part` holds the members of `whole` it holds in the order `whole` holds them: an
+/// option a narrowing preference leaves keeps the position the analysis ranks it in.
+fn is_subsequence<T: PartialEq>(part: &[T], whole: &[T]) -> bool {
+    let mut held = whole.iter();
+    part.iter()
+        .all(|wanted| held.any(|candidate| candidate == wanted))
+}
+
+/// The rule one resource's options are judged against, over the rows of the architecture table:
+/// a preference naming ONE architecture leaves a subsequence of the options reported under no
+/// preference, the two single-architecture selections hold no option in common and together
+/// cover that baseline, and naming both leaves it whole whichever order they are named in.
+fn assert_architecture_partition<T: PartialEq + ::std::fmt::Debug>(
+    case: &str,
+    baseline: &[T],
+    current: &[T],
+    graviton: &[T],
+    both: &[T],
+    reversed: &[T],
+) {
+    for (asked, left) in [("CURRENT", current), ("AWS_ARM64", graviton)] {
+        assert!(
+            is_subsequence(left, baseline),
+            "case {case:?}: asking for {asked} leaves options of the baseline {baseline:?} in \
+             the order it ranks them, got {left:?}"
+        );
+    }
+    assert!(
+        !current.iter().any(|option| graviton.contains(option)),
+        "case {case:?}: an option consists of ONE architecture, so the two selections share \
+         none, got {current:?} and {graviton:?}"
+    );
+    assert_eq!(
+        current.len() + graviton.len(),
+        baseline.len(),
+        "case {case:?}: the two architectures together admit every option of the baseline \
+         {baseline:?}, got {current:?} and {graviton:?}"
+    );
+    assert_eq!(
+        both, baseline,
+        "case {case:?}: naming both architectures restricts nothing, got {both:?}"
+    );
+    assert_eq!(
+        reversed, baseline,
+        "case {case:?}: the order the architectures are named in does not reorder the options, \
+         got {reversed:?}"
+    );
+}
+
+/// Every surface of ONE analysis admits the options the request's `cpuVendorArchitectures`
+/// preference leaves, and admits the same ones: "when you specify `AWS_ARM64` with a
+/// `GetEC2InstanceRecommendations` or `GetAutoScalingGroupRecommendations` request, Compute
+/// Optimizer returns recommendations that consist of Graviton instance types only", with a
+/// `GetEC2RecommendationProjectedMetrics` request "projected utilization metrics for Graviton
+/// instance type recommendations only", and with an `ExportEC2InstanceRecommendations` request
+/// it "exports recommendations that consist of Graviton instance types only"
+/// (`RecommendationPreferences$cpuVendorArchitectures`). A surface that admitted its own set
+/// would let a client see an instance type recommended by one path and absent from the next.
+///
+/// The ORACLE is the rule, not a list of instance types: each surface is checked against the
+/// reader of the same analysis, and the selections are checked against the baseline the same
+/// request reports with no preference at all.
+#[tokio::test]
+async fn every_surface_of_the_analysis_admits_the_same_architecture_options() {
+    /// The `CpuVendorArchitecture` the resource runs today, and the Graviton one — the model's
+    /// whole value set (`smithy_query query="shape" shape="CpuVendorArchitecture"`).
+    const CURRENT: &str = "CURRENT";
+    /// See [`CURRENT`].
+    const GRAVITON: &str = "AWS_ARM64";
+
+    let rows: [ArchitectureRow; 5] = [
+        ("no preference at all", None),
+        ("the architecture the resource runs today", Some(&[CURRENT])),
+        ("Graviton only", Some(&[GRAVITON])),
+        ("both architectures", Some(&[CURRENT, GRAVITON])),
+        (
+            "both architectures, named the other way round",
+            Some(&[GRAVITON, CURRENT]),
+        ),
+    ];
+
+    // One entry per row, in the order the rows are listed.
+    let mut instance_rows: Vec<BTreeMap<String, Vec<String>>> = Vec::new();
+    let mut group_rows: Vec<BTreeMap<String, Vec<Vec<String>>>> = Vec::new();
+    for (case, asked) in rows {
+        // A fresh emulator per row: one instance export job runs per Region at a time, so each
+        // row exports from its own store.
+        let router = analysed_emulator().await;
+        create_bucket(&router, BUCKET).await;
+        let preference = asked.map(|values| json!({"cpuVendorArchitectures": values}));
+
+        let read = reported_option_types(
+            case,
+            &instance_recommendations_asking(&router, case, preference.as_ref()).await,
+        );
+        // The projection of an option's metrics covers exactly the options the reader reports,
+        // in the same order.
+        for (arn, types) in &read {
+            let projected = projected_option_types(&router, case, arn, preference.as_ref()).await;
+            assert_eq!(
+                &projected, types,
+                "case {case:?}: expected the projection of {arn} to cover the options the \
+                 reader reports, {types:?}, got {projected:?}"
+            );
+        }
+        // The export of those recommendations holds one row per option the reader reports.
+        let exported = exported_option_types_asking(&router, case, preference.as_ref()).await;
+        assert_eq!(
+            exported, read,
+            "case {case:?}: expected the export to hold the options {read:?}, got {exported:?}"
+        );
+
+        let groups = reported_group_options(
+            case,
+            &group_recommendations_asking(&router, case, preference.as_ref()).await,
+        );
+        // A preference selects which OPTIONS an answer reports, never which resources are
+        // analysed, so every row names the same resources as the baseline row.
+        if let Some(baseline) = instance_rows.first() {
+            assert_eq!(
+                read.keys().collect::<Vec<_>>(),
+                baseline.keys().collect::<Vec<_>>(),
+                "case {case:?}: expected the instances of the baseline, got {read:?}"
+            );
+        }
+        if let Some(baseline) = group_rows.first() {
+            assert_eq!(
+                groups.keys().collect::<Vec<_>>(),
+                baseline.keys().collect::<Vec<_>>(),
+                "case {case:?}: expected the groups of the baseline, got {groups:?}"
+            );
+        }
+        instance_rows.push(read);
+        group_rows.push(groups);
+    }
+
+    let empty_types: Vec<String> = Vec::new();
+    let empty_configurations: Vec<Vec<String>> = Vec::new();
+    let mut saw_split_instance = false;
+    for (arn, baseline) in &instance_rows[0] {
+        let left = |row: &BTreeMap<String, Vec<String>>| {
+            row.get(arn).cloned().unwrap_or_else(|| empty_types.clone())
+        };
+        let current = left(&instance_rows[1]);
+        let graviton = left(&instance_rows[2]);
+        assert_architecture_partition(
+            &format!("the options of {arn}"),
+            baseline,
+            &current,
+            &graviton,
+            &left(&instance_rows[3]),
+            &left(&instance_rows[4]),
+        );
+        saw_split_instance |= !current.is_empty() && !graviton.is_empty();
+    }
+    assert!(
+        saw_split_instance,
+        "the analysis must hold an instance with a candidate of each architecture, or the table \
+         proves nothing"
+    );
+
+    let mut saw_split_group = false;
+    for (arn, baseline) in &group_rows[0] {
+        let left = |row: &BTreeMap<String, Vec<Vec<String>>>| {
+            row.get(arn)
+                .cloned()
+                .unwrap_or_else(|| empty_configurations.clone())
+        };
+        let current = left(&group_rows[1]);
+        let graviton = left(&group_rows[2]);
+        assert_architecture_partition(
+            &format!("the configurations of {arn}"),
+            baseline,
+            &current,
+            &graviton,
+            &left(&group_rows[3]),
+            &left(&group_rows[4]),
+        );
+        saw_split_group |= !current.is_empty() && !graviton.is_empty();
+    }
+    assert!(
+        saw_split_group,
+        "the analysis must hold a group with a candidate configuration of each architecture, or \
+         the group half of the table proves nothing"
     );
 }

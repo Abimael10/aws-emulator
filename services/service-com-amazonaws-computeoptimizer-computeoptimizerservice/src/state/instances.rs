@@ -285,6 +285,28 @@ impl ObservedInstance {
         modelled_tags(&self.tags)
     }
 
+    /// The options a reader of this instance's recommendation REPORTS, best first: the stored
+    /// candidates the preferences in force admit
+    /// ([`InstanceConfiguration::option_admitted`]) — the request's `cpuVendorArchitectures`
+    /// and the account's preferred-resource lists — kept in the order the analysis found them,
+    /// so an option's `rank` is its position among them ("the top recommendation option is
+    /// ranked as 1").
+    ///
+    /// Selected here once for the same reason the admission rule itself is stated once
+    /// ([`architecture_admitted`]): the reader of these recommendations, their export and the
+    /// projection of their metrics all report the options of ONE analysis, so under the same
+    /// preference they cannot report different options or different ranks.
+    pub fn admitted_options(
+        &self,
+        preferences: &EffectivePreferences,
+        requested_architectures: &[String],
+    ) -> Vec<&InstanceConfiguration> {
+        self.candidates
+            .iter()
+            .filter(|candidate| candidate.option_admitted(preferences, requested_architectures))
+            .collect()
+    }
+
     /// The metrics `InstanceRecommendation$utilizationMetrics` reports: every observation the
     /// analysis recorded under [`METRIC_STATISTIC_MAXIMUM`], which is the one statistic this
     /// API reports ("The Compute Optimizer API, Command Line Interface (CLI), and SDKs return

@@ -515,17 +515,13 @@ fn recommendation(
     idle: bool,
     last_refresh_timestamp: Option<::aws_smithy_types::DateTime>,
 ) -> InstanceRecommendation {
-    // The candidates the preferences in force admit, and the architectures the options they
-    // leave consist of: the crate's one rule for which candidate types a recommendation
-    // consists of ([`crate::state::InstanceConfiguration::option_admitted`]) — the request's
+    // The options this instance's recommendation consists of, and the architectures they leave
+    // it consisting of: the crate's one selection of the candidates the preferences in force
+    // admit ([`crate::state::ObservedInstance::admitted_options`]) — the request's
     // `cpuVendorArchitectures` and the account's preferred-resource lists — shared with the
     // EXPORT of these recommendations and with the projection of their metrics, so a read, an
     // export and a projection under one preference cannot report different options.
-    let options: Vec<&crate::state::InstanceConfiguration> = instance
-        .candidates
-        .iter()
-        .filter(|candidate| candidate.option_admitted(preferences, requested_architectures))
-        .collect();
+    let options = instance.admitted_options(preferences, requested_architectures);
     let architectures = crate::state::stated_architectures(
         options.iter().map(|option| option.architecture.as_str()),
     );

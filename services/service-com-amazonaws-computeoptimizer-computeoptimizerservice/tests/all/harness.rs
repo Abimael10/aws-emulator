@@ -645,10 +645,27 @@ pub(crate) async fn exported_recommendation_rows(
     bucket: &str,
     fields: &[&str],
 ) -> Vec<Vec<String>> {
-    let request = json!({
+    exported_recommendation_rows_asking(router, case, operation, bucket, fields, None).await
+}
+
+/// The same export-then-download workflow for an export that carries a
+/// `recommendationPreferences` of its own, which selects which recommendation options the
+/// exported file holds a row of.
+pub(crate) async fn exported_recommendation_rows_asking(
+    router: &MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    bucket: &str,
+    fields: &[&str],
+    preference: Option<&Value>,
+) -> Vec<Vec<String>> {
+    let mut request = json!({
         "s3DestinationConfig": {"bucket": bucket, "keyPrefix": "options"},
         "fieldsToExport": fields,
     });
+    if let Some(asked) = preference {
+        request["recommendationPreferences"] = asked.clone();
+    }
     let (status, body) = call(router, operation, request.clone()).await;
     assert_eq!(
         status, 200,

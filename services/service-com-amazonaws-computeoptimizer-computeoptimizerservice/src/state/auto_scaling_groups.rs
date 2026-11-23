@@ -85,6 +85,28 @@ impl AnalyzedAutoScalingGroup {
         }
     }
 
+    /// The options a reader of this group's recommendation REPORTS, best first: the stored
+    /// candidate configurations the preferences in force admit
+    /// ([`GroupConfiguration::option_admitted`]) — the request's `cpuVendorArchitectures` and
+    /// the account's preferred-resource lists — kept in the order the analysis found them, so
+    /// an option's `rank` is its position among them ("the top recommendation option is ranked
+    /// as 1").
+    ///
+    /// Selected here once for the same reason the admission rule itself is stated once
+    /// ([`architecture_admitted`]): the reader of these recommendations and their export report
+    /// the options of ONE analysis, so under the same preference they cannot report different
+    /// options or different ranks.
+    pub fn admitted_options(
+        &self,
+        preferences: &EffectivePreferences,
+        requested_architectures: &[String],
+    ) -> Vec<&GroupConfiguration> {
+        self.candidates
+            .iter()
+            .filter(|candidate| candidate.option_admitted(preferences, requested_architectures))
+            .collect()
+    }
+
     /// The observed utilization as the modelled `UtilizationMetrics`.
     pub fn utilization_metrics(&self) -> Vec<UtilizationMetric> {
         self.utilization
