@@ -249,8 +249,9 @@ async fn each_create_mints_its_own_provider() {
 
 /// Which `clientToken` a create carries decides whether it mints a provider: a request
 /// repeating a token a previous create used answers with the provider that token first
-/// produced, while a token of its own — or no token at all — is a create of its own. The rows
-/// differ in the token they carry, over the forms `ClientToken` admits.
+/// produced, while a token of its own — or no token at all — is a create of its own, even when
+/// it repeats a name the account already holds. The rows differ in the token they carry, over
+/// the forms `ClientToken` admits.
 #[tokio::test]
 async fn whether_a_create_mints_a_provider_follows_its_client_token() {
     let region = "eu-central-1";
@@ -296,8 +297,8 @@ async fn whether_a_create_mints_a_provider_follows_its_client_token() {
         held.push(id.clone());
 
         // The same request again: a tokened create answers with the provider its token first
-        // produced; an untokened one collides on the name it already holds, so neither row
-        // leaves a second provider behind.
+        // produced, so it leaves no second provider behind; an untokened one is a create of
+        // its own and mints a second provider under the same name.
         let (status, again) = create_provider(&router, region, &body).await;
         if token.is_some() {
             assert_eq!(
@@ -307,11 +308,18 @@ async fn whether_a_create_mints_a_provider_follows_its_client_token() {
                  produced, got {status} ({again})"
             );
         } else {
+            let repeated = text(&again, "capacityProviderId");
             assert_eq!(
-                status, 409,
-                "case {case:?}: without a token the repeat is the name conflict, got {status} \
+                status, 202,
+                "case {case:?}: without a token the repeat is a create of its own, got {status} \
                  ({again})"
             );
+            assert!(
+                !held.contains(&repeated),
+                "case {case:?}: the untokened repeat mints an id of its own, got the \
+                 already-minted {repeated:?}"
+            );
+            held.push(repeated);
         }
 
         let mut listed = list_provider_ids(&router, region).await;
@@ -320,22 +328,20 @@ async fn whether_a_create_mints_a_provider_follows_its_client_token() {
         expected.sort();
         assert_eq!(
             listed, expected,
-            "case {case:?}: the repeat minted no further provider, got {listed:?}"
+            "case {case:?}: the listing reports exactly the providers the row minted, got \
+             {listed:?}"
         );
     }
 
     // Every provider the rows minted is still readable, each under its own id.
-    for (case, name, _) in &rows {
-        let id = held
-            .iter()
-            .find(|id| id.starts_with(&format!("{name}-")))
-            .unwrap_or_else(|| panic!("case {case:?}: {name:?} minted an id"));
+    for id in &held {
         let (status, fetched) = get_provider(&router, region, id).await;
+        let name = text(&fetched, "name");
         assert_eq!(
-            (status, text(&fetched, "name")),
-            (200, (*name).to_string()),
-            "case {case:?}: the provider reads back under the id the create minted, got \
-             {status} ({fetched})"
+            (status, id.starts_with(&format!("{name}-"))),
+            (200, true),
+            "case {id:?}: the provider reads back under the id the create minted, got {status} \
+             ({fetched})"
         );
     }
 }

@@ -24,9 +24,11 @@
 //! CreateMemory,CreateHarness,CreateDataset,CreateRegistry,CreateConfigurationBundle")`.
 //!
 //! The families that already shared this sentence before — the custom browser, the browser
-//! profile, the custom code interpreter, the capacity provider and the consent portal — are
-//! covered by `tests/all/tool_resource_statuses_and_name_conflicts.rs` and their own
-//! lifecycle suites.
+//! profile, the custom code interpreter and the consent portal — are covered by
+//! `tests/all/tool_resource_statuses_and_name_conflicts.rs` and their own lifecycle suites.
+//! The capacity provider refuses no duplicate name at all — it is identified by the id this
+//! service mints, not by its name — so it is not a family here
+//! (`tests/all/capacity_provider_lifecycle.rs` pins that rule).
 
 use std::sync::Arc;
 

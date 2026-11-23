@@ -13,8 +13,8 @@
 //! operation="GetCapacityProvider,ListCapacityProviders")` for every member, id and ARN form
 //! asserted here, and the operation's own documentation for the `CREATING` -> `READY`
 //! transition ("After you create the capacity provider, it enters a CREATING state and
-//! transitions to READY when it is available for use") and for the name being unique within
-//! the account.
+//! transitions to READY when it is available for use") and for the provider being identified
+//! by the `capacityProviderId` this service mints rather than by its name.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -297,52 +297,155 @@ async fn a_created_capacity_provider_reads_back() {
     }
 }
 
-/// The name "must be unique within your account": a second create carrying a name this
-/// account already holds is the modelled conflict, and leaves the first provider as it was.
+/// A capacity provider is identified by the id this service mints, not by its name: a create
+/// carrying a name the account already holds is served and mints a second, independently
+/// identified provider, and both read back and list.
+///
+/// The rows differ along what the rule generalises over: how many creates share the one name,
+/// whether the repeats carry the same configuration or a different one, and the shape of the
+/// name itself (a short lower-case word, a mixed-case name with digits and an underscore, and
+/// the longest `CapacityProviderName` admits — @length 1..48, pattern
+/// `^[a-zA-Z][a-zA-Z0-9_]{0,47}$`).
 #[tokio::test]
-async fn a_name_this_account_already_holds_is_a_conflict() {
-    let router = router();
-    let body = json!({
-        "name": "uniqueProvider",
-        "permissionsConfiguration": permissions_configuration(),
-        "computeConfiguration": compute_configuration(900)
-    });
-    let (status, created) = create_provider(&router, &body).await;
-    assert_eq!(
-        status, 202,
-        "case \"the first create\": expected HTTP 202, got {status} ({created})"
-    );
+async fn a_name_this_account_already_holds_mints_a_second_provider() {
+    /// The idle timeout the `attempt`-th create of a row carries: the same one every time,
+    /// or its own when the row varies the configuration.
+    fn idle_timeout(attempt: usize, vary: bool) -> i64 {
+        let attempt = i64::try_from(attempt).expect("a row drives a handful of creates");
+        if vary {
+            900 + attempt
+        } else {
+            900
+        }
+    }
 
-    // A second create of the same name, with a different configuration, is still the name
-    // that collides.
-    let mut again = body.clone();
-    again["computeConfiguration"] = compute_configuration(1800);
-    let (status, refused) = create_provider(&router, &again).await;
-    assert_eq!(
-        (status, error_code(&refused).as_str()),
-        (409, "ConflictException"),
-        "case \"a repeated name\": expected HTTP 409 ConflictException, got {status} {} \
-         ({refused})",
-        error_code(&refused)
-    );
-    assert_eq!(
-        text(&refused, "message"),
-        "Capacity provider with name 'uniqueProvider' already exists in this account",
-        "case \"a repeated name\": got {refused}"
-    );
+    // (case, the shared name, how many creates carry it, whether the repeats differ in
+    // configuration)
+    let rows: [(&str, String, usize, bool); 4] = [
+        (
+            "a second create of the same name",
+            "twiceProvider".to_string(),
+            2,
+            false,
+        ),
+        (
+            "a second create of the same name with another configuration",
+            "reconfiguredProvider".to_string(),
+            2,
+            true,
+        ),
+        (
+            "a mixed-case name with digits and an underscore, created three times",
+            "Fleet_7Provider".to_string(),
+            3,
+            false,
+        ),
+        (
+            "a name at the member's maximum length, created twice",
+            format!("q{}", "y".repeat(47)),
+            2,
+            true,
+        ),
+    ];
 
-    let (status, listed) = list_providers(&router, "").await;
-    let summaries = listed
-        .get("capacityProviders")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    assert_eq!(
-        (status, summaries.len()),
-        (200, 1),
-        "case \"a repeated name\": the refused create left no second provider behind, got \
-         {listed}"
-    );
+    for (case, name, creates, vary) in rows {
+        // One router per row, so the account each row starts from holds no provider.
+        let router = router();
+        let mut ids: Vec<String> = Vec::new();
+        for attempt in 0..creates {
+            let body = json!({
+                "name": name,
+                "permissionsConfiguration": permissions_configuration(),
+                "computeConfiguration": compute_configuration(idle_timeout(attempt, vary))
+            });
+            let (status, created) = create_provider(&router, &body).await;
+            assert_eq!(
+                status, 202,
+                "case {case:?} / create {attempt}: expected HTTP 202 for the reused name, got \
+                 {status} ({created})"
+            );
+            assert_eq!(
+                text(&created, "name"),
+                name,
+                "case {case:?} / create {attempt}: the create reports the shared name, got \
+                 {created}"
+            );
+            let id = text(&created, "capacityProviderId");
+            let suffix = id
+                .strip_prefix(&format!("{name}-"))
+                .unwrap_or_else(|| panic!("case {case:?}: {id:?} is not {name:?} plus a suffix"));
+            assert!(
+                suffix.len() == 10 && suffix.chars().all(|character| character.is_ascii_alphanumeric()),
+                "case {case:?} / create {attempt}: the minted id's suffix is 10 alphanumerics, \
+                 got {suffix:?}"
+            );
+            assert_eq!(
+                text(&created, "capacityProviderArn"),
+                format!("arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT}:capacity-provider/{id}"),
+                "case {case:?} / create {attempt}: the ARN carries the minted id, got {created}"
+            );
+            assert!(
+                !ids.contains(&id),
+                "case {case:?} / create {attempt}: every create of the name mints its own id, \
+                 got {id} again among {ids:?}"
+            );
+            ids.push(id);
+        }
+
+        // Each provider is its own resource: readable by its own id, reporting the shared
+        // name and the configuration ITS create carried.
+        for (attempt, id) in ids.iter().enumerate() {
+            let (status, fetched) = get_provider(&router, id).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?} / provider {attempt}: expected HTTP 200 from \
+                 GetCapacityProvider, got {status} ({fetched})"
+            );
+            assert_eq!(
+                (text(&fetched, "capacityProviderId"), text(&fetched, "name")),
+                (id.clone(), name.clone()),
+                "case {case:?} / provider {attempt}: the read reports this provider under the \
+                 shared name, got {fetched}"
+            );
+            let expected_timeout = json!(idle_timeout(attempt, vary));
+            assert_eq!(
+                fetched.pointer(
+                    "/computeConfiguration/ec2Configuration/lifecycleConfiguration/\
+                     idleInstanceTimeout"
+                ),
+                Some(&expected_timeout),
+                "case {case:?} / provider {attempt}: the read reports the configuration its own \
+                 create persisted, got {fetched}"
+            );
+        }
+
+        // And the listing reports one entry per provider, all sharing the name.
+        let (status, listed) = list_providers(&router, "").await;
+        let summaries = listed
+            .get("capacityProviders")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut listed_ids: Vec<String> = summaries
+            .iter()
+            .map(|summary| text(summary, "capacityProviderId"))
+            .collect();
+        listed_ids.sort();
+        let mut expected_ids = ids.clone();
+        expected_ids.sort();
+        assert_eq!(
+            (status, listed_ids),
+            (200, expected_ids),
+            "case {case:?}: the listing reports every provider minted under the name, got \
+             {listed}"
+        );
+        assert!(
+            summaries
+                .iter()
+                .all(|summary| text(summary, "name") == name),
+            "case {case:?}: every listed provider reports the shared name, got {listed}"
+        );
+    }
 }
 
 /// A replayed `clientToken` answers with the provider that token first produced rather than

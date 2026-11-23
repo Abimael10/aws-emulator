@@ -6,10 +6,12 @@
 //! launches instances from, and the IAM role it manages them with — and persists it in
 //! [`crate::state`], where every later read of the provider answers from.
 //!
-//! The name "must be unique within your account", so a name this account already holds is
-//! the modelled `ConflictException` (409) rather than a second provider. A repeated
-//! `clientToken` answers with the provider that token first produced, and a fresh provider
-//! enters `CREATING` and reaches `READY` when the clock owes the transition
+//! A capacity provider is identified by the `capacityProviderId` this service mints for it —
+//! the requested name plus a generated suffix — and NOT by its name, so a create carrying a
+//! name this account already holds is served like any other: it mints a second, independently
+//! identified provider that reads and lists beside the first. A repeated `clientToken` is the
+//! one path that answers with an existing provider — the one that token first produced — and
+//! a fresh provider enters `CREATING` and reaches `READY` when the clock owes the transition
 //! ([`crate::state::CAPACITY_PROVIDER_SETTLE_DELAY`]) — nothing here sleeps for it.
 //!
 //! The provider is MANAGED as the operator role `permissionsConfiguration` names, so that
@@ -222,12 +224,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this service assume it, is the operation's modelled validation error and no
         // provider is minted (`crate::state::operator_role_is_unassumable`).
         //
-        // It is resolved HERE, ahead of the name and quota verdicts below, because the
-        // store guard cannot be held across this await — the order
-        // `create_agent_runtime` resolves its own role in. A request that is BOTH a
-        // repeated name and an unassumable role is therefore answered the role's
-        // validation error; nothing recorded says which of the two the service reports
-        // first.
+        // It is resolved HERE, ahead of the quota verdict below, because the store guard
+        // cannot be held across this await — the order `create_agent_runtime` resolves its
+        // own role in.
         if crate::state::operator_role_is_unassumable(
             ctx,
             &region,
@@ -254,15 +253,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Ok(replayed);
         }
 
-        // "The capacity provider name must be unique within your account", so a name this
-        // account already holds is a conflict and not a second provider.
-        if store.capacity_provider_names.contains_key(&input.name) {
-            return Err(CreateCapacityProviderErrorModeled::ConflictException(
-                crate::state::capacity_provider_name_conflict(&input.name),
-            )
-            .into());
-        }
-
         // The store this request would grow is bounded, so a caller looping on create meets
         // the modelled quota instead of this process's memory limit.
         if store.capacity_providers.len() >= crate::state::MAX_CAPACITY_PROVIDERS {
@@ -279,6 +269,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The provider's identity is the id minted here, not the name the request carried:
+        // the name is the stem and the generated suffix is what tells two providers apart,
+        // so this create is served whether or not the account already holds the name.
         let capacity_provider_id = store.mint_capacity_provider_id(&input.name, now);
         let record = crate::state::CapacityProviderRecord {
             capacity_provider_arn: crate::state::capacity_provider_arn(
@@ -286,7 +279,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &capacity_provider_id,
             ),
             capacity_provider_id: capacity_provider_id.clone(),
-            name: input.name.clone(),
+            name: input.name,
             description: input.description,
             permissions_configuration: input.permissions_configuration,
             compute_configuration: input.compute_configuration,
@@ -307,9 +300,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.client_token,
             &capacity_provider_id,
         );
-        store
-            .capacity_provider_names
-            .insert(input.name, capacity_provider_id.clone());
         store.capacity_providers.insert(capacity_provider_id, record);
 
         Ok(output)

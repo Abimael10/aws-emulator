@@ -17,7 +17,7 @@
 //! gateway family words its subject with the indefinite article and the noun in lower case
 //! ("A gateway with name '<name>' already exists in this account"), while the families
 //! already on this sentence elsewhere in [`crate::state`] word theirs as the bare noun
-//! ("Browser with name …", "Capacity provider with name …"). A family with no recording of
+//! ("Browser with name …", "Consent portal with name …"). A family with no recording of
 //! its own keeps the bare noun its siblings use.
 
 use super::*;

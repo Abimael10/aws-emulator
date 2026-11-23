@@ -3411,11 +3411,10 @@ pub struct ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState
     /// Every capacity provider, keyed by `capacityProviderId` — the identifier
     /// every capacity-provider route addresses it by. The key order is the
     /// deterministic list order `ListCapacityProviders` pages over.
+    /// A provider is held under the minted id ALONE: the name is the stem of
+    /// that id rather than an identity of its own, so several providers of this
+    /// account can carry one name and no name index backs the create.
     pub capacity_providers: BTreeMap<String, CapacityProviderRecord>,
-    /// `name` -> `capacityProviderId`, so a duplicate name at create time is a
-    /// `ConflictException` ("The capacity provider name must be unique within
-    /// your account"). One entry per stored capacity provider.
-    pub capacity_provider_names: BTreeMap<String, String>,
     /// `<operation>/<clientToken>` -> the capacity provider that token first
     /// produced, so a replayed `CreateCapacityProvider` answers with its first
     /// result instead of minting a second provider. The key carries the

@@ -32,17 +32,11 @@ pub fn capacity_provider_not_found(capacity_provider_id: &str) -> ResourceNotFou
     }
 }
 
-/// How this control plane spells the capacity provider in a duplicate-name refusal.
-const CAPACITY_PROVIDER_CONFLICT_LABEL: &str = "Capacity provider";
-
-/// The modelled conflict for a capacity provider `name` this account already holds.
-///
-/// `CreateCapacityProvider`'s name "must be unique within your account"
-/// (`smithy_query doc shape=CreateCapacityProvider`), and the refusal is this control plane's
-/// fixed sentence ([`super::name_conflict`]) around the name the request carried.
-pub fn capacity_provider_name_conflict(name: &str) -> ConflictException {
-    super::name_conflict(CAPACITY_PROVIDER_CONFLICT_LABEL, name)
-}
+// A capacity provider has NO duplicate-name refusal, which is why this module carries none of
+// the control plane's conflict sentences: the provider's identity is the `capacityProviderId`
+// this service mints ([`ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState::mint_capacity_provider_id`]),
+// the name being only the stem of it, so a create reusing a name is served and mints a second,
+// independently identified provider.
 
 /// The whole sentence a create whose OPERATOR ROLE this service cannot assume is refused
 /// with, as the recorded `CreateCapacityProvider` words it.
@@ -262,6 +256,10 @@ impl ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState {
     /// The stem is the name as sent: `CapacityProviderName` is
     /// `^[a-zA-Z][a-zA-Z0-9_]{0,47}$`, exactly the stem that pattern admits, and the name's
     /// 1..48 `@length` with the 11 characters of the suffix lands inside the id's own 12..59.
+    ///
+    /// The suffix is what tells two providers of ONE name apart, so this mint is asked for a
+    /// name the account already holds as readily as for a fresh one, and the loop keeps
+    /// drawing until the candidate id is free.
     pub fn mint_capacity_provider_id(&mut self, name: &str, at: SystemTime) -> String {
         loop {
             self.mint_counter = self.mint_counter.wrapping_add(1);
