@@ -1962,11 +1962,16 @@ pub const ATTRIBUTE_VALUE_PATTERN: &str =
 /// The refusal an attribute WRITE's `name` earns when it falls outside
 /// [`ATTRIBUTE_NAME_PATTERN`], or `None` when the member's documented rule accepts it. A
 /// write stores the name, so a name the member does not admit cannot be stored under it.
+///
+/// The member states TWO rules — a length and a character set — and each is answered with
+/// its own sentence, the length first ([`attribute_text_length_violation`]).
 pub fn attribute_name_violation(name: &str) -> Option<String> {
-    let legal = (1..=MAX_ATTRIBUTE_TEXT_LENGTH).contains(&name.chars().count())
-        && name
-            .chars()
-            .all(|letter| letter.is_ascii_alphanumeric() || r"-_/\.".contains(letter));
+    if let Some(message) = attribute_text_length_violation("name", name) {
+        return Some(message);
+    }
+    let legal = name
+        .chars()
+        .all(|letter| letter.is_ascii_alphanumeric() || r"-_/\.".contains(letter));
     (!legal).then(|| pattern_message("attributes.name", ATTRIBUTE_NAME_PATTERN))
 }
 
@@ -1975,10 +1980,12 @@ pub fn attribute_name_violation(name: &str) -> Option<String> {
 /// one — `DeleteAttributes$attributes` has the caller "not specify the value" — so this is
 /// read only for a value the request did carry.
 pub fn attribute_value_violation(value: &str) -> Option<String> {
-    let legal = (1..=MAX_ATTRIBUTE_TEXT_LENGTH).contains(&value.chars().count())
-        && value
-            .chars()
-            .all(|letter| letter.is_ascii_alphanumeric() || r"-_.@/\: ".contains(letter))
+    if let Some(message) = attribute_text_length_violation("value", value) {
+        return Some(message);
+    }
+    let legal = value
+        .chars()
+        .all(|letter| letter.is_ascii_alphanumeric() || r"-_.@/\: ".contains(letter))
         && !value.starts_with(' ')
         && !value.ends_with(' ');
     (!legal).then(|| pattern_message("attributes.value", ATTRIBUTE_VALUE_PATTERN))

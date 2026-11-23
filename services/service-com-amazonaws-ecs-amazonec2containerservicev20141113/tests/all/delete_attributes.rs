@@ -41,9 +41,9 @@
 //! `AttributeLimitExceededException`), a write that would take it past that count is refused
 //! with HTTP 400 `AttributeLimitExceededException` and applies nothing, and a slot freed
 //! with `DeleteAttributes` takes the refused write. The suites at the end of this file pin
-//! that rule and every request `PutAttributes` refuses; they share this file rather than
-//! taking a `put_attributes.rs` of their own because this crate's `tests/all.rs` is a
-//! hand-maintained declaration list that a new suite file would have to be added to.
+//! that rule and every request `PutAttributes` refuses, beside the deletion they are the
+//! other half of; the LENGTH rule its `attributes` text members state is pinned in
+//! [`crate::attribute_text_length`].
 //!
 //! * `PutAttributes`: "Create or update an attribute on an Amazon ECS resource. If the
 //!   attribute doesn't exist, it's created. If the attribute exists, its value is replaced
@@ -64,6 +64,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::attribute_text_length::{NAME_LENGTH_MESSAGE, VALUE_LENGTH_MESSAGE};
 use crate::ecs_wire::{
     create_cluster, count, list, ok, refusal, refused, service, ACCOUNT, SIGNED_REGION,
 };
@@ -709,11 +710,14 @@ fn is_custom_attribute(name: &str) -> bool {
     )
 }
 
-/// The sentence a `name` outside the rule `Attribute$name` documents is refused with.
-const NAME_PATTERN_MESSAGE: &str = r"attributes.name must match ^[a-zA-Z0-9\-_/\\.]{1,128}$";
+/// The sentence a `name` of an admitted LENGTH that falls outside the character set
+/// `Attribute$name` documents is refused with; a name of no admitted length is refused for
+/// its length instead ([`crate::attribute_text_length`]).
+pub(crate) const NAME_PATTERN_MESSAGE: &str =
+    r"attributes.name must match ^[a-zA-Z0-9\-_/\\.]{1,128}$";
 
-/// The same for a `value` outside the rule `Attribute$value` documents.
-const VALUE_PATTERN_MESSAGE: &str = concat!(
+/// The same for a `value` outside the character set `Attribute$value` documents.
+pub(crate) const VALUE_PATTERN_MESSAGE: &str = concat!(
     r"attributes.value must match ",
     r"^[a-zA-Z0-9\-_.@/\\:]([a-zA-Z0-9\-_.@/\\: ]{0,126}[a-zA-Z0-9\-_.@/\\:])?$",
 );
@@ -1250,13 +1254,13 @@ async fn an_unusable_attribute_write_is_refused_and_applies_nothing() {
             "a name with no character at all".to_string(),
             json!([{ "name": "", "value": "production", "targetId": arn }]),
             "InvalidParameterException",
-            NAME_PATTERN_MESSAGE.to_string(),
+            NAME_LENGTH_MESSAGE.to_string(),
         ),
         (
             "a name one character past its documented length".to_string(),
             json!([{ "name": "n".repeat(129), "value": "production", "targetId": arn }]),
             "InvalidParameterException",
-            NAME_PATTERN_MESSAGE.to_string(),
+            NAME_LENGTH_MESSAGE.to_string(),
         ),
         (
             "a name carrying a character the member does not admit".to_string(),
@@ -1268,13 +1272,13 @@ async fn an_unusable_attribute_write_is_refused_and_applies_nothing() {
             "a value with no character at all".to_string(),
             json!([{ "name": "stack", "value": "", "targetId": arn }]),
             "InvalidParameterException",
-            VALUE_PATTERN_MESSAGE.to_string(),
+            VALUE_LENGTH_MESSAGE.to_string(),
         ),
         (
             "a value one character past its documented length".to_string(),
             json!([{ "name": "stack", "value": "v".repeat(129), "targetId": arn }]),
             "InvalidParameterException",
-            VALUE_PATTERN_MESSAGE.to_string(),
+            VALUE_LENGTH_MESSAGE.to_string(),
         ),
         (
             "a value that starts with a space".to_string(),

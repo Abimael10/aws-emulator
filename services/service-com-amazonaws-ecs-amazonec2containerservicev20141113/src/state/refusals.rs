@@ -2098,6 +2098,29 @@ pub fn pattern_message(subject: &str, pattern: &str) -> String {
     format!("{subject} must match {pattern}")
 }
 
+/// `InvalidParameterException$message` for the text of an `Attribute` member whose LENGTH
+/// is outside the bound that member documents: `Attribute$name` and `Attribute$value` each
+/// state "must contain between 1 and 128 characters".
+///
+/// The length and the character set are two rules of one member, and the length is answered
+/// with its own sentence rather than with the character-set one ([`pattern_message`]): the
+/// sentence names the member whose text was read and nothing else, so it is the same
+/// whichever end of the bound the text fell outside and whatever the text was.
+pub fn attribute_length_message(member: &str) -> String {
+    format!("Invalid length for attribute {member}.")
+}
+
+/// The refusal an `Attribute` member's text earns when its length falls outside the 1 to
+/// [`MAX_ATTRIBUTE_TEXT_LENGTH`] characters the member documents, or `None` when the length
+/// holds.
+///
+/// Read BEFORE the member's character set: a text of no admissible length is refused for its
+/// length, and only a text of an admissible one is then judged by the characters in it.
+pub fn attribute_text_length_violation(member: &str, text: &str) -> Option<String> {
+    (!(1..=MAX_ATTRIBUTE_TEXT_LENGTH).contains(&text.chars().count()))
+        .then(|| attribute_length_message(member))
+}
+
 /// `InvalidParameterException$message` for a caller-supplied NAME outside
 /// [`RESOURCE_NAME_PATTERN`]: [`pattern_message`] for that pattern, plus the value the
 /// request spelled, appended bare after the fixed `but was ` prefix — what a call asked
