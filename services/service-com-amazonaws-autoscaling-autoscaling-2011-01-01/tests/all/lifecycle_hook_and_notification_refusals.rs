@@ -76,10 +76,11 @@ fn absent_group_named(name: &str) -> String {
 /// the whole message, in the refusal each read serves.
 ///
 /// Four forms, one per group of reads: the modelled `InvalidNextToken` stating the token
-/// in the past tense, the same error stating it in the present tense
-/// (`DescribeNotificationConfigurations`, `DescribeScheduledActions`), that present-tense
-/// sentence terminated by a period (`DescribeInstanceRefreshes`), and the service-common
-/// `ValidationError` naming the member and the value submitted for it.
+/// in the past tense (`DescribeAutoScalingGroups`, `DescribeScalingActivities`), the same
+/// error stating it in the present tense (`DescribeNotificationConfigurations`,
+/// `DescribeScheduledActions`, `DescribeAutoScalingInstances`, `DescribeWarmPool`), that
+/// present-tense sentence terminated by a period (`DescribeInstanceRefreshes`), and the
+/// service-common `ValidationError` naming the member and the value submitted for it.
 #[derive(Debug, Clone, Copy)]
 enum TokenRefusal {
     PastTense,
@@ -769,7 +770,7 @@ async fn an_unusable_next_token_is_refused_in_the_refusal_the_read_serves() {
         (
             "DescribeWarmPool",
             vec![("AutoScalingGroupName", group)],
-            TokenRefusal::PastTense,
+            TokenRefusal::PresentTense,
         ),
         (
             "DescribeInstanceRefreshes",

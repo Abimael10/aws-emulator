@@ -2301,6 +2301,11 @@ impl AutoScalingState {
     /// suspended the group records the capacity asked for and leaves its instances where
     /// they are ([`suspended_processes`]).
     ///
+    /// A scale-out of a group whose warm pool has prepared instances CONSUMES them before
+    /// anything is launched ([`Self::consume_warm_pool`]): a pre-initialized instance comes
+    /// into service under its own id and the pool's depth falls by the number taken, so a
+    /// cold launch is made only for the capacity the pool could not cover.
+    ///
     /// Does nothing when `group_name` names no group. The capacity is clamped to
     /// [`MAX_GROUP_CAPACITY`] here as well as refused by the handlers, so the
     /// allocation below is bounded however it is reached.
@@ -2359,7 +2364,13 @@ impl AutoScalingState {
         };
         let due = now + LIFECYCLE_TRANSITION;
 
-        let wanted = usize::try_from(to_launch).unwrap_or(0);
+        // A group whose warm pool has already prepared instances draws on THOSE before it
+        // launches anything: a prepared instance leaves the pool under its own id and comes
+        // into service through `Pending` ([`Self::consume_warm_pool`]), so the scale-out
+        // only launches what the pool could not cover.
+        let needed = usize::try_from(to_launch).unwrap_or(0);
+        let promoted = self.consume_warm_pool(engine, group_name, needed, now, due);
+        let wanted = needed.saturating_sub(promoted.len());
         let launch = self.launch_into_group(
             engine,
             &GroupLaunch {
@@ -2402,9 +2413,11 @@ impl AutoScalingState {
         let terminated_ids = self.scale_in_selection(group_name, surplus_units, now);
         self.terminate_group_instances(engine, group_name, &terminated_ids, now, due);
 
-        for instance_id in launched_ids {
-            // The activity of an instance the CONVERGENCE launched states both what asked
-            // for the capacity and the step the group took to meet it.
+        for instance_id in promoted.into_iter().chain(launched_ids) {
+            // The activity of an instance the CONVERGENCE brought into service states both
+            // what asked for the capacity and the step the group took to meet it — one step
+            // whether the instance was launched for it or taken out of the group's warm
+            // pool, since either way the group has an instance coming into service.
             let cause = Self::convergence_cause(
                 cause,
                 InstanceLifecycle::Launched,
@@ -2534,11 +2547,16 @@ impl AutoScalingState {
             .collect();
         for (name, arn, count, from, desired) in owed {
             let due = now + LIFECYCLE_TRANSITION;
+            // The capacity a group is owed is met from its warm pool first, exactly as a
+            // capacity change meets it ([`Self::consume_warm_pool`]): the instances the pool
+            // has prepared are the group's to bring into service, so a shortfall the pool
+            // can cover is covered without a cold launch.
+            let promoted = self.consume_warm_pool(engine, &name, count, now, due);
             let launch = self.launch_into_group(
                 engine,
                 &GroupLaunch {
                     group_name: &name,
-                    count,
+                    count: count.saturating_sub(promoted.len()),
                     launched_at: now,
                     due,
                     // The capacity a group maintains is launched from the group's own launch
@@ -2550,7 +2568,7 @@ impl AutoScalingState {
                 },
             );
             let cause = capacity_shortfall_cause(from, desired);
-            for instance_id in launch.launched_ids {
+            for instance_id in promoted.into_iter().chain(launch.launched_ids) {
                 self.record_instance_lifecycle_change(
                     engine,
                     &InstanceLifecycleChange {
@@ -4693,7 +4711,8 @@ pub fn decode_next_token(token: &str) -> Option<usize> {
         .filter(|offset| *offset > 0)
 }
 
-/// The message a paginated read refuses an unusable `NextToken` with.
+/// The message a paginated read refuses an unusable `NextToken` with in the PAST tense,
+/// the form `DescribeAutoScalingGroups` and `DescribeScalingActivities` serve.
 ///
 /// The refusal quotes the token the caller sent — that is the only thing the caller can
 /// act on, since the token it is holding is not one this service will resume from. The
@@ -4703,9 +4722,9 @@ pub fn invalid_next_token_message(token: &str) -> String {
     format!("The token '{token}' was invalid")
 }
 
-/// The same sentence in the PRESENT tense, the form `DescribeNotificationConfigurations`
-/// and `DescribeScheduledActions` serve: the sentence is about the token the caller is
-/// holding now.
+/// The same sentence in the PRESENT tense, the form `DescribeNotificationConfigurations`,
+/// `DescribeScheduledActions`, `DescribeAutoScalingInstances` and `DescribeWarmPool`
+/// serve: the sentence is about the token the caller is holding now.
 ///
 /// Separate from [`invalid_next_token_message`] because the sentence is each read's own —
 /// the reads that answer the past-tense form state it as recorded for them, and

@@ -178,7 +178,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The page this read resumes at, from the token a previous one issued: a token
         // this service never issued names no page, which is the operation's own modelled
-        // `InvalidNextToken`.
+        // `InvalidNextToken` — stating the token in the sentence THIS read answers with
+        // ([`crate::state::invalid_next_token_message_in_present_tense`]).
         let (offset, token) = match input.next_token.clone() {
             None => (0, None),
             Some(token) => match crate::state::decode_next_token(&token) {
@@ -186,7 +187,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => {
                     return Err(DescribeWarmPoolErrorModeled::InvalidNextToken(
                         InvalidNextToken {
-                            message: Some(crate::state::invalid_next_token_message(&token)),
+                            message: Some(
+                                crate::state::invalid_next_token_message_in_present_tense(&token),
+                            ),
                         },
                     )
                     .into());
@@ -226,7 +229,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(token) = token {
                 return Err(DescribeWarmPoolErrorModeled::InvalidNextToken(
                     InvalidNextToken {
-                        message: Some(crate::state::invalid_next_token_message(&token)),
+                        message: Some(
+                            crate::state::invalid_next_token_message_in_present_tense(&token),
+                        ),
                     },
                 )
                 .into());

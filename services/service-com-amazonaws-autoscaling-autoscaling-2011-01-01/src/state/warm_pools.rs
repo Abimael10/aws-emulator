@@ -35,14 +35,23 @@
 //! [`super::AutoScalingState::reconcile_warm_pools`] materialises it, and a freshly
 //! launched warm-pool instance is reported [`WARMED_PENDING`] until
 //! [`super::LIFECYCLE_TRANSITION`] takes it to the pool's own state.
+//!
+//! # What the pool is for
+//!
+//! A group that has to ADD instances to reach the capacity it maintains CONSUMES what its
+//! pool has already prepared before it launches anything new
+//! ([`super::AutoScalingState::consume_warm_pool`], reached from the one capacity
+//! convergence): the warmed states live in the same `LifecycleState` value set as `Pending`
+//! and `InService`, so a prepared instance moves out of the pool and into service under its
+//! own `InstanceId` instead of a cold launch taking its place.
 
 use std::time::SystemTime;
 
 use crate::ops::types::{InstanceReusePolicy, WarmPoolConfiguration};
 
 use super::{
-    GroupLaunch, LaunchDestination, StoredGroup, StoredInstance, AutoScalingState,
-    GROUP_STATE_IN_SERVICE, LIFECYCLE_TRANSITION,
+    AutoScalingState, GroupLaunch, HeldTransition, LaunchDestination, StoredGroup, StoredInstance,
+    GROUP_STATE_IN_SERVICE, LIFECYCLE_PENDING, LIFECYCLE_TRANSITION,
 };
 
 /// `MinSize` when a request that CREATES a warm pool omits it.
@@ -413,6 +422,93 @@ impl AutoScalingState {
             .collect();
         super::ec2_instances::terminate(engine, &instance_ids, now);
         true
+    }
+
+    /// Take up to `wanted` of the instances `group_name`'s warm pool has already PREPARED
+    /// into the group, and answer the ids that moved.
+    ///
+    /// What a warm pool is FOR: it is "a pool of pre-initialized EC2 instances" the group
+    /// draws on, and the model spells the warmed states (`Warmed:Pending`,
+    /// `Warmed:Stopped`, `Warmed:Running`, `Warmed:Hibernated`) in the SAME
+    /// `LifecycleState` value set as `Pending` and `InService` — one instance of one group,
+    /// moving between them. So a group that has to ADD instances to reach the capacity it
+    /// maintains takes them from its pool before anything new is launched: the instance
+    /// keeps its own `InstanceId`, leaves the pool, is reported [`LIFECYCLE_PENDING`] and
+    /// reaches service when [`LIFECYCLE_TRANSITION`] is due, exactly as a launch of the
+    /// group's own does — which is what makes the pool's depth fall by the number consumed
+    /// and the group's footprint the pool plus its own members rather than both plus a cold
+    /// launch.
+    ///
+    /// Only a PREPARED instance can be taken: one still in [`WARMED_PENDING`] has not
+    /// finished the pool's own transition, and one in [`WARMED_TERMINATING`] is already on
+    /// its way out. The prepared ones are taken OLDEST FIRST — the pool holds its instances
+    /// in launch order — so the instance that has been ready longest is the one that enters
+    /// service.
+    ///
+    /// Being in service means RUNNING: a pool that is not `Running` holds instances Amazon
+    /// EC2 reports stopped, so the instance behind each id is started where it lives
+    /// ([`super::ec2_instances::set_running`]) exactly as the pool stops it when it settles
+    /// there. And an instance coming into service is held by every launch lifecycle hook the
+    /// group configures ([`super::lifecycle_actions`]), on the same footing as one the group
+    /// launched or attached.
+    ///
+    /// Answers an empty list for a group this store holds nothing for, for one with no warm
+    /// pool, for one whose pool has nothing prepared, and for a call that asks for nothing.
+    pub(crate) fn consume_warm_pool<Eng: Send + Sync + 'static>(
+        &mut self,
+        engine: &Eng,
+        group_name: &str,
+        wanted: usize,
+        now: SystemTime,
+        due: SystemTime,
+    ) -> Vec<String> {
+        if wanted == 0 {
+            return Vec::new();
+        }
+        let Some(group) = self.groups.get_mut(group_name) else {
+            return Vec::new();
+        };
+        let mut taken: Vec<StoredInstance> = Vec::new();
+        {
+            let Some(pool) = group.warm_pool.as_mut() else {
+                return Vec::new();
+            };
+            let prepared = warmed_lifecycle_state(&pool.pool_state);
+            // ONE pass over the pool, keeping its launch order on both sides: the prepared
+            // instances this call takes, oldest first, and the ones the pool keeps.
+            let mut kept: Vec<StoredInstance> = Vec::with_capacity(pool.instances.len());
+            for instance in pool.instances.drain(..) {
+                if taken.len() < wanted && instance.lifecycle_state == prepared {
+                    taken.push(instance);
+                } else {
+                    kept.push(instance);
+                }
+            }
+            pool.instances = kept;
+        }
+        if taken.is_empty() {
+            return Vec::new();
+        }
+        let ids: Vec<String> = taken
+            .iter()
+            .map(|instance| instance.instance_id.clone())
+            .collect();
+        for instance in &mut taken {
+            // The transient state every instance this group brings into service is reported
+            // in, for the span the group owes it; the instance keeps its id, its placement,
+            // its launch source and the launch time Amazon EC2 recorded for it, which is the
+            // age a scale-in's age-ordered policies order it by
+            // ([`super::termination_policies`]). Its HEALTH is kept too: an instance a caller
+            // marked unhealthy is unhealthy wherever it stands, and taking it into service
+            // does not clear that mark — the group's own check acts on it from here
+            // ([`super::instance_health`]).
+            instance.lifecycle_state = LIFECYCLE_PENDING.to_string();
+            instance.transition_due = Some(due);
+        }
+        group.instances.extend(taken);
+        super::ec2_instances::set_running(engine, &ids, true, now);
+        self.hold_lifecycle_transition(engine, group_name, HeldTransition::Launching, &ids, now);
+        ids
     }
 
     /// Bring every group's warm pool to the size it maintains, and settle the warm-pool

@@ -1109,7 +1109,7 @@ async fn an_unsatisfiable_request_is_refused() {
             absent_group: None,
             status: 400,
             code: "InvalidNextToken",
-            message: "The token 'not-a-token' was invalid".to_string(),
+            message: "The token 'not-a-token' is invalid".to_string(),
         },
     ];
 
