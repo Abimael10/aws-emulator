@@ -105,14 +105,13 @@ fn params(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The Availability Zones of a Region, named `<region>` + a letter from `a`: the naming
-/// every service of this emulator models the account's network with (see
-/// `services/common/src/network.rs`) and what EC2's `DescribeAvailabilityZones` reports.
+/// The Availability Zones of a Region: the zones AWS publishes for it, read off the one
+/// table this tree keeps them in (`service_common::aws_availability_zones`) — the same
+/// table EC2's `DescribeAvailabilityZones` answers from, and so the set `Fn::GetAZs`
+/// resolves. Not a letter run: `crate::get_azs_region_zone_catalog` is the suite that
+/// holds the two services to one catalogue.
 fn zones(region: &str) -> Vec<String> {
-    ["a", "b", "c"]
-        .iter()
-        .map(|letter| format!("{region}{letter}"))
-        .collect()
+    ::service_common::aws_availability_zones::availability_zones(region)
 }
 
 fn sns_arn(name: &str) -> String {
@@ -155,7 +154,7 @@ Outputs:
                 value("StackRegionZones", local.clone()),
                 // A Region the stack does not live in: the zones are that Region's.
                 value("NamedRegionZones", zones("eu-west-2").join(",")),
-                value("ZoneCount", "3"),
+                value("ZoneCount", zones(REGION).len().to_string()),
             ],
         },
         Case {

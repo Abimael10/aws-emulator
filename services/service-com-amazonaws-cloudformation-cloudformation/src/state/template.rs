@@ -211,15 +211,6 @@ pub fn format_refusal(body: &str, declared: &Template) -> Option<String> {
 /// the properties any resource declaration carries.
 pub const MAX_ATTRIBUTES_PER_RESOURCE: usize = 128;
 
-/// How many Availability Zones a Region has, for `Fn::GetAZs`.
-///
-/// The account's network is modelled Region by Region rather than stored (see
-/// `services/common/src/network.rs`): a Region has three Availability Zones, named
-/// `<region>a`, `<region>b`, `<region>c`, which is exactly what EC2's own
-/// `availability_zones_in_region` reports — so a template reading the zones here reads
-/// the zones `DescribeAvailabilityZones` lists.
-pub const AVAILABILITY_ZONES_PER_REGION: usize = 3;
-
 /// The most parameters one template declares. The documented CloudFormation quota
 /// ("Parameters — maximum number of parameters that you can declare in a template: 200").
 pub const MAX_PARAMETERS_PER_TEMPLATE: usize = 200;
@@ -3401,19 +3392,14 @@ fn intrinsic(
 /// The Availability Zones Region `region` has, in zone-name order, as `Fn::GetAZs` lists
 /// them.
 ///
-/// Derived from the Region name rather than stored: the zones of a Region are a fact of
-/// the account's network, named `<region>` + a letter running from `a`
-/// ([`AVAILABILITY_ZONES_PER_REGION`] of them) — the model of the account's network every
-/// service of this emulator shares (stated in `services/common/src/network.rs`, and
-/// implemented for EC2 by that crate's own `availability_zones_in_region`), so the zones a
-/// template reads here are the zones `DescribeAvailabilityZones` reports.
+/// The zones a Region exposes are the ones AWS publishes for it, read off the ONE table
+/// this tree keeps them in (`service_common::aws_availability_zones`) rather than counted
+/// off the alphabet: most Regions expose three, several expose more, and a Region's zone
+/// letters are not always the first letters of the alphabet. It is the same table EC2's
+/// own `availability_zones_in_region` reports from, so the zones a template reads here are
+/// the zones `DescribeAvailabilityZones` lists for that Region.
 fn availability_zones(region: &str) -> Vec<String> {
-    (0..AVAILABILITY_ZONES_PER_REGION)
-        .map(|index| {
-            let letter = char::from(b'a' + u8::try_from(index).unwrap_or(0));
-            format!("{region}{letter}")
-        })
-        .collect()
+    ::service_common::aws_availability_zones::availability_zones(region)
 }
 
 /// `{"Fn::Cidr": [ipBlock, count, cidrBits]}`: "the specified number of CIDRs"

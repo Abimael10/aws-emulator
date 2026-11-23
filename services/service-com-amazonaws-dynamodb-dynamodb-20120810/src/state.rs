@@ -1362,17 +1362,16 @@ impl VectorIndex {
     }
 
     /// The entry this index holds for one covered item: just the attributes it stores
-    /// ([`Self::stored_attributes`]), which is what a write of the entry meters, what the
-    /// search condition filters on, and what a search REPORTS for the item.
+    /// ([`Self::stored_attributes`]), which is what a write of the entry meters and what
+    /// the search condition filters on.
     ///
     /// An index holds "attributes that are copied (projected) from the table into the vector
     /// index" (`VectorIndex$Projection`) and, beside them, the vector attribute it finds an
     /// item by and the attributes its search schema filters on
     /// ([`Self::consumed_attributes`]) — so one entry serves every question about what the
     /// index HOLDS for an item: what a write of it meters
-    /// ([`Table::vector_write_request_bytes`]), what a condition reads, and what "only
-    /// attributes projected into the vector index can be retrieved"
-    /// (`SearchVectors$ProjectionExpression`) lets a search hand back.
+    /// ([`Table::vector_write_request_bytes`]) and what a condition reads. What a SEARCH
+    /// may hand back of it is narrower ([`Self::retrievable_entry`]).
     ///
     /// The vector itself is held as the index holds it rather than as the item does
     /// ([`stored_vector`]): "each element is a 32-bit IEEE-754 floating point number"
@@ -1393,6 +1392,37 @@ impl VectorIndex {
             }
         }
         entry
+    }
+
+    /// Whether a search of this index may hand back the attribute `name` of an entry it
+    /// holds.
+    ///
+    /// Every attribute but the VECTOR one: "only attributes projected into the vector index
+    /// can be retrieved" (`SearchVectors$ProjectionExpression`), and what is projected into
+    /// it is what its `Projection` copies there — "attributes that are copied (projected)
+    /// from the table into the vector index" (`VectorIndex$Projection`) — beside "the
+    /// primary key attributes and index key attributes, which are automatically projected"
+    /// (`Projection`): the table's own key and the attributes the search schema is keyed and
+    /// filtered by ("an attribute projected into the vector index for filtering at the
+    /// storage layer during search", `SearchSchemaElement$SearchSchemaElementType`).
+    ///
+    /// The vector attribute reaches the index through neither: it arrives in its own member
+    /// (`VectorIndex$VectorAttribute`) as the value the index is BUILT on, not as an
+    /// attribute copied into it, and a result "contains the projected attributes and a
+    /// similarity score" (`SearchVectors$SearchResults`) — so it is no part of what a search
+    /// hands back, whatever the `Projection` says, and the score computed from it is what a
+    /// result reports of it.
+    pub fn retrieves(&self, name: &str) -> bool {
+        name != self.vector_attribute.attribute_name
+    }
+
+    /// What a search of this index may hand back of one entry it holds: the entry without
+    /// the attributes [`Self::retrieves`] keeps out of a response.
+    pub fn retrievable_entry(&self, entry: Item) -> Item {
+        entry
+            .into_iter()
+            .filter(|(name, _)| self.retrieves(name))
+            .collect()
     }
 
     /// The bytes this index stores for one covered item: the size of the entry it holds

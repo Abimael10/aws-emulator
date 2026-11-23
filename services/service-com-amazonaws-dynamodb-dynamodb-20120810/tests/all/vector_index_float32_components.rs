@@ -12,14 +12,15 @@
 //! the decimal the write carried, and `GetItem` answers it — so the two differ exactly where
 //! the rounding does.
 //!
-//! The score is one of the two things the index's held copy is observed through: a search
-//! answers "the similarity score for this item relative to the search vector"
-//! (`SearchResultItem$Score`) and the attributes of the item the index holds
-//! (`SearchResultItem$Item`), the vector among them. Over `DOT_PRODUCT` against the
-//! all-ones search vector that score is the sum of the held coordinates, so a coordinate the
-//! type cannot represent and the coordinate it rounds to score IDENTICALLY while every
-//! neighbour of them scores apart — which is the rounding, observed. The other is the vector
-//! the result carries, which is the index's held copy itself rather than the item's decimal.
+//! The score is how the index's held copy is observed: a search answers "the similarity
+//! score for this item relative to the search vector" (`SearchResultItem$Score`) beside the
+//! attributes the index PROJECTS of the item (`SearchResultItem$Item`), which never include
+//! the vector it searched by — that one reaches the index as the value it is built on
+//! (`VectorIndex$VectorAttribute`) rather than as an attribute copied into it. Over
+//! `DOT_PRODUCT` against the all-ones search vector the score is the sum of the held
+//! coordinates, so a coordinate the type cannot represent and the coordinate it rounds to
+//! score IDENTICALLY while every neighbour of them scores apart — which is the rounding,
+//! observed.
 //!
 //! The rows span what the rule generalises over: a coordinate a 32-bit float holds exactly
 //! (a whole number, a power of two, a half), the first whole number it does NOT hold
@@ -262,42 +263,27 @@ async fn a_vector_index_scores_each_coordinate_as_the_float32_it_is_held_as() {
     );
 }
 
-/// The decimal the companion coordinate is HELD as: a 32-bit float, rendered as one.
-const COMPANION_HELD: &str = "1.0";
-
 #[tokio::test]
-async fn a_search_reports_the_vector_as_the_index_holds_it() {
+async fn a_search_reports_no_vector_attribute_of_the_index_it_searched() {
     let router = emulator();
     stored_rows(&router).await;
     let answered = search_every_row(&router).await;
 
-    // The same rows, read through the vector the result CARRIES rather than through the
-    // score: a result carries the attributes the index holds for its item
-    // (`SearchResultItem$Item`), and the vector among them is the index's own copy — "each
-    // element is a 32-bit IEEE-754 floating point number" — so every coordinate comes back
-    // as the float it is held as and not as the decimal the write spelled.
+    // The score is the ONE thing the index's held copy is observed through: a result
+    // "contains the projected attributes and a similarity score"
+    // (`SearchVectors$SearchResults`), and the vector attribute reaches the index in its own
+    // member as the value it is built on rather than as an attribute copied into it
+    // (`VectorIndex$VectorAttribute` beside `VectorIndex$Projection`) — so no result carries
+    // it, not even from an index whose `Projection` is `ALL`.
     for (at, row) in rows().iter().enumerate() {
         let result = result_for(&answered, &key_of(at));
-        let reported = result["Item"]["emb"]["L"][0]["N"].clone();
-        assert_eq!(
-            reported,
-            json!(row.held),
-            "case {:?}: the coordinate written as {:?} is held as {:?}, so the search reports \
-             that, got {reported} from {result} of {answered}",
-            row.case,
-            row.written,
-            row.held
-        );
-        let companion = result["Item"]["emb"]["L"][1]["N"].clone();
-        assert_eq!(
-            companion,
-            json!(COMPANION_HELD),
-            "case {:?}: every coordinate of the reported vector is the held float, got \
-             {companion} from {result}",
+        assert!(
+            result["Item"]["emb"].is_null(),
+            "case {:?}: a search hands back no vector attribute, got {result} of {answered}",
             row.case
         );
-        // Read back off the TABLE's item, the same coordinate is the decimal the write
-        // carried: the two stores hold different things, which is this suite's whole rule.
+        // Read back off the TABLE's item, the coordinate is the decimal the write carried:
+        // the two stores hold different things, which is this suite's whole rule.
         let read = ok(
             &router,
             "GetItem",
@@ -312,10 +298,11 @@ async fn a_search_reports_the_vector_as_the_index_holds_it() {
         );
     }
 
-    // A `ProjectionExpression` narrowing the result to the vector attribute reports it and
-    // nothing else: it is one of the attributes the index holds, so it can be retrieved
+    // A `ProjectionExpression` naming the vector attribute reports nothing for it: a request
+    // may only narrow what the index projects, and the vector is not among those attributes
     // ("only attributes projected into the vector index can be retrieved",
-    // `SearchVectors$ProjectionExpression`).
+    // `SearchVectors$ProjectionExpression`). The rows are still SCORED and answered — the
+    // projection decides what each result carries, not which items a search finds.
     let narrowed = ok(
         &router,
         "SearchVectors",
@@ -361,10 +348,8 @@ async fn a_search_reports_the_vector_as_the_index_holds_it() {
          {narrowed}"
     );
     assert!(
-        reported
-            .iter()
-            .all(|names| names == &vec!["emb".to_string()]),
-        "case \"a projection naming the vector attribute\": each result carries that one \
-         attribute, got {reported:?} from {narrowed}"
+        reported.iter().all(Vec::is_empty),
+        "case \"a projection naming the vector attribute\": it reports nothing for it, got \
+         {reported:?} from {narrowed}"
     );
 }

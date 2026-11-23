@@ -10,11 +10,12 @@
 //!    partitions by — against the search vector with the index's OWN distance function,
 //!    and reports the `TopK` of them most similar first: the `k` smallest scores for
 //!    `COSINE` and `EUCLIDEAN`, the `k` highest for `DOT_PRODUCT`;
-//! 2. a result carries what the index HOLDS for its item — "only attributes projected
+//! 2. a result carries what the index PROJECTS of its item — "only attributes projected
 //!    into the vector index can be retrieved" (`SearchVectors$ProjectionExpression`), so the
-//!    attributes its `Projection` projects together with the vector it finds them by —
-//!    narrowed further by a `ProjectionExpression`, which reports nothing for a name the
-//!    index does not hold;
+//!    attributes its `Projection` copies into it beside the table's key and its search
+//!    schema's attributes, which are projected automatically, and never the vector it finds
+//!    them by, which reaches the index as the value it is built on — narrowed further by a
+//!    `ProjectionExpression`, which reports nothing for a name the index does not project;
 //! 3. a `SearchConditionExpression` filters the scored items by the index's search schema
 //!    attributes, each PINNED by `=`, and may reference no others;
 //! 4. a request that addresses no searchable index is refused: a table that is not serving
@@ -351,29 +352,26 @@ async fn a_result_carries_the_attributes_the_index_projects() {
     // along the `ProjectionExpression` the request narrows it with — absent, a written-out
     // name, several names, and a name reached through an `ExpressionAttributeNames` alias.
     // "Only attributes projected into the vector index can be retrieved"
-    // (`SearchVectors$ProjectionExpression`), and what the index holds for an item is the
-    // attributes its `Projection` projects together with the vector attribute `emb` it finds
-    // the item by and the attributes its search schema filters on — so every row reports
-    // `emb`, whatever its `Projection` covers, and a row whose `ProjectionExpression` names
-    // it reports it alone.
+    // (`SearchVectors$ProjectionExpression`), and what is projected into the index is what
+    // its `Projection` copies there, beside "the primary key attributes and index key
+    // attributes, which are automatically projected" (`Projection`) — the table's key and
+    // the attributes its search schema is keyed and filtered by. The vector attribute `emb`
+    // reaches the index as the value it is BUILT on rather than as an attribute copied into
+    // it, so no row reports it, whatever its `Projection` covers and whether or not the
+    // request names it.
     let cases: [(&str, Value, Value, &[&str]); 9] = [
         (
             "all-index",
             Value::Null,
             Value::Null,
-            &["brand", "emb", "note", "pk", "tenant"],
+            &["brand", "note", "pk", "tenant"],
         ),
-        (
-            "keys-index",
-            Value::Null,
-            Value::Null,
-            &["emb", "pk", "tenant"],
-        ),
+        ("keys-index", Value::Null, Value::Null, &["pk", "tenant"]),
         (
             "include-index",
             Value::Null,
             Value::Null,
-            &["brand", "emb", "pk", "tenant"],
+            &["brand", "pk", "tenant"],
         ),
         ("all-index", json!("note"), Value::Null, &["note"]),
         ("all-index", json!("pk, note"), Value::Null, &["note", "pk"]),
@@ -388,8 +386,10 @@ async fn a_result_carries_the_attributes_the_index_projects() {
         // hold is the same case, over an index that projects every attribute of the item as
         // much as over one that projects none.
         ("all-index", json!("absent"), Value::Null, &[]),
-        ("all-index", json!("emb"), Value::Null, &["emb"]),
-        ("keys-index", json!("note, emb"), Value::Null, &["emb"]),
+        // The vector attribute cannot be retrieved through a search however the index
+        // projects it, so a projection naming it reports nothing.
+        ("all-index", json!("emb"), Value::Null, &[]),
+        ("keys-index", json!("note, emb"), Value::Null, &[]),
     ];
     for (index, projection_expression, names, expected) in cases {
         let case = format!("{index} projecting {projection_expression}");

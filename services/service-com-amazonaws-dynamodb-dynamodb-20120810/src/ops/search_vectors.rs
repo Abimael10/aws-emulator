@@ -9,12 +9,13 @@
 //! Everything reported is computed from stored state: the index comes from the table
 //! `CreateTable`/`UpdateTable` wrote, the candidates are the table's own items (those the
 //! index covers, carrying a vector of the index's dimensions), and each result item is the
-//! entry the index HOLDS for it ([`crate::state::VectorIndex::index_entry`]) — "only
+//! entry the index HOLDS for it ([`crate::state::VectorIndex::index_entry`]) narrowed to
+//! what that index may hand back ([`crate::state::VectorIndex::retrieves`]) — "only
 //! attributes projected into the vector index can be retrieved"
 //! (`SearchVectors$ProjectionExpression`), so a search reports the attributes the index
-//! holds for the item and nothing the table holds outside them; the vector it was found by
-//! is one of those, reported as the index holds it — a list of 32-bit floats — beside the
-//! score computed from it.
+//! projects and nothing the table holds outside them; the vector it was found BY is not one
+//! of them — it reaches the index as the value it is built on rather than as an attribute
+//! copied into it — and what a result reports of it is the score computed from it.
 //!
 //! The refusals, each grounded in the operation's own contract:
 //!
@@ -448,35 +449,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let top_k = usize::try_from(input.top_k).unwrap_or(0);
         let mut search_results: Vec<SearchResultItem> = Vec::new();
         let mut reported_bytes: i64 = 0;
-        // What the search METERS is the ITEMS it HANDED BACK:
+        // What the search METERS is the index ENTRIES it READ:
         // `VectorSearchRequestBytes` is "the number of vector search request bytes
         // consumed" (`VectorCapacity$VectorSearchRequestBytes`), and a similarity search
         // walks the index to the most similar entries rather than reading every one of
-        // them — so the figure is what the results carry, each sized as the index holds it
-        // ([`crate::state::Table::metered_item_size`], a vector at four bytes per
-        // dimension), and it grows with the `TopK` the request asked for, with the index's
-        // `Dimensions` and with the attributes the projection reports, never with how many
-        // items the table happens to hold.
+        // them — so the figure is what those entries carry, each sized as the index holds
+        // it ([`crate::state::Table::metered_item_size`], a vector at four bytes per
+        // dimension), whether or not the response hands every attribute back; it grows
+        // with the `TopK` the request asked for, with the index's `Dimensions` and with
+        // the attributes the projection reads, never with how many items the table
+        // happens to hold.
         let mut metered_bytes: i64 = 0;
         for (score, item) in ranked.into_iter().take(top_k) {
             if !search_results.is_empty() && page_budget_spent(reported_bytes) {
                 break;
             }
-            // What a search REPORTS is the entry the index HOLDS for the item — "only
-            // attributes projected into the vector index can be retrieved"
-            // (`SearchVectors$ProjectionExpression`), which is the attributes its `Projection`
-            // projects together with the ones it indexes the item by — and the vector among
-            // them comes back as the index holds it, a list of 32-bit floats
-            // ([`crate::state::VectorIndex::index_entry`]).
+            // The entry the index HOLDS for the item is what this search read, with the
+            // vector as the index holds it — a list of 32-bit floats
+            // ([`crate::state::VectorIndex::index_entry`]) — narrowed by the projection
+            // the request named.
             let entry = index.index_entry(item, &table.key_schema);
-            let projected = match requested_attributes.as_ref() {
+            let read = match requested_attributes.as_ref() {
                 Some(requested) => crate::state::project_paths(&entry, requested),
                 None => entry,
             };
-            reported_bytes = reported_bytes.saturating_add(crate::state::item_size(&projected));
-            metered_bytes = metered_bytes.saturating_add(table.metered_item_size(&projected));
+            metered_bytes = metered_bytes.saturating_add(table.metered_item_size(&read));
+            // What a search HANDS BACK of that entry is narrower: "only attributes
+            // projected into the vector index can be retrieved"
+            // (`SearchVectors$ProjectionExpression`), and the vector the index finds an
+            // item BY is not one of the attributes projected into it
+            // ([`crate::state::VectorIndex::retrieves`]) — the score is what a result
+            // reports of it.
+            let reported = index.retrievable_entry(read);
+            reported_bytes = reported_bytes.saturating_add(crate::state::item_size(&reported));
             search_results.push(SearchResultItem {
-                item: Some(projected),
+                item: Some(reported),
                 score,
             });
         }

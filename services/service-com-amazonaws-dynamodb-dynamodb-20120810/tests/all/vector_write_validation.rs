@@ -555,9 +555,10 @@ async fn a_created_vector_index_becomes_a_searchable_index_of_the_table() {
     );
 
     // The new index holds the items the table carries under its own attribute, so a search
-    // through it answers them — each with the attributes the index HOLDS, which is what can
-    // be retrieved through it (`SearchVectors$ProjectionExpression`): the ones it projects
-    // and the vector it finds them by.
+    // through it answers them — each with the attributes the index PROJECTS, which is what
+    // can be retrieved through it (`SearchVectors$ProjectionExpression`): the table's key
+    // and the non-key attributes its `Projection` names, and not the vector it finds them
+    // by, which that `Projection` does not cover.
     ok(
         &router,
         "PutItem",
@@ -602,8 +603,8 @@ async fn a_created_vector_index_becomes_a_searchable_index_of_the_table() {
     attributes.sort();
     assert_eq!(
         attributes,
-        vec!["emb2".to_string(), "note".to_string(), "pk".to_string()],
+        vec!["note".to_string(), "pk".to_string()],
         "case \"a search through the created index\": expected the attributes the index \
-         holds, got {found}"
+         projects, got {found}"
     );
 }
