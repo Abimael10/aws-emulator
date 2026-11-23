@@ -260,7 +260,8 @@ enum ReferenceForm {
     Arn,
     /// The ARN with the version suffix a reference "optionally version-qualified" carries.
     VersionQualifiedArn,
-    /// The bare `ruleId`, the other identifier every rule read resolves.
+    /// The bare `ruleId`. No rule READ resolves it — `ruleIdentifier` is the ARN — but the
+    /// reference graph accepts a reference written that way, so it still pins the rule.
     BareId,
 }
 
@@ -282,9 +283,6 @@ struct ConflictCase {
     reference_form: ReferenceForm,
     rule_type: &'static str,
     is_published: bool,
-    /// Whether the delete names the rule by its ARN or by its bare `ruleId` — both
-    /// identifiers resolve to the same record, so both must be refused alike.
-    delete_by_arn: bool,
     /// How many OTHER rules the holder references beside the one under test, so a match
     /// is by ARN rather than by the reference's position in the list.
     other_references: usize,
@@ -292,26 +290,26 @@ struct ConflictCase {
 
 /// The in-use table: rows span both holders of a rule reference in this service's state,
 /// every spelling a reference may name the rule by, both `RuleType` values, a published and
-/// a draft rule, both identifier forms a delete may name, and a reference standing alone or
-/// among others.
+/// a draft rule, and a reference standing alone or among others.
+///
+/// The delete always names the rule by its ARN, the one form `ruleIdentifier` admits (the
+/// refusal of any other form is pinned by `rule_identifier_form.rs`).
 fn conflict_cases() -> Vec<ConflictCase> {
     vec![
         ConflictCase {
-            name: "a policy references the only rule, deleted by ARN",
+            name: "a policy references the only rule",
             holder: Holder::Policy,
             reference_form: ReferenceForm::Arn,
             rule_type: "CONFIGURATION",
             is_published: true,
-            delete_by_arn: true,
             other_references: 0,
         },
         ConflictCase {
-            name: "a policy references a draft rule among others, deleted by id",
+            name: "a policy references a draft rule among others",
             holder: Holder::Policy,
             reference_form: ReferenceForm::Arn,
             rule_type: "INSPECTION",
             is_published: false,
-            delete_by_arn: false,
             other_references: 2,
         },
         ConflictCase {
@@ -320,7 +318,6 @@ fn conflict_cases() -> Vec<ConflictCase> {
             reference_form: ReferenceForm::VersionQualifiedArn,
             rule_type: "CONFIGURATION",
             is_published: true,
-            delete_by_arn: true,
             other_references: 1,
         },
         ConflictCase {
@@ -329,25 +326,22 @@ fn conflict_cases() -> Vec<ConflictCase> {
             reference_form: ReferenceForm::BareId,
             rule_type: "CONFIGURATION",
             is_published: true,
-            delete_by_arn: true,
             other_references: 0,
         },
         ConflictCase {
-            name: "a template references the only rule, deleted by id",
+            name: "a template references the only rule",
             holder: Holder::Template,
             reference_form: ReferenceForm::Arn,
             rule_type: "INSPECTION",
             is_published: true,
-            delete_by_arn: false,
             other_references: 0,
         },
         ConflictCase {
-            name: "a template references a draft rule among others, deleted by ARN",
+            name: "a template references a draft rule among others",
             holder: Holder::Template,
             reference_form: ReferenceForm::Arn,
             rule_type: "CONFIGURATION",
             is_published: false,
-            delete_by_arn: true,
             other_references: 1,
         },
     ]
@@ -405,11 +399,9 @@ async fn deleting_a_rule_another_resource_references_is_refused_until_it_is_rele
             }
         };
 
-        let identifier = if case.delete_by_arn {
-            rule_arn.clone()
-        } else {
-            rule_id.clone()
-        };
+        // `ruleIdentifier` is the rule's ARN, as the model documents it: that is what the
+        // delete and the read below name the rule by.
+        let identifier = rule_arn.clone();
         let stored_rules = emulator.rules_len();
 
         let refused = emulator.delete_rule(&identifier).await;
@@ -487,14 +479,10 @@ async fn deleting_a_rule_another_resource_references_is_refused_until_it_is_rele
             emulator.rules_len()
         );
 
-        // The removal is visible to the read path, by either identifier — and the miss is
-        // worded with the rule id the identifier names, whichever form it took (the
-        // version-qualified ARN among them: the version is not part of the id).
-        for identifier in [
-            rule_id.clone(),
-            rule_arn.clone(),
-            format!("{rule_arn}:1"),
-        ] {
+        // The removal is visible to the read path, by every form of the identifier the
+        // read resolves — the version-qualified ARN among them: the version is not part of
+        // the id, which is what the miss is worded with.
+        for identifier in [rule_arn.clone(), format!("{rule_arn}:1")] {
             let gone = emulator.get_rule(&identifier).await;
             assert_eq!(
                 gone.status, 404,
@@ -518,6 +506,22 @@ async fn deleting_a_rule_another_resource_references_is_refused_until_it_is_rele
             );
         }
 
+        // The bare id was never a form this read resolves: it is refused on its FORM,
+        // before the store is consulted, whether or not the rule it spells is still there.
+        let refused_form = emulator.get_rule(&rule_id).await;
+        assert_eq!(
+            refused_form.status, 400,
+            "case {:?}: reading the bare id {rule_id:?} expected 400, got {} {:?}",
+            case.name, refused_form.status, refused_form.json
+        );
+        assert_eq!(
+            refused_form.code(),
+            Some("ValidationException".to_string()),
+            "case {:?}: reading the bare id expected the modelled error code, got {:?}",
+            case.name,
+            refused_form.error_code
+        );
+
         // Every other rule the holder referenced is still there: only the named one went.
         for other in &others {
             let read = emulator.get_rule(other).await;
@@ -536,42 +540,38 @@ struct DeleteCase {
     name: &'static str,
     rule_type: &'static str,
     is_published: bool,
-    delete_by_arn: bool,
     /// Whether a policy exists that references a DIFFERENT rule — a reference elsewhere
     /// in the store must not pin this one.
     unrelated_policy: bool,
 }
 
-/// Rows span both `RuleType` values, a published and a draft rule, both identifier forms,
-/// and the presence of an unrelated reference in the store.
+/// Rows span both `RuleType` values, a published and a draft rule, and the presence of an
+/// unrelated reference in the store. The delete names the rule by its ARN, the one form
+/// `ruleIdentifier` admits.
 fn delete_cases() -> Vec<DeleteCase> {
     vec![
         DeleteCase {
-            name: "a published configuration rule, deleted by ARN",
+            name: "a published configuration rule",
             rule_type: "CONFIGURATION",
             is_published: true,
-            delete_by_arn: true,
             unrelated_policy: false,
         },
         DeleteCase {
-            name: "a draft inspection rule, deleted by id",
+            name: "a draft inspection rule",
             rule_type: "INSPECTION",
             is_published: false,
-            delete_by_arn: false,
             unrelated_policy: false,
         },
         DeleteCase {
-            name: "a rule beside a policy that references another rule, deleted by ARN",
+            name: "an inspection rule beside a policy that references another rule",
             rule_type: "INSPECTION",
             is_published: true,
-            delete_by_arn: true,
             unrelated_policy: true,
         },
         DeleteCase {
-            name: "a rule beside a policy that references another rule, deleted by id",
+            name: "a draft configuration rule beside a policy that references another rule",
             rule_type: "CONFIGURATION",
             is_published: false,
-            delete_by_arn: false,
             unrelated_policy: true,
         },
     ]
@@ -591,7 +591,6 @@ async fn deleting_an_unreferenced_rule_removes_it_and_repeats_as_a_success() {
             "case {:?}: creating the rule expected 201, got {} {:?}",
             case.name, created.status, created.json
         );
-        let rule_id = string_at(&created.json, "ruleId");
         let rule_arn = string_at(&created.json, "ruleArn");
 
         let mut keeper_arn = None;
@@ -614,11 +613,7 @@ async fn deleting_an_unreferenced_rule_removes_it_and_repeats_as_a_success() {
             keeper_arn = Some(arn);
         }
 
-        let identifier = if case.delete_by_arn {
-            rule_arn.clone()
-        } else {
-            rule_id.clone()
-        };
+        let identifier = rule_arn.clone();
         let expected_remaining = emulator.rules_len() - 1;
 
         // Rows: the delete, then the same delete again — `@idempotent`, and this
@@ -671,8 +666,9 @@ async fn deleting_an_unreferenced_rule_removes_it_and_repeats_as_a_success() {
     }
 }
 
-/// `DeleteRule` models no not-found error: an identifier naming no rule is already in the
-/// state the caller asked for, so it is a success that removes nothing.
+/// `DeleteRule` models no not-found error: a well-formed identifier naming no rule is
+/// already in the state the caller asked for, so it is a success that removes nothing. An
+/// identifier that is not an ARN is not well-formed, and is refused on its form instead.
 #[tokio::test]
 async fn deleting_a_rule_no_identifier_names_is_a_success_that_removes_nothing() {
     let emulator = Emulator::new();
@@ -683,14 +679,13 @@ async fn deleting_a_rule_no_identifier_names_is_a_success_that_removes_nothing()
         created.status, created.json
     );
     let rule_id = string_at(&created.json, "ruleId");
+    let rule_arn = string_at(&created.json, "ruleArn");
 
-    // Rows: a well-formed id nothing holds, an ARN nothing holds, the stored id inside
-    // another resource type's ARN, and the rule's NAME, which is not an identifier.
+    // Rows: an ARN nothing holds, and the stored id inside another resource type's ARN —
+    // both the documented form, so both are the `@idempotent` success.
     for identifier in [
-        "0123456789abcdef".to_string(),
         reference_arn("rule", "0123456789abcdef"),
         reference_arn("policy", &rule_id),
-        "the-only-rule".to_string(),
     ] {
         let reply = emulator.delete_rule(&identifier).await;
         assert_eq!(
@@ -706,7 +701,30 @@ async fn deleting_a_rule_no_identifier_names_is_a_success_that_removes_nothing()
         );
     }
 
-    let read = emulator.get_rule(&rule_id).await;
+    // Rows: a well-formed id nothing holds, and the rule's NAME — neither is an ARN, so
+    // neither is the no-op success: each is refused on its form.
+    for identifier in ["0123456789abcdef".to_string(), "the-only-rule".to_string()] {
+        let reply = emulator.delete_rule(&identifier).await;
+        assert_eq!(
+            reply.status, 400,
+            "case {identifier:?}: expected 400, got {} {:?}",
+            reply.status, reply.json
+        );
+        assert_eq!(
+            reply.code(),
+            Some("ValidationException".to_string()),
+            "case {identifier:?}: expected the modelled error code, got {:?}",
+            reply.error_code
+        );
+        assert_eq!(
+            emulator.rules_len(),
+            1,
+            "case {identifier:?}: nothing may be removed, store holds {}",
+            emulator.rules_len()
+        );
+    }
+
+    let read = emulator.get_rule(&rule_arn).await;
     assert_eq!(
         read.status, 200,
         "the stored rule must still be readable, got {} {:?}",

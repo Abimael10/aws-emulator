@@ -6,8 +6,8 @@
 //! restJson1 request — so what is asserted is what a client sees, not what a handler
 //! returns. The rule under test is that a create mints a rule from the REQUEST and
 //! persists it, and that every member of the 201 is the stored record's: reading the
-//! rule back through `GetRule`, by either identifier, returns exactly what the create
-//! answered.
+//! rule back through `GetRule`, by the ARN the model documents its identifier to be,
+//! returns exactly what the create answered.
 
 use std::sync::Arc;
 
@@ -356,9 +356,11 @@ async fn creating_a_rule_persists_every_member_it_answers_with() {
             created.json["updatedAt"]
         );
 
-        // The round trip: both identifiers resolve to the same stored record, and the
-        // record is exactly what the create answered.
-        for identifier in [rule_id.clone(), expected_rule_arn(&rule_id)] {
+        // The round trip: the ARN the model documents the identifier to be resolves to the
+        // stored record, and the record is exactly what the create answered. A value of any
+        // other form is refused on its form before the lookup, which
+        // `rule_identifier_form.rs` pins.
+        for identifier in [expected_rule_arn(&rule_id)] {
             let read = emulator.get(&identifier).await;
             assert_eq!(
                 read.status, 200,
@@ -414,7 +416,7 @@ async fn rules_sharing_a_name_are_distinct_resources() {
             ids.push(rule_id);
         }
         for (index, rule_id) in ids.iter().enumerate() {
-            let read = emulator.get(rule_id).await;
+            let read = emulator.get(&expected_rule_arn(rule_id)).await;
             assert_eq!(
                 read.status, 200,
                 "case {case:?}: rule {index} expected 200, got {} {:?}",
@@ -484,8 +486,9 @@ async fn a_replayed_client_token_returns_the_first_result() {
     );
 }
 
-/// An identifier no rule answers to is the modelled 404, whatever form it takes — and a
-/// rule's id does not resolve on another account's ARN shape.
+/// An identifier no rule answers to is the modelled 404 — and a rule's id does not resolve
+/// on another account's ARN shape. An identifier that is not an ARN at all never reaches
+/// the lookup: its FORM is refused first, with the modelled 400.
 #[tokio::test]
 async fn reading_an_unknown_rule_is_the_modelled_not_found() {
     let emulator = Emulator::new();
@@ -499,17 +502,15 @@ async fn reading_an_unknown_rule_is_the_modelled_not_found() {
         .await;
     let rule_id = string_at(&created.json, "ruleId");
 
-    // Rows: a well-formed id nothing holds, an ARN nothing holds, the stored id inside
-    // another resource type's ARN, and the rule's NAME, which is not an identifier.
+    // Rows: an ARN nothing holds and the stored id inside another resource type's ARN —
+    // both the documented form, so both are decided by the lookup and reported as misses.
     for identifier in [
-        "0123456789abcdef".to_string(),
         expected_rule_arn("0123456789abcdef"),
         engine::emulator_arn(
             "network-security-manager",
             "us-east-1",
             &format!("policy/{rule_id}"),
         ),
-        "the-only-rule".to_string(),
     ] {
         let read = emulator.get(&identifier).await;
         assert_eq!(
@@ -529,9 +530,30 @@ async fn reading_an_unknown_rule_is_the_modelled_not_found() {
         );
     }
 
+    // Rows: a well-formed id nothing holds, and the rule's NAME — neither is an ARN, so
+    // each is refused on its form rather than reported as an absent rule.
+    for identifier in ["0123456789abcdef".to_string(), "the-only-rule".to_string()] {
+        let read = emulator.get(&identifier).await;
+        assert_eq!(
+            read.status, 400,
+            "case {identifier:?}: expected 400, got {} {:?}",
+            read.status, read.json
+        );
+        assert_eq!(
+            read.error_code.as_deref().map(|code| code
+                .split(['#', ':'])
+                .next_back()
+                .unwrap_or(code)
+                .to_string()),
+            Some("ValidationException".to_string()),
+            "case {identifier:?}: expected the modelled error code, got {:?}",
+            read.error_code
+        );
+    }
+
     // The stored rule is still readable: a miss changed nothing.
     assert_eq!(
-        emulator.get(&rule_id).await.status,
+        emulator.get(&expected_rule_arn(&rule_id)).await.status,
         200,
         "the stored rule must still be readable after the misses"
     );

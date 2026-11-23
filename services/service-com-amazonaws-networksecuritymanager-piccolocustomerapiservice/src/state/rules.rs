@@ -19,6 +19,11 @@ use super::{
 /// shapes carry. One of `ServiceResourceType`'s modelled values.
 pub const RESOURCE_TYPE_RULE: &str = "Rule";
 
+/// The input member every rule read and write names the rule through, as the model spells
+/// it — the member an identifier-form refusal
+/// ([`super::identifier_arn_violation`]) states.
+pub const RULE_IDENTIFIER_MEMBER: &str = "ruleIdentifier";
+
 /// The most rules this emulator stores, after which `CreateRule` answers with the
 /// modelled `ServiceQuotaExceededException` (HTTP 402) instead of growing
 /// [`State::rules`] for as long as a caller keeps asking. A CHOSEN emulator capacity,
@@ -78,12 +83,14 @@ impl State {
         mint_entity_id(&mut self.next_rule_seq)
     }
 
-    /// The `ruleId` a `ruleIdentifier` names — the rule's ARN, as the model documents it,
-    /// or the bare id — or `None` when no stored rule answers to it.
+    /// The `ruleId` a `ruleIdentifier` names, or `None` when no stored rule answers to it.
+    ///
+    /// The identifier IS the rule's ARN — "This is the rule's Amazon Resource Name (ARN)"
+    /// — so a stored rule answers only to the ARN it was minted with. A value of any other
+    /// form never reaches this lookup: [`super::identifier_arn_violation`] refuses it as a
+    /// field-validation failure first, so an identifier the caller spelled wrongly is not
+    /// reported as a resource that is absent.
     pub fn resolve_rule_id(&self, identifier: &str) -> Option<String> {
-        if self.rules.contains_key(identifier) {
-            return Some(identifier.to_string());
-        }
         self.rules
             .values()
             .find(|rule| rule.rule_arn == identifier)

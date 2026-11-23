@@ -233,7 +233,16 @@ async fn every_timestamp_member_is_carried_as_a_date_time_string() {
             "GetPolicy",
             format!("/policies/{}", policy.string_at("policyId")),
         ),
-        ("GetRule", format!("/rules/{}", rule.string_at("ruleId"))),
+        // `ruleIdentifier` is documented to be the rule's ARN, and only that form resolves
+        // (the identifier-form refusal is pinned by `rule_identifier_form.rs`), so the
+        // rule read is addressed by the ARN the create answered with.
+        (
+            "GetRule",
+            format!(
+                "/rules/{}",
+                rule.string_at("ruleArn").replace('/', "%2F")
+            ),
+        ),
         (
             "GetTemplate",
             format!("/templates/{}", template.string_at("templateId")),

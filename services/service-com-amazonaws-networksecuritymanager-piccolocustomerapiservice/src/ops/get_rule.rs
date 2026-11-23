@@ -2,7 +2,9 @@
 
 //! @op GetRule
 //! READS the rule [`crate::state`] holds — the reader that proves what `CreateRule`
-//! persisted. Reporting only: it writes nothing.
+//! persisted. Reporting only: it writes nothing. `ruleIdentifier` is the rule's ARN, as
+//! the model documents it, so a value of another form is refused as a field-validation
+//! failure before the store is read ([`crate::state::identifier_arn_violation`]).
 //!
 //! ## Shape of an operation
 //!
@@ -169,6 +171,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The model documents `ruleIdentifier` as the rule's ARN, so a value of another
+        // form is a FIELD of this request that failed validation rather than an identifier
+        // naming a rule that is absent: it is refused before the store is consulted at
+        // all, with the sentence this service states for that error class.
+        if let Some(message) = crate::state::identifier_arn_violation(
+            crate::state::RULE_IDENTIFIER_MEMBER,
+            &input.rule_identifier,
+        ) {
+            return Err(
+                GetRuleErrorModeled::ValidationException(ValidationException {
+                    reason: Some(crate::state::VALIDATION_REASON_FIELD.to_string()),
+                    field_list: None,
+                    message,
+                })
+                .into(),
+            );
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetRuleErrorModeled::InternalServerException(
                 InternalServerException {

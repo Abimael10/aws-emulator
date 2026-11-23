@@ -4,7 +4,8 @@
 //! Removes the rule from [`crate::state`] and answers 204 with an empty body — unless
 //! another stored resource still references it, which is the modelled 409
 //! `ConflictException`. `@idempotent`: deleting a rule that is already absent is still a
-//! success.
+//! success — as long as the identifier is WELL-FORMED, the rule's ARN as the model
+//! documents it ([`crate::state::identifier_arn_violation`] refuses any other form).
 //!
 //! ## Shape of an operation
 //!
@@ -164,6 +165,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The model documents `ruleIdentifier` as the rule's ARN, so a value of another
+        // form is a FIELD of this request that failed validation. `@idempotent` makes an
+        // identifier that names NO rule a success with nothing to remove, but only a
+        // well-formed one: a malformed identifier never reaches the lookup, so it is
+        // refused rather than answered as a removal that was already done.
+        if let Some(message) = crate::state::identifier_arn_violation(
+            crate::state::RULE_IDENTIFIER_MEMBER,
+            &input.rule_identifier,
+        ) {
+            return Err(
+                DeleteRuleErrorModeled::ValidationException(ValidationException {
+                    reason: Some(crate::state::VALIDATION_REASON_FIELD.to_string()),
+                    field_list: None,
+                    message,
+                })
+                .into(),
+            );
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteRuleErrorModeled::InternalServerException(
                 InternalServerException {

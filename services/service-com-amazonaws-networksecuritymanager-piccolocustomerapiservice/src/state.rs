@@ -539,6 +539,25 @@ pub fn reference_arn_violation<'a>(
         })
 }
 
+/// Refuse an identifier the model documents to be the named resource's ARN when the value
+/// carried is not an ARN, returning the `message` the refusal states — `None` when it is
+/// one.
+///
+/// The member it names is documented "The identifier of the rule. This is the rule's
+/// Amazon Resource Name (ARN)", so the admissible FORM of the value is an ARN
+/// ([`is_modelled_arn`]): a bare entity id, a resource name or half an ARN is a field of
+/// the request that failed validation, not an identifier that happens to resolve to
+/// nothing. The refusal is therefore the modelled `ValidationException`
+/// ([`VALIDATION_REASON_FIELD`]) and it is owed BEFORE the store is consulted, so no
+/// lookup — hit or miss — decides it.
+///
+/// The sentence is fixed text for this error class, naming the offending input member and
+/// nothing else. One home for it, so every operation resolving such an identifier refuses
+/// alike.
+pub fn identifier_arn_violation(member: &str, identifier: &str) -> Option<String> {
+    (!is_modelled_arn(identifier)).then(|| format!("{member} must be the resource's ARN."))
+}
+
 /// The most templates (as opposed to rules) one policy may associate, per the model's
 /// "of which at most 2 can be templates".
 const MAX_ASSOCIATED_TEMPLATES: usize = 2;
