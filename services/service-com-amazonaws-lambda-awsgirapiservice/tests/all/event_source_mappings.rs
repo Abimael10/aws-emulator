@@ -2322,13 +2322,18 @@ async fn a_request_no_event_source_mapping_can_satisfy_is_refused() {
     let known_uuid = created.string("UUID").expect("the create answers a UUID");
 
     let cases = vec![
+        // A `FunctionName` that resolves to nothing is a PARAMETER of the mapping this call
+        // creates rather than a resource the call addresses, so both rows are the modelled
+        // 400 rather than a not-found — recorded behaviour, corpus `simparity-wire-aws-v1`,
+        // fixture `lambda-esm-error-paths` step `task#5`. Which sentence each carries is the
+        // table in `event_source_mapping_absent_function.rs`.
         RefusalCase {
             name: "create-for-an-unknown-function",
             method: "POST",
             uri: MAPPINGS_URI.to_string(),
             body: create_request("esm-absent-fn", Some(taken), &json!({})),
-            status: 404,
-            code: "ResourceNotFoundException",
+            status: 400,
+            code: "InvalidParameterValueException",
         },
         RefusalCase {
             name: "create-for-an-unknown-version",
@@ -2339,8 +2344,8 @@ async fn a_request_no_event_source_mapping_can_satisfy_is_refused() {
                 Some("arn:aws:sqs:us-east-1:000000000000:versioned"),
                 &json!({}),
             ),
-            status: 404,
-            code: "ResourceNotFoundException",
+            status: 400,
+            code: "InvalidParameterValueException",
         },
         RefusalCase {
             name: "create-naming-no-event-source",

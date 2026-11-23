@@ -28,10 +28,11 @@
 //!
 //! The rows differ along what the rule generalises over: WHAT Lambda refused (an execution role
 //! that may not read the queue — the recorded case — a batch larger than the queue's ceiling with
-//! no batching window, and an event source of a service no mapping polls), hence WHICH sentence
-//! that service words and at which point of the call it refused, and the CLASS the refusal falls
-//! in (the last row names a function Lambda does not hold, which is the not-found class and
-//! carries no plugin wording). The CONTROL deploys the same estate with nothing wrong with it:
+//! no batching window, an event source of a service no mapping polls, and a function Lambda does
+//! not hold, which is a parameter of the mapping being created), hence WHICH sentence that
+//! service words and at which point of the call it refused, and the CLASS the refusal falls in
+//! (the last row names an Amazon MQ broker that does not exist, which is the ABSENCE of the
+//! resource the declaration named, so the not-found class, and carries no plugin wording). The CONTROL deploys the same estate with nothing wrong with it:
 //! the mapping is created, the stack completes, no resource records a failure and Lambda itself
 //! reports the mapping polling the declared queue — so the wording above is what a REFUSAL
 //! reports rather than something every deployment of the type now carries.
@@ -70,8 +71,8 @@ const INVALID_REQUEST_PROVIDED: &str = "Invalid request provided: ";
 /// (`smithy_query(query="operation",operation="CreateEventSourceMapping")`).
 const REFUSED_PARAMETER_STATUS: u16 = 400;
 
-/// The status it answers for a function it does not hold: `ResourceNotFoundException`'s own
-/// `httpError` in the same operation.
+/// The status it answers for a source RESOURCE the service that owns it does not hold:
+/// `ResourceNotFoundException`'s own `httpError` in the same operation.
 const NOT_FOUND_STATUS: u16 = 404;
 
 /// The `HandlerErrorCode` classes the refusals below fall in, both values of the CloudFormation
@@ -219,6 +220,12 @@ const QUEUE_READS: &[&str] = &[
 /// A grant of something other than the queue's reads: the role has a document in force, and
 /// none of it lets the poller read the source.
 const UNRELATED_GRANT: &[&str] = &["logs:CreateLogStream"];
+
+/// The read of an Amazon MQ BROKER the poller makes on the named source, as AWS Lambda's own
+/// refusal of a role that may not make it names it (`state::event_source_authorization`, whose
+/// broker entry names that describe) — granted to the role of the row whose broker does not
+/// exist, so what that row observes is the broker's absence rather than the role's grants.
+const BROKER_READS: &[&str] = &["mq:DescribeBroker"];
 
 /// The sentence AWS Lambda words for a role that may not make the first of the queue's reads.
 ///
@@ -454,6 +461,10 @@ struct Row {
 fn rows() -> Vec<Row> {
     let unpollable = format!("arn:aws:s3:{REGION}:{ACCOUNT}:lambda-esm-reason-not-a-source");
     let absent_function = "lambda-esm-reason-absent-fn";
+    // "Amazon MQ – The ARN of the broker", which Amazon MQ addresses as `broker:<name>:<id>`;
+    // nothing creates this broker, so the service that owns brokers holds none under the name.
+    let absent_broker =
+        format!("arn:aws:mq:{REGION}:{ACCOUNT}:broker:lambda-esm-reason-ghost-broker:b-1111");
     vec![
         Row {
             // The recorded shape: the queue is there, the mapping is well formed, and the role
@@ -523,9 +534,11 @@ fn rows() -> Vec<Row> {
             plugin_worded: true,
         },
         Row {
-            // The other class: the mapping names a function Lambda does not hold, which is the
-            // ABSENCE of the resource the declaration named rather than a request that service
-            // refused — so the plugin's invalid-request wording is no part of it.
+            // A fourth refusal of the same class: the mapping names a function Lambda does not
+            // hold. `FunctionName` is a PARAMETER of the mapping the call creates rather than the
+            // resource it addresses, so that service refuses the REQUEST (400) with its fixed
+            // absent-function sentence, which the provider words through the plugin like every
+            // other request it refuses.
             case: "a function AWS Lambda does not hold",
             stack: "lambda-esm-reason-function",
             template: template(
@@ -538,9 +551,32 @@ fn rows() -> Vec<Row> {
                 }),
                 false,
             ),
-            says: format!(
-                "Function not found: arn:aws:lambda:{REGION}:{ACCOUNT}:function:{absent_function}"
+            says:
+                service_com_amazonaws_lambda_awsgirapiservice::state::ABSENT_MAPPING_FUNCTION_MESSAGE
+                    .to_string(),
+            class: INVALID_REQUEST,
+            status: REFUSED_PARAMETER_STATUS,
+            plugin_worded: true,
+        },
+        Row {
+            // The other class: the mapping polls an Amazon MQ broker that does not exist, which
+            // is the ABSENCE of the resource the declaration named rather than a request that
+            // service refused — so the plugin's invalid-request wording is no part of it. The
+            // role IS granted the describe that read takes, so the absence is what refuses.
+            case: "an Amazon MQ broker that does not exist",
+            stack: "lambda-esm-reason-broker",
+            template: template(
+                "lambda-esm-reason-broker",
+                BROKER_READS,
+                json!({
+                    "EventSourceArn": absent_broker.clone(),
+                    "FunctionName": {"Ref": FUNCTION_ID},
+                    "BatchSize": 1,
+                }),
+                true,
             ),
+            says: service_com_amazonaws_lambda_awsgirapiservice::state::ABSENT_BROKER_MESSAGE
+                .to_string(),
             class: NOT_FOUND,
             status: NOT_FOUND_STATUS,
             plugin_worded: false,

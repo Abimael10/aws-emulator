@@ -2820,12 +2820,19 @@ pub use event_source_mapping::{EventSourceMappingRecord, ShardCursor, ShardSourc
 /// item is re-exported here, so a handler names them as `crate::state::…`.
 pub mod event_source_request;
 pub use event_source_request::{
-    absent_event_source_message, event_source_arn_refusal, filter_criteria_refusal,
-    names_fifo_queue, propagated_queue_read_failure, queue_batch_window_refusal,
-    queue_event_source_read_refusal, unrecognized_event_source, ABSENT_BROKER_MESSAGE,
-    FIFO_BATCHING_WINDOW_MESSAGE, INVALID_FILTER_PATTERN_MESSAGE,
-    MAX_QUEUE_BATCH_SIZE_WITHOUT_WINDOW, QUEUE_BATCH_WINDOW_MESSAGE, QUEUE_SOURCE_READ_CALL,
+    absent_event_source_message, absent_mapping_function_message, event_source_arn_refusal,
+    filter_criteria_refusal, names_fifo_queue, propagated_queue_read_failure,
+    queue_batch_window_refusal, queue_event_source_read_refusal, unrecognized_event_source,
+    ABSENT_BROKER_MESSAGE, ABSENT_MAPPING_FUNCTION_MESSAGE, FIFO_BATCHING_WINDOW_MESSAGE,
+    INVALID_FILTER_PATTERN_MESSAGE, MAX_QUEUE_BATCH_SIZE_WITHOUT_WINDOW,
+    QUEUE_BATCH_WINDOW_MESSAGE, QUEUE_SOURCE_READ_CALL,
 };
+
+/// Whether the QUEUE such a mapping would poll is one the queue service answers for lives in
+/// [`event_source_queue_probe`], apart from the readings above, because it is the one of them
+/// that asks ANOTHER service: see the module's own header.
+pub mod event_source_queue_probe;
+pub use event_source_queue_probe::absent_queue_event_source_refusal;
 
 /// WHICH destinations such a mapping may hand a record of a failed batch to lives in
 /// [`event_source_mapping_destination`], beside the slice above, and is re-exported here for

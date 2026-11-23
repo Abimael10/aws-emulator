@@ -29,7 +29,18 @@
 //! consumed by connecting to the endpoints of the named broker, so a value naming a broker
 //! the service that owns brokers does not hold is refused with the modelled
 //! `ResourceNotFoundException` — the absence of the resource the request named, settled
-//! before the conflict below (see [`crate::state::absent_event_source_message`]).
+//! before the conflict below (see [`crate::state::absent_event_source_message`]). A QUEUE's
+//! own existence is settled by the service that owns queues as well, but by READING it: this
+//! create asks that service about the queue the ARN names and refuses with the failure it
+//! answers, reported as the read it came from, so a mapping is never wired to a queue nothing
+//! could receive from (see [`crate::state::absent_queue_event_source_refusal`]).
+//!
+//! The FUNCTION the mapping invokes is resolved too, and it is a PARAMETER of the mapping
+//! being created rather than the resource this call addresses — the mapping it would address
+//! does not exist yet — so a `FunctionName` naming no function, version or alias of this
+//! endpoint is refused with that same modelled `InvalidParameterValueException` rather than
+//! with a not-found, whichever documented form the reference was written in (see
+//! [`crate::state::absent_mapping_function_message`]).
 //!
 //! What the mapping may POLL that source in is held to the source as well: `BatchSize`'s own
 //! related setting — "When you set BatchSize to a value greater than 10, you must set
@@ -685,64 +696,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        let mut store = state.lock();
-        // Every mapping this store reports is first brought up to whatever the clock has
-        // already made due, so a mapping whose deletion is due is gone before this call
-        // looks for a conflict with it.
-        store.materialize_all(now);
+        // The function is resolved against this service's own store, which is locked for
+        // that read ALONE: the source is then asked about of the service that owns it, which
+        // is an await, so the lock is taken again further down for the conflict this create
+        // may be in and for the write itself.
+        let (function_name, function_arn, function_timeout, function_role, function_qualifier) = {
+            let mut store = state.lock();
+            // Every mapping this store reports is first brought up to whatever the clock has
+            // already made due, so a mapping whose deletion is due is gone before this call
+            // looks for a conflict with it.
+            store.materialize_all(now);
 
-        // The mapping invokes one function, so the `FunctionName` it names — in any of
-        // its documented forms, qualified or not — has to resolve to a record this store
-        // holds.
-        let (function, version) = match crate::state::resolve_function(
-            &mut store,
-            &input.function_name,
-            None,
-            &region,
-            now,
-        ) {
-            Ok(resolved) => resolved,
-            Err(crate::state::ResolveFailure::Malformed(message)) => {
-                return Err(invalid_parameter(message))
-            }
-            Err(crate::state::ResolveFailure::NotFound(message)) => {
-                return Err(
-                    CreateEventSourceMappingErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            r#type: None,
-                            message: Some(message),
-                        },
-                    )
-                    .into(),
+            // The mapping invokes one function, so the `FunctionName` it names — in any of
+            // its documented forms, qualified or not — has to resolve to a record this store
+            // holds. That member is a PARAMETER of the mapping being created rather than the
+            // resource this call addresses (no mapping exists yet to be found), so a
+            // reference that resolves to no function, version or alias is the modelled 400
+            // over that parameter rather than the not-found of an addressed resource —
+            // worded in one place for every way it resolves to nothing (see
+            // [`crate::state::absent_mapping_function_message`]).
+            let (function, version) = match crate::state::resolve_function(
+                &mut store,
+                &input.function_name,
+                None,
+                &region,
+                now,
+            ) {
+                Ok(resolved) => resolved,
+                Err(crate::state::ResolveFailure::Malformed(message)) => {
+                    return Err(invalid_parameter(message))
+                }
+                Err(crate::state::ResolveFailure::NotFound(_)) => {
+                    return Err(invalid_parameter(
+                        crate::state::absent_mapping_function_message(&input.function_name, &region),
+                    ))
+                }
+            };
+            let function_name = function.config.name.clone();
+            let function_arn = function.versioned_arn(&version);
+            // The `Timeout` of the version this mapping invokes: "The amount of time in
+            // seconds that Lambda allows a function to run before stopping it." The
+            // resolution above refuses a version this store holds no configuration for, so a
+            // version with no timeout to compare is a failure of the store rather than of
+            // the request. The same configuration carries the EXECUTION ROLE the mapping's
+            // poller would read the event source as.
+            let Some((function_timeout, function_role)) = function
+                .config_of(&version)
+                .map(|config| (config.timeout, config.role.clone()))
+            else {
+                return Err(CreateEventSourceMappingErrorModeled::ServiceException(
+                    ServiceException {
+                        r#type: None,
+                        message: Some(format!(
+                            "Lambda resolved {function_arn} without a configuration to read \
+                             its timeout from"
+                        )),
+                    },
                 )
-            }
-        };
-        let function_name = function.config.name.clone();
-        let function_arn = function.versioned_arn(&version);
-        // The `Timeout` of the version this mapping invokes: "The amount of time in
-        // seconds that Lambda allows a function to run before stopping it." The resolution
-        // above refuses a version this store holds no configuration for, so a version with
-        // no timeout to compare is a failure of the store rather than of the request. The
-        // same configuration carries the EXECUTION ROLE the mapping's poller would read the
-        // event source as.
-        let Some((function_timeout, function_role)) = function
-            .config_of(&version)
-            .map(|config| (config.timeout, config.role.clone()))
-        else {
-            return Err(CreateEventSourceMappingErrorModeled::ServiceException(
-                ServiceException {
-                    r#type: None,
-                    message: Some(format!(
-                        "Lambda resolved {function_arn} without a configuration to read its \
-                         timeout from"
-                    )),
-                },
+                .into());
+            };
+            // `$LATEST` is the function itself rather than one version or alias of it, so a
+            // reference to it is an unqualified reference.
+            let function_qualifier =
+                (version != crate::state::VERSION_LATEST).then(|| version.clone());
+            (
+                function_name,
+                function_arn,
+                function_timeout,
+                function_role,
+                function_qualifier,
             )
-            .into());
         };
-        // `$LATEST` is the function itself rather than one version or alias of it, so a
-        // reference to it is an unqualified reference.
-        let function_qualifier = (version != crate::state::VERSION_LATEST).then(|| version.clone());
+
+        // A mapping onto a QUEUE is wired up by RECEIVING from the queue the ARN addresses,
+        // so that queue has to be one the queue service answers for: this create asks that
+        // service about it and refuses with the failure it answers, reported as the read it
+        // came from (see [`crate::state::absent_queue_event_source_refusal`]). That is the
+        // ABSENCE of the named source, settled BEFORE what the invoked function's execution
+        // role may read on it: a read of a queue that is not there is refused by the queue
+        // itself rather than by any policy over it.
+        if let Some(message) =
+            crate::state::absent_queue_event_source_refusal(ctx, event_source_arn.as_deref()).await
+        {
+            return Err(invalid_parameter(message));
+        }
 
         // An Amazon SQS queue hands a message to one consumer for the length of its
         // visibility timeout, so the timeout of the queue this mapping would poll is what
@@ -820,6 +857,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // servers for a self-managed Apache Kafka source, which carries no ARN at all, and
         // the topic or the queue for a source that is read per topic or per queue (see
         // [`crate::state::polled_event_source`]).
+        //
+        // The store is taken again here — the reads above released it — and brought up to
+        // the clock once more, so the mappings this conflict is decided against are the ones
+        // held at the instant the decision is taken.
+        let mut store = state.lock();
+        store.materialize_all(now);
         let polled = crate::state::polled_event_source(
             event_source_arn.as_deref(),
             input.self_managed_event_source.as_ref(),

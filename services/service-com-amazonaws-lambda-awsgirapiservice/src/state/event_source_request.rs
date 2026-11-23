@@ -86,6 +86,33 @@ pub const QUEUE_BATCH_WINDOW_MESSAGE: &str =
 /// states the one thing the value got wrong: the definition is not a pattern.
 pub const INVALID_FILTER_PATTERN_MESSAGE: &str = "Invalid filter pattern definition.";
 
+/// The WHOLE sentence a request that WIRES a mapping to a function naming no function of this
+/// endpoint is refused with.
+///
+/// Entirely FIXED text: it states that the function the mapping would invoke is not there and
+/// nothing of the request — not the name the caller sent, and not the ARN the reference
+/// resolved to, unlike the sentence the function operations of the earlier Lambda API dates
+/// carry ([`super::resolve_function`]'s `Function not found: <arn>`). Recorded behaviour:
+/// corpus `simparity-wire-aws-v1`, fixture `lambda-esm-error-paths` step `task#5` (a create
+/// naming a function nobody created), answered `400 InvalidParameterValueException` with
+/// `message` exactly this.
+pub const ABSENT_MAPPING_FUNCTION_MESSAGE: &str = "Function does not exist";
+
+/// The sentence a `FunctionName` the mapping would be created WITH is refused with when it
+/// resolves to nothing — the one place that choice is made.
+///
+/// The Region sentence when the identifier named a Region this endpoint does not serve
+/// ([`super::unreachable_region_message`]), which states the two Regions that disagree;
+/// [`ABSENT_MAPPING_FUNCTION_MESSAGE`] for every other way the reference resolves to no
+/// function, version or alias. Either way the value is a PARAMETER of the mapping the call
+/// creates rather than the resource the call addresses, so the caller raises both as the
+/// modelled `InvalidParameterValueException`.
+#[must_use]
+pub fn absent_mapping_function_message(function_name: &str, region: &str) -> String {
+    super::unreachable_region_message(function_name, region)
+        .unwrap_or_else(|| ABSENT_MAPPING_FUNCTION_MESSAGE.to_string())
+}
+
 /// Why the `EventSourceArn` `event_source` names no event source a mapping could poll, or
 /// `None` when it names one.
 ///
