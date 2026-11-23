@@ -37,20 +37,27 @@ pub struct VaultNotifications {
     pub events: Vec<String>,
 }
 
-/// The sentence AWS states for "the vault named carries no notification
-/// configuration to report" — FIXED text: it names no part of the request, so
-/// the vault asked about does not appear in it, and it states the class of the
-/// refusal rather than anything about the account's vaults. Worded as the other
-/// not-found conditions of this service are
-/// ([`super::MESSAGE_BACKUP_JOB_NOT_FOUND`]). No `Code`: this condition has no
-/// observed token.
+/// `Code` for "the vault named carries no notification configuration to
+/// report" — the token of that error class, constant for the condition and
+/// taken from no part of the request, as every other token of this service is
+/// ([`super::ERROR_CODE_BACKUP_JOB_NOT_FOUND`]).
+pub const ERROR_CODE_VAULT_NOTIFICATIONS_NOT_FOUND: &str = "ERROR_2106";
+
+/// The sentence AWS states for that condition — FIXED text: it names no part of
+/// the request, so the vault asked about does not appear in it, and it states
+/// the class of the refusal rather than anything about the account's vaults.
+/// Worded as the other not-found conditions of this service are
+/// ([`super::MESSAGE_BACKUP_JOB_NOT_FOUND`]).
 pub const MESSAGE_VAULT_NOTIFICATIONS_NOT_FOUND: &str =
     "Failed reading notifications from database for Backup vault";
 
 /// The modelled refusal for a notifications read of a vault that carries no
-/// configuration — see [`MESSAGE_VAULT_NOTIFICATIONS_NOT_FOUND`].
+/// configuration — see [`MESSAGE_VAULT_NOTIFICATIONS_NOT_FOUND`], with the
+/// condition's own token, so a client branching on the body's `Code` reads the
+/// token for this class rather than nothing.
 pub fn vault_notifications_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
+        code: Some(ERROR_CODE_VAULT_NOTIFICATIONS_NOT_FOUND.to_string()),
         message: Some(MESSAGE_VAULT_NOTIFICATIONS_NOT_FOUND.to_string()),
         ..Default::default()
     }

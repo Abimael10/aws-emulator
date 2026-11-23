@@ -63,7 +63,11 @@ const VAULT_POLL_WAIT: std::time::Duration = std::time::Duration::from_millis(10
 
 /// A body member as a string, or `"<unset>"` when the member is absent — the
 /// distinction this suite exists to pin.
-fn member_or_unset(body: &Value, name: &str) -> String {
+///
+/// Shared with the sibling suite that pins one more condition's token
+/// (`vault_notifications_refusal_code.rs`), so this crate has ONE reader of a
+/// refusal body's `Code` rather than one per file.
+pub(crate) fn member_or_unset(body: &Value, name: &str) -> String {
     body.get(name)
         .and_then(Value::as_str)
         .unwrap_or("<unset>")
@@ -72,7 +76,7 @@ fn member_or_unset(body: &Value, name: &str) -> String {
 
 /// The (status, `__type`, `Code`, `Message`) a refusal reports, as one tuple so
 /// an assertion names all four at once.
-fn reported(status: u16, body: &Value) -> (u16, String, String, String) {
+pub(crate) fn reported(status: u16, body: &Value) -> (u16, String, String, String) {
     (
         status,
         error_code(body),
@@ -82,7 +86,12 @@ fn reported(status: u16, body: &Value) -> (u16, String, String, String) {
 }
 
 /// The expected tuple for a refusal class.
-fn expected(status: u16, shape: &str, code: &str, message: &str) -> (u16, String, String, String) {
+pub(crate) fn expected(
+    status: u16,
+    shape: &str,
+    code: &str,
+    message: &str,
+) -> (u16, String, String, String) {
     (
         status,
         shape.to_string(),

@@ -38,7 +38,8 @@ use crate::vault_and_backup_job::{
 /// The sentence AWS states for "the vault named carries no notification
 /// configuration to report" — fixed text, naming neither the vault nor the
 /// account.
-const NO_NOTIFICATIONS: &str = "Failed reading notifications from database for Backup vault";
+pub(crate) const NO_NOTIFICATIONS: &str =
+    "Failed reading notifications from database for Backup vault";
 
 /// The sentence this service refuses a member whose value it cannot accept
 /// with, for the member that carries the topic.
@@ -84,14 +85,14 @@ const BACKUP_VAULT_EVENTS: [&str; 30] = [
 /// The ARN of an SNS topic of this account, in the form the model's own doc
 /// gives for the member ("for example,
 /// `arn:aws:sns:us-west-2:111122223333:MyVaultTopic`").
-fn topic_arn(name: &str) -> String {
+pub(crate) fn topic_arn(name: &str) -> String {
     format!("arn:aws:sns:{REGION}:{ACCOUNT}:{name}")
 }
 
 /// `PUT /backup-vaults/{BackupVaultName}/notification-configuration`, as the
 /// model binds the write. The body is built here so a case can send a topic
 /// that is not an ARN at all.
-async fn put_notifications(
+pub(crate) async fn put_notifications(
     router: &MultiServiceRouter,
     vault: &str,
     topic: &str,
@@ -108,7 +109,7 @@ async fn put_notifications(
 
 /// `GET /backup-vaults/{BackupVaultName}/notification-configuration`, as the
 /// model binds the read.
-async fn get_notifications(router: &MultiServiceRouter, vault: &str) -> (u16, Value) {
+pub(crate) async fn get_notifications(router: &MultiServiceRouter, vault: &str) -> (u16, Value) {
     call(
         router,
         "GET",
@@ -120,7 +121,10 @@ async fn get_notifications(router: &MultiServiceRouter, vault: &str) -> (u16, Va
 
 /// `DELETE /backup-vaults/{BackupVaultName}/notification-configuration`, as the
 /// model binds the delete.
-async fn delete_notifications(router: &MultiServiceRouter, vault: &str) -> (u16, Value) {
+pub(crate) async fn delete_notifications(
+    router: &MultiServiceRouter,
+    vault: &str,
+) -> (u16, Value) {
     call(
         router,
         "DELETE",
