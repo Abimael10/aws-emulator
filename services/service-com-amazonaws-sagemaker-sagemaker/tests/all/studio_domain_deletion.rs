@@ -45,12 +45,16 @@ const SETTLE_DEADLINE: Duration = Duration::from_secs(120);
 /// How often a poll looks again. Only the loop's condition decides when it stops.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-/// The smallest `CreateDomain` request: the three required members and nothing else.
+/// The smallest `CreateDomain` request: the required members, plus the VPC and subnet a
+/// SageMaker AI domain's networking must name (`VpcId` and `SubnetIds` are optional only
+/// for a domain created from SageMaker Unified Studio).
 fn minimal(domain_name: &str, auth_mode: &str) -> Value {
     json!({
         "DomainName": domain_name,
         "AuthMode": auth_mode,
-        "DefaultUserSettings": { "ExecutionRole": EXECUTION_ROLE }
+        "DefaultUserSettings": { "ExecutionRole": EXECUTION_ROLE },
+        "VpcId": "vpc-0a1b2c3d",
+        "SubnetIds": ["subnet-0a1b2c3d"]
     })
 }
 

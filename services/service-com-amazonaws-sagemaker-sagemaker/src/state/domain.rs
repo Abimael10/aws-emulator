@@ -10,7 +10,9 @@
 //! handler keeps naming `crate::state::…`.
 
 use super::*;
-use crate::ops::types::{DefaultSpaceSettings, DomainSettings, UserSettings};
+use crate::ops::types::{
+    DefaultSpaceSettings, DomainSettings, StudioWebPortalSettings, UserSettings,
+};
 
 /// The ARN resource kind a domain carries, i.e. the `<kind>` in [`resource_arn`]. Fixed
 /// by `DomainArn`'s modelled pattern
@@ -89,16 +91,129 @@ pub fn mint_domain_id() -> String {
     format!("d-{}", mint_short_id())
 }
 
-/// Where the Studio domain `domain_id` is served in `region`: the host SageMaker gives
-/// one Studio domain, which `CreateDomain`, `DescribeDomain` and `ListDomains` all report
-/// as the domain's `Url`.
+/// The last path segment of a Studio domain's LANDING address: what a caller handed the
+/// domain's `Url` opens, as `crate::service::studio_landing` serves it.
+pub const STUDIO_LANDING_SEGMENT: &str = "studio";
+
+/// The path a Studio domain's landing address is served at:
+/// `/_aws/sagemaker/domain/<DomainId>/studio`, with the id percent-encoded.
 ///
-/// Derived from the domain's own id and the Region the caller signed for, so it is stable
-/// across reads and distinct per domain — the same way [`notebook_instance_url`] gives one
-/// notebook instance its host.
-pub fn studio_domain_url(region: &str, domain_id: &str) -> String {
-    format!("https://{domain_id}.studio.{region}.sagemaker.aws")
+/// One function for the mint and for the route — the same arrangement the presigned
+/// sessions use ([`presigned_session_path`]) — so the address a `Url` names and the
+/// address this emulator serves cannot drift apart. The namespace segment begins with
+/// `_`, which no modelled path segment carries, so it collides with no control-plane
+/// route.
+pub fn studio_domain_path(domain_id: &str) -> String {
+    format!(
+        "/{namespace}/{PRESIGNED_SESSION_PLANE}/{DOMAIN_ARN_KIND}/{domain}/\
+         {STUDIO_LANDING_SEGMENT}",
+        namespace = ::service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE,
+        domain = encoded_url_value(domain_id),
+    )
 }
+
+/// Where the Studio domain `domain_id` is served: the endpoint the request arrived on
+/// ([`::smithy_server_runtime::OperationContext::endpoint`]) plus that domain's landing
+/// path, which `CreateDomain`, `DescribeDomain` and `ListDomains` all report as the
+/// domain's `Url`.
+///
+/// The host is NEVER one of AWS's own names: a caller handed this address FOLLOWS it, and
+/// a Studio DNS name of AWS's (`d-<id>.studio.<region>.sagemaker.aws`) resolves to nothing
+/// a client of the emulator can reach, so the Studio flow the member exists for could
+/// never be driven here. Derived from the domain's own id, so it is stable across reads
+/// and distinct per domain, and minted ONCE by the create so every later reader replays
+/// the same address.
+pub fn studio_domain_url(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    domain_id: &str,
+) -> String {
+    format!(
+        "{endpoint}{path}",
+        endpoint = ctx.endpoint().as_str().trim_end_matches('/'),
+        path = studio_domain_path(domain_id),
+    )
+}
+
+/// `StudioWebPortal`'s resolved value for a domain whose create named none: the member
+/// decides "whether the user can access Studio", and a domain SageMaker AI creates admits
+/// Studio — recorded behaviour, which is also the only value `studio::` may be the landing
+/// experience with.
+pub const DEFAULT_STUDIO_WEB_PORTAL: &str = "ENABLED";
+
+/// `DefaultLandingUri`'s documented value for Studio: "studio::: Indicates that Studio is
+/// the default experience. This value can only be passed if StudioWebPortal is set to
+/// ENABLED."
+pub const STUDIO_LANDING_URI: &str = "studio::";
+
+/// `DefaultLandingUri`'s other documented value: "app:JupyterServer:: Indicates that
+/// Studio Classic is the default experience." — where the domain does not admit Studio at
+/// all, which is the landing experience left.
+pub const STUDIO_CLASSIC_LANDING_URI: &str = "app:JupyterServer:";
+
+/// `AutoMountHomeEFS`'s resolved value for a domain whose create named none: a domain's
+/// home EFS volume is auto-mounted — recorded behaviour. (`DefaultAsDomain`, the third
+/// member of the enum, is "only supported for user profiles"; `Disabled` is what a create
+/// that withholds auto-mounting names itself.)
+pub const DEFAULT_AUTO_MOUNT_HOME_EFS: &str = "Enabled";
+
+/// `ExecutionRoleSessionNameMode`'s resolved value for a domain whose create named none:
+/// the session name of the execution role corresponds to the user's identity — recorded
+/// behaviour for a domain created now.
+pub const DEFAULT_EXECUTION_ROLE_SESSION_NAME_MODE: &str = "USER_IDENTITY";
+
+/// The domain's `DefaultUserSettings` as the service RESOLVES them, i.e. what every reader
+/// of the domain reports: the settings the create carried, with each member the service
+/// resolves a value for filled in.
+///
+/// A reader of a domain reports the configuration the domain CARRIES, not the subset of it
+/// the request happened to mention, so the members SageMaker resolves for a domain are
+/// resolved ONCE here, on the write path:
+///
+/// * `StudioWebPortal` — whether the domain admits Studio ([`DEFAULT_STUDIO_WEB_PORTAL`]);
+/// * `DefaultLandingUri` — the experience a user is directed to, which is Studio's own
+///   ([`STUDIO_LANDING_URI`]) for a domain that admits Studio and Studio Classic's
+///   ([`STUDIO_CLASSIC_LANDING_URI`]) for one that does not, since `studio::` "can only be
+///   passed if StudioWebPortal is set to ENABLED";
+/// * `AutoMountHomeEFS` — whether the home EFS volume is auto-mounted
+///   ([`DEFAULT_AUTO_MOUNT_HOME_EFS`]);
+/// * `StudioWebPortalSettings.ExecutionRoleSessionNameMode` — how an execution-role
+///   session is named ([`DEFAULT_EXECUTION_ROLE_SESSION_NAME_MODE`]).
+///
+/// Every value the request DID carry is kept exactly as it was sent: this fills gaps and
+/// overrides nothing.
+pub fn resolved_default_user_settings(mut settings: UserSettings) -> UserSettings {
+    let studio_web_portal = settings
+        .studio_web_portal
+        .get_or_insert_with(|| DEFAULT_STUDIO_WEB_PORTAL.to_string())
+        .clone();
+    settings.default_landing_uri.get_or_insert_with(|| {
+        if studio_web_portal == DEFAULT_STUDIO_WEB_PORTAL {
+            STUDIO_LANDING_URI.to_string()
+        } else {
+            STUDIO_CLASSIC_LANDING_URI.to_string()
+        }
+    });
+    settings
+        .auto_mount_home_efs
+        .get_or_insert_with(|| DEFAULT_AUTO_MOUNT_HOME_EFS.to_string());
+    settings
+        .studio_web_portal_settings
+        .get_or_insert_with(StudioWebPortalSettings::default)
+        .execution_role_session_name_mode
+        .get_or_insert_with(|| DEFAULT_EXECUTION_ROLE_SESSION_NAME_MODE.to_string());
+    settings
+}
+
+/// How `CreateDomain` states that the request named no network for the domain to
+/// communicate through: the whole sentence is fixed text for this refusal — it interpolates
+/// nothing from the request.
+///
+/// `VpcId`'s and `SubnetIds`' own docs make each optional only "for domains created from
+/// Amazon SageMaker Unified Studio", so a SageMaker AI domain — the only kind created
+/// here — has to name both, and a request that leaves either out is refused before any
+/// domain exists.
+pub const DOMAIN_NETWORK_REQUIRED: &str = "VpcId and SubnetIds are required for SageMaker \
+     AI Domain not created by SageMaker Unified Studio.";
 
 /// How the domain operations state a `DomainId` this account holds no domain under: the
 /// entity, then the ARN the requested id resolves to in the Region the request signed for

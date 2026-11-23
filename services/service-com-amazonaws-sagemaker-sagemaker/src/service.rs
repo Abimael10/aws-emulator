@@ -64,6 +64,14 @@ pub mod authorization;
 /// address it published for it ([`presigned_session::PresignedSessionRoute`]).
 pub mod presigned_session;
 
+/// Serves the Studio landing address a domain publishes as its `Url`
+/// ([`studio_landing::StudioLandingRoute`]).
+pub mod studio_landing;
+
+/// What the routes that serve an ADDRESS this service published share: how such an address's
+/// path is read, and how one fetch of it is answered ([`published_address`]).
+mod published_address;
+
 /// This service's own Smithy shape id, whose LOCAL name (`SageMaker`) is what an
 /// awsJson1_1 request names its target service by
 /// (`X-Amz-Target: SageMaker.<Operation>`).
@@ -84,6 +92,9 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// published opens. Held rather than built per request because
     /// [`Service::override_operation`] hands the router a BORROW of it.
     presigned_session: presigned_session::PresignedSessionRoute<Eng>,
+    /// The route that serves the Studio landing address a domain publishes as its `Url`.
+    /// Held for the same reason the presigned-session route is.
+    studio_landing: studio_landing::StudioLandingRoute<Eng>,
     /// The wrapper every routable request is served through, so a constraint a list's
     /// ELEMENTS break is stated at the list member quoting the list the request sent; see
     /// [`list_element_refusals`]. Held for the same reason the route above is.
@@ -97,6 +108,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             presigned_session: presigned_session::PresignedSessionRoute::new(Arc::clone(&engine)),
+            studio_landing: studio_landing::StudioLandingRoute::new(Arc::clone(&engine)),
             stated_from_request: list_element_refusals::StatedFromRequest,
             entry: crate::ServiceDefinition::new(engine),
         }
@@ -110,6 +122,21 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         self.presigned_session
             .claims(method, uri)
             .then_some(&self.presigned_session as &dyn ErasedOperation)
+    }
+
+    /// The Studio landing route, when it is what serves this request — the same one-place
+    /// decision the presigned-session route above is resolved through.
+    fn studio_landing_route(&self, method: &str, uri: &str) -> Option<&dyn ErasedOperation> {
+        self.studio_landing
+            .claims(method, uri)
+            .then_some(&self.studio_landing as &dyn ErasedOperation)
+    }
+
+    /// The route that serves a request addressed at one of the ADDRESSES this service
+    /// published for a caller to follow, rather than at a modelled operation.
+    fn published_address_route(&self, method: &str, uri: &str) -> Option<&dyn ErasedOperation> {
+        self.presigned_session_route(method, uri)
+            .or_else(|| self.studio_landing_route(method, uri))
     }
 }
 
@@ -140,12 +167,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // posts to (the root). Each data-plane sibling's own URI path space is then
         // claimed by it alone — and a root-path request targeted at some other RPC peer
         // sharing the signing name is not claimed here either.
-        // The address a presigned URL this service published names is claimed by its PATH:
-        // such a URL is fetched by a browser, which presents no credential scope and names
-        // no route key, so nothing else would claim it (see
-        // [`presigned_session::PresignedSessionRoute`]).
+        // The ADDRESSES this service published for a caller to follow — a presigned URL, a
+        // Studio domain's landing `Url` — are claimed by their PATH: such an address is
+        // fetched by a browser, which presents no credential scope and names no route key,
+        // so nothing else would claim it (see [`presigned_session::PresignedSessionRoute`]
+        // and [`studio_landing::StudioLandingRoute`]).
         if self
-            .presigned_session_route(parts.method.as_str(), &parts.uri.to_string())
+            .published_address_route(parts.method.as_str(), &parts.uri.to_string())
             .is_some()
         {
             return true;
@@ -167,9 +195,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.
         //
-        // The model binds no operation to the address a presigned URL points at — an
-        // opened session is not an API call, it is what the API's URL leads to — so that
-        // address is served here.
+        // The model binds no operation to the addresses this service published for a caller
+        // to follow — an opened session is not an API call, and neither is a landing page:
+        // both are what the API's URL leads to — so those addresses are served here.
         //
         // Every OTHER request the generated routing table can serve is served through the
         // wrapper that states the one refusal this service words from the REQUEST — a
@@ -178,7 +206,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // entry for everything else. The routing stays the model's: a request whose target
         // names no modelled operation is declined here, so the framework answers it as the
         // unroutable request it is.
-        if let Some(route) = self.presigned_session_route(req.method(), req.uri()) {
+        if let Some(route) = self.published_address_route(req.method(), req.uri()) {
             return Some(route);
         }
         let routes = self

@@ -50,7 +50,10 @@ async fn in_service_domain(emulator: &Emulator, region: &str, name: &str) -> Str
             &json!({
                 "DomainName": name,
                 "AuthMode": "IAM",
-                "DefaultUserSettings": { "ExecutionRole": EXECUTION_ROLE }
+                "DefaultUserSettings": { "ExecutionRole": EXECUTION_ROLE },
+                // The VPC and subnet a SageMaker AI domain's networking must name.
+                "VpcId": "vpc-0a1b2c3d",
+                "SubnetIds": ["subnet-0a1b2c3d"]
             }),
         )
         .await;

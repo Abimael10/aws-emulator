@@ -43,12 +43,16 @@ const SETTLE_DEADLINE: Duration = Duration::from_secs(120);
 /// How often a poll looks again. Only the loop's condition decides when it stops.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-/// The smallest `CreateDomain` request: the three required members and nothing else.
+/// The smallest `CreateDomain` request: the required members, plus the VPC and the subnet
+/// a SageMaker AI domain's networking must name (`VpcId` and `SubnetIds` are optional only
+/// for a domain created from SageMaker Unified Studio).
 fn minimal(domain_name: &str) -> Value {
     json!({
         "DomainName": domain_name,
         "AuthMode": "IAM",
-        "DefaultUserSettings": { "ExecutionRole": EXECUTION_ROLE }
+        "DefaultUserSettings": { "ExecutionRole": EXECUTION_ROLE },
+        "VpcId": "vpc-0a1b2c3d",
+        "SubnetIds": ["subnet-0a1b2c3d"]
     })
 }
 
@@ -202,7 +206,17 @@ async fn create_domain_round_trips_through_describe_domain() {
                     "DefaultUserSettings",
                     json!({
                         "ExecutionRole": EXECUTION_ROLE,
-                        "SecurityGroups": ["sg-01", "sg-02"]
+                        "SecurityGroups": ["sg-01", "sg-02"],
+                        // The members the service resolves for the domain: Studio is
+                        // admitted, so Studio is the landing experience, the home EFS
+                        // volume is auto-mounted, and an execution-role session is named
+                        // after the user's identity.
+                        "StudioWebPortal": "ENABLED",
+                        "DefaultLandingUri": "studio::",
+                        "AutoMountHomeEFS": "Enabled",
+                        "StudioWebPortalSettings": {
+                            "ExecutionRoleSessionNameMode": "USER_IDENTITY"
+                        }
                     }),
                 ),
                 ("DomainSettings", json!({ "SecurityGroupIds": ["sg-03"] })),
@@ -237,7 +251,10 @@ async fn create_domain_round_trips_through_describe_domain() {
             expected_arn,
             "case {case}: DomainArn, got {created}"
         );
-        let expected_url = format!("https://{domain_id}.studio.{}.sagemaker.aws", row.region);
+        let expected_url = format!(
+            "{}/_aws/sagemaker/domain/{domain_id}/studio",
+            smithy_server_runtime::UNSERVED_URL_BASE
+        );
         assert_eq!(
             str_field(&created, "Url"),
             expected_url,
@@ -291,7 +308,8 @@ async fn create_domain_round_trips_through_describe_domain() {
             );
         }
         // A member the request did not carry is reported by neither the create nor the
-        // reader: only the three members the model documents a default for are resolved.
+        // reader: beyond the three members the model documents a default for and the
+        // domain's resolved default user settings, nothing is filled in.
         if row.request.get("KmsKeyId").is_none() {
             assert_eq!(
                 described.get("KmsKeyId"),

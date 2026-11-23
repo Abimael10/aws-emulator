@@ -570,7 +570,10 @@ async fn a_version_a_studio_app_runs_on_is_in_use_and_refused() {
             &json!({
                 "DomainName": "studio-pinned",
                 "AuthMode": "IAM",
-                "DefaultUserSettings": { "ExecutionRole": ROLE_ARN }
+                "DefaultUserSettings": { "ExecutionRole": ROLE_ARN },
+                // The VPC and subnet a SageMaker AI domain's networking must name.
+                "VpcId": "vpc-0a1b2c3d",
+                "SubnetIds": ["subnet-0a1b2c3d"]
             }),
         )
         .await;

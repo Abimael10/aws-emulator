@@ -2,8 +2,10 @@
 
 //! @op CreateDomain
 //! IMPLEMENTED: mints a Studio domain into `crate::state` — its `DomainId`, its ARN and
-//! its Studio URL — and leaves it `Pending` until the clock owes `InService`. This is
-//! the ONLY file to touch for this operation.
+//! the Studio address this emulator serves for it — resolves the default user settings the
+//! service decides for a domain, and leaves it `Pending` until the clock owes `InService`;
+//! refuses a request that names no VPC or no subnets for the domain to communicate
+//! through. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -211,20 +213,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `AppSecurityGroupManagement`, `HomeEfsFileSystemCreation`, `TagPropagation`) is
         // refused outside its modelled catalog by the boundary validator before this
         // handler runs, so reaching here means each one carries a value its enum declares
-        // and the only values left to resolve are the three the model documents a default
-        // for.
+        // and the only values left to resolve are the ones the service itself decides —
+        // the three members the model documents a default for, and the domain's resolved
+        // default user settings (`crate::state::resolved_default_user_settings`).
 
         // The FORM of the network identifiers is settled before anything else: a value no
         // EC2 identifier could be is a bad request, so the call is refused and no domain is
         // created (see `crate::state::domain_identifiers`). This is checked before the
         // placement is resolved against EC2, because there is nothing to ask that service
-        // about an identifier it could not have minted.
+        // about an identifier it could not have minted — and before the precondition below,
+        // because AWS settles what a request SAYS before what it leaves unsaid.
         if let Some(refusal) = crate::state::domain_network_identifier_refusal(
             Self::INPUT_SCHEMA,
             input.vpc_id.as_deref(),
             input.subnet_ids.as_deref().unwrap_or_default(),
         ) {
             return Err(crate::scaffolded::Scaffolded::validation(refusal));
+        }
+
+        // A domain's traffic goes through a VPC and that VPC's subnets, and both are the
+        // caller's to name: `VpcId`'s and `SubnetIds`' own docs make each optional only
+        // "for domains created from Amazon SageMaker Unified Studio", so a SageMaker AI
+        // domain — the only kind created here — has to carry both, and a request that
+        // leaves either out resolves no network for the domain at all. It is refused ahead
+        // of the create, so nothing is written for it; the model declares no validation
+        // error for this operation, so the refusal travels as the service-common
+        // `ValidationException`.
+        let names_subnets = input
+            .subnet_ids
+            .as_deref()
+            .is_some_and(|subnets| !subnets.is_empty());
+        if input.vpc_id.as_deref().is_none_or(str::is_empty) || !names_subnets {
+            return Err(CreateDomainError::validation(
+                crate::state::DOMAIN_NETWORK_REQUIRED,
+            ));
         }
 
         // The id is the server's: `DomainId` is not an input member, it is what every
@@ -234,7 +256,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let domain_id = crate::state::mint_domain_id();
         let arn = crate::state::resource_arn(&region, crate::state::DOMAIN_ARN_KIND, &domain_id);
-        let url = crate::state::studio_domain_url(&region, &domain_id);
+        // Addressed on the endpoint this request arrived on, which is where a caller that
+        // follows the domain's `Url` reaches this emulator (see
+        // `crate::state::studio_domain_url`, served by `crate::service::studio_landing`).
+        let url = crate::state::studio_domain_url(ctx, &domain_id);
 
         // A domain's traffic goes through the VPC, the subnets and the security groups the
         // request names, which are Amazon EC2's resources: the placement is resolved against
@@ -299,7 +324,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 name: input.domain_name,
                 url: url.clone(),
                 auth_mode: input.auth_mode,
-                default_user_settings: input.default_user_settings,
+                // The settings the create carried, with every member the service resolves
+                // a value for filled in, so a reader reports the configuration the domain
+                // CARRIES rather than the subset the request happened to mention.
+                default_user_settings: crate::state::resolved_default_user_settings(
+                    input.default_user_settings,
+                ),
                 domain_settings: input.domain_settings,
                 default_space_settings: input.default_space_settings,
                 subnet_ids: input.subnet_ids,

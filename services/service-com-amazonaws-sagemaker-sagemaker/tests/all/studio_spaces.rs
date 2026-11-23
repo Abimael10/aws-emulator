@@ -36,6 +36,18 @@ fn space_arn(region: &str, domain_id: &str, space_name: &str) -> String {
     format!("arn:aws:sagemaker:{region}:{ACCOUNT}:space/{domain_id}/{space_name}")
 }
 
+/// The Studio address a domain of this harness publishes: the base this emulator publishes
+/// plus that domain's own landing path, which is where a caller following the address
+/// reaches this emulator (`state::studio_domain_path`). Spelled out from the base rather
+/// than taken from the record, so the suite pins the address instead of echoing it.
+fn domain_url(domain_id: &str) -> String {
+    format!(
+        "{}{}",
+        smithy_server_runtime::UNSERVED_URL_BASE,
+        state::studio_domain_path(domain_id)
+    )
+}
+
 /// `base` with every member of `extra` added.
 fn with_members(base: &Value, extra: &Value) -> Value {
     let mut merged = base
@@ -104,10 +116,7 @@ fn seed_deleting_space(
             space_settings: None,
             ownership_settings: None,
             space_sharing_settings: None,
-            url: state::studio_space_url(
-                &state::studio_domain_url(region, domain_id),
-                space_name,
-            ),
+            url: state::studio_space_url(&domain_url(domain_id), space_name),
             tags: Vec::new(),
             status: SPACE_STATUS_DELETING.to_string(),
             creation_time: when,
@@ -249,11 +258,7 @@ async fn create_space_round_trips_through_describe_space() {
         // host with the space on it.
         assert_eq!(
             str_field(&described, "Url"),
-            format!(
-                "{}/space/{}",
-                state::studio_domain_url(row.region, &domain_id),
-                row.name
-            ),
+            format!("{}/space/{}", domain_url(&domain_id), row.name),
             "case {case}: the reader reports the space's address under its domain, got \
              {described}"
         );

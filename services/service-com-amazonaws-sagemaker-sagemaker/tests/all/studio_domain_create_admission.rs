@@ -44,8 +44,20 @@ const TEARDOWN_DEADLINE: Duration = Duration::from_secs(120);
 /// How often a poll looks again. Only the loop's condition decides when it stops.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-/// The smallest `CreateDomain` request: the three required members and nothing else.
+/// The smallest `CreateDomain` request SageMaker SERVES: the three required members, plus
+/// the VPC and the subnet a SageMaker AI domain's networking must name (`VpcId` and
+/// `SubnetIds` are optional only for a domain created from SageMaker Unified Studio), each in
+/// the published identifier form.
 fn minimal(domain_name: &str) -> Value {
+    let mut request = network_free(domain_name);
+    request["VpcId"] = json!("vpc-0a1b2c3d");
+    request["SubnetIds"] = json!(["subnet-0a1b2c3d"]);
+    request
+}
+
+/// The three required members and nothing else, which is what the network table below varies
+/// the placement members on top of.
+fn network_free(domain_name: &str) -> Value {
     json!({
         "DomainName": domain_name,
         "AuthMode": "IAM",
@@ -53,9 +65,9 @@ fn minimal(domain_name: &str) -> Value {
     })
 }
 
-/// [`minimal`] plus the network members a row names.
+/// [`network_free`] plus the network members a row names.
 fn with_network(domain_name: &str, vpc_id: Option<&str>, subnet_ids: &[&str]) -> Value {
-    let mut request = minimal(domain_name);
+    let mut request = network_free(domain_name);
     if let Some(vpc_id) = vpc_id {
         request["VpcId"] = json!(vpc_id);
     }
@@ -275,9 +287,9 @@ async fn create_domain_refuses_a_network_identifier_no_ec2_could_have_minted() {
     // and the requests that are in the form and must be served.
     let rows: Vec<NetworkRow> = vec![
         NetworkRow {
-            case: "no network member at all",
-            vpc_id: None,
-            subnet_ids: Vec::new(),
+            case: "one subnet in the published form",
+            vpc_id: Some("vpc-0a1b2c3d"),
+            subnet_ids: vec!["subnet-0a1b2c3d"],
             clauses: Vec::new(),
         },
         NetworkRow {

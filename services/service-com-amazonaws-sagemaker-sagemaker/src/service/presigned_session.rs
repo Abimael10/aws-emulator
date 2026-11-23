@@ -31,18 +31,18 @@
 
 use std::sync::Arc;
 
-use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
-use aws_smithy_types::body::SdkBody;
-use smithy_server_runtime::{http, BoxFuture, ErasedOperation, OperationContext, Service};
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
+use smithy_server_runtime::{BoxFuture, ErasedOperation, OperationContext, Service};
+
+use super::published_address::{
+    answer, decoded_segments, query_field, FETCH_METHOD, JSON_MEDIA_TYPE, PLAIN_MEDIA_TYPE,
+};
 
 /// The method a presigned session is opened on: a browser following the URL.
-const SESSION_METHOD: &str = "GET";
+const SESSION_METHOD: &str = FETCH_METHOD;
 
 /// The media type the session is reported in.
-const SESSION_MEDIA_TYPE: &str = "application/json";
-
-/// The media type of the answers that are not a session.
-const PLAIN_MEDIA_TYPE: &str = "text/plain; charset=utf-8";
+const SESSION_MEDIA_TYPE: &str = JSON_MEDIA_TYPE;
 
 /// What a fetch that authenticates nothing is answered with. A presigned URL is opened by
 /// a browser rather than by an AWS SDK, so the answer is the status itself with a one-line
@@ -101,8 +101,7 @@ impl<Eng: Send + Sync + 'static> PresignedSessionRoute<Eng> {
         // The token is read DECODED, the way the mint percent-encoded it into the URL, so
         // the value matched here is the one the grant holds.
         let token = query_field(req.uri(), crate::state::PRESIGNED_SESSION_TOKEN_FIELD)
-            .unwrap_or_default();
-        let store = state.lock();
+            .unwrap_or_default();        let store = state.lock();
         let session = store.presigned_session(
             &addressed.kind,
             &addressed.resource,
@@ -199,52 +198,3 @@ fn addressed(method: &str, uri: &str) -> Option<Addressed> {
     })
 }
 
-/// One answer of this route: the bytes, their media type and their length.
-///
-/// The headers are set through the NON-panicking setter: `Headers::insert` aborts on a
-/// value it cannot represent, and nothing a request can reach may panic. Every value here
-/// is this module's own, so neither can fail; a header that somehow did is dropped rather
-/// than taken down the process with.
-fn answer(status: u16, media_type: &str, body: &str) -> RtResponse {
-    let bytes = body.as_bytes().to_vec();
-    let length = bytes.len();
-    let mut response = RtResponse::new(session_status(status), SdkBody::from(bytes));
-    let _ = response
-        .headers_mut()
-        .try_insert("content-type", media_type.to_string());
-    let _ = response
-        .headers_mut()
-        .try_insert("content-length", length.to_string());
-    response
-}
-
-/// A status this route answers with. Every call site passes a constant, so the conversion
-/// cannot fail.
-fn session_status(code: u16) -> StatusCode {
-    StatusCode::try_from(code).expect("a presigned session answers constant statuses")
-}
-
-/// The decoded value of one query field of `uri`, or `None` when it carries none.
-fn query_field(uri: &str, field: &str) -> Option<String> {
-    let query = uri.split_once('?').map(|(_, query)| query).unwrap_or("");
-    query.split('&').find_map(|pair| {
-        let (name, value) = pair.split_once('=')?;
-        name.eq_ignore_ascii_case(field)
-            .then(|| smithy_server_runtime::percent_decode(value))
-    })
-}
-
-/// The path segments of `uri`, percent-decoded, empty segments dropped — the same view of
-/// a path the mint built the address from.
-fn decoded_segments(uri: &str) -> Vec<String> {
-    uri.parse::<http::Uri>()
-        .map(|parsed| {
-            parsed
-                .path()
-                .split('/')
-                .filter(|segment| !segment.is_empty())
-                .map(smithy_server_runtime::percent_decode)
-                .collect()
-        })
-        .unwrap_or_default()
-}

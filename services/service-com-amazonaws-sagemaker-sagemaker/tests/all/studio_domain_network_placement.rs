@@ -11,11 +11,12 @@
 //!
 //! The suite asserts a RULE over a TABLE of placements rather than one recorded call: a
 //! domain is provisioned only when every part of its placement that EC2 states a VPC for
-//! belongs to the ONE VPC the domain uses for communication — the VPC `VpcId` declares, or
-//! the first resolved subnet's VPC for a request that declares none. The rows differ along
-//! which part disagrees (a subnet, a group named in each of the three settings members, two
-//! subnets of different VPCs), whether a VPC was declared at all, how many parts the request
-//! names, and whether EC2 holds any record for them.
+//! belongs to the ONE VPC the domain uses for communication, the VPC `VpcId` declares. The
+//! rows differ along which part disagrees (a subnet, a group named in each of the three
+//! settings members, two subnets of different VPCs), how many parts the request names, and
+//! whether EC2 holds any record for them. A request that names no VPC or no subnets at all
+//! resolves no network for the domain and is refused before any domain exists, which is
+//! `studio_domain_resolved_settings`' own table.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -295,10 +296,9 @@ struct Row {
 }
 
 /// RULE: every part of a domain's placement that EC2 states a VPC for must belong to the one
-/// VPC the domain uses for communication — the VPC `VpcId` declares, or the first resolved
-/// subnet's VPC when it declares none; a domain whose placement disagrees is still CREATED
-/// and settles in `Failed` with the `FailureReason` naming the disagreeing part, while a
-/// self-consistent one reaches `InService` with no reason at all.
+/// VPC the domain uses for communication, the VPC `VpcId` declares; a domain whose placement
+/// disagrees is still CREATED and settles in `Failed` with the `FailureReason` naming the
+/// disagreeing part, while a self-consistent one reaches `InService` with no reason at all.
 #[tokio::test]
 async fn a_domain_settles_by_whether_its_placement_names_one_vpc() {
     let wired = Wired::new();
@@ -313,12 +313,6 @@ async fn a_domain_settles_by_whether_its_placement_names_one_vpc() {
     let unheld_subnet = "subnet-0f1e2d3c4b5a69781".to_string();
 
     let rows = vec![
-        Row {
-            case: "no placement at all",
-            request: create_domain("no-placement", None, &no_ids, &no_ids, &no_ids, &no_ids),
-            status: IN_SERVICE,
-            reason: None,
-        },
         Row {
             case: "one subnet and one group of the declared VPC",
             request: create_domain(
@@ -346,10 +340,10 @@ async fn a_domain_settles_by_whether_its_placement_names_one_vpc() {
             reason: None,
         },
         Row {
-            case: "subnets of the declared VPC and no VPC declared",
+            case: "two subnets of the declared VPC",
             request: create_domain(
-                "undeclared-vpc",
-                None,
+                "two-subnets",
+                Some(&own.vpc_id),
                 &own.subnet_ids[..2],
                 &own.group_ids[..1],
                 &no_ids,
@@ -389,19 +383,6 @@ async fn a_domain_settles_by_whether_its_placement_names_one_vpc() {
             request: create_domain(
                 "cross-vpc-second-subnet",
                 Some(&own.vpc_id),
-                &[own.subnet_ids[0].clone(), other.subnet_ids[0].clone()],
-                &no_ids,
-                &no_ids,
-                &no_ids,
-            ),
-            status: FAILED,
-            reason: Some(subnet_reason(&other.subnet_ids[0], &own.vpc_id)),
-        },
-        Row {
-            case: "subnets of two VPCs with no VPC declared",
-            request: create_domain(
-                "undeclared-cross-vpc",
-                None,
                 &[own.subnet_ids[0].clone(), other.subnet_ids[0].clone()],
                 &no_ids,
                 &no_ids,
@@ -458,19 +439,6 @@ async fn a_domain_settles_by_whether_its_placement_names_one_vpc() {
                 &no_ids,
                 &no_ids,
                 &other.group_ids,
-            ),
-            status: FAILED,
-            reason: Some(group_reason(&other.group_ids[0], &own.vpc_id)),
-        },
-        Row {
-            case: "a group of another VPC with no VPC declared, held to the subnet's",
-            request: create_domain(
-                "undeclared-cross-vpc-group",
-                None,
-                &own.subnet_ids[..1],
-                &other.group_ids,
-                &no_ids,
-                &no_ids,
             ),
             status: FAILED,
             reason: Some(group_reason(&other.group_ids[0], &own.vpc_id)),

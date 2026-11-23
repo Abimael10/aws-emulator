@@ -42,12 +42,16 @@ pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// The smallest `CreateDomain` request for a domain whose members authenticate with
 /// `auth_mode` — `AuthMode`'s members are `SSO` (IAM Identity Center) and `IAM`
-/// (`smithy_query(query="shape", shape="AuthMode")`).
+/// (`smithy_query(query="shape", shape="AuthMode")`) — carrying the VPC and subnet a
+/// SageMaker AI domain's networking must name (`VpcId` and `SubnetIds` are optional only
+/// for a domain created from SageMaker Unified Studio).
 pub(crate) fn minimal_domain_with_auth(domain_name: &str, auth_mode: &str) -> Value {
     json!({
         "DomainName": domain_name,
         "AuthMode": auth_mode,
-        "DefaultUserSettings": { "ExecutionRole": EXECUTION_ROLE }
+        "DefaultUserSettings": { "ExecutionRole": EXECUTION_ROLE },
+        "VpcId": "vpc-0a1b2c3d",
+        "SubnetIds": ["subnet-0a1b2c3d"]
     })
 }
 
@@ -100,12 +104,18 @@ pub(crate) fn seed_studio_domain(emulator: &Emulator, region: &str, domain_id: &
             id: domain_id.to_string(),
             arn: state::resource_arn(region, state::DOMAIN_ARN_KIND, domain_id),
             name: format!("seeded-{domain_id}"),
-            url: state::studio_domain_url(region, domain_id),
+            // The address a create would mint in this harness: the base this emulator
+            // publishes plus the domain's own landing path.
+            url: format!(
+                "{}{}",
+                smithy_server_runtime::UNSERVED_URL_BASE,
+                state::studio_domain_path(domain_id)
+            ),
             auth_mode: "IAM".to_string(),
-            default_user_settings: UserSettings {
+            default_user_settings: state::resolved_default_user_settings(UserSettings {
                 execution_role: Some(EXECUTION_ROLE.to_string()),
                 ..UserSettings::default()
-            },
+            }),
             domain_settings: None,
             default_space_settings: None,
             subnet_ids: None,

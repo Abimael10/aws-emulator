@@ -33,6 +33,22 @@ const EXECUTION_ROLE: &str = "arn:aws:iam::123456789012:role/service-role/Studio
 /// A second execution role, so a member an update rewrites can only be reporting the update.
 const OTHER_EXECUTION_ROLE: &str = "arn:aws:iam::123456789012:role/service-role/OtherRole";
 
+/// The `DefaultUserSettings` a domain whose write path carried only `execution_role` CARRIES:
+/// the role as sent, plus the members SageMaker resolves for a domain — whether Studio is
+/// admitted, the experience a user lands in, whether the home EFS volume is auto-mounted and
+/// how an execution-role session is named — which `CreateDomain` and `UpdateDomain` resolve on
+/// the write path and every reader replays. Spelled out here rather than taken from the
+/// implementation, so this suite pins what the reader reports.
+fn resolved_user_settings(execution_role: &str) -> Value {
+    json!({
+        "ExecutionRole": execution_role,
+        "StudioWebPortal": "ENABLED",
+        "DefaultLandingUri": "studio::",
+        "AutoMountHomeEFS": "Enabled",
+        "StudioWebPortalSettings": { "ExecutionRoleSessionNameMode": "USER_IDENTITY" }
+    })
+}
+
 /// The Region every case here signs for, and so the Region the domain's ARN belongs to.
 const REGION: &str = "us-east-1";
 
@@ -136,7 +152,7 @@ async fn update_domain_applies_the_members_it_carries_and_leaves_the_rest() {
             expected: vec![
                 (
                     "DefaultUserSettings",
-                    json!({ "ExecutionRole": EXECUTION_ROLE }),
+                    resolved_user_settings(EXECUTION_ROLE),
                 ),
                 ("TagPropagation", json!("DISABLED")),
             ],
@@ -149,7 +165,7 @@ async fn update_domain_applies_the_members_it_carries_and_leaves_the_rest() {
             expected: vec![
                 (
                     "DefaultUserSettings",
-                    json!({ "ExecutionRole": OTHER_EXECUTION_ROLE }),
+                    resolved_user_settings(OTHER_EXECUTION_ROLE),
                 ),
                 // The members the update did not carry are left as the create stored them.
                 ("SubnetIds", json!(["subnet-0a1b2c3d"])),

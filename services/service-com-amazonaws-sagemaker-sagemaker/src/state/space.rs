@@ -70,15 +70,22 @@ pub fn space_key(domain_id: &str, space_name: &str) -> (String, String) {
     (domain_id.to_string(), space_name.to_string())
 }
 
+/// The path segment that names a SPACE under its domain's own Studio landing address, i.e.
+/// the `<kind>` segment in `…/studio/space/<SpaceName>`.
+///
+/// Named once here so the address [`studio_space_url`] publishes and the address
+/// `crate::service::studio_landing` SERVES cannot drift apart.
+pub const SPACE_PATH_SEGMENT: &str = "space";
+
 /// Where the space `space_name` of the domain whose Studio address is `domain_url` is
 /// served, i.e. the `Url` `DescribeSpace` reports.
 ///
-/// Derived from the domain's own Studio host ([`studio_domain_url`]) and the space's name,
-/// so it is stable across reads and distinct per space — the space is reached THROUGH its
-/// domain, and the member's doc has the caller append a redirect parameter to whatever this
-/// answers (`smithy_query(query="doc", shape="DescribeSpaceResponse", member="Url")`).
+/// Derived from the domain's own Studio address ([`studio_domain_url`]) and the space's
+/// name, so it is stable across reads and distinct per space — the space is reached THROUGH
+/// its domain, and the member's doc has the caller append a redirect parameter to whatever
+/// this answers (`smithy_query(query="doc", shape="DescribeSpaceResponse", member="Url")`).
 pub fn studio_space_url(domain_url: &str, space_name: &str) -> String {
-    format!("{domain_url}/space/{space_name}")
+    format!("{domain_url}/{SPACE_PATH_SEGMENT}/{space_name}")
 }
 
 /// How the operations whose SUBJECT is the space itself state a `(DomainId, SpaceName)` pair

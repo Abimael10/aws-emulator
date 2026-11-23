@@ -262,7 +262,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // in its own `…ForUpdate` shape are merged member by member below, for the same
         // reason.
         if let Some(default_user_settings) = input.default_user_settings {
-            domain.default_user_settings = default_user_settings;
+            // Resolved the way the create resolves them, so a domain reports the
+            // configuration it CARRIES whichever write path last set its settings
+            // (`crate::state::resolved_default_user_settings`).
+            domain.default_user_settings =
+                crate::state::resolved_default_user_settings(default_user_settings);
         }
         if let Some(default_space_settings) = input.default_space_settings {
             domain.default_space_settings = Some(default_space_settings);
