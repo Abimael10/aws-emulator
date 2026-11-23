@@ -161,14 +161,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .notebook_instances
             .get_mut(&input.notebook_instance_name)
         else {
+            // The transitions word a name nothing is stored under with the token AND the ARN
+            // the name resolves to, the same sentence the delete answers; the reader's own
+            // answer is the bare token.
             let arn = crate::state::resource_arn(
                 &crate::state::request_region(ctx),
                 crate::state::NOTEBOOK_INSTANCE_ARN_KIND,
                 &input.notebook_instance_name,
             );
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "RecordNotFound. Notebook Instance Arn: {arn}"
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::notebook_instance_record_not_found_at(&arn),
+            ));
         };
 
         // Whatever the clock already owed is materialised FIRST, so the status this
@@ -196,12 +199,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::record_state_change(Self::NAME, &arn, ctx);
             }
             // The operation models no error, so a refusal is a 400 `ValidationException`.
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Status ({status}) not in ({}). Unable to transition to ({}) for Notebook \
-                 Instance ({arn}).",
-                crate::state::NOTEBOOK_INSTANCE_STOPPABLE_STATUSES.join(", "),
-                crate::state::NOTEBOOK_INSTANCE_STATUS_STOPPING,
-            )));
+            // The statuses a stop is taken from travel as a bracketed list, the same shape
+            // the delete's own guard states its set in.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::notebook_instance_transition_refusal(
+                    &status,
+                    &crate::state::NOTEBOOK_INSTANCE_STOPPABLE_STATUSES,
+                    crate::state::NOTEBOOK_INSTANCE_STATUS_STOPPING,
+                    &arn,
+                ),
+            ));
         }
 
         crate::state::record_state_change(Self::NAME, &arn, ctx);

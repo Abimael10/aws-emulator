@@ -170,7 +170,7 @@ async fn create_domain_round_trips_through_describe_domain() {
                 },
                 "DefaultSpaceSettings": { "ExecutionRole": EXECUTION_ROLE },
                 "DomainSettings": { "SecurityGroupIds": ["sg-03"] },
-                "SubnetIds": ["subnet-01", "subnet-02", "subnet-03"],
+                "SubnetIds": ["subnet-0a1b2c3d", "subnet-1a2b3c4d", "subnet-2a3b4c5d"],
                 "VpcId": "vpc-99887766",
                 "AppNetworkAccessType": "VpcOnly",
                 "AppSecurityGroupManagement": "Service",
@@ -194,7 +194,10 @@ async fn create_domain_round_trips_through_describe_domain() {
                     json!("arn:aws:kms:us-west-2:123456789012:key/abc"),
                 ),
                 ("TagPropagation", json!("ENABLED")),
-                ("SubnetIds", json!(["subnet-01", "subnet-02", "subnet-03"])),
+                (
+                    "SubnetIds",
+                    json!(["subnet-0a1b2c3d", "subnet-1a2b3c4d", "subnet-2a3b4c5d"]),
+                ),
                 (
                     "DefaultUserSettings",
                     json!({
@@ -325,7 +328,10 @@ async fn create_domain_admits_each_enum_catalog_and_refuses_a_value_outside_it()
     let mut accepted = 0usize;
     for (member, catalog) in catalogs {
         for value in catalog {
-            let mut request = minimal("enum-table");
+            // One domain per accepted value, under a name of its own: a `DomainName` this
+            // account already holds a domain under is refused, which is a different rule
+            // from the one under test here.
+            let mut request = minimal(&format!("enum-{member}-{value}"));
             request[member] = json!(value);
             let created = emulator.ok("CreateDomain", &request).await;
             let domain_id = str_field(&created, "DomainId");
@@ -350,7 +356,7 @@ async fn create_domain_admits_each_enum_catalog_and_refuses_a_value_outside_it()
         };
         let wrong_case = catalog[0].to_ascii_lowercase();
         for outside in ["NotAMember", wrong_case.as_str()] {
-            let mut request = minimal("enum-table");
+            let mut request = minimal(&format!("enum-{member}-outside"));
             request[member] = json!(outside);
             let (status, parsed) = emulator.call("CreateDomain", &request).await;
             assert_eq!(

@@ -1163,6 +1163,11 @@ pub use domain::*;
 pub mod domain_network;
 pub use domain_network::*;
 
+/// The IDENTIFIER FORM a Studio domain's network members have to be written in, checked
+/// before the placement is resolved against anything: see `state/domain_identifiers.rs`.
+pub mod domain_identifiers;
+pub use domain_identifiers::*;
+
 /// The EBS VOLUME a HyperPod node attachment names, resolved against the service that owns
 /// it: see `state/ec2_volumes.rs`.
 pub mod ec2_volumes;
@@ -3777,7 +3782,7 @@ pub const REQUESTED_RESOURCE_NOT_FOUND: &str = "Requested resource not found.";
 /// hold: the resource kind as the service spells it, the ARN the request's
 /// `NotebookInstanceName` resolves to, and `does not exist` with no closing period.
 ///
-/// A separate template from the `RecordNotFound. Notebook Instance Arn: <arn>` sentence the
+/// A separate template from the fixed [`NOTEBOOK_INSTANCE_RECORD_NOT_FOUND`] token the
 /// READERS of this resource answer, because the service words the two differently — the
 /// same split the processing-job family has between its read and its update templates.
 #[must_use]

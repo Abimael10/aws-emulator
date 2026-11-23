@@ -298,9 +298,11 @@ pub async fn first_unassumable_execution_role<'role>(
 /// assume: this account holds no such role, or the trust policy it carries does not admit
 /// [`SERVICE_PRINCIPAL`].
 ///
-/// A job and a notebook instance each RUN AS the role the request names, so a role
-/// SageMaker cannot assume backs no work at all and the create is refused with
-/// [`could_not_assume_role`] before anything is stored. The whole question — which role of
+/// A job RUNS AS the role the request names, so a role SageMaker cannot assume backs no work
+/// at all and that create is refused with [`could_not_assume_role`] before anything is
+/// stored. The creates the recorded service ANSWERS instead — a notebook instance, a custom
+/// image — ask the same question only to decide what the resource then fails with
+/// ([`unable_to_assume_role_with_arn`]). The whole question — which role of
 /// this account the value names, what IAM answers about it, and whether the trust document
 /// admits a service principal — is the ONE reading every emulated service that resolves a
 /// caller-supplied execution role shares

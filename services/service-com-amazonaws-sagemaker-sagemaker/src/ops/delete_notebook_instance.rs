@@ -156,16 +156,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .notebook_instances
             .get_mut(&input.notebook_instance_name)
         else {
-            // The one sentence this service refuses a notebook-instance name nothing is
-            // stored under with, the same one the reader and the stop answer.
+            // The transitions word a name nothing is stored under with the token AND the ARN
+            // the name resolves to — the resource this call could not move — where the
+            // reader answers the bare token
+            // (`crate::state::notebook_instance_record_not_found_at`).
             let arn = crate::state::resource_arn(
                 &crate::state::request_region(ctx),
                 crate::state::NOTEBOOK_INSTANCE_ARN_KIND,
                 &input.notebook_instance_name,
             );
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "RecordNotFound. Notebook Instance Arn: {arn}"
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::notebook_instance_record_not_found_at(&arn),
+            ));
         };
 
         // Whatever the clock already owed is materialised FIRST, so the status this delete
@@ -189,12 +191,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::record_state_change(Self::NAME, &arn, ctx);
             }
             // The operation models no error, so a refusal is a 400 `ValidationException`.
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Status ({status}) not in ({}). Unable to transition to ({}) for Notebook \
-                 Instance ({arn}).",
-                crate::state::NOTEBOOK_INSTANCE_DELETABLE_STATUSES.join(", "),
-                crate::state::NOTEBOOK_INSTANCE_STATUS_DELETING,
-            )));
+            // The statuses a delete is taken from travel as a bracketed list, which is the
+            // machine-readable half of this refusal
+            // (`crate::state::notebook_instance_transition_refusal`).
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::notebook_instance_transition_refusal(
+                    &status,
+                    &crate::state::NOTEBOOK_INSTANCE_DELETABLE_STATUSES,
+                    crate::state::NOTEBOOK_INSTANCE_STATUS_DELETING,
+                    &arn,
+                ),
+            ));
         }
 
         crate::state::record_state_change(Self::NAME, &arn, ctx);

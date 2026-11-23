@@ -85,6 +85,57 @@ pub const NOTEBOOK_INSTANCE_DELETABLE_STATUSES: [&str; 2] = [
 pub const NOTEBOOK_INSTANCE_STOPPABLE_STATUSES: [&str; 2] =
     [NOTEBOOK_INSTANCE_STATUS_PENDING, STATUS_IN_SERVICE];
 
+/// How SageMaker's notebook-instance READER states a `NotebookInstanceName` this account
+/// holds no instance under — never created, or already deleted.
+///
+/// A FIXED token carrying NOTHING from the request or from the store: the whole message is
+/// this word, which is the sentinel a client compares against to tell "this notebook is
+/// gone" from any other bad request, so a refusal that appended the ARN the name resolves to
+/// would never match it.
+///
+/// The TRANSITIONS of the same resource word the same fact differently
+/// ([`notebook_instance_record_not_found_at`]), and so does the presigned-URL mint
+/// ([`notebook_instance_does_not_exist`]): one resource, one fact, and the sentence each
+/// operation is recorded answering it with.
+pub const NOTEBOOK_INSTANCE_RECORD_NOT_FOUND: &str = "RecordNotFound";
+
+/// How the notebook-instance TRANSITIONS — the stop and the delete — state a name this
+/// account holds no instance under: the [`NOTEBOOK_INSTANCE_RECORD_NOT_FOUND`] token, then
+/// the clause naming the ARN that name resolves to in the Region the request signed for.
+///
+/// These calls would MOVE the instance, and the refusal names the resource they could not
+/// move; the reader's own answer is the bare token. Stated once here so the two transitions
+/// cannot word the one fact differently.
+#[must_use]
+pub fn notebook_instance_record_not_found_at(arn: &str) -> String {
+    format!("{NOTEBOOK_INSTANCE_RECORD_NOT_FOUND}. Notebook Instance Arn: {arn}")
+}
+
+/// How a notebook-instance operation states that the instance cannot take the transition
+/// asked of it from the status it is in: the CURRENT status in round brackets, the statuses
+/// the transition is taken from as a BRACKETED LIST inside them, the status it could not move
+/// to, and the instance's ARN.
+///
+/// The bracketed set is the machine-readable half of the refusal — it is what tells a caller
+/// which transition to perform first (stop, then delete) — so the list keeps its brackets
+/// whichever of these operations answers. `allowed` is that operation's own set
+/// ([`NOTEBOOK_INSTANCE_DELETABLE_STATUSES`], [`NOTEBOOK_INSTANCE_STOPPABLE_STATUSES`]) and
+/// `target` the status it was moving the instance to; every variable part comes from the
+/// request and from the stored instance.
+#[must_use]
+pub fn notebook_instance_transition_refusal(
+    status: &str,
+    allowed: &[&str],
+    target: &str,
+    arn: &str,
+) -> String {
+    format!(
+        "Status ({status}) not in ([{}]). Unable to transition to ({target}) for Notebook \
+         Instance ({arn}).",
+        allowed.join(", ")
+    )
+}
+
 /// The IMDS version a notebook instance reports when the create named none:
 /// `MinimumInstanceMetadataServiceVersion`'s doc says that "when passed as part of
 /// `CreateNotebookInstance`, if no value is selected, then it defaults to IMDSv1".

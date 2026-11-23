@@ -27,6 +27,13 @@ use super::notebook_instance_lifecycle::{create_body, describe, PAST_IN_SERVICE_
 /// Long enough to pass `state::NOTEBOOK_INSTANCE_STOPPED_AFTER` (300 ms).
 const PAST_STOPPED_DUE: Duration = Duration::from_millis(600);
 
+/// The whole message a notebook-instance TRANSITION refuses a name nothing is stored under
+/// with: the not-found token and the ARN the name resolves to — the crate's own helper, so
+/// this suite reads the service's wording rather than a copy of it.
+fn not_found_at(arn: &str) -> String {
+    service_com_amazonaws_sagemaker_sagemaker::state::notebook_instance_record_not_found_at(arn)
+}
+
 /// `StopNotebookInstance` for `name`.
 async fn stop(emulator: &Emulator, name: &str) -> (u16, Value) {
     emulator
@@ -281,8 +288,9 @@ async fn stopping_an_instance_that_is_not_running_is_refused_and_changes_nothing
 }
 
 /// RULE: a stop naming a `NotebookInstanceName` the store does not hold is refused with
-/// a 400 `ValidationException` naming the ARN it could not find, in the region the
-/// caller signed for.
+/// a 400 `ValidationException` whose message carries the not-found token and the ARN it
+/// could not find, in the region the caller signed for. The wording itself, and the reader's
+/// own bare-token answer, are pinned by `notebook_instance_refusal_wording`.
 #[tokio::test]
 async fn stopping_an_absent_notebook_instance_is_refused_with_a_400_validation_exception() {
     // Rows: name shapes nothing created, across signed regions, plus a name that exists
@@ -310,8 +318,9 @@ async fn stopping_an_absent_notebook_instance_is_refused_with_a_400_validation_e
                 "ValidationException",
                 "case {case}: error code, got {parsed:?}"
             );
-            assert!(
-                message(&parsed).contains(&format!(
+            assert_eq!(
+                message(&parsed),
+                not_found_at(&format!(
                     "arn:aws:sagemaker:{region}:{ACCOUNT}:notebook-instance/{name}"
                 )),
                 "case {case}: the refusal must name the instance it could not find, got \
@@ -330,8 +339,9 @@ async fn stopping_an_absent_notebook_instance_is_refused_with_a_400_validation_e
         )
         .await;
     assert_eq!(status, 400, "case unsigned: expected HTTP 400, got {status} {parsed}");
-    assert!(
-        message(&parsed).contains(&format!(
+    assert_eq!(
+        message(&parsed),
+        not_found_at(&format!(
             "arn:aws:sagemaker:us-east-1:{ACCOUNT}:notebook-instance/absent-unsigned"
         )),
         "case unsigned: the refusal must fall back to the default region, got {parsed:?}"

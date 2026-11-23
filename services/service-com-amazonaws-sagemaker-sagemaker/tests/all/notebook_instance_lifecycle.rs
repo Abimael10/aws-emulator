@@ -433,7 +433,9 @@ async fn a_notebook_instance_advances_from_pending_to_in_service_once_the_clock_
 }
 
 /// RULE: a reader resolving a `NotebookInstanceName` nothing created is refused with a
-/// 400 `ValidationException` naming the ARN it could not find.
+/// 400 `ValidationException` whose whole message is the fixed not-found token. The wording
+/// itself, and the other operations that answer it, are pinned by
+/// `notebook_instance_refusal_wording`.
 #[tokio::test]
 async fn an_absent_notebook_instance_is_refused_with_a_400_validation_exception() {
     let emulator = Emulator::new();
@@ -456,10 +458,10 @@ async fn an_absent_notebook_instance_is_refused_with_a_400_validation_exception(
             "ValidationException",
             "case {name}: error code, got {parsed:?}"
         );
-        assert!(
-            message(&parsed).contains(&format!("{ACCOUNT}:notebook-instance/{name}")),
-            "case {name}: the refusal must name the notebook instance it could not find, \
-             got {parsed:?}"
+        assert_eq!(
+            message(&parsed),
+            service_com_amazonaws_sagemaker_sagemaker::state::NOTEBOOK_INSTANCE_RECORD_NOT_FOUND,
+            "case {name}: the refusal is the fixed not-found token, got {parsed:?}"
         );
     }
 }

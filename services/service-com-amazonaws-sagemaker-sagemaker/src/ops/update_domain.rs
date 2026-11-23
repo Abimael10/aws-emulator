@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDomain
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDomain`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDomain::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: applies the members the request carries to the Studio domain its `DomainId`
+//! names and answers that domain's ARN. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +169,183 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDomain` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDomainErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDomain"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let region = crate::state::request_region(ctx);
+        // The FORM of the network identifiers is settled first, the same rule the create
+        // follows: a value no EC2 identifier could be is a bad request, so the call is
+        // refused and the stored domain is left exactly as it was (see
+        // `crate::state::domain_identifiers`).
+        if let Some(refusal) = crate::state::domain_network_identifier_refusal(
+            Self::INPUT_SCHEMA,
+            input.vpc_id.as_deref(),
+            input.subnet_ids.as_deref().unwrap_or_default(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(refusal));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The removals the clock already completed are materialised first, so a domain whose
+        // teardown is done is gone here too. Each was due at its stored instant whether or
+        // not anybody called, so this call's observer makes no difference to the result.
+        store.release_deleted_domains(now);
+        // Whether the domain still holds Studio apps is asked before the record is taken
+        // mutably, so the one store answers every question under one lock.
+        let holds_apps = store.domain_holds_apps(&input.domain_id);
+
+        // `DomainId` is the only member that addresses a domain, resolved through the crate's
+        // one domain lookup so this call and every reader agree on which ids resolve. An id
+        // this account holds no domain under — including one whose removal the clock already
+        // completed — is answered with the `ResourceNotFound` this operation models, worded
+        // the way every operation whose subject IS the domain words it.
+        let Some(domain) = store.domain_mut(&input.domain_id, now) else {
+            return Err(UpdateDomainErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(crate::state::domain_not_found(&region, &input.domain_id)),
+            })
+            .into());
+        };
+        // The provisioning the clock already owed is materialised BEFORE the update is
+        // weighed, so the status this call is decided against is the one any reader would
+        // have reported at this instant.
+        domain.settle_status(now);
+
+        // A domain the service is already tearing down has nothing left to configure: the
+        // work is in flight, which is what `ResourceInUse` reports.
+        if domain.is_deleting() {
+            let refusal = crate::state::domain_not_updatable(&domain.arn, &domain.status);
+            return Err(UpdateDomainErrorModeled::ResourceInUse(ResourceInUse {
+                message: Some(refusal),
+            })
+            .into());
+        }
+
+        // "You can change from Disabled to Enabled to provision EFS on demand, but you
+        // cannot change from Enabled to Disabled" (`HomeEfsFileSystemCreation`): the one
+        // direction the member does not admit is refused before anything is written, so a
+        // domain never reports a file system it still has as not created. The operation
+        // models no error for a bad request, so this is a 400 `ValidationException`.
+        let disables_efs = input
+            .home_efs_file_system_creation
+            .as_deref()
+            .is_some_and(|asked| asked != crate::state::HOME_EFS_FILE_SYSTEM_CREATION_ENABLED);
+        if disables_efs
+            && domain.home_efs_file_system_creation
+                == crate::state::HOME_EFS_FILE_SYSTEM_CREATION_ENABLED
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::home_efs_file_system_cannot_be_disabled(),
+            ));
+        }
+
+        // `AppNetworkAccessType`'s own doc: "this configuration can only be modified if there
+        // are no apps in the InService, Pending, or Deleting state" — so a domain still
+        // holding apps keeps the access type it has, and the refusal names the apps that
+        // stand in the way. `ResourceInUse` is what this operation models for a domain whose
+        // members block a change.
+        let changes_access_type = input
+            .app_network_access_type
+            .as_deref()
+            .is_some_and(|asked| asked != domain.app_network_access_type);
+        if changes_access_type && holds_apps {
+            let refusal = crate::state::app_network_access_type_locked_by_apps(&domain.arn);
+            return Err(UpdateDomainErrorModeled::ResourceInUse(ResourceInUse {
+                message: Some(refusal),
+            })
+            .into());
+        }
+
+        // Every member the request CARRIED replaces the stored one, and every member it did
+        // not carry is left as it stands: "a collection of settings to update", so an update
+        // states what changes rather than the whole domain. The settings this operation takes
+        // in its own `…ForUpdate` shape are merged member by member below, for the same
+        // reason.
+        if let Some(default_user_settings) = input.default_user_settings {
+            domain.default_user_settings = default_user_settings;
+        }
+        if let Some(default_space_settings) = input.default_space_settings {
+            domain.default_space_settings = Some(default_space_settings);
+        }
+        if let Some(settings) = input.domain_settings_for_update {
+            domain.domain_settings = Some(updated_domain_settings(
+                domain.domain_settings.take().unwrap_or_default(),
+                settings,
+            ));
+        }
+        if let Some(subnet_ids) = input.subnet_ids {
+            domain.subnet_ids = Some(subnet_ids);
+        }
+        if let Some(vpc_id) = input.vpc_id {
+            domain.vpc_id = Some(vpc_id);
+        }
+        if let Some(app_network_access_type) = input.app_network_access_type {
+            domain.app_network_access_type = app_network_access_type;
+        }
+        if let Some(app_security_group_management) = input.app_security_group_management {
+            domain.app_security_group_management = Some(app_security_group_management);
+        }
+        if let Some(home_efs_file_system_creation) = input.home_efs_file_system_creation {
+            domain.home_efs_file_system_creation = home_efs_file_system_creation;
+        }
+        if let Some(tag_propagation) = input.tag_propagation {
+            domain.tag_propagation = tag_propagation;
+        }
+        // The change IS a change to the domain: SageMaker applies it to the domain's apps and
+        // network after answering, so the domain reports `Updating` from here and owes the
+        // clock its way back into service.
+        domain.begin_update(now);
+        let arn = domain.arn.clone();
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(UpdateDomainOutput {
+            domain_arn: Some(arn),
+        })
     }
+}
+
+/// The domain settings `stored` becomes once `asked` is applied to it: every member the
+/// update CARRIED replaces the stored one, and every member it did not carry is left as it
+/// stands.
+///
+/// `DomainSettingsForUpdate` is "a collection of DomainSettings configuration values to
+/// update", declaring the same members as the stored `DomainSettings` but for the RStudio
+/// app's settings, which it states in its own update shape — so that one is mapped member by
+/// member and everything else is moved across as it arrived.
+fn updated_domain_settings(
+    mut stored: DomainSettings,
+    asked: DomainSettingsForUpdate,
+) -> DomainSettings {
+    if let Some(rstudio) = asked.r_studio_server_pro_domain_settings_for_update {
+        stored.r_studio_server_pro_domain_settings = Some(RStudioServerProDomainSettings {
+            domain_execution_role_arn: rstudio.domain_execution_role_arn,
+            r_studio_connect_url: rstudio.r_studio_connect_url,
+            r_studio_package_manager_url: rstudio.r_studio_package_manager_url,
+            default_resource_spec: rstudio.default_resource_spec,
+        });
+    }
+    if let Some(execution_role_identity_config) = asked.execution_role_identity_config {
+        stored.execution_role_identity_config = Some(execution_role_identity_config);
+    }
+    if let Some(security_group_ids) = asked.security_group_ids {
+        stored.security_group_ids = Some(security_group_ids);
+    }
+    if let Some(trusted_identity_propagation_settings) = asked.trusted_identity_propagation_settings
+    {
+        stored.trusted_identity_propagation_settings = Some(trusted_identity_propagation_settings);
+    }
+    if let Some(docker_settings) = asked.docker_settings {
+        stored.docker_settings = Some(docker_settings);
+    }
+    if let Some(amazon_q_settings) = asked.amazon_q_settings {
+        stored.amazon_q_settings = Some(amazon_q_settings);
+    }
+    if let Some(unified_studio_settings) = asked.unified_studio_settings {
+        stored.unified_studio_settings = Some(unified_studio_settings);
+    }
+    if let Some(ip_address_type) = asked.ip_address_type {
+        stored.ip_address_type = Some(ip_address_type);
+    }
+    stored
 }

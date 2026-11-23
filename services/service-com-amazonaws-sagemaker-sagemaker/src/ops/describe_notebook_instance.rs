@@ -203,14 +203,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .notebook_instances
             .get_mut(&input.notebook_instance_name)
         else {
-            let arn = crate::state::resource_arn(
-                &crate::state::request_region(ctx),
-                crate::state::NOTEBOOK_INSTANCE_ARN_KIND,
-                &input.notebook_instance_name,
-            );
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "RecordNotFound. Notebook Instance Arn: {arn}"
-            )));
+            // The one token this service refuses a notebook-instance name nothing is stored
+            // under with, the same one the stop and the delete answer: the whole message is
+            // fixed text, so the sentinel a client matches on is what it reads
+            // (`crate::state::NOTEBOOK_INSTANCE_RECORD_NOT_FOUND`).
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::NOTEBOOK_INSTANCE_RECORD_NOT_FOUND,
+            ));
         };
 
         // The only write a reporting call makes: the provisioning the clock already

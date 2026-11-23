@@ -39,9 +39,15 @@ pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 /// The service principal a SageMaker execution role's trust document admits.
 const SERVICE_PRINCIPAL: &str = service_com_amazonaws_sagemaker_sagemaker::state::SERVICE_PRINCIPAL;
 
-/// Long enough to pass `state::NOTEBOOK_INSTANCE_IN_SERVICE_AFTER` (300 ms), so the status a
-/// notebook instance reports is the one the clock already owed.
-const PAST_NOTEBOOK_SETTLE_DUE: Duration = Duration::from_millis(600);
+/// How long a case waits for a notebook-instance status the clock already owes.
+///
+/// GENEROUS on purpose: what is under test is WHICH status the instance settles in, never how
+/// fast it gets there, so each case polls the reader for the condition it needs and this is
+/// only the deadline that stops a broken emulator from hanging the suite.
+const NOTEBOOK_SETTLE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How long a case waits between two reads while polling for a settled status.
+const NOTEBOOK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// The bucket the artifacts of most rows live in.
 const BUCKET: &str = "sagemaker-artifacts";
@@ -785,11 +791,36 @@ async fn a_transform_job_whose_input_holds_no_object_is_refused() {
     }
 }
 
-/// RULE: a notebook instance created against a role this account's IAM holds NOTHING under
-/// is accepted and then FAILS — it settles into the modelled `Failed` status carrying the
-/// `FailureReason` that names the role, and never reaches `InService` — while a role IAM
-/// HOLDS whose trust document does not admit SageMaker is refused up front, and one that does
-/// comes up.
+/// Read the notebook instance `name` until it reports a status the clock has settled it in,
+/// and answer that reading.
+///
+/// Waits for the CONDITION, never for a fixed span: `Pending` is the status the clock moves
+/// on, so the reader is asked again until it reports something else or a generous deadline
+/// passes.
+async fn settled_notebook_instance(emulator: &Emulator, case: &str, name: &str) -> Value {
+    let request = json!({ "NotebookInstanceName": name });
+    let deadline = std::time::Instant::now() + NOTEBOOK_SETTLE_DEADLINE;
+    loop {
+        let described = emulator
+            .sagemaker_ok(case, "DescribeNotebookInstance", &request)
+            .await;
+        if str_field(&described, "NotebookInstanceStatus") != "Pending" {
+            return described;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: the instance must leave Pending inside \
+             {NOTEBOOK_SETTLE_DEADLINE:?}, last read {described}"
+        );
+        tokio::time::sleep(NOTEBOOK_POLL_INTERVAL).await;
+    }
+}
+
+/// RULE: `CreateNotebookInstance` is ACCEPTED whatever its `RoleArn` names — SageMaker
+/// resolves the role as the instance provisions, not before it answers — and the status the
+/// clock then owes the instance is the modelled `Failed`, carrying the `FailureReason` that
+/// names the role, wherever this account's IAM answers that SageMaker cannot assume it, and
+/// `InService` with no reason at all otherwise.
 #[tokio::test]
 async fn a_notebook_instance_whose_role_cannot_be_assumed_fails_instead_of_coming_up() {
     let emulator = Emulator::new();
@@ -800,28 +831,30 @@ async fn a_notebook_instance_whose_role_cannot_be_assumed_fails_instead_of_comin
         .given_role("notebook-lambda-only", &trust_for("lambda.amazonaws.com"))
         .await;
 
-    // (case, the role the request names, the status the instance settles into — `None` when
-    // the create itself is refused)
-    let rows: Vec<(&str, String, Option<&str>)> = vec![
+    // (case, the role the request names, the status the instance settles into). The rows
+    // differ along what IAM answers about the role: a trust document that admits SageMaker,
+    // one that admits another service only, a role this account holds nothing under, and a
+    // role of another account, whose IAM is not this emulator's to ask.
+    let rows: Vec<(&str, String, &str)> = vec![
         (
             "a role that trusts SageMaker",
             role_arn("notebook-exec"),
-            Some("InService"),
+            "InService",
         ),
         (
             "a role IAM holds nothing under",
             role_arn("does-not-exist"),
-            Some("Failed"),
+            "Failed",
         ),
         (
             "a role of another account",
             "arn:aws:iam::123456789012:role/notebook-exec".to_string(),
-            Some("InService"),
+            "InService",
         ),
         (
             "a role that trusts another service only",
             role_arn("notebook-lambda-only"),
-            None,
+            "Failed",
         ),
     ];
 
@@ -833,26 +866,6 @@ async fn a_notebook_instance_whose_role_cannot_be_assumed_fails_instead_of_comin
             "RoleArn": role,
         });
         let (status, answered) = emulator.sagemaker("CreateNotebookInstance", &body).await;
-        let Some(settled) = settled else {
-            assert_eq!(
-                (status, error_code(&answered).as_str()),
-                (400, "ValidationException"),
-                "case {case:?}: a held role SageMaker cannot assume must be refused, got \
-                 {status} with {answered}"
-            );
-            let (read_status, read) = emulator
-                .sagemaker(
-                    "DescribeNotebookInstance",
-                    &json!({ "NotebookInstanceName": name }),
-                )
-                .await;
-            assert_eq!(
-                read_status, 400,
-                "case {case:?}: a refused create must store nothing, got {read_status} with \
-                 {read}"
-            );
-            continue;
-        };
         assert_eq!(
             status, 200,
             "case {case:?}: the create must be accepted, got {status} with {answered}"
@@ -872,14 +885,9 @@ async fn a_notebook_instance_whose_role_cannot_be_assumed_fails_instead_of_comin
             "case {case:?}: a fresh instance must report Pending, got {pending}"
         );
 
-        tokio::time::sleep(PAST_NOTEBOOK_SETTLE_DUE).await;
-        let read = emulator
-            .sagemaker_ok(
-                case,
-                "DescribeNotebookInstance",
-                &json!({ "NotebookInstanceName": name }),
-            )
-            .await;
+        // The CONDITION is what is waited for, never a span: the instance is read again
+        // until it reports a status the clock has settled it in.
+        let read = settled_notebook_instance(&emulator, case, &name).await;
         assert_eq!(
             str_field(&read, "NotebookInstanceStatus"),
             settled,

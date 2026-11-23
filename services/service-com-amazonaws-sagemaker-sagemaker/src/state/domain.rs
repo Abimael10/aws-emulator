@@ -24,7 +24,7 @@ pub const DOMAIN_ARN_KIND: &str = "domain";
 pub const DOMAIN_QUOTA: usize = 1_000;
 
 /// `DomainStatus`'s members a domain of this emulator moves through. The modelled enum
-/// also carries the update, delete and failure states, which no implemented operation
+/// also carries the delete and update failure states, which no implemented operation
 /// reaches yet.
 pub const DOMAIN_STATUS_PENDING: &str = "Pending";
 /// See [`DOMAIN_STATUS_PENDING`].
@@ -36,8 +36,14 @@ pub const DOMAIN_STATUS_FAILED: &str = "Failed";
 /// See [`DOMAIN_STATUS_PENDING`]. What a domain reports from the `DeleteDomain` that asked
 /// for its deletion until the clock completes the teardown ([`Domain::begin_deletion`]).
 pub const DOMAIN_STATUS_DELETING: &str = "Deleting";
+/// See [`DOMAIN_STATUS_PENDING`]. What a domain reports from the `UpdateDomain` that asked
+/// for a change until the clock completes it ([`Domain::begin_update`]): SageMaker applies
+/// the change to the domain's own apps and network after it has answered, so the domain is
+/// not in service while that is in flight.
+pub const DOMAIN_STATUS_UPDATING: &str = "Updating";
 
-/// How long after `CreateDomain` the clock owes the `Pending` -> `InService` transition.
+/// How long after `CreateDomain` the clock owes the `Pending` -> `InService` transition, and
+/// after `UpdateDomain` the `Updating` -> `InService` one.
 ///
 /// Three seconds, so a caller that describes or lists the domain straight after creating
 /// it still observes `Pending`, and one that waits observes `InService`. Real SageMaker
@@ -198,6 +204,75 @@ pub fn domain_not_in_service_refusal(entity: &str, resource_arn: &str, domain_ar
     )
 }
 
+/// How `CreateDomain` states that this account already holds a domain under the `DomainName`
+/// the request carried, in the Region it was signed for: the name IN SINGLE QUOTES, and the
+/// fixed sentence that states where it is taken.
+///
+/// Recorded AWS behaviour, whose only variable part is the name the REQUEST sent — the
+/// account and the Region are the ones the caller already addressed, so the sentence names
+/// neither. One domain per name per Region is the invariant this states: the name is free
+/// again once `DeleteDomain` has taken the domain that held it away.
+#[must_use]
+pub fn domain_name_already_exists(domain_name: &str) -> String {
+    format!("The Domain Name '{domain_name}' already exists in this account in this region.")
+}
+
+/// The Region a domain's ARN names, or `None` for a value that is not an ARN this emulator
+/// mints at all.
+///
+/// A stored domain carries the ARN its create minted from the Region that request was signed
+/// for ([`resource_arn`]), so the ARN is where the domain's Region is read back from rather
+/// than from a second copy of it beside the record. Read by `service_common::arn`, the one
+/// ARN parse this workspace has.
+fn domain_arn_region(arn: &str) -> Option<&str> {
+    Some(::service_common::arn::parse_of(arn, ARN_SERVICE)?.region)
+}
+
+/// How the domain operations state that a domain cannot take the change asked of it while
+/// the service is already removing it: the entity, then the ARN the request resolves to IN
+/// SQUARE BRACKETS — the subject form [`domain_not_found`] names the same resource with —
+/// then the status that stands in the way.
+///
+/// What an UPDATE of a domain the service is already tearing down is answered with: the
+/// teardown is in flight, so there is nothing left to configure. Worded like
+/// [`domain_not_deletable`] beside it, with the change it could not make in place of the
+/// removal.
+pub fn domain_not_updatable(arn: &str, status: &str) -> String {
+    format!("Domain [{arn}] cannot be updated while it is in {status} status.")
+}
+
+/// The `HomeEfsFileSystemCreation` member a domain that HAS a home EFS file system carries,
+/// i.e. the value an update cannot move away from.
+pub const HOME_EFS_FILE_SYSTEM_CREATION_ENABLED: &str = DEFAULT_HOME_EFS_FILE_SYSTEM_CREATION;
+
+/// How `UpdateDomain` states the one change its `HomeEfsFileSystemCreation` member does not
+/// admit: that member's own doc states the rule — "you can change from Disabled to Enabled
+/// to provision EFS on demand, but you cannot change from Enabled to Disabled" — so a
+/// request asking for the other direction is refused and the domain keeps its file system.
+///
+/// FIXED text naming the member and the two values: the rule is about the pair, not about
+/// anything the request chose.
+pub fn home_efs_file_system_cannot_be_disabled() -> String {
+    format!(
+        "HomeEfsFileSystemCreation cannot be changed from \
+         {HOME_EFS_FILE_SYSTEM_CREATION_ENABLED} to Disabled."
+    )
+}
+
+/// How `UpdateDomain` states that the domain's apps stand in the way of the change asked of
+/// its network access type: the bracketed-ARN subject [`domain_not_found`] names the domain
+/// with, then the condition that has to hold.
+///
+/// `AppNetworkAccessType`'s own `UpdateDomain` doc states the rule: "this configuration can
+/// only be modified if there are no apps in the InService, Pending, or Deleting state" — so
+/// a domain still holding apps keeps the access type it has until they are deleted.
+pub fn app_network_access_type_locked_by_apps(arn: &str) -> String {
+    format!(
+        "Unable to update AppNetworkAccessType for Domain [{arn}] because it has non-deleted \
+         Apps."
+    )
+}
+
 /// A Studio domain created by `CreateDomain`, as `DescribeDomain` replays it and
 /// `ListDomains` summarises it.
 ///
@@ -255,20 +330,24 @@ pub struct Domain {
 }
 
 impl Domain {
-    /// Materialise the transition out of `Pending` the clock already owes, the way
-    /// [`Endpoint::settle_status`] does for an endpoint: it was due at `in_service_due_at`
-    /// whether or not anybody read the domain, so the observer makes no difference to the
-    /// result, and `LastModifiedTime` moves to the instant the transition was due rather
-    /// than to "now".
+    /// Materialise the transition out of a non-terminal status the clock already owes, the
+    /// way [`Endpoint::settle_status`] does for an endpoint: it was due at
+    /// `in_service_due_at` whether or not anybody read the domain, so the observer makes no
+    /// difference to the result, and `LastModifiedTime` moves to the instant the transition
+    /// was due rather than to "now".
     ///
-    /// WHICH status it lands in is what the create already resolved: `InService` for a
+    /// Both the create's `Pending` and the update's [`DOMAIN_STATUS_UPDATING`] are moved,
+    /// because both are statuses SageMaker leaves the domain in while it is still working on
+    /// it. WHICH status it lands in is what the create already resolved: `InService` for a
     /// domain whose provisioning completes, and [`DOMAIN_STATUS_FAILED`] with the
-    /// `FailureReason` beside it for one whose placement the account's network does not
-    /// admit ([`Domain::creation_failure_reason`]).
+    /// `FailureReason` beside it for one whose placement the account's network does not admit
+    /// ([`Domain::creation_failure_reason`]).
     ///
     /// Answers whether the transition happened on this call, so the caller can record it.
     pub fn settle_status(&mut self, now: SystemTime) -> bool {
-        if self.status == DOMAIN_STATUS_PENDING && now >= self.in_service_due_at {
+        let settling =
+            self.status == DOMAIN_STATUS_PENDING || self.status == DOMAIN_STATUS_UPDATING;
+        if settling && now >= self.in_service_due_at {
             self.last_modified_time = self.in_service_due_at;
             // What the create resolved about the domain's placement decides WHICH status the
             // clock owed: a domain whose network the account does not admit fails with the
@@ -282,6 +361,22 @@ impl Domain {
             return true;
         }
         false
+    }
+
+    /// Start the change `UpdateDomain` asked for: the domain reports
+    /// [`DOMAIN_STATUS_UPDATING`], and the clock owes it its way back into service
+    /// [`DOMAIN_IN_SERVICE_AFTER`] later.
+    ///
+    /// SageMaker applies a domain's change to the apps and the network of that domain AFTER
+    /// it has answered the call, so the domain is not in service while that is in flight:
+    /// the transient status is observable to a caller that reads the domain straight back,
+    /// and the move out of it is the clock's — stored as an instant and never slept on
+    /// ([`Domain::settle_status`]). The change itself is a change to the domain, so it moves
+    /// `last_modified_time` too.
+    pub fn begin_update(&mut self, now: SystemTime) {
+        self.status = DOMAIN_STATUS_UPDATING.to_string();
+        self.last_modified_time = now;
+        self.in_service_due_at = now + DOMAIN_IN_SERVICE_AFTER;
     }
 
     /// Start the teardown `DeleteDomain` asked for: the domain reports `Deleting`, and the
@@ -315,6 +410,26 @@ impl Domain {
 }
 
 impl ComAmazonawsSagemakerSagemakerState {
+    /// Whether this account already holds a domain named `name` in `region`, i.e. the name
+    /// is taken and a create naming it has nothing to allocate.
+    ///
+    /// A domain's name is unique per account per REGION ([`domain_name_already_exists`]), so
+    /// the comparison is against the Region each stored domain was created in, which its own
+    /// ARN carries — the value the create minted it from. A domain whose removal the clock
+    /// already completed holds nothing ([`Domain::is_released`]), the one rule every reader
+    /// of the store follows; a domain the service is still tearing down DOES still hold its
+    /// name, because it is still a domain of the account until that teardown finishes.
+    ///
+    /// `now` is the caller's instant, so one request weighs the store against ONE clock
+    /// reading.
+    pub fn domain_name_taken(&self, region: &str, name: &str, now: SystemTime) -> bool {
+        self.domains.values().any(|domain| {
+            domain.name == name
+                && !domain.is_released(now)
+                && domain_arn_region(&domain.arn).is_some_and(|held| held == region)
+        })
+    }
+
     /// Whether another domain fits, i.e. the store is below [`DOMAIN_QUOTA`].
     pub fn domains_below_quota(&self) -> bool {
         self.domains.len() < DOMAIN_QUOTA

@@ -255,22 +255,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The instance RUNS AS the role the request names ("SageMaker AI assumes this role
-        // to perform tasks on your behalf"), so the role is settled before anything is
-        // stored and before the store is locked: only what the emulator's OWN IAM ANSWERED
-        // is refused (see `crate::state::admission`). A role IAM HOLDS whose trust document
-        // does not admit SageMaker is refused here; a role IAM holds nothing under is
-        // ACCEPTED, which is what the recorded service does — the provisioning then fails on
-        // the instance itself, as the failure reason resolved below.
-        if crate::state::admission::held_execution_role_is_unassumable(ctx, &region, &input.role_arn)
-            .await
-        {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                crate::state::could_not_assume_role(&input.role_arn),
-            ));
-        }
-        // Why this instance will never come up, for an accepted create whose role SageMaker
-        // cannot assume after all: the reason travels on the instance, as the `Failed` status
-        // and the `FailureReason` the clock owes it (see `crate::state::notebook_instance`).
+        // to perform tasks on your behalf"), and SageMaker does not resolve that role before
+        // it answers: a well-formed `RoleArn` is ACCEPTED whatever this account's IAM says
+        // about it, and the AssumeRole failure surfaces during provisioning — the instance is
+        // created and sticks in the modelled `Failed` status with the `FailureReason` naming
+        // the role, which is what a client debugging a failed deployment reads off the
+        // resource itself. So the role is resolved here, before anything is stored and before
+        // the store is locked, only to decide WHICH status the clock owes the instance (see
+        // `crate::state::notebook_instance`); only what the emulator's OWN IAM ANSWERED fails
+        // one (see `crate::state::admission`).
         let creation_failure_reason =
             crate::state::execution_role_is_unassumable(ctx, &region, &input.role_arn)
                 .await

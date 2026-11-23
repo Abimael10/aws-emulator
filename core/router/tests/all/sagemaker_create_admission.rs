@@ -350,9 +350,10 @@ fn image_uri(repository: &str, tag: &str) -> String {
 
 /// The creates the role rule is driven over, one per resource kind.
 ///
-/// `CreateNotebookInstance` is NOT among them: the hosting reading it takes — accept a role
-/// this account's IAM holds nothing under, and fail the resource instead — is driven by
-/// `sagemaker_execution_role_admission` beside the other creates that take it. Neither is
+/// `CreateNotebookInstance` is NOT among them: the recorded service does not resolve that
+/// create's role before answering at all — it is accepted whatever the role names and the
+/// instance then settles into the modelled `Failed` status, which the SageMaker crate's
+/// `model_artifact_admission` suite drives. Neither is
 /// `CreatePipeline`: registering a pipeline assumes nothing, so it resolves no role at all
 /// and the resolution belongs to the run that performs a step as it — driven by
 /// `sagemaker_pipeline_role_resolution`.

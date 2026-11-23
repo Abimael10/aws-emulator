@@ -214,6 +214,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and the only values left to resolve are the three the model documents a default
         // for.
 
+        // The FORM of the network identifiers is settled before anything else: a value no
+        // EC2 identifier could be is a bad request, so the call is refused and no domain is
+        // created (see `crate::state::domain_identifiers`). This is checked before the
+        // placement is resolved against EC2, because there is nothing to ask that service
+        // about an identifier it could not have minted.
+        if let Some(refusal) = crate::state::domain_network_identifier_refusal(
+            Self::INPUT_SCHEMA,
+            input.vpc_id.as_deref(),
+            input.subnet_ids.as_deref().unwrap_or_default(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(refusal));
+        }
+
         // The id is the server's: `DomainId` is not an input member, it is what every
         // later call addresses this domain by, and it is derived from nothing in the
         // request. The ARN and the Studio URL are minted from it once, here, so every
@@ -251,6 +264,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // again. Each was due at its stored instant whether or not anybody called, so this
         // call's observer makes no difference to the result.
         store.release_deleted_domains(now);
+        // A domain of this account in this Region already holding the requested name is the
+        // resource this call would have to take over, so the create is refused rather than
+        // minting a second domain under one name: `ResourceInUse` is the in-use failure this
+        // operation models, and the name is free again once `DeleteDomain` has taken the
+        // domain that held it away.
+        if store.domain_name_taken(&region, &input.domain_name, now) {
+            return Err(CreateDomainErrorModeled::ResourceInUse(ResourceInUse {
+                message: Some(crate::state::domain_name_already_exists(&input.domain_name)),
+            })
+            .into());
+        }
         // The store is bounded, so a caller creating domain after domain cannot grow it
         // without end. `ResourceLimitExceeded` is the limit failure this operation models.
         if !store.domains_below_quota() {

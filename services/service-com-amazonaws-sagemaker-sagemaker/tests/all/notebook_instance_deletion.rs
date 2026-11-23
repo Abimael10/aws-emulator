@@ -46,6 +46,14 @@ pub(crate) fn notebook_instance_arn(region: &str, name: &str) -> String {
     format!("arn:aws:sagemaker:{region}:{ACCOUNT}:notebook-instance/{name}")
 }
 
+/// The whole message a notebook-instance TRANSITION refuses a name nothing is stored under
+/// with: the not-found token and the ARN the name resolves to — the crate's own helper, so
+/// this suite reads the service's wording rather than a copy of it. The READER answers the
+/// bare token instead, which `notebook_instance_refusal_wording` pins.
+fn record_not_found_at(arn: &str) -> String {
+    service_com_amazonaws_sagemaker_sagemaker::state::notebook_instance_record_not_found_at(arn)
+}
+
 /// The ARN a notebook instance lifecycle configuration of `name` carries in `region`.
 fn lifecycle_config_arn(region: &str, name: &str) -> String {
     format!("arn:aws:sagemaker:{region}:{ACCOUNT}:notebook-instance-lifecycle-config/{name}")
@@ -203,9 +211,10 @@ async fn deleting_a_stopped_notebook_instance_removes_only_that_instance() {
             (400, "ValidationException"),
             "case {case:?}: expected the deleted instance to be gone, got {status} with {gone}"
         );
-        assert!(
-            message(&gone).contains(&notebook_instance_arn(region, &name)),
-            "case {case:?}: expected the refusal to name the instance's ARN, got {:?}",
+        assert_eq!(
+            message(&gone),
+            service_com_amazonaws_sagemaker_sagemaker::state::NOTEBOOK_INSTANCE_RECORD_NOT_FOUND,
+            "case {case:?}: expected the reader's fixed not-found token, got {:?}",
             message(&gone)
         );
 
@@ -286,11 +295,11 @@ async fn deleting_a_notebook_instance_that_is_still_running_is_refused() {
             "case {case:?}: expected the delete to be refused, got {status} with {refused}"
         );
         assert!(
-            message(&refused).contains("not in (Stopped, Failed)")
-                && message(&refused).contains("Deleting")
+            message(&refused).contains("not in ([Stopped, Failed])")
+                && message(&refused).contains("Unable to transition to (Deleting)")
                 && message(&refused).contains(&notebook_instance_arn(region, &name)),
-            "case {case:?}: expected the refusal to name the statuses a delete needs, the \
-             transition it could not make and the instance, got {:?}",
+            "case {case:?}: expected the refusal to name the statuses a delete needs as a \
+             bracketed list, the transition it could not make and the instance, got {:?}",
             message(&refused)
         );
 
@@ -333,9 +342,10 @@ async fn deleting_a_record_that_is_not_there_is_refused() {
             "case {name:?}: expected a 400 for an absent notebook instance, got {status} with \
              {gone}"
         );
-        assert!(
-            message(&gone).contains(&notebook_instance_arn(region, name)),
-            "case {name:?}: expected the refusal to name the instance's ARN, got {:?}",
+        assert_eq!(
+            message(&gone),
+            record_not_found_at(&notebook_instance_arn(region, name)),
+            "case {name:?}: expected the transition's not-found sentence, got {:?}",
             message(&gone)
         );
 

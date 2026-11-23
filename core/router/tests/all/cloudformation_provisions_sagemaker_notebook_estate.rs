@@ -259,6 +259,20 @@ fn sagemaker_trust_document() -> Value {
     })
 }
 
+/// A trust document that admits ANOTHER service's principal only, so the role exists and
+/// SageMaker cannot assume it — the declaration a template gets wrong by pointing a notebook
+/// instance at a role meant for something else.
+fn other_service_trust_document(principal: &str) -> Value {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": { "Service": principal },
+            "Action": "sts:AssumeRole"
+        }]
+    })
+}
+
 /// One row of the table: a template, and what the rule says the stack must then have created
 /// in SageMaker.
 struct Row {
@@ -761,6 +775,124 @@ async fn a_notebook_instance_whose_role_cannot_be_assumed_fails_the_stack() {
         status, 400,
         "expected the failed instance to be gone with the stack, got {status} with body {gone}"
     );
+}
+
+/// RULE: a notebook instance whose role the account HOLDS but SageMaker cannot assume is
+/// created all the same — that service accepts a well-formed `RoleArn` and the AssumeRole
+/// denial surfaces as the instance's own terminal `Failed` status and `FailureReason` — so a
+/// stack that asked for the failed state to be kept (`DisableRollback`) ends `CREATE_FAILED`
+/// with that instance retained for a client to read the diagnosis off.
+///
+/// The rows differ along what the rule generalises over: how the role fails to admit
+/// SageMaker (another service's principal, and a role the account holds nothing under) and
+/// which of the two ways a create asks for the failed state to be kept.
+#[tokio::test]
+async fn a_retained_notebook_instance_reports_its_own_assume_role_failure() {
+    let router = build_router();
+
+    // (case, the role the notebook names and the resources the template declares for it,
+    //  the member the create states the kept-failure request with)
+    let rows: &[(&str, Option<&str>, (&str, &str))] = &[
+        (
+            "a role that trusts another service only, rollback disabled",
+            Some("ec2.amazonaws.com"),
+            ("DisableRollback", "true"),
+        ),
+        (
+            "a role that trusts a third service, failure action DO_NOTHING",
+            Some("glue.amazonaws.com"),
+            ("OnFailure", "DO_NOTHING"),
+        ),
+        (
+            "a role the account holds nothing under, rollback disabled",
+            None,
+            ("DisableRollback", "true"),
+        ),
+    ];
+
+    for (index, (case, trusted_principal, kept)) in rows.iter().enumerate() {
+        let stack_name = format!("retained-notebook-{index}");
+        let notebook_name = format!("{stack_name}-notebook");
+        let mut resources = json!({
+            "Notebook": {
+                "Type": "AWS::SageMaker::NotebookInstance",
+                "Properties": {
+                    "NotebookInstanceName": notebook_name,
+                    "InstanceType": "ml.t3.medium",
+                    "RoleArn": format!("arn:aws:iam::{ACCOUNT_ID}:role/absent-{index}")
+                }
+            }
+        });
+        if let Some(principal) = trusted_principal {
+            // The role is REALLY created, in IAM, by the stack itself, so what SageMaker
+            // resolves is a trust document that account holds.
+            resources["NotebookRole"] = json!({
+                "Type": "AWS::IAM::Role",
+                "Properties": {
+                    "AssumeRolePolicyDocument": other_service_trust_document(principal)
+                }
+            });
+            resources["Notebook"]["Properties"]["RoleArn"] =
+                json!({ "Fn::GetAtt": ["NotebookRole", "Arn"] });
+        }
+        let template = json!({
+            "Resources": resources,
+            "Outputs": { "NotebookName": { "Value": { "Ref": "Notebook" } } }
+        });
+        let (status, body) = cloudformation(
+            &router,
+            "CreateStack",
+            &[
+                ("StackName", stack_name.as_str()),
+                ("TemplateBody", &template.to_string()),
+                ("Capabilities.member.1", "CAPABILITY_NAMED_IAM"),
+                (kept.0, kept.1),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from CreateStack, got {status} with body {body}"
+        );
+
+        // The stack cannot be carried through, and the failed state is KEPT.
+        let failed = stack_resting_in(&router, case, &stack_name, "CREATE_FAILED").await;
+        assert!(
+            failed.contains("Notebook"),
+            "case {case:?}: expected the stack's failure to name the resource that did not \
+             come up, got {failed}"
+        );
+
+        // ...so the instance SageMaker created is still there, reporting WHY it never came
+        // up: that diagnosis is the whole point of keeping the failed state.
+        let (status, described) = sagemaker(
+            &router,
+            "DescribeNotebookInstance",
+            &json!({ "NotebookInstanceName": notebook_name }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the retained instance to be readable, got {status} with \
+             body {described}"
+        );
+        assert_eq!(
+            described["NotebookInstanceStatus"].as_str(),
+            Some("Failed"),
+            "case {case:?}: expected SageMaker to report the instance Failed, got {described}"
+        );
+        let reason = described["FailureReason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("Unable to assume role with RoleArn")
+                && reason.contains(":role/"),
+            "case {case:?}: expected the failure reason to name the role, got {described}"
+        );
+        assert_eq!(
+            described["NotebookInstanceName"].as_str(),
+            Some(notebook_name.as_str()),
+            "case {case:?}: expected the retained instance's own name, got {described}"
+        );
+    }
 }
 
 /// RULE: a resource the owning service refuses is never passed off as created — the stack

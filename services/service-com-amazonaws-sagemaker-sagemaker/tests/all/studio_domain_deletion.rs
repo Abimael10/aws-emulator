@@ -531,7 +531,11 @@ async fn delete_domain_refuses_a_domain_that_still_holds_apps() {
             ],
         ),
     ] {
-        let created = emulator.ok("CreateDomain", &minimal("hosting", "IAM")).await;
+        // A name of its own per row: the row before it left its domain on its way out, and
+        // a domain still being torn down holds its name until the clock completes that.
+        let created = emulator
+            .ok("CreateDomain", &minimal(&format!("hosting-{case}"), "IAM"))
+            .await;
         let domain_id = str_field(&created, "DomainId");
         let request = json!({ "DomainId": domain_id });
         // A domain admits members only once its own provisioning has settled, so each row
