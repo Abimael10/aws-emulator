@@ -28,6 +28,16 @@ use super::kafka_harness::{
     pct, sleep_past_activation, ClusterRequest, Emulator, Reply, ACCOUNT, REGION,
 };
 
+/// The form a submitted document is STORED and reported in: the service
+/// canonicalizes a policy rather than echoing the caller's bytes, which is the
+/// one minification every service of this emulator that stores a JSON document
+/// applies. Read from that shared canonicalization, so this suite and the
+/// handlers cannot drift apart on what a read reports; the
+/// `cluster_policy_write_rules` suite is what states the rule itself.
+fn stored_form(document: &str) -> String {
+    service_common::json_document::minified(document)
+}
+
 /// The resource URI of one cluster's policy: the model binds all three policy
 /// operations to `/v1/clusters/{ClusterArn}/policy`, with the ARN
 /// percent-encoded into the single `@httpLabel` path segment.
@@ -204,8 +214,9 @@ fn policy_rows() -> Vec<(&'static str, String)> {
         ("with-condition", with_condition.to_string()),
         ("non-ascii-sid", non_ascii.to_string()),
         ("sixty-four-statements", large.to_string()),
-        // The same document pretty-printed: the service stores the document it
-        // was given, so the whitespace comes back as submitted.
+        // The same document pretty-printed: the service canonicalizes what it
+        // stores, so a read reports it without that whitespace
+        // ([`stored_form`]).
         (
             "pretty-printed",
             serde_json::to_string_pretty(&one_statement).expect("render the policy"),
@@ -293,8 +304,8 @@ async fn a_stored_policy_is_what_the_reader_reports_and_the_delete_removes() {
             );
             assert_eq!(
                 read.at("/policy").as_str(),
-                Some(document.as_str()),
-                "case {case}: the reader must report the document as submitted, got {}",
+                Some(stored_form(&document).as_str()),
+                "case {case}: the reader must report the stored document, got {}",
                 read.body
             );
             assert_eq!(
@@ -429,7 +440,7 @@ async fn each_put_is_a_new_version_and_a_stale_one_is_refused() {
             let read = get(&emulator, &cluster).await;
             assert_eq!(
                 (read.at("/policy").as_str(), read.at("/currentVersion").as_str()),
-                (Some(document.as_str()), Some(next.as_str())),
+                (Some(stored_form(document).as_str()), Some(next.as_str())),
                 "case {case}: a refused put must leave the stored policy alone, got {}",
                 read.body
             );
@@ -483,7 +494,7 @@ async fn a_body_that_is_not_a_policy_document_is_refused() {
                 if attached {
                     assert_eq!(
                         read.at("/policy").as_str(),
-                        Some(document.as_str()),
+                        Some(stored_form(&document).as_str()),
                         "case {case}: a refused put must leave the stored policy alone, got {}",
                         read.body
                     );

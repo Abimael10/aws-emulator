@@ -5,6 +5,10 @@
 //! the version that policy is at. REPORTING ONLY: the single write it makes is
 //! the one the settling lookup owes the cluster itself.
 //!
+//! What it reports is the STORED document, which the attach canonicalized when
+//! it stored it ([`crate::state::ClusterPolicy::document`]) — so two callers
+//! that attach the same policy written differently read the same text back.
+//!
 //! A cluster this endpoint's region does not hold and a cluster that carries no
 //! policy are both the one `NotFoundException` this operation models (either way
 //! the policy the request addresses does not exist), which is the same line

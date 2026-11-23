@@ -115,11 +115,14 @@
 //!
 //! A cluster's resource-based policy is held ON that cluster record, as a
 //! [`ClusterPolicy`]: `PutClusterPolicy` attaches or replaces it through
-//! [`Cluster::put_policy`], `GetClusterPolicy` reports the stored document and
-//! its version, and `DeleteClusterPolicy` takes it off through
+//! [`Cluster::put_policy`], which canonicalizes the document it stores,
+//! `GetClusterPolicy` reports that stored document and its version, and
+//! `DeleteClusterPolicy` takes it off through
 //! [`Cluster::take_policy`] — one stored document, so the writer and both
 //! readers cannot disagree, and a cluster that leaves the registry takes its
-//! policy with it.
+//! policy with it. What the attach ADMITS as a policy
+//! ([`invalid_cluster_policy`]), and the version lock a replacement passes
+//! through ([`cluster_policy_write_refused`]), sit beside this module.
 //!
 //! A cluster's SASL/SCRAM secrets are held ON the record for the same reason, as
 //! the [`Cluster::scram_secret_arns`] set: `BatchAssociateScramSecret` adds to it
@@ -235,6 +238,12 @@ mod kafka_versions;
 /// one parse, one predicate per resource kind, and one envelope per condition.
 mod arn_vocabulary;
 pub use arn_vocabulary::*;
+/// What this service admits as one cluster's resource-based POLICY document, and
+/// the refusals a document, or a version quoted over the stored one, that it
+/// cannot act on earns. A function of the request and of the stored policy's own
+/// version rather than of anything this module holds, so it sits beside this one.
+mod cluster_policy;
+pub use cluster_policy::*;
 /// The bounded record of the replicators this registry held and released, which
 /// is what tells a replicator that is GONE from one that never existed.
 pub mod replicator_releases;
@@ -1324,8 +1333,11 @@ pub struct Cluster {
 /// reports is derived from the stored policy rather than echoed from a request.
 #[derive(Debug, Clone)]
 pub struct ClusterPolicy {
-    /// The policy document exactly as submitted — the service stores a policy,
-    /// it does not rewrite one.
+    /// The policy document as the service CANONICALIZES it: the submitted
+    /// document with the insignificant whitespace between its JSON tokens
+    /// dropped and nothing else about it changed, which is the form
+    /// [`Cluster::put_policy`] stores and therefore the form every reader
+    /// reports.
     pub document: String,
     /// Which revision of this cluster's policy the stored document is: 1 for the
     /// first one attached, the next for each one that replaces it.

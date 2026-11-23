@@ -260,14 +260,20 @@ fn cluster_policy(effect: &str, principal: &Value, action: &str, cluster_arn: &s
 
 /// Attach `policy` to the cluster, as the account's own credential — which is the
 /// caller that administers the cluster's policy — and assert it was stored.
+///
+/// A policy the cluster ALREADY carries is replaced under the service's own
+/// optimistic lock: the version the stored policy is at is read back and quoted,
+/// since `PutClusterPolicy` refuses a replacement that quotes none (the rule the
+/// `cluster_policy_write_rules` suite states). The first attachment quotes
+/// nothing, as it has no version to quote.
 async fn put_cluster_policy(emulator: &Emulator, case: &str, cluster_arn: &str, policy: &str) {
-    let reply = emulator
-        .call(
-            "PUT",
-            &format!("/v1/clusters/{}/policy", pct(cluster_arn)),
-            Some(json!({ "policy": policy })),
-        )
-        .await;
+    let policy_uri = format!("/v1/clusters/{}/policy", pct(cluster_arn));
+    let held = emulator.call("GET", &policy_uri, None).await;
+    let mut body = json!({ "policy": policy });
+    if let Some(version) = held.at("/currentVersion").as_str() {
+        body["currentVersion"] = json!(version);
+    }
+    let reply = emulator.call("PUT", &policy_uri, Some(body)).await;
     assert_eq!(
         reply.status, 200,
         "case {case}: expected PutClusterPolicy to store the document, got {} {}",
@@ -275,13 +281,7 @@ async fn put_cluster_policy(emulator: &Emulator, case: &str, cluster_arn: &str, 
     );
     // Read it back through the service's own reader, so a row that depends on the
     // attached document depends on one the service really holds.
-    let stored = emulator
-        .call(
-            "GET",
-            &format!("/v1/clusters/{}/policy", pct(cluster_arn)),
-            None,
-        )
-        .await;
+    let stored = emulator.call("GET", &policy_uri, None).await;
     assert_eq!(
         stored.at("/policy").as_str(),
         Some(policy),

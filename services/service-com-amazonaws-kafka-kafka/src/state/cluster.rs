@@ -221,7 +221,18 @@ impl Cluster {
     /// Each attachment is the next revision of the cluster's policy, so the
     /// `CurrentVersion` the writer answers with and every later reader reports
     /// changes exactly when the stored document does.
+    ///
+    /// The document is stored CANONICALIZED rather than as the caller's bytes:
+    /// the service parses a policy and re-serializes it, so what every reader
+    /// reports is the document with the insignificant whitespace between its
+    /// JSON tokens dropped and nothing else about it changed — the one
+    /// minification of a stored JSON document
+    /// ([`::service_common::json_document::minified`]), which keeps member
+    /// order, every string literal's own escapes and non-ASCII content, and
+    /// every number's own spelling. Done HERE, on the one path that stores a
+    /// policy, so no reader has to canonicalize what it was handed.
     pub fn put_policy(&mut self, document: String) -> &ClusterPolicy {
+        let document = ::service_common::json_document::minified(&document);
         let revision = self
             .policy
             .as_ref()

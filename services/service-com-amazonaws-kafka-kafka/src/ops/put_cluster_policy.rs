@@ -4,8 +4,17 @@
 //! Attaches a resource-based policy to the cluster an ARN names, replacing the
 //! policy it already carries, and answers with the version of the policy it
 //! stored. The document is held on the cluster record
-//! ([`crate::state::ClusterPolicy`]), so `GetClusterPolicy` reports the stored
-//! one and `DeleteClusterPolicy` takes that same one off.
+//! ([`crate::state::ClusterPolicy`]), canonicalized as that record states, so
+//! `GetClusterPolicy` reports the stored one and `DeleteClusterPolicy` takes
+//! that same one off.
+//!
+//! The document is a document in the IAM JSON policy language, and the version
+//! the request quotes is an optimistic lock over the one policy a cluster
+//! carries: both are read before anything is stored
+//! ([`crate::state::invalid_cluster_policy`],
+//! [`crate::state::cluster_policy_write_refused`]), so a document that is not a
+//! policy and a replacement that has not read the policy it replaces are
+//! refused with the service's own fixed sentences and change nothing.
 //!
 //! This operation models no `NotFoundException`, so a cluster this endpoint's
 //! region does not hold is refused with the `BadRequestException` it does model,
@@ -164,42 +173,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let region = crate::state::request_region(ctx.parts());
-        // Every check that depends on the request alone runs before the state
-        // lock is taken: a value that is not a cluster ARN, a document larger
-        // than this emulator stores, and a policy that is not a policy document
-        // at all — a resource-based policy is a JSON document, so a body that
-        // does not parse as a JSON object is not one. The document is parsed by
-        // `serde_json`, which bounds its own nesting depth, rather than by a
-        // hand-rolled walk over caller text.
+        // The checks that depend on the request alone run before the state lock
+        // is taken: a value that is not a cluster ARN, and a document larger
+        // than this emulator stores.
         if !crate::state::is_cluster_arn(&input.cluster_arn) {
             return Err(PutClusterPolicyErrorModeled::BadRequestException(
                 crate::state::malformed_arn(crate::state::CLUSTER_ARN_MEMBER),
             )
             .into());
         }
-        // `Policy` is stored verbatim as the cluster's policy, so the document
-        // this emulator will keep for one cluster is bounded here. Checked
-        // before the document is parsed, and before the lock: it depends on the
-        // request alone.
+        // `Policy` is kept on the cluster record as the document the service
+        // canonicalizes it to, so the document this emulator will hold for one
+        // cluster is bounded here. Checked before the document is parsed, and
+        // before the lock: it depends on the request alone.
         if input.policy.len() > crate::state::MAX_CLUSTER_POLICY_BYTES {
             return Err(
                 PutClusterPolicyErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some("Policy".to_string()),
+                    invalid_parameter: Some(crate::state::CLUSTER_POLICY_MEMBER.to_string()),
                     message: Some(format!(
                         "Policy must be at most {} bytes.",
                         crate::state::MAX_CLUSTER_POLICY_BYTES
                     )),
-                })
-                .into(),
-            );
-        }
-        if !serde_json::from_str::<serde_json::Value>(&input.policy)
-            .is_ok_and(|document| document.is_object())
-        {
-            return Err(
-                PutClusterPolicyErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some("Policy".to_string()),
-                    message: Some(crate::state::BAD_REQUEST_MESSAGE.to_string()),
                 })
                 .into(),
             );
@@ -225,33 +219,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // A quoted version must be the one the stored policy is actually at; a
-        // stale one means the caller is replacing a policy it has not read the
-        // latest version of. A request that quotes none replaces whatever is
-        // there, which is what makes the first attachment need no version.
-        if let Some(requested) = input.current_version.as_deref() {
-            let stored = cluster
-                .policy
-                .as_ref()
-                .map(|policy| policy.current_version.clone());
-            if stored.as_deref() != Some(requested) {
-                let message = match stored {
-                    Some(stored) => format!(
-                        "The cluster policy's current version is {stored}, not {requested}."
-                    ),
-                    None => format!(
-                        "The cluster carries no policy, so there is no version {requested} \
-                         to replace."
-                    ),
-                };
-                return Err(
-                    PutClusterPolicyErrorModeled::BadRequestException(BadRequestException {
-                        invalid_parameter: Some("CurrentVersion".to_string()),
-                        message: Some(message),
-                    })
-                    .into(),
-                );
-            }
+        // A `CurrentVersion` is a token the SERVICE mints and the caller quotes
+        // back, so a value outside that shape
+        // ([`crate::state::is_current_version_token`]) names no version of this
+        // cluster's policy or of any other: the PARAMETER is at fault, and it is
+        // answered in the service's generic parameter sentence before any
+        // refusal about the stored policy itself — the caller has to fix the
+        // request rather than read the policy again and retry. The same
+        // distinction every operation of this service that quotes a version
+        // draws ([`crate::state::malformed_current_version`]).
+        if input
+            .current_version
+            .as_deref()
+            .is_some_and(|quoted| !crate::state::is_current_version_token(quoted))
+        {
+            return Err(PutClusterPolicyErrorModeled::BadRequestException(
+                crate::state::malformed_current_version(),
+            )
+            .into());
+        }
+
+        // The document itself: a resource-based policy is a document in the IAM
+        // JSON policy language, so one that breaks that language's grammar —
+        // including a statement that omits an element the language requires — is
+        // refused and NOTHING is attached, which is what keeps a caller that
+        // mis-rendered a policy from being told it is live. Read after the
+        // cluster is resolved, since a reference this endpoint cannot act on is
+        // refused before the body it carries is read, and before the version
+        // gate below, which is the request's precondition rather than its
+        // content.
+        if let Some(refusal) = crate::state::invalid_cluster_policy(&input.policy) {
+            return Err(PutClusterPolicyErrorModeled::BadRequestException(refusal).into());
+        }
+
+        // A quoted version must be the one the stored policy is actually at, and
+        // a put that would REPLACE a stored policy has to quote one: the version
+        // is the optimistic lock over the one policy a cluster carries, so a
+        // writer that has not read the policy it is replacing is refused rather
+        // than allowed to clobber it. Both refusals are the service's own fixed
+        // sentences ([`crate::state::cluster_policy_write_refused`]), decided
+        // before anything is stored.
+        let stored_version = cluster
+            .policy
+            .as_ref()
+            .map(|policy| policy.current_version.clone());
+        if let Some(refusal) = crate::state::cluster_policy_write_refused(
+            stored_version.as_deref(),
+            input.current_version.as_deref(),
+        ) {
+            return Err(PutClusterPolicyErrorModeled::BadRequestException(refusal).into());
         }
 
         // The version answered here is the stored policy's own, so the caller
