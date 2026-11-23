@@ -280,6 +280,12 @@ pub mod model_source;
 pub mod logging_destination;
 pub use logging_destination::*;
 
+/// Whether the Amazon S3 locations a job-creating request names are locations Amazon Bedrock
+/// could reach at all. Beside this module for the reason [`model_source`] is: deciding it
+/// means asking the service that OWNS buckets, while the records the decision guards live
+/// here.
+pub mod job_s3_locations;
+
 /// The foundation-model catalogue this emulator publishes, and the renderings the model
 /// and inference profile surfaces report it through. Here rather than in this file so one
 /// file holds one concern; every name it declares is re-exported below, so a handler still

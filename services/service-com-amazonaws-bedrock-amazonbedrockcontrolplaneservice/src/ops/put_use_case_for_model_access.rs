@@ -14,8 +14,15 @@
 //!
 //! The one constraint the model states — `AcknowledgementFormDataBody` 10..16384 bytes —
 //! is refused by the centralized validation walk BEFORE this handler runs, so a request
-//! that reaches here is one this emulator stores as given. What the form SAYS is a
-//! document this emulator does not interpret.
+//! that reaches here carries a form of an admissible SIZE.
+//!
+//! Size is not the whole requirement. `formData` carries the use-case form itself, which
+//! Amazon Bedrock reads as a document — it is parsed, the account's answers are taken out of
+//! it, and `GetUseCaseForModelAccess` reports it back — so a blob whose bytes are no such
+//! document is refused with the modelled `ValidationException` (HTTP 400) and nothing is
+//! stored, which is what keeps the read behind this put telling the caller to fill the form
+//! out ([`crate::state::is_no_use_case_form`]). What the form's fields SAY is the caller's own
+//! text and is not judged.
 //!
 //! The writer half of this operation's reader, `GetUseCaseForModelAccess`.
 //!
@@ -128,6 +135,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ctx` carries request metadata this operation has no use for: the form it
         // stores is account-level.
         let _ = ctx;
+        // The form is a DOCUMENT rather than opaque bytes: a blob that is no use-case form
+        // at all is refused as input and nothing is stored, so the read behind this put
+        // still tells the caller to fill the form out
+        // ([`crate::state::is_no_use_case_form`]).
+        if crate::state::is_no_use_case_form(&input.form_data) {
+            return Err(PutUseCaseForModelAccessErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::INVALID_USE_CASE_FORM.to_string()),
+                },
+            )
+            .into());
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(PutUseCaseForModelAccessErrorModeled::InternalServerException(
                 InternalServerException {

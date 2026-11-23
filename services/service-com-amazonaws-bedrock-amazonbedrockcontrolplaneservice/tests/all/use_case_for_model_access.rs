@@ -5,24 +5,29 @@
 //!
 //! # The rule
 //!
-//! The use case for model access is ONE account-level form, so
-//! `PutUseCaseForModelAccess` replaces it whole with the `formData` bytes the request
-//! carries, `GetUseCaseForModelAccess` reports back exactly those bytes — byte for byte,
-//! nothing re-encoded and nothing merged in from an earlier put — and while no form has
-//! been submitted the get has no `@required formData` to report, so it answers the
-//! modelled `ResourceNotFoundException` (HTTP 404).
+//! The use case for model access is ONE account-level form, and `formData` carries that form
+//! as a DOCUMENT rather than as opaque bytes: Amazon Bedrock parses it, so a blob whose bytes
+//! are no form document is refused as input (400 `ValidationException`, "Invalid form data.")
+//! and nothing is stored. A form it accepts replaces the account's form whole, and
+//! `GetUseCaseForModelAccess` reports back exactly the bytes that were submitted — byte for
+//! byte, nothing re-encoded and nothing merged in from an earlier put. While no form has been
+//! accepted the get has no `@required formData` to report, so it answers the modelled
+//! `ResourceNotFoundException` (HTTP 404).
 //!
-//! # What the table below generalises over
+//! # What the tables below generalise over
 //!
-//! One row per independent form along the axes a blob spans: its SIZE (both published
-//! bounds of `AcknowledgementFormDataBody`, `@length(10..16384)` in this service's Smithy
-//! model, and sizes between them), its CONTENT (ASCII JSON, UTF-8 beyond ASCII, bytes
-//! that are not text at all — including NUL, 0xFF and every byte value — so nothing may
-//! round-trip the form as a string), and its ORDER (the rows are driven in sequence
-//! against ONE emulator, so each get also witnesses that the put before it replaced the
-//! previous row rather than appending to or merging with it).
-//! [`a_form_outside_the_published_size_bounds_is_refused_and_changes_nothing`] drives one
-//! form under and one past each of those bounds.
+//! [`cases`] is one row per independent form along the axes an ACCEPTED form spans: its SIZE
+//! (both published bounds of `AcknowledgementFormDataBody`, `@length(10..16384)` in this
+//! service's Smithy model, and sizes between them), its CONTENT (the fields the form carries,
+//! their count, UTF-8 beyond ASCII, and values that are not text at all) and its ORDER (the
+//! rows are driven in sequence against ONE emulator, so each get also witnesses that the put
+//! before it replaced the previous row rather than appending to or merging with it).
+//!
+//! [`a_blob_that_is_no_form_document_is_refused_and_changes_nothing`] is the same span from
+//! the other side: one row per independent way a blob fails to be a form document, each
+//! inside the published size bounds so the refusal is about the DOCUMENT and not its length.
+//! [`a_form_outside_the_published_size_bounds_is_refused_and_changes_nothing`] drives one form
+//! under and one past each of those bounds.
 
 use serde_json::{json, Value};
 
@@ -47,47 +52,56 @@ fn filler_bytes(filler: u8, n: usize) -> Vec<u8> {
     vec![filler; n]
 }
 
-/// A form padded to `n` bytes so a chosen payload can be driven at a chosen size.
-fn padded(payload: &[u8], n: usize) -> Vec<u8> {
-    let mut bytes = payload.to_vec();
-    bytes.resize(n, b' ');
-    bytes
+/// A form document whose one field is padded with `filler` until the whole blob is `n`
+/// bytes, so a chosen SIZE can be driven by a blob that is still a form.
+///
+/// The field name is one character so the envelope fits inside the shortest form
+/// `AcknowledgementFormDataBody` admits.
+fn form_of_size(filler: char, n: usize) -> Vec<u8> {
+    let envelope = br#"{"u":""}"#.len();
+    assert!(
+        n >= envelope,
+        "a form document cannot be shorter than its own envelope ({envelope} bytes)"
+    );
+    let value: String = std::iter::repeat_n(filler, n - envelope).collect();
+    format!(r#"{{"u":"{value}"}}"#).into_bytes()
 }
 
-/// The forms the rule must round-trip, one per independent shape of the blob.
+/// The forms the rule must round-trip, one per independent shape of the document.
 fn cases() -> Vec<Case> {
     vec![
         Case {
-            name: "an acknowledgement form as JSON text",
+            name: "an acknowledgement form carrying several fields",
             form_data: br#"{"companyName":"Acme","useCase":"document summarisation"}"#.to_vec(),
         },
         Case {
             name: "the shortest form the model admits (10 bytes)",
-            form_data: padded(b"acme", MIN_FORM_BYTES),
+            form_data: form_of_size('a', MIN_FORM_BYTES),
         },
         Case {
             name: "the longest form the model admits (16384 bytes)",
-            form_data: filler_bytes(b'f', MAX_FORM_BYTES),
+            form_data: form_of_size('f', MAX_FORM_BYTES),
         },
         Case {
-            name: "UTF-8 beyond ASCII",
-            form_data: "use case: résumé analysis — 日本語 🙂".as_bytes().to_vec(),
+            name: "a field value in UTF-8 beyond ASCII",
+            form_data: r#"{"useCase":"résumé analysis — 日本語 🙂"}"#.as_bytes().to_vec(),
         },
         Case {
-            name: "bytes that are not text: NUL, 0xFF and everything between",
-            form_data: (0u8..=255).collect(),
+            name: "fields whose values are not text: a number, a boolean, null, a list",
+            form_data: br#"{"headcount":42,"production":true,"other":null,"regions":["eu"]}"#
+                .to_vec(),
         },
         Case {
-            name: "a form of nothing but NUL bytes",
-            form_data: filler_bytes(0, 64),
+            name: "a nested form document",
+            form_data: br#"{"company":{"name":"Acme","site":"https://acme.example"}}"#.to_vec(),
         },
         Case {
             name: "one byte past the shortest admitted form",
-            form_data: padded(b"x", MIN_FORM_BYTES + 1),
+            form_data: form_of_size('x', MIN_FORM_BYTES + 1),
         },
         Case {
             name: "one byte under the longest admitted form",
-            form_data: filler_bytes(b'z', MAX_FORM_BYTES - 1),
+            form_data: form_of_size('z', MAX_FORM_BYTES - 1),
         },
     ]
 }
@@ -214,6 +228,130 @@ async fn putting_the_same_form_twice_leaves_the_same_form() {
     }
 }
 
+/// RULE: a blob that is no form document is refused 400 `ValidationException` with the
+/// service's fixed sentence and stores nothing, so the read behind it still reports whatever
+/// form was accepted before it.
+///
+/// Every row is inside `AcknowledgementFormDataBody`'s published size bounds, so what is
+/// refused is the DOCUMENT and not the length — the length is the table below.
+#[tokio::test]
+async fn a_blob_that_is_no_form_document_is_refused_and_changes_nothing() {
+    /// The one sentence Amazon Bedrock states for form data it cannot read, written out
+    /// here so this suite pins the wording a client branches on.
+    const INVALID_FORM: &str = "Invalid form data.";
+
+    let refused: Vec<(String, Vec<u8>)> = vec![
+        (
+            "plain text that is no document at all".to_string(),
+            b"not a form at all".to_vec(),
+        ),
+        (
+            "bytes that are not text: NUL, 0xFF and everything between".to_string(),
+            (0u8..=255).collect(),
+        ),
+        (
+            "a form of nothing but NUL bytes".to_string(),
+            filler_bytes(0, 64),
+        ),
+        (
+            "a document that is a JSON list rather than a form".to_string(),
+            br#"["document summarisation"]"#.to_vec(),
+        ),
+        (
+            "a document that is a bare JSON string".to_string(),
+            br#""document summarisation""#.to_vec(),
+        ),
+        (
+            "a document that is a bare JSON number".to_string(),
+            b"1234567890".to_vec(),
+        ),
+        (
+            "a form document carrying no field at all".to_string(),
+            br#"{         }"#.to_vec(),
+        ),
+        (
+            "a form document that was truncated in transit".to_string(),
+            br#"{"useCase":"summar"#.to_vec(),
+        ),
+        (
+            "a form document the size of the longest admitted form, truncated".to_string(),
+            {
+                let mut bytes = form_of_size('t', MAX_FORM_BYTES);
+                bytes.truncate(MAX_FORM_BYTES - 1);
+                bytes
+            },
+        ),
+    ];
+
+    let emulator = emulator();
+    // A form that IS accepted, so each refusal is checked against a known stored form
+    // rather than against an empty store.
+    let stored = br#"{"useCase":"text generation"}"#.to_vec();
+    let put_reply = put(&emulator, &stored).await;
+    assert_eq!(
+        put_reply.status, 201,
+        "the baseline put must answer 201, got {} {:?}",
+        put_reply.status, put_reply.body
+    );
+
+    for (case, form_data) in refused {
+        assert!(
+            (MIN_FORM_BYTES..=MAX_FORM_BYTES).contains(&form_data.len()),
+            "case {case}: this row must sit inside the published size bounds, got {} bytes",
+            form_data.len()
+        );
+        let reply = put(&emulator, &form_data).await;
+        assert_eq!(
+            reply.status, 400,
+            "case {case}: the put must be refused 400, got {} {:?}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error.as_deref(),
+            Some("ValidationException"),
+            "case {case}: a blob that is no form is a ValidationException, got {:?}",
+            reply.error
+        );
+        assert_eq!(
+            reply.body.get("message").and_then(Value::as_str),
+            Some(INVALID_FORM),
+            "case {case}: the refusal must be the service's fixed sentence, got {:?}",
+            reply.body
+        );
+        let after = get(&emulator).await;
+        let got = blob_bytes(&case, &after, "formData");
+        assert_eq!(
+            got, stored,
+            "case {case}: a refused put must store nothing; got {} bytes, expected {}",
+            got.len(),
+            stored.len()
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_blob_that_is_no_form_document_is_refused_before_any_form_is_accepted() {
+    let emulator = emulator();
+    let reply = put(&emulator, b"not a form at all").await;
+    assert_eq!(
+        (reply.status, reply.error.as_deref()),
+        (400, Some("ValidationException")),
+        "case \"a junk form against an empty store\": the put must be refused 400, got {} {:?}",
+        reply.status,
+        reply.body
+    );
+    // Nothing was stored, so the read behind the refusal still tells the caller to fill the
+    // form out.
+    let after = get(&emulator).await;
+    assert_eq!(
+        (after.status, after.error.as_deref()),
+        (404, Some("ResourceNotFoundException")),
+        "case \"a junk form against an empty store\": the read must still be a 404, got {} {:?}",
+        after.status,
+        after.body
+    );
+}
+
 #[tokio::test]
 async fn a_form_outside_the_published_size_bounds_is_refused_and_changes_nothing() {
     // Each row drives the form past a bound its Smithy model declares; the bounds
@@ -226,18 +364,18 @@ async fn a_form_outside_the_published_size_bounds_is_refused_and_changes_nothing
         ("an empty form".to_string(), Vec::new()),
         (
             format!("one byte past @length max {MAX_FORM_BYTES}"),
-            filler_bytes(b'a', MAX_FORM_BYTES + 1),
+            form_of_size('a', MAX_FORM_BYTES + 1),
         ),
         (
             format!("far past @length max {MAX_FORM_BYTES}"),
-            filler_bytes(b'a', MAX_FORM_BYTES * 2),
+            form_of_size('a', MAX_FORM_BYTES * 2),
         ),
     ];
 
     let emulator = emulator();
-    // A form that IS admitted, so each refusal is checked against a known stored form
+    // A form that IS accepted, so each refusal is checked against a known stored form
     // rather than against an empty store.
-    let stored = b"{\"useCase\":\"text generation\"}".to_vec();
+    let stored = br#"{"useCase":"text generation"}"#.to_vec();
     let put_reply = put(&emulator, &stored).await;
     assert_eq!(
         put_reply.status, 201,

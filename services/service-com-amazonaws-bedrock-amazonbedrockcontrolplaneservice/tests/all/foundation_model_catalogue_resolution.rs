@@ -439,6 +439,9 @@ fn batch_body(name: &str, model_id: &str) -> Value {
     })
 }
 
+/// RULE: the batch submission resolves its `modelId` against the published catalogue, so a
+/// model it OFFERS gets past identification and one it does not — whether it was never there
+/// or is offered no longer — is refused as the spelling the caller used.
 #[tokio::test]
 async fn a_batch_submission_resolves_its_model_against_the_models_the_service_offers() {
     let emu = emulator();

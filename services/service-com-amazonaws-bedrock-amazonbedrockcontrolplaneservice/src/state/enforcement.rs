@@ -66,6 +66,37 @@ pub const DATA_RETENTION_MODE_DEFAULT: &str = "default";
 pub const USE_CASE_FOR_MODEL_ACCESS_NOT_SUBMITTED: &str =
     "You have not filled out the request form. Fill out the form before getting access.";
 
+/// What `PutUseCaseForModelAccess` answers as its `ValidationException` message for a
+/// `formData` blob that is no use-case form at all.
+///
+/// RECORDED behaviour, and a wholly fixed sentence: Amazon Bedrock reports that the form data
+/// it was handed is invalid without quoting any of it, so there is nothing of the request to
+/// fill in. It is answered as the modelled `ValidationException` (`@httpError(400)`).
+pub const INVALID_USE_CASE_FORM: &str = "Invalid form data.";
+
+/// Whether the bytes `form_data` carries are NO acknowledgement form.
+///
+/// `formData` is a blob, so its modelled `@length(10..16384)` says how BIG the form may be
+/// and nothing about what it is. What the member carries is the use-case form itself — the
+/// company, the intended users and the use cases a caller fills out to be granted model
+/// access — which Amazon Bedrock reads as a DOCUMENT: it is parsed, the account's answers are
+/// taken out of it, and `GetUseCaseForModelAccess` reports it back. So a blob whose bytes are
+/// no document of that kind is not a form submitted in a state the service can act on, and it
+/// is refused as input ([`INVALID_USE_CASE_FORM`]) rather than stored — which is what keeps
+/// the read behind it answering "fill out the form" instead of serving bytes that say nothing.
+///
+/// A form document is a JSON object: the acknowledgement form is a set of NAMED answers, and
+/// that is the one structured form the documents of this service take. What the answers SAY
+/// is not judged here — the fields of the form are the caller's own text, and a form carrying
+/// fields this emulator does not know is still a form — so the question is the document's own
+/// form and nothing beyond it. The bytes are read with the maintained JSON parser this crate
+/// already depends on rather than inspected by hand.
+#[must_use]
+pub fn is_no_use_case_form(form_data: &[u8]) -> bool {
+    !::serde_json::from_slice::<::serde_json::Value>(form_data)
+        .is_ok_and(|document| document.as_object().is_some_and(|form| !form.is_empty()))
+}
+
 /// The account's data retention setting: the `mode` `PutAccountDataRetention` last stored,
 /// and the instant that put stored it.
 ///

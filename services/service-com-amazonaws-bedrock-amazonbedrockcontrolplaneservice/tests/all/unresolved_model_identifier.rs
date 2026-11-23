@@ -31,6 +31,12 @@
 //! refused with the same fixed sentence — before the `iam:PassRole` step, which is what the
 //! corpus records for it.
 //!
+//! The JOB creates read the member that names the model they are to RUN the same way, and
+//! ahead of that same authorization step, which is what the corpus records for them too: a
+//! value that resolves to no model the catalogue OFFERS — including a base model this service
+//! recognises and offers NO LONGER, which serves no inference and so could never back the job
+//! — is refused with the fixed sentence rather than accepted.
+//!
 //! # What the table generalises over
 //!
 //! One row per independent input along the axes the rule spans: which operation carries the
@@ -79,6 +85,17 @@ fn unqualified_catalogue_model() -> &'static str {
         .find(|model| !model.model_id.contains(':'))
         .map(|model| model.model_id)
         .expect("the catalogue must publish an unqualified model id")
+}
+
+/// A base model this service RECOGNISES and offers no longer: one past its end of life,
+/// which names no model a job could be run against. Read off the published list rather than
+/// spelled here, so the row follows the publication.
+fn retired_catalogue_model() -> &'static str {
+    bedrock::state::RETIRED_FOUNDATION_MODELS
+        .iter()
+        .copied()
+        .find(|model_id| !model_id.contains(':'))
+        .expect("the service must recognise a model past its end of life")
 }
 
 /// A `custom-model` ARN of this account naming a model nothing created. The resource is
@@ -162,6 +179,30 @@ fn submit_batch_job(identifier: &str) -> Request {
     }
 }
 
+fn submit_evaluation_job(identifier: &str) -> Request {
+    Request {
+        method: "POST",
+        path: "/evaluation-jobs".to_string(),
+        body: Some(json!({
+            "jobName": "evaluation-unresolved",
+            "roleArn": format!("arn:aws:iam::{ACCOUNT}:role/bedrock-evaluation"),
+            "outputDataConfig": { "s3Uri": "s3://evaluation-out/" },
+            "evaluationConfig": {
+                "automated": {
+                    "datasetMetricConfigs": [{
+                        "taskType": "Summarization",
+                        "dataset": { "name": "Builtin.Gigaword" },
+                        "metricNames": ["Builtin.Accuracy"],
+                    }],
+                },
+            },
+            "inferenceConfig": {
+                "models": [{ "bedrockModel": { "modelIdentifier": identifier } }],
+            },
+        })),
+    }
+}
+
 fn start_customization_job(identifier: &str) -> Request {
     Request {
         method: "POST",
@@ -190,6 +231,7 @@ struct Case {
 fn cases() -> Vec<Case> {
     let qualified = qualified_catalogue_model();
     let unqualified = unqualified_catalogue_model();
+    let retired = retired_catalogue_model();
     let missing_foundation_model = foundation_model_arn(REGION, "acme.not-a-model-v1");
     vec![
         // ---- the custom model family: it resolves `custom-model` ARNs alone -------------
@@ -302,6 +344,48 @@ fn cases() -> Vec<Case> {
             status: 404,
             code: "ResourceNotFoundException",
             message: INFERENCE_PROFILE_NOT_FOUND.to_string(),
+        },
+        // ---- an evaluation: it resolves the catalogue and this account's own models -----
+        Case {
+            case: "CreateEvaluationJob by a bare id no row carries",
+            request: submit_evaluation_job,
+            identifier: "acme.not-a-model-v1".to_string(),
+            status: 400,
+            code: "ValidationException",
+            message: INVALID_MODEL_IDENTIFIER.to_string(),
+        },
+        Case {
+            case: "CreateEvaluationJob by a foundation-model ARN no row carries",
+            request: submit_evaluation_job,
+            identifier: missing_foundation_model.clone(),
+            status: 404,
+            code: "ResourceNotFoundException",
+            message: bedrock::state::foundation_model_not_found(&missing_foundation_model),
+        },
+        Case {
+            case: "CreateEvaluationJob by an application-inference-profile ARN nothing minted",
+            request: submit_evaluation_job,
+            identifier: missing_inference_profile_arn(),
+            status: 404,
+            code: "ResourceNotFoundException",
+            message: INFERENCE_PROFILE_NOT_FOUND.to_string(),
+        },
+        // ---- a model offered NO LONGER names no model a job could run -------------------
+        Case {
+            case: "CreateEvaluationJob by a base model offered no longer",
+            request: submit_evaluation_job,
+            identifier: retired.to_string(),
+            status: 400,
+            code: "ValidationException",
+            message: INVALID_MODEL_IDENTIFIER.to_string(),
+        },
+        Case {
+            case: "CreateModelInvocationJob by a base model offered no longer",
+            request: submit_batch_job,
+            identifier: retired.to_string(),
+            status: 400,
+            code: "ValidationException",
+            message: INVALID_MODEL_IDENTIFIER.to_string(),
         },
         // ---- a customization: the FORM of the identifier is read first ------------------
         Case {

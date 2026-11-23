@@ -99,6 +99,36 @@ pub fn relay_envelope_of(call: RelayedCall<'_>, request_id: &str) -> String {
     )
 }
 
+/// The header a relayed answer carries its EXTENDED request id in, where the called service
+/// answers one at all.
+///
+/// Amazon S3 is the service that does: every S3 response carries `x-amz-id-2` beside
+/// `x-amz-request-id` (Amazon S3 API Reference, *Common Response Headers*), and the exception
+/// an S3 SDK raises states both ids in its envelope.
+const EXTENDED_REQUEST_ID_HEADER: &str = "x-amz-id-2";
+
+/// The envelope a relayed refusal is reported inside, with BOTH identifiers the relayed
+/// ANSWER carried: the request id, and the extended request id where that answer carried one.
+///
+/// What a caller that holds the relayed response's own headers states, so the ids in the
+/// message are the ids of the call that was actually made rather than ones minted beside it.
+/// An answer carrying no extended id gets the single-id envelope ([`relay_envelope_of`]),
+/// because a field the answer did not carry is not invented for it.
+#[must_use]
+pub fn relay_envelope_answered(
+    call: RelayedCall<'_>,
+    headers: &::aws_smithy_runtime_api::http::Headers,
+) -> String {
+    let request_id = answered_request_id(headers);
+    match headers.get(EXTENDED_REQUEST_ID_HEADER) {
+        Some(extended) => relay_envelope_of(
+            call,
+            &format!("{request_id}, Extended Request ID: {extended}"),
+        ),
+        None => relay_envelope_of(call, &request_id),
+    }
+}
+
 /// `reason`, the message the called service itself gave, as the calling service reports it
 /// to its caller: that reason verbatim, then the envelope naming the call it came from
 /// ([`relay_envelope`]).

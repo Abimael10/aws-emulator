@@ -17,6 +17,13 @@
 //!   `TooManyTagsException`, and the account's job bound with
 //!   `ServiceQuotaExceededException`.
 //!
+//! A well-formed request is still not an admissible one. `inputConfig` and `outputConfig`
+//! name the Amazon S3 locations the job READS its prompts from and WRITES its results under,
+//! so a submission naming a bucket the object store does not hold describes work that can
+//! never be carried out: it is refused with the modelled `ValidationException` (HTTP 400)
+//! stating the location it could not reach and the exception the Amazon S3 client raised for
+//! it, with no job minted ([`crate::state::job_s3_locations`]).
+//!
 //! `jobName` is NOT an identifier of this resource — an
 //! `AdvancedPromptOptimizationJobIdentifier` is the job ARN or the minted id alone
 //! (`smithy_query(query="operation",operation="GetAdvancedPromptOptimizationJob")`) — and
@@ -202,6 +209,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
+        }
+
+        // The locations the job READS its input from and WRITES its results under, resolved
+        // where the object store holds them BEFORE the job is minted: a job pointed at a
+        // bucket Amazon S3 does not hold can never read its input or save its results, so
+        // such a submission is refused as input with nothing stored
+        // ([`crate::state::job_s3_locations`]). Asked in the order the request states the two
+        // configurations, so a submission wrong in both is refused on its input, and with no
+        // store guard held — the question goes to another service.
+        for uri in [
+            input.input_config.s3_uri.as_str(),
+            input.output_config.s3_uri.as_str(),
+        ] {
+            if let Some(refusal) =
+                crate::state::job_s3_locations::inaccessible_s3_location(ctx, &region, uri).await
+            {
+                return Err(
+                    CreateAdvancedPromptOptimizationJobErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(refusal),
+                        },
+                    )
+                    .into(),
+                );
+            }
         }
 
         let mut store = state.lock();

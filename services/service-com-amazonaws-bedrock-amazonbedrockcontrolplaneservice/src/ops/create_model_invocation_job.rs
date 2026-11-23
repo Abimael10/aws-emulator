@@ -1,7 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateModelInvocationJob
-//! Submits a batch inference job: the submission hands Amazon Bedrock the `roleArn` it is
+//! Submits a batch inference job. What the request ASKS FOR is read before who may ask for
+//! it: `modelId` names the model the inference is to run, and a value that resolves to no
+//! model this service OFFERS describes no job to create, so it is refused as un-usable input
+//! — the modelled `ValidationException` (HTTP 400) carrying the service's fixed
+//! invalid-model-identifier sentence, or the modelled `ResourceNotFoundException` (HTTP 404)
+//! where the spelling is an ARN of a resource type this member is resolved against
+//! ([`crate::state::unresolved_model`]) — ahead of the authorization step below, and with no
+//! job written.
+//!
+//! The submission then hands Amazon Bedrock the `roleArn` it is
 //! to carry out and manage the inference under, so the request is decided by the
 //! `iam:PassRole` step for that role once what it ASKS FOR has been read
 //! ([`crate::state::job_pass_role_denial`], the one decision every job-creating operation

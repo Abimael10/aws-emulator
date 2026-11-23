@@ -24,6 +24,15 @@
 //! — `GetCustomModel` answers 404 and `ListCustomModels(nameContains=…)` reports no model —
 //! and that the OTHER way of naming artifacts (`customModelDataSource`, a model package
 //! ARN) asks the object store nothing and stays admitted.
+//!
+//! The same harness carries the OTHER pre-condition this service puts to the object store:
+//! the Amazon S3 locations a job-creating request names
+//! ([`a_job_location_must_name_a_bucket_the_object_store_holds`]). An advanced prompt
+//! optimization job READS its prompt templates from `inputConfig.s3Uri` and WRITES its
+//! results under `outputConfig.s3Uri`, so a bucket the store does not hold describes work
+//! that can never be carried out and the create is refused with the modelled
+//! `ValidationException` (`@httpError(400)`) stating the location it could not reach and the
+//! exception the Amazon S3 client raised for it.
 
 use std::sync::Arc;
 
@@ -342,6 +351,266 @@ async fn a_model_source_must_name_an_amazon_managed_bucket() {
             "case {case:?}: a refused create must leave nothing to list, got {listed:?}"
         );
     }
+}
+
+/// The name of a bucket an advanced prompt optimization job's locations live in, which the
+/// caller creates for itself.
+const JOB_BUCKET: &str = "example-apo-locations";
+
+/// A bucket no `CreateBucket` here ever creates, so the object store answers that it holds
+/// no such bucket.
+const JOB_ABSENT_BUCKET: &str = "example-apo-nowhere";
+
+/// `PUT /<bucket>` — `CreateBucket` — for one named bucket.
+async fn given_bucket(emu: &Emulator, name: &str) {
+    let status = emu.s3("PUT", &format!("/{name}")).await;
+    assert_eq!(
+        status, 200,
+        "the bucket {name} must be created first, got {status}"
+    );
+}
+
+/// `CreateAdvancedPromptOptimizationJob` reading from `input` and writing under `output`,
+/// carrying `client_token` when one is given (`@idempotencyToken`).
+async fn create_optimization_job_with_token(
+    emu: &Emulator,
+    name: &str,
+    input: &str,
+    output: &str,
+    client_token: Option<&str>,
+) -> Reply {
+    let mut body = json!({
+        "jobName": name,
+        "inputConfig": { "s3Uri": input },
+        "outputConfig": { "s3Uri": output },
+        "modelConfigurations": [{ "modelId": "amazon.nova-lite-v1:0" }],
+    });
+    if let Some(token) = client_token {
+        body["clientToken"] = json!(token);
+    }
+    emu.bedrock("POST", "/advanced-prompt-optimization-jobs", Some(body))
+        .await
+}
+
+/// `CreateAdvancedPromptOptimizationJob` reading from `input` and writing under `output`.
+async fn create_optimization_job(
+    emu: &Emulator,
+    name: &str,
+    input: &str,
+    output: &str,
+) -> Reply {
+    create_optimization_job_with_token(emu, name, input, output, None).await
+}
+
+/// `GetAdvancedPromptOptimizationJob` on the job `identifier` names.
+async fn read_optimization_job(emu: &Emulator, identifier: &str) -> Reply {
+    emu.bedrock(
+        "GET",
+        &format!("/advanced-prompt-optimization-jobs/{}", label(identifier)),
+        None,
+    )
+    .await
+}
+
+/// The FIXED text of the sentence Amazon Bedrock words for an Amazon S3 location it could
+/// not reach, around the location the request named: everything after it is the exception
+/// the Amazon S3 client raised, whose request ids and attempt count belong to that one call.
+fn unreachable_location_head(location: &str) -> String {
+    format!(
+        "Cannot access S3 location: {location}. Error: The specified bucket does not exist \
+         (Service: S3, Status Code: 404, Request ID: "
+    )
+}
+
+/// RULE: a job pointed at a bucket the object store does not hold can never read its input or
+/// save its results, so the create is refused with the modelled 400 `ValidationException`
+/// stating the location it could not reach — and mints nothing; a job whose locations the
+/// store DOES hold is accepted and round-trips through a read.
+///
+/// The rows differ along what the rule generalises over: WHICH configuration names the absent
+/// bucket (the input, the output, both), the FORM of the location (a prefix, a nested prefix,
+/// an object key, the bucket alone) and the bucket NAME, so the sentence follows the request
+/// rather than one recorded run.
+#[tokio::test]
+async fn a_job_location_must_name_a_bucket_the_object_store_holds() {
+    let emu = emulator();
+    given_bucket(&emu, JOB_BUCKET).await;
+    let held_input = format!("s3://{JOB_BUCKET}/apo-input/templates.jsonl");
+    let held_output = format!("s3://{JOB_BUCKET}/apo-output/");
+    let other_absent = format!("{JOB_ABSENT_BUCKET}-two");
+
+    // (case, jobName, inputConfig.s3Uri, outputConfig.s3Uri, the location the refusal names
+    //  — `None` when the create is admitted)
+    let rows: &[(&str, &str, String, String, Option<String>)] = &[
+        (
+            "both locations in a bucket the caller holds",
+            "apo-held",
+            held_input.clone(),
+            held_output.clone(),
+            None,
+        ),
+        (
+            "the bucket itself as the input location",
+            "apo-held-bucket",
+            format!("s3://{JOB_BUCKET}"),
+            held_output.clone(),
+            None,
+        ),
+        (
+            "the input in a bucket nothing holds, named by a prefix",
+            "apo-absent-input",
+            format!("s3://{JOB_ABSENT_BUCKET}/apo-input/"),
+            held_output.clone(),
+            Some(format!("{JOB_ABSENT_BUCKET}/apo-input/")),
+        ),
+        (
+            "the input in a bucket nothing holds, named by a nested prefix",
+            "apo-absent-input-nested",
+            format!("s3://{JOB_ABSENT_BUCKET}/runs/2026/apo-input/"),
+            held_output.clone(),
+            Some(format!("{JOB_ABSENT_BUCKET}/runs/2026/apo-input/")),
+        ),
+        (
+            "the input in a bucket nothing holds, named by the bucket alone",
+            "apo-absent-input-bucket",
+            format!("s3://{JOB_ABSENT_BUCKET}"),
+            held_output.clone(),
+            Some(format!("{JOB_ABSENT_BUCKET}/")),
+        ),
+        (
+            "the OUTPUT in a bucket nothing holds, so the refusal follows that one",
+            "apo-absent-output",
+            held_input.clone(),
+            format!("s3://{other_absent}/apo-output/"),
+            Some(format!("{other_absent}/apo-output/")),
+        ),
+        (
+            "both locations in buckets nothing holds, so the input is refused first",
+            "apo-absent-both",
+            format!("s3://{JOB_ABSENT_BUCKET}/apo-input/"),
+            format!("s3://{other_absent}/apo-output/"),
+            Some(format!("{JOB_ABSENT_BUCKET}/apo-input/")),
+        ),
+    ];
+
+    for (case, name, input, output, refused_location) in rows {
+        let reply = create_optimization_job(&emu, name, input, output).await;
+        let Some(location) = refused_location else {
+            assert_eq!(
+                reply.status, 200,
+                "case {case:?}: a location the object store holds satisfies the \
+                 pre-condition, so the create must be accepted, got {} {:?}",
+                reply.status, reply.body
+            );
+            // The round trip: what the create minted is what a read reports.
+            let arn = reply.text("jobArn");
+            let read_back = read_optimization_job(&emu, &arn).await;
+            assert_eq!(
+                read_back.status, 200,
+                "case {case:?}: the minted job must read back, got {} {:?}",
+                read_back.status, read_back.body
+            );
+            assert_eq!(
+                read_back.text("jobName"),
+                *name,
+                "case {case:?}: expected the name the create carried, got {:?}",
+                read_back.body
+            );
+            continue;
+        };
+
+        assert_eq!(
+            reply.status, 400,
+            "case {case:?}: a location in a bucket nothing holds must be refused, got {} {:?}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error.as_deref(),
+            Some("ValidationException"),
+            "case {case:?}: expected the modelled ValidationException, got {:?}",
+            reply.error
+        );
+        let message = reply.text("message");
+        let head = unreachable_location_head(location);
+        assert!(
+            message.starts_with(&head),
+            "case {case:?}: expected the message to open {head:?}, got {message:?}"
+        );
+        // The ids and the attempt count belong to the call the object store answered, so the
+        // shape is the requirement and the values are that one call's.
+        let tail = ") (SDK Attempt Count: 1)";
+        assert!(
+            message.ends_with(tail),
+            "case {case:?}: expected the message to end {tail:?}, got {message:?}"
+        );
+        let ids = message
+            .strip_prefix(&head)
+            .and_then(|rest| rest.strip_suffix(tail))
+            .unwrap_or_default();
+        let (request_id, extended) = ids
+            .split_once(", Extended Request ID: ")
+            .unwrap_or_else(|| panic!("case {case:?}: expected both request ids, got {ids:?}"));
+        assert!(
+            !request_id.is_empty() && !extended.is_empty(),
+            "case {case:?}: both request ids must name the call that answered, got {ids:?}"
+        );
+        // And the refusal handed back nothing to address: no job was minted.
+        assert_eq!(
+            reply.get("jobArn"),
+            Value::Null,
+            "case {case:?}: a refused create mints no job, got {:?}",
+            reply.body
+        );
+    }
+}
+
+/// RULE, from the other side: a refused create writes NOTHING — not even the
+/// `@idempotencyToken` it carried — so the same token replayed on a request whose locations
+/// the object store does hold mints a job rather than answering with one the refusal left
+/// behind.
+#[tokio::test]
+async fn a_refused_job_create_records_nothing_for_its_client_token() {
+    let emu = emulator();
+    given_bucket(&emu, JOB_BUCKET).await;
+    let token = "apo-refused-then-accepted";
+
+    let refused = create_optimization_job_with_token(
+        &emu,
+        "apo-token-refused",
+        &format!("s3://{JOB_ABSENT_BUCKET}/apo-input/"),
+        &format!("s3://{JOB_BUCKET}/apo-output/"),
+        Some(token),
+    )
+    .await;
+    assert_eq!(
+        (refused.status, refused.error.as_deref()),
+        (400, Some("ValidationException")),
+        "the create naming an absent bucket must be refused, got {} {:?}",
+        refused.status,
+        refused.body
+    );
+
+    let accepted = create_optimization_job_with_token(
+        &emu,
+        "apo-token-accepted",
+        &format!("s3://{JOB_BUCKET}/apo-input/templates.jsonl"),
+        &format!("s3://{JOB_BUCKET}/apo-output/"),
+        Some(token),
+    )
+    .await;
+    assert_eq!(
+        accepted.status, 200,
+        "the create naming held locations must be accepted, got {} {:?}",
+        accepted.status, accepted.body
+    );
+    let read_back = read_optimization_job(&emu, &accepted.text("jobArn")).await;
+    assert_eq!(
+        read_back.text("jobName"),
+        "apo-token-accepted",
+        "the replayed token must mint the accepted job rather than answer with the refused \
+         one, got {:?}",
+        read_back.body
+    );
 }
 
 /// RULE: the pre-condition is the S3 model source's. Naming the artifacts the OTHER way —

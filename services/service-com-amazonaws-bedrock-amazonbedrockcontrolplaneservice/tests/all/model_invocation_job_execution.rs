@@ -460,7 +460,7 @@ fn run_rows() -> Vec<Row> {
             terminal_status: "Completed",
         },
         Row {
-            case: "two Claude records, one of which omits a member its family's request \
+            case: "two records, one of which omits a member its family's request \
                    schema requires, with the results at the bucket root",
             name: "batch-claude",
             model_id: "anthropic.claude-haiku-4-5-20251001-v1:0",
