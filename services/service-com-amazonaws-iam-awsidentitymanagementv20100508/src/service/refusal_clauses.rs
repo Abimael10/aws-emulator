@@ -9,8 +9,8 @@
 //! envelope, the member path and the requirement stay the framework's and cannot drift:
 //!
 //! * the VALUE half is dropped. A refusal of IAM's states the member and the requirement and
-//!   nothing the request carried — for a value outside a declared bound, outside an
-//!   enumerated set, outside the `@pattern` of a member of the input ITSELF, and for a SCALAR
+//!   nothing the request carried — for a value outside a declared bound, and, for a member of
+//!   the input ITSELF, outside an enumerated set or outside its `@pattern`; and for a SCALAR
 //!   member that was absent;
 //! * a `@pattern` requirement on a member of the input ITSELF quotes the expression the way
 //!   AWS publishes one for a member: without the pair of anchors the model writes around a
@@ -20,9 +20,13 @@
 //!   framework's own clause instead — the value it carried and the expression as the model
 //!   writes it — which is the clause this service answers one with
 //!   (`tests/all/nested_member_clause_wording.rs`,
-//!   `tests/all/server_certificate_untag_input_bounds.rs`);
+//!   `tests/all/server_certificate_untag_input_bounds.rs`). A value outside an enumerated
+//!   SET is split the same way, for the same reason: the value is dropped for a member of
+//!   the input itself and kept for a value reached inside one of its collections
+//!   (`tests/all/nested_enum_clause_wording.rs`);
 //! * an enumerated set is stated in the order IAM publishes for that enum
-//!   ([`PUBLISHED_ENUM_ORDERS`]) rather than the model's declaration order.
+//!   ([`PUBLISHED_ENUM_ORDERS`]) rather than the model's declaration order, wherever the
+//!   value sat.
 //!
 //! The one clause that KEEPS the `null` the framework writes is an absent member whose model
 //! type is a COLLECTION ([`names_a_collection`]): a list or a map has no scalar rendering, so
@@ -74,6 +78,24 @@ const PUBLISHED_ENUM_ORDERS: &[&[&str]] = &[
     // `Active, Inactive, Expired`). Every member of this service targeting that enum is
     // stated this way, since the order belongs to the enum rather than to one member.
     &["Expired", "Active", "Inactive"],
+    // The type of a context key a simulation is given (`iam#ContextKeyTypeEnum`, declared by
+    // the model as `string, stringList, numeric, numericList, boolean, booleanList, ip,
+    // ipList, binary, binaryList, date, dateList`), reached through the `ContextEntries` of
+    // both simulations.
+    &[
+        "binary",
+        "ipList",
+        "booleanList",
+        "ip",
+        "boolean",
+        "numericList",
+        "dateList",
+        "numeric",
+        "date",
+        "stringList",
+        "string",
+        "binaryList",
+    ],
 ];
 
 /// The order this service states the admissible set `allowed` in, or `None` when the
@@ -238,10 +260,21 @@ fn pattern_clause(violation: &Violation, pattern: &str) -> Option<String> {
     Some(stated.replace(pattern, &::service_common::validation::unanchored(pattern)))
 }
 
-/// The clause for a value outside an enumerated set: the member and the set, in the order
-/// IAM publishes it, and nothing of the value.
+/// The clause for a value outside an enumerated set: the member and the set in the order IAM
+/// publishes it, with nothing of the value for a member of the input ITSELF and the value as
+/// the framework states it for a value reached inside one of the input's collections.
+///
+/// The split is the one the `@pattern` class is restated under ([`pattern_clause`]): the two
+/// classes whose requirement states the admissible FORM of a value are restated for an
+/// input's own member alone, and a value reached through one of its collections keeps the
+/// framework's clause, the value it carried included. The published ORDER of the set is a
+/// property of the enum, so it is stated either way.
 fn enum_clause(violation: &Violation, allowed: &[String]) -> Option<String> {
-    let stated = without_the_value(violation)?;
+    let stated = if names_a_top_level_member(&violation.path) {
+        without_the_value(violation)?
+    } else {
+        violation.message()
+    };
     let Some(published) = published_enum_order(allowed) else {
         return Some(stated);
     };

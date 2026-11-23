@@ -98,7 +98,8 @@ pub struct SshPublicKeyRecord {
     /// [`name_key`] of the IAM user that holds the key.
     pub user_key: String,
     /// "The SSH public key" (`SSHPublicKey$SSHPublicKeyBody`), verbatim as the upload
-    /// carried it, so a later read reports the body the caller sent byte for byte.
+    /// carried it, which is what the upload's OWN response reports back. A later READ
+    /// reports the key itself rather than this text ([`body_in`](Self::body_in)).
     pub ssh_public_key_body: String,
     /// The DER `SubjectPublicKeyInfo` the body decodes to: what tells one key from
     /// another, independently of the encoding that carried it and of any comment on the
@@ -163,15 +164,13 @@ impl SshPublicKeyRecord {
     /// The key's body written in the encoding `encoding` names, or `None` for an encoding
     /// outside the value set `encodingType` declares.
     ///
-    /// A body already written in the encoding asked for is reported verbatim, so the key
-    /// the upload carried comes back byte for byte in its own encoding. In the OTHER
-    /// encoding the body is written out from the KEY the account holds — the DER
+    /// The body is written out from the KEY the account holds — the DER
     /// `SubjectPublicKeyInfo` every accepted body was reduced to — by the crates that
-    /// implement these formats, so one key renders alike however it arrived.
+    /// implement these formats, and never from the text that carried it: what the account
+    /// holds is a public key, so one key is reported alike however it arrived and nothing a
+    /// body carried BESIDE the key (the comment token an OpenSSH line may end with, the
+    /// label a PEM structure happened to be framed under) is reported back.
     pub fn body_in(&self, encoding: &str) -> Option<String> {
-        if body_encoding(&self.ssh_public_key_body) == Some(encoding) {
-            return Some(self.ssh_public_key_body.clone());
-        }
         match encoding {
             ENCODING_SSH => openssh_public_key_line(&self.subject_public_key_info),
             ENCODING_PEM => subject_public_key_info_pem(&self.subject_public_key_info),
@@ -444,22 +443,6 @@ fn spki_rsa_key(der: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
         key.modulus.as_bytes().to_vec(),
         key.public_exponent.as_bytes().to_vec(),
     ))
-}
-
-/// Which of the encodings `encodingType` names the body `ssh_public_key_body` is written
-/// in, or `None` when it is in neither.
-///
-/// Read by the crates that implement those formats, exactly as [`read_ssh_public_key`]
-/// reads the material itself: the question is what the text IS, not what it looks like.
-fn body_encoding(ssh_public_key_body: &str) -> Option<&'static str> {
-    let text = ssh_public_key_body.trim();
-    if ::ssh_key::PublicKey::from_openssh(text).is_ok() {
-        Some(ENCODING_SSH)
-    } else if ::pkcs1::der::Document::from_pem(text).is_ok() {
-        Some(ENCODING_PEM)
-    } else {
-        None
-    }
 }
 
 /// The OpenSSH `ssh-rsa` public key line for the key the DER `SubjectPublicKeyInfo`
