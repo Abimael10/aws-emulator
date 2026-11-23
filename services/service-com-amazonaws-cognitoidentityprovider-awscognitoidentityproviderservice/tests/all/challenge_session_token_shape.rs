@@ -64,7 +64,12 @@ const NEW_PASSWORD_REQUIRED: &str = "NEW_PASSWORD_REQUIRED";
 const MFA_SETUP: &str = "MFA_SETUP";
 
 /// The user every flow signs in as.
-const USERNAME: &str = "ada";
+///
+/// Long enough that "the token states nothing of the challenge" is a statement
+/// about a RENDERING rather than about a coincidence: a two- or three-character
+/// name turns up inside several hundred characters of opaque base64url material
+/// by chance, which says nothing about whether the server rendered it there.
+const USERNAME: &str = "ada-lovelace";
 
 /// The password an administrator creates the user with, which satisfies a
 /// default pool's password policy.
