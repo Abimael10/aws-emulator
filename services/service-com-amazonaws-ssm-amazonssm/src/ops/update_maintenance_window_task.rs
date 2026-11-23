@@ -1,15 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateMaintenanceWindowTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateMaintenanceWindowTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Modify a task already registered with a maintenance window — the edit half of this
+//! service's maintenance-window task slice. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateMaintenanceWindowTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! It writes the one store `RegisterTaskWithMaintenanceWindow` minted the task into and
+//! `GetMaintenanceWindowTask`/`DescribeMaintenanceWindowTasks` report it out of
+//! ([`crate::state::maintenance_window_tasks`]), so what this update persists is what a later
+//! read reports. Nothing about the task's identity moves: no input member carries the id, the
+//! window or the task type — "you can't change the task type" — so the update edits what the
+//! task RUNS and how, under the id the register minted.
+//!
+//! A task is addressed through its window, so BOTH ids are resolved against the Region's
+//! records: a window this endpoint holds none of, and a task that is no task of the window
+//! named, are each refused `DoesNotExistException` and nothing is written.
+//!
+//! "If the value for a parameter in UpdateMaintenanceWindowTask is null, then the
+//! corresponding field isn't modified", and under `Replace` "all fields required by the
+//! RegisterTaskWithMaintenanceWindow operation are required for this request. Optional fields
+//! that aren't specified are set to null" — the one reading of an omitted member every update
+//! of this service holds to ([`crate::state::replacing_update`]).
+//!
+//! The two bounds are read the way the register reads them: "for maintenance window tasks
+//! without a target specified, you can't supply a value for this option. Instead, the system
+//! inserts a placeholder value of 1" (`UpdateMaintenanceWindowTaskRequest$MaxConcurrency`), so
+//! a task the update leaves TARGETLESS holds that placeholder
+//! ([`crate::state::maintenance_window_tasks::held_bound`]) whatever the request stated.
 //!
 //! ## Shape of an operation
 //!
@@ -212,6 +229,22 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::maintenance_window_tasks as tasks;
+use crate::state::replacing_update::{
+    replace_requires_member_message, updated_member, updated_optional_member,
+};
+
+/// The member a replacing update must carry, in the spelling this service's refusals name a
+/// member in — its modelled name with a lowercase first letter.
+///
+/// "If you set Replace to true, then all fields required by the
+/// RegisterTaskWithMaintenanceWindow operation are required for this request": of the members
+/// this update carries, `TaskArn` is the one that register requires. The register's other
+/// required members — `WindowId` and `TaskType` — are not among them: `WindowId` is required
+/// here anyway and no input member of this update carries the task type at all ("you can't
+/// change the task type"), so a replacing update leaves the type the register persisted alone.
+const REPLACE_REQUIRED_MEMBER: &str = "taskArn";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -281,18 +314,148 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateMaintenanceWindowTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateMaintenanceWindowTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Both ids' presence, lengths and patterns, the `Targets` list's length, the two
+        // bounds' patterns, `Priority`'s range, `CutoffBehavior`'s enum and every other
+        // member's length are MODELLED constraints, so the centralized walk has already
+        // refused anything outside them: what is resolved here is which task the update edits.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateMaintenanceWindowTaskErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the maintenance window store is unavailable".to_string()),
+            })
+        })?;
+
+        // A replacing update that leaves out a member the register requires is missing a
+        // member it was required to carry — decided before anything is read, so such a
+        // request cannot touch the task.
+        let replace = input.replace.unwrap_or(false);
+        if replace && input.task_arn.is_none() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                replace_requires_member_message(REPLACE_REQUIRED_MEMBER),
+            ));
+        }
+
+        // A window and its tasks live in the Region the endpoint names, which is the signed
+        // credential scope's — so both ids are resolved against that Region's records.
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        if store
+            .maintenance_window(&region, &input.window_id)
+            .is_none()
+        {
+            return Err(UpdateMaintenanceWindowTaskErrorModeled::DoesNotExistException(
+                DoesNotExistException {
+                    message: Some(
+                        crate::state::maintenance_windows::maintenance_window_not_found_message(
+                            &input.window_id,
+                        ),
+                    ),
+                },
+            )
+            .into());
+        }
+        let held = store
+            .maintenance_window_task(&region, &input.window_id, &input.window_task_id)
+            .cloned();
+        let Some(mut record) = held else {
+            return Err(UpdateMaintenanceWindowTaskErrorModeled::DoesNotExistException(
+                DoesNotExistException {
+                    message: Some(tasks::task_not_found_message(
+                        &input.window_id,
+                        &input.window_task_id,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // Every member the request supplied is applied to the task the store holds, and every
+        // member it left out keeps the value that task holds — unless the update replaces the
+        // task, where a member left out is cleared to what a register that named it nothing
+        // would have persisted: nothing at all for a member a read reports only when a write
+        // set it, the empty list the modelled length admits for the targets, no parameters at
+        // all for the parameter map, and the documented default for the priority and the
+        // cutoff behaviour.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateMaintenanceWindowTask"))
+        // What the update does NOT touch is the task's identity — its minted id, its window,
+        // its Region, its task type and the idempotency token its register carried — nor when
+        // that register ran, which is the order a listing of the window's tasks walks them in.
+        record.targets = updated_member(input.targets, record.targets, Vec::new(), replace);
+        // The ARN is the one member a replacing update is required to carry, so it is never
+        // cleared: a replacement states it and a patch that leaves it out keeps what the task
+        // runs.
+        record.task_arn = input.task_arn.unwrap_or(record.task_arn);
+        record.service_role_arn =
+            updated_optional_member(input.service_role_arn, record.service_role_arn, replace);
+        record.task_parameters = updated_member(
+            input
+                .task_parameters
+                .map(|supplied| supplied.into_iter().collect()),
+            record.task_parameters,
+            ::std::collections::BTreeMap::new(),
+            replace,
+        );
+        // "When you update a maintenance window task that has options specified in
+        // TaskInvocationParameters, you must provide again all the TaskInvocationParameters
+        // values that you want to retain. The values you don't specify again are removed": a
+        // supplied structure stands for the WHOLE of them rather than being merged into what
+        // is stored.
+        record.task_invocation_parameters = updated_optional_member(
+            input.task_invocation_parameters,
+            record.task_invocation_parameters,
+            replace,
+        );
+        record.priority = updated_member(
+            input.priority,
+            record.priority,
+            tasks::DEFAULT_PRIORITY,
+            replace,
+        );
+        // The bounds are stated against the targets the task now has: a task the update
+        // leaves targetless holds the documented placeholder for both, whatever was stated.
+        let stated_concurrency =
+            updated_optional_member(input.max_concurrency, record.max_concurrency, replace);
+        let stated_errors = updated_optional_member(input.max_errors, record.max_errors, replace);
+        record.max_concurrency = tasks::held_bound(&record.targets, stated_concurrency);
+        record.max_errors = tasks::held_bound(&record.targets, stated_errors);
+        record.logging_info =
+            updated_optional_member(input.logging_info, record.logging_info, replace);
+        record.name = updated_optional_member(input.name, record.name, replace);
+        record.description = updated_optional_member(input.description, record.description, replace);
+        record.cutoff_behavior = updated_member(
+            input.cutoff_behavior,
+            record.cutoff_behavior,
+            tasks::DEFAULT_CUTOFF_BEHAVIOR.to_string(),
+            replace,
+        );
+        record.alarm_configuration = updated_optional_member(
+            input.alarm_configuration,
+            record.alarm_configuration,
+            replace,
+        );
+
+        // "The updated task ARN value", "the updated parameter values", "the updated
+        // MaxConcurrency value": what the update persisted, which is what a later read of this
+        // task reports. A member the task now carries nothing for is reported as nothing at
+        // all, the way a read of a task whose register named none of them does — except the
+        // priority, which the model states a default of 0 for and a read always reports.
+        let output = UpdateMaintenanceWindowTaskOutput {
+            window_id: Some(record.window_id.clone()),
+            window_task_id: Some(record.window_task_id.clone()),
+            targets: Some(record.targets.clone()),
+            task_arn: Some(record.task_arn.clone()),
+            service_role_arn: record.service_role_arn.clone(),
+            task_parameters: record.reported_task_parameters(),
+            task_invocation_parameters: record.task_invocation_parameters.clone(),
+            priority: record.priority,
+            max_concurrency: record.max_concurrency.clone(),
+            max_errors: record.max_errors.clone(),
+            logging_info: record.logging_info.clone(),
+            name: record.name.clone(),
+            description: record.description.clone(),
+            cutoff_behavior: Some(record.cutoff_behavior.clone()),
+            alarm_configuration: record.alarm_configuration.clone(),
+        };
+        store.insert_maintenance_window_task(record);
+        Ok(output)
     }
 }

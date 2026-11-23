@@ -3,10 +3,11 @@
 //! The TASKS registered with a maintenance window: "information about a task defined for a
 //! maintenance window" (`smithy_query(query="shape",shape="MaintenanceWindowTask")`).
 //!
-//! `RegisterTaskWithMaintenanceWindow` mints one and `GetMaintenanceWindowTask` reports it,
-//! both through the one store below
+//! `RegisterTaskWithMaintenanceWindow` mints one, `UpdateMaintenanceWindowTask` edits it and
+//! `GetMaintenanceWindowTask` reports it, all through the one store below
 //! ([`super::ComAmazonawsSsmAmazonssmState::maintenance_window_tasks`]), so whatever the
-//! register persisted is what a later read reports and what deleting the window removes.
+//! register and the updates persisted is what a later read reports and what deleting the
+//! window removes.
 //!
 //! A task belongs to ONE maintenance window of one Region — a window is reached through the
 //! endpoint of the Region it was created in — so the store is keyed by
@@ -136,9 +137,13 @@ pub fn target_referenced_message(window_task_id: &str) -> String {
     )
 }
 
-/// What `MaxConcurrency` or `MaxErrors` is HELD as, given the targets the register stated and
-/// the value it stated for the bound: a targetless task holds the documented placeholder
+/// What `MaxConcurrency` or `MaxErrors` is HELD as, given the targets the task now has and the
+/// value the request stated for the bound: a targetless task holds the documented placeholder
 /// ([`TARGETLESS_PLACEHOLDER`]) and a targeted one holds what was stated.
+///
+/// The register and the update read the bounds the same way, because the sentence is stated on
+/// both (`RegisterTaskWithMaintenanceWindowRequest$MaxConcurrency`,
+/// `UpdateMaintenanceWindowTaskRequest$MaxConcurrency`).
 #[must_use]
 pub fn held_bound(targets: &[Target], stated: Option<String>) -> Option<String> {
     if targets.is_empty() {
