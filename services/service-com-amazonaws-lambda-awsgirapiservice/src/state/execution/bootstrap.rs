@@ -1119,12 +1119,76 @@ def _frame_file(filename, library):
     return "%s/%s.py" % (library, path.replace(".", "/"))
 
 
+def _library_source(filename):
+    """The SOURCE of the standard-library module compiled under ``filename``, or ``None``
+    when the library this runtime ships holds no module under that name.
+
+    The modules of that library are compiled INTO this runtime rather than read off a path,
+    so a source lookup for one of them — a traceback rendering a frame, `inspect` reading a
+    definition — finds no file and comes back empty. The environment holds the library's own
+    text and answers for one module of it at a time, which is the same text those compiled
+    modules were built from.
+    """
+
+    # A module resolved from one of the MOUNTS names its own path, and its lines are cached
+    # when it is imported ([_PackageLoader.exec_module]); a pseudo-file is no module of the
+    # library at all.
+    if not filename or filename.startswith("/") or filename.startswith("<"):
+        return None
+    source = _host.library_source(filename)
+    if not source:
+        return None
+    return source
+
+
+def _install_library_lines():
+    """Make the modules of the runtime's own standard library READABLE to every source
+    lookup, the way a managed runtime's library directory is.
+
+    `linecache` is what the standard library looks a source line up through — a traceback
+    frame's own line, a definition `inspect` is asked for — so the library's text is given
+    to it rather than to one renderer: a frame inside the library then carries its source
+    line wherever a traceback is rendered, in the error document a failed invocation answers
+    with and in the records the invocation logs alike.
+
+    The cache is seeded as a module held in memory is, with no modification time, so the
+    entry is kept rather than dropped by a cache check that finds no file
+    ([_PackageLoader.exec_module]).
+    """
+
+    held = linecache.getlines
+
+    def getlines(filename, module_globals=None):
+        lines = held(filename, module_globals)
+        if lines:
+            return lines
+        source = _library_source(filename)
+        if source is None:
+            return lines
+        linecache.cache[filename] = (
+            len(source),
+            None,
+            source.splitlines(True),
+            _frame_file(filename, _PREPARED.get("library") or ""),
+        )
+        return linecache.cache[filename][2]
+
+    linecache.getlines = getlines
+
+
+# Installed with this runtime, before anything it could be asked for has run: the library's
+# own modules are readable from the first source lookup of the first invocation on.
+_install_library_lines()
+
+
 def _frames(trace, library):
     """One rendered frame per entry of ``trace``, as the error document carries them.
 
     A frame is its location line and the source line at that location, and nothing else:
     the fine-grained error-location anchors (the ``~`` and ``^`` run under the source
-    line) this interpreter can render are not part of the frame the runtime reports.
+    line) this interpreter can render are not part of the frame the runtime reports. That
+    holds for every frame of the stack, the ones inside the runtime's own standard library
+    included ([_install_library_lines]).
     """
 
     rendered = []

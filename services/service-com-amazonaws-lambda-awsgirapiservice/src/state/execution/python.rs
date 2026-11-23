@@ -36,16 +36,19 @@
 //!   one destination is an address this emulator itself opened a resource's data-plane
 //!   listener at — every other destination raises the error a host answers for it, and no name
 //!   but this machine's own resolves;
-//! * the only host functions the guest can call are the nine on [`HOST_MODULE`]: the
+//! * the only host functions the guest can call are the ones on [`HOST_MODULE`]: the
 //!   invocation log, a sleep clamped to what is left of the run, ONE AWS SDK call into this
 //!   same emulator ([`super::aws_api`], which decides which services are reachable, signs the
 //!   request itself and bounds it by what the run has left), the authentication token an
 //!   SDK mints in its client, the one request a handler sends itself, the one URL it has
 //!   signed, what a called operation's own model says about paging, the one call a handler
 //!   makes on a stream socket it opened ([`super::guest_socket`], which decides which
-//!   addresses are dialable and bounds every wait by what the run has left), and ONE
+//!   addresses are dialable and bounds every wait by what the run has left), ONE
 //!   checkpoint of the durable execution this run is the run of
-//!   ([`super::super::durable_steps`]). No host path,
+//!   ([`super::super::durable_steps`]), and the SOURCE of one module of the standard library
+//!   this runtime ships ([`super::python_library`], which is the text a frame inside that
+//!   library carries the line of, and which a real runtime keeps as a readable file of its own
+//!   library directory). No host path,
 //!   host environment variable, host credential or
 //!   other function's state is reachable from guest code, and NO bound of the run — no
 //!   deadline, no step count and no memory baseline — is reachable from it either: where one
@@ -1681,13 +1684,14 @@ fn clamp_recursion(vm: &VirtualMachine, limit: usize) -> PyResult<()> {
 
 /// The module the host functions live on, and the whole of what guest code can call of
 /// this process: `log`, `sleep`, `aws`, `db_auth_token`, `request`, `presign`, `pagination`,
-/// `net`, `durable` and `ephemeral` — the invocation log, a sleep clamped to what the run has left, ONE AWS SDK
+/// `net`, `durable`, `ephemeral` and `library_source` — the invocation log, a sleep clamped to what the run has left, ONE AWS SDK
 /// call into this same emulator, the authentication token an SDK mints in its client, the one
 /// request a handler sends itself, the one URL it has signed, what the called service's
 /// own model states about paging one operation through, the one call a handler makes on a
 /// stream socket it opened to a data-plane listener of this emulator, one checkpoint of
-/// the durable execution this invocation is the run of, and what the run wrote to the
-/// ephemeral storage its function is configured for. Nothing else of the
+/// the durable execution this invocation is the run of, what the run wrote to the
+/// ephemeral storage its function is configured for, and the source of one module of the
+/// standard library this runtime ships. Nothing else of the
 /// host is reachable from guest code, and nothing here moves a bound.
 ///
 /// Installed ONCE per execution environment, with its interpreter: every one of these
@@ -2088,6 +2092,27 @@ fn host_module(vm: &VirtualMachine, session: &Arc<Session>) -> PyResult<PyRef<Py
                 .into())
         },
     );
+    // The SOURCE of one module of the standard library this RUNTIME ships, which the runtime
+    // reads a traceback frame's own line out of ([`super::python_library`]). A managed runtime
+    // keeps that library as readable files of its own library directory, and the interpreter
+    // embedded here imports it from a frozen copy instead — compiled code with no text — so
+    // the text is held by the host and answered for the module a frame states it is in.
+    // Nothing is dispatched, no host path is opened and no bound is spent: it is the
+    // environment's own library, the same text the frozen code was compiled from.
+    set_function(
+        vm,
+        &module,
+        "library_source",
+        move |args: FuncArgs, vm: &VirtualMachine| {
+            let named: String = args.bind(vm)?;
+            // The seam is string-in, string-out: a name this library holds no module under
+            // answers the empty text, which is the frame having no line to show.
+            Ok(vm
+                .ctx
+                .new_str(super::python_library::library_source(&named).unwrap_or_default())
+                .into())
+        },
+    );
     // CHECKED, once for the whole surface: the runtime source is driven through these
     // functions, so one that did not take its place is reported here rather than left for
     // guest code to meet as a missing name.
@@ -2117,6 +2142,7 @@ const HOST_MODULE_FUNCTIONS: &[&str] = &[
     "net",
     "durable",
     "ephemeral",
+    "library_source",
 ];
 
 /// What the guest reads back from one AWS SDK call: the service's own answer, or the
@@ -2200,7 +2226,17 @@ fn signing_as_client(access: AwsAccess, credentials: Option<&str>) -> Result<Aws
 /// finds, so an absent one changes what `os` offers) and each one RAISES when it is
 /// called: a Lambda function in this emulator has no host filesystem and no host process
 /// to reach. Nothing here is a stub that pretends to have done the work.
+///
+/// The names that would end THIS PROCESS are refused here too (`_exit`, `abort`), beside the
+/// ones that would start or signal another (`fork`, `execv`, `kill`): the module this list
+/// narrows carries no such call today, and a refusal installed under the name is what keeps
+/// that true of an interpreter release that adds one — a guest call that ended the process
+/// would take every other invocation's run and every tenant's state with it, past every bound
+/// a run is held to. What a run may do to its own ENVIRONMENT is not on this list and is not
+/// host-reaching: the environment mapping, the working directory it reports and the random
+/// bytes it reads are answered from the environment's own memory ([`super::host_posix`]).
 const REFUSED_POSIX_CALLS: &[&str] = &[
+    "_exit", "abort",
     "access", "chdir", "chmod", "chown", "close", "closerange", "confstr", "cpu_count",
     "device_encoding", "dup", "dup2",
     "execv", "execve", "fchdir", "fchmod", "fchown", "fdatasync", "fdopen", "fork", "forkpty",
@@ -3579,6 +3615,7 @@ mod tests {
             "durable",
             "ephemeral",
             "error_shapes",
+            "library_source",
             "log",
             "net",
             "pagination",

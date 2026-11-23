@@ -369,6 +369,12 @@ simple-dns = "0.13"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+# The same interpreter standard library the dependency above freezes into the build, taken
+# here as TEXT: `build.rs` reads the modules of it that the frozen code objects were compiled
+# from, so a traceback frame inside one of them carries its source line
+# (`state::execution::python_library`). No feature of it is built here — only the constant
+# naming where that library is — and nothing is read while a function runs.
+rustpython-pylib = { version = "0.6" }
 
 [dev-dependencies]
 # The one integration-test target is rooted at tests/all/main.rs, which declares one module

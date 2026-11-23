@@ -34,7 +34,7 @@ use crate::invoke_request_id::{is_host_bound, one_invocation_stream_at_a_time};
 use crate::node_invoke_run::package;
 
 /// Where `CreateFunction` is bound.
-const FUNCTIONS_URI: &str = "/2015-03-31/functions";
+pub(crate) const FUNCTIONS_URI: &str = "/2015-03-31/functions";
 
 /// A SigV4 credential scope naming this service's signing name (`lambda`) in `us-east-1`.
 /// Nothing in it is verified: the harness turns request authentication off.
@@ -46,7 +46,7 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 const ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambda-exec";
 
 /// The `Runtime` every row runs.
-const PYTHON: &str = "python3.12";
+pub(crate) const PYTHON: &str = "python3.12";
 
 /// The directory the deployment package is mounted at, which is the prefix of the file every
 /// frame of the package's own modules names.
@@ -68,7 +68,7 @@ const SLOT_ATTEMPTS: usize = 6;
 const SLOT_RETRY_PAUSE: Duration = Duration::from_millis(150);
 
 /// One service mounted on its own engine, reached the way the production router reaches it.
-fn router_on(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
+pub(crate) fn router_on(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(engine)));
@@ -76,25 +76,25 @@ fn router_on(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
 }
 
 /// What a dispatched request answered.
-struct Answer {
-    status: u16,
-    body: bytes::Bytes,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: bytes::Bytes,
 }
 
 impl Answer {
-    fn json(&self) -> Value {
+    pub(crate) fn json(&self) -> Value {
         if self.body.is_empty() {
             return Value::Null;
         }
         serde_json::from_slice(&self.body).unwrap_or(Value::Null)
     }
 
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).to_string()
     }
 
     /// The frames of the stack a Python run reports, under `stackTrace`.
-    fn frames(&self) -> Vec<String> {
+    pub(crate) fn frames(&self) -> Vec<String> {
         self.json()
             .get("stackTrace")
             .and_then(Value::as_array)
@@ -110,7 +110,12 @@ impl Answer {
 }
 
 /// Dispatch one request.
-async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: &[u8]) -> Answer {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: &[u8],
+) -> Answer {
     let request = http::Request::builder()
         .method(method)
         .uri(format!("http://lambda.us-east-1.amazonaws.com{uri}"))
@@ -130,7 +135,7 @@ async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: &[u8])
 /// Create a function holding `entries`, configured with `handler`. The provisioning window
 /// the create documents is then waited out by polling each function for the `Active` state
 /// it owes ([`poll_until_active`]), so no row waits a fixed time.
-async fn create_function(
+pub(crate) async fn create_function(
     router: &MultiServiceRouter,
     name: &str,
     entries: &[(&str, &str)],
@@ -167,7 +172,7 @@ async fn create_function(
 ///
 /// Waits for the CONDITION rather than for a span, so a loaded or a fast host only changes
 /// how often it looks.
-async fn poll_until_active(router: &MultiServiceRouter, name: &str) {
+pub(crate) async fn poll_until_active(router: &MultiServiceRouter, name: &str) {
     let deadline = std::time::Instant::now() + ACTIVE_DEADLINE;
     loop {
         let read = call(
@@ -197,17 +202,17 @@ async fn poll_until_active(router: &MultiServiceRouter, name: &str) {
     }
 }
 
-/// `Invoke` on `name`, re-driven while the answer reports one of the emulator's own host
-/// bounds rather than what the run came to.
-async fn invoke(router: &MultiServiceRouter, name: &str) -> Answer {
+/// `Invoke` on `name` with `body`, re-driven while the answer reports one of the emulator's
+/// own host bounds rather than what the run came to.
+pub(crate) async fn invoke(router: &MultiServiceRouter, name: &str, body: &[u8]) -> Answer {
     let uri = format!("{FUNCTIONS_URI}/{name}/invocations");
-    let mut answered = call(router, "POST", &uri, b"{}").await;
+    let mut answered = call(router, "POST", &uri, body).await;
     for _ in 1..SLOT_ATTEMPTS {
         if !is_host_bound(answered.status, &answered.text()) {
             break;
         }
         tokio::time::sleep(SLOT_RETRY_PAUSE).await;
-        answered = call(router, "POST", &uri, b"{}").await;
+        answered = call(router, "POST", &uri, body).await;
     }
     answered
 }
@@ -305,13 +310,13 @@ fn frame_cases() -> Vec<FrameCase> {
 }
 
 /// The lines of one rendered frame, its trailing newline dropped.
-fn frame_lines(frame: &str) -> Vec<&str> {
+pub(crate) fn frame_lines(frame: &str) -> Vec<&str> {
     frame.strip_suffix('\n').unwrap_or(frame).split('\n').collect()
 }
 
 /// The file and the line number a frame's location line states, or `None` when the line is
 /// not one.
-fn located(line: &str) -> Option<(String, usize)> {
+pub(crate) fn located(line: &str) -> Option<(String, usize)> {
     let rest = line.strip_prefix("  File \"")?;
     let (file, rest) = rest.split_once("\", line ")?;
     let (number, _name) = rest.split_once(", in ")?;
@@ -349,7 +354,7 @@ async fn a_package_frame_carries_the_source_line_it_stands_on() {
             .map(|(path, source)| (format!("{TASK_ROOT}/{path}"), *source))
             .collect();
 
-        let answered = invoke(&router, &name).await;
+        let answered = invoke(&router, &name, b"{}").await;
         assert_eq!(
             answered.status,
             200,

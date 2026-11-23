@@ -95,6 +95,10 @@ pub mod python;
 /// names.
 mod python_release;
 
+/// The SOURCE of the standard library that interpreter ships, which a traceback frame inside
+/// one of its modules carries the line of.
+mod python_library;
+
 /// The execution ENVIRONMENTS this process keeps standing, which an invocation of an
 /// already-initialized one is served by.
 pub mod warm_pool;
