@@ -20,9 +20,13 @@
 //!   covering the field serves it, an explicit `Deny` over one field of a wildcard-allowed
 //!   API refuses it, and a caller no statement allows is refused too — a call that may reach
 //!   no field it selects is answered `401` with `UnauthorizedException` / "Permission
-//!   denied", and one that may reach some is served in part, the refused fields resolving to
-//!   nothing and reported as `Unauthorized` errors of their own path, with no resolver of
-//!   them run.
+//!   denied", named in the answer's own error-type field as well as in the error itself, and
+//!   one that may reach some is served in part, the refused fields resolving to nothing and
+//!   reported as `Unauthorized` errors of their own path, with no resolver of them run;
+//! * and whatever a template rendered is written out as the field's DECLARED type writes it:
+//!   a field of the `AWSJSON` scalar — "a JSON string. Any valid JSON construct" — answers
+//!   the JSON TEXT of the construct the response template produced, so a client reads the
+//!   echoed identity back by parsing that one string.
 //!
 //! Four services have to agree for that to hold — Cognito Identity vends the session, IAM
 //! holds the role and its policy, STS records the session and names its principal, and
@@ -35,9 +39,11 @@
 //! read in the response template, `$util` helpers over a map and a string, a `$util.error`,
 //! a helper that does not exist, and a `PIPELINE` resolver whose function is a template
 //! pair); the exchange a session comes from (an authenticated developer identity and an
-//! unauthenticated guest); and the policy in force on the caller (the field itself, the
+//! unauthenticated guest); the policy in force on the caller (the field itself, the
 //! API-wide wildcard, the wildcard with an explicit deny over the field, a grant over
-//! another field only, and no grant at all).
+//! another field only, and no grant at all); the DECLARED type of the field a template
+//! resolves (an object type, a scalar, and the `AWSJSON` scalar); and how many fields one
+//! call selects (one, two).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -93,9 +99,22 @@ type Who {\n  accountId: String\n  userArn: String\n  username: String\n  \
 \n\
 type Query {\n  \
   allowed: String\n  other: String\n  whoAmI: Who\n  \
+  identityJson: AWSJSON\n  otherJson: AWSJSON\n  \
   vtlLiteral: String\n  vtlEcho(text: String): String\n  vtlList: [Int]\n  \
   vtlBranch(flag: Boolean): String\n  vtlStash: String\n  vtlHelpers: String\n  \
   vtlRefused: String\n  vtlUnknownHelper: String\n  vtlPiped: String\n}\n";
+
+/// The two halves of the resolver the identity rows are resolved by, as the documented VTL
+/// form of one writes them: the request half renders the caller's identity as the payload the
+/// `NONE` data source answers with, and the response half renders that result as the value
+/// the field takes. `$context` is the long spelling of the reference `$ctx` abbreviates.
+const IDENTITY_REQUEST_TEMPLATE: &str =
+    r#"{"version": "2018-05-29", "payload": $util.toJson($context.identity)}"#;
+const IDENTITY_RESPONSE_TEMPLATE: &str = "$util.toJson($context.result)";
+
+/// The field of the answer AppSync names the class of a data-plane error in, beside the error
+/// itself; the service's own copy is `service::graphql_api::query`'s `ERROR_TYPE_FIELD`.
+const ERROR_TYPE_FIELD: &str = "x-amzn-errortype";
 
 /// The four services this rule spans, over ONE engine.
 fn build_router() -> MultiServiceRouter {
@@ -336,6 +355,18 @@ async fn post_published(
     body: &Value,
     fields: &[(&str, String)],
 ) -> (u16, Value) {
+    let (status, _, document) = post_published_answer(case, api, body, fields).await;
+    (status, document)
+}
+
+/// The same, answering the response FIELDS as well — the lowercase name of each, with its
+/// value — for a case that reads the class off the answer rather than out of its body.
+async fn post_published_answer(
+    case: &str,
+    api: &Api,
+    body: &Value,
+    fields: &[(&str, String)],
+) -> (u16, Vec<(String, String)>, Value) {
     let (authority, path) = published_parts(case, &api.graphql_uri);
     let port: u16 = authority
         .rsplit_once(':')
@@ -379,8 +410,22 @@ async fn post_published(
         .nth(1)
         .and_then(|code| code.parse().ok())
         .unwrap_or_else(|| panic!("case {case:?}: expected a status line, got {head:?}"));
+    let answered_fields: Vec<(String, String)> = head
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
+        .collect();
     let document = serde_json::from_str(payload).unwrap_or(Value::Null);
-    (status, document)
+    (status, answered_fields, document)
+}
+
+/// The value one field of an answer carries, or `None` when the answer states none.
+fn answered_field(fields: &[(String, String)], name: &str) -> Option<String> {
+    fields
+        .iter()
+        .find(|(field, _)| field == name)
+        .map(|(_, value)| value.clone())
 }
 
 /// The authority and the path of a published URL — what a client dials and what it asks for.
@@ -1049,4 +1094,218 @@ async fn a_call_selecting_a_permitted_and_a_refused_field_is_served_in_part() {
         }]),
         "case {case:?}: expected one error naming the refused field, got {answered}"
     );
+}
+
+#[tokio::test]
+async fn a_json_scalar_field_resolved_by_templates_answers_the_identity_its_request_half_echoed()
+{
+    let router = build_router();
+    let api = create_api(&router, "identity-json", "AWS_IAM").await;
+    for field in ["identityJson", "otherJson"] {
+        create_template_resolver(
+            &router,
+            &api.api_id,
+            field,
+            IDENTITY_REQUEST_TEMPLATE,
+            IDENTITY_RESPONSE_TEMPLATE,
+        )
+        .await;
+    }
+    let pool = create_pool(&router, "identity-json-pool").await;
+    put_role_policy(
+        &router,
+        &pool,
+        &field_policy(&[format!("{}/*", api.arn)], &[]),
+    )
+    .await;
+
+    /// One row: which exchange the session came from, the authentication type that exchange
+    /// publishes, and the fields the call selects — each of the `AWSJSON` scalar, so each
+    /// answers the JSON text of the identity the templates rendered.
+    struct Row {
+        case: &'static str,
+        authenticated: bool,
+        auth_type: &'static str,
+        query: &'static str,
+        selected: &'static [&'static str],
+    }
+    let rows: &[Row] = &[
+        Row {
+            case: "one json field, for a session vended to an authenticated identity",
+            authenticated: true,
+            auth_type: "authenticated",
+            query: "query { identityJson }",
+            selected: &["identityJson"],
+        },
+        Row {
+            case: "one json field, for a session vended to an unauthenticated guest",
+            authenticated: false,
+            auth_type: "unauthenticated",
+            query: "query { identityJson }",
+            selected: &["identityJson"],
+        },
+        Row {
+            case: "two json fields in one call, for an authenticated identity",
+            authenticated: true,
+            auth_type: "authenticated",
+            query: "query { identityJson otherJson }",
+            selected: &["identityJson", "otherJson"],
+        },
+        Row {
+            case: "two json fields in one call, for an unauthenticated guest",
+            authenticated: false,
+            auth_type: "unauthenticated",
+            query: "query { identityJson otherJson }",
+            selected: &["identityJson", "otherJson"],
+        },
+    ];
+    for row in rows {
+        let case = row.case;
+        let (access_key_id, identity_id) = if row.authenticated {
+            vend_authenticated_session(&router, &pool).await
+        } else {
+            vend_guest_session(&router, &pool).await
+        };
+        let (status, answered) = post_published(
+            case,
+            &api,
+            &json!({"query": row.query}),
+            &[("authorization", authorization(&access_key_id, "appsync"))],
+        )
+        .await;
+        assert_eq!(
+            (status, answered.get("errors")),
+            (200, None),
+            "case {case:?}: a field a template resolves must be served cleanly, got {status} \
+             and {answered}"
+        );
+        for field in row.selected {
+            // The field is declared `AWSJSON`, so what it answers is the JSON TEXT of the
+            // construct the response template produced — one string a client parses — and
+            // never the construct itself.
+            let text = answered["data"][field].as_str().unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: the {field} field must answer the json text of what the \
+                     template rendered, got {answered}"
+                )
+            });
+            let echoed: Value = serde_json::from_str(text).unwrap_or_else(|error| {
+                panic!(
+                    "case {case:?}: the {field} field's value must parse as json, got \
+                     {text:?} ({error})"
+                )
+            });
+            assert_eq!(
+                (
+                    echoed["cognitoIdentityId"].as_str(),
+                    echoed["cognitoIdentityPoolId"].as_str(),
+                    echoed["cognitoIdentityAuthType"].as_str(),
+                    echoed["accountId"].as_str(),
+                ),
+                (
+                    Some(identity_id.as_str()),
+                    Some(pool.pool_id.as_str()),
+                    Some(row.auth_type),
+                    Some(engine::EMULATOR_ACCOUNT_ID),
+                ),
+                "case {case:?}: expected the {field} field to echo the identity the session \
+                 was vended to, got {echoed}"
+            );
+            assert!(
+                echoed["userArn"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains(&format!("assumed-role/{}/", pool.role_name)),
+                "case {case:?}: expected the {field} field to echo the session's \
+                 assumed-role principal, got {echoed}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_class_of_an_iam_refusal_is_named_in_the_answer_as_well_as_in_its_error() {
+    let router = build_router();
+    let api = create_api(&router, "refusal-class", "AWS_IAM").await;
+    for field in ["identityJson", "otherJson"] {
+        create_template_resolver(
+            &router,
+            &api.api_id,
+            field,
+            IDENTITY_REQUEST_TEMPLATE,
+            IDENTITY_RESPONSE_TEMPLATE,
+        )
+        .await;
+    }
+    let pool = create_pool(&router, "refusal-class-pool").await;
+    let (access_key_id, _) = vend_guest_session(&router, &pool).await;
+
+    /// One row: the policy in force on the caller, and whether the call it makes is one the
+    /// caller may reach a field of at all.
+    struct Row {
+        case: &'static str,
+        allowed: Vec<String>,
+        denied: Vec<String>,
+        served: bool,
+    }
+    let rows: Vec<Row> = vec![
+        Row {
+            case: "a grant naming another field only",
+            allowed: vec![field_arn(&api, "otherJson")],
+            denied: Vec::new(),
+            served: false,
+        },
+        Row {
+            case: "an explicit deny over the selected field of a wildcard-allowed API",
+            allowed: vec![format!("{}/*", api.arn)],
+            denied: vec![field_arn(&api, "identityJson")],
+            served: false,
+        },
+        Row {
+            case: "a grant naming the selected field itself",
+            allowed: vec![field_arn(&api, "identityJson")],
+            denied: Vec::new(),
+            served: true,
+        },
+    ];
+    for row in &rows {
+        let case = row.case;
+        put_role_policy(&router, &pool, &field_policy(&row.allowed, &row.denied)).await;
+        let (status, fields, answered) = post_published_answer(
+            case,
+            &api,
+            &json!({"query": "query { identityJson }"}),
+            &[("authorization", authorization(&access_key_id, "appsync"))],
+        )
+        .await;
+        let named = answered_field(&fields, ERROR_TYPE_FIELD);
+        if row.served {
+            assert_eq!(
+                (status, answered.get("errors"), named.as_deref()),
+                (200, None, None),
+                "case {case:?}: a permitted field is served with no error class to name, got \
+                 {status}, {named:?} and {answered}"
+            );
+            assert!(
+                answered["data"]["identityJson"].is_string(),
+                "case {case:?}: expected the field's own value, got {answered}"
+            );
+            continue;
+        }
+        assert_eq!(
+            (status, named.as_deref()),
+            (401, Some(UNAUTHORIZED_ERROR_TYPE)),
+            "case {case:?}: a call the policies permit no field of is refused 401 naming its \
+             class, got {status}, {named:?} and {answered}"
+        );
+        assert_eq!(
+            (
+                answered["errors"][0]["errorType"].as_str(),
+                answered["errors"][0]["message"].as_str(),
+                answered.get("data"),
+            ),
+            (Some(UNAUTHORIZED_ERROR_TYPE), Some(PERMISSION_DENIED), None),
+            "case {case:?}: expected the authorization refusal and no data, got {answered}"
+        );
+    }
 }
