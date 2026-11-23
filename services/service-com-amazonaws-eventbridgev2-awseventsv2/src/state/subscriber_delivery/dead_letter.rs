@@ -116,7 +116,8 @@ const ABSENT_RESOURCE_CODES: [&str; 5] = [
 /// and the sentence that condition is stated with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Failure {
-    /// One of [`ACCESS_DENIED`] and [`DELIVERY_FAILED`].
+    /// One of [`ACCESS_DENIED`], [`RESOURCE_NOT_FOUND`] and
+    /// [`DELIVERY_FAILED`].
     code: &'static str,
     /// What the record says about the failure: the sentence AWS words for the
     /// condition, or the answer the target's service gave.

@@ -51,25 +51,25 @@ use eventsv2::ops::put_events::PutEvents;
 use eventsv2::ops::types::{
     CreateEventBusInput, CreateSubscriberInput, DescribeEventBusInput, Filter,
     FilterConfiguration, InvokeConfiguration, OnFailureConfiguration, PutEventsInput,
-    PutEventsRequestEntry,
+    PutEventsRequestEntry, RetryPolicy,
 };
 
 /// The account segment every emulated ARN carries.
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// The region every request below is signed for.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// How long a poll waits for a condition the emulator owes: far above the
 /// provisioning span a bus takes, so a loaded host has ample room.
-const PATIENCE: Duration = Duration::from_secs(30);
+pub(crate) const PATIENCE: Duration = Duration::from_secs(30);
 
 /// How long one pass of a poll sleeps before looking again.
-const POLL_INTERVAL: Duration = Duration::from_millis(25);
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// The service principal a role EventBridge V2 assumes trusts, and the other
 /// name the same service is written under — its regional endpoint prefix.
-const SERVICE_PRINCIPAL: &str = "events.amazonaws.com";
+pub(crate) const SERVICE_PRINCIPAL: &str = "events.amazonaws.com";
 /// See [`SERVICE_PRINCIPAL`].
 const ENDPOINT_PRINCIPAL: &str = "eventsv2.amazonaws.com";
 
@@ -81,7 +81,7 @@ const ROLE_POLICY_NAME: &str = "subscriber-delivery";
 /// whose only variable part is the target the delivery was for. Written out here
 /// rather than read from the service, so this suite pins the wording a client
 /// reads off the record.
-fn could_not_access(target_arn: &str) -> String {
+pub(crate) fn could_not_access(target_arn: &str) -> String {
     format!(
         "EventBridge could not access {target_arn}. Check that it exists and that the \
          subscriber's delivery role is allowed to access it."
@@ -90,13 +90,13 @@ fn could_not_access(target_arn: &str) -> String {
 
 /// The condition the record of a delivery the acting identity could not make
 /// carries, stated here for the same reason.
-const ACCESS_DENIED: &str = "ACCESS_DENIED";
+pub(crate) const ACCESS_DENIED: &str = "ACCESS_DENIED";
 
 /// The IAM action a delivery to a topic performs, and the one a delivery to a
 /// queue performs.
 const PUBLISH_ACTION: &str = "sns:Publish";
 /// See [`PUBLISH_ACTION`].
-const SEND_MESSAGE_ACTION: &str = "sqs:SendMessage";
+pub(crate) const SEND_MESSAGE_ACTION: &str = "sqs:SendMessage";
 
 // ---------------------------------------------------------------------------
 // The emulator and the wire harnesses
@@ -105,7 +105,7 @@ const SEND_MESSAGE_ACTION: &str = "sqs:SendMessage";
 /// EventBridge V2, Amazon SNS, Amazon SQS and IAM on ONE engine — the shape
 /// `core/router/src/lib.rs` mounts them in, which is what makes a handler's
 /// in-process callback reach the other services.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<InMemoryEngine> = Arc::new(InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -182,7 +182,12 @@ where
 }
 
 /// One awsJson1_0 call against Amazon SQS, requiring a 200.
-async fn sqs_ok(router: &MultiServiceRouter, operation: &str, body: &Value, case: &str) -> Value {
+pub(crate) async fn sqs_ok(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+    case: &str,
+) -> Value {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -312,7 +317,11 @@ fn xml_text(xml: &str, tag: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// A queue called `name`: its url, and the ARN a subscriber names it by.
-async fn given_queue(router: &MultiServiceRouter, case: &str, name: &str) -> (String, String) {
+pub(crate) async fn given_queue(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+) -> (String, String) {
     let created = sqs_ok(router, "CreateQueue", &json!({ "QueueName": name }), case).await;
     let url = created["QueueUrl"]
         .as_str()
@@ -379,7 +388,7 @@ async fn given_topic(
 /// `statements` as its one inline policy — or no policy at all where the row
 /// states none, which is the routine state of a role provisioned out of band.
 /// Answers the ARN IAM holds it under.
-async fn given_role(
+pub(crate) async fn given_role(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
@@ -423,7 +432,7 @@ async fn given_role(
 
 /// A bus called `name`, polled until it is `ACTIVE` — the state
 /// `CreateSubscriber` requires of it.
-async fn given_active_bus(router: &MultiServiceRouter, case: &str, name: &str) -> String {
+pub(crate) async fn given_active_bus(router: &MultiServiceRouter, case: &str, name: &str) -> String {
     let created = eventsv2_ok::<CreateEventBus<InMemoryEngine>>(
         router,
         &CreateEventBusInput {
@@ -461,20 +470,28 @@ async fn given_active_bus(router: &MultiServiceRouter, case: &str, name: &str) -
 }
 
 /// What one row's subscriber is created with.
-struct Wanted<'a> {
-    name: &'a str,
-    event_bus_arn: &'a str,
-    role_arn: &'a str,
-    target_arn: &'a str,
+pub(crate) struct Wanted<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) event_bus_arn: &'a str,
+    pub(crate) role_arn: &'a str,
+    pub(crate) target_arn: &'a str,
     /// The resource a failed delivery is recorded on, when the row names one.
-    on_failure_arn: Option<&'a str>,
+    pub(crate) on_failure_arn: Option<&'a str>,
     /// The pattern the subscriber's one `DATA`-scoped filter carries, when the
     /// row states one.
-    filter: Option<&'a str>,
+    pub(crate) filter: Option<&'a str>,
+    /// The `MaxRetryAttempts` of the subscriber's `RetryPolicy`, when the row
+    /// bounds its retries itself; `None` states no policy at all, which is held
+    /// to the member's own default.
+    pub(crate) retry_attempts: Option<i32>,
 }
 
 /// A subscriber as `wanted` describes it; answers its ARN.
-async fn given_subscriber(router: &MultiServiceRouter, case: &str, wanted: Wanted<'_>) -> String {
+pub(crate) async fn given_subscriber(
+    router: &MultiServiceRouter,
+    case: &str,
+    wanted: Wanted<'_>,
+) -> String {
     let created = eventsv2_ok::<CreateSubscriber<InMemoryEngine>>(
         router,
         &CreateSubscriberInput {
@@ -495,6 +512,10 @@ async fn given_subscriber(router: &MultiServiceRouter, case: &str, wanted: Wante
             on_failure_configuration: wanted.on_failure_arn.map(|arn| OnFailureConfiguration {
                 arn: Some(arn.to_string()),
             }),
+            retry_policy: wanted.retry_attempts.map(|attempts| RetryPolicy {
+                max_retry_attempts: Some(attempts),
+                ..Default::default()
+            }),
             client_token: Some(format!("token-for-{}", wanted.name)),
             ..Default::default()
         },
@@ -507,7 +528,7 @@ async fn given_subscriber(router: &MultiServiceRouter, case: &str, wanted: Wante
 }
 
 /// One event entry whose detail carries `kind`, which a row's filter selects on.
-fn entry(index: usize, kind: &str) -> PutEventsRequestEntry {
+pub(crate) fn entry(index: usize, kind: &str) -> PutEventsRequestEntry {
     PutEventsRequestEntry {
         source: "suite.topic-target".to_string(),
         detail_type: "Delivery".to_string(),
@@ -518,7 +539,7 @@ fn entry(index: usize, kind: &str) -> PutEventsRequestEntry {
 
 /// Publish `entries` onto `event_bus_arn`, requiring every entry to be
 /// accepted, and answer the `EventId` the publish reported for each.
-async fn publish(
+pub(crate) async fn publish(
     router: &MultiServiceRouter,
     case: &str,
     event_bus_arn: &str,
@@ -586,7 +607,7 @@ async fn one_pass(router: &MultiServiceRouter, case: &str, queue_url: &str) -> V
 /// many have been read under a generous deadline, and then one more pass, which
 /// must find nothing — a queue holding more than the rule allows is a failure
 /// too, and `expected` of 0 is asserted by that pass alone.
-async fn messages_on(
+pub(crate) async fn messages_on(
     router: &MultiServiceRouter,
     case: &str,
     queue_url: &str,
@@ -628,7 +649,7 @@ fn notification(case: &str, message: &Value) -> Value {
 }
 
 /// `text` as the document it is.
-fn document(case: &str, text: &str) -> Value {
+pub(crate) fn document(case: &str, text: &str) -> Value {
     serde_json::from_str(text).unwrap_or_else(|error| {
         panic!("case {case:?}: {text:?} is no document: {error}")
     })
@@ -724,6 +745,7 @@ async fn each_selected_event_reaches_the_topic_a_subscriber_targets_once() {
                 target_arn: &topic_arn,
                 on_failure_arn: None,
                 filter: row.filter,
+                retry_attempts: None,
             },
         )
         .await;
@@ -1044,6 +1066,7 @@ async fn a_delivery_the_subscribers_role_does_not_allow_reaches_nothing_and_is_r
                 target_arn: &target_arn,
                 on_failure_arn: Some(&dead_letter_arn),
                 filter: None,
+                retry_attempts: None,
             },
         )
         .await;
@@ -1189,6 +1212,7 @@ async fn a_failed_delivery_is_recorded_where_the_on_failure_configuration_names(
                 target_arn: &target_arn,
                 on_failure_arn: on_failure_arn.as_deref(),
                 filter: None,
+                retry_attempts: None,
             },
         )
         .await;
