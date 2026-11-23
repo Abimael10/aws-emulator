@@ -3,9 +3,12 @@
 //! @op ListCodegenJobs
 //! Reports one page of the codegen jobs stored for the app environment the request
 //! names, in start order, as the `CodegenJobSummary` projection. `nextToken` carries
-//! the app environment it was issued for and the cursor the next page resumes at; a
-//! token this operation never issued for that app environment is refused with the
-//! modelled `InvalidParameterException`.
+//! the app environment and the collection it was issued over and the cursor the next page
+//! resumes at: a token names a page of ONE collection of ONE app environment, so this list
+//! honours every token this service issued over that app environment's codegen jobs — the
+//! collection this list alone pages — and refuses any other, a token of another app
+//! environment or of another of this service's collections included, with the modelled
+//! `InvalidParameterException`.
 //!
 //! Like every codegen reader this settles first, so a page reports the status
 //! transitions the clock has already made due rather than moving a job because it
@@ -183,13 +186,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // One page of this app environment's codegen jobs, through the service's
         // one page walk (`crate::state::page_of`): it resumes where the token
         // says, serves at most `page_size` summaries and issues the token of the
-        // next page. A token this operation never issued — a malformed one, one
-        // issued while listing another app environment, one issued over another
-        // collection of this app environment, or one whose cursor is not among
-        // those handed out, whether above the highest or below the first — names
-        // no page, so it is refused rather than silently served as a page of
-        // this list. With no token at all the list starts at the first cursor
-        // the service ever hands out, i.e. at its head.
+        // next page. A token this service never issued over this app
+        // environment's codegen jobs — a malformed one, one issued while listing
+        // another app environment, one issued over another collection of this
+        // app environment, or one whose cursor is not among those handed out,
+        // whether above the highest or below the first — names no page, so it is
+        // refused rather than silently served as a page of this list. With no
+        // token at all the list starts at the first cursor the service ever
+        // hands out, i.e. at its head.
         let page = crate::state::page_of(
             store.codegen_jobs_in(&input.app_id, &input.environment_name),
             &key,

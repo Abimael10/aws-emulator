@@ -7,8 +7,11 @@
 //!
 //! The operation is `@readonly` and `@paginated(items: entities)` with no page-size
 //! member, so one page carries at most [`crate::state::EXPORT_PAGE_LIMIT`] components and
-//! `nextToken` resumes the same creation order. A token this operation never issued for
-//! that app environment is refused with the modelled `InvalidParameterException`.
+//! `nextToken` resumes the same creation order. A token names a page of ONE collection of
+//! ONE app environment, so this export honours every token this service issued over that
+//! app environment's components — the ones `ListComponents` hands out included — and
+//! refuses any other, a token of another app environment or of another of this service's
+//! collections included, with the modelled `InvalidParameterException`.
 //!
 //! ## Shape of an operation
 //!

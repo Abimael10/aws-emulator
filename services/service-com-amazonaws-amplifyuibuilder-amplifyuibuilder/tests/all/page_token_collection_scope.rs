@@ -19,11 +19,18 @@
 //! operation of the crate — the four lists and the three exports. Every case goes through
 //! the router: routing, deserialization, the handler, the persisted state and
 //! serialization.
+//!
+//! The second test drives the same rule from the other issuing side: a token an EXPORT
+//! hands out is honoured by the list of the collection it was served over, and refused by
+//! every operation paging another collection and by the same export addressing another app
+//! environment. Which OPERATION issued a token is not the discriminator — which collection
+//! of which app environment it was served over is.
 
 use std::sync::Arc;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
+use service_com_amazonaws_amplifyuibuilder_amplifyuibuilder::state::EXPORT_PAGE_LIMIT;
 use service_com_amazonaws_amplifyuibuilder_amplifyuibuilder::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -36,6 +43,11 @@ const SIGNED_FOR_AMPLIFYUIBUILDER: &str = "AWS4-HMAC-SHA256 \
 /// pattern `^d[a-z0-9]+$`.
 const APP_ID: &str = "d1234abcd";
 const ENVIRONMENT: &str = "staging";
+
+/// A second backend environment of the same app, whose pages are a different scope: a token
+/// names a page of one collection of ONE app environment, so the cases below present a
+/// token issued in `ENVIRONMENT` to the same operation addressing this one.
+const OTHER_ENVIRONMENT: &str = "production";
 
 /// How many records each collection holds: two, so a list of `maxResults=1` issues a token
 /// and the page that token resumes carries exactly the second record.
@@ -215,31 +227,53 @@ impl Collection {
         }
     }
 
-    /// Where this collection is created and listed.
-    fn list_uri(self) -> String {
+    /// Where this collection is created and listed in one backend environment of the app.
+    fn list_uri_in(self, environment: &str) -> String {
         format!(
-            "/app/{APP_ID}/environment/{ENVIRONMENT}/{segment}",
+            "/app/{APP_ID}/environment/{environment}/{segment}",
             segment = self.segment()
         )
     }
 
-    /// Where this collection is exported, for the three collections this service models an
-    /// export of: `ExportComponents`, `ExportForms` and `ExportThemes`. The codegen jobs
-    /// are paged by their list alone.
+    /// Where this collection is created and listed in the app environment the cases address.
+    fn list_uri(self) -> String {
+        self.list_uri_in(ENVIRONMENT)
+    }
+
+    /// The operation exporting this collection, for the three collections this service
+    /// models an export of: `ExportComponents`, `ExportForms` and `ExportThemes`. The
+    /// codegen jobs are paged by their list alone.
+    fn export_operation(self) -> Option<&'static str> {
+        match self {
+            Collection::Components => Some("ExportComponents"),
+            Collection::Forms => Some("ExportForms"),
+            Collection::Themes => Some("ExportThemes"),
+            Collection::CodegenJobs => None,
+        }
+    }
+
+    /// Where this collection is exported in one backend environment of the app.
+    fn export_uri_in(self, environment: &str) -> String {
+        format!(
+            "/export/app/{APP_ID}/environment/{environment}/{segment}",
+            segment = self.segment()
+        )
+    }
+
+    /// The export of this collection and where it is bound in the app environment the cases
+    /// address.
     fn export(self) -> Option<(&'static str, String)> {
-        let operation = match self {
-            Collection::Components => "ExportComponents",
-            Collection::Forms => "ExportForms",
-            Collection::Themes => "ExportThemes",
-            Collection::CodegenJobs => return None,
-        };
-        Some((
-            operation,
-            format!(
-                "/export/app/{APP_ID}/environment/{ENVIRONMENT}/{segment}",
-                segment = self.segment()
-            ),
-        ))
+        self.export_operation()
+            .map(|operation| (operation, self.export_uri_in(ENVIRONMENT)))
+    }
+
+    /// The list paging this collection, as a receiver a token can be presented to.
+    fn list_receiver(self) -> Receiver {
+        Receiver {
+            operation: self.list_operation(),
+            uri: self.list_uri(),
+            collection: self,
+        }
     }
 }
 
@@ -255,11 +289,7 @@ struct Receiver {
 fn receivers() -> Vec<Receiver> {
     let mut rows: Vec<Receiver> = Vec::new();
     for collection in COLLECTIONS {
-        rows.push(Receiver {
-            operation: collection.list_operation(),
-            uri: collection.list_uri(),
-            collection,
-        });
+        rows.push(collection.list_receiver());
         if let Some((operation, uri)) = collection.export() {
             rows.push(Receiver {
                 operation,
@@ -271,21 +301,34 @@ fn receivers() -> Vec<Receiver> {
     rows
 }
 
-/// Create one record of `collection` and report the id it was minted under.
-async fn create(router: &MultiServiceRouter, collection: Collection, index: usize) -> String {
+/// Create one record of `collection` in one backend environment of the app and report the
+/// id it was minted under.
+async fn create_in(
+    router: &MultiServiceRouter,
+    environment: &str,
+    collection: Collection,
+    index: usize,
+) -> String {
     let answer = call(
         router,
         "POST",
-        &collection.list_uri(),
+        &collection.list_uri_in(environment),
         Some(collection.create_payload(index)),
     )
     .await;
     assert_eq!(
         answer.status, 200,
-        "creating a {collection:?} record must answer HTTP 200, got {} with {:?}",
+        "creating a {collection:?} record in {environment} must answer HTTP 200, got {} with \
+         {:?}",
         answer.status, answer.body
     );
     answer.id()
+}
+
+/// Create one record of `collection` in the app environment the cases address and report the
+/// id it was minted under.
+async fn create(router: &MultiServiceRouter, collection: Collection, index: usize) -> String {
+    create_in(router, ENVIRONMENT, collection, index).await
 }
 
 /// The token the list of `collection` issues after its first record: a token the service
@@ -455,5 +498,175 @@ async fn a_page_token_names_a_page_of_the_collection_that_issued_it() {
              records, got {:?}",
             answer.entity_ids()
         );
+    }
+}
+
+/// How many records of one collection it takes for an EXPORT to issue a token: one past the
+/// bound an export page serves, so the first page ends before the last record and reports
+/// the token that resumes at it.
+const EXPORTED_RECORDS: usize = EXPORT_PAGE_LIMIT + 1;
+
+/// How many records each collection other than the one under test holds: enough for a page
+/// of its own, created AFTER the records under test, so their cursors sit above the one an
+/// export token carries — without the collection in the token's scope such a token would
+/// resume inside them and serve a page of records the export never paged.
+const OTHER_RECORDS: usize = 3;
+
+/// The same rule from the issuing side an export reaches: a token an EXPORT hands out names
+/// a page of the collection and app environment it was served over, so the list of that
+/// collection resumes at it exactly as the export does, and every operation paging another
+/// collection — or the same collection of another app environment — refuses it with the
+/// modelled `InvalidParameterException` (HTTP 400).
+///
+/// The rows differ in which collection issued the token (each of the three this service
+/// models an export of) and in which operation it is presented to (the four lists, the
+/// three exports, and the export of the same collection in a second app environment), so
+/// both operations paging one collection are covered as issuer and as receiver.
+#[tokio::test]
+async fn an_export_issued_page_token_is_honoured_by_the_list_of_the_same_collection() {
+    for subject in COLLECTIONS {
+        let Some((export_operation, export_uri)) = subject.export() else {
+            // Only a collection this service models an export of can issue a token from
+            // one: the codegen jobs are paged by their list alone.
+            continue;
+        };
+        // A fresh store per row, so the cursors of the records under test are the first
+        // ones the store hands out and the ones created after them sit above.
+        let router = emulator();
+        let mut created: Vec<String> = Vec::new();
+        for index in 0..EXPORTED_RECORDS {
+            created.push(create(&router, subject, index).await);
+        }
+        let mut elsewhere: Vec<(Collection, Vec<String>)> = Vec::new();
+        for collection in COLLECTIONS.into_iter().filter(|kind| *kind != subject) {
+            let mut ids: Vec<String> = Vec::new();
+            for index in 0..OTHER_RECORDS {
+                ids.push(create(&router, collection, index).await);
+            }
+            elsewhere.push((collection, ids));
+        }
+        for index in 0..OTHER_RECORDS {
+            create_in(&router, OTHER_ENVIRONMENT, subject, index).await;
+        }
+
+        // The export serves its own page bound and issues the token that resumes after it.
+        let first = call(&router, "GET", &export_uri, None).await;
+        assert_eq!(
+            first.status, 200,
+            "case {export_operation}: the first export page must be served, got {} with {:?}",
+            first.status, first.body
+        );
+        assert_eq!(
+            first.entity_ids(),
+            created[..EXPORT_PAGE_LIMIT].to_vec(),
+            "case {export_operation}: the first page must carry the first {EXPORT_PAGE_LIMIT} \
+             records in creation order, got {:?}",
+            first.entity_ids()
+        );
+        let token = first.next_token().unwrap_or_else(|| {
+            panic!(
+                "case {export_operation}: a first page of {EXPORTED_RECORDS} records must carry \
+                 a nextToken, got {:?}",
+                first.body
+            )
+        });
+
+        // The rest of the collection, which is what the token names: every operation that
+        // pages this collection must resume there — the export that issued it and the list
+        // beside it alike.
+        let rest: Vec<String> = created[EXPORT_PAGE_LIMIT..].to_vec();
+        for Receiver {
+            operation,
+            uri,
+            collection: _,
+        } in [
+            Receiver {
+                operation: export_operation,
+                uri: export_uri.clone(),
+                collection: subject,
+            },
+            subject.list_receiver(),
+        ] {
+            let case = format!("an {export_operation} token presented to {operation}");
+            let answer = call(&router, "GET", &format!("{uri}?nextToken={token}"), None).await;
+            assert_eq!(
+                answer.status, 200,
+                "case {case:?}: a token issued over the collection this operation pages must be \
+                 served, got {} with {:?}",
+                answer.status, answer.body
+            );
+            assert_eq!(
+                answer.entity_ids(),
+                rest,
+                "case {case:?}: the page must resume at the record the token names, got {:?}",
+                answer.entity_ids()
+            );
+            assert_eq!(
+                answer.next_token(),
+                None,
+                "case {case:?}: a page that ends the collection must carry no nextToken, got {:?}",
+                answer.body
+            );
+        }
+
+        // Every operation paging another collection, and the export of this collection in
+        // another app environment, names no page of that token and must refuse it rather
+        // than resume at a position of records it does not page.
+        let other_environment = Receiver {
+            operation: export_operation,
+            uri: subject.export_uri_in(OTHER_ENVIRONMENT),
+            collection: subject,
+        };
+        let refusing = receivers()
+            .into_iter()
+            .filter(|row| row.collection != subject)
+            .chain([other_environment]);
+        for Receiver { operation, uri, .. } in refusing {
+            let case = format!("an {export_operation} token presented to {uri}");
+            let answer = call(&router, "GET", &format!("{uri}?nextToken={token}"), None).await;
+            assert_eq!(
+                answer.status, 400,
+                "case {case:?}: a token this operation's collection never issued must be refused, \
+                 got {} with {:?}",
+                answer.status, answer.body
+            );
+            assert!(
+                !answer.has_entities(),
+                "case {case:?}: a refusal must carry no entities, got {:?}",
+                answer.body
+            );
+            assert_eq!(
+                answer.error_code(),
+                "",
+                "case {case:?}: a refusal must name no error type, got {:?}",
+                answer.body
+            );
+            let message = answer.message();
+            assert!(
+                message.contains(operation) && message.contains(token.as_str()),
+                "case {case:?}: the refusal must name the operation and the token it refuses, \
+                 got {message:?}"
+            );
+        }
+
+        // None of those refusals served or hid a page: each other collection still reports
+        // exactly its own records, in creation order.
+        for (collection, ids) in &elsewhere {
+            let Receiver { operation, uri, .. } = collection.list_receiver();
+            let answer = call(&router, "GET", &uri, None).await;
+            assert_eq!(
+                answer.status, 200,
+                "case {operation} after the refusals: a page with no token must be served, got {} \
+                 with {:?}",
+                answer.status, answer.body
+            );
+            assert_eq!(
+                &answer.entity_ids(),
+                ids,
+                "case {operation} after the refusals: the page must report this collection's own \
+                 records, got {:?}",
+                answer.entity_ids()
+            );
+        }
     }
 }
