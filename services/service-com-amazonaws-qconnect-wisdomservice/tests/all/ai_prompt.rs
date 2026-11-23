@@ -69,7 +69,7 @@ const ORIGIN_CUSTOMER: &str = "CUSTOMER";
 /// (`smithy_query(query="shape",shape="AIPromptType")`), written out here rather than
 /// imported from the implementation so the table spans the whole catalog — including the
 /// types no recording of this surface used.
-const PROMPT_TYPES: [&str; 12] = [
+pub(crate) const PROMPT_TYPES: [&str; 12] = [
     "ANSWER_GENERATION",
     "INTENT_LABELING_GENERATION",
     "QUERY_REFORMULATION",
@@ -87,7 +87,7 @@ const PROMPT_TYPES: [&str; 12] = [
 /// Every value the modelled `AIPromptAPIFormat` enumeration declares
 /// (`smithy_query(query="shape",shape="AIPromptAPIFormat")`): the two the model recommends
 /// and the two it documents as being deprecated, which the service still accepts.
-const API_FORMATS: [&str; 4] = [
+pub(crate) const API_FORMATS: [&str; 4] = [
     "MESSAGES",
     "TEXT_COMPLETIONS",
     "ANTHROPIC_CLAUDE_MESSAGES",
@@ -101,7 +101,7 @@ const TEMPLATE_TYPE_TEXT: &str = "TEXT";
 /// Model identifiers from the catalog `AIPromptData$modelId` documents
 /// (`smithy_query(query="doc",shape="AIPromptData",member="modelId")` lists seventeen),
 /// including entries no recording of this surface used.
-const MODEL_IDS: [&str; 4] = [
+pub(crate) const MODEL_IDS: [&str; 4] = [
     "anthropic.claude-3-haiku--v1:0",
     "us.amazon.nova-pro-v1:0",
     "eu.anthropic.claude-3-7-sonnet-20250219-v1:0",
@@ -135,7 +135,7 @@ const MAX_TOKENS_MAX: i64 = 4096;
 
 /// `CreateAIPrompt` on one assistant, as the model's URI binds it
 /// (`POST /assistants/{assistantId}/aiprompts`).
-async fn create_prompt(emulator: &Emulator, assistant: &str, body: Value) -> Reply {
+pub(crate) async fn create_prompt(emulator: &Emulator, assistant: &str, body: Value) -> Reply {
     emulator
         .send(
             "POST",
@@ -146,7 +146,7 @@ async fn create_prompt(emulator: &Emulator, assistant: &str, body: Value) -> Rep
 }
 
 /// `GetAIPrompt` (`GET /assistants/{assistantId}/aiprompts/{aiPromptId}`).
-async fn get_prompt(emulator: &Emulator, assistant: &str, prompt: &str) -> Reply {
+pub(crate) async fn get_prompt(emulator: &Emulator, assistant: &str, prompt: &str) -> Reply {
     emulator
         .send(
             "GET",
@@ -162,12 +162,17 @@ async fn get_prompt(emulator: &Emulator, assistant: &str, prompt: &str) -> Reply
 
 /// A YAML prompt template, as the member's own documentation describes it ("The YAML text
 /// for the AI Prompt template").
-fn template(text: &str) -> Value {
+pub(crate) fn template(text: &str) -> Value {
     json!({ "textFullAIPromptEditTemplateConfiguration": { "text": text } })
 }
 
 /// `UpdateAIPrompt` (`POST /assistants/{assistantId}/aiprompts/{aiPromptId}`).
-async fn update_prompt(emulator: &Emulator, assistant: &str, prompt: &str, body: Value) -> Reply {
+pub(crate) async fn update_prompt(
+    emulator: &Emulator,
+    assistant: &str,
+    prompt: &str,
+    body: Value,
+) -> Reply {
     emulator
         .send(
             "POST",
@@ -200,7 +205,12 @@ async fn delete_prompt(emulator: &Emulator, assistant: &str, prompt: &str) -> Re
 /// varies (`smithy_query(query="operation",operation="CreateAIPrompt")` marks `name`,
 /// `type`, `templateConfiguration`, `visibilityStatus`, `templateType`, `modelId` and
 /// `apiFormat` required).
-fn required(name: &str, prompt_type: &str, api_format: &str, visibility: &str) -> Value {
+pub(crate) fn required(
+    name: &str,
+    prompt_type: &str,
+    api_format: &str,
+    visibility: &str,
+) -> Value {
     json!({
         "name": name,
         "type": prompt_type,
@@ -1281,7 +1291,13 @@ fn label_forms(assistant_id: &str, prompt_id: &str) -> Vec<(String, String)> {
 /// The `AIPromptData` an update must answer with: every member it carried replaces the
 /// stored value, every other writable member is the one the previous answer reported, and
 /// the members the service owns — the ARN of the resource among them — are untouched.
-fn assert_applies_update(case: &str, what: &str, stored: &Value, update: &Value, reply: &Reply) {
+pub(crate) fn assert_applies_update(
+    case: &str,
+    what: &str,
+    stored: &Value,
+    update: &Value,
+    reply: &Reply,
+) {
     assert_eq!(
         reply.status, 200,
         "case {case:?}: {what} must be served, got HTTP {} with body {}",
@@ -1326,7 +1342,7 @@ fn assert_applies_update(case: &str, what: &str, stored: &Value, update: &Value,
 /// The record the update left, read back through `GetAIPrompt` however it is addressed: a
 /// read answers with that record, with the one member a read renders differently — the ARN
 /// it reports names the version it answered for.
-async fn assert_reads_the_update(
+pub(crate) async fn assert_reads_the_update(
     emulator: &Emulator,
     case: &str,
     assistant: &str,
