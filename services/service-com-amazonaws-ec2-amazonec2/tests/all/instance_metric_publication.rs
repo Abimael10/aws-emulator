@@ -342,16 +342,16 @@ pub(crate) async fn poll_until_reported(
 /// One datapoint as this suite asserts on it: the period it is stamped with, the unit it
 /// carries, how many observations it folded and what they averaged.
 #[derive(Debug, Clone, PartialEq)]
-struct Datapoint {
-    at: i64,
-    unit: String,
-    sample_count: f64,
-    average: f64,
+pub(crate) struct Datapoint {
+    pub(crate) at: i64,
+    pub(crate) unit: String,
+    pub(crate) sample_count: f64,
+    pub(crate) average: f64,
 }
 
 /// The datapoints of `metric` for `instance_id` inside `[start, end)`, read at one-minute
 /// granularity so every published period is visible on its own, oldest first.
-async fn datapoints(
+pub(crate) async fn datapoints(
     router: &MultiServiceRouter,
     case: &str,
     instance_id: &str,
@@ -416,11 +416,25 @@ fn window_start(at: i64, period: i64) -> i64 {
 /// suite's choosing: that is what lets one test cover ten periods of two cadences without
 /// waiting ten minutes for them.
 pub(crate) fn sample_the_span(engine: &engine::InMemoryEngine, base: i64) {
-    for minute in 0..SPAN_MINUTES {
+    sample_minutes(engine, base, 1..SPAN_MINUTES + 1);
+}
+
+/// The same sampling over an arbitrary run of `minutes` of the span based at `base`, each sample
+/// taken [`SAMPLE_OFFSET_SECS`] into the minute it names.
+///
+/// [`sample_the_span`] is this over the whole span. The run is a parameter so that a case can
+/// sample PART of a span, make a call that changes what the rest of it publishes, and go on
+/// sampling the same span — which is how the cadence a monitoring move switches is driven
+/// without waiting for those periods to pass.
+pub(crate) fn sample_minutes(
+    engine: &engine::InMemoryEngine,
+    base: i64,
+    minutes: std::ops::Range<i64>,
+) {
+    for minute in minutes {
         let at = UNIX_EPOCH
             + Duration::from_secs(
-                u64::try_from(base + (minute + 1) * MINUTE + SAMPLE_OFFSET_SECS)
-                    .unwrap_or_default(),
+                u64::try_from(base + minute * MINUTE + SAMPLE_OFFSET_SECS).unwrap_or_default(),
             );
         ec2::state::instance_telemetry::publish_instance_metrics_at(engine, at);
     }
