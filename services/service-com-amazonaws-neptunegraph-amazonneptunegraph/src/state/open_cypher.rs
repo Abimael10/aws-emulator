@@ -1,16 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The openCypher data plane: how a graph's STORED nodes and edges are read by the
-//! query engine, and how a result set and a refused query are reported.
+//! The READING half of the openCypher data plane: how a graph's STORED nodes and edges
+//! are read by the query engine, and how a result set and a refused query are reported.
 //!
 //! `ExecuteQuery` is the one operation that runs a caller-supplied query, and it runs it
-//! for real: the text is lexed and parsed by the `cypher-parser` crate's openCypher
-//! parser and evaluated by that crate's executor, which reads the graph ONLY through its
-//! [`GraphProvider`] trait. [`StoredGraph`] is this service's implementation of that
-//! trait over [`super::GraphData`], so a query answers from the same nodes and edges
-//! every other reading of the graph (a summary, an export, a restore) is computed from —
-//! there is no second copy of a graph's contents and nothing is synthesised to look
-//! computed.
+//! for real: a text whose clauses are all READING ones is lexed and parsed by the
+//! `cypher-parser` crate's openCypher parser and evaluated by that crate's executor,
+//! which reads the graph ONLY through its [`GraphProvider`] trait. [`StoredGraph`] is
+//! this service's implementation of that trait over [`super::GraphData`], so a query
+//! answers from the same nodes and edges every other reading of the graph (a summary, an
+//! export, a restore) is computed from — there is no second copy of a graph's contents
+//! and nothing is synthesised to look computed.
+//!
+//! A text carrying an UPDATING clause, or binding its data through `$name` parameters, is
+//! read and evaluated by the engine that has a production for it
+//! (`super::open_cypher_updates`) — over the same stored nodes and edges, and reported
+//! through the same failures and the same payload envelope ([`rows_payload`]). Which
+//! engine a text reaches is decided there, from a real parse of it.
 //!
 //! What the engine decides and what this module decides are kept apart:
 //!
@@ -30,11 +36,11 @@
 //! ## What a query may do
 //!
 //! The evaluation happens IN THIS PROCESS over the data it is handed and nothing else:
-//! the engine opens no socket, reads no file and starts nothing. Its grammar accepts
-//! only `MATCH`, `OPTIONAL MATCH`, `UNWIND` and `WITH` before a `RETURN`, so a query
-//! naming any other clause is reported as the clause this endpoint does not run
-//! ([`unsupported_clause`]) rather than as a text that does not parse, and a function it
-//! does not implement is refused by the engine itself.
+//! the engine opens no socket, reads no file and starts nothing. This engine's grammar
+//! accepts only `MATCH`, `OPTIONAL MATCH`, `UNWIND` and `WITH` before a `RETURN`, so a
+//! query naming a clause NEITHER of this data plane's engines runs is reported as the
+//! clause this endpoint does not run ([`unsupported_clause`]) rather than as a text that
+//! does not parse, and a function neither implements is refused by the engine itself.
 //!
 //! What a caller's query does choose is how much work it asks for, so every bound on
 //! that is stated here, on this side of the engine, and each is taken BEFORE the work it
@@ -467,9 +473,21 @@ pub enum QueryFailure {
     /// The result set is larger than this emulator answers with
     /// ([`MAX_QUERY_RESULT_ROWS`]).
     TooLarge { rows: usize, ceiling: usize },
-    /// The query names a clause this data plane's engine has no grammar for
+    /// The query names a clause this data plane runs through neither of its engines
     /// ([`UNSUPPORTED_CLAUSES`]).
     Unsupported { clause: &'static str },
+    /// The query asked for something the graph's own rules do not allow — a second
+    /// element under one id, an element named longer than one is held.
+    Constraint(String),
+    /// The query references a `$name` parameter the request's `parameters` did not carry,
+    /// so there is no data to bind it to.
+    MissingParameter(String),
+    /// The run, or the data it would have left behind, is past a ceiling this emulator
+    /// holds: the sentence states which.
+    OverLimit(String),
+    /// The run could not be carried out at all — a failure of this service rather than
+    /// anything the request said.
+    Interrupted(String),
     /// The evaluation was stopped before it had answered: it asked for more of the graph
     /// than one query may read, the span it was given ran out, or the query was
     /// cancelled.
@@ -644,19 +662,21 @@ fn character_nesting(query: &str) -> usize {
     deepest
 }
 
-/// The clause keywords this data plane's engine has no grammar for: openCypher's write
-/// clauses, which its own documentation states are "intentionally not supported", and the
-/// clauses that would reach outside the graph at all (a bulk load from a file, a
-/// procedure call).
+/// The clause keywords this data plane runs through NEITHER of its engines: the clauses
+/// that would reach outside the graph — a procedure call, a bulk load from a file — and
+/// the one that runs a clause per element of a list.
 ///
-/// Source: the clauses the engine's grammar accepts are `MATCH`, `OPTIONAL MATCH`,
-/// `UNWIND` and `WITH` before a `RETURN`, so every other clause keyword is outside it.
-/// They are listed here to say WHICH one a refused query named, because "this endpoint
-/// does not run that clause" and "this text is not a query" are different answers to the
-/// caller.
-const UNSUPPORTED_CLAUSES: &[&str] = &[
-    "CALL", "CREATE", "DELETE", "DETACH", "FOREACH", "LOAD", "MERGE", "REMOVE", "SET",
-];
+/// openCypher's updating clauses are NOT here: `ExecuteQuery` runs read and write
+/// openCypher (`smithy_query(query="doc",shape="ExecuteQuery")`), and a query carrying
+/// one is read and evaluated by the engine that has a production for it
+/// ([`super::beyond_the_reading_engine`]).
+///
+/// Source: the clauses either engine evaluates are `MATCH`, `OPTIONAL MATCH`, `UNWIND`,
+/// `WITH`, `CREATE`, `MERGE`, `SET`, `REMOVE` and `[DETACH] DELETE` before a `RETURN`, so
+/// every other clause keyword is outside both. They are listed here to say WHICH one a
+/// refused query named, because "this endpoint does not run that clause" and "this text
+/// is not a query" are different answers to the caller.
+const UNSUPPORTED_CLAUSES: &[&str] = &["CALL", "FOREACH", "LOAD"];
 
 /// The clause of [`UNSUPPORTED_CLAUSES`] `query` names, if it names one.
 ///
@@ -976,6 +996,16 @@ fn results_payload(result: &ResultSet, data: &GraphData) -> Vec<u8> {
             ::serde_json::Value::Object(object)
         })
         .collect();
+    rows_payload(&rows)
+}
+
+/// The `payload` carrying `rows`: `{"results": [ … ]}`, one object per row keyed by the
+/// query's own return items, in the order the evaluation produced them.
+///
+/// The one place the member a result set is carried in is spelled, so a query answered by
+/// either of this data plane's engines is answered in the same envelope.
+#[must_use]
+pub fn rows_payload(rows: &[::serde_json::Value]) -> Vec<u8> {
     ::serde_json::json!({ RESULTS_MEMBER: rows }).to_string().into_bytes()
 }
 
@@ -1099,18 +1129,33 @@ fn engine_expectation(message: &str) -> &str {
 /// position a parse stopped.
 const EXPECTED_PREFIX: &str = "expected ";
 
-/// One construct a query may continue with, as a refusal NAMES it and as the engine's
-/// grammar is ASKED about it.
+/// One construct a query may continue with, as a refusal NAMES it and as the grammar is
+/// ASKED about it.
 #[derive(Debug)]
 struct Continuation {
     /// How a refusal names this alternative: a literal token in quotes, as the grammar
-    /// spells it, and anything else by the construct it is.
+    /// spells it; a production of the grammar by the production's own name; and anything
+    /// else by the construct it is.
     name: &'static str,
-    /// The shortest text that starts this construct. It is appended to the text the
+    /// The shortest text that starts this construct, or EMPTY for a production decided by
+    /// the position alone (see [`Continuation::beside`]). It is appended to the text the
     /// parser had read and the whole is parsed again: the construct may stand at that
     /// position exactly when the parser reads past it rather than stopping where it
     /// stopped before.
+    ///
+    /// One construct may be asked about with SEVERAL probes — one entry each, under the
+    /// same name — because a construct can be reached from a position in more than one
+    /// way: a relationship pattern continues a pattern whose node pattern is complete,
+    /// and continues one whose node pattern is still open once that pattern is closed.
+    /// The alternative is listed once, at the first probe that reaches it.
     probe: &'static str,
+    /// The alternatives this one stands BESIDE: it is admitted exactly where every one of
+    /// them is.
+    ///
+    /// What a production with no text of its own is decided by — the grammar's own name
+    /// for a part of a construct that is admitted wherever the construct is, which a
+    /// parse cannot be asked about separately because the two start the same way.
+    beside: &'static [&'static str],
     /// Whether the probe is spelled as a WORD. A position that takes a variable takes
     /// every word, so naming each keyword there would say nothing about the grammar:
     /// these are asked about only where no variable may stand.
@@ -1120,13 +1165,19 @@ struct Continuation {
 impl Continuation {
     /// A construct named by what it is, or by the token it is, asked about everywhere.
     const fn construct(name: &'static str, probe: &'static str) -> Self {
-        Self { name, probe, a_word: false }
+        Self { name, probe, beside: &[], a_word: false }
+    }
+
+    /// A production of the grammar admitted wherever every alternative of `beside` is —
+    /// no text of its own is parsed for it (see [`Continuation::beside`]).
+    const fn production(name: &'static str, beside: &'static [&'static str]) -> Self {
+        Self { name, probe: "", beside, a_word: false }
     }
 
     /// A construct spelled as a word of the language, asked about only where a variable
     /// cannot stand (see [`Continuation::a_word`]).
     const fn keyword(name: &'static str) -> Self {
-        Self { name, probe: name, a_word: true }
+        Self { name, probe: name, beside: &[], a_word: true }
     }
 }
 
@@ -1134,15 +1185,28 @@ impl Continuation {
 /// are asked about at all.
 const VARIABLE_PROBE: &str = "variable";
 
+/// How a refusal names the two alternatives that stand beside the parts of a NODE
+/// PATTERN: the keyword a node pattern's own continuation is spelled with, and the map
+/// form of the properties production.
+const COPY_ALTERNATIVE: &str = "COPY";
+const MAP_LITERAL_ALTERNATIVE: &str = "MapLiteral";
+
+/// How a refusal names the parts of a node pattern the two above stand beside.
+const NODE_LABELS_ALTERNATIVE: &str = "node labels";
+const PROPERTIES_ALTERNATIVE: &str = "a property map";
+const CLOSE_PAREN_ALTERNATIVE: &str = "')'";
+
 /// Every construct one position of a query is asked about, in the order a refusal lists
 /// them.
 ///
-/// Source: the constructs of the openCypher grammar the engine reads — the two forms of
-/// text a parse skips (whitespace and a comment), the parts a pattern is built from
-/// (`Variable`, `NodeLabels`, `Properties`, `NodePattern`, `RelationshipPattern`), the
-/// literals an expression is written with, the tokens that close or continue one, and
-/// the clause and operator keywords of the read-only subset this engine accepts (see the
-/// module docs, and [`UNSUPPORTED_CLAUSES`] for the clauses outside it).
+/// Source: the constructs of the openCypher grammar this service's parser reads — the two
+/// forms of text a parse skips (whitespace and a comment), the parts a pattern is built
+/// from (`Variable`, `NodeLabels`, `Properties`/`MapLiteral`, `NodePattern`,
+/// `RelationshipPattern`), the keyword a node pattern's own continuation is spelled with,
+/// the literals an expression is written with, the tokens that close or continue one, and
+/// the clause and operator keywords of the subset the reading engine accepts (see the
+/// module docs, and [`UNSUPPORTED_CLAUSES`] for the clauses outside both engines). Each is
+/// named as the grammar spells it: a production by its own name, a token in quotes.
 ///
 /// WHICH of them may stand at a given position is not stated here and could not be: it
 /// is decided by parsing the caller's own text with each probe appended
@@ -1151,15 +1215,20 @@ const VARIABLE_PROBE: &str = "variable";
 const CONTINUATIONS: &[Continuation] = &[
     Continuation::construct("whitespace", " "),
     Continuation::construct("comment", "/* comment */"),
+    Continuation::production(
+        COPY_ALTERNATIVE,
+        &[NODE_LABELS_ALTERNATIVE, CLOSE_PAREN_ALTERNATIVE],
+    ),
     Continuation::construct("a variable", VARIABLE_PROBE),
-    Continuation::construct("node labels", ":Label"),
-    Continuation::construct("a property map", "{ key: 0 }"),
-    Continuation::construct("a node pattern", "(node)"),
+    Continuation::construct(NODE_LABELS_ALTERNATIVE, ":Label"),
+    Continuation::construct(PROPERTIES_ALTERNATIVE, "{ key: 0 }"),
+    Continuation::construct(CLOSE_PAREN_ALTERNATIVE, ")"),
+    Continuation::production(MAP_LITERAL_ALTERNATIVE, &[PROPERTIES_ALTERNATIVE]),
     Continuation::construct("a relationship pattern", "-[relationship]->(node)"),
+    Continuation::construct("a node pattern", "(node)"),
     Continuation::construct("a number", "0"),
     Continuation::construct("a string", "'text'"),
     Continuation::construct("a list", "[0]"),
-    Continuation::construct("')'", ")"),
     Continuation::construct("']'", "]"),
     Continuation::construct("'}'", "}"),
     Continuation::construct("','", ","),
@@ -1178,16 +1247,21 @@ const CONTINUATIONS: &[Continuation] = &[
     Continuation::keyword("AND"),
     Continuation::keyword("OR"),
     Continuation::keyword("NOT"),
+    // A relationship pattern also continues a pattern whose node pattern is still open,
+    // once that node pattern is closed, so the position inside one admits it too — last,
+    // because it is reached through the close of the pattern the position is inside.
+    Continuation::construct("a relationship pattern", ")-[relationship]->(node)"),
 ];
 
-/// What the engine's grammar allows at `offset` of `query`, worded as a refusal lists
+/// What the grammar allows at `offset` of `query`, worded as a refusal lists
 /// alternatives: `a, b or c`.
 ///
 /// The question is asked of the PARSER, never answered from a table: the text the parser
-/// had already read is `query` up to `offset`, so each construct of [`CONTINUATIONS`] is
+/// had already read is `query` up to `offset`, so each probe of [`CONTINUATIONS`] is
 /// appended to exactly that text and the whole is parsed again ([`continues`]). What
 /// comes back is the set of constructs the grammar can continue the caller's own text
-/// with at that position — the ones the parse that failed was looking for.
+/// with at that position — the ones the parse that failed was looking for — and then the
+/// productions that stand beside them, which are admitted exactly where they are.
 ///
 /// `None` when the grammar admits nothing there, which is what a text the lexer itself
 /// could not read looks like: there is then no alternative to list, and the engine's own
@@ -1204,12 +1278,37 @@ pub fn expected_alternatives(query: &str, offset: usize) -> Option<String> {
         return None;
     }
     let a_variable_fits = continues(read, VARIABLE_PROBE);
-    let named: Vec<&'static str> = CONTINUATIONS
+    // Which PROBE reached its construct, asked one parse at a time; a construct asked
+    // about with several probes is reached by the first of them that gets past.
+    let reached: Vec<bool> = CONTINUATIONS
         .iter()
-        .filter(|continuation| !(continuation.a_word && a_variable_fits))
-        .filter(|continuation| continues(read, continuation.probe))
-        .map(|continuation| continuation.name)
+        .map(|continuation| {
+            !continuation.probe.is_empty()
+                && !(continuation.a_word && a_variable_fits)
+                && continues(read, continuation.probe)
+        })
         .collect();
+    let admitted: Vec<&'static str> = CONTINUATIONS
+        .iter()
+        .zip(&reached)
+        .filter(|(_, reached)| **reached)
+        .map(|(continuation, _)| continuation.name)
+        .collect();
+    let mut named: Vec<&'static str> = Vec::new();
+    for (at, continuation) in CONTINUATIONS.iter().enumerate() {
+        let listed = if continuation.probe.is_empty() {
+            !continuation.beside.is_empty()
+                && continuation
+                    .beside
+                    .iter()
+                    .all(|beside| admitted.contains(beside))
+        } else {
+            reached.get(at).copied().unwrap_or_default()
+        };
+        if listed && !named.contains(&continuation.name) {
+            named.push(continuation.name);
+        }
+    }
     match named.split_last() {
         None => None,
         Some((last, [])) => Some((*last).to_string()),
@@ -1647,26 +1746,32 @@ mod tests {
         }
     }
 
-    /// RULE: a well-formed query naming a clause the engine has no grammar for is
-    /// reported as THAT clause, not as a text that does not parse — and a word that is
-    /// not a clause (a property name, a map key, a word inside a string or a comment) is
-    /// not one.
+    /// RULE: a well-formed query naming a clause NEITHER of this data plane's engines
+    /// runs is reported as THAT clause, not as a text that does not parse — and a word
+    /// that is not a clause (a property name, a map key, a word inside a string or a
+    /// comment) is not one. An UPDATING clause is not one of them: it is a clause this
+    /// endpoint runs (`super::beyond_the_reading_engine`).
     #[test]
     fn a_clause_the_engine_does_not_run_is_named() {
         // (case, the query, the clause it names)
         let rows: &[(&str, &str, Option<&str>)] = &[
-            ("a create", "CREATE (n:Person) RETURN n", Some("CREATE")),
-            ("a merge", "MERGE (n:Person) RETURN n", Some("MERGE")),
+            ("a create", "CREATE (n:Person) RETURN n", None),
+            ("a merge", "MERGE (n:Person) RETURN n", None),
             (
                 "a write to a property",
                 "MATCH (n) SET n.name = 'a' RETURN n",
-                Some("SET"),
+                None,
             ),
-            ("a delete", "MATCH (n) DELETE n RETURN n", Some("DELETE")),
+            ("a delete", "MATCH (n) DELETE n RETURN n", None),
             (
                 "a detach delete",
                 "MATCH (n) DETACH DELETE n RETURN n",
-                Some("DETACH"),
+                None,
+            ),
+            (
+                "a clause per element of a list",
+                "MATCH (n) FOREACH (x IN [1] | SET n.seen = x) RETURN n",
+                Some("FOREACH"),
             ),
             (
                 "a procedure call",
@@ -1852,6 +1957,38 @@ mod tests {
             assert!(
                 worded.contains(&expected),
                 "case {case:?}: expected {expected:?} in the refusal, got {worded:?}"
+            );
+        }
+    }
+
+    /// RULE: what a refusal lists as expected is the GRAMMAR's answer for that one
+    /// position — the constructs a parse of the caller's own text can continue with
+    /// there, and the productions that stand beside them — each named as the grammar
+    /// names it, in the order the grammar lists them. The position inside an unclosed
+    /// node pattern is the one every part of a node pattern is admitted at.
+    #[test]
+    fn the_alternatives_of_one_position_are_named_as_the_grammar_names_them() {
+        // The alternatives of a node-pattern position, in order. Source: the parts of the
+        // openCypher `NodePattern` production — the text a parse skips, the keyword a node
+        // pattern's own continuation is spelled with, `NodeLabels`, `Properties` and its
+        // `MapLiteral` form, the token that closes the pattern — plus the
+        // `RelationshipPattern` the pattern may continue into once it is closed.
+        let node_pattern_position = "whitespace, comment, COPY, node labels, a property \
+                                     map, ')', MapLiteral or a relationship pattern";
+        // (case, the text, the offset a parse of it stops at)
+        let rows: &[(&str, &str, usize)] = &[
+            ("an unclosed node pattern", "MATCH (n RETURN n", 9),
+            // The same position in another text, reached another way: the defect is the
+            // same one, so the grammar's answer is the same list.
+            ("an unclosed node pattern of a longer query", "MATCH (a)-[:R]->(b LIMIT 1", 19),
+        ];
+        for (case, query, offset) in rows {
+            let listed = expected_alternatives(query, *offset).unwrap_or_else(|| {
+                panic!("case {case:?}: expected the grammar to admit something at {offset}")
+            });
+            assert_eq!(
+                listed, node_pattern_position,
+                "case {case:?}: expected the node pattern's own alternatives, got {listed:?}"
             );
         }
     }

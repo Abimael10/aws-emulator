@@ -70,6 +70,20 @@ oxrdf = "0.3"
 # on what one query may read, nest, be handed and answer with is stated on this side of
 # it, and `tests/all/execute_query_data_plane.rs` pins that surface over the wire.
 cypher-parser = { version = "0.8", default-features = false }
+# `opencypher`: the openCypher parser the UPDATING half of the data plane reads a query
+# with. Its typed AST carries the productions `cypher-parser`'s read-only grammar has
+# none for — the updating clauses (CREATE, MERGE, SET, REMOVE, DELETE) and the `$name`
+# parameter references a request binds data through — so which engine evaluates a query
+# is decided from this parse (`src/state/open_cypher_updates.rs`). Taken with NO
+# features, so nothing optional is pulled in.
+opencypher = { version = "0.1", default-features = false }
+# The openCypher engine that EVALUATES those queries: Neptune's other openCypher query
+# endpoint (`neptunedata`) owns one engine over a property graph — parameters bound as
+# data, the updating clauses applied to the graph, every bound on what one run may spend
+# — and Neptune Analytics' data plane runs the SAME language, so this crate evaluates
+# through that engine over its own stored nodes and edges rather than carrying a second
+# copy of it. The adapter is `src/state/open_cypher_updates.rs`.
+service-com-amazonaws-neptunedata-amazonneptunedataplane = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

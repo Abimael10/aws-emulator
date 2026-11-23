@@ -1,24 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ExecuteQuery
-//! IMPLEMENTED: runs the caller's openCypher query against the graph's STORED nodes and
-//! edges and answers the result set, after the three decisions AWS takes ahead of it —
-//! whether the caller's IAM policies allow a query at all, whether the graph's own data
-//! plane is serving, and whether the query text parses.
+//! IMPLEMENTED: runs the caller's openCypher query — READING and WRITING — against the
+//! graph's STORED nodes and edges and answers the result set, after the three decisions
+//! AWS takes ahead of it: whether the caller's IAM policies allow a query at all, whether
+//! the graph's own data plane is serving, and whether the query text parses.
 //!
 //! An accepted query is also ADMITTED to the store as a query in flight on its graph, so
 //! the three operations that report a graph's queries (`ListQueries`, `GetQuery`,
 //! `CancelQuery`) can see it, stop it and then refuse the id it has stopped under: the
 //! record carries the text the caller sent and the span the run was given, it is in
 //! flight for as long as the clock owes that run (`crate::state::QUERY_RUN_SPAN`), and an
-//! accepted cancel stops the evaluation itself rather than only the record.
+//! accepted cancel ends the record and, where the engine reading the query takes a
+//! cancellation, the evaluation with it.
 //!
-//! The query is lexed, parsed and evaluated by the `cypher-parser` crate, which reads
-//! the graph only through the trait `crate::state::StoredGraph` implements over the
-//! stored data: nothing here interprets the query text itself, and nothing is
-//! synthesised to look computed. The engine's own subset is read-only openCypher, so a
-//! query it cannot read is refused with the position it could not read it at and the
-//! constructs its grammar could have continued the text with there.
+//! The query text is read and evaluated by a real openCypher engine over the graph's own
+//! stored data — nothing here interprets the query text itself, and nothing is
+//! synthesised to look computed. Which engine reads it follows from what it SAYS
+//! (`crate::state::evaluate_query`): a text whose clauses only read the graph is lexed,
+//! parsed and evaluated by the `cypher-parser` crate through the trait
+//! `crate::state::StoredGraph` implements over the stored data, and a text carrying an
+//! updating clause (`CREATE`, `MERGE`, `SET`, `REMOVE`, `[DETACH] DELETE`) or binding its
+//! data through `$name` parameters is evaluated by the engine that covers those
+//! (`crate::state::open_cypher_updates`), which commits what it wrote under the store's
+//! guard. A text NEITHER can read is refused with the position it could not be read at
+//! and the constructs the grammar could have continued it with there.
 //!
 //! ## Shape of an operation
 //!
@@ -237,30 +243,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The query runs on the graph's OWN data endpoint — this operation is bound to
         // the host prefix `{graphIdentifier}.`
-        // (`smithy_query(query="operation",operation="ExecuteQuery")` -> endpoint) — and
-        // that endpoint is registered only while the graph is serving
-        // (`crate::state::GraphStatus::is_serving`). So a graph this Region does not
-        // hold and a graph that is not serving yet (or no longer) are the same fact for
-        // a query: there is no data plane at that address, which is the missing resource
-        // the 404 reports. The sole write the lookup makes is materialising the status
-        // transition the clock had already made due, which was owed whether or not
-        // anybody queried.
+        // (`smithy_query(query="operation",operation="ExecuteQuery")` -> endpoint). Two
+        // DIFFERENT facts can stop a query there, and each is reported as what it is:
+        //
+        // * this Region holds no graph under that identifier, so there is no graph to
+        //   address at all — the missing resource the 404 reports;
+        // * the graph EXISTS and its data plane is not serving (it is still coming up, is
+        //   reconfiguring, is stopping or is stopped). The graph is still there — a read of
+        //   it answers, and starting it brings the data plane back — so the query is
+        //   refused as the server-side "not serving right now" it is
+        //   (`crate::scaffolded::GRAPH_UNAVAILABLE_CODE`), which a client retries, rather
+        //   than as a resource that is gone, which it cleans up after. Nothing about the
+        //   graph is touched, so a start followed by the same query runs it.
+        //
+        // The sole write the lookup makes is materialising the status transition the clock
+        // had already made due, which was owed whether or not anybody queried.
         //
         // The query is then evaluated over a SNAPSHOT of the graph's data, taken here and
         // read with the store's guard already GIVEN UP — the guard is released at the end
         // of this block: an evaluation walks every node and edge the pattern reaches, and
-        // no other caller of this service waits on it.
+        // no other caller of this service waits on it. A query that WRITES takes the guard
+        // again for its own evaluation (`crate::state::evaluate_query`).
         let (graph_id, data) = {
             let (mut store, now) = crate::state::locked_store_now(&state);
-            let serving = store
-                .settled_graph(&input.graph_identifier, &region, now)
-                .filter(|graph| graph.status.is_serving());
-            let Some(graph) = serving else {
+            let Some(graph) = store.settled_graph(&input.graph_identifier, &region, now) else {
                 return Err(ExecuteQueryErrorModeled::ResourceNotFoundException(
                     crate::state::graph_not_found(&input.graph_identifier),
                 )
                 .into());
             };
+            if !graph.status.is_serving() {
+                return Err(crate::scaffolded::Scaffolded::graph_unavailable());
+            }
             (graph.id.clone(), graph.data.clone())
         };
 
@@ -277,6 +291,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // "The data parameters the query can use in JSON format"
+        // (`smithy_query(query="operation",operation="ExecuteQuery")` -> input.parameters)
+        // are read HERE, into the data the query's `$name` references bind to — read as
+        // values and handed to the evaluation as values, never spliced into the query
+        // text, so a value carrying the delimiter a string literal is written with is
+        // still that value. What one request may bind is bounded by the reading
+        // (`crate::state::request_parameters`), which is the member's own ceiling and not
+        // a statement about the query, hence the modelled reason for an argument the
+        // service cannot take.
+        let parameters = match crate::state::request_parameters(input.parameters.as_ref()) {
+            Ok(parameters) => parameters,
+            Err(refused) => {
+                return Err(query_refusal(crate::state::QueryFailure::Rejected(refused)).into())
+            }
+        };
+
         // The evaluation is CPU-bound work whose cost the caller's own query chooses, so
         // four things hold it: a PERMIT, so the queries this service evaluates at once
         // are bounded and a request past that bound is shed as the throttle it is; a
@@ -287,9 +317,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`crate::state::query_run_timeout`) — so a query whose cost diverges stops
         // ASKING rather than running on; and the same span again on the WAIT, so the
         // caller is answered at its deadline whatever the evaluation is doing. Nothing
-        // here reads the query text: it is parsed and evaluated by the engine
-        // (`crate::state::run_query_until`), under the bounds that module states on what
-        // one request may read, nest, be handed and answer with.
+        // here reads the query text: it is parsed and evaluated by the engine that covers
+        // it (`crate::state::evaluate_query`), under the bounds those modules state on
+        // what one request may read, nest, be handed and answer with.
         let Ok(permit) = crate::state::QUERY_SLOTS.try_acquire() else {
             return Err(ExecuteQueryErrorModeled::ThrottlingException(ThrottlingException {
                 message: format!(
@@ -338,7 +368,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let worker = ::std::thread::Builder::new()
             .stack_size(crate::state::QUERY_STACK_BYTES)
             .spawn(move || {
-                let run = crate::state::run_query_until(&data, &text, deadline, &cancellation);
+                let run = crate::state::evaluate_query(
+                    &evaluation_state,
+                    &evaluated_graph,
+                    &data,
+                    &text,
+                    parameters,
+                    deadline,
+                    &cancellation,
+                );
                 // The run this record reports is over, so the end of the record falls
                 // due. Reported by the THREAD that did the work rather than by the
                 // request that was waiting for it, so a query whose caller has gone away
@@ -421,6 +459,11 @@ const ILLEGAL_ARGUMENT_REASON: &str = "ILLEGAL_ARGUMENT";
 /// The modelled reason for a query text past the length this service reads.
 const QUERY_TOO_LARGE_REASON: &str = "QUERY_TOO_LARGE";
 
+/// The modelled reason for a write the graph's own rules do not allow — a second element
+/// under one id, an element named longer than one is held
+/// (`crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`).
+const CONSTRAINT_VIOLATION_REASON: &str = "CONSTRAINT_VIOLATION";
+
 /// The modelled `UnprocessableException` reason for a query the service stopped at its
 /// timeout.
 const QUERY_TIMEOUT_REASON: &str = "QUERY_TIMEOUT";
@@ -501,12 +544,33 @@ fn query_refusal(refused: crate::state::QueryFailure) -> ExecuteQueryErrorModele
         }
         crate::state::QueryFailure::Unsupported { clause } => {
             ExecuteQueryErrorModeled::ValidationException(ValidationException {
-                message: format!(
-                    "the {clause} clause is not supported by this endpoint: it runs \
-                     read-only openCypher"
-                ),
+                message: format!("the {clause} clause is not supported by this endpoint"),
                 reason: Some(UNSUPPORTED_OPERATION_REASON.to_string()),
             })
+        }
+        crate::state::QueryFailure::Constraint(message) => {
+            ExecuteQueryErrorModeled::ValidationException(ValidationException {
+                message,
+                reason: Some(CONSTRAINT_VIOLATION_REASON.to_string()),
+            })
+        }
+        crate::state::QueryFailure::MissingParameter(name) => {
+            ExecuteQueryErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "the query references the parameter ${name}, which parameters does not \
+                     carry"
+                ),
+                reason: Some(ILLEGAL_ARGUMENT_REASON.to_string()),
+            })
+        }
+        crate::state::QueryFailure::OverLimit(message) => {
+            ExecuteQueryErrorModeled::UnprocessableException(UnprocessableException {
+                message,
+                reason: INTERNAL_LIMIT_REASON.to_string(),
+            })
+        }
+        crate::state::QueryFailure::Interrupted(message) => {
+            ExecuteQueryErrorModeled::InternalServerException(InternalServerException { message })
         }
         crate::state::QueryFailure::TooLarge { rows, ceiling } => {
             ExecuteQueryErrorModeled::UnprocessableException(UnprocessableException {

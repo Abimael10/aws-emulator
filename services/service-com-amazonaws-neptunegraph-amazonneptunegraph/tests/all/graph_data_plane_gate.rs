@@ -21,13 +21,13 @@
 //! reports; this suite pins the gate in front of both.
 //!
 //! The operation that RUNS a query (`ExecuteQuery`) is on the same endpoint and applies
-//! the same precondition, but AWS answers it with the modelled
-//! `ResourceNotFoundException` (404) rather than this refusal — the request is addressed
-//! to the per-graph endpoint as its HOST, and an endpoint that is not registered is a
-//! resource that is missing — so it is driven by `tests/all/execute_query_data_plane.rs`
-//! instead. The queries under test here are admitted through the state constructors a
-//! query that is still in flight is held in; everything the assertions look at goes over
-//! the wire.
+//! the same precondition, but AWS answers it with its own `InternalServerErrorException`
+//! (500, "Request cannot be processed as graph is unavailable") rather than this refusal —
+//! a graph that is not serving cannot process a query right now, which is a server-side
+//! fault a caller resolves by starting the graph — so it is driven by
+//! `tests/all/execute_query_data_plane.rs` instead. The queries under test here are
+//! admitted through the state constructors a query that is still in flight is held in;
+//! everything the assertions look at goes over the wire.
 
 use serde_json::{json, Value};
 
@@ -71,7 +71,7 @@ const STATUSES: &[(&str, bool)] = &[
 /// Source: the operations' HTTP bindings and `endpoint` traits
 /// (`smithy_query(query="operation",operation="GetGraphSummary,ListQueries,GetQuery,CancelQuery")`).
 /// `ExecuteQuery` is bound to the same prefix and answers a graph that is not serving
-/// with the modelled 404 (see the module docs), so it is not driven here.
+/// with the service's own 500 (see the module docs), so it is not driven here.
 const DATA_PLANE_OPERATIONS: &[(&str, &str, &str, &str)] = &[
     ("GetGraphSummary", "summarise", "GET", "/summary?mode=BASIC"),
     (

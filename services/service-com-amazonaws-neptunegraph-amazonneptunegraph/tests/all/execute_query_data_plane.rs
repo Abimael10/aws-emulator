@@ -15,14 +15,18 @@
 //!    whether or not the graph exists.
 //! 2. **the endpoint next.** The operation is bound to the host prefix
 //!    `{graphIdentifier}.` (`smithy_query(query="operation",operation="ExecuteQuery")` ->
-//!    endpoint), which is registered only while the graph is serving, so a
-//!    `graphIdentifier` that names no serving graph of the Region reaches no data plane
-//!    at all and is answered `ResourceNotFoundException` (404).
+//!    endpoint), and two different facts about that address are reported differently: a
+//!    `graphIdentifier` this Region holds NO graph under is answered
+//!    `ResourceNotFoundException` (404), while a graph that EXISTS and is not serving is
+//!    answered the service's own `InternalServerErrorException` (500, the sentence
+//!    `crate::scaffolded::GRAPH_UNAVAILABLE_TEXT`) — the graph is still there, so starting
+//!    it serves the same query again.
 //! 3. **then the query.** A query text the openCypher parser cannot read is refused
-//!    `ValidationException` (400) with the modelled `MALFORMED_QUERY` reason and the
-//!    position the parser could not continue at; a query it can read is EVALUATED over
-//!    the graph's stored nodes and edges, and the payload is what that evaluation
-//!    produced.
+//!    `ValidationException` (400) with the modelled `MALFORMED_QUERY` reason, the
+//!    position the parser could not continue at and the alternatives the grammar admits
+//!    there; a query it can read is EVALUATED over the graph's stored nodes and edges —
+//!    reading it, and WRITING it where the query says so — and the payload is what that
+//!    evaluation produced.
 //!
 //! So the tables below span what those rules generalise over rather than re-running one
 //! request: the four kinds of credential a call can be signed with crossed with the
@@ -38,10 +42,10 @@
 //! — the documents the account holds change between calls, and each call is decided by
 //! what the IAM store holds at the moment it arrives.
 //!
-//! The data is seeded through the store's own writers (`crate::state::GraphData`), which
-//! is where a bulk load and a restore write it too: the engine behind this operation
-//! evaluates read-only openCypher, so a query cannot be used to write the rows another
-//! query reads.
+//! Where a suite needs data it did not write through the data plane, the data is seeded
+//! through the store's own writers (`crate::state::GraphData`), which is where a bulk load
+//! and a restore write it too — so a row a query reads is a row some other path could have
+//! written, and a row a WRITING query left behind is read back through the same reads.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -151,6 +155,30 @@ async fn execute_query_as(
         "/queries",
         Some(graph_identifier),
         Some(json!({"query": query, "language": "OPEN_CYPHER"})),
+    )
+    .await
+}
+
+/// One `ExecuteQuery` call carrying `parameters` — the data the query's `$name`
+/// references bind to, sent as the modelled member carries it (a JSON object of parameter
+/// names to values).
+async fn execute_query_with(
+    router: &MultiServiceRouter,
+    graph_identifier: &str,
+    query: &str,
+    parameters: Value,
+) -> (u16, Value) {
+    call_as(
+        router,
+        AMBIENT_KEY,
+        "POST",
+        "/queries",
+        Some(graph_identifier),
+        Some(json!({
+            "query": query,
+            "language": "OPEN_CYPHER",
+            "parameters": parameters,
+        })),
     )
     .await
 }
@@ -489,6 +517,50 @@ async fn a_query_the_parser_cannot_read_is_refused_as_a_validation_exception() {
         );
     }
 
+    // The refusal states the ALTERNATIVES the grammar admits at the position it stopped
+    // at, each named as the grammar names it, beside the input it could not use and the
+    // line, column and offset of the submitted text. Spelled out here rather than read
+    // from the code under test, for the one position every part of a node pattern is
+    // admitted at — and then for the SAME defect written further into another text, where
+    // only the position differs.
+    let node_pattern_alternatives = "whitespace, comment, COPY, node labels, a property \
+                                     map, ')', MapLiteral or a relationship pattern";
+    // (case, the query, the input it stops on, the line, the column, the offset)
+    let positions: &[(&str, &str, &str, usize, usize, usize)] = &[
+        ("an unclosed node pattern", "MATCH (n RETURN n", "R", 1, 10, 9),
+        (
+            "the same defect further into the text",
+            "MATCH (a)-[:r]->(b LIMIT 1",
+            "L",
+            1,
+            20,
+            19,
+        ),
+        (
+            "the same defect on a second line",
+            "MATCH (x)\nMATCH (n RETURN n",
+            "R",
+            2,
+            10,
+            19,
+        ),
+    ];
+    for (case, query, input, line, column, offset) in positions {
+        let (status, body) = execute_query(&router, &graph_id, query).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status}: {body}"
+        );
+        assert_eq!(
+            body["message"],
+            json!(format!(
+                "Invalid input '{input}': expected {node_pattern_alternatives} (line {line}, \
+                 column {column} (offset: {offset}))"
+            )),
+            "case {case:?}: unexpected refusal message in {body}"
+        );
+    }
+
     // The graph is untouched by a refused query: it still serves, and a well-formed query
     // on it is still answered.
     let (status, payload) = execute_query(&router, &graph_id, ANY_QUERY).await;
@@ -545,10 +617,6 @@ async fn a_query_reaches_only_a_graph_whose_data_plane_is_serving() {
     ];
 
     let (graph_id, _) = graph_in_service(&router, "query-statuses").await;
-    let not_found = format!(
-        "No graph found for customer [{}] with graph id [{graph_id}]",
-        engine::emulator_account_id()
-    );
     for (graph_status, serving) in statuses {
         // The status is parked with nothing owed out of it, so the answer cannot depend
         // on how long the call took to arrive.
@@ -573,26 +641,34 @@ async fn a_query_reaches_only_a_graph_whose_data_plane_is_serving() {
             );
             continue;
         }
-        assert_eq!(status, 404, "case {case:?}: expected 404, got {status}: {body}");
+        // The graph EXISTS and is not serving: a server-side "not right now", which a
+        // caller resolves by starting the graph, and not the missing resource a 404
+        // reports.
+        assert_eq!(status, 500, "case {case:?}: expected 500, got {status}: {body}");
         assert_eq!(
             error_code(&body),
-            "ResourceNotFoundException",
+            "InternalServerErrorException",
             "case {case:?}: unexpected error code in {body}"
         );
         assert_eq!(
             body["message"],
-            json!(not_found),
+            json!("Request cannot be processed as graph is unavailable"),
             "case {case:?}: unexpected message in {body}"
         );
     }
 
-    // And an identifier no graph holds at all is the same answer: there is no endpoint at
-    // that address either.
+    // And an identifier no graph holds at all is a DIFFERENT answer: there is no graph at
+    // that address to be unavailable.
     let absent = "g-0000000000";
     let (status, body) = execute_query(&router, absent, ANY_QUERY).await;
     assert_eq!(
         status, 404,
         "case \"an identifier no graph holds\": expected 404, got {status}: {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "ResourceNotFoundException",
+        "case \"an identifier no graph holds\": unexpected error code in {body}"
     );
     assert_eq!(
         body["message"],
@@ -747,7 +823,7 @@ async fn a_caller_whose_policies_allow_no_query_action_is_denied() {
 }
 
 #[tokio::test]
-async fn a_query_naming_anything_outside_the_engines_read_only_subset_is_refused() {
+async fn a_query_naming_anything_outside_the_engines_surface_is_refused() {
     let (router, engine) = emulator();
     let (graph_id, _) = graph_in_service(&router, "query-surface").await;
     seed(
@@ -758,15 +834,16 @@ async fn a_query_naming_anything_outside_the_engines_read_only_subset_is_refused
         &[],
     );
 
-    // What the engine accepts is a READ-ONLY Cypher subset, so everything a caller might
-    // reach the host or the store with is outside it and is refused rather than run. The
-    // rows span the shapes that would be an escape if one existed, and the modelled
-    // reason each is refused under says WHICH way it is outside the subset: a CLAUSE the
-    // grammar does not accept (a bulk load from a file, a procedure call, and the four
-    // write clauses the engine's own documentation states it does not support) is the
-    // unsupported operation it is, while a FUNCTION the evaluator does not implement
-    // (named here after a file read, an HTTP fetch of the instance-metadata address and a
-    // dynamic import) is the illegal argument it is.
+    // What this data plane runs is openCypher over the graph's own data — reading it and
+    // writing it — so everything a caller might reach the HOST or the store BESIDE the
+    // graph with is outside that surface and is refused rather than run. The rows span the
+    // shapes that would be an escape if one existed, and the modelled reason each is
+    // refused under says WHICH way it is outside: a CLAUSE neither engine runs (a bulk
+    // load from a file, a procedure call, a clause per element of a list) is the
+    // unsupported operation it is, while a FUNCTION neither evaluator implements (named
+    // here after a file read, an HTTP fetch of the instance-metadata address and a dynamic
+    // import) is the illegal argument it is — in a reading query and in a writing one
+    // alike, so neither engine is a way around the other.
     let outside: &[(&str, &str, &str)] = &[
         (
             "a clause that loads a file",
@@ -776,6 +853,11 @@ async fn a_query_naming_anything_outside_the_engines_read_only_subset_is_refused
         (
             "a procedure call",
             "CALL dbms.listConfig() YIELD name RETURN name",
+            "UNSUPPORTED_OPERATION",
+        ),
+        (
+            "a clause per element of a list",
+            "MATCH (n) FOREACH (x IN [1] | SET n.seen = x) RETURN n",
             "UNSUPPORTED_OPERATION",
         ),
         (
@@ -794,24 +876,14 @@ async fn a_query_naming_anything_outside_the_engines_read_only_subset_is_refused
             "ILLEGAL_ARGUMENT",
         ),
         (
-            "a create",
-            "CREATE (n:Person {name: 'Eve'}) RETURN n",
-            "UNSUPPORTED_OPERATION",
+            "a function that would read a file, in a writing query",
+            "CREATE (n:Leak {text: readFile('/etc/passwd')})",
+            "ILLEGAL_ARGUMENT",
         ),
         (
-            "a merge",
-            "MERGE (n:Person {name: 'Eve'}) RETURN n",
-            "UNSUPPORTED_OPERATION",
-        ),
-        (
-            "a write to a property",
-            "MATCH (n) SET n.name = 'Eve' RETURN n",
-            "UNSUPPORTED_OPERATION",
-        ),
-        (
-            "a delete",
-            "MATCH (n) DELETE n RETURN n",
-            "UNSUPPORTED_OPERATION",
+            "a dynamic import in a writing query",
+            "MERGE (n:Leak {text: apocLoadJson('file:///etc/passwd')})",
+            "ILLEGAL_ARGUMENT",
         ),
     ];
 
@@ -826,7 +898,7 @@ async fn a_query_naming_anything_outside_the_engines_read_only_subset_is_refused
             "ValidationException",
             "case {case:?}: unexpected error code in {body}"
         );
-        // A well-formed query naming a clause this engine does not run is refused as the
+        // A well-formed query naming a clause this endpoint does not run is refused as the
         // UNSUPPORTED operation it is, not as a text that does not parse: a caller must
         // be able to tell "this endpoint does not do that" from "fix your query".
         assert_eq!(
@@ -836,8 +908,8 @@ async fn a_query_naming_anything_outside_the_engines_read_only_subset_is_refused
         );
     }
 
-    // And the graph is untouched by every one of them: the write clauses stored nothing,
-    // so the one node it was seeded with is the one node it still holds.
+    // And the graph is untouched by every one of them: a refused query writes nothing, so
+    // the one node it was seeded with is the one node it still holds.
     let (status, payload) = execute_query(
         &router,
         &graph_id,
@@ -2004,4 +2076,529 @@ async fn an_accepted_query_is_in_flight_on_its_graph_until_its_run_is_over() {
             "case an id no query holds on {case}: unexpected message {message:?}"
         );
     }
+}
+
+/// `GET /summary` for one graph, so a suite that WROTE through the data plane can read
+/// the same data back through the operation that reports it.
+async fn summary(router: &MultiServiceRouter, graph_id: &str, mode: &str) -> (u16, Value) {
+    call_as(
+        router,
+        AMBIENT_KEY,
+        "GET",
+        &format!("/summary?mode={mode}"),
+        Some(graph_id),
+        None,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_writing_query_is_executed_and_what_it_wrote_is_read_back() {
+    let (router, _engine) = emulator();
+    let (graph_id, _) = graph_in_service(&router, "query-writes").await;
+
+    // Every kind of write openCypher states, each with the read that must see it
+    // afterwards: the rule is that a well-formed updating query is EVALUATED against the
+    // graph's stored data and the data it leaves behind is the data every later reading
+    // answers from. The rows run in order on ONE graph, so each read is over the data the
+    // writes before it left.
+    //
+    // (case, the writing query, its own result rows, the read after it, the rows that
+    // read must answer)
+    let writes: &[(&str, &str, Value, &str, Value)] = &[
+        (
+            "a create of one node",
+            "CREATE (p:Person {name: 'Bob', age: 25})",
+            json!([]),
+            "MATCH (p:Person) RETURN p.name AS name, p.age AS age",
+            json!([{"name": "Bob", "age": 25}]),
+        ),
+        (
+            "a create that projects what it created",
+            "CREATE (p:Person {name: 'Ada', age: 36}) RETURN p.name AS name",
+            json!([{"name": "Ada"}]),
+            "MATCH (p:Person) RETURN count(p) AS people",
+            json!([{"people": 2}]),
+        ),
+        (
+            "a create of a relationship between matched nodes",
+            "MATCH (a:Person {name: 'Bob'}), (b:Person {name: 'Ada'}) \
+             CREATE (a)-[:KNOWS {since: 2020}]->(b)",
+            json!([]),
+            "MATCH (a:Person)-[r:KNOWS]->(b:Person) \
+             RETURN a.name AS from, b.name AS to, r.since AS since",
+            json!([{"from": "Bob", "to": "Ada", "since": 2020}]),
+        ),
+        (
+            "a set of a property on a matched node",
+            "MATCH (p:Person {name: 'Bob'}) SET p.city = 'Berlin'",
+            json!([]),
+            "MATCH (p:Person {name: 'Bob'}) RETURN p.city AS city",
+            json!([{"city": "Berlin"}]),
+        ),
+        (
+            "a set of a label on a matched node",
+            "MATCH (p:Person {name: 'Bob'}) SET p:Engineer",
+            json!([]),
+            "MATCH (p:Engineer) RETURN p.name AS name",
+            json!([{"name": "Bob"}]),
+        ),
+        (
+            "a remove of a property",
+            "MATCH (p:Person {name: 'Bob'}) REMOVE p.city",
+            json!([]),
+            "MATCH (p:Person {name: 'Bob'}) RETURN p.city AS city",
+            json!([{"city": null}]),
+        ),
+        (
+            "a merge of an element that is already there",
+            "MERGE (p:Person {name: 'Ada'}) RETURN p.age AS age",
+            json!([{"age": 36}]),
+            "MATCH (p:Person) RETURN count(p) AS people",
+            json!([{"people": 2}]),
+        ),
+        (
+            "a merge of an element that is not",
+            "MERGE (p:Person {name: 'Grace'}) RETURN p.name AS name",
+            json!([{"name": "Grace"}]),
+            "MATCH (p:Person) RETURN count(p) AS people",
+            json!([{"people": 3}]),
+        ),
+        (
+            "a delete of a matched node with no relationships",
+            "MATCH (p:Person {name: 'Grace'}) DELETE p",
+            json!([]),
+            "MATCH (p:Person) RETURN count(p) AS people",
+            json!([{"people": 2}]),
+        ),
+        (
+            "a detach delete of a node an edge joins",
+            "MATCH (p:Person {name: 'Bob'}) DETACH DELETE p",
+            json!([]),
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name AS from",
+            json!([]),
+        ),
+    ];
+
+    for (case, write, written_rows, read, read_rows) in writes {
+        let (status, payload) = execute_query(&router, &graph_id, write).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from the write, got {status}: {payload}"
+        );
+        assert_eq!(
+            Value::Array(rows(case, &payload)),
+            *written_rows,
+            "case {case:?}: expected the clause's own result set {written_rows}, got \
+             {payload}"
+        );
+        let (status, payload) = execute_query(&router, &graph_id, read).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from the read after it, got {status}: {payload}"
+        );
+        assert_eq!(
+            Value::Array(rows(case, &payload)),
+            *read_rows,
+            "case {case:?}: expected the read to answer {read_rows}, got {payload}"
+        );
+    }
+
+    // And the operation that REPORTS a graph's data counts what the queries wrote: the
+    // data plane and the control plane read one graph.
+    let (status, reported) = summary(&router, &graph_id, "DETAILED").await;
+    assert_eq!(
+        status, 200,
+        "case \"the summary after the writes\": expected 200, got {status}: {reported}"
+    );
+    assert_eq!(
+        reported["graphSummary"]["numNodes"],
+        json!(1),
+        "case \"the summary after the writes\": expected the surviving node to be counted, \
+         got {reported}"
+    );
+    assert_eq!(
+        reported["graphSummary"]["numEdges"],
+        json!(0),
+        "case \"the summary after the writes\": the detach delete took the edge with it, \
+         got {reported}"
+    );
+    assert_eq!(
+        reported["graphSummary"]["nodeLabels"],
+        json!(["Person"]),
+        "case \"the summary after the writes\": expected the labels the writes left, got \
+         {reported}"
+    );
+}
+
+#[tokio::test]
+async fn parameters_are_bound_as_data_and_never_spliced_into_the_query() {
+    let (router, _engine) = emulator();
+    let (graph_id, _) = graph_in_service(&router, "query-parameters").await;
+
+    // A `$name` binds the matching entry of `parameters` AS DATA: the query parses
+    // whatever the value is, the value is stored and matched opaquely, and a parameter set
+    // that matches nothing answers no rows. The rows span the JSON forms a parameter can
+    // carry — including a string carrying the delimiter openCypher writes a string with,
+    // which is the case text substitution could not survive.
+    //
+    // (case, the value bound to $value, the rows the read-back answers)
+    let values: &[(&str, Value)] = &[
+        ("a string", json!("Bob")),
+        ("a string carrying the string delimiter", json!("O'Brien")),
+        ("a string carrying a quote and a backslash", json!("a\"b\\c")),
+        ("a string that reads like a clause", json!("CREATE (x)")),
+        ("a whole number", json!(25)),
+        ("a negative number", json!(-7)),
+        ("a fractional number", json!(1.5)),
+        ("a boolean", json!(true)),
+    ];
+
+    for (case, value) in values {
+        let (status, payload) = execute_query_with(
+            &router,
+            &graph_id,
+            "CREATE (p:Param {label: $label, value: $value})",
+            json!({"label": case, "value": value}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from the parameterized write, got {status}: \
+             {payload}"
+        );
+
+        // The same parameters match the element they created, and the value comes back as
+        // the value it was.
+        let (status, payload) = execute_query_with(
+            &router,
+            &graph_id,
+            "MATCH (p:Param {label: $label, value: $value}) RETURN p.value AS value",
+            json!({"label": case, "value": value}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from the parameterized read, got {status}: \
+             {payload}"
+        );
+        assert_eq!(
+            Value::Array(rows(case, &payload)),
+            json!([{"value": value}]),
+            "case {case:?}: expected the stored value back, got {payload}"
+        );
+
+        // And a parameter set that matches nothing is a query that answers no rows, not a
+        // refusal.
+        let (status, payload) = execute_query_with(
+            &router,
+            &graph_id,
+            "MATCH (p:Param {label: $label, value: $value}) RETURN p.value AS value",
+            json!({"label": case, "value": "nothing holds this"}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a parameter set matching nothing is still a query, got \
+             {status}: {payload}"
+        );
+        assert_eq!(
+            Value::Array(rows(case, &payload)),
+            json!([]),
+            "case {case:?}: expected no rows, got {payload}"
+        );
+    }
+
+    // A list is a value a query may bind and ANSWER with, and it is not a property
+    // value: a write that sets a property to one is refused, while the same value
+    // projected straight back is answered.
+    let (status, body) = execute_query_with(
+        &router,
+        &graph_id,
+        "CREATE (p:Param {label: 'a list', value: $value})",
+        json!({"value": [1, 2, 3]}),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case \"a list as a property value\": expected 400, got {status}: {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "ValidationException",
+        "case \"a list as a property value\": unexpected error code in {body}"
+    );
+    assert_eq!(
+        body["reason"],
+        json!("CONSTRAINT_VIOLATION"),
+        "case \"a list as a property value\": expected the CONSTRAINT_VIOLATION reason, got \
+         {body}"
+    );
+    assert_eq!(
+        body["message"],
+        json!("Expected a simple literal but found CType."),
+        "case \"a list as a property value\": unexpected message in {body}"
+    );
+    let (status, payload) = execute_query_with(
+        &router,
+        &graph_id,
+        "RETURN $value AS value",
+        json!({"value": [1, 2, 3]}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case \"a list a query answers with\": expected 200, got {status}: {payload}"
+    );
+    assert_eq!(
+        Value::Array(rows("a list a query answers with", &payload)),
+        json!([{"value": [1, 2, 3]}]),
+        "case \"a list a query answers with\": expected the list back, got {payload}"
+    );
+
+    // A whole property map may be a parameter too, and the elements it created are
+    // matched by the same map.
+    let (status, payload) = execute_query_with(
+        &router,
+        &graph_id,
+        "CREATE (p:Mapped $props)",
+        json!({"props": {"name": "Ada", "age": 36}}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case \"a parameter as the whole property map\": expected 200, got {status}: \
+         {payload}"
+    );
+    let (status, payload) = execute_query_with(
+        &router,
+        &graph_id,
+        "MATCH (p:Mapped $props) RETURN p.name AS name, p.age AS age",
+        json!({"props": {"name": "Ada", "age": 36}}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case \"a parameter as the whole property map\": expected 200 from the read, got \
+         {status}: {payload}"
+    );
+    assert_eq!(
+        Value::Array(rows("a parameter as the whole property map", &payload)),
+        json!([{"name": "Ada", "age": 36}]),
+        "case \"a parameter as the whole property map\": expected the stored row, got \
+         {payload}"
+    );
+
+    // A query referencing a parameter the request did not carry is refused as the MISSING
+    // parameter it is — naming the parameter — and never as a text that does not parse.
+    for (case, parameters) in [
+        ("no parameters at all", json!({})),
+        ("another parameter", json!({"other": "Bob"})),
+    ] {
+        let (status, body) = execute_query_with(
+            &router,
+            &graph_id,
+            "MATCH (p:Param {value: $value}) RETURN p.value AS value",
+            parameters,
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status}: {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {case:?}: unexpected error code in {body}"
+        );
+        let message = body["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("$value"),
+            "case {case:?}: expected the missing parameter to be named, got {message:?}"
+        );
+        assert!(
+            !message.starts_with("Invalid input"),
+            "case {case:?}: a parameter nothing bound is not a text that does not parse, \
+             got {message:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_graph_that_is_not_serving_is_unavailable_and_serves_again_once_started() {
+    let (router, _engine) = emulator();
+    let (graph_id, _) = graph_in_service(&router, "query-stopped").await;
+
+    // The query that must answer the same way before the stop and after the start, so the
+    // refusal in between is the only difference.
+    let probe = "CREATE (p:Probe {n: 1}) RETURN p.n AS n";
+    let (status, payload) = execute_query(&router, &graph_id, probe).await;
+    assert_eq!(
+        status, 200,
+        "case \"a serving graph\": expected 200, got {status}: {payload}"
+    );
+    assert_eq!(
+        Value::Array(rows("a serving graph", &payload)),
+        json!([{"n": 1}]),
+        "case \"a serving graph\": unexpected rows in {payload}"
+    );
+
+    // Stopped: the graph still EXISTS — a read of it answers — so the query is refused as
+    // the server-side "not serving right now" it is.
+    let (status, stopping) = call_as(
+        &router,
+        AMBIENT_KEY,
+        "POST",
+        &format!("/graphs/{graph_id}/stop"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case \"a stop\": expected 200 from StopGraph, got {status}: {stopping}"
+    );
+    let mut reported = Value::Null;
+    for _ in 0..40 {
+        let (status, graph) = call_as(
+            &router,
+            AMBIENT_KEY,
+            "GET",
+            &format!("/graphs/{graph_id}"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case \"waiting for STOPPED\": expected 200 from GetGraph, got {status}: {graph}"
+        );
+        if graph["status"] == json!("STOPPED") {
+            reported = graph;
+            break;
+        }
+        tokio::time::sleep(PROVISIONING_SPAN / 4).await;
+    }
+    assert_eq!(
+        reported["status"],
+        json!("STOPPED"),
+        "case \"waiting for STOPPED\": the graph never reached STOPPED, last read \
+         {reported}"
+    );
+
+    let (status, body) = execute_query(&router, &graph_id, probe).await;
+    assert_eq!(
+        status, 500,
+        "case \"a stopped graph\": expected 500, got {status}: {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "InternalServerErrorException",
+        "case \"a stopped graph\": unexpected error code in {body}"
+    );
+    assert_eq!(
+        body["message"],
+        json!("Request cannot be processed as graph is unavailable"),
+        "case \"a stopped graph\": unexpected message in {body}"
+    );
+
+    // The refusal touched nothing: the graph is still there to be started, and the same
+    // query runs again once it is.
+    let (status, starting) = call_as(
+        &router,
+        AMBIENT_KEY,
+        "POST",
+        &format!("/graphs/{graph_id}/start"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case \"a start\": expected 200 from StartGraph, got {status}: {starting}"
+    );
+    let mut answered = None;
+    for _ in 0..40 {
+        let (status, payload) = execute_query(&router, &graph_id, probe).await;
+        if status == 200 {
+            answered = Some(payload);
+            break;
+        }
+        tokio::time::sleep(PROVISIONING_SPAN / 4).await;
+    }
+    let payload = answered.expect("the started graph serves its data plane again");
+    assert_eq!(
+        Value::Array(rows("a started graph", &payload)),
+        json!([{"n": 1}]),
+        "case \"a started graph\": unexpected rows in {payload}"
+    );
+
+    // Everything the two writes created is in the graph: the write before the stop and
+    // the write after the start, and nothing from the refusal in between.
+    let (status, payload) = execute_query(
+        &router,
+        &graph_id,
+        "MATCH (p:Probe) RETURN count(p) AS probes",
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case \"the graph after the cycle\": expected 200, got {status}: {payload}"
+    );
+    assert_eq!(
+        Value::Array(rows("the graph after the cycle", &payload)),
+        json!([{"probes": 2}]),
+        "case \"the graph after the cycle\": expected the two writes and nothing else, got \
+         {payload}"
+    );
+}
+
+#[tokio::test]
+async fn several_callers_merging_one_element_create_it_once() {
+    let (router, _engine) = emulator();
+    let (graph_id, _) = graph_in_service(&router, "query-merge-race").await;
+
+    // `MERGE` is the upsert path: it matches the element its pattern names or creates it,
+    // so however many callers run the same MERGE at once, the element exists once
+    // afterwards. The calls are driven together — each handler evaluates on a thread of
+    // its own, so the evaluations really do contend — on the shared router the emulator
+    // serves from.
+    let merge = "MERGE (p:Person {name: $name}) RETURN p.name AS name";
+    let answered = tokio::join!(
+        execute_query_with(&router, &graph_id, merge, json!({"name": "Bob", "caller": 1})),
+        execute_query_with(&router, &graph_id, merge, json!({"name": "Bob", "caller": 2})),
+        execute_query_with(&router, &graph_id, merge, json!({"name": "Bob", "caller": 3})),
+        execute_query_with(&router, &graph_id, merge, json!({"name": "Bob", "caller": 4})),
+    );
+    for (caller, (status, payload)) in [answered.0, answered.1, answered.2, answered.3]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(
+            status, 200,
+            "case \"caller {caller}\": expected 200 from the merge, got {status}: {payload}"
+        );
+        assert_eq!(
+            Value::Array(rows("a concurrent merge", &payload)),
+            json!([{"name": "Bob"}]),
+            "case \"caller {caller}\": expected the merged element back, got {payload}"
+        );
+    }
+
+    let (status, payload) = execute_query(
+        &router,
+        &graph_id,
+        "MATCH (p:Person {name: 'Bob'}) RETURN count(p) AS people",
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case \"the graph after the merges\": expected 200, got {status}: {payload}"
+    );
+    assert_eq!(
+        Value::Array(rows("the graph after the merges", &payload)),
+        json!([{"people": 1}]),
+        "case \"the graph after the merges\": every caller merging one element must leave \
+         one, got {payload}"
+    );
 }

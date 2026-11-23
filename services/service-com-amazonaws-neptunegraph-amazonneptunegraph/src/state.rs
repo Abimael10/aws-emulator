@@ -291,7 +291,11 @@ impl PendingTransition {
 ///
 /// A node is addressed by its own id (openCypher's `~id`), which is the key it sits
 /// under in [`GraphData::nodes`], so the id is not repeated here.
-#[derive(Debug, Clone, Default)]
+///
+/// `PartialEq` compares what the node IS, which is what a write is judged against: an
+/// evaluation that left a node exactly as it found it changed nothing, and nothing about
+/// the graph may move for it.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct GraphNode {
     /// The node's labels. openCypher lets one node carry several, and a summary of
     /// the data counts DISTINCT labels, so they are held as a set.
@@ -305,8 +309,9 @@ pub struct GraphNode {
 /// One edge of a graph's data: its label, the nodes it joins, and its properties.
 ///
 /// An edge is addressed by its own id, which is the key it sits under in
-/// [`GraphData::edges`], so the id is not repeated here.
-#[derive(Debug, Clone)]
+/// [`GraphData::edges`], so the id is not repeated here. `PartialEq` compares what the
+/// edge IS, for the reason [`GraphNode`] carries it.
+#[derive(Debug, Clone, PartialEq)]
 pub struct GraphEdge {
     /// The edge's label. openCypher gives an edge exactly one.
     pub label: String,
@@ -4744,10 +4749,12 @@ mod endpoint_network;
 mod import_formats;
 mod import_load;
 mod open_cypher;
+mod open_cypher_updates;
 mod query_authorization;
 
 pub use endpoint_network::*;
 pub use import_formats::*;
 pub use import_load::*;
 pub use open_cypher::*;
+pub use open_cypher_updates::*;
 pub use query_authorization::*;

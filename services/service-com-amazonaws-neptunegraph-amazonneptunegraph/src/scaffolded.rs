@@ -177,6 +177,73 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The `message` member of the synthetic error shape a graph that is not serving is
+/// refused with.
+static GRAPH_UNAVAILABLE_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#GraphUnavailable$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for that shape. In the `smithy.framework` namespace for the same reason as
+/// `NotImplemented`: the shape is in no service's model, so it must not collide with a
+/// modelled one. The wire code comes from [`OperationError::shape_name`] below.
+pub static GRAPH_UNAVAILABLE_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#GraphUnavailable",
+        "smithy.framework",
+        "GraphUnavailable",
+    ),
+    ShapeType::Structure,
+    &[&GRAPH_UNAVAILABLE_MESSAGE],
+);
+
+/// The wire error code a query on a graph whose data plane is not serving is refused
+/// with.
+///
+/// NOT a shape this service's model declares — the model's server fault is
+/// `InternalServerException` — so it cannot travel as [`Scaffolded::Modeled`]. It is the
+/// code the service emits for this one condition, and a client branches on the code: a
+/// graph that is merely not serving is a server-side "not right now", which a caller
+/// resolves by starting the graph and retrying, and not the missing resource a 404
+/// reports.
+pub const GRAPH_UNAVAILABLE_CODE: &str = "InternalServerErrorException";
+
+/// The HTTP status of that refusal: a server fault, which is what makes an SDK's retry
+/// policy engage rather than treating the answer as the caller's own fault.
+pub const GRAPH_UNAVAILABLE_STATUS: u16 = 500;
+
+/// The service's own sentence for it. ONE constant: it interpolates nothing from the
+/// request or from the graph — what the caller is told is that the graph cannot serve the
+/// request, not which graph or which status, and the status is what a read of the graph
+/// reports.
+pub const GRAPH_UNAVAILABLE_TEXT: &str = "Request cannot be processed as graph is unavailable";
+
+/// The payload of that refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphUnavailable;
+
+impl std::fmt::Display for GraphUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{GRAPH_UNAVAILABLE_CODE}: {GRAPH_UNAVAILABLE_TEXT}")
+    }
+}
+
+impl std::error::Error for GraphUnavailable {}
+
+impl SerializableStruct for GraphUnavailable {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&GRAPH_UNAVAILABLE_MESSAGE, GRAPH_UNAVAILABLE_TEXT)?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -185,6 +252,10 @@ pub enum Scaffolded<E> {
     NotImplemented(NotImplemented),
     /// A modeled error the operation declares. Renders with the model's own status.
     Modeled(E),
+    /// The graph the request addressed exists and its data plane is not serving. Renders
+    /// as HTTP 500 with the error code [`GRAPH_UNAVAILABLE_CODE`], which the model does
+    /// not declare — so it cannot travel as [`Modeled`](Self::Modeled).
+    GraphUnavailable(GraphUnavailable),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
     ///
@@ -202,6 +273,18 @@ impl<E> Scaffolded<E> {
     /// The scaffold signal for `operation`.
     pub fn not_implemented(operation: &str) -> Self {
         Self::NotImplemented(NotImplemented::new(operation))
+    }
+
+    /// Refuse a request addressed to a graph that EXISTS and whose data plane is not
+    /// serving: HTTP 500 with the code [`GRAPH_UNAVAILABLE_CODE`] and the text
+    /// [`GRAPH_UNAVAILABLE_TEXT`].
+    ///
+    /// Use this rather than the modelled `ResourceNotFoundException` wherever an operation
+    /// on a graph's own data plane finds the graph and finds it not serving: the graph is
+    /// still there, so reporting the resource as missing would tell a client to clean up
+    /// after a graph a `StartGraph` brings back.
+    pub fn graph_unavailable() -> Self {
+        Self::GraphUnavailable(GraphUnavailable)
     }
 
     /// Refuse the request as invalid, with HTTP 400 `ValidationException`.
@@ -228,6 +311,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
+            Self::GraphUnavailable(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
         }
     }
@@ -240,6 +324,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
+            Self::GraphUnavailable(e) => e.source(),
             Self::ValidationException(e) => e.source(),
         }
     }
@@ -254,6 +339,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
+            Self::GraphUnavailable(e) => e,
             Self::ValidationException(e) => e,
         }
     }
@@ -262,6 +348,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
+            Self::GraphUnavailable(_) => &GRAPH_UNAVAILABLE_SCHEMA,
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
         }
     }
@@ -274,6 +361,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
+            Self::GraphUnavailable(_) => GRAPH_UNAVAILABLE_CODE,
             Self::ValidationException(_) => "ValidationException",
         }
     }
@@ -286,6 +374,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
+            Self::GraphUnavailable(_) => GRAPH_UNAVAILABLE_STATUS,
             Self::ValidationException(_) => 400,
         }
     }
@@ -297,8 +386,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // envelope carries the signal on the query protocols too.
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
-            // Same reason: the synthetic shape carries no `awsQueryError` trait.
-            Self::ValidationException(_) => None,
+            // Same reason: neither synthetic shape carries an `awsQueryError` trait.
+            Self::GraphUnavailable(_) | Self::ValidationException(_) => None,
         }
     }
 }
