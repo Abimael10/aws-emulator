@@ -450,6 +450,69 @@ fn data_key_reuse_period(
         .unwrap_or(super::DEFAULT_KMS_DATA_KEY_REUSE_PERIOD_SECONDS)
 }
 
+/// The data key a state machine's EXECUTION DATA is sealed under, as this store holds the
+/// fact of it: no plaintext key material, only WHICH key minted it and WHEN.
+///
+/// That is all the reuse period is decided from: "maximum duration that Step Functions
+/// will reuse data keys. When the period expires, Step Functions will call
+/// `GenerateDataKey`" (`kmsDataKeyReusePeriodSeconds`), so a data key minted inside the
+/// period seals the next execution's data too, and the mint is a call the service makes
+/// only once that period has run out.
+#[derive(Debug, Clone)]
+pub struct DataKey {
+    /// The key reference it was minted with, exactly as the resource's configuration
+    /// named it: a configuration that now names another key has no data key in force,
+    /// because this one was never minted with it.
+    pub key: String,
+    /// When it was minted, which the reuse period is counted from.
+    pub minted: ::std::time::SystemTime,
+}
+
+/// Whether a data key is IN FORCE for the state machine `arn` at `now`: one minted with
+/// the key its configuration names, inside the reuse period that configuration states.
+fn data_key_in_force(
+    store: &super::ComAmazonawsSfnAwsstepfunctionsState,
+    arn: &str,
+    used: &KeyUse,
+    now: ::std::time::SystemTime,
+) -> bool {
+    let period = ::std::time::Duration::from_secs(
+        u64::try_from(data_key_reuse_period(store, arn)).unwrap_or_default(),
+    );
+    store.data_keys.get(arn).is_some_and(|held| {
+        held.key == used.key && now.duration_since(held.minted).unwrap_or_default() < period
+    })
+}
+
+/// Record the MINT of the data key the executions of the state machine `arn` are sealed
+/// under, made at `at` — what a start that found none in force did before it sealed this
+/// execution's data.
+///
+/// Idempotent against the key in force: a start inside the reuse period re-uses the data
+/// key already minted and leaves the instant the period is counted from where it is, so
+/// the period is a bound on the key's life rather than on the gap between two starts.
+/// Call it with the store locked, where the execution is admitted: a start that is refused
+/// mints nothing.
+pub fn mint_data_key(
+    store: &mut super::ComAmazonawsSfnAwsstepfunctionsState,
+    arn: &str,
+    at: ::std::time::SystemTime,
+) {
+    let Some(used) = state_machine_key(store, arn) else {
+        return;
+    };
+    if data_key_in_force(store, arn, &used, at) {
+        return;
+    }
+    store.data_keys.insert(
+        arn.to_string(),
+        DataKey {
+            key: used.key,
+            minted: at,
+        },
+    );
+}
+
 /// The one resolution behind the READ above: the key the execution's data lives
 /// under, judged for the `operations` this call makes on it.
 fn execution_key_denied<Eng: Send + Sync + 'static>(
@@ -703,13 +766,30 @@ pub fn activity_read_denied<Eng: Send + Sync + 'static>(
 ///
 /// `None` for an ARN that addresses no state machine, which is the operation's own
 /// `StateMachineDoesNotExist`.
-pub fn state_machine_seal_denied<Eng: Send + Sync + 'static>(
+fn state_machine_seal_denied<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     region: &str,
     state_machine_arn: &str,
 ) -> Option<KeyRefusal> {
     state_machine_key_denied(engine, ctx, region, state_machine_arn, SEAL_OF_CALLER_DATA)
+}
+
+/// Why the KEY a state machine's data is sealed under admits no cryptographic use of
+/// itself at all, whoever asks — the key's own KEY STATE, and nothing of any identity's
+/// authorities.
+///
+/// It is a condition of the key rather than of a caller, which is why KMS decides it
+/// first for every cryptographic operation ([`key_denied`]): a key no cryptographic
+/// operation can use refuses the call whatever any policy says and whichever identity the
+/// call is made as.
+fn state_machine_key_state_refusal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    state_machine_arn: &str,
+) -> Option<KeyRefusal> {
+    state_machine_key_denied(engine, ctx, region, state_machine_arn, NOTHING_OF_THE_KEY)
 }
 
 /// Why a SYNCHRONOUS run of the state machine `state_machine_arn` identifies cannot be
@@ -923,21 +1003,21 @@ pub fn state_machine_read_denied<Eng: Send + Sync + 'static>(
 /// nothing.
 ///
 /// Acting as the role comes before anything the role may then do, so this decision is
-/// taken only for a role this service CAN act as: a role whose assume IAM answered for is
-/// one no identity of the account's holds the key for, which is the run's own failure
-/// ([`run_is_sealed_as_the_execution_role`]) rather than a refusal of this call.
+/// taken only for a role this service CAN act as: a role it may not act as for this state
+/// machine has no identity to make the mint as at all, which [`start_denied`] reports as
+/// the assume's own failure before it asks this.
 ///
 /// The KEY STATE is deliberately not decided here: it is a condition of the key rather
-/// than of an identity, and it is decided by the calls that read or write the sealed
-/// data ([`key_denied`]), which is where this crate decides it for every operation
-/// that touches that data. One question, one place.
+/// than of an identity, and it is decided ahead of every identity's authorities
+/// ([`state_machine_key_state_refusal`], [`key_denied`]), which is where this crate
+/// decides it for every operation that touches that data. One question, one place.
 ///
 /// `None` wherever nothing of the kind can be shown: a state machine on an Amazon Web
 /// Services owned key (nothing of any identity's is asked of such a key), an engine
 /// carrying no KMS or no IAM store, an identifier naming no key KMS holds, and a role
 /// IAM holds no record for — each is evidence of nothing, so the start proceeds. Call
 /// it with no store of this service locked.
-pub fn execution_start_denied<Eng: Send + Sync + 'static>(
+fn execution_start_denied<Eng: Send + Sync + 'static>(
     engine: &Eng,
     region: &str,
     state_machine_arn: &str,
@@ -957,6 +1037,85 @@ pub fn execution_start_denied<Eng: Send + Sync + 'static>(
         role_arn,
         &[GENERATE_DATA_KEY_OPERATION],
     )
+}
+
+/// Why the START of an execution of the state machine `state_machine_arn` identifies
+/// cannot be served, or `None` when it can be.
+///
+/// Everything such an execution retains is sealed under the state machine's key, with a
+/// data key the service holds for a WHILE: "maximum duration that Step Functions will
+/// reuse data keys. When the period expires, Step Functions will call `GenerateDataKey`"
+/// (`kmsDataKeyReusePeriodSeconds`). So a start that finds a data key in force for its
+/// state machine seals this execution's data with it and asks the key for NOTHING, and
+/// only a start that has to ACQUIRE one asks anything of any identity — which Step
+/// Functions does, before any state is entered, as the state machine's EXECUTION ROLE
+/// ("the IAM role to use for this state machine"). Such a start is refused by exactly what
+/// stops that acquisition, decided in the order the acquisition makes it:
+///
+/// 1. the key's own KEY STATE ([`state_machine_key_state_refusal`]), which admits no
+///    cryptographic use of the key for anybody, whatever any policy says and whichever
+///    identity asks — the order KMS itself decides a cryptographic operation in, and the
+///    one condition that holds whether this start mints or not, since no execution of an
+///    encrypted state machine runs while the key admits no use of itself;
+/// 2. taking the ROLE on, which is the first call the acquisition makes: a role this
+///    service may not act as for this state machine leaves it no identity to acquire the
+///    data key as, and what the caller is told is the exception that assume raised,
+///    relayed (`unrunnable`, which
+///    [`super::task_authorization::unrunnable_attempt`] answers for exactly the runs whose
+///    own data is sealed as that role);
+/// 3. the MINT itself, as that role ([`execution_start_denied`]) — so a refusal of it names
+///    the SESSION this service assumed the role under, which is the identity that made the
+///    refused call;
+/// 4. and last the CALLER's own use of the key ([`state_machine_seal_denied`]), which the
+///    `input` this call hands the service to keep is sealed with.
+///
+/// Each refusal is the modelled `Kms*` error of the operation and starts nothing. `None`
+/// wherever nothing of the kind can be shown, as each decision above documents — a state
+/// machine on an Amazon Web Services owned key foremost, which asks nothing of any
+/// identity. Call it with no store of this service locked.
+pub fn start_denied<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    state_machine_arn: &str,
+    role_arn: &str,
+    unrunnable: Option<&super::integration::Failed>,
+) -> Option<KeyRefusal> {
+    if let Some(refusal) = state_machine_key_state_refusal(engine, ctx, region, state_machine_arn) {
+        return Some(refusal);
+    }
+    if !start_mints_a_data_key(engine, state_machine_arn, super::now()) {
+        return None;
+    }
+    // The relay of the assume's failure carries no metadata tail of its own: that failure
+    // is the exception the ASSUME raised, which the service reports as the cause it words
+    // it by, not a sentence a KMS answer came back with.
+    unrunnable
+        .map(|failed| KeyRefusal::AccessDenied(failed.cause.clone()))
+        .or_else(|| execution_start_denied(engine, region, state_machine_arn, role_arn))
+        .or_else(|| state_machine_seal_denied(engine, ctx, region, state_machine_arn))
+}
+
+/// Whether the start of an execution of the state machine `arn` names has to ACQUIRE the
+/// data key its data is sealed under, at `now` — rather than seal that data with the one
+/// already in force ([`data_key_in_force`]).
+///
+/// `false` for a state machine on an Amazon Web Services owned key, which mints no data
+/// key of the account's at all, and for an engine carrying no store of this service.
+/// Call it with no store of this service locked.
+fn start_mints_a_data_key<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    arn: &str,
+    now: ::std::time::SystemTime,
+) -> bool {
+    let Some(state) = super::service_state(engine) else {
+        return false;
+    };
+    let store = state.lock();
+    let Some(used) = state_machine_key(&store, arn) else {
+        return false;
+    };
+    !data_key_in_force(&store, arn, &used, now)
 }
 
 /// Whether an execution of the state machine `state_machine_arn` identifies has its data

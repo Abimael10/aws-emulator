@@ -2435,6 +2435,9 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
     pub fn remove_state_machine(&mut self, arn: &str) -> Option<StateMachine> {
         let machine = self.state_machines.remove(arn)?;
         self.retained_bytes = self.retained_bytes.saturating_sub(machine.retained_bytes);
+        // The data key its executions were sealed under goes with it: nothing of this
+        // state machine is left for a later record of the same ARN to re-use.
+        self.data_keys.remove(arn);
         let version_arns: Vec<String> = self
             .versions_of(arn)
             .into_iter()

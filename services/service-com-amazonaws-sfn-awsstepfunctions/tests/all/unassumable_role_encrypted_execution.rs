@@ -7,16 +7,18 @@
 //! shape `core/router/src/lib.rs` mounts them in — so the trust document the assume is
 //! decided against is the one IAM's own handlers hold.
 //!
-//! The rule under test: taking the execution role on is part of the RUN, not of the call
-//! that starts it. Everything an execution of a state machine on a customer managed key
-//! retains is sealed under that key, and the data-key mint that sealing makes is a call
-//! Step Functions makes as that role, before any state is entered — so a role whose
-//! stored trust policy no longer admits this service leaves the run no identity to be
-//! performed as:
+//! The rule under test: taking the execution role on is the first call the acquisition of
+//! an execution's DATA KEY makes, and that acquisition is what a start of a state machine
+//! on a customer managed key begins with — where it has to make one at all. A start that
+//! finds the data key of its state machine already in force seals this execution's data
+//! with it and asks the role for nothing, so it is SERVED; the run's own work still has to
+//! be done as that role, and a role whose stored trust policy no longer admits this service
+//! leaves it no identity to be performed as:
 //!
 //! 1. `StartExecution` is SERVED (HTTP 200) and the execution exists with its input,
-//!    rather than being refused with a KMS error about an identity the service never
-//!    acted as;
+//!    because the data key an earlier start of that state machine acquired is still in
+//!    force (`tests/all/encrypted_start_data_key_acquisition.rs` holds the other half:
+//!    a start that HAS to acquire one and cannot is refused instead, and starts nothing);
 //! 2. that execution ends `FAILED` with the Amazon States Language's own
 //!    `States.Runtime` and the exception the assume raised as its cause — the exception's
 //!    class followed by the service's fixed sentence for a role it cannot act as, naming
@@ -316,10 +318,10 @@ fn rows() -> Vec<Row> {
     ]
 }
 
-/// A start whose execution role this service cannot act as is SERVED, and the execution
-/// it started ends `FAILED` with `States.Runtime` and the fixed unassumable-role
-/// sentence, having run nothing — then a redrive under the restored trust runs that same
-/// execution to `SUCCEEDED`.
+/// A start that re-uses the data key already in force for its state machine is SERVED
+/// whatever the role's trust now says, and the execution it started ends `FAILED` with
+/// `States.Runtime` and the fixed unassumable-role sentence, having run nothing — then a
+/// redrive under the restored trust runs that same execution to `SUCCEEDED`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_encrypted_execution_whose_role_cannot_be_assumed_fails_and_is_redrivable() {
     for (index, row) in rows().into_iter().enumerate() {
@@ -349,6 +351,18 @@ async fn an_encrypted_execution_whose_role_cannot_be_assumed_fails_and_is_redriv
         )
         .await;
 
+        // A first start, under the trust the service needs, ACQUIRES the data key this
+        // state machine's execution data is sealed under: it is in force for the reuse
+        // period the configuration states from here on, so the start below asks the role
+        // for nothing.
+        chain
+            .sfn(
+                "StartExecution",
+                &json!({ "stateMachineArn": machine, "name": "baseline" }),
+            )
+            .await;
+        let children_of_the_baseline = started_count(&chain, &child).await;
+
         // The trust this service's assume needs is taken away AFTER the state machine was
         // created, which is the only way a configuration the control plane admitted ends
         // up naming a role the data plane cannot act as.
@@ -368,7 +382,7 @@ async fn an_encrypted_execution_whose_role_cannot_be_assumed_fails_and_is_redriv
         let execution = string(&answered, "executionArn");
         assert_eq!(
             started_count(&chain, &machine).await,
-            1,
+            2,
             "case {case:?}: expected the start to have started the execution"
         );
 
@@ -411,10 +425,10 @@ async fn an_encrypted_execution_whose_role_cannot_be_assumed_fails_and_is_redriv
             "case {case:?}: expected the history event to carry the failure, got {failed:?}"
         );
         // And the work a state of the definition would have done never happened: the
-        // `Task` row's child was never started.
+        // `Task` row's child was started only by the baseline run.
         assert_eq!(
             started_count(&chain, &child).await,
-            0,
+            children_of_the_baseline,
             "case {case:?}: expected no child execution for a run that never happened"
         );
 

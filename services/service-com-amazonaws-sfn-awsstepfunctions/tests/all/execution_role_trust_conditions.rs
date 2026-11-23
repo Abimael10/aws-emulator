@@ -16,15 +16,14 @@
 //!    `aws:SourceAccount`, the account that owns it). A statement's `Condition` is part of
 //!    its grant, so a role whose trust is narrowed to another state machine, to another
 //!    account, or to a key the assume carries no value for is a role this service may not
-//!    act as for THIS execution. That assume belongs to the RUN rather than to the call
-//!    that starts it, so the start is SERVED and nothing the role would have done then
-//!    happens: an execution of a state machine on a CUSTOMER MANAGED key ends FAILED with
-//!    `States.Runtime` and the service's fixed sentence for a role it cannot act as — the
-//!    data key its data goes under is minted as that role, before any state is entered —
-//!    and a `Task` state of an unencrypted execution fails rather than having its work
-//!    done as nobody (`tests/all/execution_role_assumption.rs` holds that half of the
-//!    rule, and `tests/all/unassumable_role_encrypted_execution.rs` the redrive that
-//!    resumes such an execution once the trust is put back).
+//!    act as for THIS execution. That assume is the first call the acquisition of an
+//!    execution's data key makes, so a start of a state machine on a CUSTOMER MANAGED key
+//!    that has to acquire one is refused `KmsAccessDeniedException` carrying the exception
+//!    the assume raised, and starts nothing — while a `Task` state of an unencrypted
+//!    execution fails rather than having its work done as nobody
+//!    (`tests/all/execution_role_assumption.rs` holds that half of the rule, and
+//!    `tests/all/encrypted_start_data_key_acquisition.rs` the start that re-uses a data
+//!    key already in force, which asks that role for nothing).
 //! 2. **the refusal names the acting identity.** Where it is the KEY that refuses the
 //!    mint, Step Functions relays what KMS answered, and the identity such a refusal
 //!    blames is the SESSION of the role this service assumed —
@@ -60,7 +59,12 @@ const ANOTHER_ACCOUNT: &str = "210987654321";
 /// The KMS calls sealing an execution's data makes, as the role's own policy allows
 /// them: a row that gets past the assume must not then be refused on what the role may
 /// do.
-fn data_key_policy() -> Value {
+///
+/// `pub(crate)`: `tests/all/main.rs` is this binary's crate root, so the sibling suite
+/// that drives the whole acquisition of an execution's data key
+/// (`tests/all/encrypted_start_data_key_acquisition.rs`) reads these documents rather than
+/// carrying a second copy of them.
+pub(crate) fn data_key_policy() -> Value {
     json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -73,7 +77,9 @@ fn data_key_policy() -> Value {
 
 /// A trust policy trusting this service's global principal to assume the role, narrowed
 /// by `condition` where the row states one.
-fn trust(condition: Option<Value>) -> Value {
+///
+/// `pub(crate)` for the reason [`data_key_policy`] is.
+pub(crate) fn trust(condition: Option<Value>) -> Value {
     let mut statement = json!({
         "Effect": "Allow",
         "Principal": { "Service": "states.amazonaws.com" },
@@ -115,7 +121,9 @@ async fn role_at(chain: &Chain, name: &str, path: &str, trust: &Value) -> String
 
 /// A key policy naming the account root — the form the default key policy takes, which
 /// delegates to that account's own identity-based policies — beside `statements`.
-fn key_policy_with(statements: Vec<Value>) -> Value {
+///
+/// `pub(crate)` for the reason [`data_key_policy`] is.
+pub(crate) fn key_policy_with(statements: Vec<Value>) -> Value {
     let mut all = granting_policy()
         .get("Statement")
         .and_then(Value::as_array)
@@ -132,7 +140,14 @@ fn machine_arn(name: &str) -> String {
 }
 
 /// A state machine on `key` running as `role_arn`, by its ARN.
-async fn encrypted_machine(chain: &Chain, name: &str, role_arn: &str, key: &str) -> String {
+///
+/// `pub(crate)` for the reason [`data_key_policy`] is.
+pub(crate) async fn encrypted_machine(
+    chain: &Chain,
+    name: &str,
+    role_arn: &str,
+    key: &str,
+) -> String {
     let created = chain
         .sfn(
             "CreateStateMachine",
@@ -148,7 +163,9 @@ async fn encrypted_machine(chain: &Chain, name: &str, role_arn: &str, key: &str)
 }
 
 /// How many executions `ListExecutions` reports for `machine`.
-async fn started_count(chain: &Chain, machine: &str) -> usize {
+///
+/// `pub(crate)` for the reason [`data_key_policy`] is.
+pub(crate) async fn started_count(chain: &Chain, machine: &str) -> usize {
     let listed = chain
         .sfn(
             "ListExecutions",
@@ -271,9 +288,10 @@ fn rows() -> Vec<Row> {
 
 /// `StartExecution` on a state machine encrypted with a customer managed key follows the
 /// trust policy's conditions: a role whose grant covers the assume this start would make
-/// runs, and one whose grant does not leaves the execution FAILED with `States.Runtime`
-/// and the service's fixed sentence for a role it cannot act as — the start itself being
-/// served either way, because the assume belongs to the run.
+/// runs, and one whose grant does not refuses the start with 400
+/// `KmsAccessDeniedException` carrying the exception the assume raised — the data key the
+/// execution's data would be sealed under being acquired as that role, before any state is
+/// entered — having started nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_start_follows_the_conditions_the_trust_policy_narrows_the_assume_to() {
     let chain = Chain::new();
@@ -307,6 +325,35 @@ async fn a_start_follows_the_conditions_the_trust_policy_narrows_the_assume_to()
                 &json!({ "stateMachineArn": machine, "name": "run" }),
             )
             .await;
+
+        // A role this service may not act as for THIS state machine leaves the start no
+        // identity to acquire the execution's data key as, so the start is refused and
+        // nothing of the execution exists.
+        if !assumable {
+            let code = error_code(&answered);
+            let expected = unassumable_cause(&role_arn);
+            assert_eq!(
+                (
+                    status,
+                    code.as_str(),
+                    answered.get("message").and_then(Value::as_str)
+                ),
+                (
+                    KMS_ACCESS_DENIED_STATUS,
+                    KMS_ACCESS_DENIED,
+                    Some(expected.as_str())
+                ),
+                "case {case:?}: expected the relayed assume failure, got {status} {code} with \
+                 {answered:?}"
+            );
+            assert_eq!(
+                started_count(&chain, &machine).await,
+                0,
+                "case {case:?}: expected a refused start to have started nothing"
+            );
+            continue;
+        }
+
         assert_eq!(
             status, 200,
             "case {case:?}: expected the start to be served, got {status} {answered:?}"
@@ -328,28 +375,10 @@ async fn a_start_follows_the_conditions_the_trust_policy_narrows_the_assume_to()
         );
 
         let finished = ended(&chain, case, &execution).await;
-        if assumable {
-            assert_eq!(
-                finished.get("status").and_then(Value::as_str),
-                Some("SUCCEEDED"),
-                "case {case:?}: expected the execution to run, got {finished:?}"
-            );
-            continue;
-        }
-
-        // A role this service cannot act as for THIS state machine leaves the run no
-        // identity to mint the data key its data goes under as, so nothing of the
-        // definition happens and the execution carries the service's fixed sentence for
-        // such a role.
-        let expected = unassumable_cause(&role_arn);
         assert_eq!(
-            (
-                finished.get("status").and_then(Value::as_str),
-                finished.get("error").and_then(Value::as_str),
-                finished.get("cause").and_then(Value::as_str),
-            ),
-            (Some("FAILED"), Some("States.Runtime"), Some(expected.as_str())),
-            "case {case:?}: expected the unassumable-role failure, got {finished:?}"
+            finished.get("status").and_then(Value::as_str),
+            Some("SUCCEEDED"),
+            "case {case:?}: expected the execution to run, got {finished:?}"
         );
     }
 }

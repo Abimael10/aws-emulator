@@ -2739,6 +2739,15 @@ pub struct ComAmazonawsSfnAwsstepfunctionsState {
     /// looking up the ARN it would mint, and a name in one region never answers for a
     /// name in another.
     pub state_machines: BTreeMap<String, StateMachine>,
+    /// The data key each state machine's EXECUTION DATA is sealed under, keyed by that
+    /// state machine's own ARN, for a state machine on a customer managed key: when that
+    /// data key was minted, and the key reference it was minted with
+    /// ([`encryption::DataKey`]) — no key material, which this store never holds.
+    /// Absent while no data key is in force, which is what makes the next start acquire
+    /// one ([`encryption::start_denied`]), and removed with the state machine
+    /// ([`ComAmazonawsSfnAwsstepfunctionsState::remove_state_machine`]), so it holds at
+    /// most one entry per stored state machine.
+    pub data_keys: BTreeMap<String, encryption::DataKey>,
     /// Every published state machine version, keyed by its own qualified ARN
     /// (`<stateMachineArn>:<version>`). A `BTreeMap` so one state machine's
     /// versions sit contiguously under the `<stateMachineArn>:` prefix and go with

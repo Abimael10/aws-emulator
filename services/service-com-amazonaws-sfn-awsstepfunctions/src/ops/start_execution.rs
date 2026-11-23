@@ -462,28 +462,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .await;
 
-        // An execution of a state machine on a CUSTOMER MANAGED key has its data
-        // sealed under that key, and TWO identities have to be allowed to seal it:
-        // the CALLER, whose `input` this call hands the service to keep, and the state
-        // machine's EXECUTION ROLE, which is the identity Step Functions does the run's
-        // own cryptographic work as. A key no cryptographic operation can use and either
-        // identity being refused the data key each refuse the start with the modelled
-        // `Kms*` error and start nothing. Both decisions are taken with no store of this
-        // service locked, before the walk.
-        if let Some(refusal) = crate::state::encryption::state_machine_seal_denied(
-            &*self.engine,
-            ctx,
-            &region,
-            &machine_arn,
-        ) {
-            return Err(crate::kms_key_refusal!(StartExecutionErrorModeled, refusal).into());
-        }
-        // A role this service cannot ACT AS is not one of those refusals: the assume is
-        // part of the RUN rather than of this call, so the start is SERVED and it is the
-        // execution that fails — with not one state entered, where the run's own data is
-        // sealed as that role, and a redrive runs it again once the trust is put back
-        // ([`crate::state::task_authorization::unrunnable_attempt`], the one reading of
-        // that condition every operation that begins an attempt takes).
+        // An execution of a state machine on a CUSTOMER MANAGED key has everything it
+        // retains sealed under that key, with a data key the service re-uses for as long
+        // as `kmsDataKeyReusePeriodSeconds` lets it. A start that has to ACQUIRE that data
+        // key does so as the state machine's EXECUTION ROLE, before any state is entered,
+        // so what stops the acquisition refuses the start with the modelled `Kms*` error
+        // and starts nothing: the key's own key state, a role this service may not act as
+        // for this state machine (which leaves it no identity to acquire the data key as —
+        // [`crate::state::task_authorization::unrunnable_attempt`], the one reading of
+        // that condition every operation that begins an attempt takes), the mint itself as
+        // that role, and the CALLER's own use of the key, whose `input` this call hands
+        // the service to keep. One decision
+        // ([`crate::state::encryption::start_denied`]), taken in that order, with no
+        // store of this service locked, before the walk.
         let unrunnable = crate::state::task_authorization::unrunnable_attempt(
             &*self.engine,
             &region,
@@ -491,15 +482,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &role_arn,
             unassumable.as_ref(),
         );
-        if unrunnable.is_none() {
-            if let Some(refusal) = crate::state::encryption::execution_start_denied(
-                &*self.engine,
-                &region,
-                &machine_arn,
-                &role_arn,
-            ) {
-                return Err(crate::kms_key_refusal!(StartExecutionErrorModeled, refusal).into());
-            }
+        if let Some(refusal) = crate::state::encryption::start_denied(
+            &*self.engine,
+            ctx,
+            &region,
+            &machine_arn,
+            &role_arn,
+            unrunnable.as_ref(),
+        ) {
+            return Err(crate::kms_key_refusal!(StartExecutionErrorModeled, refusal).into());
         }
 
         // Phase 2, OUTSIDE the lock: the definition is INTERPRETED here. The walk is
@@ -547,8 +538,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(ctx.credential_store()),
         );
         let interpreted = match &unrunnable {
-            // Nothing is interpreted for a run that cannot be performed at all: the
-            // attempt opens its history and ends on the failure above.
+            // Nothing is interpreted for a run that cannot be performed at all: this
+            // start was served — it sealed its data with the data key already in force,
+            // so it asked the role for nothing — but the run's own work has no identity
+            // to be done as, so the attempt opens its history and ends there.
             Some(failed) => Ok(crate::state::plan_attempt_that_cannot_run(
                 started,
                 crate::state::EVENT_EXECUTION_STARTED,
@@ -716,6 +709,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
 
             store.insert_execution(candidate);
+            // This execution's data is sealed under the state machine's data key, so the
+            // mint the start made where none was in force is recorded with it: the next
+            // start inside `kmsDataKeyReusePeriodSeconds` re-uses this one, and the one
+            // after the period has expired mints again.
+            crate::state::encryption::mint_data_key(&mut store, &machine_arn, started);
             // Every Distributed Map state the walk entered started a Map Run, which
             // `ListMapRuns` reports for this execution and `DescribeMapRun` by its own
             // ARN.
