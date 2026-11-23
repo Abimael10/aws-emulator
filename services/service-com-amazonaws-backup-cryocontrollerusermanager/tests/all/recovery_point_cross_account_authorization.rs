@@ -35,7 +35,7 @@ use crate::vault_and_backup_job::{
 };
 
 /// The vault whose stored point the controls use.
-const VAULT: &str = "authz-source";
+pub(crate) const VAULT: &str = "authz-source";
 
 /// The vault a copy would be written into, so the copy rows are refused for the
 /// SOURCE point rather than for a destination that does not exist.
@@ -57,11 +57,17 @@ pub(crate) fn caller_principal() -> String {
 /// what the suites assert. `operation` is the API name the request reached, which
 /// names the action `backup:<Operation>`.
 pub(crate) fn denial(operation: &str, arn: &str) -> String {
+    denial_as(&caller_principal(), operation, arn)
+}
+
+/// The SAME sentence for a request signed as `principal` rather than as the one
+/// principal most cases here present: the frame is stated once, so a suite that
+/// varies the credential and one that varies the resource cannot word it two ways.
+pub(crate) fn denial_as(principal: &str, operation: &str, arn: &str) -> String {
     let action = format!("{ACTION_NAMESPACE}:{operation}");
     format!(
-        "User: {} is not authorized to perform: {action} on resource: {arn} because no \
-         resource-based policy allows the {action} action",
-        caller_principal()
+        "User: {principal} is not authorized to perform: {action} on resource: {arn} \
+         because no resource-based policy allows the {action} action"
     )
 }
 
@@ -157,6 +163,38 @@ pub(crate) async fn address(
     let path = (operation.path)(arn);
     let body = operation.body.map(|render| render(arn));
     call_reported(router, operation.method, &path, body.as_deref()).await
+}
+
+/// Those of the operations above that address the point by the ARN in their PATH
+/// alone — the delete and the two reads. The two job starts carry it in their body
+/// and are judged on the CALLER's own identity policies first, which
+/// `caller_authorization.rs` owns.
+pub(crate) fn operations_addressing_by_path() -> Vec<Addressed> {
+    addressed_operations()
+        .into_iter()
+        .filter(|operation| operation.body.is_none())
+        .collect()
+}
+
+/// The SAME call as [`address`], signed with `access_key_id` rather than with this
+/// harness's own credential: what a suite that varies the CALLER drives, so there is
+/// one operation table and one dispatch rather than a second copy per suite.
+pub(crate) async fn address_as(
+    router: &MultiServiceRouter,
+    operation: &Addressed,
+    arn: &str,
+    access_key_id: &str,
+) -> (u16, Value) {
+    let path = (operation.path)(arn);
+    let body = operation.body.map(|render| render(arn));
+    crate::caller_authorization::call_as(
+        router,
+        access_key_id,
+        operation.method,
+        &path,
+        body.as_deref(),
+    )
+    .await
 }
 
 /// The vaults and the one settled recovery point every case runs against.
