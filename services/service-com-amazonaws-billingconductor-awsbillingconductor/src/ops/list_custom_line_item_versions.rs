@@ -317,8 +317,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // Oldest generation first, the order the history was written in, so a
-        // `NextToken` names the same cut point on the next call.
+        // Oldest generation first, the order the history was written in.
         let versions = item.versions();
         let mut selected: Vec<(String, CustomLineItemVersionListElement)> = Vec::new();
         for (index, version) in versions.iter().enumerate() {
@@ -326,9 +325,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             }
             let end = end_billing_period(version, versions.get(index + 1));
-            // The pagination key is the generation's position in that order, written
-            // fixed-width so it orders as a string the way it orders as a number.
-            selected.push((format!("{index:010}"), element(item, version, end)));
+            // The page is cut over the generation's OWN identity in the history — the
+            // ordinal the store minted for it once and gives no other generation of the
+            // item ([`CustomLineItemVersion::history_key`]) — and never over its position
+            // in that order, because the history is not append-only: a write that leaves a
+            // generation applying in no billing period takes it out of the history, after
+            // which a position names a different generation while the ordinal still names
+            // the one the token was minted for. So a `NextToken` names the same cut point
+            // on the next call however the history around it changed — the rule every
+            // paginated read of this service pages by.
+            selected.push((version.history_key(), element(item, version, end)));
         }
 
         let (custom_line_item_versions, next_token) = crate::state::paginate(

@@ -2307,6 +2307,12 @@ pub struct CustomLineItemRecord {
     /// [`ComAmazonawsBillingconductorAwsbillingconductorState::put_custom_line_item`]).
     /// It is what a version reports as its `StartTime`.
     pub version_start_time_millis: i64,
+    /// The ORDINAL of the item's current generation in the item's history: the identity
+    /// the store minted for that generation when the write that opened it landed (see
+    /// [`ComAmazonawsBillingconductorAwsbillingconductorState::put_custom_line_item`]),
+    /// which it keeps for as long as it is a version of the item and no other generation
+    /// of this item ever takes.
+    pub version_ordinal: u64,
     /// The generations of this item that later writes SUPERSEDED, oldest first, at
     /// most [`MAX_CUSTOM_LINE_ITEM_VERSIONS`] of them. The generation in effect NOW is
     /// not among them — it is projected from this record by [`Self::current_version`] —
@@ -2466,6 +2472,7 @@ impl CustomLineItemRecord {
             creation_time_millis: self.creation_time_millis,
             last_modified_time_millis: self.last_modified_time_millis,
             start_time_millis: self.version_start_time_millis,
+            ordinal: self.version_ordinal,
         }
     }
 
@@ -2593,6 +2600,16 @@ pub struct CustomLineItemVersion {
     /// `StartTime`: "The inclusive start time" — the instant this generation took
     /// effect.
     pub start_time_millis: i64,
+    /// This generation's place in the item's history, minted ONCE by the write that
+    /// opened the generation and never moved, reused or recomputed: ordinals ascend with
+    /// the order the generations were written, so the oldest-first history
+    /// ([`CustomLineItemRecord::versions`]) is the ordinals in ascending order, and a
+    /// write that drops a generation from the middle of the history leaves every other
+    /// generation's ordinal exactly where it was.
+    ///
+    /// It is the generation's STABLE identity, which is what a paginated read of the
+    /// history cuts its pages over ([`Self::history_key`]).
+    pub ordinal: u64,
 }
 
 impl CustomLineItemVersion {
@@ -2626,6 +2643,20 @@ impl CustomLineItemVersion {
     /// reports such a generation and no write keeps one.
     pub fn applies_anywhere(&self) -> bool {
         !self.spans.is_empty()
+    }
+
+    /// This generation's key in the item's history, as a paginated read of that history
+    /// cuts a page over it: [`Self::ordinal`] rendered fixed-width, so the keys order as
+    /// strings the way the generations order in the history.
+    ///
+    /// The ordinal and not the generation's POSITION in the history, because the history
+    /// is not append-only: a write that leaves a generation applying in no billing period
+    /// takes it out of the history altogether ([`Self::applies_anywhere`]), so a position
+    /// names a different generation afterwards while the ordinal keeps naming the one it
+    /// was minted for — the stable identity a cursor into a sequence needs, which is what
+    /// the sibling listings of this service page over too.
+    pub fn history_key(&self) -> String {
+        format!("{:020}", self.ordinal)
     }
 
     /// `StartBillingPeriod`: the billing period this generation is in effect FROM,
@@ -3797,7 +3828,17 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
             // A generation this write left no billing period to is not a version of the
             // item in any period, so there is nothing for a read to report it for.
             kept.retain(CustomLineItemVersion::applies_anywhere);
+            // The generation this write leaves in effect is a NEW one exactly when the
+            // write froze the generation before it, so it takes the next ordinal of this
+            // item's history; a write that replaced the generation in effect outright is
+            // still that same generation, so it keeps the ordinal it already had. The
+            // ordinal is minted from the generation this write replaced rather than
+            // counted off the kept history, because a generation this write dropped — and
+            // the oldest one the cap below evicts — must not hand its ordinal on to a
+            // later generation: an ordinal names ONE generation of the item for good.
+            updated.version_ordinal = replaced.ordinal;
             if replaced.applies_anywhere() {
+                updated.version_ordinal = replaced.ordinal.saturating_add(1);
                 kept.push(replaced);
                 updated.version_start_time_millis = now;
             }

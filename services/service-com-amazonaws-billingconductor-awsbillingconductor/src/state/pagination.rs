@@ -24,7 +24,7 @@ pub const NEXT_TOKEN_MEMBER: &str = "NextToken";
 ///
 /// A unit separator occurs in no scope (every scope of this service is built by
 /// [`page_scope_of`], which joins with [`PAGE_SCOPE_SEPARATOR`] instead) and in none of the
-/// keys this service pages over (ARNs, account ids, fixed-width indices), and only the FIRST
+/// keys this service pages over (ARNs, account ids, fixed-width ordinals), and only the FIRST
 /// one is read as the separator, so a cursor is handed back exactly as it was minted.
 pub(super) const PAGE_TOKEN_SEPARATOR: char = '\u{1f}';
 
@@ -204,8 +204,8 @@ pub fn page_scope_shaped(operation: &str, resource_arn: &str, shaping: &[&str]) 
 /// the service cannot read
 /// (`smithy_query(query="shape",shape="ValidationExceptionReason")`), so the answer is the
 /// 400 `ValidationException` with that reason. ONE wording, built here, so a token refused
-/// by a read whose cursor is a stored key reads exactly like one refused by a read whose
-/// cursor is a position.
+/// by a read whose cursor is a resource ARN reads exactly like one refused by a read whose
+/// cursor is a minted ordinal.
 ///
 /// The message states the member and the requirement and NOTHING of the rejected token:
 /// the token is caller input, and a refusal that echoed it would copy it into every client

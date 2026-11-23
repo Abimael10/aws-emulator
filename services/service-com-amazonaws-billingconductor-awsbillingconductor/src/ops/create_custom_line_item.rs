@@ -470,6 +470,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `ListCustomLineItemVersions` reports as in effect from this create on —
             // begins here, and nothing has superseded it yet.
             version_start_time_millis: now,
+            // and it is the FIRST ordinal of the item's history, the identity a
+            // paginated read of that history cuts its pages over: every later generation
+            // of this item takes a higher one
+            // ([`crate::state::ComAmazonawsBillingconductorAwsbillingconductorState::put_custom_line_item`]).
+            version_ordinal: 0,
             superseded_versions: Vec::new(),
         };
         state.custom_line_items.insert(arn.clone(), record);
