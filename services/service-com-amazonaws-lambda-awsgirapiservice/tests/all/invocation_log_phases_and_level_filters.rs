@@ -165,7 +165,11 @@ fn phase_rows() -> Vec<Phase> {
             case: "a python function on the structured format",
             runtime: PYTHON_RUNTIME,
             source: PYTHON_LEVELS,
-            logging_config: Some(json!({ "LogFormat": "JSON" })),
+            // The records of the INIT phase state the detail of how a run was served, so they
+            // reach the group only at the most detailed system level
+            // ([`crate::invocation_system_record_levels`] owns that rule): a row asserting the
+            // phase a record belongs to selects the level that withholds none of them.
+            logging_config: Some(json!({ "LogFormat": "JSON", "SystemLogLevel": "DEBUG" })),
             structured: true,
         },
         Phase {
@@ -179,7 +183,7 @@ fn phase_rows() -> Vec<Phase> {
             case: "a node function on the structured format",
             runtime: NODE_RUNTIME,
             source: NODE_LEVELS,
-            logging_config: Some(json!({ "LogFormat": "JSON" })),
+            logging_config: Some(json!({ "LogFormat": "JSON", "SystemLogLevel": "DEBUG" })),
             structured: true,
         },
     ]

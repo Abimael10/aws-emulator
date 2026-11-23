@@ -494,21 +494,26 @@ fn platform_record(message: &str) -> Option<(String, ::serde_json::Value)> {
 /// How much DETAIL each KIND of platform record names, on the ladder the system level filters
 /// by, for a record of a run that came to what an ordinary run comes to.
 ///
-/// The records of an ORDINARY run — the initialization of the execution environment, the
-/// opening of an invocation, the end of the runtime's work on it and the report of what it
-/// spent — are the records Lambda states about every invocation, so they are that ladder's
-/// `INFO` records; a record about a log Lambda could not deliver is a warning about the log
-/// itself.
+/// The system level sends "system logs at the selected level of detail and lower, where
+/// `DEBUG` is the highest level and `WARN` is the lowest", so each kind sits at the level the
+/// detail IT carries is stated at. What EVERY invocation is reported by — that one happened,
+/// and what it spent — is the envelope of the run, stated at the middle level; the records of
+/// one PHASE inside that envelope (the initialization of the execution environment starting,
+/// the runtime reporting a phase of its own done, and that phase's report) and the record that
+/// closes the runtime's work on the invocation are the DETAIL of how the run was served, which
+/// only the highest level admits; and a record about a log Lambda could not deliver is a
+/// warning about the log itself, which even the lowest level admits.
 ///
-/// Source: the three levels the model's `SystemLogLevel` enum declares (`DEBUG | INFO |
-/// WARN`), against the platform record kinds this module writes ([`init_start`], [`start`],
-/// [`runtime_done`], [`report`]).
+/// Source: the levels AWS states for the system records of a run
+/// (<https://docs.aws.amazon.com/lambda/latest/dg/monitoring-cloudwatchlogs-log-level.html>,
+/// the page the sentence above is on), against the platform record kinds this module writes
+/// ([`init_start`], [`init_done`], [`start`], [`runtime_done`], [`report`]).
 const PLATFORM_RECORD_LEVELS: &[(&str, &str)] = &[
-    ("platform.initStart", "INFO"),
-    ("platform.initRuntimeDone", "INFO"),
-    ("platform.initReport", "INFO"),
+    ("platform.initStart", "DEBUG"),
+    ("platform.initRuntimeDone", "DEBUG"),
+    ("platform.initReport", "DEBUG"),
     ("platform.start", "INFO"),
-    ("platform.runtimeDone", "INFO"),
+    ("platform.runtimeDone", "DEBUG"),
     ("platform.report", "INFO"),
     ("platform.logsDropped", "WARN"),
 ];
@@ -959,10 +964,13 @@ mod tests {
 
     /// RULE: `SystemLogLevel` filters the PLATFORM records of a run independently of the level
     /// the application records are filtered at, and each platform record is judged at the level
-    /// of what IT reports — a record of a run that did not succeed being a warning about that
-    /// run — one row per level the model declares for it, at and around each record's own
-    /// level, the records that close a run for every outcome a run comes to, plus an
-    /// application record, which this filter never withholds.
+    /// of what IT reports — the frames that state an invocation happened and what it spent at
+    /// the level of that envelope, the records of one phase of the environment and of the
+    /// runtime's work on the invocation at the level their detail is stated at, and a record of
+    /// a run that did not succeed as a warning about that run — one row per level the model
+    /// declares for it, at and around each record's own level, the records that close a run for
+    /// every outcome a run comes to, plus an application record, which this filter never
+    /// withholds.
     #[test]
     fn a_platform_record_is_sent_only_at_the_selected_system_level_and_lower() {
         let completion = Completion::Returned("{}".to_string());
@@ -994,25 +1002,44 @@ mod tests {
                 true,
             ),
             (
+                "the same frame one level lower in detail than the phase records it belongs to",
+                init_start(true, at(), &initializing("on-demand")),
+                Some("INFO"),
+                false,
+            ),
+            (
                 "the frame that opens an invocation, at its own level",
                 start(true, at(), "req-1", FUNCTION_ARN, "7"),
                 Some("INFO"),
+                true,
+            ),
+            (
+                "the same frame at the most detailed level, which withholds nothing",
+                start(true, at(), "req-1", FUNCTION_ARN, "7"),
+                Some("DEBUG"),
                 true,
             ),
             // The records that CLOSE a run are judged by what they REPORT: those of a run that
             // answered are the records of an ordinary run, and those of a run that did not
             // succeed are warnings about it, which the least detailed level still admits.
             (
-                "the record that closes the run of a handler that answered, one level higher in \
+                "the record that closes the run of a handler that answered, two levels higher in \
                  detail than the filter",
                 runtime_done(true, at(), "req-1", &completion, produced()),
                 Some("WARN"),
                 false,
             ),
             (
-                "the same record at the level the records of an ordinary run are stated at",
+                "the same record one level higher in detail than the filter, which states the \
+                 detail of how the run was served and not that it happened",
                 runtime_done(true, at(), "req-1", &completion, produced()),
                 Some("INFO"),
+                false,
+            ),
+            (
+                "the same record at the level that detail is stated at",
+                runtime_done(true, at(), "req-1", &completion, produced()),
+                Some("DEBUG"),
                 true,
             ),
             (
@@ -1102,7 +1129,7 @@ mod tests {
                 true,
             ),
             (
-                "the same record of an initialization that stood the environment up, one level \
+                "the same record of an initialization that stood the environment up, two levels \
                  higher in detail than the filter",
                 init_done(
                     at(),
@@ -1117,7 +1144,36 @@ mod tests {
                 false,
             ),
             (
-                "the frame that opens an environment's log, one level higher in detail",
+                "the same record one level higher in detail than the filter",
+                init_done(
+                    at(),
+                    &InitDone {
+                        initialization_type: "on-demand",
+                        took: Duration::from_millis(12),
+                        failed: false,
+                    },
+                )
+                .remove(1),
+                Some("INFO"),
+                false,
+            ),
+            (
+                "the record the runtime closes an initialization that stood the environment up \
+                 with, at the level the phase records are stated at",
+                init_done(
+                    at(),
+                    &InitDone {
+                        initialization_type: "on-demand",
+                        took: Duration::from_millis(12),
+                        failed: false,
+                    },
+                )
+                .remove(0),
+                Some("DEBUG"),
+                true,
+            ),
+            (
+                "the frame that opens an environment's log, under the least detailed level",
                 init_start(true, at(), &initializing("on-demand")),
                 Some("WARN"),
                 false,

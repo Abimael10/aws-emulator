@@ -47,15 +47,46 @@ const FUNCTIONS_URI: &str = "/2015-03-31/functions";
 /// model's `SystemLogLevel` enum declares (`DEBUG | INFO | WARN`).
 const SYSTEM_LOG_LEVELS: [&str; 3] = ["DEBUG", "INFO", "WARN"];
 
-/// The level the platform records of an ORDINARY run are stated at, which is the least detailed
-/// level that still admits them: a function filtering below it keeps none of them.
-const ORDINARY_RUN_LEVEL: &str = "INFO";
+/// The level each KIND of platform record of an ordinary run is stated at: the two frames that
+/// state an invocation happened and what it spent are the envelope every invocation is reported
+/// by, while the records of one phase of the execution environment and the record that closes
+/// the runtime's work on the invocation are the DETAIL of how the run was served, which only the
+/// most detailed level admits.
+///
+/// Source: the levels AWS states for the system records of a run
+/// (<https://docs.aws.amazon.com/lambda/latest/dg/monitoring-cloudwatchlogs-log-level.html>),
+/// against the records one run of this function leaves.
+const RECORD_LEVELS: [(&str, &str); 6] = [
+    ("platform.initStart", "DEBUG"),
+    ("platform.initRuntimeDone", "DEBUG"),
+    ("platform.initReport", "DEBUG"),
+    ("platform.start", "INFO"),
+    ("platform.runtimeDone", "DEBUG"),
+    ("platform.report", "INFO"),
+];
 
-/// Whether a function filtering its system records at `level` keeps the records of an ORDINARY
-/// run: the level those records are stated at, and every more detailed one, admit them.
-fn admits_an_ordinary_run(level: &str) -> bool {
+/// The level a record of a run that did NOT succeed is stated at: such a record is a warning
+/// about that run, which even the least detailed level admits.
+const FAILED_RUN_LEVEL: &str = "WARN";
+
+/// The level the record `kind` of a run that came to `succeeded` is stated at.
+fn stated_level(kind: &str, succeeded: bool) -> &'static str {
+    if !succeeded {
+        return FAILED_RUN_LEVEL;
+    }
+    RECORD_LEVELS
+        .iter()
+        .find(|(named, _)| *named == kind)
+        .map(|(_, level)| *level)
+        .unwrap_or_else(|| panic!("the level of {kind:?} is one of the table's"))
+}
+
+/// Whether a function filtering its system records at `filter` is sent a record stated at
+/// `stated`: "Lambda only sends system logs at the selected level of detail and lower", so a
+/// filter at least as detailed as the record admits it.
+fn admits(filter: &str, stated: &str) -> bool {
     let placed = |named: &str| SYSTEM_LOG_LEVELS.iter().position(|value| *value == named);
-    placed(level) <= placed(ORDINARY_RUN_LEVEL)
+    placed(filter) <= placed(stated)
 }
 
 /// The records that CLOSE an invocation, in the order the platform writes them: the runtime
@@ -267,10 +298,11 @@ async fn the_records_that_close_a_failed_run_are_sent_at_every_system_log_level(
             // whole log it wrote: the filter is on what Lambda SENDS.
             let held = searched(&router, &case, &group).await;
             let delivered: Vec<Value> = held.iter().filter_map(|line| record(line)).collect();
-            // The closing records of a run that answered are records of an ordinary run; those
-            // of a run that did not succeed are warnings about it, which every level admits.
-            let sent = !row.succeeded || admits_an_ordinary_run(level);
             for closing in CLOSING_RECORDS {
+                // The closing records of a run that answered are stated at the level of their
+                // own kind; those of a run that did not succeed are warnings about it, which
+                // every level admits.
+                let sent = admits(level, stated_level(closing, row.succeeded));
                 let wrote = of_kind(&written, closing);
                 assert_eq!(
                     wrote.len(),
@@ -315,18 +347,22 @@ async fn the_records_that_close_a_failed_run_are_sent_at_every_system_log_level(
             }
 
             // The frames that OPEN a phase report an ordinary run whatever that run came to, so
-            // they follow the level alone.
+            // each follows the level IT is stated at alone: the environment the rows run in was
+            // built by the first of them, so every frame this level admits is in the group.
             let frames: Vec<&str> = OPENING_FRAMES
                 .iter()
                 .filter(|named| !of_kind(&delivered, named).is_empty())
                 .copied()
                 .collect();
-            let ordinary = admits_an_ordinary_run(level);
+            let expected: Vec<&str> = OPENING_FRAMES
+                .iter()
+                .filter(|named| admits(level, stated_level(named, true)))
+                .copied()
+                .collect();
             assert_eq!(
-                !frames.is_empty(),
-                ordinary,
-                "case {case:?}: expected the frames that open a phase to be delivered: \
-                 {ordinary}, got {frames:?} of {delivered:?}"
+                frames, expected,
+                "case {case:?}: expected the frames {expected:?} to be delivered, got \
+                 {frames:?} of {delivered:?}"
             );
         }
     }

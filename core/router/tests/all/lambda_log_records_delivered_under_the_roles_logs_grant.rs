@@ -97,16 +97,22 @@ pub(crate) const TEXT_FORMAT: &str = "Text";
 /// See [`TEXT_FORMAT`].
 pub(crate) const JSON_FORMAT: &str = "JSON";
 
-/// How many records ONE run of these handlers leaves: the record that states the
-/// initialization of the execution environment it built, the three frames of the run, and the
-/// one line the handler printed.
-const RECORDS_PER_RUN: usize = 5;
+/// How many records ONE run of these handlers leaves in the group under the plain-text format,
+/// which filters by no level at all: the record that states the initialization of the execution
+/// environment it built, the three frames of the run, and the one line the handler printed.
+const TEXT_RECORDS_PER_RUN: usize = 5;
 
-/// How many of those records the PLATFORM writes itself, which under the structured format are
-/// the platform records a client parses: the three records of the environment's initialization
-/// (the phase starting, the runtime reporting it done and its report), and the three frames of
-/// the run.
-const PLATFORM_RECORDS_PER_RUN: usize = 6;
+/// How many it leaves under the structured format, whose system records are filtered at the
+/// documented default level: the two frames that state the invocation happened and what it spent,
+/// and the handler's own line. The records of the environment's phases and the one closing the
+/// runtime's work on the invocation state the DETAIL of how the run was served, which only the
+/// most detailed level is sent — [`crate::lambda_log_record_framing_and_system_level`] owns which
+/// level admits which record.
+const JSON_RECORDS_PER_RUN: usize = 3;
+
+/// How many of the records of a structured run the PLATFORM writes itself, which are the platform
+/// records a client parses: the two frames the default level admits.
+const JSON_PLATFORM_RECORDS_PER_RUN: usize = 2;
 
 /// The python handler every python row deploys: it prints the marker the event carries and
 /// answers it, so the record it wrote can be told from any other row's.
@@ -347,10 +353,15 @@ async fn every_delivered_log_record_carries_the_line_break_that_closed_its_write
         // 2. What the group holds: one event per record the run wrote, each closed by the break
         //    that closed its write — which is what [`record_text`] asserts of every one of
         //    them, including the frames of the run.
-        let held = messages_at_least(&router, &group, RECORDS_PER_RUN).await;
+        let per_run = if row.format == JSON_FORMAT {
+            JSON_RECORDS_PER_RUN
+        } else {
+            TEXT_RECORDS_PER_RUN
+        };
+        let held = messages_at_least(&router, &group, per_run).await;
         assert!(
-            held.len() >= RECORDS_PER_RUN,
-            "case {case:?}: expected at least the run's {RECORDS_PER_RUN} records in {group:?}, \
+            held.len() >= per_run,
+            "case {case:?}: expected at least the run's {per_run} records in {group:?}, \
              got {held:?}"
         );
         let texts: Vec<String> = held
@@ -392,9 +403,9 @@ async fn every_delivered_log_record_carries_the_line_break_that_closed_its_write
                 })
                 .count();
             assert_eq!(
-                frames, PLATFORM_RECORDS_PER_RUN,
-                "case {case:?}: expected the run's {PLATFORM_RECORDS_PER_RUN} platform records, \
-                 got {texts:?}"
+                frames, JSON_PLATFORM_RECORDS_PER_RUN,
+                "case {case:?}: expected the run's {JSON_PLATFORM_RECORDS_PER_RUN} platform \
+                 records, got {texts:?}"
             );
         } else {
             for frame in TEXT_FRAMES {

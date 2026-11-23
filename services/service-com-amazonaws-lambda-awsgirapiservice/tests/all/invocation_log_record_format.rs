@@ -112,7 +112,12 @@ fn rows() -> Vec<Row> {
             logging_config: Some(json!({
                 "LogFormat": "JSON",
                 "ApplicationLogLevel": "WARN",
-                "SystemLogLevel": "INFO",
+                // The level a function filters its SYSTEM records at decides which of the
+                // platform's records of a run reach the group at all, which is
+                // [`crate::invocation_system_record_levels`]'s rule and not this suite's: these
+                // rows are about the FORM each record takes, so every structured row selects
+                // the level that withholds none of them.
+                "SystemLogLevel": "DEBUG",
             })),
             reported_format: "JSON",
             structured: true,
@@ -131,6 +136,7 @@ fn rows() -> Vec<Row> {
             case: "a python function on the structured format logging into a named group",
             logging_config: Some(json!({
                 "LogFormat": "JSON",
+                "SystemLogLevel": "DEBUG",
                 "LogGroup": "/aws/lambda/records-elsewhere",
             })),
             reported_format: "JSON",
@@ -144,7 +150,7 @@ fn rows() -> Vec<Row> {
         },
         Row {
             case: "a python function on the structured format whose handler failed",
-            logging_config: Some(json!({ "LogFormat": "JSON" })),
+            logging_config: Some(json!({ "LogFormat": "JSON", "SystemLogLevel": "DEBUG" })),
             reported_format: "JSON",
             structured: true,
             source: PYTHON_RAISES,
@@ -180,7 +186,7 @@ fn rows() -> Vec<Row> {
         },
         Row {
             case: "a node function on the structured format",
-            logging_config: Some(json!({ "LogFormat": "JSON" })),
+            logging_config: Some(json!({ "LogFormat": "JSON", "SystemLogLevel": "DEBUG" })),
             reported_format: "JSON",
             structured: true,
             source: NODE_LOGGING,
@@ -453,19 +459,26 @@ async fn the_application_log_level_decides_which_records_reach_cloudwatch_logs()
              of {lines:?}",
             row.delivered
         );
-        // Whatever the filter withholds, the frames of the run itself are delivered: the group
-        // and its stream exist for every invocation.
-        let frames: Vec<&String> = lines
+        // Whatever the APPLICATION filter withholds, the platform's own frames of the run are
+        // delivered: the group and its stream exist for every invocation. Which of them reach
+        // it is the other level's doing — these rows name none, so they are filtered at the
+        // documented default, which admits the two frames that state the invocation happened
+        // and what it spent ([`crate::invocation_system_record_levels`] owns that rule).
+        let frames: Vec<String> = lines
             .iter()
-            .filter(|line| {
-                record(line).is_some_and(|members| members.contains_key("type"))
+            .filter_map(|line| record(line))
+            .filter_map(|members| {
+                members
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
             })
             .collect();
         assert_eq!(
-            frames.len(),
-            6,
-            "case {case:?}: expected the run's six platform frames — the three of the \
-             environment's initialization and the three of the invocation — got {frames:?}"
+            frames,
+            vec!["platform.start".to_string(), "platform.report".to_string()],
+            "case {case:?}: expected the frames the default system level admits, got {frames:?} \
+             out of {lines:?}"
         );
     }
 }

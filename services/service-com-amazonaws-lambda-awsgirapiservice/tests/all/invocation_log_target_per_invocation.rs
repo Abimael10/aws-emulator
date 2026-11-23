@@ -485,8 +485,10 @@ struct Filtered {
 
 /// The platform records of a COLD run that every row's delivery carries whatever its application
 /// level is: the record of the environment's initialization, the one that closes the handler's run
-/// and the one that reports what the run spent. Each is stated at the level a function's system
-/// records are filtered at by default, which is the level these rows leave `SystemLogLevel` at.
+/// and the one that reports what the run spent. The first two state the DETAIL of how the run was
+/// served, so the rows select the system level that admits every platform record
+/// ([`crate::invocation_system_record_levels`] owns which level admits which record); what this
+/// rule needs of them is that the level over the APPLICATION records withholds none of them.
 const PLATFORM_RECORDS: [&str; 3] = [
     "platform.initStart",
     "platform.runtimeDone",
@@ -572,8 +574,14 @@ async fn a_handlers_own_json_record_is_filtered_by_the_level_it_states() {
                 log_group: None,
             },
             // A level is a feature of the structured format, which is the format this handler's
-            // own records are already in.
-            Some(&json!({ "LogFormat": "JSON", "ApplicationLogLevel": row.level })),
+            // own records are already in. The system level is the one that admits every platform
+            // record, so what reaches the group of those is this level's doing and not the other
+            // one's.
+            Some(&json!({
+                "LogFormat": "JSON",
+                "ApplicationLogLevel": row.level,
+                "SystemLogLevel": "DEBUG",
+            })),
         )
         .await;
 

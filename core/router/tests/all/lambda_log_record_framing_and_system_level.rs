@@ -11,9 +11,12 @@
 //! are its SYSTEM logs: the execution environment's initialization is framed by its own records
 //! (the phase starting, the runtime reporting that phase done, and the phase's report) before
 //! the records of the invocation served in it, and Lambda sends each such record only at the
-//! function's `LoggingConfig$SystemLogLevel` of detail and lower — a filter of the structured
-//! format, so a function on the plain-text format is sent the runtime's framing whatever level
-//! is stored.**
+//! function's `LoggingConfig$SystemLogLevel` of detail and lower — the records of a phase and
+//! the one closing the runtime's work on an invocation state the DETAIL of how the run was
+//! served and travel at the most detailed level, while the two frames that state an invocation
+//! happened and what it spent are the envelope the default level still admits. It is a filter of
+//! the structured format, so a function on the plain-text format is sent the runtime's framing
+//! whatever level is stored.**
 //!
 //! A client reads its function's log by matching records: a metric filter counting the lines a
 //! handler printed, a subscription filter forwarding them, an operator grepping a stream. A
@@ -39,8 +42,8 @@
 //! the KIND of write (a runtime-framed record carrying breaks of its own — a `console.log` whose
 //! message holds one, and a `logging` record carrying an exception's frames — a raw write
 //! carrying several lines, and a raw line written in pieces across two writes), the `LogFormat`
-//! the records are rendered in, and the system level in force — the most detailed, the default,
-//! and one below every record the platform writes for a run.
+//! the records are rendered in, and the system level in force — the most detailed, the default
+//! (left unnamed and named outright), and one below every record the platform writes for a run.
 //!
 //! No expected value here comes from a recording: every marker is built by the row, and every
 //! asserted record is built from it.
@@ -73,7 +76,8 @@ const DELIVERY_ACTIONS: [&str; 3] = [
 ];
 
 /// The kinds of platform record one run leaves, in the order the platform writes them: the
-/// initialization of the execution environment, then the invocation served in it.
+/// initialization of the execution environment, then the invocation served in it. Every one of
+/// them reaches the group at the most detailed system level.
 const EVERY_PLATFORM_KIND: [&str; 6] = [
     "platform.initStart",
     "platform.initRuntimeDone",
@@ -82,6 +86,15 @@ const EVERY_PLATFORM_KIND: [&str; 6] = [
     "platform.runtimeDone",
     "platform.report",
 ];
+
+/// The kinds a function filtered at the DOCUMENTED DEFAULT system level is sent: the envelope
+/// every invocation is reported by — that one happened, and what it spent. The records of the
+/// environment's phases and the one closing the runtime's work on the invocation state the
+/// detail of HOW the run was served, which the level above alone admits.
+///
+/// Source: the levels AWS states for the system records of a run
+/// (<https://docs.aws.amazon.com/lambda/latest/dg/monitoring-cloudwatchlogs-log-level.html>).
+const ENVELOPE_PLATFORM_KINDS: [&str; 2] = ["platform.start", "platform.report"];
 
 /// The node handler the node rows deploy. It reports the same text four ways, so one row shows
 /// every form of write the rule distinguishes:
@@ -170,7 +183,17 @@ const ROWS: &[Row] = &[
         source: NODE_HANDLER,
         format: JSON_FORMAT,
         system_level: None,
-        platform_kinds: &EVERY_PLATFORM_KIND,
+        platform_kinds: &ENVELOPE_PLATFORM_KINDS,
+    },
+    Row {
+        case: "a python run on the structured format at the default level named outright, which \
+               withholds the detail of how the run was served",
+        function: "xsvc-log-framing-python-info",
+        runtime: "python3.12",
+        source: PYTHON_HANDLER,
+        format: JSON_FORMAT,
+        system_level: Some("INFO"),
+        platform_kinds: &ENVELOPE_PLATFORM_KINDS,
     },
     Row {
         case: "a python run on the plain-text format, whose logging record carries an \
