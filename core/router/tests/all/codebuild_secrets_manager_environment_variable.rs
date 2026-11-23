@@ -434,11 +434,18 @@ async fn a_secrets_manager_variable_is_substituted_inside_the_build() {
             reference: Reference::KeyByArn("token"),
             expected: "arn-addressed-token",
         },
+        // The number this row stores is WIDE for a reason the assertions below turn on: the
+        // last of them reads the whole answer as text and requires the plaintext to be absent
+        // from it, and an answer carries machine-generated numbers of its own (a build's
+        // `startTime` and `endTime` are epoch seconds). A plaintext narrow enough to appear
+        // INSIDE one of those would make this case depend on what the clock reads rather than
+        // on what the build substituted, so the value is wider than any number the answer can
+        // carry while still being what the row is about: a JSON field that is not a string.
         Row {
             case: "a JSON field that is not a string",
-            stored: r#"{"port":5432}"#,
-            reference: Reference::KeyByName("port"),
-            expected: "5432",
+            stored: r#"{"revision":867530913572468}"#,
+            reference: Reference::KeyByName("revision"),
+            expected: "867530913572468",
         },
         Row {
             case: "a value whose byte length differs from its character count",
