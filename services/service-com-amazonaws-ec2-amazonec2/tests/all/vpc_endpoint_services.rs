@@ -247,7 +247,7 @@ const REGIONS: [&str; 3] = ["us-east-1", "eu-west-2", "ap-southeast-2"];
 /// A derived id — one of a service of the Region's catalogue — never opens with a zero digit,
 /// which is what keeps it clear of the ids the store mints from its counter for a service
 /// configuration a caller created.
-fn is_derived_service_id(value: &str) -> bool {
+pub(crate) fn is_derived_service_id(value: &str) -> bool {
     value.strip_prefix("vpce-svc-").is_some_and(|suffix| {
         suffix.len() == 17
             && !suffix.starts_with('0')
