@@ -24,6 +24,11 @@
 //! The rows differ along what the rule generalises over: the TYPE and SCHEME of the load
 //! balancer (both the families the attribute's documentation lists it for) and how many
 //! Availability Zones it spans.
+//!
+//! The rest of the ARC surface reached THROUGH such a registration — the listing, the
+//! practice run configuration and the zonal autoshift status ARC holds for the load
+//! balancer — is `elbv2_zonal_shift_managed_resource_control_plane.rs`, which reuses the
+//! helpers below.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -49,7 +54,7 @@ const ZONAL_SHIFT_ATTRIBUTE: &str =
 
 /// One emulator carrying Amazon EC2, Elastic Load Balancing v2 and ARC Zonal Shift over
 /// ONE shared engine, as the production router mounts them.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -137,7 +142,7 @@ async fn elbv2(router: &MultiServiceRouter, action: &str, params: &[(&str, &str)
 }
 
 /// One ELBv2 action that must succeed, answered with its XML body.
-async fn elbv2_ok(
+pub(crate) async fn elbv2_ok(
     router: &MultiServiceRouter,
     case: &str,
     action: &str,
@@ -152,7 +157,7 @@ async fn elbv2_ok(
 }
 
 /// One restJson1 call to ARC Zonal Shift, answered with its status and parsed body.
-async fn arc(
+pub(crate) async fn arc(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -181,7 +186,7 @@ async fn arc(
 }
 
 /// `GetManagedResource` for one resource identifier.
-async fn get_managed_resource(router: &MultiServiceRouter, arn: &str) -> (u16, Value) {
+pub(crate) async fn get_managed_resource(router: &MultiServiceRouter, arn: &str) -> (u16, Value) {
     arc(
         router,
         "GET",
@@ -192,7 +197,7 @@ async fn get_managed_resource(router: &MultiServiceRouter, arn: &str) -> (u16, V
 }
 
 /// The wire error code of a restJson1 error envelope, with any `shapeId#` prefix dropped.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body["__type"]
         .as_str()
         .unwrap_or_default()
@@ -203,7 +208,7 @@ fn error_code(body: &Value) -> String {
 }
 
 /// The `appliedWeights` of a resource view, as a sorted map.
-fn weights(view: &Value) -> BTreeMap<String, f64> {
+pub(crate) fn weights(view: &Value) -> BTreeMap<String, f64> {
     view["appliedWeights"]
         .as_object()
         .unwrap_or_else(|| panic!("appliedWeights is required, got {view}"))
@@ -214,7 +219,7 @@ fn weights(view: &Value) -> BTreeMap<String, f64> {
 
 /// The weights a resource deployed in `zones` reports while traffic is moved away from
 /// `away_from`: 0 there, 1 everywhere else.
-fn expected_weights(zones: &[String], away_from: Option<&str>) -> BTreeMap<String, f64> {
+pub(crate) fn expected_weights(zones: &[String], away_from: Option<&str>) -> BTreeMap<String, f64> {
     zones
         .iter()
         .map(|zone| {
@@ -229,9 +234,9 @@ fn expected_weights(zones: &[String], away_from: Option<&str>) -> BTreeMap<Strin
 }
 
 /// One subnet EC2 minted: its id and the Availability Zone ID EC2 reports for it.
-struct Subnet {
-    id: String,
-    zone_id: String,
+pub(crate) struct Subnet {
+    pub(crate) id: String,
+    pub(crate) zone_id: String,
 }
 
 /// Create one VPC carrying one subnet per entry of `zones`, through EC2's own operations —
@@ -240,7 +245,11 @@ struct Subnet {
 /// The VPC is given an internet gateway, attached through EC2's own `AttachInternetGateway`:
 /// an internet-facing load balancer of the rows below can only be placed in a VPC that has
 /// one.
-async fn ec2_network(router: &MultiServiceRouter, second_octet: u8, zones: &[&str]) -> Vec<Subnet> {
+pub(crate) async fn ec2_network(
+    router: &MultiServiceRouter,
+    second_octet: u8,
+    zones: &[&str],
+) -> Vec<Subnet> {
     let cidr = format!("10.{second_octet}.0.0/16");
     let vpc_id = element(&ec2(router, "CreateVpc", &[("CidrBlock", &cidr)]).await, "vpcId");
     let gateway = element(
@@ -278,7 +287,12 @@ async fn ec2_network(router: &MultiServiceRouter, second_octet: u8, zones: &[&st
 }
 
 /// Write the zonal-shift attribute of one load balancer, requiring the 200.
-async fn set_zonal_shift(router: &MultiServiceRouter, case: &str, lb_arn: &str, value: &str) {
+pub(crate) async fn set_zonal_shift(
+    router: &MultiServiceRouter,
+    case: &str,
+    lb_arn: &str,
+    value: &str,
+) {
     elbv2_ok(
         router,
         case,
