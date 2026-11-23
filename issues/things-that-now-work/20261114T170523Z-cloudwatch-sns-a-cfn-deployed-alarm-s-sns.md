@@ -42,3 +42,36 @@ Actual: the control queue stays empty. receive_message(MaxNumberOfMessages=10, W
 Observed: no message ever arrives; the poll never returns an envelope and the check is cut off at the 60 s harness cap.
 Expected: one SNS notification envelope arrives whose Message document has AlarmName = the alarm's name and NewStateValue = "ALARM".
 4. (Blocked by the above) Deploy the same template plus an AWS::SNS::TopicPolicy on the same topic allowing only ["SNS:Subscribe","SNS:Receive","SNS:GetTopicAttributes"], force its alarm to ALARM first, and assert its queue stays empty for max(60 s, control latency) — the publish must be refused with AuthorizationError (HTTP 403, awsQueryError code `AuthorizationError`).
+
+## Resolution
+
+* Cause 1 — "the control delivery never happens" — is DECLINED: it does happen, and this report's
+  reading of where the check stopped is what does not hold. The notification reaches the queue the
+  control stack's `QueueUrl` output names, within a second of `SetAlarmState`, on the emulator a
+  client STARTS (the built binary, request authentication on, calls signed and the consumer
+  long-polling): the message's `Body` is the SNS notification envelope and `json.loads(Body)["Message"]`
+  carries `AlarmName` = the deployed alarm and `NewStateValue` = `ALARM`. The replay key's line is in
+  `_poll_for_notification`, the helper BOTH of the check's polls go through, so it does not say which
+  poll was cut off — and the check's own absence half holds the restricted queue empty for
+  `max(60 s, control latency)` on top of deploying two stacks, which exceeds the check's 60 s
+  wall-clock budget however fast the delivery is. That is the same reason already recorded for this
+  trace id in `issues/things-that-now-work/20261114T083920Z-cloudwatch-sns-a-cfn-deployed-aws-sns-topicpolicy.md`
+  and `issues/things-that-now-work/20261029T182452Z-cloudwatch-sns-alarm-actions-cfn-alarms-are-never.md`.
+* What this change adds is the one axis of that chain no test pinned: the emulator AS SERVED.
+  `core/router/tests/all/cloudwatch_cfn_alarm_notification_on_a_started_emulator.rs` starts the built
+  binary, deploys the estate this report describes — a queue, a topic, the `sqs` subscription, an
+  `AWS::SQS::QueuePolicy` whose grant to `sns.amazonaws.com` is scoped by `aws:SourceArn`, and the
+  alarm whose `AlarmActions` is that topic — forces each alarm into `ALARM` and long-polls each
+  subscribed queue. Its rows span whether the template declares the queue's and the topic's names or
+  leaves CloudFormation to generate them, and whether the stack declares a topic policy that
+  withholds the publish: the two granted rows receive exactly one notification each and record the
+  action as `Succeeded`, and the two withholding rows receive nothing and record it as `Failed` with
+  the refused `SNS:Publish` and the topic ARN.
+* The dispatch, the fan-out and the CloudFormation providers this report names are unchanged,
+  because each already does what it asks for: `settle_alarms` /
+  `sns_topic_authorization::publish_refusal`
+  (`services/service-com-amazonaws-cloudwatch-graniteserviceversion20100801/src/state/alarm_actions.rs`),
+  the subscribed-queue hand-over
+  (`services/service-com-amazonaws-sns-amazonsimplenotificationservice/src/ops/publish/service_delivery.rs`)
+  and the `AWS::SNS::Subscription` / `AWS::SQS::QueuePolicy` / `AWS::SNS::TopicPolicy` providers
+  (`services/service-com-amazonaws-cloudformation-cloudformation/src/state/provisioner/application_services.rs`).
