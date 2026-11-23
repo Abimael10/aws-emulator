@@ -291,13 +291,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 tags: input.tags.unwrap_or_default(),
                 // AWS answers `CreateInferenceRecommendationsJob` with an ARN while the
                 // job is still queued, so the move out of `PENDING` is owed by the clock
-                // rather than taken on this call.
+                // rather than taken on this call. It is owed from the instant the benchmark
+                // below reports, which is before this call answers
+                // (`crate::state::recommendation_job_settles_at`), so the request that
+                // follows this one reports what the benchmark measured.
                 status: crate::state::RECOMMENDATION_JOB_STATUS_PENDING.to_string(),
                 failure_reason: None,
                 creation_time: now,
                 last_modified_time: now,
                 completion_time: None,
-                ends_at: now + crate::state::RECOMMENDATION_JOB_SETTLES_AFTER,
+                ends_at: crate::state::recommendation_job_settles_at(now),
                 // Both are filled in by the benchmark below, once it has reported.
                 recommendations: Vec::new(),
                 run: None,
@@ -311,9 +314,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The job's own WORK: the load test, performed here against the same serving path an
         // `InvokeEndpoint` takes — in this process, over this emulator's own Amazon S3, with no
         // socket opened and no address from the request dialled — and RECORDED on the stored
-        // job rather than revealed, so a caller that describes the job straight after creating
-        // it still observes `PENDING`. The work is a constant bounded by this emulator's own
-        // ceilings and does not grow with the request (see the module docs).
+        // job rather than revealed, so this call's own answer is the `PENDING` it stored and
+        // the next request reports the outcome. The work is a constant bounded by this
+        // emulator's own ceilings and does not grow with the request (see the module docs).
         let outcome = crate::state::run_inference_recommendations_job(
             ctx,
             &region,

@@ -26,34 +26,10 @@ use crate::inference_deployment_lifecycle::{
     error_code, message, one_variant_config, primary_container, str_field, Emulator, ACCOUNT,
 };
 
-/// Long enough to pass `state::RECOMMENDATION_JOB_SETTLES_AFTER` (400 ms).
+/// Long enough for a created job's single move to be due, whenever it falls
+/// (`state::recommendation_job_settles_at`), so a read past this point reports a terminal
+/// status.
 const PAST_JOB_END_DUE: Duration = Duration::from_millis(700);
-
-/// How long a poll for a recommendation job's terminal status may take before the test gives
-/// up, and how often it looks. What is waited for is the CONDITION, re-read in a loop, so a
-/// loaded host cannot fail a case the clock would have served.
-const TERMINAL_DEADLINE: Duration = Duration::from_secs(120);
-const POLL_INTERVAL: Duration = Duration::from_millis(50);
-
-/// The `RecommendationJobStatus` members a job's work has ENDED in (smithy_query
-/// shape=RecommendationJobStatus).
-const TERMINAL_STATUSES: [&str; 3] = ["COMPLETED", "FAILED", "STOPPED"];
-
-/// Describe `name` until its status is terminal, and answer that `(status, body)` read.
-async fn ended(emulator: &Emulator, name: &str) -> (u16, Value) {
-    let deadline = ::std::time::Instant::now() + TERMINAL_DEADLINE;
-    loop {
-        let (status, described) = describe(emulator, name).await;
-        if TERMINAL_STATUSES.contains(&str_field(&described, "Status").as_str()) {
-            return (status, described);
-        }
-        assert!(
-            ::std::time::Instant::now() < deadline,
-            "case {name:?}: the job never reached a terminal Status, last read {described}"
-        );
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
-}
 
 /// A `RoleArn` matching the modelled pattern
 /// `^arn:aws[a-z\-]*:iam::\d{12}:role/?[a-zA-Z_0-9+=,.@\-_/]+$`.
@@ -384,21 +360,24 @@ async fn describe_replays_every_member_the_create_carried() {
         }
         assert_eq!(
             str_field(&described, "Status"),
-            // `RecommendationJobStatus`'s non-terminal entry point (smithy_query
-            // shape=RecommendationJobStatus).
-            "PENDING",
-            "case {case}: a job starts PENDING, got {described}"
+            // The job's benchmark ran inside the create and had no model artifact to invoke
+            // (the seeded model carries none), so the terminal status the clock owes from the
+            // instant that create answered is `RecommendationJobStatus`'s `FAILED`
+            // (smithy_query shape=RecommendationJobStatus).
+            "FAILED",
+            "case {case}: the first read reports what the create's own benchmark produced, got \
+             {described}"
         );
-        // Nothing has run and nothing is due yet, so none of these is reported.
-        for absent in [
-            "CompletionTime",
-            "FailureReason",
-            "InferenceRecommendations",
-            "EndpointPerformances",
-        ] {
+        assert!(
+            !str_field(&described, "FailureReason").is_empty(),
+            "case {case}: a FAILED job must say what stopped it, got {described}"
+        );
+        // Nothing was measured, so neither of the measurement members is reported.
+        for absent in ["InferenceRecommendations", "EndpointPerformances"] {
             assert!(
                 described.get(absent).is_none(),
-                "case {case}: {absent} must be absent on a PENDING job, got {:?}",
+                "case {case}: {absent} must be absent when the benchmark measured nothing, got \
+                 {:?}",
                 described.get(absent)
             );
         }
@@ -410,49 +389,37 @@ async fn describe_replays_every_member_the_create_carried() {
             creation_time > 0.0,
             "case {case}: CreationTime must be the instant of the create, got {creation_time}"
         );
+        let completion_time = described
+            .get("CompletionTime")
+            .and_then(Value::as_f64)
+            .unwrap_or_else(|| panic!("case {case}: expected a CompletionTime in {described}"));
+        assert!(
+            completion_time >= creation_time,
+            "case {case}: the job completed at or after it was created, got {described}"
+        );
         assert_eq!(
             described.get("LastModifiedTime").and_then(Value::as_f64),
-            Some(creation_time),
-            "case {case}: an unchanged job reports the creation instant as \
-             LastModifiedTime, got {described}"
+            Some(completion_time),
+            "case {case}: LastModifiedTime is the instant the move was due, got {described}"
         );
     }
 }
 
-/// RULE: a job is accepted in the non-terminal `PENDING` status and owes its single move
-/// to a terminal status to the clock: a read before the move is due reports `PENDING` with
-/// no completion time, a read at or after it reports the terminal status with the reason
-/// and the completion time stamped at the instant the move was due, and further reads
-/// change nothing.
+/// RULE: a job is accepted in the non-terminal `PENDING` status and owes its single move to
+/// a terminal status to the clock — and that move is owed from the instant the create that
+/// performed the job's own benchmark answers, so the FIRST read after it reports the terminal
+/// status with the reason and the completion time stamped at the instant the move was due, and
+/// further reads change nothing. A polling client therefore spends none of its interval on the
+/// job (`state::recommendation_job_settles_at`).
 #[tokio::test]
-async fn the_status_moves_out_of_pending_only_when_the_clock_owes_it() {
+async fn the_first_read_after_the_create_reports_the_benchmark_the_create_ran() {
     let emulator = Emulator::new();
     seed_model(&emulator, "us-east-1").await;
     emulator
         .ok("CreateInferenceRecommendationsJob", &minimal_create("clock-owed"))
         .await;
 
-    // Two reads straight after the create: the transient status is observable, and
-    // reading does not advance it.
-    for read in ["first", "second"] {
-        let (status, described) = describe(&emulator, "clock-owed").await;
-        assert_eq!(status, 200, "case read={read}: describe, got {status} with {described}");
-        assert_eq!(
-            str_field(&described, "Status"),
-            "PENDING",
-            "case read={read}: a job must start PENDING, got {described}"
-        );
-        for absent in ["CompletionTime", "FailureReason"] {
-            assert!(
-                described.get(absent).is_none(),
-                "case read={read}: {absent} must be absent while PENDING, got {:?}",
-                described.get(absent)
-            );
-        }
-    }
-
-    // Wait for the CONDITION — the job leaving `PENDING` — rather than for a fixed time.
-    let (status, settled) = ended(&emulator, "clock-owed").await;
+    let (status, settled) = describe(&emulator, "clock-owed").await;
     assert_eq!(status, 200, "case settled: describe, got {status} with {settled}");
     let reached = str_field(&settled, "Status");
     // `RecommendationJobStatus`'s terminal members are COMPLETED | FAILED | STOPPED
@@ -485,14 +452,47 @@ async fn the_status_moves_out_of_pending_only_when_the_clock_owes_it() {
         "case settled: LastModifiedTime is the instant the move was due, got {settled}"
     );
 
-    // A later read reports exactly the same job: the move happened once, at the instant
+    // Reading it again reports exactly the same job: the move happened once, at the instant
     // it was due, not on every read.
-    let (status, again) = describe(&emulator, "clock-owed").await;
-    assert_eq!(status, 200, "case re-read: describe, got {status} with {again}");
-    assert_eq!(
-        again, settled,
-        "case re-read: a settled job is stable across reads, got {again}"
-    );
+    for read in ["second", "third"] {
+        let (status, again) = describe(&emulator, "clock-owed").await;
+        assert_eq!(status, 200, "case read={read}: describe, got {status} with {again}");
+        assert_eq!(
+            again, settled,
+            "case read={read}: a settled job is stable across reads, got {again}"
+        );
+    }
+
+    // The transient status is the one the create STORES, and nothing a reader does moves it:
+    // a job whose due instant has not arrived still reports `PENDING` with no completion time.
+    {
+        let state = emulator.engine.state::<
+            service_com_amazonaws_sagemaker_sagemaker::ComAmazonawsSagemakerSagemakerState,
+        >();
+        let mut store = state.lock();
+        let job = store
+            .inference_recommendations_jobs
+            .get_mut("clock-owed")
+            .expect("the created job is in the store");
+        job.status = "PENDING".to_string();
+        job.failure_reason = None;
+        job.completion_time = None;
+        job.ends_at = ::std::time::SystemTime::now() + Duration::from_secs(3_600);
+    }
+    for read in ["first", "second"] {
+        let (status, pending) = describe(&emulator, "clock-owed").await;
+        assert_eq!(status, 200, "case pending read={read}: got {status} with {pending}");
+        assert_eq!(
+            str_field(&pending, "Status"),
+            "PENDING",
+            "case pending read={read}: a move that is not due must not happen because \
+             something read the job, got {pending}"
+        );
+        assert!(
+            pending.get("CompletionTime").is_none(),
+            "case pending read={read}: CompletionTime must be absent while PENDING, got {pending}"
+        );
+    }
 }
 
 /// RULE: a job name is unique to the account in a Region — a create naming one already in

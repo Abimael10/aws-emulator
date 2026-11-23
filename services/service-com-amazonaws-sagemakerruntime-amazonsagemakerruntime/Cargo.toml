@@ -32,6 +32,9 @@ service-com-amazonaws-sagemaker-sagemaker = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs` from `tests/all/main.rs`, so a suite is a
+# file and nothing lists it.
+automod = { workspace = true }
 # The services a caller's own identity is made with:
 # `tests/all/invocation_authorization.rs` creates roles with IAM's own operations and
 # assumes them through STS, so the identity-based documents the authorization gate reads

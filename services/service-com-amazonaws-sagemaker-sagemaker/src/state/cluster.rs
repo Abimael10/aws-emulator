@@ -270,21 +270,25 @@ impl Cluster {
     }
 }
 
-/// The instant a HyperPod cluster LIFECYCLE transition is owed from: the instant the
-/// call that starts it answers.
+/// The instant a transition this service's clock owes is due from, where the call that STARTS
+/// it has already decided its outcome: the instant that call answers.
 ///
-/// The lifecycle a client drives a cluster through is three transitions, and each is
+/// The HyperPod cluster lifecycle a client drives is three such transitions, and each is
 /// DECIDED by the call that starts it: `CreateCluster` admits the cluster, so its
 /// `Creating` -> `InService` (with the instances its groups declare) is settled;
 /// `BatchAddClusterNodes` admits the nodes, so each added node's `Pending` -> `Running`
 /// (with the instance id that comes with it) is settled; `DeleteCluster` admits the
-/// teardown, so the cluster's removal is settled. Nothing is left to compute afterwards,
-/// so the emulator interposes no span of its own between deciding the outcome and letting
-/// a reader observe it: the transition is owed from the instant that call answers, and
-/// the FIRST request after it reports the settled resource. A client driving the cluster
+/// teardown, so the cluster's removal is settled. An Inference Recommender job's single move
+/// out of `PENDING` is one too, for the same reason:
+/// `CreateInferenceRecommendationsJob` performs the job's own benchmark and records what it
+/// measured before it answers ([`crate::state::recommendation_job_settles_at`]). Nothing is
+/// left to compute
+/// afterwards, so the emulator interposes no span of its own between deciding the outcome and
+/// letting a reader observe it: the transition is owed from the instant that call answers, and
+/// the FIRST request after it reports the settled resource. A client driving the resource
 /// with the documented poll-until-settled loop therefore observes each transition on its
 /// next probe instead of paying one whole polling interval — an interval it sizes against
-/// the many minutes real HyperPod provisioning takes — so a workflow that chains several
+/// the many minutes real provisioning takes — so a workflow that chains several
 /// of these waits converges as fast as the emulator can answer instead of outliving its
 /// own deadline.
 ///
@@ -298,19 +302,22 @@ impl Cluster {
 /// because every handler settles what it touches BEFORE it owes anything of its own.
 ///
 /// What that costs, stated plainly: since the owed instant is this instant and not a later
-/// one, a cluster's `Creating` and `Deleting` and an added node's `Pending` are reported
+/// one, a cluster's `Creating` and `Deleting`, an added node's `Pending` and a recommendation
+/// job's `PENDING` are reported
 /// only by the call that stores them, so no SEQUENCE of requests observes them — a reader
 /// always answers the settled resource. That is the only way to spend none of a client's
 /// polling interval: a transition still owed when the next probe arrives costs that probe
 /// its whole interval however small the remaining span is, and bringing one forward
 /// BECAUSE something read it would make a reporting call decide a status, which is the one
 /// thing it may never do. This function is therefore deliberately the IDENTITY and hides
-/// no arithmetic; it exists so the three call sites name this rule rather than restate it,
-/// and so changing when a cluster lifecycle transition falls due is one edit. A test that
+/// no arithmetic; it exists so the call sites name this rule rather than restate it,
+/// and so changing when such a transition falls due is one edit. A test that
 /// needs one of those statuses sets the stored instant itself.
 ///
-/// A node OPERATION — a reboot, a replacement, a volume attachment — is not one of these
-/// and keeps its span ([`crate::state::TRANSIENT_STATE_SETTLES_AFTER`]), which says why.
+/// A resource whose work is NOT over when the accepting call answers keeps a span of its own:
+/// a node OPERATION — a reboot, a replacement, a volume attachment — has
+/// [`crate::state::TRANSIENT_STATE_SETTLES_AFTER`], and a training job's run is reported stage
+/// by stage ([`crate::state::TRAINING_JOB_PHASE_SPAN`]), each of which says why.
 #[inline]
 pub fn transition_owed_at(now: SystemTime) -> SystemTime {
     now

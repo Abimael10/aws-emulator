@@ -158,9 +158,13 @@ impl Emulator {
 
     /// `PUT /<bucket>/<key>` — `PutObject`, storing `body` as the object's own bytes.
     pub async fn given_object(&self, bucket: &str, key: &str, body: &str) {
-        let (status, answered) = self
-            .s3("PUT", &format!("/{bucket}/{key}"), body.as_bytes())
-            .await;
+        self.given_object_bytes(bucket, key, body.as_bytes()).await;
+    }
+
+    /// [`Emulator::given_object`] for an object whose bytes are not text — a compressed
+    /// archive, say — so a case stages one without going through a lossy string.
+    pub async fn given_object_bytes(&self, bucket: &str, key: &str, body: &[u8]) {
+        let (status, answered) = self.s3("PUT", &format!("/{bucket}/{key}"), body).await;
         assert_eq!(
             status,
             200,

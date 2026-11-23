@@ -106,9 +106,9 @@ pub const NON_SERVING_ENDPOINT_STATUSES: &[&str] = &[
 ///
 /// Every variant but [`InvocationOutcome::NoInferenceContainer`] is a refusal of the
 /// REQUEST, decided from the control plane's own record of the endpoint. The last one is
-/// the honest answer to a request this emulator cannot serve: a model container is
+/// the honest answer to a request no inference was computed for: a model container is
 /// customer-provided code in a container image, which a generated emulator cannot run,
-/// so no inference is performed and the operation's modelled `ModelError` says so rather
+/// so the operation's modelled `ModelError` says what stopped the invocation rather
 /// than a synthesised prediction body claiming work that never ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvocationOutcome {
@@ -145,7 +145,12 @@ pub enum InvocationOutcome {
     /// Everything about the request resolved and the model behind the endpoint computed the
     /// inference this call answered with.
     Served,
-    /// Everything about the request resolved; no container ran the inference.
+    /// Everything about the request resolved; NO INFERENCE was computed. Either nothing
+    /// answered the invocation at all — there was no model artifact to compute from, or none
+    /// this emulator can read — or the model container itself refused the request, which is
+    /// the case the failure reports with the container's own status and sentence (the media
+    /// type the payload was offered under is one that container does not accept). Both are
+    /// one outcome here: the data plane served the call and no prediction came of it.
     NoInferenceContainer,
 }
 

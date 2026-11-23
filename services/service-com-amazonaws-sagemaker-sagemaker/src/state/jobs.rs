@@ -1130,15 +1130,30 @@ pub const RECOMMENDATION_JOB_STATUS_PENDING: &str = "PENDING";
 /// recommendation ends in [`RECOMMENDATION_JOB_STATUS_COMPLETED`].
 pub const RECOMMENDATION_JOB_STATUS_FAILED: &str = "FAILED";
 
-/// How long after `CreateInferenceRecommendationsJob` the clock owes the job's move out
-/// of `PENDING` into its terminal status.
+/// When the clock owes a recommendation job its move out of `PENDING` into the terminal
+/// status, measured from the instant `CreateInferenceRecommendationsJob` answers.
 ///
-/// A span chosen by this emulator (AWS documents no duration for a recommendation run),
-/// inside the 250–750 ms band the project fixes for a transition the clock owes. It is
-/// never zero, so a caller that describes the job straight after creating it still
-/// observes `PENDING`, and one that waits observes the terminal status, so a poller
-/// terminates.
-pub const RECOMMENDATION_JOB_SETTLES_AFTER: Duration = Duration::from_millis(400);
+/// The job's WORK is the benchmark, and the create performs it and records what it measured
+/// ([`crate::state::run_inference_recommendations_job`], [`Self::record_run`]) before it
+/// answers — so by the time the caller can address the job at all, its one move is already
+/// decided and nothing is left to compute. The emulator therefore interposes no span of its own
+/// between deciding that outcome and letting a reader observe it
+/// ([`crate::state::transition_owed_at`]): the FIRST request after the create reports the
+/// terminal status, so a client driving the job with the documented poll-until-settled loop
+/// spends none of its polling interval on it — an interval it sizes against the many minutes a
+/// real load test takes — and a workflow that chains a job onto other resources converges as
+/// fast as the emulator can answer instead of outliving its own deadline.
+///
+/// What that costs, plainly: `PENDING` is the status the create stores, and no SEQUENCE of
+/// requests observes it, because a reader always answers the settled job. That is the only way
+/// to spend none of a client's interval — a move still owed when the next probe arrives costs
+/// that probe its whole interval however small the remaining span is — and nothing refuses a
+/// caller for the job being `PENDING`, so no behaviour becomes unreachable with it. A test that
+/// needs the transient status sets the stored instant itself.
+#[must_use]
+pub fn recommendation_job_settles_at(reported_at: SystemTime) -> SystemTime {
+    crate::state::transition_owed_at(reported_at)
+}
 
 /// `RecommendationJobInputConfig$JobDurationInSeconds`'s documented ceiling:
 /// "Specifies the maximum duration of the job, in seconds. The maximum value is 18,000
@@ -1190,7 +1205,9 @@ pub const NEITHER_RECOMMENDATION_ID_NOR_ENDPOINT_NAME: &str =
 /// request rather than a value invented on the read path. `ends_at` is the instant the
 /// clock owes the move out of `PENDING`; it is stored, never slept on, and materialised
 /// by whichever reporting call first runs at or after it (see
-/// [`InferenceRecommendationsJob::settle_status`]).
+/// [`InferenceRecommendationsJob::settle_status`]) — which is the request that follows the
+/// create, since the move is owed from the instant that create answers
+/// ([`recommendation_job_settles_at`]).
 ///
 /// `output_config` and `tags` are stored because the create carried them, even though no
 /// implemented reader surfaces them yet (`DescribeInferenceRecommendationsJob` reports
@@ -1297,14 +1314,39 @@ impl InferenceRecommendationsJob {
 
     /// Record what the job's BENCHMARK reported, `at` the instant it reported.
     ///
-    /// The terminal status falls due [`RECOMMENDATION_JOB_SETTLES_AFTER`] past the instant the
-    /// benchmark reported ([`stage_due_after`]), so a caller that describes the job as soon as
-    /// its create answers observes `PENDING` however long that benchmark took.
+    /// The terminal status falls due at that same instant
+    /// ([`recommendation_job_settles_at`]), so the first request after the create that
+    /// performed the benchmark reports what it measured.
     pub fn record_run(&mut self, outcome: crate::state::RecommendationRunOutcome, at: SystemTime) {
         if self.status == RECOMMENDATION_JOB_STATUS_PENDING {
-            self.ends_at = stage_due_after(at, RECOMMENDATION_JOB_SETTLES_AFTER, 0);
+            self.ends_at = recommendation_job_settles_at(at);
         }
         self.run = Some(outcome);
+    }
+
+    /// The measurements this job took on an endpoint the CALLER already held, which
+    /// `EndpointPerformances` reports: "the performance results from running an Inference
+    /// Recommender job on an existing endpoint".
+    ///
+    /// Which endpoints those are is the job's OWN input configuration:
+    /// `RecommendationJobInputConfig$Endpoints` is "existing customer endpoints on which to run
+    /// an Inference Recommender job", so a measurement taken on one of them is that endpoint's
+    /// performance, while one taken on an endpoint the job deployed for a test of its own
+    /// ([`crate::state::benchmark_endpoint_name`]) is not an existing endpoint's and is reported
+    /// only as the recommendation it is.
+    #[must_use]
+    pub fn endpoint_performances(&self) -> Vec<&InferenceRecommendation> {
+        let existing: BTreeSet<&str> = self
+            .input_config
+            .endpoints
+            .iter()
+            .flatten()
+            .filter_map(|endpoint| endpoint.endpoint_name.as_deref())
+            .collect();
+        self.recommendations
+            .iter()
+            .filter(|measured| existing.contains(measured.endpoint_name.as_str()))
+            .collect()
     }
 }
 

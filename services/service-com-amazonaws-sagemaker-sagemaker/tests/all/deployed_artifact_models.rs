@@ -23,7 +23,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_sagemaker_sagemaker::state::{
     fit, fit_epochs, model_archive, model_from_artifact, serve_inference, Record, ServedModel,
-    MODEL_ARCHIVE_ENTRY,
+    CSV_MEDIA_TYPE, MODEL_ARCHIVE_ENTRY,
 };
 
 /// A serialized gradient-boosted model of one tree: the root splits feature 0 at `threshold`,
@@ -237,7 +237,7 @@ fn the_model_served_is_the_one_the_artifact_carries() {
             .map(f64::to_string)
             .collect::<Vec<String>>()
             .join(",");
-        let answer = serve_inference(&model, payload.as_bytes(), None)
+        let answer = serve_inference(&model, payload.as_bytes(), Some(CSV_MEDIA_TYPE), None)
             .unwrap_or_else(|refusal| panic!("case {case:?}: the payload is served, got {refusal:?}"));
         let rendered = String::from_utf8(answer.body)
             .unwrap_or_else(|error| panic!("case {case:?}: the answer is text: {error}"));

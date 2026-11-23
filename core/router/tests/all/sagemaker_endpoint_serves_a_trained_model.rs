@@ -18,6 +18,13 @@
 //!   with no line terminator, one value per input record in the order the payload carried
 //!   them, so the value at a position is the same one the record at that position is answered
 //!   with on its own.
+//! * RULE FOUR — the payload is offered to the model container UNDER a media type, and a
+//!   container that does not accept the one offered REFUSES the request instead of scoring it:
+//!   the answer is the modelled 424 `ModelError` carrying the container's own status in
+//!   `OriginalStatusCode` and its own sentence in `OriginalMessage`, unwrapped, with `Message`
+//!   quoting that sentence beside the status and the endpoint's container logs. The media types
+//!   it accepts are the record forms it reads, and the endpoint is untouched by the refusal: it
+//!   still serves those.
 //!
 //! Only a cross-service suite can ask this: the flow spans four services over ONE engine
 //! exactly as `core/router/src/lib.rs` mounts them — IAM for the role the training run reads
@@ -935,4 +942,171 @@ async fn a_csv_answer_is_one_comma_separated_record_in_payload_order() {
             );
         }
     }
+}
+
+/// RULE FOUR: a payload offered under a media type the model container does not accept is
+/// REFUSED by that container, and SageMaker passes the refusal through unwrapped.
+#[tokio::test]
+async fn a_content_type_the_container_does_not_accept_is_refused_by_the_model() {
+    // One model, trained and deployed once: what the rows vary is the media type the payload is
+    // OFFERED under, not the deployment or the payload.
+    let router = emulator();
+    given_bucket(&router).await;
+    let endpoint = "media-type-endpoint";
+    trained_and_deployed(
+        &router,
+        "the media-type model",
+        "media-type-job",
+        endpoint,
+        "AllTraffic",
+        TABLE_FEATURES,
+    )
+    .await;
+    // The same valid payload throughout, so the only thing a row changes is the content type.
+    let payload = csv_record(0, TABLE_FEATURES);
+
+    // Rows: media types the container does NOT accept — one no client would expect it to take,
+    // the two generic binary and text types an SDK defaults to, a record format the container
+    // image would read but this service does not, and one that only looks like an accepted
+    // type.
+    let refused = [
+        "application/x-unsupported-by-xgboost",
+        "application/octet-stream",
+        "text/plain",
+        "application/x-recordio-protobuf",
+        "text/csv-ish",
+    ];
+    for offered in refused {
+        let answer = invoke(
+            &router,
+            endpoint,
+            &[("content-type", offered)],
+            payload.as_bytes(),
+        )
+        .await;
+        assert_eq!(
+            (answer.status, answer.error_code().as_str()),
+            (424, "ModelError"),
+            "case {offered:?}: a media type the container does not accept must be refused as \
+             the model's own failure, got {} with {}",
+            answer.status,
+            answer.text()
+        );
+        let body = answer.json();
+        // The container's own status and sentence, unwrapped: `OriginalStatusCode` is the
+        // container's 415, not the 424 SageMaker wraps it in.
+        assert_eq!(
+            body.get("OriginalStatusCode").and_then(Value::as_i64),
+            Some(415),
+            "case {offered:?}: the container's own status must be reported, got {body}"
+        );
+        let container_sentence = format!(
+            "Content-type {offered} not supported. Supported content-type is text/csv, \
+             text/libsvm"
+        );
+        assert_eq!(
+            body.get("OriginalMessage").and_then(Value::as_str),
+            Some(container_sentence.as_str()),
+            "case {offered:?}: the container's own sentence must be reported unwrapped, got \
+             {body}"
+        );
+        assert_eq!(
+            answer.message(),
+            format!(
+                "Received client error (415) from model with message \"{container_sentence}\". \
+                 See https://{REGION}.console.aws.amazon.com/cloudwatch/home?region={REGION}\
+                 #logEventViewer:group=/aws/sagemaker/Endpoints/{endpoint} in account {ACCOUNT} \
+                 for more information."
+            ),
+            "case {offered:?}: SageMaker's own wording wraps the container's sentence, got {body}"
+        );
+        assert_ne!(
+            body.get("OriginalMessage").and_then(Value::as_str),
+            body.get("Message").and_then(Value::as_str),
+            "case {offered:?}: the wrapped message is not the container's own sentence, got \
+             {body}"
+        );
+    }
+
+    // And the media types the container DOES accept are served — the record forms it reads,
+    // including one written with a parameter beside it and one written in another case, both of
+    // which name an accepted media type on the wire.
+    for offered in [
+        "text/csv",
+        "text/csv; charset=utf-8",
+        "TEXT/CSV",
+        "text/libsvm",
+        "application/json",
+    ] {
+        let answer = invoke(
+            &router,
+            endpoint,
+            &[("content-type", offered)],
+            payload.as_bytes(),
+        )
+        .await;
+        assert_eq!(
+            answer.status,
+            200,
+            "case {offered:?}: a media type the container accepts must be served, got {} with {}",
+            answer.status,
+            answer.text()
+        );
+        assert_eq!(
+            predictions(&answer, offered).len(),
+            1,
+            "case {offered:?}: the record is answered with its own prediction, got {}",
+            answer.text()
+        );
+    }
+
+    // Accepting a media type is the NEGOTIATION and nothing more: a payload offered under an
+    // accepted media type whose bytes hold no record this service reads is refused for THAT
+    // instead — with no container status, because the container took the media type.
+    let sparse = invoke(
+        &router,
+        endpoint,
+        &[("content-type", "text/libsvm")],
+        b"0 1:3.5 2:4.0 3:1.0",
+    )
+    .await;
+    assert_eq!(
+        (sparse.status, sparse.error_code().as_str()),
+        (424, "ModelError"),
+        "case \"a sparse record under an accepted media type\": expected the modelled \
+         ModelError, got {} with {}",
+        sparse.status,
+        sparse.text()
+    );
+    assert!(
+        sparse.message().contains("hold nothing to predict from"),
+        "case \"a sparse record under an accepted media type\": the refusal must name the \
+         records that could not be read, got {}",
+        sparse.text()
+    );
+    assert!(
+        sparse.json().get("OriginalStatusCode").is_none(),
+        "case \"a sparse record under an accepted media type\": the container accepted the \
+         media type, so no container status is reported, got {}",
+        sparse.text()
+    );
+
+    // The refusals are the CONTAINER's, so the endpoint itself is untouched: it is still
+    // `InService` with no failure reason, and it still serves the media types it accepts.
+    let described = control_ok(
+        &router,
+        "DescribeEndpoint",
+        &json!({ "EndpointName": endpoint }),
+    )
+    .await;
+    assert_eq!(
+        described.get("EndpointStatus").and_then(Value::as_str),
+        Some("InService"),
+        "case \"after the refusals\": the endpoint is untouched, got {described}"
+    );
+    assert!(
+        described.get("FailureReason").is_none(),
+        "case \"after the refusals\": a container's refusal is not the endpoint's failure, got \
+         {described}"
+    );
 }

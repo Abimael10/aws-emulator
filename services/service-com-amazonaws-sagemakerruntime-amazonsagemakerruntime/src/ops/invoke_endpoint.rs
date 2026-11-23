@@ -40,9 +40,14 @@
 //!
 //! What gets the modelled failure instead is an invocation with no model artifact to compute
 //! from at all — a variant whose model names none, a URI naming no object, an object Amazon S3
-//! would not answer — or a payload holding no record the model applies to. Of the six errors
+//! would not answer — a payload holding no record the model applies to, or a payload OFFERED
+//! under a media type the model's container does not accept, which that container refuses with
+//! its own status and sentence. Of the six errors
 //! the operation models, `ModelError` (424) is the one that says the model behind the endpoint
-//! did not return an inference. The retryable ones would be false — `ModelNotReadyException`
+//! did not return an inference — and for a refusal the container itself made it carries the
+//! container's own status in `OriginalStatusCode` and its sentence in `OriginalMessage`,
+//! unwrapped (`sagemaker::state::model_failure`). The retryable ones would be false —
+//! `ModelNotReadyException`
 //! (429) and `ServiceUnavailable` (503) both promise that waiting and retrying helps — and
 //! `ValidationError` (400) would blame a request that is valid.
 //!
@@ -538,12 +543,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Ok(answer) => answer,
             Err(refusal) => {
                 record(crate::state::InvocationOutcome::NoInferenceContainer);
+                // What the model reported for an invocation it did not answer, as the modelled
+                // failure carries it: where the CONTAINER itself refused the request — the
+                // media type the payload was offered under is one it does not accept — its own
+                // status and sentence travel unwrapped in `OriginalStatusCode` /
+                // `OriginalMessage` beside the service's own wording of it, and where nothing
+                // answered at all there is no container status or sentence to report
+                // (`sagemaker::state::model_failure`).
+                let reported = sagemaker::state::model_failure(
+                    &refusal,
+                    &input.endpoint_name,
+                    &region,
+                    account,
+                );
                 return Err(InvokeEndpointErrorModeled::ModelError(ModelError {
-                    message: Some(refusal.message()),
-                    // Nothing answered, so there is no container status code, no container
-                    // message and no container log stream to report.
-                    original_status_code: None,
-                    original_message: None,
+                    message: Some(reported.message),
+                    original_status_code: reported.original_status_code,
+                    original_message: reported.original_message,
+                    // No container log stream is opened for an endpoint here, so there is none
+                    // to name.
                     log_stream_arn: None,
                 })
                 .into());

@@ -34,7 +34,12 @@
 //! * the payload is read as the caller's own records and the prediction is COMPUTED from
 //!   those parameters, one prediction per record in the order the payload carried them —
 //!   rendered as one comma-separated record for a `text/csv` answer and as the `predictions`
-//!   list of scores for a JSON one.
+//!   list of scores for a JSON one;
+//! * the payload is OFFERED under a media type, and the container decides whether it takes one:
+//!   a media type it does not accept ([`SUPPORTED_PAYLOAD_MEDIA_TYPES`]) is REFUSED by the
+//!   container with its own status and sentence, which the operation's modelled failure carries
+//!   unwrapped ([`model_failure`]), so nothing is scored under a media type the container could
+//!   not have read.
 //!
 //! Nothing here runs a container image, and nothing is derived from an artifact's identity or
 //! from the request: an artifact holding no model either of those readings can take parameters
@@ -104,6 +109,49 @@ pub const CSV_ANSWER_CONTENT_TYPE: &str = "text/csv; charset=utf-8";
 /// splitting it on commas.
 pub const CSV_FIELD_SEPARATOR: &str = ",";
 
+/// The media type a payload of LIBSVM records carries — the sparse `<label> <index>:<value> …`
+/// form SageMaker's built-in algorithm containers read beside [`CSV_MEDIA_TYPE`].
+pub const LIBSVM_MEDIA_TYPE: &str = "text/libsvm";
+
+/// The media types the MODEL CONTAINER accepts a payload under.
+///
+/// "Provides input data, in the format specified in the `ContentType` request header"
+/// (`InvokeEndpointInput$Body`): the payload is offered to the container UNDER a media type, and
+/// which media types a container takes is the container's own business. These are the ones a
+/// container serving a model from the PARAMETERS its artifact carries takes: the two record
+/// forms a SageMaker built-in algorithm's inference container documents for its input — comma-
+/// separated values and the sparse `<label> <index>:<value>` LIBSVM form, the pair its own
+/// refusal names — plus the JSON form this service's records reading also takes
+/// ([`payload_records`]). A payload offered under any OTHER media type is one the container
+/// does not accept, and it is refused rather than scored from bytes the container could not
+/// have read ([`ServingRefusal::MediaTypeNotSupported`]).
+///
+/// Accepting a media type is the NEGOTIATION and nothing more: what the payload's bytes hold is
+/// then read as records, and a payload holding none this service can read is refused for that
+/// instead ([`ServingRefusal::PayloadNotRecords`]) — which is where a payload really written in
+/// the sparse form lands, since the records read here are comma-separated values and the JSON
+/// forms.
+///
+/// A request that offers NO content type negotiates nothing, so there is nothing to refuse: its
+/// bytes are read as whichever of those forms they carry. A model served by its own inference
+/// CODE negotiates nothing here either — the media type is handed to the script, whose
+/// `input_fn` decides what it reads ([`super::run_inference_script`]), the way a framework
+/// container's does.
+pub const SUPPORTED_PAYLOAD_MEDIA_TYPES: &[&str] =
+    &[CSV_MEDIA_TYPE, LIBSVM_MEDIA_TYPE, JSON_MEDIA_TYPE];
+
+/// The HTTP status the model container refuses a payload media type it does not accept with:
+/// 415, "Unsupported Media Type".
+///
+/// It is the CONTAINER's own status — what `ModelError$OriginalStatusCode` ("original status
+/// code") reports — and is distinct from the 424 the operation wraps it in, whose own meaning is
+/// that the failure was the dependency's.
+pub const CONTAINER_UNSUPPORTED_MEDIA_TYPE_STATUS: i32 = 415;
+
+/// The CloudWatch Logs log group an endpoint's model containers write to, which a refusal the
+/// container made points the caller at: one group per endpoint, under this prefix.
+pub const ENDPOINT_LOG_GROUP_PREFIX: &str = "/aws/sagemaker/Endpoints";
+
 /// What serves an invocation behind one of an endpoint's production variants.
 #[derive(Debug, Clone)]
 pub struct ServingVariant {
@@ -131,6 +179,15 @@ pub enum ServingRefusal {
     /// from: it carries no model this emulator's own runs wrote and no serialized booster
     /// either, and nothing here runs the container image that would know how to read it.
     ArtifactNotServable { uri: String },
+    /// The payload was offered under a media type the model container does not accept
+    /// ([`SUPPORTED_PAYLOAD_MEDIA_TYPES`]), so the container refused the request instead of
+    /// scoring bytes it cannot read. The REQUEST's own content type, as it offered it.
+    ///
+    /// The sentence this is reported with is the CONTAINER's own: it names the offered media
+    /// type and then the record forms a SageMaker inference container documents for its input,
+    /// which is fixed text the container writes rather than a recomputation of what this
+    /// service's reader also accepts.
+    MediaTypeNotSupported { content_type: String },
     /// The payload holds no record the model can be applied to.
     PayloadNotRecords,
     /// The payload carries more records than one invocation may.
@@ -173,6 +230,10 @@ impl ServingRefusal {
                  emulator does not run, so the artifact has to carry the model's own \
                  parameters."
             ),
+            Self::MediaTypeNotSupported { content_type } => format!(
+                "Content-type {content_type} not supported. Supported content-type is \
+                 {CSV_MEDIA_TYPE}, {LIBSVM_MEDIA_TYPE}"
+            ),
             Self::PayloadNotRecords => format!(
                 "The records hold nothing to predict from: a record is a row of \
                  numeric feature values, as {CSV_MEDIA_TYPE} or as a JSON array of them."
@@ -201,6 +262,101 @@ impl ServingRefusal {
             }
         }
     }
+
+    /// The HTTP status the MODEL CONTAINER itself answered the invocation with, for a condition
+    /// the container decided — and `None` for one where nothing answered at all, which has no
+    /// container status to report.
+    ///
+    /// A container that refuses the media type the payload was offered under answers "415
+    /// Unsupported Media Type" ([`CONTAINER_UNSUPPORTED_MEDIA_TYPE_STATUS`]). Every other
+    /// condition here stopped the invocation with no container answer to pass through: no
+    /// artifact to load, an artifact nothing can be read out of, a payload this emulator's own
+    /// bounds refuse, a run of the model's own code that this emulator's own reading reports on.
+    #[must_use]
+    pub fn container_status_code(&self) -> Option<i32> {
+        match self {
+            Self::MediaTypeNotSupported { .. } => Some(CONTAINER_UNSUPPORTED_MEDIA_TYPE_STATUS),
+            _ => None,
+        }
+    }
+}
+
+/// What the model behind an endpoint REPORTED for an invocation it did not answer, as the
+/// modelled failure for such an invocation carries it.
+///
+/// `message` is what the service says about the invocation; `original_status_code` and
+/// `original_message` are the CONTAINER's own status and sentence, unwrapped, which are present
+/// exactly when a container answered at all ([`ServingRefusal::container_status_code`]).
+#[derive(Debug, Clone)]
+pub struct ModelFailure {
+    pub message: String,
+    pub original_status_code: Option<i32>,
+    pub original_message: Option<String>,
+}
+
+/// How a condition that stopped an invocation is reported to the caller: the members the
+/// modelled failure for an invocation the model did not answer carries.
+///
+/// Where the MODEL CONTAINER itself answered — it refused the media type the payload was offered
+/// under — SageMaker passes that answer through: the container's status and its sentence travel
+/// unwrapped, and the service's own `message` quotes the sentence beside the status and points
+/// the caller at the endpoint's container logs ([`container_refusal_message`]). Where nothing
+/// answered at all there is no container status and no container sentence to report, and the
+/// message is the condition that stopped the invocation ([`ServingRefusal::message`]).
+#[must_use]
+pub fn model_failure(
+    refusal: &ServingRefusal,
+    endpoint_name: &str,
+    region: &str,
+    account_id: &str,
+) -> ModelFailure {
+    let reported = refusal.message();
+    match refusal.container_status_code() {
+        Some(status) => ModelFailure {
+            message: container_refusal_message(status, &reported, endpoint_name, region, account_id),
+            original_status_code: Some(status),
+            original_message: Some(reported),
+        },
+        None => ModelFailure {
+            message: reported,
+            original_status_code: None,
+            original_message: None,
+        },
+    }
+}
+
+/// How SageMaker words an answer the MODEL CONTAINER made: the container's status and its own
+/// sentence quoted verbatim, followed by where the container's logs for that endpoint are and
+/// the account they are in.
+///
+/// The status itself says whose error it was — "Model (owned by the customer in the container)
+/// returned 4xx or 5xx error code" (`ModelError`) — so a 4xx the container answered is reported
+/// as the CLIENT error it is and a 5xx as a server one, which is the only part of the fixed text
+/// the status decides.
+///
+/// Only the status, the container's sentence, the endpoint's name, the region the call was made
+/// in and the account that hosts the endpoint come from the request and this emulator's own
+/// state; the rest of the sentence is fixed. The log group is the endpoint's own
+/// ([`ENDPOINT_LOG_GROUP_PREFIX`]).
+#[must_use]
+pub fn container_refusal_message(
+    status: i32,
+    reported: &str,
+    endpoint_name: &str,
+    region: &str,
+    account_id: &str,
+) -> String {
+    let whose = if (400..500).contains(&status) {
+        "client"
+    } else {
+        "server"
+    };
+    format!(
+        "Received {whose} error ({status}) from model with message \"{reported}\". See \
+         https://{region}.console.aws.amazon.com/cloudwatch/home?region={region}\
+         #logEventViewer:group={ENDPOINT_LOG_GROUP_PREFIX}/{endpoint_name} in account \
+         {account_id} for more information."
+    )
 }
 
 /// The variants `endpoint_name` serves, in the order its endpoint configuration listed them,
@@ -668,9 +824,9 @@ pub async fn serve_inference_off_worker(
 /// What `artifact` answers for `body`: the prediction its parameters compute, or what its own
 /// inference code returned.
 ///
-/// `content_type` is the media type the payload is in, which a container hands its script's
-/// `input_fn`; the readings that compute from parameters read the records of either media type
-/// themselves ([`payload_records`]).
+/// `content_type` is the media type the payload is offered under, which a container hands its
+/// script's `input_fn` — and which a container serving the model's PARAMETERS has to accept for
+/// the payload to be read at all ([`serve_inference`]).
 pub fn serve_artifact(
     artifact: &ServedArtifact,
     body: &[u8],
@@ -678,7 +834,7 @@ pub fn serve_artifact(
     accept: Option<&str>,
 ) -> Result<ServedInference, ServingRefusal> {
     match artifact {
-        ServedArtifact::Model(model) => serve_inference(model, body, accept),
+        ServedArtifact::Model(model) => serve_inference(model, body, content_type, accept),
         ServedArtifact::Script(script) => {
             super::run_inference_script(script, body, content_type, accept)
         }
@@ -795,20 +951,61 @@ impl ServedInference {
     /// character set ([`CSV_ANSWER_CONTENT_TYPE`]).
     #[must_use]
     pub fn media_type(&self) -> &str {
-        self.content_type
-            .split_once(';')
-            .map_or(self.content_type.as_str(), |(media_type, _)| media_type)
-            .trim()
+        media_type_of(&self.content_type)
     }
+}
+
+/// The MEDIA TYPE a content type names, without the parameters it may carry beside it
+/// (`text/csv; charset=utf-8` is the `text/csv` media type), trimmed.
+///
+/// The one reading of a content type in this module, so what an ANSWER declares and what a
+/// request OFFERS are read the same way.
+#[must_use]
+pub fn media_type_of(content_type: &str) -> &str {
+    content_type
+        .split_once(';')
+        .map_or(content_type, |(media_type, _)| media_type)
+        .trim()
+}
+
+/// Whether the model container accepts a payload offered under `content_type`, comparing the
+/// media type it names against the ones the container takes
+/// ([`SUPPORTED_PAYLOAD_MEDIA_TYPES`]) — case-insensitively, because a media type is
+/// case-insensitive on the wire.
+#[must_use]
+pub fn payload_media_type_accepted(content_type: &str) -> bool {
+    let offered = media_type_of(content_type);
+    SUPPORTED_PAYLOAD_MEDIA_TYPES
+        .iter()
+        .any(|accepted| offered.eq_ignore_ascii_case(accepted))
 }
 
 /// Apply `model` to the records `body` carries and render the predictions in the media type
 /// `accept` asks for.
+///
+/// `content_type` is the media type the payload is OFFERED under
+/// (`InvokeEndpointInput$ContentType`, "the MIME type of the input data in the request body").
+/// A container reads a payload in the media types it accepts and refuses any other
+/// ([`SUPPORTED_PAYLOAD_MEDIA_TYPES`]) — before the payload is read, because what the bytes
+/// turn out to be does not change which media type was offered — so a payload under a media
+/// type this model's container does not take is refused rather than scored. A request offering
+/// none negotiates nothing and its bytes are read as whichever form they carry.
 pub fn serve_inference(
     model: &ServedModel,
     body: &[u8],
+    content_type: Option<&str>,
     accept: Option<&str>,
 ) -> Result<ServedInference, ServingRefusal> {
+    if let Some(offered) = content_type
+        .map(str::trim)
+        .filter(|offered| !offered.is_empty())
+    {
+        if !payload_media_type_accepted(offered) {
+            return Err(ServingRefusal::MediaTypeNotSupported {
+                content_type: offered.to_string(),
+            });
+        }
+    }
     let rows = payload_records(body)?;
     if rows.is_empty() {
         return Err(ServingRefusal::PayloadNotRecords);

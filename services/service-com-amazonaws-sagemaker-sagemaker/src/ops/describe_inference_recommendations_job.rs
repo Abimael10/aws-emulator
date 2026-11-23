@@ -12,8 +12,13 @@
 //! clock has settled the job: one entry per endpoint it benchmarked, each carrying the
 //! `RecommendationId` `GetScalingConfigurationRecommendation` resolves. A job whose benchmark
 //! measured nothing reports none, and its terminal status carries the condition that stopped
-//! it instead. `EndpointPerformances` stays absent: the load test measured each endpoint it
-//! tested as the recommendation itself reports it.
+//! it instead. `EndpointPerformances` reports the measurements taken on an endpoint the CALLER
+//! already held — "the performance results from running an Inference Recommender job on an
+//! existing endpoint" — one entry per endpoint the job's own
+//! `InputConfig$Endpoints` named, carrying that endpoint's name and the metrics the benchmark
+//! measured against it (`crate::state::InferenceRecommendationsJob::endpoint_performances`),
+//! and nothing for an endpoint the job deployed for a test of its own, which is reported only
+//! as the recommendation it is.
 //!
 //! ## Shape of an operation
 //!
@@ -237,9 +242,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     })
                     .collect()
             }),
-            // The load test measured each endpoint it benchmarked as the recommendation
-            // above reports it; no separate per-endpoint performance was measured beside it.
-            endpoint_performances: None,
+            // The load test measured each endpoint it benchmarked; the ones the job named as
+            // EXISTING endpoints of this account are the ones `EndpointPerformances` reports —
+            // "the performance results from running an Inference Recommender job on an existing
+            // endpoint" — each carrying that endpoint's own name and the metrics the
+            // invocations against it measured
+            // (`crate::state::InferenceRecommendationsJob::endpoint_performances`). A job that
+            // measured none of them reports none rather than an empty list.
+            endpoint_performances: Some(
+                job.endpoint_performances()
+                    .into_iter()
+                    .map(|measured| EndpointPerformance {
+                        metrics: InferenceMetrics {
+                            max_invocations: measured.max_invocations_per_minute,
+                            model_latency: measured.model_latency_millis,
+                        },
+                        endpoint_info: EndpointInfo {
+                            endpoint_name: Some(measured.endpoint_name.clone()),
+                        },
+                    })
+                    .collect::<Vec<EndpointPerformance>>(),
+            )
+            .filter(|performances| !performances.is_empty()),
         };
         drop(store);
 

@@ -185,7 +185,7 @@ fn answered(body: &[u8], media_type: &str, case: &str) -> Vec<f64> {
 fn a_csv_answer_is_one_comma_separated_record_of_predictions() {
     let model = fitted();
     for row in rows() {
-        let served = serve_inference(&model, row.payload.as_bytes(), row.accept)
+        let served = serve_inference(&model, row.payload.as_bytes(), None, row.accept)
             .unwrap_or_else(|refusal| {
                 panic!("case {:?}: the payload must be served, got {refusal:?}", row.case)
             });
@@ -230,7 +230,7 @@ fn a_csv_answer_is_one_comma_separated_record_of_predictions() {
 fn every_prediction_is_the_one_its_own_record_is_answered_with() {
     let model = fitted();
     for row in rows() {
-        let served = serve_inference(&model, row.payload.as_bytes(), row.accept)
+        let served = serve_inference(&model, row.payload.as_bytes(), None, row.accept)
             .unwrap_or_else(|refusal| {
                 panic!("case {:?}: the payload must be served, got {refusal:?}", row.case)
             });
