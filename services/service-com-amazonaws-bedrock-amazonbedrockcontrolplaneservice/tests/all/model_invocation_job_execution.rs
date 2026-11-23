@@ -374,12 +374,6 @@ pub(crate) fn llama_input(prompt: &str) -> Value {
     json!({"prompt": prompt, "max_gen_len": 64})
 }
 
-/// A body `InvokeModel` serves for the Amazon Titan Text family, whose documented request
-/// schema requires `inputText`.
-fn titan_input(prompt: &str) -> Value {
-    json!({"inputText": prompt})
-}
-
 /// A body `InvokeModel` serves for the Anthropic Claude Messages family, whose documented
 /// request schema requires `messages`, `max_tokens` and `anthropic_version`.
 fn claude_input(prompt: &str) -> Value {
@@ -387,6 +381,15 @@ fn claude_input(prompt: &str) -> Value {
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": 64,
         "messages": [{"role": "user", "content": prompt}],
+    })
+}
+
+/// A body `InvokeModel` serves for the Amazon Nova family, whose native request schema is
+/// Converse-shaped: the family's documented schema requires `messages`.
+fn nova_input(prompt: &str) -> Value {
+    json!({
+        "messages": [{"role": "user", "content": [{"text": prompt}]}],
+        "inferenceConfig": {"maxTokens": 64},
     })
 }
 
@@ -445,13 +448,13 @@ fn run_rows() -> Vec<Row> {
             terminal_status: "Completed",
         },
         Row {
-            case: "one Titan Text record carrying no recordId, under a nested prefix",
-            name: "batch-titan",
-            model_id: "amazon.titan-text-lite-v1",
+            case: "one Amazon Nova record carrying no recordId, under a nested prefix",
+            name: "batch-nova",
+            model_id: "amazon.nova-lite-v1:0",
             invocation_type: "InvokeModel",
-            input_key: "input/titan.jsonl",
-            output_suffix: "/output/runs/titan",
-            lines: vec![record(None, titan_input("summarise the quarter"))],
+            input_key: "input/nova.jsonl",
+            output_suffix: "/output/runs/nova",
+            lines: vec![record(None, nova_input("summarise the quarter"))],
             success: 1,
             error: 0,
             terminal_status: "Completed",
@@ -460,7 +463,7 @@ fn run_rows() -> Vec<Row> {
             case: "two Claude records, one of which omits a member its family's request \
                    schema requires, with the results at the bucket root",
             name: "batch-claude",
-            model_id: "anthropic.claude-3-haiku-20240307-v1:0",
+            model_id: "anthropic.claude-haiku-4-5-20251001-v1:0",
             invocation_type: "InvokeModel",
             input_key: "input/claude.jsonl",
             output_suffix: "",
@@ -475,7 +478,7 @@ fn run_rows() -> Vec<Row> {
         Row {
             case: "two records invoked through the Converse endpoint",
             name: "batch-converse",
-            model_id: "anthropic.claude-3-haiku-20240307-v1:0",
+            model_id: "anthropic.claude-haiku-4-5-20251001-v1:0",
             invocation_type: "Converse",
             input_key: "input/converse.jsonl",
             output_suffix: "/output",

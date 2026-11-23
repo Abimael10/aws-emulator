@@ -10,10 +10,12 @@
 //!    naming no model. Three classes:
 //!    * a model the published catalog OFFERS backs the request (or is refused by that
 //!      operation's own eligibility rule);
-//!    * a model the service recognises and offers no longer (past its end of life) names a
-//!      model all the same: a read of the catalog reports it gone (404 with the end-of-life
-//!      reason), a Provisioned Throughput purchase is refused as not supported (400), and a
-//!      batch submission goes on to be judged on what it asks for;
+//!    * a model the service recognises and offers no longer (past its end of life) is
+//!      offered under nothing, and each surface answers what that means for IT: a read of
+//!      the catalog reports it gone (404 with the end-of-life reason), a Provisioned
+//!      Throughput purchase is refused as not supported (400), and a batch submission has no
+//!      model to run on, so the identifier is refused as the spelling it is — the same two
+//!      readings an identifier naming no model at all draws;
 //!    * an identifier naming no model at all is a missing ARN (404) when it is a
 //!      `foundation-model` ARN and an unreadable identifier (400 `ValidationException`
 //!      carrying the service's fixed sentence) when it is a bare model id.
@@ -438,7 +440,7 @@ fn batch_body(name: &str, model_id: &str) -> Value {
 }
 
 #[tokio::test]
-async fn a_batch_submission_naming_a_model_the_service_knows_is_not_reported_absent() {
+async fn a_batch_submission_resolves_its_model_against_the_models_the_service_offers() {
     let emu = emulator();
     for (index, (case, identifier, named)) in rows().into_iter().enumerate() {
         let name = format!("batch-resolution-{index}");
@@ -450,12 +452,12 @@ async fn a_batch_submission_naming_a_model_the_service_knows_is_not_reported_abs
             )
             .await;
         match named {
-            // A model the service knows — offered, or recognised and offered no longer —
-            // names a model, so identification is not where the submission is refused.
-            Named::Offered | Named::Retired => {
+            // A model the published catalog OFFERS is a model the submission can run on, so
+            // identification is not where it is refused.
+            Named::Offered => {
                 assert_eq!(
                     reply.status, 200,
-                    "case {case}: a modelId naming a model this service knows must get past \
+                    "case {case}: a modelId naming a model this service offers must get past \
                      identification, got {} {:?}",
                     reply.status, reply.body
                 );
@@ -482,39 +484,33 @@ async fn a_batch_submission_naming_a_model_the_service_knows_is_not_reported_abs
                     read.body
                 );
             }
-            // An identifier that names no model at all is refused as the spelling it IS,
-            // exactly as the read of the catalogue refuses it.
-            Named::MissingArn => {
+            // A model the service recognises and offers NO LONGER is offered under nothing,
+            // so a submission made now has no model to run on: RECORDED behaviour, the
+            // corpus records this create refusing such an identifier. It is refused as the
+            // spelling it IS — the two readings an identifier naming no model at all draws
+            // — exactly as the read of the catalogue refuses one it cannot resolve.
+            Named::Retired | Named::MissingArn | Named::UnreadableId => {
+                let names_arn = identifier.starts_with("arn:");
+                let expected = if names_arn {
+                    (
+                        404,
+                        "ResourceNotFoundException",
+                        bedrock::state::foundation_model_not_found(&identifier),
+                    )
+                } else {
+                    (
+                        400,
+                        "ValidationException",
+                        bedrock::state::INVALID_MODEL_IDENTIFIER_MESSAGE.to_string(),
+                    )
+                };
                 assert_eq!(
-                    (reply.status, code(&reply)),
-                    (404, "ResourceNotFoundException"),
-                    "case {case}: an ARN naming no model has nothing to invoke, got {} {} \
-                     {:?}",
+                    (reply.status, code(&reply), message(&case, &reply)),
+                    expected,
+                    "case {case}: an identifier naming no model this service offers has \
+                     nothing to invoke, got {} {} {:?}",
                     reply.status,
                     code(&reply),
-                    reply.body
-                );
-                assert_eq!(
-                    message(&case, &reply),
-                    bedrock::state::foundation_model_not_found(&identifier),
-                    "case {case}: the refusal must name the identifier it could not resolve, \
-                     got {:?}",
-                    reply.body
-                );
-            }
-            Named::UnreadableId => {
-                assert_eq!(
-                    (reply.status, code(&reply)),
-                    (400, "ValidationException"),
-                    "case {case}: a bare id naming no model is an input fault, got {} {} {:?}",
-                    reply.status,
-                    code(&reply),
-                    reply.body
-                );
-                assert_eq!(
-                    message(&case, &reply),
-                    bedrock::state::INVALID_MODEL_IDENTIFIER_MESSAGE,
-                    "case {case}: the refusal must be the service's fixed sentence, got {:?}",
                     reply.body
                 );
             }

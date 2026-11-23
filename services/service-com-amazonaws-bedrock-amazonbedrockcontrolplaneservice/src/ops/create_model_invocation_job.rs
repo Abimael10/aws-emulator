@@ -3,11 +3,14 @@
 //! @op CreateModelInvocationJob
 //! Submits a batch inference job: the submission hands Amazon Bedrock the `roleArn` it is
 //! to carry out and manage the inference under, so the request is decided by the
-//! `iam:PassRole` step for that role BEFORE anything it names is resolved
+//! `iam:PassRole` step for that role once what it ASKS FOR has been read
 //! ([`crate::state::job_pass_role_denial`], the one decision every job-creating operation
 //! of this service makes): a pass the calling principal's permissions do not carry, and a
 //! role the caller may not pass, are both the modelled `AccessDeniedException`, and such a
-//! refusal writes no job at all. The role is taken on
+//! refusal writes no job at all. `modelId` is RESOLVED in front of that step
+//! ([`crate::state::names_an_invocation_model`]) because an identifier that names no model
+//! is un-usable input rather than something to report about the role, and no decision about
+//! the role could make such a request one Amazon Bedrock could run. The role is taken on
 //! FOR the job this submission mints, so that job's ARN is minted first and handed to the
 //! decision as the `aws:SourceArn` the assume carries — the batch-inference service role
 //! AWS documents narrows its trust to exactly that job family, and the clause is decided
@@ -231,6 +234,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let now = ::std::time::SystemTime::now();
 
+        // What the request ASKS FOR is resolved before who may ask for it: `modelId` names
+        // the model the batch inference runs on, and a value that names no model is an
+        // un-usable INPUT rather than something to report about the role, so it is read
+        // AHEAD of the `iam:PassRole` step below — nothing about the pass can make a
+        // request naming no model into one Amazon Bedrock could run.
+        //
+        // `modelId` admits a foundation model — by its bare id or by its ARN — a
+        // `custom-model` ARN and an inference profile ARN
+        // (`smithy_query(query="operation",operation="CreateModelInvocationJob")`: its
+        // pattern carries all three), so each of those families is asked in turn, through
+        // the very index its own reads resolve an identifier through
+        // (`crate::state::names_an_invocation_model`). A value naming none of them names no
+        // model there is anything to invoke, refused exactly as
+        // `ops/create_model_customization_job.rs` refuses a base model identifier the
+        // catalog does not carry.
+        let names_a_model = state
+            .lock()
+            .names_an_invocation_model(&input.model_id, &region, now);
+        if !names_a_model {
+            // An identifier that resolves to no model of any of those families is refused
+            // as the spelling it IS — the one reading every model-identifying member shares
+            // ([`crate::state::unresolved_model`]).
+            let refusal = crate::state::unresolved_model(
+                &input.model_id,
+                crate::state::INVOCATION_MODEL_RESOURCES,
+            );
+            let message = Some(refusal.message(&input.model_id));
+            return Err(if refusal.missing_resource() {
+                CreateModelInvocationJobErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException { message },
+                )
+            } else {
+                CreateModelInvocationJobErrorModeled::ValidationException(ValidationException {
+                    message,
+                })
+            }
+            .into());
+        }
+
         // The ARN of the job this submission mints, fixed BEFORE the pass below is decided
         // because it is one of the values that pass carries: Amazon Bedrock takes the role on
         // FOR this job, so the job's ARN is the `aws:SourceArn` of the assume
@@ -247,11 +289,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::model_invocation_job_arn(&region, &job_id)
         };
 
-        // The `iam:PassRole` step for `roleArn`, ahead of the store and ahead of every
-        // resource this request names: the role is the one Amazon Bedrock takes on to carry
-        // out and manage the batch inference, so whether this caller may pass it is settled
-        // before `modelId` is resolved — a denied pass is an authorization refusal rather
-        // than a report about a model — and it leaves no job behind. The decision is the
+        // The `iam:PassRole` step for `roleArn`, behind the resolution of what the request
+        // asks for and ahead of everything this submission WRITES: the role is the one
+        // Amazon Bedrock takes on to carry out and manage the batch inference, so whether
+        // this caller may pass it is settled once the request is one the service could run —
+        // a denied pass is an authorization refusal rather than a report about the request's
+        // contents — and it leaves no job behind. The decision is the
         // one every job-creating operation of this service makes
         // (`crate::state::job_pass_role_denial`), grounded in what this account's IAM
         // answers about the calling principal's `iam:PassRole` and about the role.
@@ -290,7 +333,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         {
-            let mut store = state.lock();
+            let store = state.lock();
 
             // `@idempotencyToken`: a replay answers with what the first request submitted.
             let replayed = input
@@ -310,47 +353,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
 
-            // `modelId` admits a foundation model — by its bare id or by its ARN — a
-            // `custom-model` ARN and an inference profile ARN
-            // (`smithy_query(query="operation",operation="CreateModelInvocationJob")`: its
-            // pattern carries all three), so each of those families is asked in turn,
-            // through the very index its own reads resolve an identifier through. A
-            // foundation model this service recognises counts whether or not it is still
-            // OFFERED (`crate::state::FoundationModelCatalog::resolve_base_model`): a
-            // retired model's id names a model, so the submission is judged on what it
-            // asks for rather than reported as naming nothing. A value naming none of
-            // these families names no model there is anything to invoke, refused exactly
-            // as `ops/create_model_customization_job.rs` refuses a base model identifier
-            // the catalog does not carry.
-            let names_a_model = !matches!(
-                store.foundation_models.resolve_base_model(&input.model_id),
-                crate::state::BaseModelIdentity::Unknown
-            )
-                || store.custom_model(&input.model_id, &region, now).is_some()
-                || store
-                    .inference_profile_arn_of(&input.model_id, &region)
-                    .is_some();
-            if !names_a_model {
-                // An identifier that resolves to no model of any of those families is
-                // refused as the spelling it IS — the one reading every model-identifying
-                // member shares ([`crate::state::unresolved_model`]).
-                let refusal = crate::state::unresolved_model(
-                    &input.model_id,
-                    crate::state::INVOCATION_MODEL_RESOURCES,
-                );
-                let message = Some(refusal.message(&input.model_id));
-                return Err(if refusal.missing_resource() {
-                    CreateModelInvocationJobErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException { message },
-                    )
-                } else {
-                    CreateModelInvocationJobErrorModeled::ValidationException(
-                        ValidationException { message },
-                    )
-                }
-                .into());
-            }
-
+            // `modelId` has been resolved ahead of the pass above, so what remains here is
+            // the account's own bound on the family.
+            //
             // The account's batch inference job quota. Enforcing it here is also what bounds
             // this part of the store: without a server-side cap a caller could grow it with
             // nothing but further submissions.

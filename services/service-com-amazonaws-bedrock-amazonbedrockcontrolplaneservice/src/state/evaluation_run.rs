@@ -275,6 +275,11 @@ pub fn due_datasets(config: &EvaluationConfig) -> Vec<DueDataset> {
 /// evaluation invokes. A `precomputedInferenceSource` brings responses the caller computed
 /// ELSEWHERE — there is no inference for this service to perform for it — and `ragConfigs`
 /// names knowledge bases rather than models; neither is invoked here.
+///
+/// Narrower than the set of model-identifying members the CREATE resolves
+/// ([`crate::state::evaluation_model_identifiers`]): that one answers which values name a
+/// model at all, which includes the model a knowledge-base configuration generates its
+/// responses with, while this one is the models this RUN invokes.
 #[must_use]
 pub fn due_model_ids(config: &EvaluationInferenceConfig) -> Vec<String> {
     let EvaluationInferenceConfig::Models(models) = config else {

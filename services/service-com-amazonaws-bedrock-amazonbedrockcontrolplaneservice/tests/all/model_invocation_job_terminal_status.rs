@@ -102,7 +102,7 @@ fn rows() -> Vec<Row> {
         Row {
             case: "a handful of records",
             name: "batch-seven-records",
-            model_id: "amazon.titan-text-lite-v1",
+            model_id: "amazon.nova-lite-v1:0",
             invocation_type: "InvokeModel",
             input_key: "input/seven.jsonl",
             records: 7,
@@ -110,7 +110,7 @@ fn rows() -> Vec<Row> {
         Row {
             case: "tens of records through the Converse endpoint",
             name: "batch-forty-records",
-            model_id: "anthropic.claude-3-haiku-20240307-v1:0",
+            model_id: "anthropic.claude-haiku-4-5-20251001-v1:0",
             invocation_type: "Converse",
             input_key: "input/forty.jsonl",
             records: 40,
@@ -133,13 +133,15 @@ fn lines_for(row: &Row) -> Vec<String> {
         .map(|index| {
             let record_id = format!("RECORD{index:05}");
             let prompt = format!("record {index}");
-            let model_input = if row.invocation_type == "Converse" {
+            let model_input = if row.invocation_type == "Converse"
+                || row.model_id.starts_with("amazon.nova")
+            {
+                // Amazon Nova's native request schema is Converse-shaped, so one body
+                // serves both endpoints for it.
                 serde_json::json!({
                     "messages": [{"role": "user", "content": [{"text": prompt}]}],
                     "inferenceConfig": {"maxTokens": 32},
                 })
-            } else if row.model_id.starts_with("amazon.titan") {
-                serde_json::json!({"inputText": prompt})
             } else {
                 llama_input(&prompt)
             };

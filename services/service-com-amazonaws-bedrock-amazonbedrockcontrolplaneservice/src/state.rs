@@ -290,6 +290,12 @@ mod foundation_models;
 /// inherent `impl` the handlers reach the store through, beside the struct it belongs to.
 mod store_access;
 
+/// Whether a value submitted to a member that IDENTIFIES the model a job runs on names a
+/// model this account can run that inference on — the resolution a job create takes over its
+/// request ahead of the `iam:PassRole` decision.
+mod model_identifiers;
+pub use model_identifiers::*;
+
 /// The Automated Reasoning policy family: its quotas, statuses, spans, refusal sentences
 /// and stored records.
 mod automated_reasoning_policies;

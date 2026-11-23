@@ -68,11 +68,14 @@ const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/bedrock-evaluation";
 const OUTPUT_URI: &str = "s3://evaluation-results/model-eval/";
 
 /// `EvaluationBedrockModelIdentifier` values the model admits — bare model ids of the
-/// `<provider>.<model>` form its pattern spells.
+/// `<provider>.<model>` form its pattern spells — each naming a model the published
+/// catalogue OFFERS (`state::FOUNDATION_MODELS`). A create resolves the identifier its
+/// `inferenceConfig` names against that catalogue, so an id naming no model it offers is
+/// refused rather than accepted.
 const MODEL_IDS: &[&str] = &[
-    "anthropic.claude-v2",
-    "amazon.titan-text-express-v1",
-    "meta.llama3-8b-instruct-v1",
+    "amazon.nova-lite-v1:0",
+    "amazon.nova-pro-v1:0",
+    "meta.llama3-8b-instruct-v1:0",
 ];
 
 /// `EvaluationTaskType` is `[Summarization, Classification, QuestionAndAnswer, Generation,

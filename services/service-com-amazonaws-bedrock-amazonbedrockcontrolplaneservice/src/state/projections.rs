@@ -840,6 +840,19 @@ pub const INFERENCE_PROFILE_RESOURCE_TYPE: &str = "inference-profile";
 /// See [`INFERENCE_PROFILE_RESOURCE_TYPE`].
 pub const APPLICATION_INFERENCE_PROFILE_RESOURCE_TYPE: &str = "application-inference-profile";
 
+/// The ARN resource type a Provisioned Throughput carries, as `ProvisionedModelArn` spells
+/// it before the resource's own id (`…:provisioned-model/[a-z0-9]{12}`, see
+/// [`provisioned_model_arn`]).
+pub const PROVISIONED_MODEL_RESOURCE_TYPE: &str = "provisioned-model";
+
+/// The ARN resource types a prompt router carries: the one `PromptRouterArn` spells, which
+/// is the one every router this service mints is addressed by ([`prompt_router_arn`]), and
+/// the one `TaggableResourcesArn` spells the same resource with.
+pub const DEFAULT_PROMPT_ROUTER_RESOURCE_TYPE: &str = "default-prompt-router";
+
+/// See [`DEFAULT_PROMPT_ROUTER_RESOURCE_TYPE`].
+pub const PROMPT_ROUTER_RESOURCE_TYPE: &str = "prompt-router";
+
 /// Whether `value` is an ARN of this service's own namespace naming a resource of
 /// `resource_type`, rather than one of the other spellings a member admits.
 ///
@@ -1219,7 +1232,7 @@ pub const SELF_VALIDATED_RESOURCE_TYPES: &[&str] = &[
     "model-customization-job",
     "model-import-job",
     "model-invocation-job",
-    "provisioned-model",
+    PROVISIONED_MODEL_RESOURCE_TYPE,
 ];
 
 /// Whether a declared `@pattern` spells the ARN of a resource this service validates

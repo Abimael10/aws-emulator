@@ -953,6 +953,12 @@ impl UnresolvedModel {
             Self::MissingResource(FOUNDATION_MODEL_RESOURCE_TYPE) => {
                 foundation_model_not_found(identifier)
             }
+            Self::MissingResource(PROVISIONED_MODEL_RESOURCE_TYPE) => {
+                provisioned_model_not_found_message(identifier)
+            }
+            Self::MissingResource(
+                PROMPT_ROUTER_RESOURCE_TYPE | DEFAULT_PROMPT_ROUTER_RESOURCE_TYPE,
+            ) => prompt_router_not_found_message(identifier),
             Self::MissingResource(resource_type) => resource_type_not_found_message(resource_type),
             Self::UnreadableIdentifier => INVALID_MODEL_IDENTIFIER_MESSAGE.to_string(),
         }
@@ -1010,6 +1016,25 @@ pub const INVOCATION_MODEL_RESOURCES: &[&str] = &[
     CUSTOM_MODEL_RESOURCE_TYPE,
     INFERENCE_PROFILE_RESOURCE_TYPE,
     APPLICATION_INFERENCE_PROFILE_RESOURCE_TYPE,
+];
+
+/// The ARN resource types an evaluation job's `modelIdentifier` is resolved against: the
+/// published catalogue's `foundation-model` ARNs, both kinds of inference profile, this
+/// account's Provisioned Throughputs and imported models, and the prompt routers — every ARN
+/// form of this service's own namespace that `EvaluationBedrockModelIdentifier`'s pattern
+/// admits (`smithy_query(query="shape",shape="EvaluationBedrockModelIdentifier")`).
+///
+/// The one other ARN that pattern admits is an Amazon SageMaker `endpoint`, which belongs to
+/// another service's namespace: a value of it names no resource of THIS service to report
+/// missing, so it is read as the spelling it is like every other non-ARN one.
+pub const EVALUATION_MODEL_RESOURCES: &[&str] = &[
+    FOUNDATION_MODEL_RESOURCE_TYPE,
+    INFERENCE_PROFILE_RESOURCE_TYPE,
+    APPLICATION_INFERENCE_PROFILE_RESOURCE_TYPE,
+    PROVISIONED_MODEL_RESOURCE_TYPE,
+    IMPORTED_MODEL_RESOURCE_TYPE,
+    PROMPT_ROUTER_RESOURCE_TYPE,
+    DEFAULT_PROMPT_ROUTER_RESOURCE_TYPE,
 ];
 
 /// What a create whose artifacts are named by a `modelSourceConfig` answers as its

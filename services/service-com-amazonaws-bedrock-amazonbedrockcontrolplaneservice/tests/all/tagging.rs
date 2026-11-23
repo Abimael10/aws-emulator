@@ -261,7 +261,7 @@ async fn given_evaluation_job(emu: &Emulator, name: &str) -> String {
         "inferenceConfig": {
             "models": [{
                 "bedrockModel": {
-                    "modelIdentifier": "anthropic.claude-v2",
+                    "modelIdentifier": "amazon.nova-lite-v1:0",
                     "inferenceParams": "{\"temperature\":0.2}",
                 },
             }],

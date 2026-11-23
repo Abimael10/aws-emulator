@@ -953,7 +953,26 @@ async fn a_record_whose_model_serves_no_inference_is_reported_as_an_error() {
     let emu = emulator();
     given_bucket(&emu).await;
     let case = "a model identifier that names no model this emulator serves";
-    let model_id = "arn:aws:bedrock:us-east-1::foundation-model/absent.model-v1";
+    // A prompt router Amazon Bedrock PUBLISHES in this Region, read off `ListPromptRouters`
+    // the way a caller would: `EvaluationBedrockModelIdentifier` admits a prompt router's
+    // ARN, so the create resolves it — it names a routing resource this control plane holds
+    // — while the inference plane holds no router to invoke, which is the class this rule is
+    // about.
+    let routers = emu.bedrock("GET", "/prompt-routers", None).await;
+    assert_eq!(
+        routers.status, 200,
+        "setup: ListPromptRouters must answer 200, got {} {:?}",
+        routers.status, routers.body
+    );
+    let model_id = routers
+        .get("promptRouterSummaries")
+        .as_array()
+        .and_then(|summaries| summaries.first())
+        .and_then(|summary| summary.get("promptRouterArn"))
+        .and_then(Value::as_str)
+        .expect("this Region must publish a default prompt router")
+        .to_string();
+    let model_id = model_id.as_str();
     let name = "eval-absent-model";
     let task_type = "Generation";
     let arn = submit(

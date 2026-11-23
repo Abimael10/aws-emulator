@@ -91,7 +91,7 @@ fn create_body(job_name: &str) -> Value {
         "inferenceConfig": {
             "models": [{
                 "bedrockModel": {
-                    "modelIdentifier": "anthropic.claude-v2",
+                    "modelIdentifier": "amazon.nova-lite-v1:0",
                     "inferenceParams": "{\"temperature\":0.2}",
                 },
             }],

@@ -71,11 +71,14 @@ const OUTPUT_URIS: &[&str] = &[
 ];
 
 /// `EvaluationBedrockModelIdentifier` values the model admits — a bare model id of the
-/// `<provider>.<model>` form its pattern spells.
+/// `<provider>.<model>` form its pattern spells — each naming a model the published
+/// catalogue OFFERS (`state::FOUNDATION_MODELS`). A create resolves the identifier its
+/// `inferenceConfig` names against that catalogue, so an id naming no model it offers is
+/// refused rather than accepted.
 const MODEL_IDS: &[&str] = &[
-    "anthropic.claude-v2",
-    "amazon.titan-text-express-v1",
-    "meta.llama3-8b-instruct-v1",
+    "amazon.nova-lite-v1:0",
+    "amazon.nova-pro-v1:0",
+    "meta.llama3-8b-instruct-v1:0",
 ];
 
 /// A KMS key id `customerEncryptionKeyId` admits, and the alias the same `KmsKeyId`

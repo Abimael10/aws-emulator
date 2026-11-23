@@ -5,10 +5,14 @@
 //! ## What this handler does
 //!
 //! Hands Amazon Bedrock the `roleArn` it is to run the evaluation under, so the request is
-//! decided by the `iam:PassRole` step for that role BEFORE anything it names is read
+//! decided by the `iam:PassRole` step for that role once what it ASKS FOR has been read
 //! ([`crate::state::job_pass_role_denial`], the one decision every job-creating operation
 //! of this service makes): a role the caller may not pass is the modelled
-//! `AccessDeniedException`, and such a refusal writes no job at all. The role is taken on
+//! `AccessDeniedException`, and such a refusal writes no job at all. The models the
+//! `inferenceConfig` names are RESOLVED in front of that step
+//! ([`crate::state::names_an_evaluation_model`]) because an identifier that names no model
+//! is un-usable input rather than something to report about the role, and no decision about
+//! the role could make such a request one Amazon Bedrock could run. The role is taken on
 //! FOR the job this create mints, so that job's ARN is minted first and handed to the
 //! decision as the `aws:SourceArn` the assume carries — a trust policy narrowed to the
 //! evaluation-job family is decided against it.
@@ -212,6 +216,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let now = ::std::time::SystemTime::now();
 
+        // What the request ASKS FOR is resolved before who may ask for it: `inferenceConfig`
+        // names the model (or models) Amazon Bedrock is to invoke for the evaluation, and a
+        // value that names no model is an un-usable INPUT rather than something to report
+        // about the role, so every model-identifying member of that configuration is
+        // resolved AHEAD of the `iam:PassRole` step below
+        // (`crate::state::evaluation_model_identifiers` for the members,
+        // `crate::state::names_an_evaluation_model` for the families each is resolved
+        // against). Nothing about the pass can make a request naming no model into one
+        // Amazon Bedrock could run, and a refused create writes nothing — not even the job
+        // id, which is minted behind this reading.
+        let unresolved = {
+            let mut store = state.lock();
+            crate::state::evaluation_model_identifiers(&input.inference_config)
+                .into_iter()
+                .find(|identifier| !store.names_an_evaluation_model(identifier, &region, now))
+                .map(ToString::to_string)
+        };
+        if let Some(identifier) = unresolved {
+            // An identifier that resolves to no model of any of those families is refused as
+            // the spelling it IS — the one reading every model-identifying member of this
+            // service shares ([`crate::state::unresolved_model`]).
+            let refusal =
+                crate::state::unresolved_model(&identifier, crate::state::EVALUATION_MODEL_RESOURCES);
+            let message = Some(refusal.message(&identifier));
+            return Err(if refusal.missing_resource() {
+                CreateEvaluationJobErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException { message },
+                )
+            } else {
+                CreateEvaluationJobErrorModeled::ValidationException(ValidationException {
+                    message,
+                })
+            }
+            .into());
+        }
+
         // The ARN of the job this create mints, fixed BEFORE the pass below is decided
         // because it is one of the values that pass carries: Amazon Bedrock takes the role on
         // FOR this job, so the job's ARN is the `aws:SourceArn` of the assume
@@ -227,11 +267,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::evaluation_job_arn(&region, &job_id)
         };
 
-        // The `iam:PassRole` step for `roleArn`, ahead of the store and ahead of every
-        // resource this request names: the role is the one Amazon Bedrock takes on to run
-        // the evaluation and write its output, so whether this caller may pass it is
-        // settled before the configuration is read — a denied pass is an authorization
-        // refusal rather than a report about the request's contents — and it leaves no job
+        // The `iam:PassRole` step for `roleArn`, behind the resolution of what the request
+        // asks for and ahead of everything this create WRITES: the role is the one Amazon
+        // Bedrock takes on to run the evaluation and write its output, so whether this
+        // caller may pass it is settled once the request is one the service could run — a
+        // denied pass is an authorization refusal rather than a report about the request's
+        // contents — and it leaves no job
         // behind. The decision is the one every job-creating operation of this service
         // makes (`crate::state::job_pass_role_denial`), grounded in what this account's IAM
         // answers about the calling principal's `iam:PassRole` and about the role.
