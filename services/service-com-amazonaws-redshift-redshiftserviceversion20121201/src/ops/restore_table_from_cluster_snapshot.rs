@@ -231,12 +231,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     RestoreTableFromClusterSnapshotErrorModeled::ClusterNotFoundFault(
                         ClusterNotFoundFault {
-                            // The recorded refusal of this operation for an
-                            // unknown cluster is the cluster-scoped sentence every
-                            // other read of a cluster answers — see
-                            // [`st::ClusterNotFoundWording`].
+                            // The sentence this operation's own recorded refusal
+                            // carries, which is the one the operations that ACT
+                            // on the cluster they name answer with rather than
+                            // the one the reads answer with — the per-operation
+                            // catalog [`st::ClusterNotFoundWording`].
                             message: Some(st::cluster_not_found_message(
-                                st::ClusterNotFoundWording::IdentifierThenNotFound,
+                                st::ClusterNotFoundWording::NotFoundThenIdentifier,
                                 &input.cluster_identifier,
                             )),
                         },

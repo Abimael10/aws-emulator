@@ -202,12 +202,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 ModifyClusterSnapshotScheduleErrorModeled::ClusterNotFoundFault(
                     ClusterNotFoundFault {
-                        // No recorded refusal gives this operation a sentence of
-                        // its own, so it carries the one every other
-                        // cluster-scoped operation does — see
+                        // The sentence this operation's own recorded refusal
+                        // carries: the identifier QUOTED, which is this
+                        // operation's own wording rather than one inherited from
+                        // another — the per-operation catalog
                         // [`st::ClusterNotFoundWording`].
                         message: Some(st::cluster_not_found_message(
-                            st::ClusterNotFoundWording::IdentifierThenNotFound,
+                            st::ClusterNotFoundWording::QuotedIdentifierThenNotFound,
                             &input.cluster_identifier,
                         )),
                     },

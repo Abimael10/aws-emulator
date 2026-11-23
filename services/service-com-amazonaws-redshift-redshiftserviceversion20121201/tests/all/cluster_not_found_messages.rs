@@ -19,8 +19,9 @@
 //! The table spans what the rule generalises over: the operation (every family
 //! that dereferences a cluster — a configuration change, a cluster-scoped
 //! create, a namespace registration change, a read, a delete, a suspension of
-//! its compute, a failover of its primary compute unit, the partner integration
-//! and custom domain association families,
+//! its compute, a failover of its primary compute unit, a resize, a key
+//! rotation, a table restore, a snapshot-schedule change, the partner
+//! integration and custom domain association families,
 //! including the two that name their cluster through a member other than
 //! `ClusterIdentifier`)
 //! and the identifier (its spelling, both documented length bounds, its case,
@@ -51,6 +52,9 @@ enum Wording {
     IdentifierThenNotFound,
     /// `Cluster <ClusterIdentifier> can't be found.`
     IdentifierCannotBeFound,
+    /// `Cluster '<ClusterIdentifier>' not found.` — the same sentence as
+    /// [`Wording::IdentifierThenNotFound`] with the identifier SINGLE-QUOTED.
+    QuotedIdentifierThenNotFound,
 }
 
 /// The message `wording` words about `cluster_identifier`.
@@ -60,6 +64,9 @@ fn sentence(wording: Wording, cluster_identifier: &str) -> String {
         Wording::IdentifierThenNotFound => format!("Cluster {cluster_identifier} not found."),
         Wording::IdentifierCannotBeFound => {
             format!("Cluster {cluster_identifier} can't be found.")
+        }
+        Wording::QuotedIdentifierThenNotFound => {
+            format!("Cluster '{cluster_identifier}' not found.")
         }
     }
 }
@@ -122,6 +129,29 @@ fn delete_cluster(identifier: &str) -> Vec<(String, String)> {
     vec![
         pair("ClusterIdentifier", identifier),
         pair("SkipFinalClusterSnapshot", "true"),
+    ]
+}
+
+/// The four members a table restore carries beside the cluster it restores into:
+/// the snapshot it reads and the table it copies out of it. The cluster is
+/// resolved before any of them, so a row about the cluster may name a snapshot
+/// this account does not hold.
+fn restore_table(identifier: &str) -> Vec<(String, String)> {
+    vec![
+        pair("ClusterIdentifier", identifier),
+        pair("SnapshotIdentifier", "cluster-message-probe-source"),
+        pair("SourceDatabaseName", "dev"),
+        pair("SourceTableName", "people"),
+        pair("NewTableName", "people_restored"),
+    ]
+}
+
+/// The schedule a `ModifyClusterSnapshotSchedule` names beside its cluster,
+/// which is likewise resolved only once the cluster is.
+fn cluster_snapshot_schedule(identifier: &str) -> Vec<(String, String)> {
+    vec![
+        pair("ClusterIdentifier", identifier),
+        pair("ScheduleIdentifier", "cluster-message-probe-schedule"),
     ]
 }
 
@@ -235,6 +265,26 @@ fn operations() -> Vec<OperationCase> {
             Wording::NotFoundThenIdentifier,
         ),
         (
+            "ResizeCluster",
+            cluster_only as Request,
+            Wording::NotFoundThenIdentifier,
+        ),
+        (
+            "RotateEncryptionKey",
+            cluster_only as Request,
+            Wording::NotFoundThenIdentifier,
+        ),
+        (
+            "RestoreTableFromClusterSnapshot",
+            restore_table as Request,
+            Wording::NotFoundThenIdentifier,
+        ),
+        (
+            "ModifyClusterSnapshotSchedule",
+            cluster_snapshot_schedule as Request,
+            Wording::QuotedIdentifierThenNotFound,
+        ),
+        (
             "DescribePartners",
             partner_members as Request,
             Wording::NotFoundThenIdentifier,
@@ -281,6 +331,11 @@ fn operations() -> Vec<OperationCase> {
         ),
         (
             "DescribeClusters",
+            cluster_only as Request,
+            Wording::IdentifierThenNotFound,
+        ),
+        (
+            "DescribeLoggingStatus",
             cluster_only as Request,
             Wording::IdentifierThenNotFound,
         ),
@@ -391,15 +446,20 @@ async fn every_operation_words_its_cluster_not_found_refusal_its_own_way() {
     }
 
     // The sentences are DISTINGUISHABLE: the same missing identifier, asked
-    // about through operations of the three wording classes, comes back worded
-    // three different ways rather than collapsed onto one template.
+    // about through operations of the four wording classes, comes back worded
+    // four different ways rather than collapsed onto one template.
     let shared = "message-collapse-probe";
     let mut answered: Vec<String> = Vec::new();
-    for action in ["ModifyCluster", "DescribeClusters", "RegisterNamespace"] {
-        let request: Request = if action == "RegisterNamespace" {
-            namespace_change
-        } else {
-            cluster_only
+    for action in [
+        "ModifyCluster",
+        "DescribeClusters",
+        "RegisterNamespace",
+        "ModifyClusterSnapshotSchedule",
+    ] {
+        let request: Request = match action {
+            "RegisterNamespace" => namespace_change,
+            "ModifyClusterSnapshotSchedule" => cluster_snapshot_schedule,
+            _ => cluster_only,
         };
         let refused = call(&emulator, action, &request(shared)).await;
         answered.push(
@@ -414,7 +474,7 @@ async fn every_operation_words_its_cluster_not_found_refusal_its_own_way() {
     assert_eq!(
         distinct.len(),
         answered.len(),
-        "case the three wording classes: expected three different sentences for one identifier, got {answered:?}"
+        "case the four wording classes: expected four different sentences for one identifier, got {answered:?}"
     );
 }
 

@@ -1129,8 +1129,10 @@ pub enum ClusterNotFoundWording {
     /// `Cluster not found: <ClusterIdentifier>` — what `RebootCluster`,
     /// `ModifyCluster`, `ModifyClusterIamRoles`, `EnableSnapshotCopy`,
     /// `DisableSnapshotCopy`, `ModifySnapshotCopyRetentionPeriod`,
-    /// `CreateClusterSnapshot`, `CreateUsageLimit` and
-    /// `FailoverPrimaryCompute` answer, and the sentence
+    /// `CreateClusterSnapshot`, `CreateUsageLimit`,
+    /// `FailoverPrimaryCompute`, `ResizeCluster`, `RotateEncryptionKey` and
+    /// `RestoreTableFromClusterSnapshot`
+    /// answer, and the sentence
     /// the two families that dereference a cluster without describing it —
     /// partner integration (`AddPartner`, `DeletePartner`, `DescribePartners`,
     /// `UpdatePartnerStatus`) and custom domain association
@@ -1156,6 +1158,12 @@ pub enum ClusterNotFoundWording {
     /// the request named, so it is passed one only to keep every caller of
     /// [`cluster_not_found_message`] uniform.
     SpecifiedIdentifierCannotBeFound,
+    /// `Cluster '<ClusterIdentifier>' not found.` — the same sentence as
+    /// [`Self::IdentifierThenNotFound`] with the identifier QUOTED, which is
+    /// what `ModifyClusterSnapshotSchedule` is recorded answering. The quoting
+    /// is itself per-operation, the way it is for the other resources of this
+    /// service whose refusals quote the name they could not resolve.
+    QuotedIdentifierThenNotFound,
 }
 
 /// Which sentence a `ClusterSnapshotNotFoundFault` is worded with.
@@ -1252,6 +1260,9 @@ pub fn cluster_not_found_message(
         }
         ClusterNotFoundWording::SpecifiedIdentifierCannotBeFound => {
             "The specified cluster identifier can't be found.".to_string()
+        }
+        ClusterNotFoundWording::QuotedIdentifierThenNotFound => {
+            format!("Cluster '{cluster_identifier}' not found.")
         }
     }
 }

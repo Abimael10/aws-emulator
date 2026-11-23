@@ -234,11 +234,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ResizeCluster<Eng
         let Some(position) = store.cluster_position(&input.cluster_identifier) else {
             return Err(ResizeClusterErrorModeled::ClusterNotFoundFault(
                 ClusterNotFoundFault {
-                    // No recorded refusal gives this operation a sentence of its
-                    // own, so it carries the one every other cluster-scoped
-                    // operation does — see [`st::ClusterNotFoundWording`].
+                    // The sentence this operation's own recorded refusal
+                    // carries, which is the one the operations that ACT on the
+                    // cluster they name answer with rather than the one the reads
+                    // answer with — the per-operation catalog
+                    // [`st::ClusterNotFoundWording`].
                     message: Some(st::cluster_not_found_message(
-                        st::ClusterNotFoundWording::IdentifierThenNotFound,
+                        st::ClusterNotFoundWording::NotFoundThenIdentifier,
                         &input.cluster_identifier,
                     )),
                 },
