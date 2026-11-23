@@ -2200,12 +2200,13 @@ fn a_served_invocation_whose_function_errored_is_a_failed_task() {
     );
 }
 
-/// The `Payload` a Lambda task's PARAMETERS name carries the JSON document the function
-/// is invoked with, so parameters naming a bare JSON scalar for it name no invocation
-/// the call can be built from — and nothing else is refused here.
+/// The `Payload` a Lambda task's PARAMETERS name is the TEXT the invocation carries, so
+/// parameters naming a JSON value that is neither that text nor the document written as
+/// it name no invocation the call can be built from — and the diagnosis of such
+/// parameters names the field and the type it requires, never the value one run gave it.
 ///
 /// The rows span what the rule generalises over: each JSON type the parameter may be
-/// given (object, array, number, string, boolean), the null document (which names no
+/// given (object, array, string, number, boolean), the null document (which names no
 /// value, exactly as an absent member does), parameters naming no `Payload` at all, and
 /// the two forms that carry no parameter for it — a `Resource` that names the FUNCTION,
 /// whose event is the state's own data, and a call of another operation.
@@ -2219,8 +2220,9 @@ fn a_payload_parameter_that_is_not_a_document_names_no_invocation() {
         ("the empty object", Some(::serde_json::json!({})), true),
         ("the null document", Some(Value::Null), true),
         ("no Payload at all", None, true),
+        ("a string", Some(::serde_json::json!("text")), true),
         ("a number", Some(::serde_json::json!(42)), false),
-        ("a string", Some(::serde_json::json!("text")), false),
+        ("a negative number", Some(::serde_json::json!(-1.5)), false),
         ("a boolean", Some(::serde_json::json!(true)), false),
     ];
     for (case, payload, usable) in rows {
@@ -2248,11 +2250,13 @@ fn a_payload_parameter_that_is_not_a_document_names_no_invocation() {
                     super::super::asl::RUNTIME_ERROR,
                     "case {case:?}: expected the runtime error, got {failed:?}"
                 );
-                assert!(
-                    failed.cause.starts_with(UNUSABLE_PARAMETERS_OPENING)
-                        && failed.cause.contains(PAYLOAD_MEMBER),
-                    "case {case:?}: the diagnosis must name the parameters and the member that \
-                     could not be used, got {:?}",
+                let expected = format!(
+                    "{UNUSABLE_PARAMETERS_OPENING}{request}' could not be used to start the \
+                     Task: [The value for the field '{PAYLOAD_MEMBER}' must be a STRING]"
+                );
+                assert_eq!(
+                    failed.cause, expected,
+                    "case {case:?}: expected {expected:?}, got {:?}",
                     failed.cause
                 );
             }

@@ -14,11 +14,12 @@
 //! the version the invocation resolved to, which for an alias-qualified invoke is the
 //! numeric version that alias points at rather than the unpublished one.
 //!
-//! RULE 2: the `Payload` parameter of a Lambda task carries the JSON document the
-//! function is invoked with, so parameters whose `Payload` is a bare JSON scalar name no
-//! invocation the call can be built from: the task fails on its own parameters, with the
-//! Amazon States Language's runtime error and the diagnosis the service words for
-//! parameters it could not start a task with.
+//! RULE 2: the `Payload` parameter of a Lambda task is the text the invocation carries —
+//! a JSON string, or the document (an object or an array) written as one — so parameters
+//! whose `Payload` is any OTHER bare JSON value name no invocation the call can be built
+//! from: the task fails on its own parameters, with the Amazon States Language's runtime
+//! error and the diagnosis the service words for parameters it could not start a task
+//! with ([`crate::lambda_task_payload_field_diagnosis`] states that diagnosis in full).
 //!
 //! The rows differ along what each rule generalises over: for the first, every
 //! documented form a request names a qualified function in (the alias in the name, in
@@ -146,8 +147,8 @@ async fn an_alias_qualified_invoke_reports_the_version_the_alias_resolved_to() {
     }
 }
 
-/// The `Payload` parameter of a Lambda task carries the JSON DOCUMENT the function is
-/// invoked with, and only an object or an array is one.
+/// The `Payload` parameter of a Lambda task is the TEXT the invocation carries, and a
+/// bare JSON value that is neither that text nor a document written as one is not.
 #[tokio::test]
 async fn a_payload_parameter_that_is_not_a_document_fails_the_task() {
     let chain = Chain::new();
@@ -178,7 +179,7 @@ async fn a_payload_parameter_that_is_not_a_document_fails_the_task() {
             "a bare string",
             json!({ "Payload.$": "$" }),
             r#""text""#,
-            false,
+            true,
         ),
         ("a bare boolean", json!({ "Payload.$": "$" }), "true", false),
         (

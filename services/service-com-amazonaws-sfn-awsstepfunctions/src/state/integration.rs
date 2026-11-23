@@ -1419,23 +1419,37 @@ const LAMBDA_UNKNOWN_ERROR: &str = "Lambda.Unknown";
 /// that reads this opening.
 pub(super) const UNUSABLE_PARAMETERS_OPENING: &str = "The Parameters '";
 
+/// The TYPE a parameter the invocation is built from must carry, as the diagnosis of
+/// unusable parameters names it.
+///
+/// `Payload` targets a BLOB and is the operation's `httpPayload`
+/// (`smithy_query(query="operation",operation="Invoke",model_path=
+/// "services/service-com-amazonaws-lambda-awsgirapiservice/smithy-model/
+/// com-amazonaws-lambda-awsgirapiservice.json")`), and a blob's value on the wire is the
+/// member's own text — so the type that field requires is the STRING it is deserialized
+/// into, whatever JSON value a path resolved it to.
+const PAYLOAD_MEMBER_TYPE: &str = "STRING";
+
 /// The failure the task's own PARAMETERS are, for parameters the invoked operation
 /// cannot be called with at all, or `None` for parameters that build a call.
 ///
 /// `Payload` is "The JSON that you want to provide to your Lambda function as input"
 /// (`smithy_query(query="doc",shape="InvocationRequest",member="Payload",model_path=
 /// "services/service-com-amazonaws-lambda-awsgirapiservice/smithy-model/
-/// com-amazonaws-lambda-awsgirapiservice.json")`), so the parameter carries the JSON
-/// DOCUMENT the invocation is made with — an object or an array. A bare JSON scalar is a
-/// value rather than a document, so parameters whose `Payload` resolved to one name no
-/// invocation this call can be built from, and the task fails on its own parameters
-/// before any request is sent.
+/// com-amazonaws-lambda-awsgirapiservice.json")`) and it targets a BLOB, whose value is
+/// the TEXT the invocation carries ([`PAYLOAD_MEMBER_TYPE`]): a parameter resolved to a
+/// JSON string IS that text, and one resolved to an object or an array is the document
+/// the invocation is made with, which this call writes as its text ([`Rest::wired`]).
+/// Any OTHER bare JSON value — a number, a boolean — is neither, so parameters whose
+/// `Payload` resolved to one name no invocation this call can be built from, and the task
+/// fails on its own parameters before any request is sent.
 ///
 /// The diagnosis is the one the service words for parameters it could not start a task
-/// with: the parameters AS RESOLVED, and then the deserialization of the member that
-/// could not be read — the member's own name and the JSON value it was handed, both
-/// taken from those resolved parameters, because which value a path resolved to is what
-/// a reader has to be told.
+/// with: the parameters AS RESOLVED, and then the field that could not be used and the
+/// TYPE that field requires — the member's own name out of those parameters and the type
+/// the invoked operation gives it — because what a reader has to be told about such a
+/// refusal is which field is unusable and what it takes, rather than the value one run
+/// happened to hand it.
 ///
 /// A parameter the request carries as the NULL document names no value at all, which is
 /// how this module's own request builder reads one ([`Rest::wired`]): such a request is
@@ -1457,7 +1471,7 @@ fn unusable_parameters(call: &Call, request: &Value) -> Option<Failed> {
     let payload = request.get(PAYLOAD_MEMBER)?;
     if matches!(
         payload,
-        Value::Object(_) | Value::Array(_) | Value::Null
+        Value::Object(_) | Value::Array(_) | Value::String(_) | Value::Null
     ) {
         return None;
     }
@@ -1465,25 +1479,9 @@ fn unusable_parameters(call: &Call, request: &Value) -> Option<Failed> {
         error: super::asl::RUNTIME_ERROR.to_string(),
         cause: format!(
             "{UNUSABLE_PARAMETERS_OPENING}{request}' could not be used to start the Task: \
-             [Cannot deserialize the '{PAYLOAD_MEMBER}' of the invocation from {} value \
-             {payload}]",
-            json_kind(payload)
+             [The value for the field '{PAYLOAD_MEMBER}' must be a {PAYLOAD_MEMBER_TYPE}]"
         ),
     })
-}
-
-/// How the deserialization of a member names the JSON VALUE it was handed: the kind of
-/// value the document carried where the member takes another, which is the only part of
-/// that sentence the request decides besides the value itself.
-fn json_kind(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "Null",
-        Value::Bool(_) => "Boolean",
-        Value::Number(_) => "Number",
-        Value::String(_) => "String",
-        Value::Array(_) => "Array",
-        Value::Object(_) => "Object",
-    }
 }
 
 impl Call {
