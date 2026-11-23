@@ -3,7 +3,9 @@
 //! @op DeleteDataCatalog
 //! IMPLEMENTED: removes the named data catalog from this service's registry and answers
 //! with the record it removed, so a later `GetDataCatalog` of that name is refused and a
-//! second delete of the same name finds nothing left to remove.
+//! second delete of the same name finds nothing left to remove. The account's implicit Glue
+//! Data Catalog is not a registered catalog and no delete removes it, so a delete that
+//! addresses it is refused as a protected resource before the registry is read at all.
 //!
 //! ## Shape of an operation
 //!
@@ -140,6 +142,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The account's implicit Glue Data Catalog is Athena's own: no create registered it
+        // and no delete removes it. So the reserved name is refused BEFORE anything is
+        // resolved — the registry holds no record under it, and answering the miss would
+        // tell a client the catalog is already gone where it exists and is permanently
+        // undeletable. Matched by the ONE predicate this crate resolves that catalog's name
+        // with, so the control plane and the metadata operations answer for the same set of
+        // spellings, and the sentence names the catalog as this account holds it rather than
+        // as the request spelled it.
+        if crate::state::is_glue_data_catalog(&input.name) {
+            return Err(invalid_request(crate::state::data_catalog_cannot_be_deleted(
+                crate::state::GLUE_DATA_CATALOG_NAME,
+            )));
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteDataCatalogErrorModeled::InternalServerException(
                 InternalServerException {

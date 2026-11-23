@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSessionEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSessionEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSessionEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: answers with the connection endpoint of the session the request names — an
+//! address of this emulator carrying that session's own path — and a fresh authentication
+//! token for it, out of the record `StartSession` persisted; a session id this account holds
+//! none under, and a session whose resources are no longer running, are refused.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +137,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSessionEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSessionEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSessionEndpoint"))
+        // No IAM decision here, for the reason `GetSession` states: an Athena action is
+        // scoped by the WORKGROUP the request names, and a session-addressed request names
+        // none.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetSessionEndpointErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("Athena state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        // A read of the session, and a MINT of the grant this call's caller asked for:
+        // "Gets a connection endpoint and authentication token for a given session Id" is
+        // what this operation does, and the token it answers with carries everything needed
+        // to resolve it, so nothing is written to the store below either. The session's
+        // state is DERIVED from the stored instants and the clock
+        // (`crate::state::SessionRecord::state_at`), so asking for an endpoint neither moves
+        // a session on nor holds it back.
+        let store = state.lock();
+
+        // The id names a session this account holds, or it names nothing this service will
+        // act on — the one refusal every session-addressed operation of this service states
+        // for that miss (`crate::state::session_not_authorized`), which states nothing about
+        // whether a session has that id.
+        let Some(session) = store.sessions.session(&input.session_id) else {
+            return Err(crate::state::session_not_authorized());
+        };
+
+        // A client CONNECTS to what this call reports, and only a session that is running
+        // accepts a connection: a session shutting down, one whose resources are gone and
+        // one that ended badly have no endpoint to connect to (see
+        // `crate::state::session_endpoint`).
+        if !session.is_active_at(now) {
+            return Err(invalid_request(crate::state::SESSION_ENDPOINT_UNAVAILABLE));
+        }
+
+        // A fresh token per call, so a re-issue refreshes it rather than handing back the
+        // same value: the store's own authenticator over the session this endpoint names,
+        // which is the STORED session's id rather than the spelling the request carried.
+        let auth_token = store.session_endpoint_auth_token(&session.id);
+        let session_id = session.id.clone();
+        // Nothing below reads or writes the store: the address is the caller's answer.
+        drop(store);
+
+        Ok(GetSessionEndpointOutput {
+            // The address THIS emulator is reached at, with the session's own path under it:
+            // a client takes this value and connects to it, so it leads back here rather
+            // than to a host AWS publishes its own endpoints at.
+            endpoint_url: crate::state::session_endpoint_url(ctx.endpoint().as_str(), &session_id),
+            auth_token,
+            // When the token just minted stops working, which is what this member reports
+            // ("Expiration time of the auth token"), at the resolution every timestamp of
+            // this service is reported at.
+            auth_token_expiration_time: crate::state::reported_time(
+                now.checked_add(crate::state::SESSION_ENDPOINT_AUTH_TOKEN_LIFETIME)
+                    .unwrap_or(now),
+            ),
+        })
     }
+}
+
+/// The operation's own client error (HTTP 400), carrying `message`.
+///
+/// `InvalidRequestException` is the client error this operation models for a refusal the
+/// request itself caused: "Indicates that something is wrong with the input to the request."
+/// Raised through the service's own refusal channel, which carries the code under both names
+/// the wire gives it — the class of a refusal the caller's own input caused
+/// ([`crate::state::ERROR_CODE_INVALID_INPUT`]).
+fn invalid_request(message: impl Into<String>) -> GetSessionEndpointError {
+    GetSessionEndpointError::invalid_request(crate::state::ERROR_CODE_INVALID_INPUT, message)
 }

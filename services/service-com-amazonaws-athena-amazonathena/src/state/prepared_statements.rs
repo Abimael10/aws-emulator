@@ -57,12 +57,16 @@ pub const MAX_PREPARED_STATEMENT_NAMES_PER_BATCH: usize = 256;
 /// The error code reported for a name the addressed workgroup holds no prepared statement
 /// under.
 ///
-/// `UnprocessedPreparedStatementName$ErrorMessage` names this class itself:
-/// "`STATEMENT_NOT_FOUND` - A prepared statement with the name provided could not be
-/// found", beside `INVALID_INPUT` and `UNAUTHORIZED`. Its own class rather than
+/// `STATEMENTNAME_NOT_FOUND` is what Athena answers on the wire for this class — the code
+/// a batch read's per-item entry carries for a name the workgroup holds nothing under, and
+/// the only machine-readable discriminator such an entry has. It is NOT the spelling
+/// `UnprocessedPreparedStatementName$ErrorMessage` lists in prose
+/// ("`STATEMENT_NOT_FOUND` - A prepared statement with the name provided could not be
+/// found"): that documentation names the MESSAGES this member may carry, and the recorded
+/// wire form governs where the two disagree. Its own class rather than
 /// [`ERROR_CODE_INVALID_INPUT`], so a client can tell a statement that is simply absent
 /// from a request that is otherwise wrong.
-pub const ERROR_CODE_STATEMENT_NOT_FOUND: &str = "STATEMENT_NOT_FOUND";
+pub const ERROR_CODE_STATEMENT_NAME_NOT_FOUND: &str = "STATEMENTNAME_NOT_FOUND";
 
 /// One prepared statement, as this service persists it.
 #[derive(Debug, Clone)]
@@ -355,7 +359,7 @@ pub fn prepared_statement_already_exists(name: &str, work_group: &str) -> String
 }
 
 /// The reason `BatchGetPreparedStatement` reports beside
-/// [`ERROR_CODE_STATEMENT_NOT_FOUND`] for a name the workgroup holds no statement under.
+/// [`ERROR_CODE_STATEMENT_NAME_NOT_FOUND`] for a name the workgroup holds no statement under.
 ///
 /// `UnprocessedPreparedStatementName$ErrorMessage` documents the reason for this class
 /// itself — "A prepared statement with the name provided could not be found" — so that is

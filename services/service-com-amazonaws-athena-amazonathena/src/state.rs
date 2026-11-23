@@ -150,6 +150,10 @@ pub use notebooks::*;
 mod notebook_urls;
 pub use notebook_urls::*;
 
+/// The address a client connects to one session at, and the token that authenticates it.
+mod session_endpoint;
+pub use session_endpoint::*;
+
 /// The sessions this account's workgroups run, the executors each one runs on, and the
 /// notebook a notebook session was started in.
 mod sessions;
@@ -597,6 +601,20 @@ pub fn data_catalog_not_found(catalog_name: &str) -> String {
 /// sentences are separate helpers and neither path can drift onto the other's wording.
 pub fn data_catalog_not_found_on_delete(catalog_name: &str) -> String {
     format!("DataCatalog {catalog_name} was not found")
+}
+
+/// The refusal message a DELETE that addresses the data catalog Athena holds of its own
+/// answers with.
+///
+/// The Glue Data Catalog ([`GLUE_DATA_CATALOG_NAME`]) is the account's implicit catalog: no
+/// create registered it and no delete removes it, so a delete that addresses it is refused
+/// as a PROTECTED resource rather than as an absent one — and the two say operationally
+/// different things, one that the catalog is already gone and the other that it exists and
+/// cannot be removed. Athena words it as the refusal of the delete itself: "Cannot delete "
+/// and the name of the catalog that cannot be deleted, which is the one name this account
+/// holds that catalog under rather than the spelling the request carried.
+pub fn data_catalog_cannot_be_deleted(catalog_name: &str) -> String {
+    format!("Cannot delete {catalog_name}.")
 }
 
 /// The refusal message an UPDATE whose named data catalog this account does not hold
@@ -1171,8 +1189,10 @@ impl DataCatalogRecord {
 /// holds no record for it — the position the account's default workgroup is in
 /// ([`default_work_group_record`]). Athena addresses it by [`GLUE_DATA_CATALOG_NAME`] and
 /// this emulator serves its metadata out of the Glue store the metadata operations read
-/// ([`metadata_source`]), so a read of it and a listing of catalogs both answer from this one
-/// projection rather than one of them reporting a catalog the other does not. Its type is
+/// ([`metadata_source`]), so nothing of the catalog is held here. Reached only from
+/// [`ComAmazonawsAthenaAmazonathenaState::data_catalog_summaries`], which is the one place
+/// the implicit catalog is reported: being no registered record, it is not what a registry
+/// read by name resolves ([`ComAmazonawsAthenaAmazonathenaState::data_catalog`]). Its type is
 /// created synchronously, as `DataCatalog$Status` documents, so no part of its creation is
 /// still owed and it carries no description, parameters, connection or tags: no request gave
 /// it any.
@@ -2511,7 +2531,7 @@ pub fn work_group_disabled(name: &str) -> String {
 /// resource this account does not hold, a name already taken, a value outside a rule this
 /// service enforces. The code every Athena refusal carries unless the refusal class has
 /// one of its own ([`ERROR_CODE_QUERY_EXECUTION_NOT_FOUND`],
-/// [`ERROR_CODE_NAMED_QUERY_NOT_FOUND`], [`ERROR_CODE_STATEMENT_NOT_FOUND`],
+/// [`ERROR_CODE_NAMED_QUERY_NOT_FOUND`], [`ERROR_CODE_STATEMENT_NAME_NOT_FOUND`],
 /// [`ERROR_CODE_INVALID_QUERY_EXECUTION_STATE`]), and the one a batch read whose LIST
 /// breaks its modelled constraint is refused whole with, before any id is resolved.
 pub const ERROR_CODE_INVALID_INPUT: &str = "INVALID_INPUT";
@@ -2714,6 +2734,14 @@ pub struct ComAmazonawsAthenaAmazonathenaState {
     /// for different purposes, and neither can be made to stand in for the other. Drawn
     /// from the system's randomness when the store is created and never reported.
     notebook_address_key: PageTokenKey,
+    /// The secret the authentication token a session's connection endpoint carries is
+    /// computed under, so a token this store did not mint names no session. Its own secret
+    /// rather than [`Self::notebook_address_key`], for the same reason that one is not
+    /// [`Self::page_token_key`]: a notebook's authenticator and the token a client connects
+    /// to a session with are handed out for different purposes, and neither can be made to
+    /// stand in for the other. Drawn from the system's randomness when the store is created
+    /// and never reported.
+    session_endpoint_key: PageTokenKey,
     /// What this account has left to spend of each METERED API's published call rate, per
     /// Region — [`request_quota::RequestRates`]. Written only by the rate gate in front of a
     /// metered operation, which is also the only thing that reads it.
@@ -2750,6 +2778,7 @@ impl Default for ComAmazonawsAthenaAmazonathenaState {
             named_queries: NamedQueryRegistry::default(),
             page_token_key: PageTokenKey::new(),
             notebook_address_key: PageTokenKey::new(),
+            session_endpoint_key: PageTokenKey::new(),
             request_rates: request_quota::RequestRates::default(),
             query_clock_pump_running: false,
             query_clock_pump_generation: 0,
@@ -3005,19 +3034,17 @@ impl ComAmazonawsAthenaAmazonathenaState {
     /// The data catalog `name` addresses, or `None` where this account holds none under
     /// that name.
     ///
-    /// That is the record a `CreateDataCatalog` call registered and no delete removed, or
-    /// the account's Glue Data Catalog ([`glue_data_catalog_record`]), which every account
-    /// has and which no create registered. The ONE place a catalog name is resolved, so a
-    /// read of a catalog and a listing of them report the same set — neither names a
-    /// catalog the other does not.
+    /// That is the record a `CreateDataCatalog` call registered and no delete removed — the
+    /// REGISTRY, and nothing else.
+    ///
+    /// The account's Glue Data Catalog ([`GLUE_DATA_CATALOG_NAME`]) is not among them: it is
+    /// the account's implicit catalog, which no create registered and which therefore has no
+    /// record to resolve, so a registry read by name reports it as not found. It is still
+    /// the catalog the account HAS: a listing reports it from its own projection
+    /// ([`Self::data_catalog_summaries`]) and a metadata read resolves it as the Data Catalog
+    /// it IS ([`metadata_source`]), neither of which resolves a name through here.
     pub fn data_catalog(&self, name: &str) -> Option<DataCatalogRecord> {
-        if let Some(record) = self.data_catalogs.get(name) {
-            return Some(record.clone());
-        }
-        // Matched by the ONE predicate this crate resolves that catalog's name with
-        // ([`is_glue_data_catalog`]), so the control plane and the metadata operations
-        // answer for the same set of spellings.
-        is_glue_data_catalog(name).then(|| glue_data_catalog_record(self.opened_at))
+        self.data_catalogs.get(name).cloned()
     }
 
     /// Every data catalog this account holds, as the summaries a listing reports, in name
@@ -3026,8 +3053,9 @@ impl ComAmazonawsAthenaAmazonathenaState {
     /// That is each one a `CreateDataCatalog` call registered and has not been deleted,
     /// plus the account's Glue Data Catalog ([`GLUE_DATA_CATALOG_NAME`]), which every
     /// account has and which therefore has no record of its own — the same shape as
-    /// [`Self::work_group_summaries`] beside the account's default workgroup, and the same
-    /// set [`Self::data_catalog`] resolves a name against. A record registered under that
+    /// [`Self::work_group_summaries`] beside the account's default workgroup. The implicit
+    /// catalog is reported HERE and nowhere else: being no registered record, it is not what
+    /// [`Self::data_catalog`] resolves a name against. A record registered under that
     /// catalog's own name is reported from that record, so no catalog is reported twice.
     pub fn data_catalog_summaries(&self, now: SystemTime) -> Vec<DataCatalogSummary> {
         let mut by_name: BTreeMap<&str, DataCatalogSummary> = self

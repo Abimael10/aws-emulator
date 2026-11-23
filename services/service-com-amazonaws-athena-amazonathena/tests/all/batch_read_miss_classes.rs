@@ -15,9 +15,9 @@
 //!
 //! * `BatchGetNamedQuery` → `NAMED_QUERY_NOT_FOUND`;
 //! * `BatchGetQueryExecution` → `QUERY_EXECUTION_NOT_FOUND`;
-//! * `BatchGetPreparedStatement` → `STATEMENT_NOT_FOUND`, which the model's own
-//!   `UnprocessedPreparedStatementName$ErrorMessage` documentation lists beside
-//!   `INVALID_INPUT` ("the name ... is not valid") — the two classes the rule separates.
+//! * `BatchGetPreparedStatement` → `STATEMENTNAME_NOT_FOUND`, the code Athena answers on
+//!   the wire for a name the workgroup holds nothing under, beside the `INVALID_INPUT` of a
+//!   name that "is not valid" — the two classes the rule separates.
 //!
 //! The rows of each table differ along the FORM and the SIZE of the id that resolves to
 //! nothing, inside the constraints the model declares on it (`NamedQueryId` and
@@ -32,7 +32,7 @@
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_athena_amazonathena::state::{
     self, ERROR_CODE_INVALID_INPUT, ERROR_CODE_NAMED_QUERY_NOT_FOUND,
-    ERROR_CODE_QUERY_EXECUTION_NOT_FOUND, ERROR_CODE_STATEMENT_NOT_FOUND,
+    ERROR_CODE_QUERY_EXECUTION_NOT_FOUND, ERROR_CODE_STATEMENT_NAME_NOT_FOUND,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -270,7 +270,7 @@ async fn batch_reads(router: &MultiServiceRouter) -> Vec<BatchRead> {
             unprocessed_member: "UnprocessedPreparedStatementNames",
             id_member: "StatementName",
             extra: json!({ "WorkGroup": WORK_GROUP }),
-            class: ERROR_CODE_STATEMENT_NOT_FOUND,
+            class: ERROR_CODE_STATEMENT_NAME_NOT_FOUND,
             miss_message: prepared_statement_miss,
             misses: name_misses(&statement_name),
             held: statement_name,

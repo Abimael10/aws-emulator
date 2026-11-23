@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDataCatalog
-//! IMPLEMENTED: answers with the data catalog this account holds under this name — one
-//! `CreateDataCatalog` registered, or the account's own Glue Data Catalog, which no create
-//! registered and which `ListDataCatalogs` reports from the same projection — and refuses a
-//! name the account holds none under.
+//! IMPLEMENTED: answers with the data catalog this account REGISTERED under this name — one
+//! `CreateDataCatalog` wrote and no delete removed — and refuses every other name, the
+//! account's implicit Glue Data Catalog included: that catalog is enumerated by
+//! `ListDataCatalogs` but no create registered it, so the registry resolves it to nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -155,11 +155,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // emulator creates no Identity Center application and the catalog registry is
         // account-wide, so the member selects nothing and is not read here.
         let Some(record) = store.data_catalog(&input.name) else {
-            // Athena models no not-found error for this operation; naming a catalog that
-            // does not exist is "something wrong with the input to the request", which
-            // is what `InvalidRequestException` (HTTP 400) reports, under the code for a
-            // refusal the request itself caused. The sentence comes from `crate::state`,
-            // which holds one wording per path that answers a catalog miss.
+            // Athena models no not-found error for this operation; naming a catalog the
+            // registry does not hold is "something wrong with the input to the request",
+            // which is what `InvalidRequestException` (HTTP 400) reports, under the code for
+            // a refusal the request itself caused. The account's implicit Glue Data Catalog
+            // is one of those names: no create registered it, so this read resolves nothing
+            // for it, exactly as for a name nothing ever registered. The sentence comes from
+            // `crate::state`, which holds one wording per path that answers a catalog miss.
             return Err(GetDataCatalogError::invalid_request(
                 crate::state::ERROR_CODE_INVALID_INPUT,
                 crate::state::data_catalog_not_found(&input.name),

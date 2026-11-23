@@ -441,25 +441,40 @@ async fn an_update_naming_no_registered_catalog_is_refused_and_writes_nothing() 
         let read_name = case.update["Name"].as_str().expect("the row names a catalog");
         let (status, read) = read_catalog(&router, read_name).await;
         if read_name == GLUE_DATA_CATALOG_NAME {
-            // The account holds this one catalog without any create having registered it,
-            // so what shows that the refused update wrote nothing is the read reporting it
-            // exactly as it was: its own type, and none of the parameters the update named.
+            // The account holds this one catalog without any create having registered it, so
+            // the registry resolves its name to nothing: the read is refused like every other
+            // name no create registered. What shows the refused update wrote nothing is the
+            // LISTING still reporting the catalog exactly as it was — under its own type.
             assert_eq!(
-                status, 200,
-                "case {:?}: the account's own Glue Data Catalog must still be readable, got \
+                status, 400,
+                "case {:?}: the implicit Glue Data Catalog is not resolvable by name, got \
                  {status} with {read:?}",
                 case.case
             );
+            let (listed_status, listed) = call(&router, "ListDataCatalogs", &json!({})).await;
             assert_eq!(
-                read["Type"].as_str(),
-                Some(DATA_CATALOG_TYPE_GLUE),
-                "case {:?}: the refused update must have changed no type, got {read:?}",
+                listed_status, 200,
+                "case {:?}: the listing must answer 200, got {listed_status} with {listed:?}",
                 case.case
             );
+            let summary = listed["DataCatalogsSummary"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+                .iter()
+                .find(|summary| summary["CatalogName"] == json!(GLUE_DATA_CATALOG_NAME))
+                .cloned()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {:?}: the account's own Glue Data Catalog must still be listed, \
+                         got {listed:?}",
+                        case.case
+                    )
+                });
             assert_eq!(
-                read["Parameters"],
-                Value::Null,
-                "case {:?}: the refused update must have written no parameter, got {read:?}",
+                summary["Type"].as_str(),
+                Some(DATA_CATALOG_TYPE_GLUE),
+                "case {:?}: the refused update must have changed no type, got {summary:?}",
                 case.case
             );
             continue;

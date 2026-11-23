@@ -9,7 +9,9 @@
 //! whose metadata this emulator serves — each as the summary of the record it was registered
 //! from, in one stable order, a page at a time, with a continuation token only where the
 //! listing has more to report. A token this store did not mint for THIS listing names no
-//! page.
+//! page. The implicit Glue Data Catalog is reported by the LISTING alone: having no
+//! registered record, it is not resolvable by name, so `GetDataCatalog` refuses it the way
+//! it refuses any name the registry does not hold.
 //!
 //! The bounds are the model's, read with
 //! `smithy_query(query="operation",operation="ListDataCatalogs")` and
@@ -23,13 +25,13 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_athena_amazonathena::state::{
-    page_token_malformed, DATA_CATALOG_STATUS_CREATE_COMPLETE, DATA_CATALOG_TYPE_FEDERATED,
-    DATA_CATALOG_TYPE_GLUE, DATA_CATALOG_TYPE_HIVE, DATA_CATALOG_TYPE_LAMBDA,
-    ERROR_CODE_INVALID_INPUT, GLUE_DATA_CATALOG_NAME,
+    data_catalog_not_found, page_token_malformed, DATA_CATALOG_STATUS_CREATE_COMPLETE,
+    DATA_CATALOG_TYPE_FEDERATED, DATA_CATALOG_TYPE_GLUE, DATA_CATALOG_TYPE_HIVE,
+    DATA_CATALOG_TYPE_LAMBDA, ERROR_CODE_INVALID_INPUT, GLUE_DATA_CATALOG_NAME,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{call, error_code, message, router};
+use crate::harness::{assert_refusal, call, error_code, message, router};
 
 /// The error shape every refusal of this operation carries: the client error it models
 /// (HTTP 400).
@@ -122,8 +124,8 @@ async fn given_catalogs(router: &MultiServiceRouter) {
 }
 
 /// An account that registered no catalog of its own still holds one: its Glue Data Catalog,
-/// reported with the type and the completed status that catalog has, and readable through
-/// `GetDataCatalog`.
+/// reported with the type and the completed status that catalog has — and reported by the
+/// LISTING alone, no create having registered a record a read could resolve.
 #[tokio::test]
 async fn an_account_that_registered_none_reports_its_glue_data_catalog() {
     let router = router();
@@ -151,30 +153,22 @@ async fn an_account_that_registered_none_reports_its_glue_data_catalog() {
         "a page that reported everything must hand back no token, got {token:?}"
     );
 
-    // The catalog a listing reports is one the read of a catalog serves: the listing and
-    // `GetDataCatalog` resolve the same set, so neither names a catalog the other does not.
+    // The implicit catalog is the listing's to report: no `CreateDataCatalog` registered it,
+    // so the registry resolves its name to nothing and the read is refused exactly as a name
+    // nothing ever registered is.
     let (read_status, read) = call(
         &router,
         "GetDataCatalog",
         &json!({ "Name": GLUE_DATA_CATALOG_NAME }),
     )
     .await;
-    assert_eq!(
-        read_status, 200,
-        "the Glue Data Catalog must be readable, got {read_status} with {read:?}"
+    assert_refusal(
+        "GetDataCatalog on the implicit Glue Data Catalog",
+        read_status,
+        &read,
+        ERROR_CODE_INVALID_INPUT,
+        &data_catalog_not_found(GLUE_DATA_CATALOG_NAME),
     );
-    let catalog = &read["DataCatalog"];
-    assert_eq!(
-        catalog["Name"].as_str(),
-        Some(GLUE_DATA_CATALOG_NAME),
-        "the read must report the catalog the listing named, got {catalog:?}"
-    );
-    for member in ["Type", "Status"] {
-        assert_eq!(
-            catalog[member], glue[member],
-            "the read's {member} must be the listing's, got {catalog:?} and {glue:?}"
-        );
-    }
 }
 
 /// Every registered catalog is reported with the type and status its own record carries —

@@ -260,7 +260,7 @@ pub fn named_query_not_found(id: &str) -> String {
 /// class of one id's failure can tell "this saved query does not exist" — drop the id, or
 /// create the query again — from "your request is wrong". The same shape as
 /// [`super::ERROR_CODE_QUERY_EXECUTION_NOT_FOUND`] and
-/// [`super::ERROR_CODE_STATEMENT_NOT_FOUND`] for the other resources a batch read resolves
+/// [`super::ERROR_CODE_STATEMENT_NAME_NOT_FOUND`] for the other resources a batch read resolves
 /// by id.
 pub const ERROR_CODE_NAMED_QUERY_NOT_FOUND: &str = "NAMED_QUERY_NOT_FOUND";
 

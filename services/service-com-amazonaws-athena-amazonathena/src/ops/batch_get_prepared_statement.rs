@@ -203,7 +203,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(record) => statements.push(record.to_prepared_statement()),
                 None => unprocessed.push(UnprocessedPreparedStatementName {
                     statement_name: Some(name.clone()),
-                    error_code: Some(crate::state::ERROR_CODE_STATEMENT_NOT_FOUND.to_string()),
+                    error_code: Some(
+                        crate::state::ERROR_CODE_STATEMENT_NAME_NOT_FOUND.to_string(),
+                    ),
                     error_message: Some(crate::state::prepared_statement_name_not_found()),
                 }),
             }

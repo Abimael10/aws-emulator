@@ -29,7 +29,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_athena_amazonathena::state::{
     named_query_not_found, prepared_statement_name_not_found, DEFAULT_WORK_GROUP,
-    ERROR_CODE_NAMED_QUERY_NOT_FOUND, ERROR_CODE_STATEMENT_NOT_FOUND,
+    ERROR_CODE_NAMED_QUERY_NOT_FOUND, ERROR_CODE_STATEMENT_NAME_NOT_FOUND,
 };
 
 use crate::harness::{call, create_work_group, router};
@@ -692,7 +692,7 @@ async fn batch_get_prepared_statement_answers_the_last_write_in_request_order() 
         for entry in &unprocessed {
             assert_eq!(
                 entry["ErrorCode"].as_str(),
-                Some(ERROR_CODE_STATEMENT_NOT_FOUND),
+                Some(ERROR_CODE_STATEMENT_NAME_NOT_FOUND),
                 "case {case:?}: expected the class a missing statement is reported under, got \
                  {entry:?}"
             );

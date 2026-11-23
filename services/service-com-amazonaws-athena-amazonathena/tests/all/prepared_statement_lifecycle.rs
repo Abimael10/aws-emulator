@@ -18,7 +18,7 @@ use service_com_amazonaws_athena_amazonathena::state::{
     no_prepared_statement_with_name, page_token_malformed, prepared_statement_already_exists,
     prepared_statement_does_not_exist, prepared_statement_name_not_found,
     prepared_statement_not_found, too_many_prepared_statement_names, too_many_prepared_statements,
-    ERROR_CODE_INVALID_INPUT, ERROR_CODE_STATEMENT_NOT_FOUND,
+    ERROR_CODE_INVALID_INPUT, ERROR_CODE_STATEMENT_NAME_NOT_FOUND,
     MAX_PREPARED_STATEMENTS_PER_WORK_GROUP, MAX_PREPARED_STATEMENT_NAMES_PER_BATCH,
     WORK_GROUP_NOT_FOUND,
 };
@@ -678,8 +678,9 @@ async fn a_batch_read_reports_held_statements_and_lists_the_rest_as_unprocessed(
         for entry in &unprocessed {
             assert_eq!(
                 entry["ErrorCode"].as_str(),
-                Some(ERROR_CODE_STATEMENT_NOT_FOUND),
-                "case {case:?}: expected the {ERROR_CODE_STATEMENT_NOT_FOUND} class, got {entry:?}"
+                Some(ERROR_CODE_STATEMENT_NAME_NOT_FOUND),
+                "case {case:?}: expected the {ERROR_CODE_STATEMENT_NAME_NOT_FOUND} class, got \
+                 {entry:?}"
             );
             assert_eq!(
                 entry["ErrorMessage"].as_str(),
