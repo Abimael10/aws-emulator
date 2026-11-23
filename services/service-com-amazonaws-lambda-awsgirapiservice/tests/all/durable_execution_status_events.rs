@@ -32,6 +32,12 @@
 //!
 //! The package writer is the one `synchronous_invoke_run.rs` publishes, so there is one
 //! writer of a deployment archive in this target.
+//!
+//! The harness this suite builds for the three services — the router, the queue-and-rule
+//! writer and the drain that files what a queue received — is `pub(crate)`, so the suite for
+//! the ROUTING between several status-scoped rules
+//! (`durable_execution_status_scoped_rules.rs`) drives the same wire rather than rebuilding
+//! one that could disagree with it.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -48,23 +54,23 @@ use crate::synchronous_invoke_run::package;
 /// service in an event's `source` as `aws.<service>`, and Lambda's namespace is `lambda`.
 /// Written out here rather than taken from the implementation's own constant, so the
 /// published value is checked against an expectation of its own.
-const EVENT_SOURCE: &str = "aws.lambda";
+pub(crate) const EVENT_SOURCE: &str = "aws.lambda";
 
 /// The `detail-type` every event this suite reads must carry. Written out here rather than
 /// taken from the implementation's own constant, for the same reason as [`EVENT_SOURCE`]: a
 /// rule matches on this string, so the test states it rather than reading it back out of the
 /// code that publishes it. The publishing service is already named by the event's `source`,
 /// so the `detail-type` names the resource whose status moved and the move itself.
-const DURABLE_EXECUTION_STATUS_CHANGE: &str = "Durable Execution Status Change";
+pub(crate) const DURABLE_EXECUTION_STATUS_CHANGE: &str = "Durable Execution Status Change";
 
 /// Where `Invoke` is bound.
-const INVOCATIONS_URI: &str = "/2015-03-31/functions";
+pub(crate) const INVOCATIONS_URI: &str = "/2015-03-31/functions";
 
 /// The request header `Invoke$DurableExecutionName` is bound to.
-const DURABLE_EXECUTION_NAME_HEADER: &str = "x-amz-durable-execution-name";
+pub(crate) const DURABLE_EXECUTION_NAME_HEADER: &str = "x-amz-durable-execution-name";
 
 /// The response header `Invoke$DurableExecutionArn` is bound to.
-const DURABLE_EXECUTION_ARN_HEADER: &str = "x-amz-durable-execution-arn";
+pub(crate) const DURABLE_EXECUTION_ARN_HEADER: &str = "x-amz-durable-execution-arn";
 
 /// The Region every request below is signed for, which is the Region whose default bus the
 /// events are published onto.
@@ -101,18 +107,18 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// The `ExecutionTimeout` the timed-out row runs under, in seconds — the model's own floor
 /// (`DurableConfig$ExecutionTimeout` is `@range(min: 1, max: 31622400)`), so the execution
 /// outlives it while its handler is still waiting.
-const SHORT_EXECUTION_TIMEOUT: i64 = 1;
+pub(crate) const SHORT_EXECUTION_TIMEOUT: i64 = 1;
 
 /// The `ExecutionTimeout` every other row runs under: far longer than the row takes, so
 /// nothing times out that the row is not about.
-const LONG_EXECUTION_TIMEOUT: i64 = 3_600;
+pub(crate) const LONG_EXECUTION_TIMEOUT: i64 = 3_600;
 
 /// How long the handler of the rows that must still be running waits, in seconds.
-const HANDLER_WAIT_SECONDS: u64 = 3;
+pub(crate) const HANDLER_WAIT_SECONDS: u64 = 3;
 
 /// The function `Timeout` those rows run under: longer than the handler waits, so the run is
 /// not cut off before the status the row is about is reached.
-const FUNCTION_TIMEOUT: i64 = 20;
+pub(crate) const FUNCTION_TIMEOUT: i64 = 20;
 
 /// One row: how the execution reaches its terminal status.
 struct Case {
@@ -428,11 +434,11 @@ struct Envelope {
 }
 
 /// A handler that RETURNS at once.
-const RETURNS: &str = "def lambda_handler(event, context):\n    return {'done': True}\n";
+pub(crate) const RETURNS: &str = "def lambda_handler(event, context):\n    return {'done': True}\n";
 
 /// A handler that waits for the span its event names, which is what makes a row outlive its
 /// execution timeout.
-const WAITS: &str = "import time\n\n\ndef lambda_handler(event, context):\n    \
+pub(crate) const WAITS: &str = "import time\n\n\ndef lambda_handler(event, context):\n    \
                      time.sleep(event['wait_seconds'])\n    return {'done': True}\n";
 
 /// The qualifier of the version an invocation that names none runs.
@@ -705,7 +711,7 @@ async fn a_status_change_envelope_names_the_function_version_and_its_instants() 
 /// Lambda, Amazon EventBridge and Amazon SQS over ONE shared engine, as
 /// `core/router/src/lib.rs` mounts them: the event Lambda publishes is matched by the bus and
 /// delivered to the queue in this same process.
-fn emulator(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
+pub(crate) fn emulator(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = router_on(engine);
     router.register_service(
         service_com_amazonaws_eventbridge_awsevents::EmulatedService::new(Arc::clone(engine)),
@@ -762,7 +768,7 @@ async fn rpc(
 
 /// The queue `queue` targeted by the rule `rule` on the DEFAULT bus matching `pattern`;
 /// answers the queue's url.
-async fn control_queue(
+pub(crate) async fn control_queue(
     router: &MultiServiceRouter,
     queue: &str,
     rule: &str,
@@ -842,7 +848,7 @@ async fn control_queue(
 
 /// Take whatever is waiting on the queue at `url` and file each message under the execution
 /// it is about and the status it reports.
-async fn drain_into(
+pub(crate) async fn drain_into(
     router: &MultiServiceRouter,
     url: &str,
     into: &mut BTreeMap<(String, String), Vec<Value>>,
@@ -926,7 +932,7 @@ fn timestamp_millis(value: &Value) -> Option<i64> {
 }
 
 /// A blob member: restJson1 carries one base64-encoded in a JSON body.
-fn base64_of(bytes: &[u8]) -> Value {
+pub(crate) fn base64_of(bytes: &[u8]) -> Value {
     Value::String(::base64::Engine::encode(
         &::base64::engine::general_purpose::STANDARD,
         bytes,
