@@ -87,13 +87,6 @@ pub fn parse_engine_version(engine_version: &str) -> Option<EngineVersion> {
     })
 }
 
-/// The Elasticsearch release both encryption features `InstanceTypeDetails$Encryption\
-/// Enabled` covers are available from. That member is "whether encryption at rest AND
-/// node-to-node encryption are supported for the instance type", so the gate is the
-/// LATER of the two: node-to-node encryption arrived in Elasticsearch 6.0, encryption
-/// at rest before it.
-pub(super) const ENCRYPTION_SINCE_ELASTICSEARCH: (u32, u32) = (6, 0);
-
 /// The Elasticsearch release Amazon Cognito authentication for Dashboards is
 /// available from (`InstanceTypeDetails$CognitoEnabled`).
 pub(super) const COGNITO_SINCE_ELASTICSEARCH: (u32, u32) = (5, 1);
@@ -107,9 +100,9 @@ pub(super) const APP_LOGS_SINCE_ELASTICSEARCH: (u32, u32) = (5, 1);
 /// (`InstanceTypeDetails$AdvancedSecurityEnabled`).
 pub(super) const ADVANCED_SECURITY_SINCE_ELASTICSEARCH: (u32, u32) = (6, 7);
 
-/// The Elasticsearch release UltraWarm storage is available from
-/// (`InstanceTypeDetails$WarmEnabled`), which is also the release the UltraWarm
-/// instance family was introduced for.
+/// The Elasticsearch release the UltraWarm instance family is offered from: the warm
+/// tier's own hardware arrived with it, so no earlier release publishes a type of that
+/// family at all.
 pub(super) const ULTRAWARM_SINCE_ELASTICSEARCH: (u32, u32) = (6, 8);
 
 /// The Elasticsearch release the Graviton instance families are offered from.
@@ -150,6 +143,19 @@ pub(super) const GRAVITON4_SINCE_OPENSEARCH: (u32, u32) = (2, 15);
 /// (`InstanceTypeDetails$EncryptionEnabled`). Fine-grained access control requires
 /// both, so it is unavailable on them too.
 pub(super) const UNENCRYPTED_FAMILIES: [&str; 2] = ["m3", "t2"];
+
+/// Whether the instance family of `instance_type` offers both encryption features
+/// `InstanceTypeDetails$EncryptionEnabled` covers — "whether encryption at rest and
+/// node-to-node encryption are supported for the instance type".
+///
+/// A property of the hardware, so it is read off the family
+/// ([`UNENCRYPTED_FAMILIES`]) and off nothing else: the catalog answers what the TYPE
+/// supports, which is the same answer however old the release the listing is for. The
+/// ONE derivation of that capability, as [`offers_warm_storage`] is of the warm tier's.
+pub fn offers_encryption(instance_type: &str) -> bool {
+    let family = instance_family(instance_type).unwrap_or(instance_type);
+    !UNENCRYPTED_FAMILIES.contains(&family)
+}
 
 /// The burstable instance families. UltraWarm cannot be attached to a cluster whose
 /// hot tier runs on one of them, so `InstanceTypeDetails$WarmEnabled` is off for
@@ -885,9 +891,9 @@ pub fn publishes_every_modelled_instance_type() -> bool {
         .all(|instance_type| publishes_instance_type(instance_type))
 }
 
-/// Whether the instance family of `instance_type` offers warm storage at all — the
-/// instance-type side of `InstanceTypeDetails$WarmEnabled`, which the published catalog
-/// reports off this same answer ([`instance_type_details`]).
+/// Whether the instance family of `instance_type` offers warm storage at all — what
+/// `InstanceTypeDetails$WarmEnabled` reports, which the published catalog reports off
+/// this same answer ([`instance_type_details`]).
 ///
 /// UltraWarm cannot be attached to a cluster whose hot tier runs on a burstable family
 /// ([`BURSTABLE_FAMILIES`]), so the warm tier a request asks for on one of those is a
@@ -915,10 +921,23 @@ pub fn instance_roles(instance_type: &str) -> Vec<&'static str> {
 
 /// What `instance_type` supports on `version`, as `InstanceTypeDetails`.
 ///
-/// Each feature member is a conjunction of two things: the engine release the feature
-/// is available from, and whether the instance family can serve it at all. The roles
-/// are the ones the catalog publishes for the type ([`instance_roles`]), so the entry
-/// reports the roles an instance of it can actually be provisioned in.
+/// Every feature member of this entry is documented "supported for the instance type",
+/// so each reports a capability OF THAT TYPE:
+///
+/// * a capability the instance itself provides — encryption at rest together with
+///   node-to-node encryption ([`offers_encryption`]), and the warm tier
+///   ([`offers_warm_storage`]) — is reported off the instance family alone, and is not
+///   withheld because the release the listing is for is older than the feature. Those
+///   are the same two answers a create is refused on, so what the catalog publishes for
+///   a type and what a configuration naming it is refused on cannot disagree;
+/// * a capability the ENGINE provides — Amazon Cognito authentication, application
+///   logging and fine-grained access control — is reported off the release that
+///   introduced it, because an engine that does not have the feature cannot serve it on
+///   any instance type. Fine-grained access control needs both encryption features, so
+///   it is reported only where they are.
+///
+/// The roles are the ones the catalog publishes for the type ([`instance_roles`]), so
+/// the entry reports the roles an instance of it can actually be provisioned in.
 ///
 /// `availability_zones` is reported only when the caller asked for it, so a request
 /// that did not carries no `AvailabilityZones` member rather than an empty list.
@@ -927,9 +946,7 @@ pub fn instance_type_details(
     instance_type: &str,
     availability_zones: Option<Vec<String>>,
 ) -> InstanceTypeDetails {
-    let family = instance_family(instance_type).unwrap_or(instance_type);
-    let encryption = !UNENCRYPTED_FAMILIES.contains(&family)
-        && version.since_elasticsearch(ENCRYPTION_SINCE_ELASTICSEARCH);
+    let encryption = offers_encryption(instance_type);
     let instance_role = instance_roles(instance_type)
         .into_iter()
         .map(str::to_string)
@@ -944,10 +961,7 @@ pub fn instance_type_details(
         advanced_security_enabled: Some(
             encryption && version.since_elasticsearch(ADVANCED_SECURITY_SINCE_ELASTICSEARCH),
         ),
-        warm_enabled: Some(
-            version.since_elasticsearch(ULTRAWARM_SINCE_ELASTICSEARCH)
-                && offers_warm_storage(instance_type),
-        ),
+        warm_enabled: Some(offers_warm_storage(instance_type)),
         instance_role: Some(instance_role),
         availability_zones,
     }

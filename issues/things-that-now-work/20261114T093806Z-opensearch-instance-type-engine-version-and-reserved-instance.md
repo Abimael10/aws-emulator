@@ -116,3 +116,61 @@ Cause 7 — opensearch-catalog-describe-reserved-instance-offerings#task#1:
 3. GET /2021-01-01/opensearch/compatibleVersions — fixture opensearch-catalog-get-compatible-versions, step task#1. Compare the CompatibleVersions rows and their TargetVersions sets against the recording.
 4. GET /2021-01-01/opensearch/reservedInstanceOfferings — fixture opensearch-catalog-describe-reserved-instance-offerings, step task#1. Check that offerings cover more than one instance type and include the 3-year (94608000 s) term.
 5. replay_wire_corpus reports all seven clusters as mismatches with stub_path="" and owned_by=[].
+
+## Resolution
+
+Cause 6 (GetCompatibleVersions) is FIXED: the `opensearch-catalog-get-compatible-versions`
+fixture replays clean and the replay key reports `fixed`. Held by
+`tests/all/compatible_versions.rs`.
+
+Causes 2, 3 and 4 (the capability flags) are FIXED. Every capability member of an
+`InstanceTypeDetails` entry is documented "supported for the instance type", so each one
+reports a capability OF THAT TYPE: a capability the INSTANCE provides — encryption at rest
+together with node-to-node encryption, and the warm tier — is now derived from the instance
+family alone (`state::offers_encryption`, `state::offers_warm_storage`) and is no longer
+withheld because the release the listing is for is older than the feature, while a
+capability the ENGINE provides (Cognito authentication, application logging, fine-grained
+access control) stays derived from the release that introduced it. That is the combination
+the recording carries — encryption, Cognito, application logs and the warm tier reported,
+fine-grained access control not — which no release gate on encryption or the warm tier can
+produce. It also makes the catalog agree with the create path, which already decided
+warm-tier eligibility from the family alone, so what the catalog publishes for a type and
+what a `CreateDomain` naming it is refused on cannot disagree. Held by
+`tests/all/instance_type_capability_flags.rs`.
+
+Cause 7 (the offering catalog) is FIXED. The catalog already spanned every instance type
+the service publishes times both terms times every payment option, with per-type prices and
+a non-zero recurring charge wherever the term is not prepaid, but the listing bounded a
+request that named no `MaxResults` by a page size the emulator chose for itself — so a
+client that does not page saw the offerings of the first few instance types only, which is
+the harm this cause states. `MaxResults` is `@default(0)`: a request that names no page size
+names no bound, so the whole catalog is reported in one answer with no continuation token,
+the way this service publishes its other catalogs and the way the recorded answer reports
+every offering the Region publishes. Held by `tests/all/unbounded_catalog_reads.rs`.
+
+Cause 1's membership half is already correct in this checkout (the listing carries every
+current-generation family the recording cites), held by
+`tests/all/current_generation_instance_types.rs` and
+`tests/all/published_instance_type_value_set.rs`.
+
+DECLINED, as in 20261114T061447Z and 20261030T180653Z: the ORDER each of these sets is
+stated in, which is what the two remaining replay keys report. The recorded orders are not
+a sort of anything — one listing places `m7i.2xlarge.search` at 1, `r7i.12xlarge.search` at
+6, `c7i.16xlarge.search` at 9 and `i7i.4xlarge.search` at 13, another leads with
+`r5.large.search` and a third with `r4.2xlarge.search`, and the offering listing places a
+three-year `c7i.xlarge.search` offering, a three-year `or1.12xlarge.search` one and a
+one-year `r8g.16xlarge.search` one at 0, 1 and 2 — so recordings of the SAME operation
+disagree about it and it is the per-run iteration order of the service's own collection
+rather than published content. `InstanceTypeDetailsList` and `ReservedInstanceOfferingList`
+carry no ordering trait and no documented order; both listings are published in an order
+that is a function of the catalog alone and is stable across calls.
+
+Also declined: the per-entry `ReservedInstanceOfferingId` and price figures, which are a
+GUID AWS mints for each catalog entry and AWS's price list — neither is published by this
+API nor derivable from the model, so the catalog publishes an id derived from what the
+entry IS and prices whose RELATIONS (term, payment option, size, class) it guarantees; and
+`AvailabilityZones` on an entry of a request that did not ask for zones, because the schema
+serializer writes a member only when it is present (`vendor/smithy-macros/src/lib.rs`,
+"the generated serializer writes a field only `if let Some(..)`"), so an explicit `null`
+needs a change to the read-only framework. The zones are reported exactly when
+`retrieveAZs` asks for them.

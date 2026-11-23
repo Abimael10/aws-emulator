@@ -29,20 +29,6 @@ pub const TERM_THREE_YEARS: i32 = 3 * TERM_ONE_YEAR;
 /// reserves an instance for one year or for three.
 pub const RESERVED_INSTANCE_TERMS: [i32; 2] = [TERM_ONE_YEAR, TERM_THREE_YEARS];
 
-/// How many offerings ONE page of `DescribeReservedInstanceOfferings` carries when the
-/// request names no `MaxResults`.
-///
-/// `MaxResults` is `@default(0)`: a request that names no page size has asked for no
-/// PARTICULAR one, and the service answers with its own default page rather than with
-/// the whole catalog — which is why the recorded first answer of this catalog carries a
-/// continuation token. The model publishes no default, so this is the emulator's choice
-/// of it, and it is the largest page a caller can ask for (`MaxResults` is
-/// `@range(max: 100)`): a service does not answer an unbounded request with more than it
-/// will answer a bounded one with. The catalog spans every instance type times every
-/// term times every payment option, so it is far larger than this and the listing really
-/// does hand out tokens.
-pub const RESERVED_INSTANCE_OFFERING_PAGE: usize = 100;
-
 /// `ReservedInstanceOffering$CurrencyCode`: every price in the catalog is quoted in
 /// US dollars, the currency AWS publishes its price list in.
 pub const RESERVED_INSTANCE_CURRENCY_CODE: &str = "USD";

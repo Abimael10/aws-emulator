@@ -27,7 +27,8 @@
 //!   a pagination token is scoped to the filter it was issued under;
 //! * paging is a partition: over a table of page sizes, the pages concatenate back to
 //!   the full listing in order with nothing repeated or dropped, every page is within
-//!   its size, only the last page carries no token, a page size outside the modelled
+//!   its size, only the last page carries no token, a request that names no page size is
+//!   answered with the whole catalog and no token, a page size outside the modelled
 //!   bound is refused at either end, and a token the operation never issued is
 //!   refused;
 //! * the read changes nothing a later caller sees: the same request twice answers
@@ -40,7 +41,7 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::ops::types::RESERV
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
     is_guid, published_instance_types, PAYMENT_OPTION_ALL_UPFRONT, PAYMENT_OPTION_NO_UPFRONT,
     PAYMENT_OPTION_PARTIAL_UPFRONT, RECURRING_CHARGE_HOURLY, RESERVED_INSTANCE_CURRENCY_CODE,
-    RESERVED_INSTANCE_OFFERING_PAGE, RESERVED_INSTANCE_TERMS, TERM_ONE_YEAR, TERM_THREE_YEARS,
+    RESERVED_INSTANCE_TERMS, TERM_ONE_YEAR, TERM_THREE_YEARS,
 };
 
 use super::domain_lifecycle::{
@@ -115,9 +116,9 @@ fn hourly_cost(offering: &Value, case: &str) -> f64 {
 
 /// The whole catalog, walked through the continuation tokens the answers hand out.
 ///
-/// The catalog holds more offerings than one page carries, so a request that names no
-/// `MaxResults` is still answered with a bounded page and a token: a reader that stops
-/// at the first answer sees only part of the catalog.
+/// A request that names no `MaxResults` names no bound, so the first answer already
+/// reports the whole catalog and carries no token; the walk is written as a walk anyway,
+/// so the helper reports the whole listing however many answers it takes.
 pub(crate) async fn whole_catalog(emulator: &Emulator, case: &str) -> Vec<Value> {
     let mut collected: Vec<Value> = Vec::new();
     let mut token: Option<String> = None;
@@ -605,28 +606,24 @@ async fn pages_partition_the_catalog() {
     }
 
     // `MaxResults` is `@default(0)`, so a request that names no page size — or names
-    // zero, which is that default — has asked for no particular one: the service answers
-    // with its own default page and a token, not with the whole catalog.
+    // zero, which is that default — has named no bound at all: the whole catalog is
+    // reported in one answer, with no token, exactly as this service publishes its other
+    // catalogs.
     for unbounded in ["", "maxResults=0"] {
         let case = format!("unbounded {unbounded:?}");
         let answer = describe(&emulator, unbounded).await;
         let page = offerings(&answer, &case);
         assert_eq!(
-            page,
-            catalog[..RESERVED_INSTANCE_OFFERING_PAGE].to_vec(),
-            "case {case}: expected the service's own default page, got {} offerings",
+            page, catalog,
+            "case {case}: expected the whole published catalog, got {} offerings",
             page.len()
         );
-        let resume_at = string_member(
-            &catalog[RESERVED_INSTANCE_OFFERING_PAGE],
-            "ReservedInstanceOfferingId",
-            &case,
-        );
         assert_eq!(
-            answer.body["NextToken"].as_str(),
-            Some(resume_at.as_str()),
-            "case {case}: offerings remain, so the answer names where to resume, got {:?}",
-            answer.body["NextToken"]
+            answer.body.get("NextToken"),
+            None,
+            "case {case}: nothing remains to report, so the answer carries no NextToken, \
+             got {:?}",
+            answer.body
         );
     }
 

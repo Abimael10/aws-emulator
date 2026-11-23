@@ -11,7 +11,9 @@
 //!
 //! An offering is published BY the service, never created by a caller, so this is a
 //! pure read: it writes nothing, and the catalog, the ids in it and the prices on it
-//! are the same for every caller and on every call.
+//! are the same for every caller and on every call. A request that names no
+//! `MaxResults` names no bound, so it is answered with that catalog complete and no
+//! continuation token; only a request that names a page size is bounded by it.
 //!
 //! ## Shape of an operation
 //!
@@ -255,17 +257,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "An optional parameter that specifies the maximum number of results to
-        // return. You can use nextToken to get the next page of results." `MaxResults`
-        // is `@default(0)`, so a request that names no page size asks for no PARTICULAR
-        // one — not for the whole catalog: the service still bounds the page by its own
-        // default ([`crate::state::RESERVED_INSTANCE_OFFERING_PAGE`]), which is why the
-        // recorded first answer of this catalog carries a continuation token rather than
-        // every offering the Region publishes. Every other value reaching here is in
-        // `1..=MAX_PAGE_SIZE`.
+        // return. You can use nextToken to get the next page of results." The bound on
+        // a page is the one the REQUEST named, and nothing else: `MaxResults` is
+        // `@default(0)`, so a request that names no page size has named no bound and the
+        // whole listing is reported in one answer — the same way this service publishes
+        // its other catalogs (`ListInstanceTypeDetails`, `ListVersions`), and the way the
+        // recorded answer of this one reports every offering the Region publishes rather
+        // than a prefix of them. A page size a client never asked for would hide most of
+        // the catalog from a client that does not page: the offerings of every instance
+        // type past the bound, and so every term and payment option they are published
+        // for. Every value reaching here other than that default is in
+        // `1..=MAX_PAGE_SIZE`. What an unbounded answer costs is bounded by the catalog
+        // itself: it is the set the service publishes — one entry per published instance
+        // type, term and payment option — fixed at build time, so no request can grow it
+        // and the largest answer this operation can produce is that one set.
         let page_size = usize::try_from(input.max_results)
             .ok()
             .filter(|size| *size > 0)
-            .unwrap_or(crate::state::RESERVED_INSTANCE_OFFERING_PAGE);
+            .unwrap_or(selected.len());
         let end = start.saturating_add(page_size).min(selected.len());
         let page: Vec<ReservedInstanceOffering> = selected[start..end]
             .iter()

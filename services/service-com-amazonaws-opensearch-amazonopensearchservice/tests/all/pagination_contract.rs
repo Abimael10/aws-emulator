@@ -20,7 +20,7 @@
 //!   page size or a token;
 //! * where a set IS larger than the answer, the token names where the next answer
 //!   resumes, and walking it reaches an answer that carries none — over a table of page
-//!   sizes including the one the service bounds an unbounded request by;
+//!   sizes;
 //! * a token that names no place in the set being paged is refused with the status, the
 //!   modelled error and the wording AWS uses, naming nothing of the request — over a
 //!   table of tokens and of the three operations that model that error;
@@ -31,7 +31,6 @@
 //!   while a page size outside the modelled range is still refused.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_opensearch_amazonopensearchservice::state::RESERVED_INSTANCE_OFFERING_PAGE;
 
 use super::domain_lifecycle::{error_code, string_member, Answer, Emulator, PREFIX};
 use super::vpc_endpoints::{create_endpoint, vpc_domain};
@@ -331,25 +330,19 @@ async fn a_set_larger_than_the_answer_names_where_to_resume_and_the_last_answer_
         );
     }
     assert!(
-        catalog.len() > RESERVED_INSTANCE_OFFERING_PAGE,
+        catalog.len() > 100,
         "case catalog size: these rows need a catalog larger than one page, got {}",
         catalog.len()
     );
 
     // One row per page size the answer is bounded by: the smallest, two that do not
-    // divide the catalog, the largest the model allows, and the two requests that name
-    // no page size at all — which the service bounds by its OWN default rather than
-    // answering with the whole catalog.
+    // divide the catalog, and the largest the model allows. A request that names no page
+    // size names no bound, so it is answered with the whole catalog and no token — the
+    // row below this loop.
     for (case, query, bound) in [
         ("maxResults=1", "maxResults=1".to_owned(), 1_usize),
         ("maxResults=7", "maxResults=7".to_owned(), 7),
         ("maxResults=100", "maxResults=100".to_owned(), 100),
-        ("no page size", String::new(), RESERVED_INSTANCE_OFFERING_PAGE),
-        (
-            "maxResults=0",
-            "maxResults=0".to_owned(),
-            RESERVED_INSTANCE_OFFERING_PAGE,
-        ),
     ] {
         let answer = offerings(&emulator, &query).await;
         let reported = offering_ids(&answer, case);
@@ -364,6 +357,25 @@ async fn a_set_larger_than_the_answer_names_where_to_resume_and_the_last_answer_
             Some(catalog[bound].as_str()),
             "case {case}: entries remain, so the answer names where to resume, got {:?}",
             answer.body["NextToken"]
+        );
+    }
+
+    // `MaxResults` is `@default(0)`: a request that names no page size, or names that
+    // default, has named no bound, so the whole catalog is reported in one answer with
+    // no token at all.
+    for (case, query) in [("no page size", ""), ("maxResults=0", "maxResults=0")] {
+        let answer = offerings(&emulator, query).await;
+        let reported = offering_ids(&answer, case);
+        assert_eq!(
+            reported, catalog,
+            "case {case}: expected the whole catalog, got {} entries",
+            reported.len()
+        );
+        assert_eq!(
+            answer.body.get("NextToken"),
+            None,
+            "case {case}: nothing remains, so the answer carries no NextToken, got {:?}",
+            answer.body
         );
     }
 

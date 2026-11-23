@@ -529,14 +529,15 @@ async fn roles_and_features_follow_the_family_and_the_engine_release() {
             let family = family(&instance_type);
             let case = format!("{instance_type} on {version}");
 
-            // Both features `EncryptionEnabled` covers need a release that has them and
-            // a family that can serve them.
+            // Both features `EncryptionEnabled` covers are the INSTANCE TYPE's, so the
+            // member follows the family and nothing else — including on a release older
+            // than the features.
             let encryption = flag(&entry, "EncryptionEnabled", &case);
             assert_eq!(
                 encryption,
-                !UNENCRYPTED_FAMILIES.contains(&family) && since_elasticsearch(version, (6, 0)),
-                "case {case}: expected encryption support to follow the release and the \
-                 family, got {encryption}"
+                !UNENCRYPTED_FAMILIES.contains(&family),
+                "case {case}: expected encryption support to follow the family, got \
+                 {encryption}"
             );
 
             let cognito = flag(&entry, "CognitoEnabled", &case);
@@ -572,9 +573,8 @@ async fn roles_and_features_follow_the_family_and_the_engine_release() {
             let warm = flag(&entry, "WarmEnabled", &case);
             assert_eq!(
                 warm,
-                since_elasticsearch(version, (6, 8)) && !BURSTABLE_FAMILIES.contains(&family),
-                "case {case}: expected UltraWarm support to follow the release and the \
-                 family, got {warm}"
+                !BURSTABLE_FAMILIES.contains(&family),
+                "case {case}: expected UltraWarm support to follow the family, got {warm}"
             );
 
             // The role set is one of the published vocabulary, carries no repeat, and
@@ -744,8 +744,8 @@ async fn anchored_entries_are_reported_exactly() {
     // parallel expectations above to fixed values, so a rule error replicated in both
     // the handler and this suite's own gates still fails here. The burstable class is
     // anchored on BOTH of its rules — `t3` on a current release, where encryption and
-    // fine-grained access control are available and the warm tier is not, and `t2` on an
-    // Elasticsearch release, where none of the three is.
+    // fine-grained access control are available and the warm tier is not, and `t2`,
+    // which offers none of the three on any release.
     let rows = [
         (
             "OpenSearch_2.19",
@@ -839,7 +839,7 @@ async fn anchored_entries_are_reported_exactly() {
                 "CognitoEnabled": false,
                 "AppLogsEnabled": false,
                 "AdvancedSecurityEnabled": false,
-                "WarmEnabled": false,
+                "WarmEnabled": true,
                 "InstanceRole": ["data", "master"],
             }),
         ),
@@ -847,12 +847,26 @@ async fn anchored_entries_are_reported_exactly() {
             "Elasticsearch_5.1",
             json!({
                 "InstanceType": "c4.large.search",
-                "EncryptionEnabled": false,
+                "EncryptionEnabled": true,
                 "CognitoEnabled": true,
                 "AppLogsEnabled": true,
                 "AdvancedSecurityEnabled": false,
-                "WarmEnabled": false,
+                "WarmEnabled": true,
                 "InstanceRole": ["data", "master"],
+            }),
+        ),
+        // A release older than fine-grained access control: the two capabilities the
+        // INSTANCE provides are reported, and the one the engine does not have is not.
+        (
+            "Elasticsearch_6.0",
+            json!({
+                "InstanceType": "r5.large.search",
+                "EncryptionEnabled": true,
+                "CognitoEnabled": true,
+                "AppLogsEnabled": true,
+                "AdvancedSecurityEnabled": false,
+                "WarmEnabled": true,
+                "InstanceRole": ["data", "master", "coordinator"],
             }),
         ),
         (
