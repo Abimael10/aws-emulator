@@ -271,8 +271,8 @@ pub enum Scaffolded<E> {
     ///
     /// A COMMON error rather than a modeled one: this service's model declares no
     /// `AccessDeniedException`, so it cannot travel as [`Modeled`](Self::Modeled). It is
-    /// answered by [`crate::state::authorization`], the one gate the operations that reach a
-    /// repository's images and layers consult.
+    /// answered by [`crate::state::authorization`], the one gate every operation scoped to a
+    /// repository consults.
     AccessDenied(AccessDeniedException),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.

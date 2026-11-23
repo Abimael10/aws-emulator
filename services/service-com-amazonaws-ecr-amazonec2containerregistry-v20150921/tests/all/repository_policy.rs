@@ -629,30 +629,38 @@ async fn text_that_is_not_a_policy_document_is_refused_and_changes_nothing() {
 async fn a_policy_that_would_lock_out_future_policies_needs_force() {
     let router = emulator();
 
-    // Each row is a policy and whether it would deny EVERY principal the right to set
-    // another policy — the condition the `force` flag exists for. The rows differ along
-    // the action element (`Action` or `NotAction`), the pattern that covers
-    // `ecr:SetRepositoryPolicy`, the form the wildcard principal takes, and the effect.
-    let cases: Vec<(&str, Value, bool)> = vec![
+    // Each row is a policy, whether it would deny EVERY principal the right to set another
+    // policy — the condition the `force` flag exists for — and whether the stored document
+    // still lets THIS caller read it back: a repository policy is an authorization input to
+    // every call scoped to the repository, so a document that denies the caller
+    // `ecr:GetRepositoryPolicy` refuses the read as well (the authorization decision itself
+    // is `repository_access_authorization.rs`'s subject). The rows differ along the action element
+    // (`Action` or `NotAction`), the pattern that covers `ecr:SetRepositoryPolicy`, the form
+    // the wildcard principal takes, and the effect.
+    let cases: Vec<(&str, Value, bool, bool)> = vec![
         (
             "deny the action itself to everyone",
             json!({"Statement": [{"Effect": "Deny", "Principal": "*", "Action": "ecr:SetRepositoryPolicy"}]}),
+            true,
             true,
         ),
         (
             "deny every ecr action to everyone",
             json!({"Statement": [{"Effect": "Deny", "Principal": {"AWS": "*"}, "Action": "ecr:*"}]}),
             true,
+            false,
         ),
         (
             "deny everything to everyone",
             json!({"Statement": [{"Effect": "Deny", "Principal": {"AWS": ["*"]}, "Action": "*"}]}),
             true,
+            false,
         ),
         (
             "deny a wildcard action prefix to everyone",
             json!({"Statement": [{"Effect": "Deny", "Principal": "*", "Action": ["ecr:Get*", "ecr:Set*"]}]}),
             true,
+            false,
         ),
         (
             // `NotAction` names what the statement does NOT apply to, so this denies
@@ -660,6 +668,7 @@ async fn a_policy_that_would_lock_out_future_policies_needs_force() {
             "deny everything except another action, to everyone",
             json!({"Statement": [{"Effect": "Deny", "Principal": "*", "NotAction": "ecr:BatchGetImage"}]}),
             true,
+            false,
         ),
         (
             "one locking statement among several",
@@ -668,30 +677,35 @@ async fn a_policy_that_would_lock_out_future_policies_needs_force() {
                 {"Effect": "Deny", "Principal": "*", "Action": "ecr:SetRepositoryPolicy"}
             ]}),
             true,
+            true,
         ),
         (
             "deny everything except this action, to everyone",
             json!({"Statement": [{"Effect": "Deny", "Principal": "*", "NotAction": ["ecr:SetRepositoryPolicy"]}]}),
+            false,
             false,
         ),
         (
             "deny the action to one named principal",
             json!({"Statement": [{"Effect": "Deny", "Principal": {"AWS": format!("arn:aws:iam::{OTHER_REGISTRY_ID}:root")}, "Action": "ecr:SetRepositoryPolicy"}]}),
             false,
+            true,
         ),
         (
             "deny another action to everyone",
             json!({"Statement": [{"Effect": "Deny", "Principal": "*", "Action": "ecr:BatchGetImage"}]}),
             false,
+            true,
         ),
         (
             "allow the action to everyone",
             json!({"Statement": [{"Effect": "Allow", "Principal": "*", "Action": "ecr:SetRepositoryPolicy"}]}),
             false,
+            true,
         ),
     ];
 
-    for (index, (case, policy, needs_force)) in cases.into_iter().enumerate() {
+    for (index, (case, policy, needs_force, readable)) in cases.into_iter().enumerate() {
         let name = format!("policy-force-{index}");
         create_repository(&router, case, &name).await;
         let text = policy.to_string();
@@ -731,7 +745,20 @@ async fn a_policy_that_would_lock_out_future_policies_needs_force() {
             assert_policy_response(case, "SetRepositoryPolicy", &set, &name, &text);
         }
 
-        let got = ok(&router, case, "GetRepositoryPolicy", &name_request(&name)).await;
-        assert_policy_response(case, "GetRepositoryPolicy", &got, &name, &text);
+        if readable {
+            let got = ok(&router, case, "GetRepositoryPolicy", &name_request(&name)).await;
+            assert_policy_response(case, "GetRepositoryPolicy", &got, &name, &text);
+        } else {
+            // The document the set stored denies this caller the read as well — which is
+            // what a lock-out IS, and what the forced set accepted.
+            refused(
+                &router,
+                case,
+                "GetRepositoryPolicy",
+                &name_request(&name),
+                "AccessDeniedException",
+            )
+            .await;
+        }
     }
 }

@@ -195,6 +195,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.registry_id.as_ref(),
             Some(input.repository_name.as_str()),
         )?;
+        // And whether any policy in force lets this caller perform this action on this
+        // repository is decided before anything is read or written
+        // (`crate::state::authorization`).
+        if let Some(denied) = crate::state::authorization::denied_on_repository(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.repository_name,
+        ) {
+            return Err(denied);
+        }
         // The document's own schema is a parameter constraint, so it is checked before
         // the repository is resolved: a malformed policy is a bad request whichever
         // repository it names. The check is `parse_lifecycle_policy`, the same reading of

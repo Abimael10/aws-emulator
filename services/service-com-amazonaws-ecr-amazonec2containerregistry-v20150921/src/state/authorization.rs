@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Who a request to this registry speaks for, and whether a policy in force lets it reach
-//! the images and layers of the repository it names.
+//! the repository it names.
 //!
 //! A private registry's contents are private: every operation of this service is signed
 //! (`smithy_query(query="service_info")`: `authSchemes: [sigv4]`), so every call is made by
 //! a principal, and a principal may only perform an action some policy in force ALLOWS.
-//! Two documents can allow one — the calling principal's identity-based policies, and the
+//! That holds for EVERY request scoped to one repository, whichever part of it the request
+//! reaches — its images and layers, its tags, the documents and configuration it carries,
+//! and the repository itself — and whether the request names that repository by
+//! `repositoryName` or by the `resourceArn` of ECR's tagging operations. Two documents can
+//! allow one — the calling principal's identity-based policies, and the
 //! repository's own resource-based policy, which is what shares a repository's images with a
 //! principal that has no identity-based grant — and with neither the call is refused with
 //! the AWS-common `AccessDeniedException` BEFORE the operation reads or writes anything. So

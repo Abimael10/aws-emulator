@@ -183,6 +183,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::check_tag_keys(&input.tag_keys).map_err(fault_error)?;
         let name =
             crate::state::repository_name_from_arn(&input.resource_arn).map_err(fault_error)?;
+        // The repository the ARN names is a resource its own policy governs, so whether any
+        // policy in force lets this caller perform this action on it is decided before
+        // anything is written (`crate::state::authorization`) — a refused untagging leaves
+        // the repository's tags as they were.
+        if let Some(denied) = crate::state::authorization::denied_on_repository(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &name,
+        ) {
+            return Err(denied);
+        }
 
         let mut store = state.lock();
         let repo = store

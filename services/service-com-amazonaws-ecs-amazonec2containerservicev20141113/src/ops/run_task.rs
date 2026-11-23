@@ -13,7 +13,9 @@
 //! Amazon ECS cannot launch the containers of at all — a role the account's IAM says it may
 //! not assume ([`crate::state::settle_task_launches`]), or an image no path reaches — is
 //! answered the same way and then STOPPED at the instant it would otherwise have started, with
-//! the stop code of a task that never ran.
+//! the stop code of a task that never ran. A FARGATE placement is provisioned by Amazon ECS
+//! itself while this call is answered, so a role it may not assume refuses the CALL and places
+//! nothing ([`crate::state::execution_role_trust`]).
 //!
 //! ## Shape of an operation
 //!
@@ -440,6 +442,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reads the Amazon EC2 store under that store's own lock.
         crate::state::settle_ec2_capacity(&*self.engine, now);
 
+        // Which roles of this account IAM answers Amazon ECS may not assume for a task, read
+        // out of the IAM store before this one is locked (the lock order in
+        // [`crate::state::execution_role_trust`]); the roles THIS placement resolved are
+        // weighed against it below, once the revision it runs is known.
+        let roles_withholding_assumption =
+            crate::state::roles_withholding_assumption(&*self.engine);
+
         let mut guard = state.lock();
         guard.advance_clock(now);
 
@@ -715,6 +724,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+
+        // Amazon ECS reaches a role a launch resolves by ASSUMING it, and a Fargate placement
+        // is provisioned by Amazon ECS ITSELF while this call is answered — there is no agent
+        // of the caller's to report a failure later — so the assume is taken here, before any
+        // task is created, and a role this account's IAM answers Amazon ECS may not assume
+        // refuses the CALL, naming the role that was passed
+        // ([`crate::state::execution_role_trust`]). The execution role is weighed first,
+        // because Amazon ECS acts as it before the containers are given the task role. A
+        // placement onto the cluster's own capacity is assumed for after it is placed, by the
+        // agent on the instance that runs it, so its answer is that task's stop instead
+        // ([`crate::state::settle_task_launches`]).
+        if crate::state::places_on_fargate(input.launch_type.as_deref(), &effective_strategy) {
+            let resolved = [
+                crate::state::resolved_execution_role_arn(input.overrides.as_ref(), &definition),
+                crate::state::resolved_task_role_arn(input.overrides.as_ref(), &definition),
+            ];
+            if let Some(role_arn) = resolved.into_iter().flatten().find(|role_arn| {
+                roles_withholding_assumption
+                    .iter()
+                    .any(|withheld| withheld.as_str() == *role_arn)
+            }) {
+                return Err(RunTaskErrorModeled::ClientException(ClientException {
+                    message: Some(crate::state::unable_to_assume_provided_role_message(
+                        role_arn,
+                    )),
+                })
+                .into());
+            }
         }
 
         // The Fargate platform versions are published per OPERATING SYSTEM, so which of

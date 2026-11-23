@@ -196,6 +196,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.registry_id.as_ref(),
             Some(input.repository_name.as_str()),
         )?;
+        // And whether any policy in force lets this caller perform this action on this
+        // repository is decided before anything is read or written
+        // (`crate::state::authorization`).
+        if let Some(denied) = crate::state::authorization::denied_on_repository(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.repository_name,
+        ) {
+            return Err(denied);
+        }
 
         // A value outside `ImageTagMutability`, and a filter list outside
         // `@length(1..5)` or the filter alphabet, were already refused at the boundary.
