@@ -597,7 +597,10 @@ fn glob_to_pattern(glob: &str) -> String {
 /// `eval`: define a field from an expression, as PPL writes it (`eval name = expression`).
 ///
 /// The field it defines is a column of the result ([`declare_fields`]), like every other field
-/// a command of the pipeline computes.
+/// a command of the pipeline computes — and it is put on the records the expression COMPUTED a
+/// value on, so a record it computed nothing on carries nothing for that column rather than
+/// empty text, exactly as a `parse` whose pattern did not match a record leaves it without the
+/// fields it extracts.
 fn eval(rows: &mut Rows, arguments: &str, budget: &Budget) -> Result<(), ExecutionFailure> {
     for item in split_items(arguments) {
         let Some((name, text)) = item.split_once('=') else {
@@ -614,7 +617,12 @@ fn eval(rows: &mut Rows, arguments: &str, budget: &Budget) -> Result<(), Executi
                 break;
             }
             let value = expression::evaluate(&expression, record, budget);
-            store(record, &name, value.rendered(), budget);
+            // A value nothing computed is stored on no record, the rule every other command
+            // that defines a field follows: a field the expression answered nothing for is
+            // absent from the record, so the row it renders states what the record has.
+            if !matches!(value, Value::Null) {
+                store(record, &name, value.rendered(), budget);
+            }
         }
         declare_fields(rows, [name]);
     }
