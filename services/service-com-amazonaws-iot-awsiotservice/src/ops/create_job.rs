@@ -351,24 +351,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
         // The document a device is handed is the RESOLVED one, so a request whose
-        // parameters expand the document past what `JobDocument` may carry is refused
+        // placeholders expand the document past what `JobDocument` may carry is refused
         // before anything is written, rather than stored as a job no reader can report.
-        let resolved_document = match input.document.as_deref() {
-            Some(document) => {
-                match crate::state::resolve_job_document(document, &document_parameters) {
-                    Ok(resolved) => Some(resolved),
-                    Err(length) => {
-                        return Err(invalid(format!(
-                            "the job document is {length} bytes once its document \
-                             parameters are resolved; a job document may be at most {} \
-                             bytes",
-                            crate::state::MAX_JOB_DOCUMENT_BYTES
-                        )));
-                    }
-                }
-            }
-            None => None,
-        };
+        // The resolution needs the PACKAGE CATALOG the job's association resolves
+        // attribute placeholders from, so it happens under this service's store lock
+        // below.
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::service_common::iot_job_executions::now_epoch_seconds();
@@ -398,6 +385,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the targets that did resolve. Only the DECISION and the writes are inside
         // the locks; the bounded work above is not.
         let store = state.lock();
+        // The document the job's executions carry is resolved against the job's own
+        // parameters AND the attributes of the package versions its association names,
+        // read out of the catalog this store holds: both kinds of placeholder are
+        // resolved in the one view a device is handed.
+        let resolved_document = match job.document.as_deref() {
+            Some(document) => {
+                let package_attributes = crate::state::job_package_attributes(
+                    &store.packages,
+                    &job.destination_package_versions,
+                );
+                match crate::state::resolve_job_document(
+                    document,
+                    &job.document_parameters,
+                    &package_attributes,
+                ) {
+                    Ok(resolved) => Some(resolved),
+                    Err(length) => {
+                        return Err(invalid(format!(
+                            "the job document is {length} bytes once its substitution \
+                             placeholders are resolved; a job document may be at most \
+                             {} bytes",
+                            crate::state::MAX_JOB_DOCUMENT_BYTES
+                        )));
+                    }
+                }
+            }
+            None => None,
+        };
         // LOCK ORDER: this service's store first, the shared jobs store second, the
         // shared execution store third, as `crate::state::job_store` documents.
         let mut registry = jobs.lock();

@@ -1790,54 +1790,11 @@ pub const MAX_JOB_DOCUMENT_PARAMETERS: usize = 100;
 /// here is refused rather than stored as a job no reader can report.
 pub const MAX_JOB_DOCUMENT_BYTES: usize = 32_768;
 
-/// How AWS IoT's job-document substitution writes a parameter into a job document:
-/// the parameter's key inside `${aws:iot:parameter:…}`.
-const JOB_DOCUMENT_PARAMETER_OPEN: &str = "${aws:iot:parameter:";
-
-/// Resolve a job document's substitution parameters with the values the job carries.
-///
-/// Every `${aws:iot:parameter:<key>}` whose key the job has a value for is replaced by
-/// that value; a placeholder the job has no value for is left exactly as written,
-/// because nothing here knows what it resolves to. The result is what a reader reports
-/// for the resolved view of the document, while the stored document itself is the view
-/// before substitution.
-///
-/// `Err` carries the length in bytes the resolved document reached, for a job whose
-/// parameters would expand it past [`MAX_JOB_DOCUMENT_BYTES`]: the growth is checked as
-/// the document is built, so one parameter cannot make a reader allocate without bound.
-pub fn resolve_job_document(
-    document: &str,
-    parameters: &BTreeMap<String, String>,
-) -> Result<String, usize> {
-    if parameters.is_empty() {
-        return Ok(document.to_string());
-    }
-    let mut resolved = String::with_capacity(document.len());
-    let mut rest = document;
-    while let Some(open) = rest.find(JOB_DOCUMENT_PARAMETER_OPEN) {
-        let (before, placeholder) = rest.split_at(open);
-        let key_onwards = &placeholder[JOB_DOCUMENT_PARAMETER_OPEN.len()..];
-        let Some(close) = key_onwards.find('}') else {
-            // No closing brace: the rest of the document carries no placeholder at
-            // all, so it is reported as written.
-            break;
-        };
-        resolved.push_str(before);
-        match parameters.get(&key_onwards[..close]) {
-            Some(value) => resolved.push_str(value),
-            None => resolved.push_str(&placeholder[..JOB_DOCUMENT_PARAMETER_OPEN.len() + close + 1]),
-        }
-        if resolved.len() > MAX_JOB_DOCUMENT_BYTES {
-            return Err(resolved.len());
-        }
-        rest = &key_onwards[close + 1..];
-    }
-    resolved.push_str(rest);
-    if resolved.len() > MAX_JOB_DOCUMENT_BYTES {
-        return Err(resolved.len());
-    }
-    Ok(resolved)
-}
+/// How a job document's substitution placeholders — the job's own `documentParameters`
+/// and the attributes of the package versions it is associated with — are resolved into
+/// the document a reader reports post-substitution and a device is handed.
+pub mod job_document;
+pub use job_document::{job_package_attributes, resolve_job_document};
 
 /// The ARN of a thing group: `arn:aws:iot:<region>:<account>:thinggroup/<thingGroupName>`.
 ///

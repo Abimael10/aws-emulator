@@ -283,13 +283,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and in-progress timeout. A thing the job already has an execution for is
         // already targeted, so it gets no second execution.
         let mut pending = executions.lock();
-        let document = job
-            .document
-            .as_deref()
-            .map(|document| {
-                crate::state::resolve_job_document(document, &job.document_parameters)
-                    .unwrap_or_else(|_length| document.to_string())
-            });
+        let document = job.document.as_deref().map(|document| {
+            // The copy the device is handed resolves the job's own parameters AND the
+            // attributes of the package versions its association names, read out of the
+            // catalog this service's store holds — the same resolved view the job's
+            // reader reports.
+            let package_attributes = crate::state::job_package_attributes(
+                &store.packages,
+                &job.destination_package_versions,
+            );
+            crate::state::resolve_job_document(
+                document,
+                &job.document_parameters,
+                &package_attributes,
+            )
+            .unwrap_or_else(|_length| document.to_string())
+        });
         let in_progress_timeout_minutes = job.in_progress_timeout_minutes;
         let fresh: Vec<String> = targeted_things
             .into_iter()

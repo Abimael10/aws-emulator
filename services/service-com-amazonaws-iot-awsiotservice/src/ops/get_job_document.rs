@@ -8,11 +8,12 @@
 //! rather than a hollow 200.
 //!
 //! `beforeSubstitution` selects WHICH VIEW of that document is reported: the document
-//! as written, placeholders and all, or the document with every substitution parameter
-//! the job carries resolved to its value ([`crate::state::resolve_job_document`]) —
-//! which is also the document the job's executions hand the device. A placeholder the
-//! job has no parameter for is reported as written, because nothing here knows what it
-//! resolves to.
+//! as written, placeholders and all, or the document with every substitution placeholder
+//! the job resolves — its own `documentParameters`, and the attributes of the package
+//! versions its `destinationPackageVersions` name
+//! ([`crate::state::resolve_job_document`]) — which is also the document the job's
+//! executions hand the device. A placeholder nothing the job carries binds is reported
+//! as written, because nothing here knows what it resolves to.
 //!
 //! A job created from `documentSource` — an S3 object this emulator does not fetch —
 //! has no document here, so this reports none rather than inventing one; that is the
@@ -155,19 +156,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `ctx` carries request metadata only; this operation needs none of it.
         let _ = ctx;
-        let jobs = crate::state::job_store(&*self.engine).ok_or_else(|| -> Self::Error {
+        let unavailable = || -> Self::Error {
             GetJobDocumentErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
                 message: Some("the IoT emulator has no state store attached".to_string()),
             })
             .into()
-        })?;
+        };
+        // The PACKAGE CATALOG the job's association resolves attribute placeholders
+        // from lives in this service's own store, and the job itself in the shared jobs
+        // store every creator of an IoT job records one in.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(unavailable());
+        };
+        let Some(jobs) = crate::state::job_store(&*self.engine) else {
+            return Err(unavailable());
+        };
 
-        // A pure read of the job store: the document is taken from the record
-        // `CreateJob` persisted, and an id nobody created is a 404. Only the LOOKUP is
-        // under the lock — the document and its parameters are taken out of the record
-        // and resolved after it is released, so one read never holds the store while it
-        // builds a response.
+        // A pure read of both stores: the document is taken from the record `CreateJob`
+        // persisted, and an id nobody created is a 404. Only the LOOKUP is under the
+        // locks — the document, its parameters and the attribute bindings its package
+        // association supplies are taken out of the records and resolved after they are
+        // released, so one read never holds a store while it builds a response.
         let stored = {
+            // LOCK ORDER: this service's store first, the shared jobs store second, as
+            // `crate::state::job_store` documents.
+            let store = state.lock();
             let registry = jobs.lock();
             let job = registry.job(&input.job_id).ok_or_else(|| -> Self::Error {
                 GetJobDocumentErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
@@ -175,14 +188,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .into()
             })?;
-            job.document
-                .clone()
-                .map(|document| (document, job.document_parameters.clone()))
+            job.document.clone().map(|document| {
+                (
+                    document,
+                    job.document_parameters.clone(),
+                    crate::state::job_package_attributes(
+                        &store.packages,
+                        &job.destination_package_versions,
+                    ),
+                )
+            })
         };
 
         // The view the caller asked for: the document as written, or the document with
-        // the job's substitution parameters resolved — the form its executions carry.
-        let Some((document, parameters)) = stored else {
+        // every substitution placeholder the job resolves — the form its executions
+        // carry.
+        let Some((document, parameters, package_attributes)) = stored else {
             return Ok(GetJobDocumentOutput { document: None });
         };
         if input.before_substitution {
@@ -190,18 +211,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 document: Some(document),
             });
         }
-        let resolved = crate::state::resolve_job_document(&document, &parameters)
-            .map_err(|length| -> Self::Error {
-                GetJobDocumentErrorModeled::InvalidRequestException(InvalidRequestException {
-                    message: Some(format!(
-                        "the job document is {length} bytes once its document \
-                         parameters are resolved; a job document may be at most {} \
-                         bytes",
-                        crate::state::MAX_JOB_DOCUMENT_BYTES
-                    )),
-                })
-                .into()
-            })?;
+        let resolved =
+            crate::state::resolve_job_document(&document, &parameters, &package_attributes)
+                .map_err(|length| -> Self::Error {
+                    GetJobDocumentErrorModeled::InvalidRequestException(InvalidRequestException {
+                        message: Some(format!(
+                            "the job document is {length} bytes once its substitution \
+                             placeholders are resolved; a job document may be at most \
+                             {} bytes",
+                            crate::state::MAX_JOB_DOCUMENT_BYTES
+                        )),
+                    })
+                    .into()
+                })?;
         Ok(GetJobDocumentOutput {
             document: Some(resolved),
         })
