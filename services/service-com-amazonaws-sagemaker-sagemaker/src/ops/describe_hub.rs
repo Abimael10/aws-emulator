@@ -72,6 +72,11 @@
 //! * `S3StorageConfig` (HubS3StorageConfig) — The Amazon S3 storage configuration for the
 //!   hub.
 //!
+//! Beside those, the recorded service answers `CreatedBy` and `LastModifiedBy`
+//! (`UserContext`) — the identity that created the hub and the identity of the last call
+//! that modified it — which the on-disk model does not declare for this response; they
+//! reach the wire through `super::types::recorded_read_members`.
+//!
 //! ## Errors
 //!
 //! * `ResourceNotFound` (HTTP 400) — Resource being access is not found.
@@ -134,7 +139,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for DescribeHub<Eng>
 {
     type Input = DescribeHubInput;
-    type Output = DescribeHubOutput;
+    type Output = DescribeHubRecordedOutput;
     type Error = DescribeHubError;
 
     const NAME: &'static str = "DescribeHub";
@@ -166,6 +171,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // waiter terminates and no caller's read changes the outcome.
         let settled = hub.settle_status(::std::time::SystemTime::now());
 
+        // The hub's provenance, as the record holds it: the identity that created the hub
+        // and the identity of the last call that modified it. Both are reported for every
+        // hub, the way the recorded service answers them.
+        let created_by = hub.created_by.clone();
+        let last_modified_by = hub.last_modified_by.clone();
         let output = DescribeHubOutput {
             hub_name: hub.name.clone(),
             hub_arn: hub.arn.clone(),
@@ -180,12 +190,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             creation_time: crate::state::timestamp(hub.creation_time),
             last_modified_time: crate::state::timestamp(hub.last_modified_time),
         };
+        let output = DescribeHubRecordedOutput::new(output, created_by, last_modified_by);
         drop(store);
 
         if settled {
             // The transition is a state change, so it leaves the same record a create
             // does rather than happening unobservably on a read path.
-            crate::state::record_state_change(Self::NAME, &output.hub_arn, ctx);
+            crate::state::record_state_change(Self::NAME, &output.modelled.hub_arn, ctx);
         }
         Ok(output)
     }

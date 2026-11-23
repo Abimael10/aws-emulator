@@ -195,6 +195,10 @@ pub(crate) fn seed(emulator: &Emulator, hub: &str, contents: &[Seeded<'_>]) {
             status: HUB_IN_SERVICE.to_string(),
             failure_reason: None,
             tags: Vec::new(),
+            // A seeded hub stands in for one this emulator's own published credential
+            // created, which is the identity the harness's calls speak for.
+            created_by: state::ambient_user_context(),
+            last_modified_by: state::ambient_user_context(),
             creation_time: seeded_at(0),
             last_modified_time: seeded_at(0),
             // Seeded already `InService`, so the clock owes this hub no transition.

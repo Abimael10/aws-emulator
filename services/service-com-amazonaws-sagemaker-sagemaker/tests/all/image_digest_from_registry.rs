@@ -40,17 +40,21 @@ const REGION: &str = "us-east-1";
 
 /// The access key id of the account's own published credential: a key neither STS nor IAM
 /// holds a record for, which is the position AWS account root credentials are in.
-const ACCOUNT_KEY_ID: &str = "AKIDEXAMPLE";
+pub(crate) const ACCOUNT_KEY_ID: &str = "AKIDEXAMPLE";
 
 /// SageMaker, Amazon ECR, IAM and STS on ONE shared engine, so a reference SageMaker
 /// resolves is resolved against the registry a push really reached and an identity it
 /// records is one the account really holds.
-struct Emulator {
+///
+/// Shared with this crate's other suite about the identity a write records
+/// (`tests/all/hub_provenance.rs`), which needs exactly this assembly — SageMaker beside
+/// the two services that hold the account's credentials — rather than a second copy of it.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // These tests exercise handler behaviour, not SigV4; a request below carries a
@@ -106,12 +110,12 @@ impl Emulator {
     }
 
     /// One SageMaker call, as the account's own credential, that must be served.
-    async fn ok(&self, case: &str, target: &str, body: &Value) -> Value {
+    pub(crate) async fn ok(&self, case: &str, target: &str, body: &Value) -> Value {
         self.ok_as(ACCOUNT_KEY_ID, case, target, body).await
     }
 
     /// One SageMaker call signed with `access_key_id` that must be served.
-    async fn ok_as(
+    pub(crate) async fn ok_as(
         &self,
         access_key_id: &str,
         case: &str,
@@ -166,7 +170,7 @@ impl Emulator {
     }
 
     /// One `awsQuery` action of `service`, signed with the account's own credential.
-    async fn query(
+    pub(crate) async fn query(
         &self,
         case: &str,
         service: &str,

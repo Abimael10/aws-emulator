@@ -26,16 +26,17 @@
 //! operation's input).
 //!
 //! Nothing here decides a VALUE: every member is written from what the reading operation
-//! passes in (`ops::describe_feature_group`, `ops::describe_training_job`), which reads it
-//! off the stored resource. Nor can anything here panic: every write is an `if let` over an
-//! `Option`, and no value is indexed, sliced, unwrapped or arithmetic.
+//! passes in (`ops::describe_feature_group`, `ops::describe_hub`,
+//! `ops::describe_training_job`), which reads it off the stored resource. Nor can anything
+//! here panic: no value is indexed, sliced, unwrapped or arithmetic, and a member reported
+//! only for some resources is written under an `if let` over an `Option`.
 
 use ::aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use ::aws_smithy_schema::{Schema, ShapeId, ShapeType};
 
 use super::{
-    Channel, DeployedImage, DescribeFeatureGroupOutput, DescribeTrainingJobOutput,
-    OutputDataConfig, ResourceConfig,
+    Channel, DeployedImage, DescribeFeatureGroupOutput, DescribeHubOutput,
+    DescribeTrainingJobOutput, OutputDataConfig, ResourceConfig, UserContext,
 };
 
 /// The namespace the members the on-disk model does not declare sit in: NOT this service's
@@ -139,6 +140,55 @@ impl SerializableStruct for DescribeFeatureGroupRecordedOutput {
         if let Some(count) = self.online_store_total_item_count {
             s.write_long(&Self::M_ONLINE_STORE_TOTAL_ITEM_COUNT, count)?;
         }
+        Ok(())
+    }
+}
+
+/// `DescribeHub`'s answer: the modelled response, plus the two provenance members the
+/// recorded service carries for every hub.
+///
+/// The modelled members keep the indices the model gives them (0..=9); the two recorded
+/// ones are appended after them.
+#[derive(Debug, Clone)]
+pub struct DescribeHubRecordedOutput {
+    /// Every member `DescribeHubResponse` declares.
+    pub modelled: DescribeHubOutput,
+    /// The identity that created the hub.
+    pub created_by: UserContext,
+    /// The identity of the last call that modified it.
+    pub last_modified_by: UserContext,
+}
+
+impl DescribeHubRecordedOutput {
+    const M_CREATED_BY: Schema =
+        recorded_member!("DescribeHubResponse", "CreatedBy", ShapeType::Structure, 10);
+    const M_LAST_MODIFIED_BY: Schema = recorded_member!(
+        "DescribeHubResponse",
+        "LastModifiedBy",
+        ShapeType::Structure,
+        11
+    );
+
+    /// The modelled response beside the provenance the hub it read holds.
+    #[must_use]
+    pub fn new(
+        modelled: DescribeHubOutput,
+        created_by: UserContext,
+        last_modified_by: UserContext,
+    ) -> Self {
+        Self {
+            modelled,
+            created_by,
+            last_modified_by,
+        }
+    }
+}
+
+impl SerializableStruct for DescribeHubRecordedOutput {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        self.modelled.serialize_members(s)?;
+        s.write_struct(&Self::M_CREATED_BY, &self.created_by)?;
+        s.write_struct(&Self::M_LAST_MODIFIED_BY, &self.last_modified_by)?;
         Ok(())
     }
 }

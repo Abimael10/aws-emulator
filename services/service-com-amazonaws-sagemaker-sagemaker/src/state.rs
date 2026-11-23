@@ -1609,6 +1609,14 @@ pub const HUB_QUOTA: usize = 1_000;
 /// `in_service_at` is the instant the clock owes the `Creating` -> `InService`
 /// transition; it is stored, never slept on, and materialised by whichever reporting
 /// call first runs at or after it.
+///
+/// `created_by` and `last_modified_by` are the hub's provenance: the identity whose
+/// credentials signed the call that created it, and the one that signed the last call to
+/// modify it — recorded when each call happens, as [`caller_user_context`] builds it, and
+/// replayed unchanged, exactly as every other resource of this service records its
+/// creator. Nothing a caller can send modifies a hub yet, so the modifying identity is the
+/// creating one until a modifying call records its own (the clock's own
+/// `Creating` -> `InService` transition is nobody's call and records none).
 #[derive(Debug, Clone)]
 pub struct Hub {
     pub name: String,
@@ -1620,6 +1628,8 @@ pub struct Hub {
     pub status: String,
     pub failure_reason: Option<String>,
     pub tags: Vec<Tag>,
+    pub created_by: UserContext,
+    pub last_modified_by: UserContext,
     pub creation_time: SystemTime,
     pub last_modified_time: SystemTime,
     pub in_service_at: SystemTime,
@@ -4145,6 +4155,22 @@ pub fn caller_user_context<Eng: Send + Sync + 'static>(
     // credential speaks for rather than to an ARN no identity answers to.
     let identity = crate::service::authorization::signing_identity(engine, ctx)
         .unwrap_or_else(crate::service::authorization::SigningIdentity::ambient);
+    user_context_of(identity)
+}
+
+/// The `UserContext` the identity this emulator publishes its own long-term credential as
+/// is recorded under — the creator of a record that stands in for one that credential
+/// wrote. See [`caller_user_context`], which is how a request's own identity reaches a
+/// record.
+#[must_use]
+pub fn ambient_user_context() -> UserContext {
+    user_context_of(crate::service::authorization::SigningIdentity::ambient())
+}
+
+/// One resolved signing identity as the `UserContext` a record carries for it: the ONE
+/// place a `UserContext` is built in this service, so every member of it means the same
+/// thing on every resource.
+fn user_context_of(identity: crate::service::authorization::SigningIdentity) -> UserContext {
     UserContext {
         user_profile_arn: None,
         user_profile_name: None,

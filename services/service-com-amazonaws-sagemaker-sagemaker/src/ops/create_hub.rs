@@ -148,6 +148,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx);
         let arn = crate::state::resource_arn(&region, crate::state::HUB_KIND, &input.hub_name);
+        // Who is creating the hub: the identity whose credentials signed this request, as
+        // every write of this service that records a creator reads it. Resolved before the
+        // store guard is taken, because the answer comes from the account's own records.
+        let created_by = crate::state::caller_user_context(&*self.engine, ctx);
 
         let mut store = state.lock();
         // A name already in use is refused, never overwritten: otherwise the caller reads
@@ -196,6 +200,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // which a hub this call has just registered cannot have had.
                 failure_reason: None,
                 tags: input.tags.unwrap_or_default(),
+                // The creating identity is also the last one to have modified the hub:
+                // this call is the only change made to it so far.
+                last_modified_by: created_by.clone(),
+                created_by,
                 creation_time: now,
                 last_modified_time: now,
                 in_service_at: now + crate::state::HUB_IN_SERVICE_AFTER,
