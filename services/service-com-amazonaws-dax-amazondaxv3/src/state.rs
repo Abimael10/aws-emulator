@@ -1193,8 +1193,7 @@ pub fn subnet_group_not_found() -> SubnetGroupNotFoundFault {
     }
 }
 
-/// `SubnetGroupNotFoundFault` for a request that NAMES the group it means — one element of
-/// a requested LIST of subnet group names, or the one group a modification addresses:
+/// `SubnetGroupNotFoundFault` for one element of a requested LIST of subnet group names:
 /// the template NAMES that group, so a caller that asked for several groups can tell
 /// which of them is missing. `name` is the identifier as this service holds it —
 /// `CreateSubnetGroup$SubnetGroupName` documents that it "is stored as a lowercase
@@ -1203,6 +1202,17 @@ pub fn subnet_group_not_found() -> SubnetGroupNotFoundFault {
 pub fn subnet_group_not_found_named(name: &str) -> SubnetGroupNotFoundFault {
     SubnetGroupNotFoundFault {
         message: Some(format!("Subnet group {name} not found.")),
+    }
+}
+
+/// `SubnetGroupNotFoundFault` for a request ADDRESSED to the one subnet group it names —
+/// a modification of that group: the template names the group and words the failure as
+/// the group not existing, which is how the addressed-group paths answer a name that
+/// resolves to nothing. `name` is the identifier as this service holds it, for the reason
+/// [`subnet_group_not_found_named`] gives.
+pub fn subnet_group_does_not_exist(name: &str) -> SubnetGroupNotFoundFault {
+    SubnetGroupNotFoundFault {
+        message: Some(format!("Subnet Group {name} does not exist.")),
     }
 }
 

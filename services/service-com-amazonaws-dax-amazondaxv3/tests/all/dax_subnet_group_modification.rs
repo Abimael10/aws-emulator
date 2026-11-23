@@ -319,11 +319,13 @@ async fn only_the_members_a_modification_carries_are_applied() {
 
 // ---------------------------------------------------------------------------
 // Rule: a modification naming a subnet group this service does not hold is refused with
-// the modelled `SubnetGroupNotFoundFault`, naming the group as the service holds names,
+// the modelled `SubnetGroupNotFoundFault`, worded for a request ADDRESSED to one group
+// ("Subnet Group <name> does not exist."), naming the group as the service holds names,
 // and mints nothing.
 // Source: `UpdateSubnetGroup`'s `SubnetGroupNotFoundFault` ("The requested subnet group
-// name does not refer to an existing subnet group"); the client-fault status is this
-// service's JSON protocol, see `dax_client_fault_wire_status`.
+// name does not refer to an existing subnet group") and the recorded DAX answer on that
+// path; the client-fault status is this service's JSON protocol, see
+// `dax_client_fault_wire_status`.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -378,7 +380,7 @@ async fn a_modification_of_a_group_the_store_does_not_hold_is_refused() {
         );
         assert_eq!(
             error_message(&body),
-            format!("Subnet group {} not found.", name.to_lowercase()),
+            format!("Subnet Group {} does not exist.", name.to_lowercase()),
             "case {name:?}: the fault must name the group that resolves to nothing, \
              got {body:?}"
         );

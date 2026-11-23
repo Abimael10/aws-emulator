@@ -5,7 +5,8 @@
 //! Applies ONLY the members the request carries to the stored subnet group, leaving every
 //! other value of it exactly as it was, and answers the `SubnetGroup` built from what is
 //! now stored. A request naming a group this service does not hold is refused with
-//! `SubnetGroupNotFoundFault` and changes nothing.
+//! `SubnetGroupNotFoundFault` worded for a request ADDRESSED to one group
+//! (`crate::state::subnet_group_does_not_exist`) and changes nothing.
 //!
 //! A `SubnetIds` the request carries REPLACES the group's membership, resolved the way
 //! `CreateSubnetGroup` resolves one: every identifier against the subnets the ACCOUNT has,
@@ -182,7 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ANOTHER service, which cannot be asked while the store is locked.
         if !state.lock().subnet_groups.contains_key(&name) {
             return Err(UpdateSubnetGroupErrorModeled::SubnetGroupNotFoundFault(
-                crate::state::subnet_group_not_found_named(&name),
+                crate::state::subnet_group_does_not_exist(&name),
             )
             .into());
         }
@@ -260,7 +261,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refusal as one that never existed.
         let Some(group) = store.subnet_groups.get_mut(&name) else {
             return Err(UpdateSubnetGroupErrorModeled::SubnetGroupNotFoundFault(
-                crate::state::subnet_group_not_found_named(&name),
+                crate::state::subnet_group_does_not_exist(&name),
             )
             .into());
         };
