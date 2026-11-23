@@ -1603,9 +1603,14 @@ impl AssociatedPolicyRecord {
             policy_arn: Some(self.policy_arn.clone()),
             access_scope: Some(AccessScope {
                 r#type: Some(self.scope_type.clone()),
-                // A `cluster`-scoped association has no namespaces, and the member
-                // is optional, so it is omitted rather than reported empty.
-                namespaces: (!self.namespaces.is_empty()).then(|| self.namespaces.clone()),
+                // The namespaces a scope covers are KNOWN for every association
+                // this service holds — the names a `namespace`-scoped one was
+                // associated with, and none at all for a `cluster`-scoped one — so
+                // the list is served as a present list either way, empty where the
+                // scope covers no single namespace. A reader that asks an
+                // association which namespaces it covers gets a list to iterate
+                // rather than nothing.
+                namespaces: Some(self.namespaces.clone()),
             }),
             associated_at: Some(reported_instant(self.associated_at)),
             modified_at: Some(reported_instant(self.modified_at)),

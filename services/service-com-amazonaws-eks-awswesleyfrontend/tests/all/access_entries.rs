@@ -246,10 +246,14 @@ async fn an_association_reads_back_exactly_as_stored() {
             &association["accessScope"]["type"], &access_scope["type"],
             "case {case:?}: expected the requested scope type, got {answer:?}"
         );
+        // A served `AccessScope` always carries its namespaces list, so a scope
+        // the request named none for reads back as the EMPTY list rather than as a
+        // missing member. `access_scope_namespaces` is where that rule is
+        // asserted across every shape of scope.
         let expected_namespaces = access_scope
             .get("namespaces")
             .cloned()
-            .unwrap_or(serde_json::Value::Null);
+            .unwrap_or_else(|| serde_json::json!([]));
         assert_eq!(
             &association["accessScope"]["namespaces"], &expected_namespaces,
             "case {case:?}: expected the requested namespaces, in order, got {answer:?}"
