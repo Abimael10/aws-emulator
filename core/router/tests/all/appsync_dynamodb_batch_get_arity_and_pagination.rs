@@ -80,15 +80,21 @@ type Query {\n  \
 /// REFUSED is the field's own error, and every HOLE is reported as one appended error carrying
 /// the position it stands at — which is the handling the AppSync JavaScript resolver reference
 /// writes for a batch, and what a client correlating by position needs.
+///
+/// The slots are walked with `forEach` rather than with a `for` statement, because the
+/// APPSYNC_JS rule set a written definition is checked against does not admit one: a handler
+/// using a loop statement is refused as the definition is created
+/// (`@aws-appsync/no-for`), so a resolver a client can really attach iterates through the
+/// array's own methods.
 const SLOT_RESPONSE: &str = "\
 export function response(ctx) {\n  \
   if (ctx.error) {\n    util.error(ctx.error.message, ctx.error.type);\n  }\n  \
   const slots = ctx.result.data['$TABLE'];\n  \
-  for (let at = 0; at < slots.length; at++) {\n    \
-    if (slots[at] === null) {\n      \
+  slots.forEach(function (slot, at) {\n    \
+    if (slot === null) {\n      \
       util.appendError('No item was found for this key.', 'NotFound', null, {index: at});\n    \
     }\n  \
-  }\n  \
+  });\n  \
   return slots;\n}\n";
 
 /// The request half of the field that looks up single-attribute keys.

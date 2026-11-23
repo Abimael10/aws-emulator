@@ -9,11 +9,12 @@
 //!
 //! 1. a call that would store `code` that does not compile is refused: 400
 //!    `BadRequestException` with the `CODE_ERROR` reason, AppSync's fixed
-//!    code-errors sentence and a `detail.codeErrors` list carrying one entry per fault,
-//!    each with its `errorType`, the compiler's own diagnostic as its `value` and a
-//!    `location`; asserted over every operation that stores code (`CreateFunction`,
-//!    `UpdateFunction`, `CreateResolver`, `UpdateResolver`) and over several ways for a
-//!    definition not to compile;
+//!    code-errors sentence and a `detail.codeErrors` list carrying one entry per
+//!    diagnostic, each with its `errorType`, the compiler's own diagnostic as its `value`
+//!    — `code.js(<line>,<column>): error TS<code>: <sentence>` — and a `location`;
+//!    asserted over every operation that stores code (`CreateFunction`, `UpdateFunction`,
+//!    `CreateResolver`, `UpdateResolver`) and over several ways for a definition not to
+//!    compile;
 //! 2. a refused call stores NOTHING: the function is not in the API's inventory, the
 //!    field carries no resolver, and an update leaves the stored definition as it was;
 //! 3. code the compiler reads to the end is stored and read back verbatim — including
@@ -21,9 +22,11 @@
 //!    non-ASCII text, and code defining both handlers;
 //! 4. the inventory a listing reports is exactly the definitions that were accepted,
 //!    each under its own id, with every member the model projects;
-//! 5. the compile is BOUNDED: a definition that nests as deeply as the modelled maximum
-//!    length of `code` allows is answered with that same refusal, because the compile runs
-//!    under the engine's own memory, stack, clock and step ceilings.
+//! 5. the read is BOUNDED: a definition that nests as deeply as the modelled maximum
+//!    length of `code` allows is answered — stored where the code reads, refused with the
+//!    code-error detail where it does not compile — because the read happens on a thread
+//!    sized for the deepest structure that length can describe rather than on the host's own
+//!    stack.
 //!
 //! Every assertion goes through the router the production emulator mounts, so these
 //! exercise routing, restJson1 (de)serialization, the boundary validator, the handlers
@@ -67,36 +70,44 @@ const COMPILING_CODE: &[(&str, &str)] = &[
     ),
 ];
 
-/// Code the engine cannot read to the end, in several forms, each with the position the
-/// compile stops at: the line and the column just past the code's last character, counted
-/// from one, which is as far as a compile that could not read the code got. (The engine
-/// states no position of its own for a module it could not compile, so this is the one the
-/// diagnostic carries — see `crate::state::code_definition`.)
-const BROKEN_CODE: &[(&str, &str, i64, i64)] = &[
+/// Code the compiler cannot read, in several forms, each with the diagnostic it states
+/// first: the TypeScript diagnostic the fault falls under, at the position in the submitted
+/// code the compiler reports it at and over the stretch of code it is about (see
+/// `crate::state::code_diagnostics`).
+const BROKEN_CODE: &[(&str, &str, i64, i64, i64, &str)] = &[
     (
         "a handler missing its closing brace",
         "export function request(ctx) {\n  return {\n    payload: ctx.args,\n",
-        // Three lines, the last of them terminated: the next character would start line 4.
+        // Three lines, the last of them terminated: the brace the compiler asks for would
+        // go where the next character starts, which is line 4.
         4,
         1,
+        0,
+        "code.js(4,1): error TS1005: '}' expected.\n",
     ),
     (
         "an unterminated string literal",
         "export function request(ctx) { return { payload: 'unterminated }; }",
         1,
-        68,
+        50,
+        18,
+        "code.js(1,50): error TS1002: Unterminated string literal.\n",
     ),
     (
         "a stray parenthesis",
         "export function request(ctx) { return (((( }",
         1,
-        45,
+        44,
+        1,
+        "code.js(1,44): error TS1109: Expression expected.\n",
     ),
     (
         "text that is not JavaScript at all",
         "this is not javascript at all",
         1,
-        30,
+        6,
+        2,
+        "code.js(1,6): error TS1005: ';' expected.\n",
     ),
 ];
 
@@ -158,10 +169,14 @@ async fn list_functions(router: &MultiServiceRouter, api_id: &str) -> Answer {
     call(router, "GET", &format!("/v1/apis/{api_id}/functions"), None).await
 }
 
-/// Assert `answer` is the refusal code the engine could not read takes, and — where the
-/// row states one — that it is reported at `position`, the line and column the compile
-/// stopped at.
-fn assert_code_error(case: &str, answer: &Answer, position: Option<(i64, i64)>) {
+/// What one row of [`BROKEN_CODE`] expects of the first diagnostic: its position, its
+/// length and the sentence the compiler states.
+type Diagnostic<'a> = (i64, i64, i64, &'a str);
+
+/// Assert `answer` is the refusal code that does not compile takes, and — where the row
+/// states one — that its first diagnostic is `diagnostic`: the compiler's own sentence, at
+/// the position in the submitted code and over the stretch of code it is about.
+fn assert_code_error(case: &str, answer: &Answer, diagnostic: Option<Diagnostic<'_>>) {
     assert_eq!(
         (
             answer.status,
@@ -197,33 +212,39 @@ fn assert_code_error(case: &str, answer: &Answer, position: Option<(i64, i64)>) 
         );
 
         // The diagnostic is one line, worded the way a compiler words one: the unit the
-        // code is compiled under, the position in it, and the sentence — and the position
-        // it names is the one the `location` carries, so the two cannot disagree about
-        // where in the code the compile stopped.
+        // code is compiled under, the position in it, the TypeScript error code and the
+        // sentence — and the position it names is the one the `location` carries, so the
+        // two cannot disagree about where in the code the fault sits.
         let line = fault["location"]["line"].as_i64().unwrap_or_default();
         let column = fault["location"]["column"].as_i64().unwrap_or_default();
         let value = fault["value"].as_str().unwrap_or_default();
-        if let Some((expected_line, expected_column)) = position {
-            assert_eq!(
-                (line, column),
-                (expected_line, expected_column),
-                "case {case:?}: expected the compile to stop at line {expected_line} column \
-                 {expected_column}, got {fault:?}"
-            );
-        }
-        let stated = format!("code.js({line},{column}): error");
+        let stated = format!("code.js({line},{column}): error TS");
         assert!(
             value.starts_with(&stated) && value.ends_with('\n'),
             "case {case:?}: expected a diagnostic stating {stated:?}, got {value:?}"
         );
         assert!(
             line >= 1 && column >= 1,
-            "case {case:?}: expected the position the compile stopped at, got {fault:?}"
+            "case {case:?}: expected the position of the fault in the code, got {fault:?}"
         );
+        assert!(
+            fault["location"]["span"].as_i64().unwrap_or(-1) >= 0,
+            "case {case:?}: expected the length of the stretch the diagnostic is about, got \
+             {fault:?}"
+        );
+    }
+
+    if let Some((line, column, span, value)) = diagnostic {
+        let first = &faults[0];
         assert_eq!(
-            fault["location"]["span"].as_i64(),
-            Some(0),
-            "case {case:?}: expected the span of a diagnostic about a position, got {fault:?}"
+            (
+                first["value"].as_str(),
+                first["location"]["line"].as_i64(),
+                first["location"]["column"].as_i64(),
+                first["location"]["span"].as_i64(),
+            ),
+            (Some(value), Some(line), Some(column), Some(span)),
+            "case {case:?}: expected the compiler's own first diagnostic, got {first:?}"
         );
     }
 }
@@ -234,8 +255,8 @@ type NestedCode = fn(usize) -> String;
 
 /// Rule 5 (the bound): a definition whose `code` nests as deeply as the modelled maximum
 /// length allows is ANSWERED — either stored, where the code reads, or refused with the
-/// code-error detail — because the compile is held to the engine's own memory, stack,
-/// clock and step ceilings rather than to the host's.
+/// code-error detail — because the read happens on a thread sized for the deepest structure
+/// that length can describe rather than on the host's own stack.
 ///
 /// The rows differ along the construct that nests and along the depth, up to the deepest
 /// one `Code`'s modelled `@length` (1..32768, from
@@ -262,7 +283,7 @@ async fn code_nested_as_deeply_as_the_modelled_length_allows_is_answered() {
             let case = format!("{form} {depth} deep");
             let answer = create_function(&router, &api_id, "fn_nested", &code).await;
             if answer.status == 200 {
-                // Code the engine read to the end is stored, however deep it nests.
+                // Code the reader read to the end is stored, however deep it nests.
                 stored += 1;
                 continue;
             }
@@ -290,7 +311,7 @@ async fn code_nested_as_deeply_as_the_modelled_length_allows_is_answered() {
 /// detail and stores nothing.
 #[tokio::test]
 async fn a_create_whose_code_does_not_compile_is_refused_and_stores_nothing() {
-    for (index, (case, code, line, column)) in BROKEN_CODE.iter().enumerate() {
+    for (index, (case, code, line, column, span, value)) in BROKEN_CODE.iter().enumerate() {
         let router = router();
         let api_id = create_api(&router, &format!("code-create-{index}")).await;
         create_data_source(&router, &api_id, DATA_SOURCE).await;
@@ -299,7 +320,7 @@ async fn a_create_whose_code_does_not_compile_is_refused_and_stores_nothing() {
         assert_code_error(
             &format!("CreateFunction with {case}"),
             &answer,
-            Some((*line, *column)),
+            Some((*line, *column, *span, value)),
         );
 
         // Nothing was stored for the refused create, so the API's inventory is empty.
@@ -319,7 +340,7 @@ async fn a_create_whose_code_does_not_compile_is_refused_and_stores_nothing() {
         assert_code_error(
             &format!("CreateResolver with {case}"),
             &answer,
-            Some((*line, *column)),
+            Some((*line, *column, *span, value)),
         );
 
         // And the field carries no resolver.
@@ -364,7 +385,7 @@ async fn an_update_whose_code_does_not_compile_is_refused_and_changes_nothing() 
         "case attach the resolver the updates leave alone: expected 200, got {attached:?}"
     );
 
-    for (case, code, line, column) in BROKEN_CODE {
+    for (case, code, line, column, span, value) in BROKEN_CODE {
         let answer = call(
             &router,
             "POST",
@@ -375,7 +396,7 @@ async fn an_update_whose_code_does_not_compile_is_refused_and_changes_nothing() 
         assert_code_error(
             &format!("UpdateFunction with {case}"),
             &answer,
-            Some((*line, *column)),
+            Some((*line, *column, *span, value)),
         );
         let read = call(
             &router,
@@ -403,7 +424,7 @@ async fn an_update_whose_code_does_not_compile_is_refused_and_changes_nothing() 
         assert_code_error(
             &format!("UpdateResolver with {case}"),
             &answer,
-            Some((*line, *column)),
+            Some((*line, *column, *span, value)),
         );
         let read = call(
             &router,
@@ -488,12 +509,12 @@ async fn the_inventory_holds_exactly_the_functions_that_were_accepted() {
     create_data_source(&router, &api_id, DATA_SOURCE).await;
 
     // Two refused creates and one accepted one, in the order a client would make them.
-    for (case, code, line, column) in BROKEN_CODE.iter().take(2) {
+    for (case, code, line, column, span, value) in BROKEN_CODE.iter().take(2) {
         let answer = create_function(&router, &api_id, "fn_bad", code).await;
         assert_code_error(
             &format!("CreateFunction with {case}"),
             &answer,
-            Some((*line, *column)),
+            Some((*line, *column, *span, value)),
         );
     }
     let accepted = create_function(&router, &api_id, "fn_ok", COMPILING_CODE[1].1).await;

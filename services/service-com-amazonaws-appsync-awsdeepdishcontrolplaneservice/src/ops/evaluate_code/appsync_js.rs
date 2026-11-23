@@ -281,7 +281,11 @@ pub struct Evaluation {
 /// a run the engine has not come back from by then is given up on, so the request is answered
 /// whatever the engine is doing, and the given-up run costs one sandbox slot until it ends.
 pub async fn evaluate(code: String, function: String, context: Json) -> Evaluation {
-    match in_sandbox(move || run(&code, &function, &context)).await {
+    match in_sandbox(ENGINE_THREAD_STACK_BYTES, move || {
+        run(&code, &function, &context)
+    })
+    .await
+    {
         Entered::Answered(evaluation) => evaluation,
         Entered::GaveUp(reason) => stopped(reason),
     }
@@ -304,8 +308,15 @@ static SANDBOX_SLOTS: ::tokio::sync::Semaphore =
 /// The name the sandbox's own threads carry, so one is recognisable in a thread dump.
 const SANDBOX_THREAD_NAME: &str = "appsync-js-sandbox";
 
+/// How much stack one of those threads is given for an ENGINE's run.
+///
+/// The engine holds its own, much smaller ceiling ([`RUN_STACK_BYTES`]), which is what bounds
+/// how deeply evaluated code may recurse, so the thread only has to carry the engine's own
+/// work around it.
+const ENGINE_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
+
 /// What asking the sandbox to run one engine came to.
-enum Entered<T> {
+pub(crate) enum Entered<T> {
     /// The engine ran and this is what it produced.
     Answered(T),
     /// Nothing was learned: the host did not wait for it, or could not start it. The text
@@ -313,8 +324,14 @@ enum Entered<T> {
     GaveUp(String),
 }
 
-/// Run `work` — one engine's whole life — on a thread of its own, under the sandbox's slot
+/// Run `work` — one engine's whole life, or one READ of the code an engine would run
+/// (`crate::state::code_diagnostics`) — on a thread of its own, under the sandbox's slot
 /// bound, and answer what it produced or why the host stopped waiting for it.
+///
+/// `stack_bytes` is the stack that thread is given, which the CALLER sizes because what runs
+/// on it decides: an engine's run is held to the engine's own stack ceiling
+/// ([`ENGINE_THREAD_STACK_BYTES`]), while a read of caller-supplied code walks into that code
+/// as deeply as it nests and sizes the thread for the deepest structure the code could be.
 ///
 /// Two bounds, both of the HOST's and neither reachable from the evaluated code:
 ///
@@ -324,7 +341,10 @@ enum Entered<T> {
 ///   never a thread of the executor serving other requests;
 /// * the caller's WAIT ([`CALLER_WAIT_CEILING`]), both for entering the sandbox and for the
 ///   answer, so the request is answered even where every slot is taken.
-async fn in_sandbox<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Entered<T> {
+pub(crate) async fn in_sandbox<T: Send + 'static>(
+    stack_bytes: usize,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Entered<T> {
     let Ok(Ok(slot)) =
         ::tokio::time::timeout(CALLER_WAIT_CEILING, SANDBOX_SLOTS.acquire()).await
     else {
@@ -336,6 +356,7 @@ async fn in_sandbox<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static
     let (answer, answered) = ::tokio::sync::oneshot::channel();
     let started = ::std::thread::Builder::new()
         .name(SANDBOX_THREAD_NAME.to_string())
+        .stack_size(stack_bytes)
         .spawn(move || {
             let produced = work();
             // The engine is gone with `work`; the slot goes with the thread, so what the
@@ -383,7 +404,7 @@ pub enum Compiled {
 /// clean one: the caller then answers the server fault its model declares instead of
 /// storing a definition nothing could read.
 pub async fn compile_faults(code: String) -> Compiled {
-    match in_sandbox(move || compile(&code)).await {
+    match in_sandbox(ENGINE_THREAD_STACK_BYTES, move || compile(&code)).await {
         Entered::Answered(compiled) => compiled,
         Entered::GaveUp(reason) => Compiled::Unknown(reason),
     }

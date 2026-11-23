@@ -1,47 +1,41 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The APPSYNC_JS `code` a resolver or a function is DEFINED by: the compile every call
-//! that stores one runs over it, and how code that does not compile is refused.
+//! The APPSYNC_JS `code` a resolver or a function is DEFINED by: the read every call that
+//! stores one runs over it, and how code that does not compile — or that breaks a rule of the
+//! runtime's own rule set — is refused.
 //!
 //! `code` is "The `resolver` code that contains the request and response functions"
 //! (`Resolver$code`, and `FunctionConfiguration$code` for a function), run by the
-//! APPSYNC_JS runtime. A definition the runtime cannot read defines nothing that could
-//! ever run, so the call that would store it is refused instead: AppSync compiles the code
-//! as the resolver or function is written and answers its `BadRequestException` (HTTP 400)
-//! with the `CODE_ERROR` reason, for which "the detail will contain a list of code errors"
-//! (`BadRequestDetail`) — one `CodeError` per fault, carrying the compiler's own
-//! diagnostic and where in the code it sits. Nothing is stored for a refused call, so a
-//! later read and a later listing report only the definitions that were accepted.
+//! APPSYNC_JS runtime. A definition the runtime could not run defines nothing, so the call
+//! that would store it is refused instead: AppSync reads the code as the resolver or function
+//! is written and answers its `BadRequestException` (HTTP 400) with the `CODE_ERROR` reason,
+//! for which "the detail will contain a list of code errors" (`BadRequestDetail`) — one
+//! `CodeError` per diagnostic, carrying the diagnostic as the compiler or the broken rule
+//! worded it and where in the code it sits. Nothing is stored for a refused call, so a later
+//! read and a later listing report only the definitions that were accepted.
 //!
-//! The compile is a REAL compile, by the very engine that RUNS APPSYNC_JS code in this
-//! process ([`compile_faults`]): nothing is read out of the code's text, so what is
-//! refused is what the engine could not read, and it is refused under the engine's own
-//! memory and stack ceilings and the wall clock and step budget its interrupt handler
-//! spends — so a definition's size or nesting is a bounded failure inside the engine
-//! rather than a demand on the host, and one compile cannot hold the request open. (Size
-//! is bounded ahead of all of that as well: `code` targets `Code`, whose modelled
-//! `@length` is 1..32768, which the request boundary enforces before a handler runs.)
-//! Nothing of the code is evaluated: the compile stops at the compiled module.
+//! How the code is read — the compile and the rule set, what each diagnostic is worded like,
+//! and the bounds the read happens under — is [`super::code_diagnostics`], shared by every
+//! operation that stores `code` (`CreateFunction`, `UpdateFunction`, `CreateResolver`,
+//! `UpdateResolver`), so one definition is judged one way whichever call wrote it; a request
+//! that carries no `code` defines nothing to read.
 //!
-//! The rule is over the MEMBER rather than over one operation, so every operation that
-//! takes `code` (`CreateFunction`, `UpdateFunction`, `CreateResolver`, `UpdateResolver`)
-//! refuses the same definitions; a request that carries no `code` defines nothing to
-//! compile.
-//!
-//! What this compile does NOT judge is which functions the module EXPORTS. A written
-//! definition is refused only for code the engine could not read, because that is what the
-//! corpus records this plane refusing: `EvaluateCode` is the call recorded reporting a module
-//! that exports no `request`/`response` pair as faulty (`crate::ops::evaluate_code`), and it
-//! reports that as the evaluation's own `error` rather than as a refusal of the request. A
-//! create or an update of a definition is left exactly as recorded until a recording says
-//! otherwise.
+//! What this read does NOT judge is which functions the module EXPORTS. A written definition
+//! is refused only for code that does not compile or that breaks a rule, because that is what
+//! the corpus records this plane refusing: `EvaluateCode` is the call recorded reporting a
+//! module that exports no `request`/`response` pair as faulty
+//! (`crate::ops::evaluate_code`), and it reports that as the evaluation's own `error` rather
+//! than as a refusal of the request. A create or an update of a definition is left exactly as
+//! recorded until a recording says otherwise.
 
-use crate::ops::evaluate_code::appsync_js::{compile_faults, CodeFault, Compiled, CODE_UNIT};
+use crate::ops::evaluate_code::appsync_js::{CodeFault, CODE_UNIT};
 use crate::ops::types::{BadRequestDetail, BadRequestException, CodeError, CodeErrorLocation};
 
-/// The `errorType` every fault of a WRITTEN definition is reported under, re-exported here
-/// beside the refusal that carries it: the compile reads the code rather than running it,
-/// so the only fault it can report is code the engine could not read.
+use super::code_diagnostics::{code_diagnostics, Diagnosed};
+
+/// The `errorType` a fault of a WRITTEN definition the COMPILE found is reported under,
+/// re-exported here beside the refusal that carries it; a fault the RULE SET found carries
+/// [`super::LINT_ERROR`] instead.
 pub use crate::ops::evaluate_code::appsync_js::PARSE_ERROR;
 
 /// The `reason` a code fault is reported under: "Provides context for the cause of the
@@ -91,19 +85,19 @@ fn code_error(fault: &CodeFault) -> CodeError {
 /// it.
 #[derive(Debug)]
 pub enum CodeDefinition {
-    /// The engine read the code to the end: the definition may be stored.
+    /// The code compiled and broke no rule: the definition may be stored.
     Compiled,
-    /// The engine could not read it: the refusal to answer the call with.
+    /// It did not: the refusal to answer the call with.
     Refused(BadRequestException),
-    /// The compile did not happen or did not come back, so nothing is known about the
-    /// code: the text says why. A definition nothing could read is not stored — the call
+    /// The read did not happen or did not come back, so nothing is known about the code: the
+    /// text says why. A definition nothing could read is not stored — the call
     /// answers the server fault its model declares instead, because storing it would be
     /// indistinguishable from storing one that compiled.
     Unknown(String),
 }
 
 /// What the `code` a call would store came to, or [`CodeDefinition::Compiled`] for a
-/// request that carries none, which defines nothing to compile.
+/// request that carries none, which defines nothing to read.
 ///
 /// The refusal is the modelled `BadRequestException` so each operation raises it through
 /// its own error channel, with the reason and the per-fault detail a client reads to place
@@ -112,39 +106,31 @@ pub async fn code_definition(code: Option<&str>) -> CodeDefinition {
     let Some(code) = code else {
         return CodeDefinition::Compiled;
     };
-    let faults = match compile_faults(code.to_string()).await {
-        Compiled::Read(faults) => faults,
-        Compiled::Unknown(reason) => return CodeDefinition::Unknown(reason),
-    };
-    if faults.is_empty() {
-        return CodeDefinition::Compiled;
+    match code_diagnostics(code.to_string()).await {
+        Diagnosed::Read => CodeDefinition::Compiled,
+        Diagnosed::Unknown(reason) => CodeDefinition::Unknown(reason),
+        Diagnosed::Faults(faults) => CodeDefinition::Refused(BadRequestException {
+            message: Some(CODE_ERRORS_MESSAGE.to_string()),
+            reason: Some(CODE_ERROR_REASON.to_string()),
+            detail: Some(code_errors_detail(&faults)),
+        }),
     }
-    let stated: Vec<CodeFault> = faults
-        .iter()
-        .map(|fault| stated_code_fault(fault, code))
-        .collect();
-    CodeDefinition::Refused(BadRequestException {
-        message: Some(CODE_ERRORS_MESSAGE.to_string()),
-        reason: Some(CODE_ERROR_REASON.to_string()),
-        detail: Some(code_errors_detail(&stated)),
-    })
 }
 
-/// `fault` as the compiler states one: its position, and its diagnostic worded the way the
-/// compiler a definition is compiled with words one.
+/// `fault` as the ENGINE that ran the code states one: its position, and the engine's own
+/// account of what it could not read.
 ///
-/// A compiler states a diagnostic as `<unit>(<line>,<column>): error <code>: <sentence>`,
-/// on a line of its own, the unit being the one the code is compiled under
-/// ([`CODE_UNIT`]) — the form a client reads it in. The sentence is the engine's own
-/// account of what it could not read, and it names no diagnostic CODE of its own, so the
-/// code is left out of the scaffolding and the sentence follows `error:` directly. The
-/// position is the one the engine stated, or, for a fault the engine states none for,
-/// where the code ITSELF ends ([`end_of_input`]), which is as far as a compile that could
-/// not read the code got.
+/// A diagnostic is stated as `<unit>(<line>,<column>): error <code>: <sentence>`, on a line
+/// of its own, the unit being the one the code is compiled under ([`CODE_UNIT`]) — the form
+/// a client reads it in. The engine names no diagnostic CODE of its own, so the code is left
+/// out of the scaffolding and the sentence follows `error:` directly. The position is the one
+/// the engine stated, or, for a fault the engine states none for, where the code ITSELF ends
+/// ([`end_of_input`]), which is as far as a run that could not read the code got.
 ///
-/// Shared by every reader of the code — the compile a WRITTEN definition runs and the
-/// evaluation of code a caller submits — so one fault is stated one way wherever the code
-/// was read.
+/// This is the wording of a fault the EVALUATION sandbox found while reading code it was
+/// about to run (`crate::ops::evaluate_code`); a WRITTEN definition is read by the compiler
+/// and the rule set instead, which state their own diagnostics
+/// (`super::code_diagnostics`).
 pub fn stated_code_fault(fault: &CodeFault, code: &str) -> CodeFault {
     let (line, column) = if fault.line > 0 {
         (fault.line, fault.column)

@@ -126,6 +126,12 @@ pub use dependencies::*;
 mod code_definition;
 pub use code_definition::*;
 
+/// How APPSYNC_JS `code` is READ on the write path: the compiler diagnostics code that does
+/// not compile is reported with, and the APPSYNC_JS rule set code that compiles is checked
+/// against.
+mod code_diagnostics;
+pub use code_diagnostics::*;
+
 /// The APPSYNC_JS `codeHandlers` a channel namespace is defined by: the compile a call that
 /// stores them runs, and the refusal handlers the runtime cannot read take.
 mod channel_namespace_handlers;

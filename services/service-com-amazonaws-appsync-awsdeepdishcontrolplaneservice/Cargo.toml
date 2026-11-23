@@ -75,6 +75,33 @@ base64 = "0.22"
 # the engine's own interpreter loop, the same one the tree's other embedded-JavaScript
 # services use, and no advisory is recorded against the locked version.
 rquickjs = { version = "0.14", features = ["loader"] }
+# The ECMAScript front end the APPSYNC_JS `code` a resolver or a function is DEFINED by is
+# READ with, as the call that would store one is served: a maintained parser produces the
+# compiler diagnostics a definition that does not compile is refused with, and the syntax
+# tree the APPSYNC_JS rule set is checked over
+# (`src/state/code_diagnostics.rs`). Nothing of the code is evaluated here — this front end
+# only reads it, which is why the write path can report WHERE in the code each fault sits
+# and how long it is.
+#
+# `default-features = false` drops the TypeScript front end this crate never parses, and
+# `stacker` is kept on, which is the front end's own handling of a deeply nested input. What
+# makes the read finite is the model: `Code`'s `@length` bounds how deeply a definition can
+# nest at all, and the read runs on a thread of the sandbox's own sized for that worst case,
+# under the same slot and caller-wait bounds the engine's runs are held to.
+swc_ecma_parser = { version = "47", default-features = false, features = ["stacker"] }
+# The syntax tree that parser produces, and the visitor the rule set walks it with.
+swc_ecma_ast = "30"
+swc_ecma_visit = "30"
+# The source map that resolves a node's byte span to the line, the column and the length a
+# diagnostic reports.
+swc_common = "27"
+# Takes the next level of the walk over a definition's syntax tree onto the HEAP when the
+# thread's own stack runs low. The walk goes as deep as the submitted code nests, so without
+# this its depth would be a demand on the host's stack; with it, the deepest definition the
+# modelled maximum length of `code` can describe is walked to the end
+# (`src/state/code_diagnostics/appsync_js_rules.rs`). It is the same mechanism the parser
+# above uses for its own recursion.
+stacker = "0.1"
 # The CloudWatch store the `AWS/AppSync` series an Event API's data plane publishes go
 # into: a service's own metric never travels over `PutMetricData` (that API refuses the
 # reserved `AWS/` namespaces), so it is appended to the very store `ListMetrics` and
