@@ -12,15 +12,16 @@
 //! this service invented. The PEM bodies themselves are stored beside those facts, so
 //! `GetCertificate` hands back the content the import carried.
 //!
-//! The certificate's own VALIDITY WINDOW is one of those reported facts and never a
-//! refusal: whether the window is open is a comparison between this host's clock and
-//! bounds pinned inside the request's material, so an import judged by it would be
-//! admissible or not depending on when the emulator happens to run rather than on what
-//! the request carries ([`imported_certificate`]).
+//! The certificate's own VALIDITY WINDOW is one of those reported facts AND one of the
+//! guidelines the import is held to — "the current time must be between the Not Before
+//! and Not After certificate fields" — so material outside its own window is refused
+//! under the sentence naming which side of it the material fell on
+//! ([`imported_certificate`]).
 //!
 //! The `CertificateChain` body is material stored to be served back beside the
 //! certificate, not a claim the import is checked against: no fact the record reports
-//! is read out of it, and all it is held to is being a PEM encoding of certificates.
+//! is read out of it, and all it is held to is being a PEM encoding of certificates
+//! each of which is inside its own validity window.
 //!
 //! A request that names `CertificateArn` replaces the certificate stored under it
 //! ("include this argument only when you want to replace a previously imported
@@ -235,12 +236,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // ONE instant answers the whole request: it materialises what the clock already
-        // owes the store and dates the import.
+        // owes the store, decides whether the material the request carries is inside its
+        // own validity period, and dates the import.
         let now = ::std::time::SystemTime::now();
 
         // Everything the record will report comes from the bodies the request carries,
         // read before the store is touched, so a refused import changes nothing.
-        let imported = imported_certificate(&input)?;
+        let imported = imported_certificate(&input, now)?;
 
         let region = crate::state::request_region(ctx.parts());
 
@@ -566,13 +568,16 @@ impl ImportedCertificate {
 /// its own encoding ([`certificate_chain`]) and nothing else. Nothing here verifies a
 /// signature: no key of the issuing authority is reachable from this service.
 ///
-/// The one guideline that is NOT a refusal here is the validity window ("the current
-/// time must be between the Not Before and Not After certificate fields"): it compares
-/// this HOST's clock with bounds pinned inside the material the request carries, so
-/// judging it would make one and the same import succeed or fail depending on when the
-/// emulator happens to be run rather than on what the request carries. The bounds are
-/// read out of the certificate and REPORTED on the record instead (`NotBefore`,
-/// `NotAfter`), which is where a client reads the window.
+/// The validity WINDOW is one of those guidelines — "the current time must be between
+/// the Not Before and Not After certificate fields" — so a certificate whose window is
+/// not open at the instant the call is served is refused under the sentence naming which
+/// side of it the material fell on ([`certificate_expired`],
+/// [`certificate_not_yet_valid`]). The comparison is against the instant this request is
+/// answered at because that is what the guideline is about: an import is admissible
+/// while the certificate it carries is usable and no longer once it is not, exactly as a
+/// certificate's own expiry moves a stored record out of `ISSUED`. The bounds are also
+/// read out of the certificate and REPORTED on the record (`NotBefore`, `NotAfter`),
+/// which is where a client reads the window of an admitted certificate.
 ///
 /// Every refusal here is a defect of the MATERIAL the request carries rather than of a
 /// parameter naming what to operate on, so each is the modelled constraint failure for
@@ -581,13 +586,14 @@ impl ImportedCertificate {
 /// but asserts nothing ACM can store a certificate under.
 fn imported_certificate(
     input: &ImportCertificateInput,
+    now: ::std::time::SystemTime,
 ) -> Result<ImportedCertificate, ImportCertificateError> {
     let certificate = one_certificate(&input.certificate)?;
 
     let chain_pem = input
         .certificate_chain
         .as_deref()
-        .map(certificate_chain)
+        .map(|body| certificate_chain(body, now))
         .transpose()?;
 
     let tbs = &certificate.tbs_certificate;
@@ -598,16 +604,18 @@ fn imported_certificate(
         ));
     }
 
-    // The validity window is the certificate's OWN fact, reported as `NotBefore` and
-    // `NotAfter` on the record this import stores — never a refusal. Whether that window
-    // is open at the instant a call happens to be served is a comparison against this
-    // HOST's clock, and nothing in the request carries the instant the material was
-    // minted for: a window held against the host clock makes one and the same import
-    // admissible or inadmissible depending on when the emulator runs, which is not a
-    // property of the request. So the bounds are read and stored, and the material is
-    // held only to what this service must be able to read out of it.
+    // "The current time must be between the Not Before and Not After certificate fields"
+    // (`ImportCertificate` doc): a certificate whose own window is not open now is
+    // refused, and the sentence says which side of the window it fell on. The bounds are
+    // the certificate's own fact either way, reported as `NotBefore` and `NotAfter` on
+    // the record an admitted import stores.
     let not_before = tbs.validity.not_before.to_system_time();
     let not_after = tbs.validity.not_after.to_system_time();
+    match validity_at(not_before, not_after, now) {
+        Validity::Open => {}
+        Validity::NotYetOpen => return Err(certificate_not_yet_valid()),
+        Validity::Closed => return Err(certificate_expired()),
+    }
 
     // The name set the certificate covers: its subject common name first, then the DNS
     // names of its Subject Alternative Name extension, each name once however often
@@ -667,16 +675,19 @@ const PEM_BEGIN: &str = "-----BEGIN ";
 /// * it has to be a PEM encoding (the operation's own guideline, "the certificate,
 ///   private key, and certificate chain must be PEM-encoded") of certificates, a
 ///   well-formed PEM of any other type being a different object rather than a damaged
-///   chain.
-///
-/// A member's own validity window is NOT one of them, for the same reason the imported
-/// certificate's window is not ([`imported_certificate`]): whether a window is open is a
-/// comparison against this host's clock, so holding the material to it would make one
-/// chain admissible or inadmissible depending on when the emulator runs.
+///   chain;
+/// * every certificate it carries has to be inside its own validity window at the
+///   instant the call is served, which is the same guideline the imported certificate is
+///   held to ("the current time must be between the Not Before and Not After certificate
+///   fields") — a chain of trust whose authority is no longer usable is one no client
+///   could verify the leaf against.
 ///
 /// The refusal is the modelled constraint failure for supplied input, under the sentence
 /// that names what the body is not.
-fn certificate_chain(body: &[u8]) -> Result<String, ImportCertificateError> {
+fn certificate_chain(
+    body: &[u8],
+    now: ::std::time::SystemTime,
+) -> Result<String, ImportCertificateError> {
     let text = ::std::str::from_utf8(body).map_err(|_| chain_not_pem())?;
 
     // Read the type labels before the content: a body framing a PEM message of another
@@ -689,9 +700,88 @@ fn certificate_chain(body: &[u8]) -> Result<String, ImportCertificateError> {
     if labels.iter().any(|label| *label != CERTIFICATE_PEM_LABEL) {
         return Err(validation_exception("Passed PEM is not a certificate chain."));
     }
-    X509Certificate::load_pem_chain(body).map_err(|_| chain_not_pem())?;
+    let members = X509Certificate::load_pem_chain(body).map_err(|_| chain_not_pem())?;
+    for member in &members {
+        let validity = &member.tbs_certificate.validity;
+        match validity_at(
+            validity.not_before.to_system_time(),
+            validity.not_after.to_system_time(),
+            now,
+        ) {
+            Validity::Open => {}
+            Validity::NotYetOpen => return Err(chain_certificate_not_yet_valid()),
+            Validity::Closed => return Err(chain_certificate_expired()),
+        }
+    }
 
     Ok(stored_pem(text))
+}
+
+/// Where the instant a call is served at falls relative to the validity window a
+/// certificate carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Validity {
+    /// Before `Not Before`: the window has not opened yet.
+    NotYetOpen,
+    /// Inside the window, which is the one state an import is admitted in.
+    Open,
+    /// After `Not After`: the window has closed.
+    Closed,
+}
+
+/// Which of those three `now` is, for the window `not_before`..`not_after`. Both bounds
+/// are INSIDE the window: "the current time must be between the Not Before and Not After
+/// certificate fields", and a certificate is usable at the instants its own fields name.
+fn validity_at(
+    not_before: ::std::time::SystemTime,
+    not_after: ::std::time::SystemTime,
+    now: ::std::time::SystemTime,
+) -> Validity {
+    if now < not_before {
+        Validity::NotYetOpen
+    } else if now > not_after {
+        Validity::Closed
+    } else {
+        Validity::Open
+    }
+}
+
+/// The refusal for a `Certificate` whose own validity window has CLOSED. Fixed text, as
+/// recorded against the service: nothing of the request is interpolated, and the sentence
+/// alone is what tells this defect of the material apart from the others.
+fn certificate_expired() -> ImportCertificateError {
+    validation_exception(
+        "The certificate is expired. You can Import a certificate only during its \
+         validity period.",
+    )
+}
+
+/// The refusal for a `Certificate` whose own validity window has NOT OPENED yet — the
+/// other side of the same guideline, under its own sentence.
+fn certificate_not_yet_valid() -> ImportCertificateError {
+    validation_exception(
+        "The certificate is not valid yet. You can Import a certificate only during its \
+         validity period.",
+    )
+}
+
+/// The refusal for a `CertificateChain` carrying a certificate whose validity window has
+/// CLOSED. Fixed text, as recorded against the service: the sentence names the chain
+/// rather than the certificate being imported, and no member of it is identified.
+fn chain_certificate_expired() -> ImportCertificateError {
+    validation_exception(
+        "A certificate in the chain is expired. You can Import a certificate only during \
+         its validity period.",
+    )
+}
+
+/// The refusal for a `CertificateChain` carrying a certificate whose validity window has
+/// NOT OPENED yet — the other side of the same guideline, under its own sentence.
+fn chain_certificate_not_yet_valid() -> ImportCertificateError {
+    validation_exception(
+        "A certificate in the chain is not valid yet. You can Import a certificate only \
+         during its validity period.",
+    )
 }
 
 /// The refusal for a `CertificateChain` that is not a PEM encoding of certificates —
