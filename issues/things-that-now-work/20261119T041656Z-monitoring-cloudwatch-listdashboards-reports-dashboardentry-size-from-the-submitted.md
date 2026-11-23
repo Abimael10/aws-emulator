@@ -57,3 +57,46 @@ Emulator code carrying the defect (citations only):
    c. Read DashboardEntries[0].Size.
 4. Observed: Size equals the submitted DashboardBody's byte length plus the 25 bytes of the appended `,"periodOverride":"auto"` member (130 for this fixture's body).
 5. Expected: Size equals the byte length of the dashboard document the service holds after completing the submitted body with every member CloudWatch defaults — several times the submitted body for a minimal body (323 for this fixture's body).
+
+## Disposition
+
+DECLINED, the one cause: the recorded `Size` is this one run's number for a document the replayed
+request does not carry, so no rule over the request or over stored state reproduces it, and the rule
+the report asks for is contradicted by the corpus's own `GetDashboard` recordings.
+
+* The rule stands as implemented and is unchanged by this report: `DashboardEntry$Size` ("The size
+  of the dashboard, in bytes.") is the byte length of the document the service holds for the
+  dashboard — the text the write submitted, byte for byte, completed with the top-level members of
+  the dashboard body structure the body left to the service. One function builds that document
+  (`src/state/dashboard_document.rs`), the write counts it once (`src/ops/put_dashboard.rs`) and the
+  listing projects that count (`src/ops/list_dashboards.rs`).
+* That rule states four of this corpus's five recorded dashboard sizes EXACTLY, each over a
+  different body: 125 bytes recorded at 149 and 141 bytes recorded at 165 — each its own text plus
+  the 24 bytes of the member the service fills in (`cloudwatch-dashboard-create-update-and-invalid-body#task#3`,
+  `cloudwatch-dashboard-crud-round-trip#task#3`, `monitoring-dashboard-lifecycle#task#3`,
+  `monitoring-dashboard-put-get-delete-lifecycle#task#3`, all replaying clean). This fixture's
+  106-byte body is recorded at 323, which exceeds its own text by 217 bytes.
+* The report's hypothesis — that the service completes the WHOLE document, per-widget layout and
+  rendering members included, and measures that — is contradicted by the same corpus: its
+  `GetDashboard` recordings answer the submitted text byte for byte across 11 steps of these
+  fixtures (`20261029T203422Z-monitoring-cloudwatch-dashboard-bodies-are-re-serialized-breaking-byte.md`),
+  and a service holding a document it had filled per-widget members into would answer them there.
+  Completing the whole document would also move the four units above off their recorded sizes,
+  since their widgets already carry what such a completion would add.
+* Everything else the excess could be a function of was measured by replay in the two earlier
+  reports of the same unit
+  (`20261118T152357Z-monitoring-listdashboards-reports-dashboardentry-size-as-the-raw-submitted.md`,
+  `20261029T203422Z-…-dashboard-bodies-are-re-serialized-breaking-byte.md`): the document's bytes,
+  those bytes completed, the compact rendering of the completed document, the dashboard's name, its
+  tag's text, the tag as a JSON member, as a key/value map, as the modelled `{Key,Value}` object,
+  as a `TagList` array, and a flat per-tag cost. None of them is 217 bytes, and no published
+  default set of the dashboard body structure sums to it either. Reproducing 323 would mean writing
+  one recording's number into the handler for one fixture's body.
+* Consequence: this unit still diverges on `$.DashboardEntries[0].Size` only. Status, name, ARN and
+  the entry's other members match.
+* Pinned instead, over the dimension this report is about:
+  `tests/all/dashboard_size_current_document.rs` walks each widget kind the body structure defines
+  written with nothing but the member that kind requires (and the same widget written out in full,
+  and the two mixed), asserting that such a dashboard is measured by the text it was written with —
+  the text its reader answers — and that the number follows the document the dashboard holds now,
+  across a replacement, a name freed and taken again, and a second listing.

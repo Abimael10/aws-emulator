@@ -88,7 +88,7 @@ fn spaced_text_widget(label: &str) -> String {
 }
 
 /// The `DashboardEntry` a listing reports for `name`.
-async fn listed_entry(
+pub async fn listed_entry(
     router: &smithy_server_runtime::MultiServiceRouter,
     name: &str,
 ) -> Option<Value> {
@@ -107,7 +107,7 @@ async fn listed_entry(
 
 /// Write `body` as the dashboard `name`, then answer the size the listing reports for it and the
 /// document `GetDashboard` reads back.
-async fn written_size_and_body(
+pub async fn written_size_and_body(
     router: &smithy_server_runtime::MultiServiceRouter,
     name: &str,
     body: &str,
