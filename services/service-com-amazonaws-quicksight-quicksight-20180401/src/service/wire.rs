@@ -2,26 +2,28 @@
 
 //! How this service's `restJson1` answers report the request id of a FAILED call.
 //!
-//! RULE: a failed call of this service reports the request id in BOTH places AWS puts it —
-//! the `RequestId` member of the error document, which every exception shape of this model
-//! declares (`smithy_query(query="shape",
+//! RULE: a failed call of this service reports the request id of the call in the
+//! `x-amzn-RequestId` response header ONLY, and its error document carries just the members
+//! the service fills for the class — the message, and the resource discriminator where it
+//! sets one. The `RequestId` member every exception shape of this model declares
+//! (`smithy_query(query="shape",
 //! shape="ResourceNotFoundException,ResourceExistsException,LimitExceededException",
-//! model_path="services/service-com-amazonaws-quicksight-quicksight-20180401/smithy-model/com-amazonaws-quicksight-quicksight-20180401.json")`),
-//! and the `x-amzn-RequestId` response header every answer of an AWS service carries. The
-//! two report the SAME id: the one the refusing handler allocated for the call. A SUCCESS
-//! is the same contract read through the output shapes, which declare `RequestId` as a body
-//! member too.
+//! model_path="services/service-com-amazonaws-quicksight-quicksight-20180401/smithy-model/com-amazonaws-quicksight-quicksight-20180401.json")`)
+//! is optional, and a failure leaves it out of the document. A SUCCESS is the other half of
+//! the same contract: an output shape declares `RequestId` as a body member and an answer
+//! that succeeds states it there.
 //!
 //! The framework's generic serializer writes the document — every member the handler set,
-//! the request id among them — but knows nothing of the header, and `vendor/` is read-only,
-//! so the one addition lives at the seam a service owns over the answers it writes:
+//! the request id among them — and knows nothing of the header, and `vendor/` is read-only,
+//! so both halves of the rule live at the seam a service owns over the answers it writes:
 //! [`RequestIdInHeaderRestJson`] is the protocol `service.rs` hands the dispatch sequence
 //! through [`smithy_server_runtime::Service::override_protocol`], so EVERY modelled failure
 //! of EVERY operation goes out the same way and no handler, shape declaration or error
-//! constructor mentions the rendering at all. The id is OBSERVED as the document is
-//! written, never re-minted here, so the header can only ever repeat what the body says;
-//! an error shape that declares no such member is rendered exactly as the framework writes
-//! it and reports no id anywhere.
+//! constructor mentions the rendering at all. The id a handler allocated is OBSERVED as the
+//! document is written and WITHHELD from it, never re-minted here, so the header can only
+//! ever report the id the refusing handler allocated for this call; an error shape that
+//! declares no such member is rendered exactly as the framework writes it and reports no id
+//! anywhere.
 //!
 //! Everything else is the framework's own `restJson1` protocol, delegated to unchanged:
 //! routing, request deserialization, success bodies, the status, `x-amzn-errortype` and
@@ -62,8 +64,9 @@ fn request_id_member(error_schema: &Schema) -> Option<&Schema> {
     })
 }
 
-/// An error structure serialized exactly as the framework writes it, with the request id it
-/// carries noted in `observed` so the response can repeat it in its header.
+/// An error structure serialized as the framework writes it except for the request id it
+/// carries, which is noted in `observed` for the response header and left out of the
+/// document.
 struct RequestIdObserved<'a> {
     inner: &'a dyn SerializableStruct,
     request_id: &'a Schema,
@@ -82,8 +85,8 @@ impl SerializableStruct for RequestIdObserved<'_> {
 }
 
 /// The serializer an error's members are written through: every write is the wrapped
-/// serializer's, unchanged, and a write of the request-id member is additionally noted so
-/// the response can report the same id in its header.
+/// serializer's, unchanged, except the write of the request-id member, which is noted for
+/// the response header instead of reaching the document.
 struct Observing<'a> {
     inner: &'a mut dyn ShapeSerializer,
     member_name: Option<&'a str>,
@@ -91,7 +94,7 @@ struct Observing<'a> {
 }
 
 impl Observing<'_> {
-    /// Whether `schema` is the member whose value the header repeats.
+    /// Whether `schema` is the member whose value the header reports.
     fn observes(&self, schema: &Schema) -> bool {
         self.member_name.is_some() && schema.member_name() == self.member_name
     }
@@ -160,9 +163,11 @@ impl ShapeSerializer for Observing<'_> {
 
     fn write_string(&mut self, schema: &Schema, value: &str) -> Result<(), SerdeError> {
         if self.observes(schema) {
-            // The id the handler allocated for this call: written to the document by the
-            // wrapped serializer below, and noted here so the header repeats it.
+            // The id the handler allocated for this call: noted here for the header, and
+            // NOT passed to the wrapped serializer, so the error document does not carry
+            // the member.
             *self.observed.borrow_mut() = Some(value.to_string());
+            return Ok(());
         }
         self.inner.write_string(schema, value)
     }
@@ -185,8 +190,8 @@ impl ShapeSerializer for Observing<'_> {
 }
 
 /// The `restJson1` codec that reports a failure's request id in the `x-amzn-RequestId`
-/// response header as well as in the error document the model declares it in: the model's
-/// own protocol in every other respect.
+/// response header alone, withholding the optional member the model declares it under from
+/// the error document: the model's own protocol in every other respect.
 #[derive(Debug)]
 pub struct RequestIdInHeaderRestJson {
     inner: RestJsonServerProtocol,
@@ -276,8 +281,8 @@ impl ServerProtocol for RequestIdInHeaderRestJson {
         )?;
         // Dropped rather than fatal if the HTTP layer cannot carry the value: `try_insert`
         // is the fallible half of the insert the framework itself uses on the error path,
-        // where a panic would become a 500 an SDK retries. The document already carries the
-        // id, so a dropped header costs a client nothing it cannot read from the body.
+        // where a panic would become a 500 an SDK retries. A value no header can carry is
+        // not reported rather than turning a modelled refusal into a server failure.
         if let Some(id) = observed.into_inner() {
             let _ = response.headers_mut().try_insert(REQUEST_ID_HEADER, id);
         }

@@ -474,7 +474,7 @@ async fn a_request_naming_no_release_label_is_refused_as_an_empty_one() {
 }
 
 // ---------------------------------------------------------------------------
-// StepConcurrencyLevel: one band, one sentence, every operation that takes it
+// StepConcurrencyLevel: two classes, and each plane's wording for them
 // ---------------------------------------------------------------------------
 
 /// The documented band a step concurrency level lies in: "The default value is 1. The
@@ -482,27 +482,37 @@ async fn a_request_naming_no_release_label_is_refused_as_an_empty_one() {
 /// and a maximum of 256 steps" (`ModifyCluster$StepConcurrencyLevel` doc).
 const STEP_CONCURRENCY_BAND: (i64, i64) = (1, 256);
 
-/// The highest level the band-stating refusal is answered for, exported by the service as
-/// `state::MAX_BAND_STATED_STEP_CONCURRENCY_LEVEL`: a level past it is outside every band
-/// the service serves.
+/// The most concurrent steps any step execution mode runs, exported by the service as
+/// `state::MAX_DISTRIBUTED_STEP_CONCURRENCY_LEVEL` and named by the launch's own refusal: a
+/// level past it is one no mode runs.
 const WIDEST_STEP_CONCURRENCY_CEILING: i64 = 6400;
 
-/// The sentence a level outside EVERY band the service serves is refused with: entirely
-/// fixed text, naming no band and nothing of the request.
+/// The sentence a MODIFICATION of a level no mode runs is refused with: entirely fixed
+/// text, naming no band and nothing of the request.
 const BEYOND_EVERY_BAND_SENTENCE: &str = "Invalid step concurrency level.";
 
-/// The sentence a level above the documented maximum but no higher than the highest level
-/// a band is stated for is refused with: the bare sentence extended with the clause stating
-/// the band the member may use.
-const ABOVE_THE_BAND_SENTENCE: &str =
-    "Invalid step concurrency level. Allowed level is from 1 to 256";
+/// The sentence that STATES the band the member may use: the bare sentence extended with
+/// the band clause. The launch answers it for a level no mode runs; the modification for one
+/// above the documented maximum that a mode does run.
+const BAND_STATING_SENTENCE: &str = "Invalid step concurrency level. Allowed level is from 1 to 256";
 
-/// THE RULE: a `StepConcurrencyLevel` outside the documented band is refused with the
-/// entirely fixed sentence of the class it falls into — the bare sentence for a level
-/// outside every band the service serves, and that sentence extended with the band clause
-/// for one just above the documented maximum — on every operation that takes the member; a
-/// level inside the band is stored and read back. Rows span either side of each published
-/// bound and far past both.
+/// The sentence a LAUNCH of a level above the documented maximum that a mode still runs is
+/// refused with: the mode to set, and the level the request asked for.
+fn mode_stating_sentence(level: i64) -> String {
+    let (_, high) = STEP_CONCURRENCY_BAND;
+    format!(
+        "StepConcurrencyLevel {level} exceeds the maximum ({high}) for StepExecutionMode \
+         STANDARD. Set StepExecutionMode to DISTRIBUTED for up to \
+         {WIDEST_STEP_CONCURRENCY_CEILING} concurrent steps."
+    )
+}
+
+/// THE RULE: a `StepConcurrencyLevel` outside the documented band falls into one of two
+/// classes — above the maximum but still a level a step execution mode runs, or outside what
+/// any mode runs — and each plane words those classes its own way: the launch names the mode
+/// that runs the level it was asked for, or states the band it enforces, while the
+/// modification states that band, or answers the bare sentence; a level inside the band is
+/// stored and read back. Rows span either side of each published bound and far past both.
 #[tokio::test]
 async fn a_step_concurrency_level_outside_the_band_is_refused_per_side_of_the_band() {
     let emr = Emr::new();
@@ -510,19 +520,45 @@ async fn a_step_concurrency_level_outside_the_band_is_refused_per_side_of_the_ba
     let (low, high) = STEP_CONCURRENCY_BAND;
     let widest = WIDEST_STEP_CONCURRENCY_CEILING;
 
-    let out_of_band = [
-        (low - 1, BEYOND_EVERY_BAND_SENTENCE),
-        (low - 2, BEYOND_EVERY_BAND_SENTENCE),
-        (-1, BEYOND_EVERY_BAND_SENTENCE),
-        (high + 1, ABOVE_THE_BAND_SENTENCE),
-        (high + 2, ABOVE_THE_BAND_SENTENCE),
-        (widest, ABOVE_THE_BAND_SENTENCE),
-        (widest + 1, BEYOND_EVERY_BAND_SENTENCE),
-        (10_000, BEYOND_EVERY_BAND_SENTENCE),
-        (i64::from(i32::MAX), BEYOND_EVERY_BAND_SENTENCE),
+    // Each row: the level, the sentence the LAUNCH answers, and the sentence the
+    // MODIFICATION answers.
+    let out_of_band: Vec<(i64, String, &str)> = vec![
+        (
+            low - 1,
+            BAND_STATING_SENTENCE.to_string(),
+            BEYOND_EVERY_BAND_SENTENCE,
+        ),
+        (
+            low - 2,
+            BAND_STATING_SENTENCE.to_string(),
+            BEYOND_EVERY_BAND_SENTENCE,
+        ),
+        (
+            -1,
+            BAND_STATING_SENTENCE.to_string(),
+            BEYOND_EVERY_BAND_SENTENCE,
+        ),
+        (high + 1, mode_stating_sentence(high + 1), BAND_STATING_SENTENCE),
+        (high + 2, mode_stating_sentence(high + 2), BAND_STATING_SENTENCE),
+        (widest, mode_stating_sentence(widest), BAND_STATING_SENTENCE),
+        (
+            widest + 1,
+            BAND_STATING_SENTENCE.to_string(),
+            BEYOND_EVERY_BAND_SENTENCE,
+        ),
+        (
+            10_000,
+            BAND_STATING_SENTENCE.to_string(),
+            BEYOND_EVERY_BAND_SENTENCE,
+        ),
+        (
+            i64::from(i32::MAX),
+            BAND_STATING_SENTENCE.to_string(),
+            BEYOND_EVERY_BAND_SENTENCE,
+        ),
     ];
 
-    for (level, sentence) in out_of_band {
+    for (level, launch_says, modification_says) in out_of_band {
         let case = format!("RunJobFlow with StepConcurrencyLevel {level}");
         let mut request = minimal_request("out of band");
         request["StepConcurrencyLevel"] = json!(level);
@@ -530,8 +566,8 @@ async fn a_step_concurrency_level_outside_the_band_is_refused_per_side_of_the_ba
         assert_refused(&case, status, &payload, REQUEST_VALIDATION);
         assert_eq!(
             message(&case, &payload),
-            sentence,
-            "case {case:?}: expected {sentence:?}, got {payload}"
+            launch_says,
+            "case {case:?}: expected {launch_says:?}, got {payload}"
         );
 
         let case = format!("ModifyCluster with StepConcurrencyLevel {level}");
@@ -544,8 +580,8 @@ async fn a_step_concurrency_level_outside_the_band_is_refused_per_side_of_the_ba
         assert_refused(&case, status, &payload, SERVICE_ERROR);
         assert_eq!(
             message(&case, &payload),
-            sentence,
-            "case {case:?}: expected {sentence:?}, got {payload}"
+            modification_says,
+            "case {case:?}: expected {modification_says:?}, got {payload}"
         );
     }
 

@@ -1,19 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! WHICH of Amazon EMR's two step-concurrency refusals a `StepConcurrencyLevel` earns, end
-//! to end over the wire.
+//! WHICH step-concurrency refusal a `StepConcurrencyLevel` earns, end to end over the
+//! wire.
 //!
-//! THE RULE: a level outside the band the member documents is refused with the entirely
-//! FIXED sentence of the class it falls into — the BARE sentence, which states no band at
-//! all, for a level outside every band the service serves (below the documented minimum, or
-//! above the highest level a band is stated for), and that same bare sentence EXTENDED with
-//! the clause naming the enforced band for a level just above the documented maximum.
-//! Neither sentence carries any part of the request: the level that was refused appears in
-//! neither, and a refusal leaves the level the cluster already holds alone.
+//! THE RULE: a level outside the band the member documents falls into one of two classes —
+//! above the maximum but still a level a step execution mode runs, or outside what any mode
+//! runs — and each PLANE words those two classes its own way. The LAUNCH names the mode
+//! that runs the level it was asked for for the first class, and states the band it enforces
+//! for the second; the MODIFICATION states that band for the first class, and answers the
+//! BARE sentence, which states no band at all, for the second. Only the launch's
+//! mode-naming sentence carries anything of the request — the level the caller is being told
+//! how to get — and a refusal leaves the level the cluster already holds alone.
 //!
 //! The table walks the class partition by its boundaries — one below the minimum and far
 //! below it, each end of the accepted band, one above the maximum, each end of the
-//! band-stating class, and one above it and far above it — on both operations that take the
+//! mode-served class, and one above it and far above it — on both operations that take the
 //! member: `RunJobFlow`, which judges a cluster being launched, and `ModifyCluster`, which
 //! judges one already running. Nothing reaches into the service's state: an accepted level
 //! is only ever read back through `DescribeCluster`.
@@ -34,32 +35,54 @@ const MODELLED_CLIENT_ERROR: &str = "InvalidRequestException";
 const MIN_LEVEL: i64 = 1;
 const MAX_LEVEL: i64 = 256;
 
-/// The highest level the band-stating refusal is answered for, which the service holds as
-/// `state::MAX_BAND_STATED_STEP_CONCURRENCY_LEVEL`.
-const MAX_BAND_STATED_LEVEL: i64 = 6400;
+/// The most concurrent steps any step execution mode runs, which the service holds as
+/// `state::MAX_DISTRIBUTED_STEP_CONCURRENCY_LEVEL` and the launch's own refusal names.
+const MAX_MODE_SERVED_LEVEL: i64 = 6400;
 
-/// The two sentences, each entirely fixed text.
+/// The sentences, each entirely fixed text.
 const BARE: &str = "Invalid step concurrency level.";
 const WITH_BAND: &str = "Invalid step concurrency level. Allowed level is from 1 to 256";
+
+/// The launch's sentence for a level a mode could still run: fixed text around the level
+/// the request asked for.
+fn names_the_mode(level: i64) -> String {
+    format!(
+        "StepConcurrencyLevel {level} exceeds the maximum ({MAX_LEVEL}) for StepExecutionMode \
+         STANDARD. Set StepExecutionMode to DISTRIBUTED for up to {MAX_MODE_SERVED_LEVEL} \
+         concurrent steps."
+    )
+}
 
 /// What a level earns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Class {
     /// Inside the documented band: stored, echoed and read back.
     Accepted,
-    /// Outside every band the service serves: the bare sentence.
-    Bare,
-    /// Above the documented maximum but still a level a band is stated for.
-    WithBand,
+    /// Outside what any step execution mode runs — below the documented minimum, or above
+    /// the ceiling the mode-naming sentence publishes.
+    BeyondEveryMode,
+    /// Above the documented maximum but still a level a mode runs.
+    AboveTheBand,
 }
 
 impl Class {
-    /// The sentence this class is refused with, or `None` when it is not a refusal.
-    fn sentence(self) -> Option<&'static str> {
+    /// The sentence a MODIFICATION of this class is refused with, or `None` when it is not
+    /// a refusal.
+    fn modification_sentence(self) -> Option<String> {
         match self {
             Class::Accepted => None,
-            Class::Bare => Some(BARE),
-            Class::WithBand => Some(WITH_BAND),
+            Class::BeyondEveryMode => Some(BARE.to_string()),
+            Class::AboveTheBand => Some(WITH_BAND.to_string()),
+        }
+    }
+
+    /// The sentence a LAUNCH of this class is refused with, or `None` when it is not a
+    /// refusal.
+    fn launch_sentence(self, level: i64) -> Option<String> {
+        match self {
+            Class::Accepted => None,
+            Class::BeyondEveryMode => Some(WITH_BAND.to_string()),
+            Class::AboveTheBand => Some(names_the_mode(level)),
         }
     }
 }
@@ -67,20 +90,20 @@ impl Class {
 /// The boundaries of the partition, each with the class it falls into.
 fn rows() -> Vec<(i64, Class)> {
     vec![
-        (i64::from(i32::MIN), Class::Bare),
-        (-1, Class::Bare),
-        (MIN_LEVEL - 1, Class::Bare),
+        (i64::from(i32::MIN), Class::BeyondEveryMode),
+        (-1, Class::BeyondEveryMode),
+        (MIN_LEVEL - 1, Class::BeyondEveryMode),
         (MIN_LEVEL, Class::Accepted),
         (MIN_LEVEL + 1, Class::Accepted),
         ((MIN_LEVEL + MAX_LEVEL) / 2, Class::Accepted),
         (MAX_LEVEL, Class::Accepted),
-        (MAX_LEVEL + 1, Class::WithBand),
-        (MAX_LEVEL + 2, Class::WithBand),
-        (MAX_BAND_STATED_LEVEL - 1, Class::WithBand),
-        (MAX_BAND_STATED_LEVEL, Class::WithBand),
-        (MAX_BAND_STATED_LEVEL + 1, Class::Bare),
-        (10_000, Class::Bare),
-        (i64::from(i32::MAX), Class::Bare),
+        (MAX_LEVEL + 1, Class::AboveTheBand),
+        (MAX_LEVEL + 2, Class::AboveTheBand),
+        (MAX_MODE_SERVED_LEVEL - 1, Class::AboveTheBand),
+        (MAX_MODE_SERVED_LEVEL, Class::AboveTheBand),
+        (MAX_MODE_SERVED_LEVEL + 1, Class::BeyondEveryMode),
+        (10_000, Class::BeyondEveryMode),
+        (i64::from(i32::MAX), Class::BeyondEveryMode),
     ]
 }
 
@@ -104,7 +127,7 @@ async fn modify_cluster_refuses_each_step_concurrency_class_with_its_own_sentenc
             )
             .await;
 
-        match class.sentence() {
+        match class.modification_sentence() {
             Some(sentence) => {
                 assert_refused(&case, status, &payload, MODELLED_CLIENT_ERROR);
                 let said = message(&case, &payload);
@@ -114,8 +137,8 @@ async fn modify_cluster_refuses_each_step_concurrency_class_with_its_own_sentenc
                 );
                 assert!(
                     !said.contains(&level.to_string()),
-                    "case {case:?}: the sentence is fixed text, so {level} must not appear \
-                     in {said:?}"
+                    "case {case:?}: this plane's sentences are fixed text, so {level} must \
+                     not appear in {said:?}"
                 );
             }
             None => {
@@ -143,10 +166,10 @@ async fn modify_cluster_refuses_each_step_concurrency_class_with_its_own_sentenc
     }
 }
 
-/// `RunJobFlow` judges the member the same way: the launch is refused with the same
-/// sentence per class, and a level the band takes launches a cluster that reports it.
+/// `RunJobFlow` judges the member on its own plane: each class earns the launch's own
+/// sentence for it, and a level the band takes launches a cluster that reports it.
 #[tokio::test]
-async fn run_job_flow_refuses_each_step_concurrency_class_with_the_same_sentence() {
+async fn run_job_flow_refuses_each_step_concurrency_class_with_its_own_sentence() {
     let emr = Emr::new();
 
     for (level, class) in rows() {
@@ -155,7 +178,7 @@ async fn run_job_flow_refuses_each_step_concurrency_class_with_the_same_sentence
         request["StepConcurrencyLevel"] = json!(level);
         let (status, payload) = emr.call("RunJobFlow", request).await;
 
-        match class.sentence() {
+        match class.launch_sentence(level) {
             Some(sentence) => {
                 // The member carries no range in the model, so a launch is refused through
                 // the request-validation channel rather than a modelled error.
@@ -165,11 +188,15 @@ async fn run_job_flow_refuses_each_step_concurrency_class_with_the_same_sentence
                     said, sentence,
                     "case {case:?}: expected {sentence:?}, got {said:?}"
                 );
-                assert!(
-                    !said.contains(&level.to_string()),
-                    "case {case:?}: the sentence is fixed text, so {level} must not appear \
-                     in {said:?}"
-                );
+                if class == Class::BeyondEveryMode {
+                    // The band-stating sentence is fixed text: nothing of the request
+                    // reaches it, the refused level included.
+                    assert!(
+                        !said.contains(&level.to_string()),
+                        "case {case:?}: the band-stating sentence is fixed text, so {level} \
+                         must not appear in {said:?}"
+                    );
+                }
             }
             None => {
                 assert_eq!(
@@ -204,9 +231,10 @@ async fn refusal_of(emr: &Emr, cluster: &str, level: i64) -> String {
     message(&case, &payload)
 }
 
-/// The two sentences are the SAME sentence, one of them extended: the band-stating refusal
-/// begins with the bare refusal's own text, and only the band clause separates them. Both
-/// texts come from the service's own answers rather than from a constant in this file.
+/// The two sentences the MODIFICATION plane answers are the SAME sentence, one of them
+/// extended: the band-stating refusal begins with the bare refusal's own text, and only the
+/// band clause separates them. Both texts come from the service's own answers rather than
+/// from a constant in this file.
 #[tokio::test]
 async fn the_band_stating_sentence_extends_the_bare_one() {
     let emr = Emr::new();

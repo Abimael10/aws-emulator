@@ -177,9 +177,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // minimum of 1 step and a maximum of 256 steps."
         // (`ModifyCluster$StepConcurrencyLevel` doc.) The model types the member as a
         // plain integer, so the band is enforced here rather than at the boundary, with
-        // Amazon EMR's own sentence for the class the refused level falls into.
+        // this plane's own sentence for the class the refused level falls into
+        // ([`crate::state::modify_step_concurrency_level_violation`]).
         if let Some(level) = input.step_concurrency_level {
-            if let Some(message) = crate::state::step_concurrency_level_violation(level) {
+            if let Some(message) = crate::state::modify_step_concurrency_level_violation(level) {
                 return Err(ModifyClusterErrorModeled::InvalidRequestException(
                     InvalidRequestException {
                         error_code: None,

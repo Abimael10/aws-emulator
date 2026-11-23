@@ -778,8 +778,40 @@ struct Modification {
     engine: &'static str,
     /// The members the modification carries beyond `DBInstanceIdentifier`.
     request: &'static [(&'static str, &'static str)],
+    /// Whether the modification also names the maintenance window it is parked for, which a
+    /// row about a PARKED change must ([`a_closed_maintenance_window`]).
+    names_its_window: bool,
     /// Whether the settled instance still has a change outstanding.
     leaves_pending: bool,
+}
+
+/// A weekly maintenance window that is NOT open while this case runs, so a modification
+/// parked for it stays parked.
+///
+/// The window is the schedule a deferred modification is applied in — "changes to the DB
+/// instance are applied during the next maintenance window" — so a case about a change that
+/// is still PENDING has to name a window that is closed, and the default window is only
+/// closed for most of the week. Which of the week's candidates is closed is asked of the
+/// service's own reading of a window (`st::window_is_open`) rather than assumed from a time
+/// of day: each candidate is a half hour of a different day, so at most one of them is open
+/// at any instant and the case does not depend on the hour the host runs it.
+fn a_closed_maintenance_window() -> &'static str {
+    const CANDIDATES: [&str; 7] = [
+        "mon:03:00-mon:03:30",
+        "tue:03:00-tue:03:30",
+        "wed:03:00-wed:03:30",
+        "thu:03:00-thu:03:30",
+        "fri:03:00-fri:03:30",
+        "sat:03:00-sat:03:30",
+        "sun:03:00-sun:03:30",
+    ];
+    let now = std::time::SystemTime::now();
+    CANDIDATES
+        .into_iter()
+        .find(|window| !st::window_is_open(window, now))
+        .unwrap_or_else(|| {
+            panic!("one half hour a day cannot all be open at once, got {CANDIDATES:?}")
+        })
 }
 
 /// The two forms of a modification, plus the instance nothing has modified at all.
@@ -789,6 +821,7 @@ const MODIFICATIONS: &[Modification] = &[
         identifier: "emu-pending-untouched",
         engine: "postgres",
         request: &[],
+        names_its_window: false,
         leaves_pending: false,
     },
     Modification {
@@ -800,6 +833,7 @@ const MODIFICATIONS: &[Modification] = &[
             ("AllocatedStorage", "25"),
             ("ApplyImmediately", "true"),
         ],
+        names_its_window: false,
         leaves_pending: false,
     },
     Modification {
@@ -810,6 +844,7 @@ const MODIFICATIONS: &[Modification] = &[
             ("DBInstanceClass", "db.t3.small"),
             ("ApplyImmediately", "false"),
         ],
+        names_its_window: true,
         leaves_pending: true,
     },
 ];
@@ -828,6 +863,15 @@ async fn every_db_instance_reports_what_it_has_pending_and_the_empty_element_whe
             let mut request = params!["DBInstanceIdentifier" => row.identifier].to_vec();
             for (member, value) in row.request {
                 request.push((member, (*value).to_string()));
+            }
+            if row.names_its_window {
+                // The window the change is parked for, which the same call stores: a window
+                // that is closed while the case runs, so the parked settings are still
+                // pending when the instance is read back.
+                request.push((
+                    "PreferredMaintenanceWindow",
+                    a_closed_maintenance_window().to_string(),
+                ));
             }
             expect_ok(row.case, call(&router, "ModifyDBInstance", &request).await);
         }
