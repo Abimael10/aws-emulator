@@ -472,15 +472,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::MFA_SMS_CONFIGURATION_REQUIRED_MESSAGE.to_string(),
             ));
         }
-        // A pool sends SMS by assuming the role its `SmsConfiguration` names, so a
-        // role that does not let Amazon Cognito assume it is refused rather than
-        // stored as a delivery path that could never send
-        // ([`crate::state::sms_caller_role_is_unassumable`]). Awaited with no state
+        // A pool sends SMS by assuming the role its `SmsConfiguration` names and
+        // publishing as it, so a role that does not let Amazon Cognito assume it,
+        // or whose permissions do not let it publish, is refused rather than
+        // stored as a delivery path that could never send — each with its own
+        // error ([`crate::state::sms_caller_role_verdict`]). Awaited with no state
         // guard held, before the pool exists.
-        if crate::state::sms_caller_role_is_unassumable(ctx, &region, pool.sms_configuration.as_ref())
-            .await
+        match crate::state::sms_caller_role_verdict(
+            ctx,
+            &region,
+            &pool.arn,
+            pool.sms_configuration.as_ref(),
+        )
+        .await
         {
-            return Err(invalid_sms_role_trust_relationship());
+            crate::state::SmsCallerRole::Usable => {}
+            crate::state::SmsCallerRole::Unassumable => {
+                return Err(invalid_sms_role_trust_relationship())
+            }
+            crate::state::SmsCallerRole::WithholdsPublish => {
+                return Err(invalid_sms_role_access_policy())
+            }
         }
 
         // A pool configuration member whose feature plan the pool is not on is
@@ -556,6 +568,19 @@ fn invalid_sms_role_trust_relationship() -> CreateUserPoolError {
     CreateUserPoolErrorModeled::InvalidSmsRoleTrustRelationshipException(
         InvalidSmsRoleTrustRelationshipException {
             message: Some(crate::state::SMS_ROLE_TRUST_RELATIONSHIP_MESSAGE.to_string()),
+        },
+    )
+    .into()
+}
+
+/// This operation's `InvalidSmsRoleAccessPolicyException` for an
+/// `SmsConfiguration` naming a role Amazon Cognito can assume but whose
+/// permissions do not let it publish the message
+/// ([`crate::state::SMS_ROLE_ACCESS_POLICY_MESSAGE`]).
+fn invalid_sms_role_access_policy() -> CreateUserPoolError {
+    CreateUserPoolErrorModeled::InvalidSmsRoleAccessPolicyException(
+        InvalidSmsRoleAccessPolicyException {
+            message: Some(crate::state::SMS_ROLE_ACCESS_POLICY_MESSAGE.to_string()),
         },
     )
     .into()

@@ -195,17 +195,24 @@ pub fn admin_only_recovery_combined(setting: &AccountRecoverySettingType) -> boo
 
 /// The service principal THIS service assumes a caller-supplied role as, so that
 /// role's trust policy has to admit it: a pool's SMS caller role
-/// ([`sms_caller_role_is_unassumable`]) and a user import job's CloudWatch Logs
+/// ([`sms_caller_role_verdict`]) and a user import job's CloudWatch Logs
 /// role ([`crate::state::IMPORT_LOGS_SERVICE_PRINCIPAL`]) are taken on by one
 /// service, so the gates that read them cannot disagree about who is assuming.
 pub const COGNITO_IDP_SERVICE_PRINCIPAL: &str = "cognito-idp.amazonaws.com";
 
 /// The message a user-pool write is refused with when the role its
 /// `SmsConfiguration` names does not let Amazon Cognito assume it
-/// ([`sms_caller_role_is_unassumable`]). Fixed text, naming neither the role nor
+/// ([`SmsCallerRole::Unassumable`]). Fixed text, naming neither the role nor
 /// the pool.
 pub const SMS_ROLE_TRUST_RELATIONSHIP_MESSAGE: &str =
     "Role does not have a trust relationship allowing Cognito to assume the role";
+
+/// The message a user-pool write is refused with when the role its
+/// `SmsConfiguration` names cannot send the message once assumed
+/// ([`SmsCallerRole::WithholdsPublish`]). Fixed text, naming neither the role,
+/// the pool nor the action: the defect is the same one for every such role.
+pub const SMS_ROLE_ACCESS_POLICY_MESSAGE: &str =
+    "Role does not have permission to publish with SNS";
 
 /// The condition key the assume Amazon Cognito makes presents the external id
 /// under: "if you provide an `ExternalId`, your Amazon Cognito user pool includes
@@ -213,6 +220,45 @@ pub const SMS_ROLE_TRUST_RELATIONSHIP_MESSAGE: &str =
 /// policy to require that Amazon Cognito, and any principal, provide the
 /// `ExternalID`" (`SmsConfigurationType.ExternalId` in this service's model).
 const EXTERNAL_ID_CONDITION_KEY: &str = "sts:ExternalId";
+
+/// The condition key that assume names the resource it is made FOR, which for an
+/// SMS caller role is the user pool the message would leave: the key a trust
+/// policy narrowed to one pool is written over, exactly as the pool's Lambda
+/// triggers present it on the invocation they make
+/// ([`crate::state::lambda_triggers`]).
+const SOURCE_ARN_CONDITION_KEY: &str = "aws:SourceArn";
+
+/// The condition key that assume names the account owning that resource by.
+const SOURCE_ACCOUNT_CONDITION_KEY: &str = "aws:SourceAccount";
+
+/// The IAM action a user pool performs under its SMS caller role: Amazon SNS's
+/// `Publish`, "the ARN of the IAM role in your Amazon Web Services account that
+/// Amazon Cognito will use to send SMS messages" (`SmsConfigurationType` in this
+/// service's model) naming the role it is performed as.
+const SNS_PUBLISH_ACTION: &str = "sns:Publish";
+
+/// The resource that publish names. A text message is published to a PHONE
+/// NUMBER rather than to a topic — Amazon SNS's `Publish` takes "the phone number
+/// to which you want to deliver an SMS message" instead of a target ARN — so the
+/// call names no resource of its own and only a grant covering every resource
+/// lets the role make it.
+const EVERY_RESOURCE: &str = "*";
+
+/// The ARN of the user pool `user_pool_id` names in `region`:
+/// `arn:<partition>:cognito-idp:<region>:<account>:userpool/<UserPoolId>`, the
+/// form [`crate::state::new_user_pool`] mints a pool's own ARN in.
+///
+/// What a write that has not read the pool yet names it by, so the assume it
+/// validates presents the same source ARN the pool's stored one would
+/// ([`UserPool::arn_in_region`]).
+#[must_use]
+pub fn user_pool_arn(region: &str, user_pool_id: &str) -> String {
+    ::engine::emulator_arn(
+        crate::state::SIGNING_NAME,
+        region,
+        &format!("userpool/{user_pool_id}"),
+    )
+}
 
 /// The Amazon SNS caller role `sms_configuration` names, when it names one: the
 /// `SnsCallerArn` it carries, and `None` where that is absent or the member's own
@@ -274,68 +320,136 @@ pub fn names_an_sms_delivery_path(
         })
 }
 
-/// Whether the Amazon SNS caller `sms_configuration` names is one Amazon Cognito
-/// cannot assume.
+/// What IAM answers about the Amazon SNS caller role a pool write names: whether
+/// the pool could send a text message through it at all, and if not, WHICH half of
+/// that is missing.
+///
+/// A pool sends SMS by taking the role on and publishing as it, so the two halves
+/// fail differently and are reported differently — which is the whole point of
+/// this being a verdict rather than a predicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmsCallerRole {
+    /// Nothing IAM answered stops the pool sending through this configuration —
+    /// including a configuration that names no Amazon SNS caller to probe.
+    Usable,
+    /// Amazon Cognito cannot take the role on, so nothing could be sent as it:
+    /// [`SMS_ROLE_TRUST_RELATIONSHIP_MESSAGE`].
+    Unassumable,
+    /// The role is one Amazon Cognito can take on, and the permissions in force
+    /// on it do not let it publish the message:
+    /// [`SMS_ROLE_ACCESS_POLICY_MESSAGE`].
+    WithholdsPublish,
+}
+
+/// What this account's IAM answers about the Amazon SNS caller
+/// `sms_configuration` names, for the pool `user_pool_arn` names.
 ///
 /// "To send SMS messages with Amazon SNS in the Amazon Web Services Region that
 /// you want, the Amazon Cognito user pool uses an Identity and Access Management
 /// (IAM) role in your Amazon Web Services account" — `SnsCallerArn` being "the
 /// ARN of the IAM role in your Amazon Web Services account that Amazon Cognito
 /// will use to send SMS messages" (`SmsConfigurationType` in this service's
-/// model). The pool sends SMS at all only if it can take that role on, and the
-/// configuration is checked by making that assume rather than by storing a
-/// delivery path that could never send. Three answers make it impossible:
+/// model). A pool sends a text message by ASSUMING that role and PUBLISHING as
+/// it, so the configuration is probed by asking IAM both of those questions
+/// rather than by storing a delivery path that could never send.
+///
+/// The assume is [`SmsCallerRole::Unassumable`] on three answers:
 ///
 /// * the value does not NAME an IAM role of this account — it is not an IAM role
 ///   ARN at all, or it names another account, whose roles this account cannot
 ///   hand to Amazon Cognito ([`service_common::iam_role::role_name`]);
 /// * this account's IAM answers that it holds no role under that name, so there
 ///   is no role to assume;
-/// * it holds the role and the trust policy it carries does not grant the assume:
-///   the principal is not admitted, or the assume this configuration would
-///   make — which presents the `ExternalId` it carries under
-///   [`EXTERNAL_ID_CONDITION_KEY`] — is not one the grant's conditions cover.
+/// * it holds the role and the trust policy it carries does not grant the assume
+///   Amazon Cognito would MAKE: the principal is not admitted, or the grant's
+///   conditions do not cover a request presenting the configuration's
+///   `ExternalId` ([`EXTERNAL_ID_CONDITION_KEY`]) for this pool
+///   ([`SOURCE_ARN_CONDITION_KEY`]) in this account
+///   ([`SOURCE_ACCOUNT_CONDITION_KEY`]). Those three are the keys that assume
+///   really carries, so a trust policy narrowed by any of them is read as the
+///   grant it is rather than as a clause nothing satisfies.
 ///
-/// The reading is the tree's one reading of a caller-supplied role for ONE assume
-/// (`service_common::iam_role::role_assume_is_unauthorized_through`), so the
-/// trust document is evaluated where every other service's is. Nothing is refused
-/// on an answer this emulator could not read, or where there is no IAM to ask at
-/// all: a refusal has to be grounded in what IAM said. Await it with no state
-/// guard held.
-pub async fn sms_caller_role_is_unassumable(
+/// A role that CAN be assumed still sends nothing unless the permissions in force
+/// on it allow the publish the pool makes as it
+/// ([`service_common::iam_role::role_withholds_action`], IAM's own simulation of
+/// that role's policies), which is [`SmsCallerRole::WithholdsPublish`] — a
+/// separate defect of a separate document, reported separately.
+///
+/// Both readings are the tree's one reading of a caller-supplied role, so a
+/// document is evaluated where every other service's is. Nothing is refused on an
+/// answer this emulator could not read, or where there is no IAM to ask at all: a
+/// refusal has to be grounded in what IAM said. Await it with no state guard
+/// held.
+pub async fn sms_caller_role_verdict(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     region: &str,
+    user_pool_arn: &str,
     sms_configuration: Option<&SmsConfigurationType>,
-) -> bool {
+) -> SmsCallerRole {
     // An Amazon SNS caller is what this reading is about: a configuration that
     // names none asks for no assume, and neither does one that delivers through
     // End User Messaging instead ([`names_an_sms_caller`]).
     let Some(role_arn) = sns_caller_role_arn(sms_configuration) else {
-        return false;
+        return SmsCallerRole::Usable;
     };
     if ::service_common::iam_role::role_name(role_arn).is_none() {
-        return true;
+        return SmsCallerRole::Unassumable;
     }
-    // The keys the assume Amazon Cognito would make carries. Nothing is stated
-    // for a key the configuration says nothing about, so a trust policy that
-    // narrows the grant to an external id this configuration does not present
-    // is a grant this assume cannot be shown to satisfy.
-    let context: Vec<(String, String)> = sms_configuration
-        .and_then(|sms| sms.external_id.as_deref())
-        .filter(|external_id| !external_id.is_empty())
-        .map(|external_id| {
-            vec![(
-                EXTERNAL_ID_CONDITION_KEY.to_string(),
-                external_id.to_string(),
-            )]
-        })
-        .unwrap_or_default();
-    ::service_common::iam_role::role_assume_is_unauthorized_through(
+    if ::service_common::iam_role::role_assume_is_unauthorized_through(
         ctx.callback(),
         region,
         role_arn,
         COGNITO_IDP_SERVICE_PRINCIPAL,
-        &context,
+        &assume_context(user_pool_arn, sms_configuration),
     )
     .await
+    {
+        return SmsCallerRole::Unassumable;
+    }
+    if ::service_common::iam_role::role_withholds_action(
+        ctx,
+        region,
+        role_arn,
+        SNS_PUBLISH_ACTION,
+        EVERY_RESOURCE,
+    )
+    .await
+    {
+        return SmsCallerRole::WithholdsPublish;
+    }
+    SmsCallerRole::Usable
+}
+
+/// The condition keys the assume Amazon Cognito makes for the pool
+/// `user_pool_arn` names carries: the resource the role is taken on FOR and the
+/// account that owns it, and the external id the configuration presents when it
+/// presents one.
+///
+/// Nothing is stated for a key the request does not really carry, so a trust
+/// policy that narrows the grant to an external id this configuration does not
+/// present is a grant this assume cannot be shown to satisfy.
+fn assume_context(
+    user_pool_arn: &str,
+    sms_configuration: Option<&SmsConfigurationType>,
+) -> Vec<(String, String)> {
+    let mut context = vec![(
+        SOURCE_ARN_CONDITION_KEY.to_string(),
+        user_pool_arn.to_string(),
+    )];
+    if let Some(account) = ::service_common::arn::parse(user_pool_arn)
+        .map(|parsed| parsed.account.to_string())
+        .filter(|account| !account.is_empty())
+    {
+        context.push((SOURCE_ACCOUNT_CONDITION_KEY.to_string(), account));
+    }
+    if let Some(external_id) = sms_configuration
+        .and_then(|sms| sms.external_id.as_deref())
+        .filter(|external_id| !external_id.is_empty())
+    {
+        context.push((
+            EXTERNAL_ID_CONDITION_KEY.to_string(),
+            external_id.to_string(),
+        ));
+    }
+    context
 }

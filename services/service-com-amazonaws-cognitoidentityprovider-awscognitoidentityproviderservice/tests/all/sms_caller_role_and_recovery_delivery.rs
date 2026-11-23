@@ -14,7 +14,10 @@
 //!   configuration carries. Every other answer is
 //!   `InvalidSmsRoleTrustRelationshipException` (HTTP 400) with nothing stored.
 //!   Where there is no IAM to ask, nothing is known about a role of this account
-//!   and the write is served, which the second test pins.
+//!   and the write is served, which the second test pins. The OTHER half of the
+//!   same probe — the permissions the role has to carry to publish the message
+//!   once assumed — is `all/sms_caller_role_publish_grant.rs`, so every role
+//!   here holds that grant and the trust document is what decides its row.
 //! * RULE B — an SMS MFA factor needs a caller to send through: a
 //!   `SmsMfaConfiguration` that names none, while the pool's MFA is on or
 //!   optional, is `InvalidParameterException` (HTTP 400).
@@ -49,6 +52,13 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 
 /// The service principal a user pool sends SMS messages as.
 const COGNITO_PRINCIPAL: &str = "cognito-idp.amazonaws.com";
+
+/// The permissions document every caller role below holds: the publish grant AWS
+/// documents for an Amazon SNS caller role, which a pool needs beside the trust
+/// relationship these rows are about (`all/sms_caller_role_publish_grant.rs`
+/// owns the rule over that half).
+const PUBLISH_GRANT: &str = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\
+     \"Action\":\"sns:Publish\",\"Resource\":\"*\"}]}";
 
 /// The sentence a write is refused with when Amazon Cognito cannot assume the
 /// Amazon SNS caller role the configuration names.
@@ -152,6 +162,11 @@ fn at<'a>(body: &'a Value, path: &str) -> Option<&'a Value> {
 
 /// Create one role through IAM's own `CreateRole` and answer the ARN IAM
 /// persisted for it.
+///
+/// Every role here also holds the publish grant AWS documents for an Amazon SNS
+/// caller ([`PUBLISH_GRANT`]): a pool sends by assuming the role AND publishing
+/// as it, and what these rows are about is the assume, so the permissions half is
+/// satisfied for all of them and the trust document is what decides each row.
 async fn given_role(
     router: &MultiServiceRouter,
     case: &str,
@@ -180,6 +195,26 @@ async fn given_role(
     assert_eq!(
         status, 200,
         "case {case:?}: the role must be created in IAM first, got {status} {xml}"
+    );
+    let granted = format!(
+        "Action=PutRolePolicy&Version=2010-05-08&RoleName={}&PolicyName=sms-publish&\
+         PolicyDocument={}",
+        form_encode(name),
+        form_encode(PUBLISH_GRANT),
+    );
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("host", "iam.amazonaws.com")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Bytes::from(granted))
+        .expect("the request is well formed");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let written = String::from_utf8_lossy(response.body()).to_string();
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the role's publish grant must be stored, got {status} {written}"
     );
     xml_element(&xml, "Arn")
         .unwrap_or_else(|| panic!("case {case:?}: CreateRole answers the role's Arn, got {xml}"))

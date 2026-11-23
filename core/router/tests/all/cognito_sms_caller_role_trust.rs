@@ -24,6 +24,12 @@
 //! with the same error — which is what the recorded wire corpus shows AWS doing
 //! for a configuration naming a role that was never created
 //! (`cognito-idp-acr-traj-enable-phone-recovery-update-mistakes#task#5`).
+//!
+//! The assume is only half the probe: a role Cognito can take on publishes
+//! nothing unless its own permissions allow it to, which is refused apart as
+//! `InvalidSmsRoleAccessPolicyException` and owned by the Cognito crate's
+//! `tests/all/sms_caller_role_publish_grant.rs`. Every role created here
+//! therefore carries that grant, so the trust document is what decides its row.
 
 use std::sync::Arc;
 
@@ -47,6 +53,13 @@ const COGNITO_TARGET_PREFIX: &str = "AWSCognitoIdentityProviderService";
 
 /// The service principal a user pool assumes its SMS caller role as.
 const COGNITO_PRINCIPAL: &str = "cognito-idp.amazonaws.com";
+
+/// The permissions document every role below holds: the publish grant AWS
+/// documents for an Amazon SNS caller role, which a pool needs beside the trust
+/// relationship this suite is about — a pool sends by assuming the role AND
+/// publishing as it.
+const PUBLISH_GRANT: &str = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\
+     \"Action\":\"sns:Publish\",\"Resource\":\"*\"}]}";
 
 /// The sentence a write naming a role Cognito cannot assume is refused with.
 const TRUST_REFUSAL_MESSAGE: &str =
@@ -156,7 +169,8 @@ fn trust_allowing(principals: &[&str]) -> String {
     .to_string()
 }
 
-/// Create a role carrying `document` and return its ARN.
+/// Create a role carrying `document`, with the publish grant every SMS caller
+/// needs ([`PUBLISH_GRANT`]), and return its ARN.
 async fn role(router: &MultiServiceRouter, name: &str, document: &str) -> String {
     let (status, created) = iam(
         router,
@@ -170,6 +184,20 @@ async fn role(router: &MultiServiceRouter, name: &str, document: &str) -> String
     assert_eq!(
         status, 200,
         "CreateRole must persist {name}, got {status}: {created}"
+    );
+    let (status, written) = iam(
+        router,
+        "PutRolePolicy",
+        &[
+            ("RoleName", name),
+            ("PolicyName", "sms-publish"),
+            ("PolicyDocument", PUBLISH_GRANT),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "PutRolePolicy must grant {name} the publish, got {status}: {written}"
     );
     element(&created, "Arn")
 }
