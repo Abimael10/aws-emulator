@@ -44,3 +44,31 @@ Supporting code: services/.../src/ops/create_gateway.rs lines 333-337 set transi
 4. GetGateway(gatewayIdentifier=<gatewayId>) with the owning credentials -> 200; observe `status` is still CREATING.
 5. DeleteGateway(gatewayIdentifier=<gatewayId>) with the owning credentials -> observed 400 ValidationException "DeleteGateway operation can't be performed on gateway when it is in Creating state. Retry the request when the gateway is in a valid state."; AWS accepts the delete (202) and GetGateway then answers 404 ResourceNotFoundException "Failed to retrieve gateway because it doesn't exist. Retry the request with a different resource identifier."
 6. Replay: run the behavioral check bedrock-agentcore-control.delete-gateway-without-iam-permission-denied.
+
+## Resolution
+
+Cause 1 is FIXED. The gateway family's transient window (`GATEWAY_SETTLE_DELAY`, which every
+gateway-family transition is armed from: the gateway's own CREATING and UPDATING spans, the
+DELETING span before its removal, and a target's, a rule's and a rate limit's CREATING spans)
+no longer lasts half a second. The span is chosen, because AWS documents no duration for any
+of these transitions, and what the recordings bound it by is what a CLIENT can observe of it:
+it must still be open when the call that armed it answers, so a caller acting in the same
+breath as its own create observes the transient status and the state refusal that goes with it
+(recorded at `bedrock-agentcore-control-gateway-lifecycle-basic#task#4`), and it must not
+outlive that caller's next calls, so the create-then-tear-down script of this issue's unit —
+which comes back to the gateway after an IAM role create, a policy put, an assume-role and a
+denied probe — is served rather than refused for a wait the emulator invented. The span is now
+of the order of one round trip to this endpoint instead of a wait a caller has to sleep out.
+
+The READY gate in `DeleteGateway` is UNCHANGED: a delete that really does arrive while the
+clock still owes the gateway its transition is still refused 400 `ValidationException` in the
+recorded sentence, which is the half of this issue that was already faithful.
+
+Conflicting fixture, kept on the record: the wire fixture
+`bedrock-agentcore-control-gateway-lifecycle-basic` issues its refused delete (`task#4`) two
+calls after the create, while this issue's unit issues its SERVED delete five calls after it.
+Replayed against an in-process emulator both sequences complete in the same handful of
+milliseconds, so no wall-clock span separates them as the recordings' own latencies did; the
+chosen span follows this issue's bound unit and keeps the refusal reachable for a caller that
+mutates the gateway in the same breath as its create (which is what the service's own tests
+pin), so that fixture's `task#4` may now be served where it recorded a refusal.

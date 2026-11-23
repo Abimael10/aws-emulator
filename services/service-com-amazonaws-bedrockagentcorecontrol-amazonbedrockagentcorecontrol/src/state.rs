@@ -4117,21 +4117,30 @@ pub fn inline_tool_definitions(configuration: &TargetConfiguration) -> Option<&[
     }
 }
 
-/// How long a freshly created gateway or gateway target stays in its transient
-/// status (`CREATING`) before the clock owes it `READY`.
+/// How long a freshly created or updated gateway — and every child of the gateway
+/// family: a target, a rule, a rate limit — stays in its transient status
+/// (`CREATING` / `UPDATING` / `SYNCHRONIZING`) before the clock owes it its
+/// terminal one, and how long a gateway whose deletion was accepted stays
+/// readable in `DELETING` before the clock owes its removal.
 ///
-/// AWS documents no duration for either transition, so the span is chosen: short
-/// enough to keep a client script quick, long enough that a caller acting
-/// straight after the call still observes the transient status.
-/// How long a freshly created or updated gateway stays in its transient status
-/// (`CREATING` / `UPDATING`) before the clock owes it `READY`, and how long a
-/// gateway whose deletion was accepted stays readable in `DELETING` before the
-/// clock owes its removal.
+/// AWS documents no duration for any of these transitions, so the span is chosen
+/// — and what it is chosen against is what a CLIENT can observe of it, which
+/// bounds it from both sides:
 ///
-/// AWS documents no duration for any of these transitions, so the span is chosen:
-/// short enough to keep a client script quick, long enough that a caller acting
-/// straight after the call still observes the transient status.
-pub const GATEWAY_SETTLE_DELAY: Duration = Duration::from_millis(500);
+/// * it must outlive the call that starts the transition, so a caller acting in
+///   the same breath as its own create still observes the transient status and
+///   the state refusals that go with it ([`gateway_status_conflict`]);
+/// * it must NOT outlive that caller's next calls: a client that creates a
+///   gateway and then goes on working — the ordinary create-then-configure or
+///   create-then-tear-down script, which spends a round trip or more elsewhere
+///   before it comes back to the gateway — finds the transition already
+///   materialised rather than being refused for a wait this emulator invented
+///   and nothing in the gateway representation tells it about.
+///
+/// So the span is of the ORDER of one round trip to this endpoint, not of a wait
+/// a caller has to sleep out. It is stored as a due instant and never slept on
+/// ([`GatewayRecord::status_at`]), so no handler blocks on it.
+pub const GATEWAY_SETTLE_DELAY: Duration = Duration::from_millis(25);
 
 /// The ARN resource type of a capacity provider: `CapacityProviderArn` is
 /// `arn:aws…:bedrock-agentcore:…:capacity-provider/{capacityProviderId}`
