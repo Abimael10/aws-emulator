@@ -119,6 +119,22 @@ const VOLUME_ARN: &str = "arn:aws:ec2:us-east-1:123456789012:volume/vol-0abc123d
 /// See [`VOLUME_ARN`].
 const INSTANCE_ARN: &str = "arn:aws:ec2:us-east-1:123456789012:instance/i-0abc123def4567890";
 
+/// `count` resources of one kind a malware scan can run over, each one DISTINCT.
+///
+/// Malware Protection admits one scan per resource per hour, so recording `count` scans
+/// means naming `count` different resources: the ARNs differ only in the resource id,
+/// which is what makes them different resources.
+fn distinct_resource_arns(kind: &str, count: usize) -> Vec<String> {
+    (0..count)
+        .map(|index| format!("arn:aws:ec2:us-east-1:123456789012:{kind}{index:04}"))
+        .collect()
+}
+
+/// [`distinct_resource_arns`] as the borrowed slice the fixture takes.
+fn as_arn_refs(arns: &[String]) -> Vec<&str> {
+    arns.iter().map(String::as_str).collect()
+}
+
 /// An account id of the modelled `len 12..12` form that owns none of the recorded work.
 const OTHER_ACCOUNT_ID: &str = "210987654321";
 
@@ -164,6 +180,10 @@ async fn statistic(router: &Router, detector_id: &str, statistic_type: &str) -> 
 
 /// An enabled detector holding one finding per [`ATTRIBUTION`] row, plus one malware scan
 /// per entry of `scan_arns` — the recorded work every expectation below is computed from.
+///
+/// Every entry must name a DIFFERENT resource: Malware Protection admits one scan per
+/// resource per hour, so a repeated ARN would be refused rather than recorded (see
+/// [`distinct_resource_arns`]).
 async fn detector_with_recorded_usage(router: &Router, scan_arns: &[&str]) -> String {
     let detector_id = enabled_detector(router).await;
     let types: Vec<&str> = ATTRIBUTION
@@ -379,9 +399,8 @@ async fn sum_by_features_is_the_cost_of_the_recorded_activity() {
     for scans in [0_i64, 1, 2] {
         let case = format!("{scans} malware scans");
         let router = new_router();
-        let arns: Vec<&str> = std::iter::repeat_n(VOLUME_ARN, usize::try_from(scans).unwrap_or(0))
-            .collect::<Vec<&str>>();
-        let detector_id = detector_with_recorded_usage(&router, &arns).await;
+        let arns = distinct_resource_arns("volume/vol-", usize::try_from(scans).unwrap_or(0));
+        let detector_id = detector_with_recorded_usage(&router, &as_arn_refs(&arns)).await;
 
         let response = statistic(&router, &detector_id, "SUM_BY_FEATURES").await;
         let got = reported_totals(&response, "sumByFeature", "feature", &case);
@@ -447,9 +466,8 @@ async fn sum_by_account_sums_the_same_records_as_sum_by_features() {
     for scans in [0_i64, 2] {
         let case = format!("{scans} malware scans");
         let router = new_router();
-        let arns: Vec<&str> = std::iter::repeat_n(INSTANCE_ARN, usize::try_from(scans).unwrap_or(0))
-            .collect::<Vec<&str>>();
-        let detector_id = detector_with_recorded_usage(&router, &arns).await;
+        let arns = distinct_resource_arns("instance/i-", usize::try_from(scans).unwrap_or(0));
+        let detector_id = detector_with_recorded_usage(&router, &as_arn_refs(&arns)).await;
         let account = recorded_account(&router, &detector_id).await;
 
         let per_account = reported_totals(
@@ -509,15 +527,26 @@ async fn sum_by_data_source_reports_only_the_features_that_view_names() {
 /// The resource statistics report the resources the store IDENTIFIES — the ones the
 /// malware scans named — summed per resource. `SUM_BY_RESOURCE` reports them in resource
 /// order and `TOP_RESOURCES` "in order from most to least expensive"
-/// (`smithy_query(query="doc",shape="UsageStatistics",member="TopResources")`), so the
-/// population gives the two resources different costs.
+/// (`smithy_query(query="doc",shape="UsageStatistics",member="TopResources")`).
+///
+/// Malware Protection admits one scan per resource per hour, so the population is one
+/// scan of each of three DIFFERENT resources: every resource owes the same one scan, the
+/// name order is the one `SUM_BY_RESOURCE` must report, and `TOP_RESOURCES` must report
+/// the same rows with their amounts never rising along the report.
 #[tokio::test]
 async fn the_resource_statistics_report_the_scanned_resources() {
     let router = new_router();
-    let detector_id =
-        detector_with_recorded_usage(&router, &[VOLUME_ARN, VOLUME_ARN, INSTANCE_ARN]).await;
+    let volumes = distinct_resource_arns("volume/vol-", 2);
+    let mut scanned: Vec<&str> = as_arn_refs(&volumes);
+    scanned.push(INSTANCE_ARN);
+    let detector_id = detector_with_recorded_usage(&router, &scanned).await;
 
-    let expected = observations(&[(VOLUME_ARN, 2), (INSTANCE_ARN, 1)]);
+    let expected = observations(
+        &scanned
+            .iter()
+            .map(|resource| (*resource, 1))
+            .collect::<Vec<(&str, i64)>>(),
+    );
     for statistic_type in ["SUM_BY_RESOURCE", "TOP_RESOURCES"] {
         let member = if statistic_type == "TOP_RESOURCES" {
             "topResources"
@@ -534,16 +563,31 @@ async fn the_resource_statistics_report_the_scanned_resources() {
         );
 
         let order: Vec<String> = rows.iter().map(|(resource, _)| resource.clone()).collect();
-        let expected_order: Vec<String> = if statistic_type == "TOP_RESOURCES" {
-            // Most expensive first: the volume was scanned twice.
-            vec![VOLUME_ARN.to_string(), INSTANCE_ARN.to_string()]
+        if statistic_type == "TOP_RESOURCES" {
+            // "From most to least expensive": the amounts never rise along the report,
+            // whatever the resources cost.
+            let amounts: Vec<&String> = rows.iter().map(|(_, amount)| amount).collect();
+            assert!(
+                amounts.windows(2).all(|pair| pair[0] >= pair[1]),
+                "case {statistic_type:?}: expected the amounts to fall along the report, got {rows:?}"
+            );
         } else {
-            // The resource's own order, which puts the instance first.
-            vec![INSTANCE_ARN.to_string(), VOLUME_ARN.to_string()]
-        };
+            // The resource's own order.
+            let mut expected_order = order.clone();
+            expected_order.sort();
+            assert_eq!(
+                order, expected_order,
+                "case {statistic_type:?}: expected the resource order, got {order:?}"
+            );
+        }
+        let mut reported = order.clone();
+        reported.sort();
+        let mut every_resource: Vec<String> =
+            scanned.iter().map(|resource| (*resource).to_string()).collect();
+        every_resource.sort();
         assert_eq!(
-            order, expected_order,
-            "case {statistic_type:?}: expected the documented order, got {order:?}"
+            reported, every_resource,
+            "case {statistic_type:?}: expected every scanned resource exactly once, got {order:?}"
         );
     }
 }

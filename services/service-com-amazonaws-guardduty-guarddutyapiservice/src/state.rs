@@ -1045,6 +1045,39 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
             .find(|scan| scan.client_token.as_deref() == Some(token))
     }
 
+    /// When the most recent scan `region`'s endpoint started for `resource_arn`
+    /// was STARTED, if it started one at all.
+    ///
+    /// The most recent START is what the one-scan-per-resource window is measured
+    /// from ([`MALWARE_SCAN_RESOURCE_COOLDOWN_MILLIS`]), so a scan that has already
+    /// reached its terminal status counts exactly as much as a running one: what
+    /// bounds the next scan of a resource is when the previous scan of it began.
+    pub fn latest_malware_scan_start_for(&self, region: &str, resource_arn: &str) -> Option<i64> {
+        self.malware_scans
+            .values()
+            .filter(|scan| scan.region == region && scan.resource_arn == resource_arn)
+            .map(|scan| scan.started_at_millis)
+            .max()
+    }
+
+    /// Is `resource_arn` still inside the window a scan `region`'s endpoint
+    /// already started on it holds open at `now`?
+    ///
+    /// The admission rule `StartMalwareScan` applies: one scan per resource per
+    /// [`MALWARE_SCAN_RESOURCE_COOLDOWN_MILLIS`], counted from the previous scan's
+    /// start instant.
+    pub fn malware_scan_within_resource_cooldown(
+        &self,
+        region: &str,
+        resource_arn: &str,
+        now: i64,
+    ) -> bool {
+        self.latest_malware_scan_start_for(region, resource_arn)
+            .is_some_and(|started| {
+                now.saturating_sub(started) < MALWARE_SCAN_RESOURCE_COOLDOWN_MILLIS
+            })
+    }
+
     /// How many malware scans `region`'s endpoint holds — the count
     /// [`MAX_MALWARE_SCANS_PER_REGION`] is measured against.
     pub fn malware_scan_count_in(&self, region: &str) -> usize {
