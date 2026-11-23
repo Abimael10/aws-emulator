@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSpace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeSpace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeSpace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: replays the Studio space `CreateSpace` stored under the domain and name
+//! the request pairs, materialising the `InService` transition the clock already owed, and
+//! refuses a pair this account holds no space under with the modelled `ResourceNotFound`.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +159,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeSpace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeSpaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeSpace"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| DescribeSpaceError::validation(crate::state::NO_STATE))?;
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+        // The two members that address a space, resolved through the crate's one space
+        // lookup so this reader and whatever resolves the same pair later agree on which
+        // pairs resolve — including that a space of a domain the clock has torn down
+        // resolves to nothing.
+        let Some(space) = store.space_mut(&input.domain_id, &input.space_name, now) else {
+            return Err(DescribeSpaceErrorModeled::ResourceNotFound(ResourceNotFound {
+                // This reader's SUBJECT is the space, so the refusal names it by the ARN
+                // the requested pair resolves to, the way the domain's and the user
+                // profile's own readers do.
+                message: Some(crate::state::space_arn_not_found(
+                    &region,
+                    &input.domain_id,
+                    &input.space_name,
+                )),
+            })
+            .into());
+        };
+
+        // The only write a reporting call makes: the transition the clock already owed. It
+        // was due at the stored instant whether or not anybody described the space, so a
+        // waiter terminates and no caller's read changes the outcome.
+        let settled = space.settle_status(now);
+        let arn = space.arn.clone();
+
+        let output = DescribeSpaceOutput {
+            domain_id: Some(space.domain_id.clone()),
+            space_arn: Some(arn.clone()),
+            space_name: Some(space.name.clone()),
+            space_display_name: space.display_name.clone(),
+            status: Some(space.status.clone()),
+            creation_time: Some(crate::state::timestamp(space.creation_time)),
+            last_modified_time: Some(crate::state::timestamp(space.last_modified_time)),
+            space_settings: space.space_settings.clone(),
+            ownership_settings: space.ownership_settings.clone(),
+            space_sharing_settings: space.space_sharing_settings.clone(),
+            url: Some(space.url.clone()),
+            // The space's directory in the domain's home EFS volume, which is an Amazon EFS
+            // file system no service of this emulator holds — the same reason
+            // `DescribeUserProfile` reports no `HomeEfsFileSystemUid` — so there is no uid
+            // to report rather than one nothing created.
+            home_efs_file_system_uid: None,
+            // Only a space in a failure status has a reason to report, and nothing fails a
+            // space's provisioning here.
+            failure_reason: None,
+        };
+        drop(store);
+
+        if settled {
+            // The transition is a state change, so it leaves the same record a create does
+            // rather than happening unobservably on a read path.
+            crate::state::record_state_change(Self::NAME, &arn, ctx);
+        }
+        Ok(output)
     }
 }

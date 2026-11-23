@@ -131,7 +131,35 @@ pub fn domain_id_not_found(domain_id: &str) -> String {
 /// What a delete of a domain the service is already tearing down is answered with, so a
 /// repeat of that call reports the work in flight rather than claiming a second deletion.
 pub fn domain_not_deletable(arn: &str, status: &str) -> String {
-    format!("Domain [{arn}] cannot be deleted while it is in {status} status.")
+    studio_resource_not_deletable(DOMAIN_ENTITY, arn, status)
+}
+
+/// The entity label the Studio refusals name a domain by, i.e. the subject of
+/// [`studio_resource_not_deletable`] when the resource being deleted is the domain itself.
+pub const DOMAIN_ENTITY: &str = "Domain";
+
+/// How a Studio operation states that the resource it addresses cannot take the removal
+/// asked of it while the service is already removing it: the entity, then the ARN the
+/// request resolves to IN SQUARE BRACKETS, then the status that stands in the way.
+///
+/// One sentence for the whole family — the domain and every member it holds — so a repeat
+/// of any of their deletes reports the work in flight the same way, with only the entity
+/// and the resource changing.
+pub fn studio_resource_not_deletable(entity: &str, arn: &str, status: &str) -> String {
+    format!("{entity} [{arn}] cannot be deleted while it is in {status} status.")
+}
+
+/// How a Studio create states that the domain already holds a member under the name the
+/// request carried: the entity, then the name IN SINGLE QUOTES, then the `DomainId` it is
+/// taken in — recorded AWS behaviour for the user profile's own collision, whose whole
+/// sentence is fixed text but for those values.
+///
+/// The domain is named by the bare `d-…` id the request supplied rather than by an ARN, the
+/// way every refusal a member-create words names the domain it was handed
+/// ([`domain_id_not_found`]). One sentence for every member of the domain, so a second
+/// create of a taken name is refused the same way whichever member it names.
+pub fn studio_member_already_exists(entity: &str, name: &str, domain_id: &str) -> String {
+    format!("A {entity} with name '{name}' already exists in Domain {domain_id}.")
 }
 
 /// How `DeleteDomain` states that the domain still holds Studio apps, which have to be
@@ -333,8 +361,8 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// `DeleteDomain` already refuses while the domain holds a profile no
     /// `DeleteUserProfile` has released ([`Self::domain_holds_user_profiles`]), so what is
     /// left here is a profile whose own removal the caller asked for first — it goes when
-    /// the domain does, and so do the apps that hung off it, so no record addresses a
-    /// domain no reader resolves.
+    /// the domain does, and so do the spaces and the apps that hung off it, so no record
+    /// addresses a domain no reader resolves.
     pub fn release_deleted_domains(&mut self, now: SystemTime) {
         let released: Vec<String> = self
             .domains
@@ -346,6 +374,7 @@ impl ComAmazonawsSagemakerSagemakerState {
             self.domains.remove(id);
         }
         self.release_domain_user_profiles(&released);
+        self.release_domain_spaces(&released);
         self.release_domain_apps(&released);
     }
 

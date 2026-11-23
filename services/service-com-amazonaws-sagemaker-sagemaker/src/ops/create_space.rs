@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSpace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSpace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSpace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: stores a Studio space in `crate::state` under the domain and name the
+//! request pairs, launching it `Pending` with the `InService` transition the clock owes
+//! recorded; refuses a domain that does not resolve or has not reached `InService`, an
+//! owner user profile that domain does not hold, and a name the domain already holds with
+//! the modelled `ResourceInUse`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +146,147 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSpace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSpaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSpace"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| CreateSpaceError::validation(crate::state::NO_STATE))?;
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+        // The ARN names both members that identify the space, so a reader of either one
+        // reports the same value and two domains can hold the same space name.
+        let arn = crate::state::resource_arn(
+            &region,
+            crate::state::SPACE_ARN_KIND,
+            &format!("{}/{}", input.domain_id, input.space_name),
+        );
+        let key = crate::state::space_key(&input.domain_id, &input.space_name);
+
+        let mut store = state.lock();
+        // The removals the clock already completed are materialised first, so a domain whose
+        // teardown is done is gone here too — and so are the spaces that hung off it. Each
+        // was due at its stored instant whether or not anybody called, so this call's
+        // observer makes no difference to the result.
+        store.release_deleted_domains(now);
+        store.release_deleted_user_profiles(now);
+        store.release_deleted_spaces(now);
+
+        // A space is created "in a domain": it belongs to the domain the request names, so
+        // an id this account holds no domain under cannot take one. The model declares no
+        // not-found error for this operation, so the refusal travels as the service-common
+        // `ValidationException`, worded from the `DomainId` the REQUEST supplied — the only
+        // thing this caller said about the domain — rather than with the ARN form a reader
+        // of the domain itself answers with, exactly as `CreateUserProfile` words the same
+        // fact for the other member of the domain. A domain the service is already tearing
+        // down still resolves until the clock completes its removal; the status gate below
+        // is what weighs which of the resolved domains admits a member.
+        let Some(domain) = store.domain_mut(&input.domain_id, now) else {
+            return Err(CreateSpaceError::validation(
+                crate::state::domain_id_not_found(&input.domain_id),
+            ));
+        };
+        // The provisioning the clock already owed is materialised BEFORE the create is
+        // weighed, so a domain whose `InService` had fallen due admits the space rather than
+        // being refused from the `Pending` it had already left.
+        domain.settle_status(now);
+        let domain_status = domain.status.clone();
+        let domain_arn = domain.arn.clone();
+        // The space is served under its domain's Studio host, so its address is resolved
+        // once here, on the write path, from the domain's own.
+        let url = crate::state::studio_space_url(&domain.url, &input.space_name);
+
+        // A space is a MEMBER of the domain, and a domain admits members only once its own
+        // provisioning has settled: while it is still `Pending` — or `Failed`, or on its way
+        // out — the create is refused, so a space is never attached to a domain whose
+        // networking and file system have not resolved. Recorded behaviour, and the model
+        // declares no state error for this operation, so it travels as the service-common
+        // `ValidationException`.
+        if domain_status != crate::state::DOMAIN_STATUS_IN_SERVICE {
+            return Err(CreateSpaceError::validation(
+                crate::state::domain_not_in_service_refusal(
+                    crate::state::SPACE_ENTITY,
+                    &arn,
+                    &domain_arn,
+                ),
+            ));
+        }
+
+        // `OwnershipSettings.OwnerUserProfileName` is "the user profile who is the owner of
+        // the space", so a named owner has to be a profile the domain actually holds: the
+        // create is refused here rather than leaving a space owned by a user profile that
+        // exists nowhere, which no later call could resolve. Weighed with the same lookup
+        // and worded with the same sentence the app create uses for the owner it names.
+        if let Some(owner) = input
+            .ownership_settings
+            .as_ref()
+            .map(|settings| settings.owner_user_profile_name.as_str())
+        {
+            if !store.holds_user_profile(&input.domain_id, owner, now) {
+                return Err(CreateSpaceError::validation(
+                    crate::state::user_profile_not_found(owner),
+                ));
+            }
+        }
+
+        // The store is bounded, so a caller creating space after space cannot grow it
+        // without end. `ResourceLimitExceeded` is the limit failure this operation models.
+        if !store.spaces_below_quota() {
+            return Err(CreateSpaceErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The account-level service limit for spaces is {}, with current \
+                         utilization of {} and a request delta of 1.",
+                        crate::state::SPACE_QUOTA,
+                        store.spaces.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A space already stored under this name is the resource this call would have to
+        // take over, so the create is refused rather than overwriting it. The refusal names
+        // the space the way the domain's other member-create names its own collision — the
+        // name the request carried, in the domain it is taken in.
+        if store.spaces.contains_key(&key) {
+            return Err(CreateSpaceErrorModeled::ResourceInUse(ResourceInUse {
+                message: Some(crate::state::studio_member_already_exists(
+                    crate::state::SPACE_ENTITY,
+                    &input.space_name,
+                    &input.domain_id,
+                )),
+            })
+            .into());
+        }
+
+        store.spaces.insert(
+            key,
+            crate::state::Space {
+                arn: arn.clone(),
+                domain_id: input.domain_id,
+                // Stored as the create carried it, so a reader replays that spelling.
+                name: input.space_name,
+                display_name: input.space_display_name,
+                // Stored verbatim, so `DescribeSpace` replays the settings the create
+                // carried and nothing the request never named.
+                space_settings: input.space_settings,
+                ownership_settings: input.ownership_settings,
+                space_sharing_settings: input.space_sharing_settings,
+                url,
+                tags: input.tags.unwrap_or_default(),
+                // A space comes up `Pending` and owes the clock its `InService`, so a caller
+                // that reads it straight back still observes the transient status.
+                status: crate::state::SPACE_STATUS_PENDING.to_string(),
+                creation_time: now,
+                last_modified_time: now,
+                in_service_due_at: now + crate::state::SPACE_IN_SERVICE_AFTER,
+                // Nothing has asked for this space's removal, so the clock owes it none.
+                removal_due_at: None,
+            },
+        );
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateSpaceOutput {
+            space_arn: Some(arn),
+        })
     }
 }

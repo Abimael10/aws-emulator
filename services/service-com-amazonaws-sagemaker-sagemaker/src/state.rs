@@ -1174,6 +1174,12 @@ pub use ec2_volumes::*;
 pub mod user_profile;
 pub use user_profile::*;
 
+/// The Studio SPACE slice — the space `CreateSpace` writes, `DescribeSpace` replays and
+/// `DeleteSpace` tears down, the other member a Studio domain holds beside its user
+/// profiles: see `state/space.rs`.
+pub mod space;
+pub use space::*;
+
 /// The Studio APP slice — the app `CreateApp` launches, `DescribeApp` replays and
 /// `DeleteApp` tears down, with its key, its statuses, the clock spans it moves on, the
 /// window a deleted app's record is retained for, its store bound and the sentences its
@@ -1465,6 +1471,7 @@ tag_accessors!(
     partner_apps,
     pipelines,
     processing_jobs,
+    spaces,
     training_jobs,
     training_sessions,
     transform_jobs,
@@ -2741,6 +2748,10 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     /// domain" and `DescribeUserProfile` resolves one by exactly that pair. See
     /// [`UserProfile`], whose slice lives in [`user_profile`].
     pub user_profiles: BTreeMap<(String, String), UserProfile>,
+    /// Studio spaces, keyed by [`space_key`] — the domain the space lives in plus its
+    /// name, because a space is created "in a domain" and `DescribeSpace` resolves one by
+    /// exactly that pair. See [`Space`], whose slice lives in [`space`].
+    pub spaces: BTreeMap<(String, String), Space>,
     /// Keyed by `ModelPackageGroupName`.
     pub model_package_groups: BTreeMap<String, ModelPackageGroup>,
     /// Keyed by `RecommendationJobName`, which AWS documents unique to the account in a

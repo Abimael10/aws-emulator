@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteSpace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteSpace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteSpace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: starts the removal of the Studio space the request's domain and name pair
+//! addresses — the space reports `Deleting` until the clock completes it — refusing a pair
+//! this account holds no space under with the modelled `ResourceNotFound` and a space whose
+//! removal is already in flight with `ResourceInUse`. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +150,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteSpace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteSpaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteSpace"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| DeleteSpaceError::validation(crate::state::NO_STATE))?;
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+        // The removals the clock already completed are materialised first, so a domain or a
+        // space whose teardown is done is gone here too. Each was due at its stored instant
+        // whether or not anybody called, so this call's observer makes no difference to the
+        // result.
+        store.release_deleted_domains(now);
+        store.release_deleted_spaces(now);
+
+        // The two members that address a space, resolved through the crate's one space
+        // lookup so this call and every reader agree on which pairs resolve.
+        // `ResourceNotFound` is what a pair this account holds no space under is answered
+        // with — never a 200, which a caller could not tell from a teardown that happened.
+        let Some(space) = store.space_mut(&input.domain_id, &input.space_name, now) else {
+            return Err(DeleteSpaceErrorModeled::ResourceNotFound(ResourceNotFound {
+                // This call's SUBJECT is the space, so the refusal names it by the ARN the
+                // requested pair resolves to, as the space's own reader does.
+                message: Some(crate::state::space_arn_not_found(
+                    &region,
+                    &input.domain_id,
+                    &input.space_name,
+                )),
+            })
+            .into());
+        };
+
+        // The provisioning the clock already owed is materialised BEFORE the deletion is
+        // weighed, so a space whose `InService` had fallen due is torn down from the status
+        // it had already reached rather than from the `Pending` it had left.
+        space.settle_status(now);
+
+        // A space the service is already removing cannot take a second deletion: the work is
+        // in flight, which is what `ResourceInUse` reports. A repeat of this call lands here,
+        // because the first one left the space `Deleting`.
+        if space.is_deleting() {
+            let refusal = crate::state::studio_resource_not_deletable(
+                crate::state::SPACE_ENTITY,
+                &space.arn,
+                &space.status,
+            );
+            return Err(DeleteSpaceErrorModeled::ResourceInUse(ResourceInUse {
+                message: Some(refusal),
+            })
+            .into());
+        }
+
+        // The record is kept until the clock completes the removal, so the `Deleting` status
+        // a caller reads straight after this call is observable; past that instant every
+        // lookup answers as if the space were gone.
+        space.begin_deletion(now);
+        let arn = space.arn.clone();
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(DeleteSpaceOutput)
     }
 }

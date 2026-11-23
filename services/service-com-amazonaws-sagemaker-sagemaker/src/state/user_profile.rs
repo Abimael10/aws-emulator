@@ -127,7 +127,7 @@ pub fn user_profile_arn_not_found(region: &str, domain_id: &str, user_profile_na
 /// which is also what tells this collision apart from the one an app's own "already in
 /// use" refusal reports.
 pub fn user_profile_already_exists(user_profile_name: &str, domain_id: &str) -> String {
-    format!("A UserProfile with name '{user_profile_name}' already exists in Domain {domain_id}.")
+    studio_member_already_exists(USER_PROFILE_ENTITY, user_profile_name, domain_id)
 }
 
 /// The entity label the Studio refusals name a user profile by, i.e. the subject of
@@ -141,7 +141,7 @@ pub const USER_PROFILE_ENTITY: &str = "UserProfile";
 /// way — the wording [`crate::state::domain_not_deletable`] uses for the domain it lives
 /// in.
 pub fn user_profile_not_deletable(arn: &str, status: &str) -> String {
-    format!("UserProfile [{arn}] cannot be deleted while it is in {status} status.")
+    studio_resource_not_deletable(USER_PROFILE_ENTITY, arn, status)
 }
 
 /// `AuthMode`'s member that means the domain authenticates its members against IAM
