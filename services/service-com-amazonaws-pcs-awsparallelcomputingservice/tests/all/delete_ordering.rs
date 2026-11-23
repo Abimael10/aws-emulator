@@ -33,6 +33,15 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::cluster_lifecycle::{call, emulator};
 
+/// A delete that is RETRIED under the idempotency token the first one carried, rather than
+/// re-sent as a delete of its own: the same `DeleteQueue` path this suite drives, read
+/// through `clientToken`, which is why it is a child of this suite rather than a second
+/// suite beside it. The `#[path]` is what keeps it one: this crate's `tests/all.rs`
+/// declares the suites directly under `tests/all/`, and a module of a `#[path]`-declared
+/// file resolves next to that file unless it says otherwise.
+#[path = "delete_ordering/idempotent_delete_retry.rs"]
+mod idempotent_delete_retry;
+
 /// The region the shared harness signs every call for.
 const REGION: &str = "us-east-1";
 

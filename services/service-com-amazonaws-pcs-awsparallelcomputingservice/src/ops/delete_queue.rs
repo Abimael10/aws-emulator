@@ -11,6 +11,11 @@
 //! releases the compute node groups it assigns jobs to, which is why it comes first in the
 //! delete order a client has to follow.
 //!
+//! The operation is `@idempotent` and its `clientToken` is an `@idempotencyToken`, so a
+//! retry presenting the token an accepted delete used replays that call's empty success
+//! and has no further effect — it is not a second delete of a queue this service no longer
+//! holds (see [`crate::state::ComAmazonawsPcsAwsparallelcomputingserviceState::remember_delete`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -188,7 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that resolves to none earns is decided by its FORM: a generated cluster id names a
         // cluster that is not there, a cluster NAME is a permissions failure; see
         // `crate::state::cluster_authorization`.
-        let Some(cluster) = state.cluster_mut(&input.cluster_identifier) else {
+        let Some(cluster_id) = state.cluster_id_for(&input.cluster_identifier) else {
             return Err(match crate::state::cluster_authorization::unresolved_cluster(
                 &input.cluster_identifier,
             ) {
@@ -208,6 +213,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                 }
             }
+            .into());
+        };
+
+        // An `@idempotencyToken` retry returns the first call's result and has NO further
+        // effect, so a delete that already used this token is replayed with its empty
+        // success — BEFORE the queue is looked up, because the queue the first call took
+        // out is exactly what a retry can no longer find. The token is remembered with the
+        // queue that call deleted, so the same token naming another queue is a conflict
+        // rather than a second delete; a request carrying no token is no retry at all (the
+        // SDK generates a fresh one per call), so it is answered on its own.
+        match state.remembered_delete(
+            Self::NAME,
+            input.client_token.as_ref(),
+            Some(&cluster_id),
+            &input.queue_identifier,
+        ) {
+            Some(crate::state::RememberedDelete::Replay) => return Ok(DeleteQueueOutput {}),
+            Some(crate::state::RememberedDelete::Conflict(remembered)) => {
+                return Err(DeleteQueueErrorModeled::ConflictException(ConflictException {
+                    message: format!(
+                        "clientToken was already used to delete queue {}",
+                        remembered.resource_id
+                    ),
+                    resource_id: remembered.resource_id,
+                    resource_type: crate::state::QUEUE.resource_type.to_string(),
+                })
+                .into());
+            }
+            None => {}
+        }
+
+        let Some(cluster) = state.clusters.get_mut(&cluster_id) else {
+            return Err(DeleteQueueErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the cluster disappeared while it was being read".to_string(),
+                },
+            )
             .into());
         };
         let Some(queue_id) = cluster
@@ -242,6 +284,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         queue.status = crate::state::STATUS_DELETING.to_string();
         queue.modified_at = crate::state::now_date_time();
         queue.pending = Some(crate::state::PendingChange::Remove);
+        let queue_name = queue.name.clone();
+        // Remembered only now that the delete has been ACCEPTED: a retry replays a call
+        // that completed successfully, so a refused delete leaves its token free.
+        state.remember_delete(
+            Self::NAME,
+            input.client_token.as_ref(),
+            Some(&cluster_id),
+            &queue_id,
+            &queue_name,
+        );
         Ok(DeleteQueueOutput {})
     }
 }

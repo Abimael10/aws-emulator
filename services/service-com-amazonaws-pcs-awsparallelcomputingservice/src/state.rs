@@ -678,14 +678,41 @@ impl QueueRecord {
     }
 }
 
-/// What a previous create with an `@idempotencyToken` produced, so a retry can be
-/// answered with it rather than creating a second resource.
+/// What a previous call that carried an `@idempotencyToken` did to a resource, so a retry
+/// presenting the same token can be answered with that call's result rather than acting a
+/// second time.
 #[derive(Debug, Clone)]
 pub struct RememberedCreate {
-    /// The cluster the resource was created in; `None` for a cluster itself.
+    /// The cluster the resource belongs to; `None` for a cluster itself.
     pub cluster_id: Option<String>,
-    /// The id the first call created.
+    /// The id of the resource the first call acted on.
     pub resource_id: String,
+    /// The name that resource was known by, recorded only where the record itself does
+    /// not outlive the call — a DELETE: a retry may address the resource by EITHER form
+    /// its `*Identifier` allows, and neither form can be resolved against a record the
+    /// service no longer holds. `None` where the resource is still stored, because there
+    /// the identifier resolves against the record itself.
+    pub resource_name: Option<String>,
+}
+
+impl RememberedCreate {
+    /// Whether `identifier` names the resource this entry was remembered for — by the
+    /// generated id, or by the name a remembered delete also kept.
+    fn names(&self, identifier: &str) -> bool {
+        self.resource_id == identifier || self.resource_name.as_deref() == Some(identifier)
+    }
+}
+
+/// How a retry that presents an `@idempotencyToken` a previous DELETE used must be
+/// answered.
+#[derive(Debug)]
+pub enum RememberedDelete {
+    /// The retry names the resource that delete took out, so it replays the first call's
+    /// success and has no further effect.
+    Replay,
+    /// The token already deleted ANOTHER resource, so the retry is not that request: it
+    /// carries what the token was used for, for the refusal to name.
+    Conflict(RememberedCreate),
 }
 
 /// Per-service state for com-amazonaws-pcs-awsparallelcomputingservice. A handler reaches it through [`service_state`].
@@ -703,10 +730,12 @@ pub struct ComAmazonawsPcsAwsparallelcomputingserviceState {
     pub cluster_ids_by_name: HashMap<String, String>,
     /// Source of both the generated ids and the creation-order sequence a list walks.
     pub next_seq: u64,
-    /// `<operation>:<clientToken>` -> what the first call created, so repeating an
-    /// `@idempotencyToken` create returns that call's result instead of creating a
-    /// second resource. Bounded at [`MAX_REMEMBERED_CLIENT_TOKENS`] by the FIFO order
-    /// below, and pruned when the cluster an entry points into is removed.
+    /// `<operation>:<clientToken>` -> the resource the first call acted on, so repeating
+    /// an `@idempotencyToken` request returns that call's result instead of acting a
+    /// second time — creating a second resource, applying an update again, or deleting a
+    /// resource the first call already took out. Bounded at
+    /// [`MAX_REMEMBERED_CLIENT_TOKENS`] by the FIFO order below, and pruned when the
+    /// cluster an entry points into is removed.
     pub client_tokens: HashMap<String, RememberedCreate>,
     /// The keys of [`Self::client_tokens`] in insertion order, so the oldest entry can
     /// be evicted once the index is full. Holds exactly the map's keys.
@@ -810,18 +839,72 @@ impl ComAmazonawsPcsAwsparallelcomputingserviceState {
         cluster_id: Option<&str>,
         resource_id: &str,
     ) {
+        self.remember(
+            operation,
+            token,
+            RememberedCreate {
+                cluster_id: cluster_id.map(str::to_string),
+                resource_id: resource_id.to_string(),
+                resource_name: None,
+            },
+        );
+    }
+
+    /// Remember that `operation` with `token` DELETED the resource `resource_id`, known as
+    /// `resource_name`, so a retry presenting the same token replays that call's success
+    /// instead of acting on a record the service no longer holds.
+    ///
+    /// The name is kept beside the id because a delete outlives its record: the retry may
+    /// address the resource by either form its `*Identifier` allows, and by then there is
+    /// nothing left to resolve either form against.
+    pub fn remember_delete(
+        &mut self,
+        operation: &str,
+        token: Option<&String>,
+        cluster_id: Option<&str>,
+        resource_id: &str,
+        resource_name: &str,
+    ) {
+        self.remember(
+            operation,
+            token,
+            RememberedCreate {
+                cluster_id: cluster_id.map(str::to_string),
+                resource_id: resource_id.to_string(),
+                resource_name: Some(resource_name.to_string()),
+            },
+        );
+    }
+
+    /// How a retry of `operation` presenting `token` on the resource `identifier` names
+    /// inside `cluster_id` must be answered, or `None` when no delete has used that token
+    /// (the request is not a retry, so it is a delete of its own).
+    ///
+    /// A token the SAME delete used for the same resource replays; one a delete of another
+    /// resource used conflicts, the way a reused create token does.
+    pub fn remembered_delete(
+        &self,
+        operation: &str,
+        token: Option<&String>,
+        cluster_id: Option<&str>,
+        identifier: &str,
+    ) -> Option<RememberedDelete> {
+        let remembered = self.remembered_create(operation, token)?;
+        if remembered.cluster_id.as_deref() == cluster_id && remembered.names(identifier) {
+            return Some(RememberedDelete::Replay);
+        }
+        Some(RememberedDelete::Conflict(remembered.clone()))
+    }
+
+    /// Store `record` under `operation` and `token`, the shared body of
+    /// [`Self::remember_create`] and [`Self::remember_delete`].
+    fn remember(&mut self, operation: &str, token: Option<&String>, record: RememberedCreate) {
         let Some(token) = token else { return };
         let key = client_token_key(operation, token);
         if self.client_tokens.contains_key(&key) {
             return;
         }
-        self.client_tokens.insert(
-            key.clone(),
-            RememberedCreate {
-                cluster_id: cluster_id.map(str::to_string),
-                resource_id: resource_id.to_string(),
-            },
-        );
+        self.client_tokens.insert(key.clone(), record);
         self.client_token_order.push_back(key);
         while self.client_token_order.len() > MAX_REMEMBERED_CLIENT_TOKENS {
             if let Some(oldest) = self.client_token_order.pop_front() {
