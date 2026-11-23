@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDataLakeNamespace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDataLakeNamespace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDataLakeNamespace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation replaces the description of one data lake namespace held in
+//! the shared store ([`crate::state`]) and answers with the record it left behind, so a
+//! later `GetDataLakeNamespace` reports exactly what this call persisted.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +148,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDataLakeNamespace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDataLakeNamespaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDataLakeNamespace"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateDataLakeNamespaceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the supplychain data lake store is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        // ONE lock for the whole look-up-then-write, so concurrent updates of the same
+        // namespace serialize: each one reports the record it left behind.
+        let mut store = state.lock();
+        // The transition the clock owed at `now`, which was due whether or not anybody
+        // called this operation.
+        store.materialize_due_transitions(now);
+
+        // The gateway authorizes an instance-scoped call against the instance BEFORE it
+        // looks the addressed resource up, so an `instanceId` naming no instance of this
+        // account is an authorization failure rather than a not-found.
+        if !store.instances.contains_key(&input.instance_id) {
+            return Err(UpdateDataLakeNamespaceErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::instance_authorization_failure_message(
+                        input.instance_id.as_str(),
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The reserved-prefix rule this operation's own `name` member documents: a name
+        // starting with a prefix the service keeps for itself is not a caller's to update,
+        // which is a bad request rather than a not-found. The model's `@pattern` cannot
+        // express the rule, so it is refused here with the modelled 400.
+        if crate::state::namespace_name_is_reserved(input.name.as_str()) {
+            return Err(UpdateDataLakeNamespaceErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::reserved_namespace_update_message()),
+                },
+            )
+            .into());
+        }
+
+        // A name this instance's data lake holds no namespace under names no namespace at
+        // all — including the name of one a delete already removed — so the mutation is
+        // refused and nothing is written.
+        let Some(record) = store
+            .namespaces
+            .get_mut(&crate::state::namespace_key(&input.instance_id, &input.name))
+        else {
+            return Err(
+                UpdateDataLakeNamespaceErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::namespace_not_found_message(&input.name)),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Absent member = leave the stored value alone; present member = replace it. Only
+        // a write that actually moves the stored description moves `lastModifiedTime`.
+        if let Some(description) = input.description {
+            if record.description.as_deref() != Some(description.as_str()) {
+                record.description = Some(description);
+                record.touch(now);
+            }
+        }
+
+        // The response is projected from the record this call leaves in the store, so
+        // nothing in it can differ from what a later GetDataLakeNamespace reports.
+        Ok(UpdateDataLakeNamespaceOutput {
+            namespace: record.to_wire(),
+        })
     }
 }

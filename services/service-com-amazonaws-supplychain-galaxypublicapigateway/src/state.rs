@@ -392,13 +392,34 @@ pub fn namespace_name_is_reserved(name: &str) -> bool {
         .any(|prefix| name.starts_with(prefix))
 }
 
-/// The sentence a namespace create carrying a reserved name is refused with, built from
+/// The sentence a namespace mutation carrying a reserved name is refused with, built from
 /// [`RESERVED_NAMESPACE_PREFIXES`] so the refusal and the rule cannot drift apart.
-pub fn reserved_namespace_name_message() -> String {
+///
+/// `verb` is the mutation the request asked for, which is the one part of the sentence that
+/// differs between the operations documenting the rule: each states it of ITS own verb
+/// ("you cannot create namespace with name starting with …", "you cannot update namespace
+/// with name starting with …"), so the refusal names what was refused.
+fn reserved_namespace_mutation_message(verb: &str) -> String {
     format!(
-        "Cannot create namespace with name starting with {}",
+        "Cannot {verb} namespace with name starting with {}",
         RESERVED_NAMESPACE_PREFIXES.join(", ")
     )
+}
+
+/// The sentence a namespace create carrying a reserved name is refused with
+/// ([`reserved_namespace_mutation_message`]).
+pub fn reserved_namespace_name_message() -> String {
+    reserved_namespace_mutation_message("create")
+}
+
+/// The sentence a namespace update carrying a reserved name is refused with
+/// ([`reserved_namespace_mutation_message`]).
+///
+/// SOURCE: the `name` member of `UpdateDataLakeNamespaceRequest`, which documents the rule
+/// of its own operation — "Noted you cannot update namespace with name starting with asc,
+/// default, scn, aws, amazon, amzn".
+pub fn reserved_namespace_update_message() -> String {
+    reserved_namespace_mutation_message("update")
 }
 
 /// How a namespace create refuses a name this instance's data lake already holds.
@@ -456,6 +477,13 @@ impl DataLakeNamespaceRecord {
             last_modified_time: now,
             tags: BTreeMap::new(),
         }
+    }
+
+    /// Record a change made at `now`: a mutation of a namespace moves `lastModifiedTime`
+    /// and nothing else, exactly as [`InstanceRecord::touch`] does for an instance. The
+    /// stamp the create set stays in `createdTime`.
+    pub fn touch(&mut self, now: SystemTime) {
+        self.last_modified_time = now;
     }
 
     /// This record as the modelled `DataLakeNamespace` shape every namespace operation

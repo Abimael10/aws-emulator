@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! `CreateDataLakeNamespace` and `GetDataLakeNamespace`, driven over the wire (restJson1,
-//! signing name `scn`) through the same `MultiServiceRouter` the emulator's front door
-//! uses — so every assertion here is about what a real client observes, not about a
-//! handler's internals.
+//! `CreateDataLakeNamespace`, `GetDataLakeNamespace` and `UpdateDataLakeNamespace`, driven
+//! over the wire (restJson1, signing name `scn`) through the same `MultiServiceRouter` the
+//! emulator's front door uses — so every assertion here is about what a real client
+//! observes, not about a handler's internals.
 //!
 //! THE RULE UNDER TEST: a data lake namespace is identified by its instance and its name,
 //! and the create PERSISTS one record under that pair — so a read reports exactly the
@@ -11,13 +11,17 @@
 //! whatever the losing request carries), the same name under another instance is a
 //! different namespace, a name the service reserves is refused, and an `instanceId` this
 //! account holds no instance for is refused by the gateway's authorization step before any
-//! namespace is looked up.
+//! namespace is looked up. A mutation of that record resolves the SAME pair: it rewrites
+//! only the member the request carries and is refused `ResourceNotFoundException` (404)
+//! whenever the pair holds no record — a name nobody created and a name a delete removed
+//! alike.
 //!
 //! The tables span what the rule generalises over: the `DataLakeNamespaceName` form and
 //! length (both published bounds), whether a `description` is sent and its length (both
 //! published bounds), how many tags the create carries, which reserved prefix a rejected
-//! name starts with and whether the name is the prefix itself or extends it, and which
-//! instance the call is addressed to.
+//! name starts with and whether the name is the prefix itself or extends it, whether the
+//! namespace a mutation addresses was never created or was removed, and which instance the
+//! call is addressed to.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -44,6 +48,13 @@ const REGION: &str = "us-east-1";
 /// create namespace with name starting with asc, default, scn, aws, amazon, amzn".
 const RESERVED_NAME_SENTENCE: &str =
     "Cannot create namespace with name starting with asc, default, scn, aws, amazon, amzn";
+
+/// The sentence the service refuses an UPDATE of a namespace name it reserves with, in the
+/// same form as the create's and with the verb the request asked for. Its SOURCE is the
+/// `name` member of `UpdateDataLakeNamespaceRequest` — "Noted you cannot update namespace
+/// with name starting with asc, default, scn, aws, amazon, amzn".
+const RESERVED_UPDATE_NAME_SENTENCE: &str =
+    "Cannot update namespace with name starting with asc, default, scn, aws, amazon, amzn";
 
 /// The sentence a namespace operation refuses a name the instance's data lake does not
 /// hold with, written out HERE rather than read from the crate: the wording is the
@@ -190,6 +201,31 @@ impl Emulator {
     async fn get_namespace(&self, instance_id: &str, name: &str) -> (u16, Value) {
         self.send(
             "GET",
+            &format!("/api/datalake/instance/{instance_id}/namespaces/{name}"),
+            None,
+        )
+        .await
+    }
+
+    /// `UpdateDataLakeNamespace` for `name` under `instance_id`, carrying `request`.
+    async fn update_namespace(
+        &self,
+        instance_id: &str,
+        name: &str,
+        request: Value,
+    ) -> (u16, Value) {
+        self.send(
+            "PATCH",
+            &format!("/api/datalake/instance/{instance_id}/namespaces/{name}"),
+            Some(request),
+        )
+        .await
+    }
+
+    /// `DeleteDataLakeNamespace` for `name` under `instance_id`.
+    async fn delete_namespace(&self, instance_id: &str, name: &str) -> (u16, Value) {
+        self.send(
+            "DELETE",
             &format!("/api/datalake/instance/{instance_id}/namespaces/{name}"),
             None,
         )
@@ -877,5 +913,380 @@ async fn concurrent_creates_of_one_name_leave_a_single_winner() {
         namespace_of("after the race", &body),
         winner,
         "the name must resolve to the winner's record, got {body}"
+    );
+}
+
+/// RULE: the update resolves the namespace by its instance and name and REWRITES the stored
+/// record — the `description` member it carries replaces the stored one, a member it omits
+/// leaves the stored value alone, and everything that identifies the namespace (its
+/// instance, its name, its ARN, the instant it was created) is untouched. The answer is
+/// projected from the record left behind, so a later read reports it identically, and a
+/// repeat of the same update changes nothing further.
+#[tokio::test]
+async fn an_update_rewrites_only_what_it_carries_and_is_reported_back_as_persisted() {
+    let emulator = Emulator::new();
+    let instance = emulator.given_instance("namespace-host").await;
+
+    let longest_name = "n".repeat(NAME_MAX_LENGTH);
+    let shortest_description = "d".repeat(DESCRIPTION_MIN_LENGTH);
+    let longest_description = "x".repeat(DESCRIPTION_MAX_LENGTH);
+
+    // Rows differ along the name's form and length (both published bounds of
+    // `DataLakeNamespaceName`), whether the namespace was created WITH a description,
+    // whether the update carries one, and its length (both published bounds of
+    // `DataLakeNamespaceDescription`).
+    let rows: Vec<(&str, &str, Option<&str>, Option<&str>)> = vec![
+        (
+            "the shortest name takes its first description",
+            "a",
+            None,
+            Some("a description where there was none"),
+        ),
+        (
+            "the longest name is re-described",
+            longest_name.as_str(),
+            Some("fifty characters of name"),
+            Some("fifty characters of name, described again"),
+        ),
+        (
+            "digits and underscores",
+            "orders_2026_q1",
+            Some("order lines for 2026 Q1"),
+            Some("order lines for 2026 Q2"),
+        ),
+        (
+            "the shortest description the model admits",
+            "min_desc_target",
+            Some("something longer"),
+            Some(shortest_description.as_str()),
+        ),
+        (
+            "the longest description the model admits",
+            "max_desc_target",
+            None,
+            Some(longest_description.as_str()),
+        ),
+        (
+            "an update carrying nothing keeps the stored description",
+            "keeper",
+            Some("kept as it was"),
+            None,
+        ),
+        (
+            "an update carrying nothing leaves a namespace without one alone",
+            "keeper_undescribed",
+            None,
+            None,
+        ),
+    ];
+
+    for (case, name, created_description, updated_description) in rows {
+        let mut create = json!({});
+        if let Some(description) = created_description {
+            create["description"] = json!(description);
+        }
+        let (status, body) = emulator.create_namespace(&instance, name, create).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: CreateDataLakeNamespace expected 200, got {status} with {body}"
+        );
+        let created = namespace_of(case, &body);
+        let created_time = number_of(case, &created, "createdTime");
+
+        let mut request = json!({});
+        if let Some(description) = updated_description {
+            request["description"] = json!(description);
+        }
+        let (status, body) = emulator
+            .update_namespace(&instance, name, request.clone())
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: UpdateDataLakeNamespace expected 200, got {status} with {body}"
+        );
+        let updated = namespace_of(case, &body);
+
+        // An omitted member leaves the stored value; a member the request carries replaces
+        // it.
+        let expected_description = updated_description.or(created_description);
+        assert_eq!(
+            updated.get("description").and_then(Value::as_str),
+            expected_description,
+            "case {case:?}: expected the description {expected_description:?}, got {updated}"
+        );
+        // The namespace's identity is not the update's to change.
+        assert_eq!(
+            (
+                updated.get("instanceId").and_then(Value::as_str),
+                updated.get("name").and_then(Value::as_str),
+                updated.get("arn").and_then(Value::as_str),
+            ),
+            (
+                Some(instance.as_str()),
+                Some(name),
+                Some(expected_arn(&instance, name).as_str()),
+            ),
+            "case {case:?}: the update must leave the namespace's identity alone, got {updated}"
+        );
+        assert_eq!(
+            number_of(case, &updated, "createdTime"),
+            created_time,
+            "case {case:?}: the update must not move createdTime, got {updated}"
+        );
+        let last_modified = number_of(case, &updated, "lastModifiedTime");
+        assert!(
+            last_modified >= created_time,
+            "case {case:?}: lastModifiedTime {last_modified} must not precede createdTime \
+             {created_time}"
+        );
+
+        // The round trip: the read answers from the record the update left behind.
+        let (status, body) = emulator.get_namespace(&instance, name).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: GetDataLakeNamespace expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            namespace_of(case, &body),
+            updated,
+            "case {case:?}: the read must report what the update persisted, got {body}"
+        );
+
+        // The same update again asks for no change, so it makes none — the record it
+        // reports is the one already stored.
+        let (status, body) = emulator.update_namespace(&instance, name, request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a repeated update expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            namespace_of(case, &body),
+            updated,
+            "case {case:?}: a repeated update must change nothing, got {body}"
+        );
+    }
+}
+
+/// RULE: a mutation addressed to an instance-and-name pair the data lake holds no record
+/// under is refused with the modelled `ResourceNotFoundException` (404) and the service's
+/// not-found sentence — a name nobody created and a name a delete removed alike — and
+/// persists nothing, so the name stays unaddressable afterwards.
+#[tokio::test]
+async fn updating_an_absent_namespace_is_a_not_found() {
+    let emulator = Emulator::new();
+    let instance = emulator.given_instance("namespace-host").await;
+    let (status, body) = emulator
+        .create_namespace(&instance, "shipments", json!({ "description": "live" }))
+        .await;
+    assert_eq!(
+        status, 200,
+        "the positive control must be created, got {status} with {body}"
+    );
+    let live = namespace_of("the live namespace", &body);
+
+    // A name whose namespace EXISTED and was removed: the removal is what makes the pair
+    // hold nothing, exactly as never creating it does.
+    let (status, body) = emulator
+        .create_namespace(&instance, "removed_space", json!({ "description": "doomed" }))
+        .await;
+    assert_eq!(
+        status, 200,
+        "the namespace to be removed must be created, got {status} with {body}"
+    );
+    let (status, body) = emulator.delete_namespace(&instance, "removed_space").await;
+    assert_eq!(
+        status, 200,
+        "DeleteDataLakeNamespace expected 200, got {status} with {body}"
+    );
+
+    // Rows differ along WHY the pair holds nothing and along the name's form: never
+    // created, removed by a delete, a prefix of a stored name, a name extending one, and
+    // the longest name the model admits.
+    let longest = "z".repeat(NAME_MAX_LENGTH);
+    let rows: Vec<(&str, &str)> = vec![
+        ("a name nobody created", "orders"),
+        ("a name a delete removed", "removed_space"),
+        ("a prefix of a stored name", "ship"),
+        ("a name extending a stored one", "shipments_2026"),
+        ("the longest name the model admits", longest.as_str()),
+    ];
+
+    for (case, name) in rows {
+        let (status, body) = emulator
+            .update_namespace(
+                &instance,
+                name,
+                json!({ "description": "post-delete-update" }),
+            )
+            .await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected 404 updating {name:?}, got {status} with {body}"
+        );
+        assert_eq!(
+            error_code(case, &body),
+            "ResourceNotFoundException",
+            "case {case:?}: expected a ResourceNotFoundException envelope, got {body}"
+        );
+        let message = error_message(case, &body);
+        let expected = namespace_not_found_sentence(name);
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
+        );
+        assert!(
+            !message.contains(instance.as_str()),
+            "case {case:?}: the sentence must not carry the instanceId: {message:?}"
+        );
+
+        // A refused mutation creates nothing: the name is still unaddressable.
+        let (status, body) = emulator.get_namespace(&instance, name).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: a refused update must persist nothing, got {status} with {body}"
+        );
+    }
+
+    // The namespace the data lake does hold is untouched by every refusal above.
+    let (status, body) = emulator.get_namespace(&instance, "shipments").await;
+    assert_eq!(
+        status, 200,
+        "the live namespace must still read back, got {status} with {body}"
+    );
+    assert_eq!(
+        namespace_of("the live namespace after the refusals", &body),
+        live,
+        "the live namespace must be unchanged, got {body}"
+    );
+}
+
+/// RULE: a namespace name starting with a prefix the service reserves is not a caller's to
+/// mutate — the update is refused with the modelled `ValidationException` (400) carrying the
+/// documented sentence for the verb asked for. The rule is on the PREFIX, so a name that
+/// merely begins with one is refused too.
+#[tokio::test]
+async fn updating_a_reserved_name_is_refused() {
+    let emulator = Emulator::new();
+    let instance = emulator.given_instance("namespace-host").await;
+
+    // Rows: each reserved prefix exactly as the `name` member documents it (`asc`,
+    // `default`, `scn`, `aws`, `amazon`, `amzn`), plus names that EXTEND one — including
+    // `ascending` and `amazon_feed`, which no part of the issue cites.
+    let rows = [
+        "asc",
+        "default",
+        "scn",
+        "aws",
+        "amazon",
+        "amzn",
+        "ascending",
+        "defaults",
+        "aws_orders",
+        "amazon_feed",
+        "amzn_feed",
+        "scn123",
+    ];
+
+    for name in rows {
+        let (status, body) = emulator
+            .update_namespace(&instance, name, json!({ "description": "reserved" }))
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {name:?}: a reserved name expected 400, got {status} with {body}"
+        );
+        assert_eq!(
+            error_code(name, &body),
+            "ValidationException",
+            "case {name:?}: expected a ValidationException envelope, got {body}"
+        );
+        let message = error_message(name, &body);
+        assert_eq!(
+            message, RESERVED_UPDATE_NAME_SENTENCE,
+            "case {name:?}: expected {RESERVED_UPDATE_NAME_SENTENCE:?}, got {message:?}"
+        );
+    }
+
+    // The control: a name the service does not reserve is updated, so the refusals above
+    // are about the prefix and nothing else.
+    let (status, body) = emulator
+        .create_namespace(&instance, "sales", json!({}))
+        .await;
+    assert_eq!(
+        status, 200,
+        "case \"sales\": the control namespace must be created, got {status} with {body}"
+    );
+    let (status, body) = emulator
+        .update_namespace(&instance, "sales", json!({ "description": "the control" }))
+        .await;
+    assert_eq!(
+        status, 200,
+        "case \"sales\": an unreserved name must be updatable, got {status} with {body}"
+    );
+    assert_eq!(
+        namespace_of("sales", &body)
+            .get("description")
+            .and_then(Value::as_str),
+        Some("the control"),
+        "case \"sales\": the update must persist the description, got {body}"
+    );
+}
+
+/// RULE: an instance-scoped namespace call whose `instanceId` names no instance of this
+/// account is refused by the gateway's authorization step — before the namespace is looked
+/// up at all — so an update of it answers `AccessDeniedException` (403) with the gateway's
+/// sentence and writes nothing.
+#[tokio::test]
+async fn an_update_naming_an_unknown_instance_is_refused_by_authorization() {
+    let emulator = Emulator::new();
+    let live = emulator.given_instance("namespace-host").await;
+    let (status, body) = emulator
+        .create_namespace(&live, "shipments", json!({ "description": "live" }))
+        .await;
+    assert_eq!(
+        status, 200,
+        "the live namespace must be created, got {status} with {body}"
+    );
+    let stored = namespace_of("the live namespace", &body);
+
+    // Rows differ along the well-formed `UUID` addressed: none of them names an instance
+    // this account holds.
+    let rows = [
+        "00000000-0000-0000-0000-000000000000",
+        "ffffffff-ffff-ffff-ffff-ffffffffffff",
+        "0123456f-89ab-cdef-0123-456789abcdef",
+    ];
+
+    for instance_id in rows {
+        let (status, body) = emulator
+            .update_namespace(
+                instance_id,
+                "shipments",
+                json!({ "description": "from nowhere" }),
+            )
+            .await;
+        assert_eq!(
+            status, 403,
+            "case {instance_id:?}: expected 403, got {status} with {body}"
+        );
+        assert_eq!(
+            error_code(instance_id, &body),
+            "AccessDeniedException",
+            "case {instance_id:?}: expected an AccessDeniedException envelope, got {body}"
+        );
+        let expected = expected_authorization_failure(instance_id);
+        assert_eq!(
+            error_message(instance_id, &body),
+            expected,
+            "case {instance_id:?}: expected {expected:?}, got {body}"
+        );
+    }
+
+    // The namespace of the instance this account does hold is untouched.
+    let (_, body) = emulator.get_namespace(&live, "shipments").await;
+    assert_eq!(
+        namespace_of("the live namespace after the refusals", &body),
+        stored,
+        "a refused update must change nothing, got {body}"
     );
 }
