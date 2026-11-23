@@ -259,7 +259,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // EMPTY describes no value to store: it asks for the stored one to be REMOVED, so
         // no later reader reports it ([`crate::state::cleared_by_empty`]). A map member is
         // a VALUE like any other, so one the request carries replaces the stored map
-        // wholesale — including a map sent empty, which clears it. The
+        // wholesale — including a map sent empty, which clears it — and an ENTRY of a
+        // parameter map carried empty describes no mapping, so the stored map holds no key
+        // for it either (`crate::state::parameter_mapping::stored_parameters`). The
         // `IntegrationResponseId` is the resource's identity and is never patched.
         let mut updated = existing.clone();
         if let Some(integration_response_key) = input.integration_response_key {
@@ -269,7 +271,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             updated.content_handling_strategy = Some(content_handling_strategy);
         }
         if let Some(response_parameters) = input.response_parameters {
-            updated.response_parameters = response_parameters.into_iter().collect();
+            updated.response_parameters =
+                crate::state::parameter_mapping::stored_parameters(response_parameters);
         }
         if let Some(response_templates) = input.response_templates {
             updated.response_templates = response_templates.into_iter().collect();

@@ -431,8 +431,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // no later reader reports it ([`crate::state::cleared_by_empty`]) — and the MERGED
         // record is then weighed below, so a clear that would leave an integration without
         // a member its type requires is refused there. A map is a VALUE like any other, so
-        // one the request carries replaces the stored map wholesale. Nothing here is
-        // defaulted: a default belongs to the create, and applying one again would
+        // one the request carries replaces the stored map wholesale — and an ENTRY of a
+        // parameter map carried empty describes no mapping, so the merged map holds no key
+        // for it either (`crate::state::parameter_mapping::stored_parameters`). Nothing here
+        // is defaulted: a default belongs to the create, and applying one again would
         // silently undo a value a later `GetIntegration` can still report.
         let mut updated = existing.clone();
         if let Some(integration_type) = input.integration_type {
@@ -469,16 +471,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             updated.payload_format_version = crate::state::cleared_by_empty(version);
         }
         if let Some(parameters) = input.request_parameters {
-            updated.request_parameters = parameters.into_iter().collect();
+            // An entry carried with nothing behind it names no source for its parameter, so
+            // the patch keeps no key for it: a caller that cleared one mapping reads a map
+            // without it, here and from every later read
+            // (`crate::state::parameter_mapping::stored_parameters`).
+            updated.request_parameters =
+                crate::state::parameter_mapping::stored_parameters(parameters);
         }
         if let Some(templates) = input.request_templates {
             updated.request_templates = templates.into_iter().collect();
         }
         if let Some(parameters) = input.response_parameters {
-            updated.response_parameters = parameters
-                .into_iter()
-                .map(|(selection, parameters)| (selection, parameters.into_iter().collect()))
-                .collect();
+            updated.response_parameters =
+                crate::state::parameter_mapping::stored_selected_parameters(parameters);
         }
         if let Some(expression) = input.template_selection_expression {
             updated.template_selection_expression = crate::state::cleared_by_empty(expression);

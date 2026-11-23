@@ -273,7 +273,11 @@ async fn a_status_keyed_response_mapping_transforms_the_backends_answer() {
         // Keyed on a success, mapping headers only: the status the backend named stands.
         "201": {
             "overwrite:header.x-from-backend": "$request.header.x-caller",
-            "remove:header.content-type": ""
+            // A `remove` operates on the header its key names and reads no value, so its
+            // value is the empty STATIC value the mapping language spells quoted: a value
+            // carried truly empty names no source, so the write stores no mapping for it
+            // (`crate::state::parameter_mapping::stored_parameters`).
+            "remove:header.content-type": "''"
         }
     });
     let (api_id, host) = given_api(&emulator, case).await;

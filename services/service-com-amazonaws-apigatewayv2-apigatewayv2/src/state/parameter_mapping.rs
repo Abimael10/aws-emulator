@@ -26,6 +26,10 @@
 //! are "an integration request parameter name" mapped from a method request parameter. So
 //! neither carries an operation on a header at all, and neither is read here.
 //!
+//! WHICH ENTRIES a parameter map stores at all is one rule across all three of those
+//! languages, because all three spell a mapping's VALUE as where the parameter's value comes
+//! from ([`stored_parameters`]), so it is answered here once for every writer of such a map.
+//!
 //! What a mapping KEY names is read here for both of its readers: the write, which refuses a
 //! mapping on a header the gateway owns, and the data plane, which carries the mapping out
 //! ([`mapping_key`], [`mapped_header`], and the one operand that names the response's own
@@ -101,6 +105,52 @@ pub fn restricted_header_message(header: &str) -> String {
         "Invalid mapping expression specified: Validation Result: warnings : [], errors : \
          [Operations on header {header} are restricted]"
     )
+}
+
+/// The entries of a parameter map a write STORES, out of the ones the request carried.
+///
+/// In every one of the parameter-mapping languages this service accepts, an entry's VALUE
+/// names WHERE the parameter's value comes from: "the associated value is a method request
+/// parameter value or static value" for a WebSocket api's integration, "you can provide
+/// static values, or map request data, stage variables, or context variables" for a
+/// subtype's parameters, and "for values, you can provide static values, or map request
+/// data, …" for the `<action>:<header|querystring|path>.<location>` language read here
+/// (`Integration$RequestParameters`). An entry carried with the EMPTY string behind it
+/// therefore names no source at all — a static value is written quoted, so the empty one is
+/// `''` — and it configures no mapping: the write keeps no key for it, so neither the
+/// writing operation's answer nor any later read of the resource reports one. This is the
+/// same reading of an empty value as the one a patch of an optional string member applies
+/// ([`super::cleared_by_empty`]) and as the one the subtype gate applies when it weighs
+/// whether an action's argument is defined ([`super::validate_subtype_request_parameters`]).
+///
+/// Read by every writer of such a map — the creates, the patches and the import — so the
+/// entry a caller cleared cannot survive in one of them and be gone from another.
+pub fn stored_parameters(
+    carried: impl IntoIterator<Item = (String, String)>,
+) -> BTreeMap<String, String> {
+    carried
+        .into_iter()
+        .filter(|(_, value)| !value.is_empty())
+        .collect()
+}
+
+/// The same rule over a map of parameter maps — `Integration$ResponseParameters`, "a
+/// key-value map from a selection key to response parameters" — applied to each selection
+/// key's own mapping ([`stored_parameters`]).
+///
+/// The SELECTION KEY's value is a map and not a mapping, so a key the request carried is
+/// kept as carried, with whatever mappings of it named a source; what an empty value clears is
+/// one parameter of that key's own map.
+pub fn stored_selected_parameters<Parameters>(
+    carried: impl IntoIterator<Item = (String, Parameters)>,
+) -> BTreeMap<String, BTreeMap<String, String>>
+where
+    Parameters: IntoIterator<Item = (String, String)>,
+{
+    carried
+        .into_iter()
+        .map(|(selection, parameters)| (selection, stored_parameters(parameters)))
+        .collect()
 }
 
 /// `Ok(())`, or why one of this integration's parameter mappings cannot be stored — the
@@ -201,6 +251,119 @@ mod tests {
 
     fn no_response_map() -> BTreeMap<String, BTreeMap<String, String>> {
         BTreeMap::new()
+    }
+
+    #[test]
+    fn a_parameter_carried_with_nothing_behind_it_is_stored_under_no_key() {
+        // Rows span what a request can carry for one entry of a parameter map: the empty
+        // string, the empty STATIC value the language spells quoted, a value that is only
+        // whitespace (text, so a value), a mapping expression, a static value, and a key of
+        // each of the three mapping languages — the `<action>:<operand>` one, a subtype
+        // parameter name and a WebSocket integration request parameter.
+        let cases: &[(&str, &str, &str, bool)] = &[
+            ("a mapping carried empty", "append:header.x-trace", "", false),
+            (
+                "the empty static value, which is a value",
+                "append:header.x-trace",
+                "''",
+                true,
+            ),
+            (
+                "a value that is only whitespace",
+                "append:header.x-trace",
+                " ",
+                true,
+            ),
+            (
+                "a mapping expression",
+                "overwrite:header.x-key",
+                "$context.requestId",
+                true,
+            ),
+            ("a static value", "append:header.x-source", "'api'", true),
+            (
+                "a subtype parameter carried empty",
+                "QueueUrl",
+                "",
+                false,
+            ),
+            (
+                "a subtype parameter naming a source",
+                "QueueUrl",
+                "$request.header.queue",
+                true,
+            ),
+            (
+                "a WebSocket integration parameter carried empty",
+                "integration.request.querystring.stage",
+                "",
+                false,
+            ),
+            (
+                "a WebSocket integration parameter naming a source",
+                "integration.request.querystring.stage",
+                "method.request.querystring.stage",
+                true,
+            ),
+        ];
+        for (case, key, value, stored) in cases {
+            let held = stored_parameters([((*key).to_string(), (*value).to_string())]);
+            assert_eq!(
+                held.contains_key(*key),
+                *stored,
+                "case {case:?}: expected the key stored {stored}, got {held:?}"
+            );
+            if *stored {
+                assert_eq!(
+                    held.get(*key).map(String::as_str),
+                    Some(*value),
+                    "case {case:?}: expected the value as written, got {held:?}"
+                );
+            }
+        }
+        // And the entries of ONE map are weighed one by one: the cleared one is gone and
+        // every other is kept.
+        let held = stored_parameters([
+            ("append:header.x-trace".to_string(), String::new()),
+            ("append:header.x-kept".to_string(), "'yes'".to_string()),
+        ]);
+        assert_eq!(
+            held,
+            BTreeMap::from([("append:header.x-kept".to_string(), "'yes'".to_string())]),
+            "case {:?}: expected only the mapping that names a source, got {held:?}",
+            "a map carrying one cleared entry beside one that names a source"
+        );
+    }
+
+    #[test]
+    fn a_selection_keys_own_mapping_is_weighed_by_the_same_rule() {
+        let held = stored_selected_parameters([
+            (
+                "200".to_string(),
+                BTreeMap::from([
+                    ("append:header.x-kept".to_string(), "'yes'".to_string()),
+                    ("append:header.x-cleared".to_string(), String::new()),
+                ]),
+            ),
+            // A selection key whose every mapping was cleared keeps its own entry: the
+            // key's value is a map and not a mapping.
+            (
+                "404".to_string(),
+                BTreeMap::from([("append:header.x-cleared".to_string(), String::new())]),
+            ),
+        ]);
+        let expected = BTreeMap::from([
+            (
+                "200".to_string(),
+                BTreeMap::from([("append:header.x-kept".to_string(), "'yes'".to_string())]),
+            ),
+            ("404".to_string(), BTreeMap::new()),
+        ]);
+        assert_eq!(
+            held, expected,
+            "case {:?}: expected {expected:?}, got {held:?}",
+            "a response mapping keyed on two statuses, one of them cleared outright"
+        );
     }
 
     #[test]

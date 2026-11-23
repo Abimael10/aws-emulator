@@ -457,18 +457,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The two maps that carry this integration's PARAMETER MAPPING, collected here so
         // the mappings are weighed before anything is minted or written: a mapping that
         // operates on a header API Gateway reserves is refused rather than stored
-        // (`crate::state::parameter_mapping`).
-        let request_parameters: ::std::collections::BTreeMap<String, String> =
-            input.request_parameters.unwrap_or_default().into_iter().collect();
-        let response_parameters: ::std::collections::BTreeMap<
-            String,
-            ::std::collections::BTreeMap<String, String>,
-        > = input
-            .response_parameters
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(selection, parameters)| (selection, parameters.into_iter().collect()))
-            .collect();
+        // (`crate::state::parameter_mapping`). An entry carried with nothing behind it
+        // names no source for its parameter, so it configures no mapping and no key is
+        // kept for it (`crate::state::parameter_mapping::stored_parameters`).
+        let request_parameters = crate::state::parameter_mapping::stored_parameters(
+            input.request_parameters.unwrap_or_default(),
+        );
+        let response_parameters = crate::state::parameter_mapping::stored_selected_parameters(
+            input.response_parameters.unwrap_or_default(),
+        );
         if let Err(message) =
             crate::state::parameter_mapping::validate_integration_parameter_mappings(
                 &protocol_type,

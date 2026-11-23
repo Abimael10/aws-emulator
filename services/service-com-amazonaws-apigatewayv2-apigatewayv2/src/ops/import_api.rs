@@ -1399,17 +1399,20 @@ fn read_integration(extension: &Node) -> Result<ImportedIntegration, String> {
         }
     }
 
-    let request_parameters = extension.string_map_member("requestParameters");
-    let response_parameters: ::std::collections::BTreeMap<
-        String,
-        ::std::collections::BTreeMap<String, String>,
-    > = extension
-        .member("responseParameters")
-        .and_then(Node::entries)
-        .unwrap_or_default()
-        .iter()
-        .map(|(selection, parameters)| (selection.clone(), parameters.scalar_entries()))
-        .collect();
+    // An entry carried with nothing behind it names no source for its parameter, so the
+    // import stores no key for it, exactly as the create and the patch store none
+    // (`crate::state::parameter_mapping::stored_parameters`).
+    let request_parameters = crate::state::parameter_mapping::stored_parameters(
+        extension.string_map_member("requestParameters"),
+    );
+    let response_parameters = crate::state::parameter_mapping::stored_selected_parameters(
+        extension
+            .member("responseParameters")
+            .and_then(Node::entries)
+            .unwrap_or_default()
+            .iter()
+            .map(|(selection, parameters)| (selection.clone(), parameters.scalar_entries())),
+    );
     // The same rule the create and the update hold a PARAMETER MAPPING to: a definition
     // cannot write a mapping that operates on a header API Gateway reserves
     // (`crate::state::parameter_mapping`). An imported api speaks HTTP, so its integrations

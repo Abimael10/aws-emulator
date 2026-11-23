@@ -305,11 +305,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             integration_response_id: integration_response_id.clone(),
             integration_response_key: input.integration_response_key,
             content_handling_strategy: input.content_handling_strategy,
-            response_parameters: input
-                .response_parameters
-                .unwrap_or_default()
-                .into_iter()
-                .collect(),
+            response_parameters: crate::state::parameter_mapping::stored_parameters(
+                input.response_parameters.unwrap_or_default(),
+            ),
             response_templates: input
                 .response_templates
                 .unwrap_or_default()
