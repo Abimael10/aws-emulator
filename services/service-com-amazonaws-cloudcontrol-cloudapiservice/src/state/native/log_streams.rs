@@ -72,6 +72,29 @@ impl NativeResourceProvider for LogStreamProvider {
         GROUP_PROPERTY
     }
 
+    /// The owning service's calls this provider's handler makes: `logs:CreateLogStream`,
+    /// which creates a stream, and `logs:DeleteLogStream`, which removes one. The type's
+    /// schema declares nothing an update could apply, so an update names no call either.
+    fn handler_calls(&self, operation: &str) -> &'static [&'static str] {
+        // The create.
+        const CREATE: &[&str] = &["logs:CreateLogStream"];
+        // The removal.
+        const REMOVE: &[&str] = &["logs:DeleteLogStream"];
+        match operation {
+            crate::state::OPERATION_CREATE => CREATE,
+            crate::state::OPERATION_DELETE => REMOVE,
+            _ => &[],
+        }
+    }
+
+    /// The stream's own ARN, as the OWNING service builds it from the Region, its group's
+    /// name and its own. A value that is not this type's compound identifier names no stream,
+    /// so it names no ARN either.
+    fn resource_arn(&self, region: &str, identifier: &str) -> Option<String> {
+        let (group, stream) = segments(identifier)?;
+        Some(logs::log_stream_arn(region, group, stream))
+    }
+
     fn read(&self, region: &str, identifier: &str) -> Option<Value> {
         // The owning service holds its groups in ONE namespace, so a stream is the same
         // stream whichever Region a call that names it was signed for.

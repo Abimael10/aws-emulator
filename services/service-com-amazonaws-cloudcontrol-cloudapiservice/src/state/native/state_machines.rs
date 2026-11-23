@@ -140,6 +140,31 @@ impl NativeResourceProvider for StateMachineProvider {
         IDENTIFIER_PROPERTY
     }
 
+    /// The owning service's calls this provider's handler makes:
+    /// `states:CreateStateMachine`, which creates a state machine,
+    /// `states:UpdateStateMachine`, which changes one, and `states:DeleteStateMachine`,
+    /// which removes one.
+    fn handler_calls(&self, operation: &str) -> &'static [&'static str] {
+        // The create.
+        const CREATE: &[&str] = &["states:CreateStateMachine"];
+        // The change.
+        const CHANGE: &[&str] = &["states:UpdateStateMachine"];
+        // The removal.
+        const REMOVE: &[&str] = &["states:DeleteStateMachine"];
+        match operation {
+            crate::state::OPERATION_CREATE => CREATE,
+            crate::state::OPERATION_UPDATE => CHANGE,
+            crate::state::OPERATION_DELETE => REMOVE,
+            _ => &[],
+        }
+    }
+
+    /// The state machine's own ARN, which is this type's primary identifier — read from the
+    /// reference the request named the way every other answer here reads it ([`own_arn`]).
+    fn resource_arn(&self, region: &str, identifier: &str) -> Option<String> {
+        own_arn(region, identifier)
+    }
+
     /// The ARN the state machine a create describes will answer to.
     ///
     /// The type's primary identifier is read-only in its schema, so no desired state carries

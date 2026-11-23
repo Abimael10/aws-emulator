@@ -184,6 +184,31 @@ impl NativeResourceProvider for TopicProvider {
         IDENTIFIER_PROPERTY
     }
 
+    /// The owning service's calls this provider's handler makes: `sns:CreateTopic`, which
+    /// creates a topic, `sns:SetTopicAttributes`, which changes one, and `sns:DeleteTopic`,
+    /// which removes one.
+    fn handler_calls(&self, operation: &str) -> &'static [&'static str] {
+        // The create.
+        const CREATE: &[&str] = &["sns:CreateTopic"];
+        // The change.
+        const CHANGE: &[&str] = &["sns:SetTopicAttributes"];
+        // The removal.
+        const REMOVE: &[&str] = &["sns:DeleteTopic"];
+        match operation {
+            crate::state::OPERATION_CREATE => CREATE,
+            crate::state::OPERATION_UPDATE => CHANGE,
+            crate::state::OPERATION_DELETE => REMOVE,
+            _ => &[],
+        }
+    }
+
+    /// The topic's own ARN, which is this type's primary identifier — resolved from the
+    /// reference the request named the way every other answer here resolves it
+    /// ([`topic_arn_of`]).
+    fn resource_arn(&self, region: &str, identifier: &str) -> Option<String> {
+        topic_arn_of(region, identifier)
+    }
+
     /// The ARN the topic a create describes will answer to.
     ///
     /// The type's primary identifier is read-only in its schema, so no desired state

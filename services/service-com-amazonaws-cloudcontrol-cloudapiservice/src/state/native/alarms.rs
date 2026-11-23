@@ -156,6 +156,26 @@ impl NativeResourceProvider for AlarmProvider {
         IDENTIFIER_PROPERTY
     }
 
+    /// The owning service's calls this provider's handler makes: `cloudwatch:PutMetricAlarm`,
+    /// the one call that creates an alarm and changes one, and `cloudwatch:DeleteAlarms`,
+    /// which removes one.
+    fn handler_calls(&self, operation: &str) -> &'static [&'static str] {
+        // The write, which this provider's create and update both make.
+        const WRITE: &[&str] = &["cloudwatch:PutMetricAlarm"];
+        // The removal.
+        const REMOVE: &[&str] = &["cloudwatch:DeleteAlarms"];
+        match operation {
+            crate::state::OPERATION_CREATE | crate::state::OPERATION_UPDATE => WRITE,
+            crate::state::OPERATION_DELETE => REMOVE,
+            _ => &[],
+        }
+    }
+
+    /// The alarm's own ARN, as the OWNING service builds it from the Region and the name.
+    fn resource_arn(&self, region: &str, identifier: &str) -> Option<String> {
+        Some(cw::alarm_arn(region, identifier))
+    }
+
     fn read(&self, region: &str, identifier: &str) -> Option<Value> {
         // One namespace per account, so an alarm is the same alarm whichever Region a call
         // that names it was signed for: see this module's header.

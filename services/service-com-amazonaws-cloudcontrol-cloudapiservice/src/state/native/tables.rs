@@ -195,6 +195,30 @@ impl NativeResourceProvider for TableProvider {
         IDENTIFIER_PROPERTY
     }
 
+    /// The owning service's calls this provider's handler makes: `dynamodb:CreateTable`,
+    /// which creates a table, `dynamodb:UpdateTable`, which changes one, and
+    /// `dynamodb:DeleteTable`, which removes one.
+    fn handler_calls(&self, operation: &str) -> &'static [&'static str] {
+        // The create.
+        const CREATE: &[&str] = &["dynamodb:CreateTable"];
+        // The change.
+        const CHANGE: &[&str] = &["dynamodb:UpdateTable"];
+        // The removal.
+        const REMOVE: &[&str] = &["dynamodb:DeleteTable"];
+        match operation {
+            crate::state::OPERATION_CREATE => CREATE,
+            crate::state::OPERATION_UPDATE => CHANGE,
+            crate::state::OPERATION_DELETE => REMOVE,
+            _ => &[],
+        }
+    }
+
+    /// The table's own ARN, as the OWNING service builds it from the Region and the name a
+    /// reference of this type resolves to ([`named`]).
+    fn resource_arn(&self, region: &str, identifier: &str) -> Option<String> {
+        Some(ddb::table_arn(region, &named(identifier).ok()?))
+    }
+
     /// The name the table a create describes will answer to.
     ///
     /// The type's schema declares `TableName` create-only but not required, so a model may

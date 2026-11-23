@@ -136,6 +136,31 @@ impl NativeResourceProvider for SecretProvider {
         IDENTIFIER_PROPERTY
     }
 
+    /// The owning service's calls this provider's handler makes:
+    /// `secretsmanager:CreateSecret`, which creates a secret, `secretsmanager:UpdateSecret`,
+    /// which changes one, and `secretsmanager:DeleteSecret`, which removes one.
+    fn handler_calls(&self, operation: &str) -> &'static [&'static str] {
+        // The create.
+        const CREATE: &[&str] = &["secretsmanager:CreateSecret"];
+        // The change.
+        const CHANGE: &[&str] = &["secretsmanager:UpdateSecret"];
+        // The removal.
+        const REMOVE: &[&str] = &["secretsmanager:DeleteSecret"];
+        match operation {
+            crate::state::OPERATION_CREATE => CREATE,
+            crate::state::OPERATION_UPDATE => CHANGE,
+            crate::state::OPERATION_DELETE => REMOVE,
+            _ => &[],
+        }
+    }
+
+    /// The secret's own ARN, which is this type's primary identifier: the value a request
+    /// addresses the secret by is that ARN.
+    fn resource_arn(&self, region: &str, identifier: &str) -> Option<String> {
+        let _ = region;
+        Some(identifier.to_string())
+    }
+
     /// The ARN the secret a create describes will answer to.
     ///
     /// The type's primary identifier is read-only in its schema, so no desired state carries

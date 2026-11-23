@@ -320,6 +320,11 @@ pub struct RequestRecord {
     pub identifier: Option<String>,
     /// `CREATE`, `UPDATE` or `DELETE`.
     pub operation: String,
+    /// The `RoleArn` the call that started this request named, when it named one: the
+    /// identity Cloud Control API carries the work out as, so the work it owes is judged
+    /// against that role's permissions when it falls due
+    /// ([`native::RolePermissions`]).
+    pub role_arn: Option<String>,
     /// Where the request has got to.
     pub operation_status: String,
     /// "When the resource operation request was initiated" — set once, at the call that
@@ -348,6 +353,7 @@ impl RequestRecord {
         operation: &str,
         now: SystemTime,
         effect: ResourceEffect,
+        role_arn: Option<String>,
     ) -> Self {
         let due = now + RESOURCE_OPERATION_SPAN;
         Self {
@@ -355,6 +361,7 @@ impl RequestRecord {
             type_name,
             identifier,
             operation: operation.to_string(),
+            role_arn,
             operation_status: STATUS_IN_PROGRESS.to_string(),
             event_time: now,
             // The resource model the request leaves behind is what the store holds once
@@ -605,6 +612,18 @@ impl ComAmazonawsCloudcontrolCloudapiserviceState {
         // record owes is applied to that service's store and the model it leaves behind is
         // the one that service then holds.
         if let Some(provider) = native.provider(&record.type_name) {
+            // The work is carried out with the permissions of the role the request named, so
+            // a call that role may not make is refused HERE — before the provider writes
+            // anything, which is what leaves the owning service's resource as it was.
+            if let Some(denied) = native.roles().refusal(
+                record.role_arn.as_deref(),
+                provider,
+                &record.operation,
+                &owning_api::region_of(&effect),
+                &identifier,
+            ) {
+                return Err(EffectFailure::from(denied));
+            }
             return match effect {
                 ResourceEffect::Create {
                     properties, region, ..
@@ -2610,6 +2629,7 @@ mod tests {
                 type_version_id: None,
                 region: DEFAULT_REGION.to_string(),
             },
+            None,
         );
         record.operation_status = status.to_string();
         record

@@ -66,6 +66,27 @@ impl NativeResourceProvider for DestinationProvider {
         IDENTIFIER_PROPERTY
     }
 
+    /// The owning service's calls this provider's handler makes: `logs:PutDestination`, the
+    /// one call that creates a destination and changes one, and `logs:DeleteDestination`,
+    /// which removes one.
+    fn handler_calls(&self, operation: &str) -> &'static [&'static str] {
+        // The write, which this provider's create and update both make.
+        const WRITE: &[&str] = &["logs:PutDestination"];
+        // The removal.
+        const REMOVE: &[&str] = &["logs:DeleteDestination"];
+        match operation {
+            crate::state::OPERATION_CREATE | crate::state::OPERATION_UPDATE => WRITE,
+            crate::state::OPERATION_DELETE => REMOVE,
+            _ => &[],
+        }
+    }
+
+    /// The destination's own ARN, as the OWNING service builds it from the Region and the
+    /// name.
+    fn resource_arn(&self, region: &str, identifier: &str) -> Option<String> {
+        Some(logs::destination_arn(region, identifier))
+    }
+
     fn read(&self, region: &str, identifier: &str) -> Option<Value> {
         // One namespace per account, as for a log group ([`super::log_groups`]).
         let _ = region;

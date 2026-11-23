@@ -512,7 +512,7 @@ impl ComAmazonawsCloudcontrolCloudapiserviceState {
 const OWNING_CALL_LEASE: ::std::time::Duration = ::std::time::Duration::from_secs(30);
 
 /// The Region an effect is to be applied in.
-fn region_of(effect: &ResourceEffect) -> String {
+pub(super) fn region_of(effect: &ResourceEffect) -> String {
     match effect {
         ResourceEffect::Create { region, .. }
         | ResourceEffect::Update { region, .. }

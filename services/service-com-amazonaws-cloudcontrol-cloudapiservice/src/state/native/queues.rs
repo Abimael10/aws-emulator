@@ -130,6 +130,30 @@ impl NativeResourceProvider for QueueProvider {
         IDENTIFIER_PROPERTY
     }
 
+    /// The owning service's calls this provider's handler makes: `sqs:CreateQueue`, which
+    /// creates a queue, `sqs:SetQueueAttributes`, which changes one, and `sqs:DeleteQueue`,
+    /// which removes one.
+    fn handler_calls(&self, operation: &str) -> &'static [&'static str] {
+        // The create.
+        const CREATE: &[&str] = &["sqs:CreateQueue"];
+        // The change.
+        const CHANGE: &[&str] = &["sqs:SetQueueAttributes"];
+        // The removal.
+        const REMOVE: &[&str] = &["sqs:DeleteQueue"];
+        match operation {
+            crate::state::OPERATION_CREATE => CREATE,
+            crate::state::OPERATION_UPDATE => CHANGE,
+            crate::state::OPERATION_DELETE => REMOVE,
+            _ => &[],
+        }
+    }
+
+    /// The queue's own ARN, as the OWNING service builds it from the Region and the name the
+    /// reference this type is identified by resolves to ([`queue_name`]).
+    fn resource_arn(&self, region: &str, identifier: &str) -> Option<String> {
+        Some(sqs::queue_arn(region, &queue_name(region, identifier)?))
+    }
+
     /// The url the queue a create describes will answer to.
     ///
     /// The type's primary identifier is read-only in its schema, so no desired state

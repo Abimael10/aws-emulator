@@ -130,6 +130,32 @@ impl NativeResourceProvider for ManagedPolicyProvider {
         IDENTIFIER_PROPERTY
     }
 
+    /// The owning service's calls this provider's handler makes: `iam:CreatePolicy`, which
+    /// creates a policy, `iam:CreatePolicyVersion`, which changes its document, and
+    /// `iam:DeletePolicy`, which removes it.
+    fn handler_calls(&self, operation: &str) -> &'static [&'static str] {
+        // The create.
+        const CREATE: &[&str] = &["iam:CreatePolicy"];
+        // The change.
+        const CHANGE: &[&str] = &["iam:CreatePolicyVersion"];
+        // The removal.
+        const REMOVE: &[&str] = &["iam:DeletePolicy"];
+        match operation {
+            crate::state::OPERATION_CREATE => CREATE,
+            crate::state::OPERATION_UPDATE => CHANGE,
+            crate::state::OPERATION_DELETE => REMOVE,
+            _ => &[],
+        }
+    }
+
+    /// The policy's own ARN, which is this type's primary identifier: the value a request
+    /// addresses the policy by is that ARN.
+    fn resource_arn(&self, region: &str, identifier: &str) -> Option<String> {
+        // Global: a policy's ARN carries no Region (see this module's header).
+        let _ = region;
+        Some(identifier.to_string())
+    }
+
     /// The ARN the policy a create describes will answer to.
     ///
     /// The type's primary identifier is read-only in its schema, so no desired state carries

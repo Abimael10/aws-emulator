@@ -151,6 +151,28 @@ impl NativeResourceProvider for ParameterProvider {
         IDENTIFIER_PROPERTY
     }
 
+    /// The owning service's calls this provider's handler makes: `ssm:PutParameter`, the one
+    /// call that "create[s] or update[s] a parameter in Parameter Store" and so carries out a
+    /// create and an update alike, and `ssm:DeleteParameter`, which removes one.
+    fn handler_calls(&self, operation: &str) -> &'static [&'static str] {
+        // The write, which this provider's create and update both make.
+        const WRITE: &[&str] = &["ssm:PutParameter"];
+        // The removal.
+        const REMOVE: &[&str] = &["ssm:DeleteParameter"];
+        match operation {
+            crate::state::OPERATION_CREATE | crate::state::OPERATION_UPDATE => WRITE,
+            crate::state::OPERATION_DELETE => REMOVE,
+            _ => &[],
+        }
+    }
+
+    /// The parameter's own ARN, which the OWNING service builds from the Region and the name
+    /// ([`ssm::parameter_arn`]) — the same ARN every read of it reports, under the one
+    /// rendering that service gives a name.
+    fn resource_arn(&self, region: &str, identifier: &str) -> Option<String> {
+        Some(ssm::parameter_arn(region, identifier))
+    }
+
     /// The name the parameter a create describes will answer to, for a model that names
     /// none.
     ///

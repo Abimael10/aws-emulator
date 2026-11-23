@@ -41,10 +41,15 @@ mod log_streams;
 mod managed_policies;
 mod parameters;
 mod queues;
+/// Whether the IAM role a resource operation request named lets this service make the calls
+/// the type's handler has to make on the owning service.
+mod role_permissions;
 mod secrets;
 mod state_machines;
 mod tables;
 mod topics;
+
+pub use role_permissions::RolePermissions;
 
 use ::serde_json::Value;
 use ::std::collections::BTreeMap;
@@ -85,8 +90,8 @@ pub enum NativeRefusal {
     /// The OWNING service raised an error of its own that this type's handler maps to no
     /// other verdict: a model well formed against that schema whose call that service's own
     /// API would refuse — a rule only it holds the value to, a value set only it publishes, a
-    /// combination it will not take, the resource's own state. Carries that service's own
-    /// diagnostic.
+    /// combination it will not take, the resource's own state, a call the credentials the
+    /// handler ran with may not make. Carries that service's own diagnostic.
     Rejected(String),
 }
 
@@ -226,6 +231,33 @@ pub trait NativeResourceProvider: Send + Sync {
 
     /// Remove `identifier` from the owning service's store, in `region`, as of `at`.
     fn delete(&self, region: &str, identifier: &str, at: SystemTime) -> Result<(), NativeRefusal>;
+
+    /// The owning service's API actions this provider's handler CALLS to carry out
+    /// `operation` — one of [`crate::state::OPERATION_CREATE`],
+    /// [`crate::state::OPERATION_UPDATE`] and [`crate::state::OPERATION_DELETE`] — on a
+    /// resource of this type.
+    ///
+    /// They are what the role a request names has to be allowed to do for the work to
+    /// happen ([`RolePermissions`]), so a provider publishes the calls it really makes and
+    /// nothing else: a call it does not make is not a permission the work needs. An
+    /// operation a provider publishes nothing for decides nothing, which is the position
+    /// every catalogue of this crate takes about what it does not state.
+    fn handler_calls(&self, operation: &str) -> &'static [&'static str] {
+        let _ = operation;
+        &[]
+    }
+
+    /// The ARN of `identifier` in `region`, as the OWNING service names it: the resource an
+    /// IAM statement about a resource of this type names, and so the resource a call on it is
+    /// decided against ([`RolePermissions`]).
+    ///
+    /// `None` where this provider cannot name one — a type whose identifier is not a
+    /// reference that service builds an ARN from — which leaves the decision about such a
+    /// resource unmade rather than made against an ARN nothing answers to.
+    fn resource_arn(&self, region: &str, identifier: &str) -> Option<String> {
+        let _ = (region, identifier);
+        None
+    }
 }
 
 /// The providers reachable from one engine: the owning stores this service resolves
@@ -236,6 +268,10 @@ pub trait NativeResourceProvider: Send + Sync {
 pub struct NativeResources {
     /// One provider per `TypeName` this emulator holds the resources of elsewhere.
     providers: Vec<Box<dyn NativeResourceProvider>>,
+    /// The account's roles, which is what a request naming a `RoleArn` is carried out with
+    /// the permissions of. Held here beside the providers for the same reason they are: it
+    /// is a handle to another service's store, built per request from the same engine.
+    roles: RolePermissions,
 }
 
 impl ::std::fmt::Debug for NativeResources {
@@ -321,7 +357,15 @@ impl NativeResources {
         if let Some(provider) = secrets::SecretProvider::for_engine(engine) {
             providers.push(Box::new(provider));
         }
-        Self { providers }
+        Self {
+            providers,
+            roles: RolePermissions::for_engine(engine),
+        }
+    }
+
+    /// What the account's roles let this service do, for a request that named one.
+    pub fn roles(&self) -> &RolePermissions {
+        &self.roles
     }
 
     /// The provider that stands behind `type_name`, or `None` when the resources of that

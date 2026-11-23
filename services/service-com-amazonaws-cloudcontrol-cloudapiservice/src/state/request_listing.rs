@@ -201,6 +201,7 @@ mod tests {
                 type_version_id: None,
                 region: "us-east-1".to_string(),
             },
+            None,
         )
     }
 

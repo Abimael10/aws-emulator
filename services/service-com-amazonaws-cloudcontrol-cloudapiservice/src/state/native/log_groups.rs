@@ -101,6 +101,29 @@ impl NativeResourceProvider for LogGroupProvider {
         IDENTIFIER_PROPERTY
     }
 
+    /// The owning service's calls this provider's handler makes: `logs:CreateLogGroup`, which
+    /// creates a group, and `logs:DeleteLogGroup`, which removes one. The properties an
+    /// update applies are each changed by a call of that service's own — a retention policy,
+    /// a tag set, a key association — so this catalogue names none for an update and nothing
+    /// about one is decided here.
+    fn handler_calls(&self, operation: &str) -> &'static [&'static str] {
+        // The create.
+        const CREATE: &[&str] = &["logs:CreateLogGroup"];
+        // The removal.
+        const REMOVE: &[&str] = &["logs:DeleteLogGroup"];
+        match operation {
+            crate::state::OPERATION_CREATE => CREATE,
+            crate::state::OPERATION_DELETE => REMOVE,
+            _ => &[],
+        }
+    }
+
+    /// The group's own ARN, as the OWNING service builds it from the Region and the name —
+    /// the same spelling this provider reports as the group's `Arn`.
+    fn resource_arn(&self, region: &str, identifier: &str) -> Option<String> {
+        Some(logs::log_group_arn(region, identifier, true))
+    }
+
     fn read(&self, region: &str, identifier: &str) -> Option<Value> {
         // The owning service holds its log groups in ONE namespace, so a group is the same
         // group whichever Region a call that names it was signed for.

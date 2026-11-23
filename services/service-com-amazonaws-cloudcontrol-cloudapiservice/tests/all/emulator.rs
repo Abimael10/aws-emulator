@@ -400,6 +400,40 @@ impl Emulator {
         })
     }
 
+    /// One emulator with that service AND the IAM service — whose own store holds the ROLES
+    /// a resource operation request names, and the policies in force on them — mounted
+    /// beside this one on the same engine.
+    pub(crate) fn with_ssm_and_iam() -> Self {
+        Self::mounted(|router, engine| {
+            router.register_service(service_com_amazonaws_ssm_amazonssm::EmulatedService::new(
+                Arc::clone(&engine),
+            ));
+            router.register_service(
+                service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(
+                    engine,
+                ),
+            );
+        })
+    }
+
+    /// The same pairing for `AWS::Logs::LogGroup`: the service that owns it beside the IAM
+    /// service, so a case can hold a request naming a role to its permissions on a SECOND
+    /// owning service.
+    pub(crate) fn with_cloudwatch_logs_and_iam() -> Self {
+        Self::mounted(|router, engine| {
+            router.register_service(
+                service_com_amazonaws_cloudwatchlogs_logs_20140328::EmulatedService::new(
+                    Arc::clone(&engine),
+                ),
+            );
+            router.register_service(
+                service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(
+                    engine,
+                ),
+            );
+        })
+    }
+
     /// One operation of the Systems Manager service — the OWNING service's own API, the one
     /// a client uses when it is not going through Cloud Control API.
     pub(crate) async fn ssm(&self, operation: &str, body: Value) -> (u16, Value) {

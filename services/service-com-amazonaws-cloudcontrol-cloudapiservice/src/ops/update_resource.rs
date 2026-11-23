@@ -665,6 +665,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // the Region it is patched in — the one this call was signed for.
                 region,
             },
+            // The role this update is to be carried out as, whose permissions the work it
+            // owes is judged against when it falls due.
+            input.role_arn.clone(),
         );
         let progress_event = crate::state::progress_event(&record);
         if store.record_request(record).is_err() {

@@ -181,6 +181,30 @@ impl NativeResourceProvider for BucketProvider {
         IDENTIFIER_PROPERTY
     }
 
+    /// The owning service's calls this provider's handler makes: `s3:CreateBucket`, which
+    /// creates a bucket, and `s3:DeleteBucket`, which removes one. The properties an update
+    /// applies are each changed by a call of that service's own — a tag set, a versioning
+    /// configuration — so this catalogue names none for an update and nothing about one is
+    /// decided here.
+    fn handler_calls(&self, operation: &str) -> &'static [&'static str] {
+        // The create.
+        const CREATE: &[&str] = &["s3:CreateBucket"];
+        // The removal.
+        const REMOVE: &[&str] = &["s3:DeleteBucket"];
+        match operation {
+            crate::state::OPERATION_CREATE => CREATE,
+            crate::state::OPERATION_DELETE => REMOVE,
+            _ => &[],
+        }
+    }
+
+    /// The bucket's own ARN, as the OWNING service builds it from the name: a bucket is
+    /// global, so its ARN carries no Region.
+    fn resource_arn(&self, region: &str, identifier: &str) -> Option<String> {
+        let _ = region;
+        Some(s3::bucket_arn(identifier))
+    }
+
     fn read(&self, region: &str, identifier: &str) -> Option<Value> {
         // One namespace, whichever Region the call was signed for: see this module's
         // header.
