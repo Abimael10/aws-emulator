@@ -356,6 +356,111 @@ fn signing_name(origin_type: &str) -> Option<&'static str> {
         .map(|(_, signing_name)| *signing_name)
 }
 
+/// Whether `domain_name` addresses an origin of the KIND an `OriginAccessControlOriginType`
+/// names — `None` for a type this emulator does not know ([`ORIGIN_TYPE_SIGNING_NAMES`]), so
+/// nothing is read into a type it cannot place.
+///
+/// Each origin type names ONE service ("The type of origin that this origin access control is
+/// for"), and that service's origins are addressed at that service's own endpoint: an Amazon S3
+/// bucket at the S3 endpoint, a Lambda function URL at the function-URL endpoint, an Amazon API
+/// Gateway API at `execute-api`, and the two Elemental origins at theirs. So the question of
+/// whether a control is the one that may front an origin is a question about the origin's
+/// ADDRESS.
+///
+/// Three spellings answer for one endpoint, because a service of this emulator reports whichever
+/// address the client it is answering can reach:
+///
+/// * `answering_service` is the service this emulator has PUBLISHED this address for — the
+///   signing name recorded for the listener a resource's own data plane is served on
+///   (`service_common::published_data_planes`). Nobody can read a service off a `host:port`, so
+///   this record is what an origin addressed at one resolves through, and a resource served on
+///   its own listener is the kind the service that opened it says it is.
+/// * The HOST form AWS publishes, read as ANY of the host's addressing labels naming that
+///   service's endpoint ([`names_the_services_endpoint`]). The question here is only WHOSE
+///   endpoint the host is under, which is why it is not [`endpoint_label`]'s right-anchored
+///   reading: that one answers WHICH label is the endpoint and what Region follows it, as the
+///   bucket and Region readings need, and a service publishes endpoint hosts with labels behind
+///   its own (`<bucket>.s3.dualstack.<region>.amazonaws.com`,
+///   `<id>.data.mediastore.<region>.amazonaws.com`) that such a reading does not place.
+/// * The reserved LOCAL addressing a plane served at this emulator's shared endpoint is
+///   announced at ([`announced_plane_label`]).
+pub(crate) fn addresses_an_origin_of_type(
+    origin_type: &str,
+    domain_name: &str,
+    answering_service: Option<&str>,
+) -> Option<bool> {
+    let signing_name = signing_name(origin_type)?;
+    if answering_service == Some(signing_name) {
+        return Some(true);
+    }
+    if announced_plane_label(domain_name)
+        .is_some_and(|plane| names_the_services_endpoint(plane, signing_name))
+    {
+        return Some(true);
+    }
+    // Read as a HOSTNAME or not at all, for the reason [`of_origin_access_control`] gives: a
+    // value that is not one addresses no service's endpoint.
+    let Some(host) = dns_host(&host_of(domain_name)) else {
+        return Some(false);
+    };
+    Some(
+        addressing_labels(&host)
+            .iter()
+            .any(|label| names_the_services_endpoint(label, signing_name)),
+    )
+}
+
+/// Whether one host label names an endpoint of the service `signing_name`: the forms built on
+/// the signing name itself ([`names_endpoint`], which covers the bare label, the dash forms that
+/// carry a Region or the S3 website surface, and `s3-fips`), or the label Amazon S3 publishes a
+/// DIRECTORY bucket's endpoint under ([`S3_DIRECTORY_BUCKET_LABEL`]), which spells the zone into
+/// the label rather than after a dash following the name.
+fn names_the_services_endpoint(label: &str, signing_name: &str) -> bool {
+    names_endpoint(label, signing_name)
+        || (signing_name == S3_ORIGIN_TYPE && names_endpoint(label, S3_DIRECTORY_BUCKET_LABEL))
+}
+
+/// The label Amazon S3 publishes a DIRECTORY bucket's endpoint under —
+/// `<bucket>.s3express-<az-id>.<region>.amazonaws.com` (Amazon S3 User Guide, *Directory bucket
+/// naming rules* and *Regional endpoints* for S3 Express One Zone) — which is an Amazon S3
+/// endpoint whose label is not built on the `s3` name with a dash behind it.
+const S3_DIRECTORY_BUCKET_LABEL: &str = "s3express";
+
+/// The authority of an origin's `DomainName` — the `host:port` a fetch of it is addressed to,
+/// which is the key an address this emulator published a data plane at is recorded under
+/// (`service_common::published_data_planes`).
+///
+/// Read through the shared scheme reading (`service_common::data_plane_addressing`), with the
+/// path taken off what is left: a `DomainName` is "the domain name for the origin", and what
+/// precedes the first `/` of it is the address a fetch opens a connection to.
+pub(crate) fn origin_authority(domain_name: &str) -> &str {
+    let authority = ::service_common::data_plane_addressing::url_authority(domain_name);
+    authority.split('/').next().unwrap_or(authority)
+}
+
+/// The DATA PLANE an address of this emulator names, when the address carries the reserved
+/// addressing a service announces one at (`<authority>/_aws/<plane>/<resource>`), and `None`
+/// for an address that carries none.
+///
+/// A client on the machine this emulator runs on resolves none of AWS's endpoint hosts, so a
+/// service announces its plane at this emulator's own endpoint and carries in the PATH what it
+/// cannot carry in the host (`service_common::data_plane_addressing`). The segment after the
+/// reserved namespace is the plane's own label, which is the label AWS's host form carries too
+/// — so one reading of the label answers for both spellings.
+fn announced_plane_label(domain_name: &str) -> Option<&str> {
+    use ::service_common::data_plane_addressing::{
+        first_segment, url_authority, EMULATOR_PATH_NAMESPACE,
+    };
+
+    let addressed = url_authority(domain_name);
+    let path = addressed.get(addressed.find('/')?..)?;
+    let (namespace, rest) = first_segment(path)?;
+    if namespace != EMULATOR_PATH_NAMESPACE {
+        return None;
+    }
+    first_segment(rest).map(|(plane, _)| plane)
+}
+
 /// The bucket, the action and the object ARN one fetch of an S3 origin is judged over, or
 /// `None` when the origin's host names no bucket or the viewer's method asks no S3 action
 /// this maps.

@@ -579,6 +579,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The same rule the create path applies: an origin access control signs the origin
+        // request CloudFront makes to the ONE service its origin type names, so an update
+        // cannot leave a control fronting an origin of another kind either. Read here, with no
+        // store guard held, because resolving the kind of an origin addressed at a data plane
+        // this emulator published consults the records of what answers there
+        // (`crate::state::mismatched_origin_access_control`).
+        if crate::state::mismatched_origin_access_control(
+            &*self.engine,
+            &input.distribution_config,
+        )
+        .is_some()
+        {
+            return Err(
+                UpdateDistributionErrorModeled::IllegalOriginAccessConfiguration(
+                    crate::state::illegal_origin_access_control_origin_type(),
+                )
+                .into(),
+            );
+        }
+
         // The same rule the create path applies: a configuration may reference a tenant
         // parameter only where it declares one, so an update cannot leave a distribution
         // carrying a reference CloudFront could never substitute either.

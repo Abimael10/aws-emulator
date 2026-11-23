@@ -636,10 +636,13 @@ async fn a_still_in_use_refusal_names_the_resource_kind_and_no_identifier() {
                 )
             }
             Kind::OriginAccessControl => {
+                // A control of the `s3` origin type: the origins this configuration carries
+                // are Amazon S3 buckets at their own endpoint, and a control fronts only an
+                // origin of the kind its origin type names.
                 let control = control_table()
-                    .first()
-                    .cloned()
-                    .expect("the control table carries at least one row")
+                    .into_iter()
+                    .find(|row| row.origin_type() == "s3")
+                    .expect("the control table carries an s3 row")
                     .with_name("the control under the reference gate", "conflict-control");
                 let created = create_control(&router, &control.xml()).await;
                 assert_eq!(
@@ -959,10 +962,13 @@ async fn an_origin_naming_both_access_mechanisms_is_refused_and_stores_nothing()
         let case = row.case;
         let router = emulator();
 
+        // A control of the `s3` origin type: the origins this configuration carries are
+        // Amazon S3 buckets at their own endpoint, and a control fronts only an origin of
+        // the kind its origin type names.
         let control = control_table()
-            .first()
-            .cloned()
-            .expect("the control table carries at least one row")
+            .into_iter()
+            .find(|row| row.origin_type() == "s3")
+            .expect("the control table carries an s3 row")
             .with_name("the control the row names", "both-mechanisms-control");
         let created_control = create_control(&router, &control.xml()).await;
         assert_eq!(

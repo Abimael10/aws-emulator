@@ -4368,6 +4368,13 @@ pub use key_group_config::*;
 mod origin_access_identity_principal;
 pub use origin_access_identity_principal::*;
 
+/// The PAIRING an origin access control an origin names has to satisfy: the control's
+/// `OriginAccessControlOriginType` against the kind of origin it is attached to, and the
+/// sentence the mismatch is refused with. A SUBMODULE for the same reason [`functions`] is one;
+/// `pub use` keeps every name reachable as `crate::state::<name>`.
+mod origin_access_control_pairing;
+pub use origin_access_control_pairing::*;
+
 /// The judgement a submitted DISTRIBUTION configuration's own MEMBERS are admitted by: the
 /// published per-list quotas its counts are bounded by, the domain each member's value has to
 /// be inside, and the references it resolves — made ONCE for every call that writes a whole

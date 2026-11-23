@@ -530,9 +530,12 @@ fn distribution_xml(reference: &str, origins: &[(&str, Option<&str>)]) -> String
         origins.len()
     );
     for (origin_id, control) in origins {
+        // An Amazon API Gateway origin at its own `execute-api` endpoint: the origin an
+        // `execute-api` origin access control is for, which is the type the control under
+        // test carries ([`table`]'s first row).
         out.push_str(&format!(
             "<Origin><Id>{origin_id}</Id>\
-             <DomainName>{origin_id}.example.com</DomainName>\
+             <DomainName>{origin_id}.execute-api.us-east-1.amazonaws.com</DomainName>\
              <CustomOriginConfig><HTTPPort>80</HTTPPort><HTTPSPort>443</HTTPSPort>\
              <OriginProtocolPolicy>https-only</OriginProtocolPolicy></CustomOriginConfig>"
         ));

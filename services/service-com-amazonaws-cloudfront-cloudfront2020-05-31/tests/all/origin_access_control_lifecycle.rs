@@ -175,6 +175,13 @@ impl Control {
         }
     }
 
+    /// The `OriginAccessControlOriginType` this configuration carries — the kind of origin
+    /// the control it creates is for, which is what a suite attaching the control to a
+    /// distribution's origin pairs that origin with.
+    pub(crate) fn origin_type(&self) -> &str {
+        &self.origin_type
+    }
+
     /// This configuration with `description` in place of its own (`None` leaving the
     /// optional member out entirely), under the case name `case`.
     pub(crate) fn with_description(&self, case: &str, description: Option<&str>) -> Control {

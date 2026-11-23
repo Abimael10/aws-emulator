@@ -23,10 +23,12 @@
 //! to resolve (a control that was deleted, an id in the shape this service mints that no
 //! control was created under, a value in no such shape), WHERE in the origin list the
 //! reference sits and how many origins carry it, the KIND of origin that carries it (an
-//! Amazon S3 origin, which is what an origin access control is for, and a custom origin),
-//! the configuration the live control itself was created with (every row of the origin
-//! access control table), and WHICH call submits the configuration
-//! (`CreateDistribution`, `CreateDistributionWithTags` and `UpdateDistribution`).
+//! Amazon S3 origin, which is what an origin access control is for, and a custom origin at
+//! an Amazon API Gateway endpoint), the configuration the live control itself was created
+//! with (every row of the origin access control table whose origin type is that origin's
+//! kind, which is the pairing a stored configuration has to satisfy), and WHICH call submits
+//! the configuration (`CreateDistribution`, `CreateDistributionWithTags` and
+//! `UpdateDistribution`).
 //!
 //! The harness (the router, the request helpers and the control table) is the one the
 //! distribution and origin access control suites use, reused rather than copied.
@@ -118,8 +120,36 @@ enum OriginKind {
     /// using origin access control (OAC) instead of origin access identity, specify an
     /// empty `OriginAccessIdentity` element").
     S3,
-    /// A `CustomOriginConfig` origin, which carries no origin access identity at all.
+    /// A `CustomOriginConfig` origin, which carries no origin access identity at all — here
+    /// an Amazon API Gateway API, addressed at its own `execute-api` endpoint.
     Custom,
+}
+
+impl OriginKind {
+    /// The `OriginAccessControlOriginType` a control fronting an origin of this kind carries
+    /// — the type that names the service this origin belongs to
+    /// (`smithy_query(query="shape",shape="OriginAccessControlOriginTypes")`).
+    fn origin_type(self) -> &'static str {
+        match self {
+            OriginKind::S3 => "s3",
+            OriginKind::Custom => "execute-api",
+        }
+    }
+}
+
+/// The rows of the origin access control table whose origin type fronts an origin of `kind`,
+/// so the configuration each case stores pairs the control with the origin it is for.
+fn controls_for(kind: OriginKind) -> Vec<Control> {
+    let rows: Vec<Control> = table()
+        .into_iter()
+        .filter(|row| row.origin_type() == kind.origin_type())
+        .collect();
+    assert!(
+        !rows.is_empty(),
+        "the control table must carry a row of origin type {:?}",
+        kind.origin_type()
+    );
+    rows
 }
 
 /// How the origin access control id a configuration names fails to resolve.
@@ -216,7 +246,7 @@ fn config_xml(
                  </S3OriginConfig>"
             )),
             OriginKind::Custom => out.push_str(&format!(
-                "<DomainName>{origin_id}.example.com</DomainName>\
+                "<DomainName>{origin_id}.execute-api.us-east-1.amazonaws.com</DomainName>\
                  <CustomOriginConfig><HTTPPort>80</HTTPPort><HTTPSPort>443</HTTPSPort>\
                  <OriginProtocolPolicy>https-only</OriginProtocolPolicy></CustomOriginConfig>"
             )),
@@ -338,8 +368,8 @@ async fn dead_id(router: &MultiServiceRouter, case: &Case, row: &Control) -> Str
 /// that control on the same origins.
 #[tokio::test]
 async fn a_create_naming_a_control_the_account_does_not_hold_is_refused() {
-    let rows = table();
     for (index, case) in cases().into_iter().enumerate() {
+        let rows = controls_for(case.kind);
         let router = emulator();
         // The live control this account holds throughout, and the configuration it was
         // created with varies by row, so the rule is not tested against one control.
@@ -459,8 +489,8 @@ fn assert_controls(answer: &Answer, case: &Case, live: &str, operation: &str) {
 /// is untouched at its own version, and the same update naming the live control lands.
 #[tokio::test]
 async fn an_update_naming_a_control_the_account_does_not_hold_is_refused() {
-    let rows = table();
     for (index, case) in cases().into_iter().enumerate() {
+        let rows = controls_for(case.kind);
         let router = emulator();
         let (live, _) = create(&router, &rows[index % rows.len()]).await;
 

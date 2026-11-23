@@ -482,6 +482,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::CreateRefusal::InvalidViewerCertificate(message.to_string()),
             ));
         }
+        // An origin access control signs the origin request CloudFront makes to the ONE
+        // service its origin type names, so a control may front only an origin of that kind:
+        // a configuration attaching one to an origin addressed at another service is refused
+        // before a distribution — or the socket its edge would be served on — exists. Read
+        // with no store guard held, because resolving the kind of an origin addressed at a
+        // data plane this emulator published consults the records of what answers there
+        // (`crate::state::mismatched_origin_access_control`).
+        if crate::state::mismatched_origin_access_control(
+            &*self.engine,
+            &input.distribution_config,
+        )
+        .is_some()
+        {
+            return Err(create_refusal(
+                crate::state::CreateRefusal::IllegalOriginAccessConfiguration(
+                    crate::state::ILLEGAL_ORIGIN_ACCESS_CONTROL_ORIGIN_TYPE_MESSAGE.to_string(),
+                ),
+            ));
+        }
         // A Lambda@Edge association fires only where the function's execution role admits
         // the assume the edge makes of it, so a configuration naming a role this emulator's
         // records show it could not be invoked under is refused BEFORE a distribution — or
