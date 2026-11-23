@@ -164,6 +164,26 @@ pub fn object_shown(object: &ObjectAddress) -> String {
     format!("{S3_SCHEME_PREFIX}{}/{}", object.bucket, object.key)
 }
 
+/// One NAMED parameter of a command line, as the CLI reads both forms it takes: `--name value`
+/// and `--name=value` ("you can specify the parameter value with a space or an equals sign", the
+/// AWS CLI's command-structure reference). `None` for a word that names no parameter at all, and
+/// for a `--name` with no value after it.
+///
+/// It is HERE rather than per command group so one emulated CLI reads a parameter's value one
+/// way whichever group the command belongs to ([`requested_api`] and
+/// [`crate::aws_sns_cli::requested_publish`] both read it through this).
+pub fn parameter_of<'a, I: Iterator<Item = &'a str>>(
+    word: &'a str,
+    rest: &mut I,
+) -> Option<(&'a str, String)> {
+    let parameter = word.strip_prefix("--")?;
+    match parameter.split_once('=') {
+        Some((parameter, value)) => Some((parameter, value.to_string())),
+        // `--name value`: the value is the next word.
+        None => Some((parameter, rest.next()?.to_string())),
+    }
+}
+
 /// What one `aws s3` command line asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Requested {
@@ -390,28 +410,31 @@ pub struct ApiCall {
 /// It performs the four commands of [`PERFORMED_S3API_COMMANDS`] over the parameters those
 /// commands take: `--bucket` and `--key`, which address the object, `--body` and
 /// `--content-type` on a write, the one OPERAND `get-object` takes (the file its bytes are
-/// written to), and `--region`. Every other command of the group, every other parameter (each
+/// written to), and `--region` — each in both forms the CLI takes a parameter's value in
+/// ([`parameter_of`]). Every other command of the group, every other parameter (each
 /// changes what the command does, so a line carrying one is not this invocation), a line
 /// missing the parameters its command needs, and one carrying an operand its command does not
 /// take, is answered nothing for.
 #[must_use]
 pub fn requested_api(arguments: &[String]) -> Option<ApiCall> {
-    let mut words = arguments.iter();
-    if words.next()?.as_str() != S3API_COMMAND_GROUP {
+    let mut words = arguments.iter().map(String::as_str);
+    if words.next()? != S3API_COMMAND_GROUP {
         return None;
     }
-    let command = words.next()?.as_str();
+    let command = words.next()?;
     if !PERFORMED_S3API_COMMANDS.contains(&command) {
         return None;
     }
     let (mut bucket, mut key, mut body, mut content_type, mut region) = (None, None, None, None, None);
     let mut operands: Vec<String> = Vec::new();
-    let mut rest = words.peekable();
-    while let Some(word) = rest.next() {
-        let Some(parameter) = word.strip_prefix("--") else {
-            operands.push(word.clone());
+    while let Some(word) = words.next() {
+        if !word.starts_with("--") {
+            operands.push(word.to_string());
             continue;
-        };
+        }
+        // Both forms the CLI takes a parameter's value in, read the one way this workspace
+        // reads them ([`parameter_of`]).
+        let (parameter, value) = parameter_of(word, &mut words)?;
         let held = match parameter {
             "bucket" => &mut bucket,
             "key" => &mut key,
@@ -422,11 +445,11 @@ pub fn requested_api(arguments: &[String]) -> Option<ApiCall> {
             // not an invocation this program performs.
             _ => return None,
         };
-        // A parameter given twice, or with no value after it, is not an invocation either.
+        // A parameter given twice is not an invocation either.
         if held.is_some() {
             return None;
         }
-        *held = Some(rest.next()?.clone());
+        *held = Some(value);
     }
     let target = ObjectAddress {
         bucket: bucket.filter(|bucket| !bucket.is_empty())?,
@@ -557,10 +580,14 @@ pub async fn head_object_api(
     ]))
 }
 
-/// What the CLI prints for one low-level call: the response document, carrying the members the
-/// service ANSWERED and no others — a member it answered nothing for is absent, never filled
-/// in — as the pretty-printed JSON the CLI's default output format is.
-fn printed_document(members: &[(&str, Option<String>)]) -> String {
+/// What the CLI prints for one call: the response document, carrying the members the service
+/// ANSWERED and no others — a member it answered nothing for is absent, never filled in — as
+/// the pretty-printed JSON the CLI's default output format is.
+///
+/// The format is the CLI's rather than any one service's, so the sibling command groups print
+/// what their calls answered through this one spelling of it ([`crate::aws_sns_cli`]).
+#[must_use]
+pub fn printed_document(members: &[(&str, Option<String>)]) -> String {
     let answered: ::serde_json::Map<String, ::serde_json::Value> = members
         .iter()
         .filter_map(|(name, value)| {
@@ -573,6 +600,22 @@ fn printed_document(members: &[(&str, Option<String>)]) -> String {
         return String::new();
     }
     ::serde_json::to_string_pretty(&::serde_json::Value::Object(answered)).unwrap_or_default()
+}
+
+/// What the CLI prints for one call in its `text` format: the values the service ANSWERED, in
+/// the order the response states them, separated by tabs — "the output is formatted as multiple
+/// lines of tab-separated string values" (AWS CLI, controlling command output) — where a member
+/// it answered nothing for is absent rather than filled in.
+///
+/// Beside [`printed_document`] for the same reason: the format is the CLI's rather than any one
+/// service's, so every command group that prints an answer prints it through these two.
+#[must_use]
+pub fn printed_values(members: &[(&str, Option<String>)]) -> String {
+    members
+        .iter()
+        .filter_map(|(_, value)| value.clone())
+        .collect::<Vec<String>>()
+        .join("\t")
 }
 
 /// The object at `address`, as the text a transfer carries — read whole and bounded by
@@ -803,7 +846,7 @@ mod tests {
             key: key.to_string(),
         };
         // (case, the arguments after `aws`, what it asks for)
-        let rows: [(&str, &str, Option<ApiCall>); 12] = [
+        let rows: [(&str, &str, Option<ApiCall>); 13] = [
             (
                 "a write of a local file",
                 "s3api put-object --bucket reports --key out.txt --body /tmp/out.txt",
@@ -887,6 +930,16 @@ mod tests {
                 "a parameter with no value after it",
                 "s3api head-object --bucket reports --key",
                 None,
+            ),
+            (
+                "the values written with equals signs, the CLI's other form",
+                "s3api head-object --bucket=reports --key=in.txt",
+                Some(ApiCall {
+                    operation: ApiOperation::HeadObject {
+                        target: object("reports", "in.txt"),
+                    },
+                    region: None,
+                }),
             ),
             (
                 "a read naming no file to write",

@@ -420,8 +420,8 @@ pub use container_runtime::*;
 mod task_role_credentials;
 pub use task_role_credentials::*;
 
-/// The AWS CLI a container's session provides: the `aws s3` transfers its program asks for,
-/// performed against this emulator's object store as the task role.
+/// The AWS CLI a container's session provides: the `aws s3` transfers and the `aws sns` publish
+/// its program asks for, performed against this emulator's own services as the task role.
 mod container_aws_cli;
 pub use container_aws_cli::*;
 

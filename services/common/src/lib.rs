@@ -686,6 +686,10 @@ pub mod s3_client;
 /// for, and the ONE performance of the transfers they name over that hop, for every service
 /// that runs such a line.
 pub mod aws_s3_cli;
+/// The ONE reading of the AWS CLI's `aws sns publish` a caller-supplied command line asks for,
+/// and the ONE performance of the call it names over that hop, for every service that runs
+/// such a line.
+pub mod aws_sns_cli;
 /// The ONE construction of the in-process Amazon SNS client a service publishing a
 /// notification drives, so no two services configure that hop differently.
 pub mod sns_client;

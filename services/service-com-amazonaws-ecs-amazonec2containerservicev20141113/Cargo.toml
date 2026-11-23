@@ -146,6 +146,11 @@ service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
 # (`state::container_aws_cli`), signed as the task role, so the object a container wrote is the
 # object a client reads back from the service that holds it.
 aws-sdk-s3 = { version = "1", default-features = false }
+# The AWS SDK for Amazon SNS, driven over that same callback and for the same reason: a
+# container's program publishes to the account's topics through `aws sns publish`
+# (`state::container_aws_cli`), signed as the task role, so the message a container published is
+# the one that topic's own subscribers receive.
+aws-sdk-sns = { version = "1", default-features = false }
 # The AWS SDK for Secrets Manager, driven over the same in-process callback: a container's
 # `secrets` entry is read through that service's own `GetSecretValue` before the container's
 # program starts (`state::container_secrets`), so the value injected into a container is the

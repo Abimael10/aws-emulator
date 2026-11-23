@@ -154,7 +154,8 @@
 //! or declined — and one per loop iteration, latched: once spent the run is ABANDONED and no
 //! status is claimed for it), how long it may run for (the deadline its session is
 //! constructed with, which also clamps every wait), how deeply a line may nest
-//! ([`MAX_COMMAND_NESTING`]), how much one word may expand to, how many command substitutions
+//! ([`MAX_COMMAND_NESTING`], and [`MAX_COMPOUND_DEPTH`] over the walk that performs it), how
+//! much one word may expand to, how many command substitutions
 //! it may perform ([`MAX_SUBSTITUTIONS`]) and how deeply they may nest
 //! ([`MAX_SUBSTITUTION_DEPTH`]), how much one substitution or one stage of a pipeline may
 //! carry ([`MAX_CAPTURED_BYTES`]), and how much output it may deliver
@@ -279,6 +280,22 @@ const MAX_PROGRAM_BYTES: usize = 64 * 1024;
 /// arbitrarily deep would exhaust the stack of the thread running it. It is checked WITHOUT
 /// parsing.
 const MAX_COMMAND_NESTING: usize = 64;
+
+/// How deeply this session's own walk over the grammar's COMPOUND forms may nest before it
+/// gives up on the form. THIS NUMBER IS THE EMULATOR'S, under [`MAX_COMMAND_NESTING`]'s rule
+/// applied to the walk rather than to the text: the walk is mutually recursive — a subshell, a
+/// brace group or a loop body re-enters it — so every level costs stack frames of the thread
+/// running it, and a program nested without end would exhaust that stack. It is checked at the
+/// ONE place the walk re-enters a compound form ([`ContainerShell::run_compound_command`]), so
+/// it holds however that form was reached — including a nested program a command substitution
+/// materialised, whose own text [`within_parse_bounds`] counts separately.
+///
+/// Set just ABOVE [`MAX_COMMAND_NESTING`]: the text bound already refuses a program carrying
+/// more grouping indicators than that, and a program may nest no deeper than it carries
+/// indicators, so no program this session admits can reach this limit — nothing a container may
+/// legitimately run is refused by it, and a walk that reaches it however it was entered ends as
+/// a form this container does not perform rather than past the thread's stack.
+const MAX_COMPOUND_DEPTH: usize = MAX_COMMAND_NESTING + 1;
 
 /// The characters that open a nested group in a program, counted by
 /// [`within_parse_bounds`]: a subshell or command substitution, a brace group or expansion,
@@ -596,6 +613,9 @@ pub struct ContainerShell {
     /// a command that fails is the condition's answer rather than a failure that ends the
     /// program under `set -e`.
     condition_depth: usize,
+    /// How deeply this session's walk over the grammar's COMPOUND forms is nested right now,
+    /// which is what [`MAX_COMPOUND_DEPTH`] bounds.
+    compound_depth: usize,
     /// Whether the pipeline just performed was written with `!`, which is the other form
     /// `set -e` does not end the program for.
     negated_pipeline: bool,
@@ -689,6 +709,7 @@ impl ContainerShell {
             redirect_failed: false,
             errexit: false,
             condition_depth: 0,
+            compound_depth: 0,
             negated_pipeline: false,
             serving,
             listening: Vec::new(),
@@ -715,7 +736,7 @@ impl ContainerShell {
     }
 
     /// This session with the AWS CLI its container's environment provides on it: the
-    /// `aws s3` transfers of the container, made as the task role
+    /// `aws s3` transfers and the `aws sns` publish of the container, made as the task role
     /// ([`super::container_aws_cli`]). A session built without it provides no such program.
     #[must_use]
     pub fn with_aws_cli(mut self, aws: ContainerAwsCli) -> Self {
@@ -895,7 +916,28 @@ impl ContainerShell {
     /// A subshell's effects are NOT confined to a child session here: there is no process
     /// to fork, so a variable it sets is set in this one. Every other compound form — an
     /// arithmetic command, a function definition — is one this container does not perform.
+    ///
+    /// This is the ONE place the walk re-enters a compound form, so it is where the walk's own
+    /// nesting is bounded ([`MAX_COMPOUND_DEPTH`]): a form nested past that bound is one this
+    /// container does not perform, rather than one more level of the thread's stack.
     fn run_compound_command<'a>(
+        &'a mut self,
+        compound: &'a ::brush_parser::ast::CompoundCommand,
+    ) -> ShellFuture<'a, i32> {
+        Box::pin(async move {
+            if self.compound_depth >= MAX_COMPOUND_DEPTH {
+                return self.declined();
+            }
+            self.compound_depth = self.compound_depth.saturating_add(1);
+            let status = self.run_nested_compound_command(compound).await;
+            self.compound_depth = self.compound_depth.saturating_sub(1);
+            status
+        })
+    }
+
+    /// The walk itself, one level deeper than its caller ([`Self::run_compound_command`], which
+    /// is what counts that level).
+    fn run_nested_compound_command<'a>(
         &'a mut self,
         compound: &'a ::brush_parser::ast::CompoundCommand,
     ) -> ShellFuture<'a, i32> {
@@ -2501,8 +2543,8 @@ impl ContainerShell {
         EXIT_SUCCESS
     }
 
-    /// Perform the container's `aws` command: the `aws s3` transfers of
-    /// [`super::container_aws_cli`], against the account's object store as the task role.
+    /// Perform the container's `aws` command: the transfers and the publish of
+    /// [`super::container_aws_cli`], against the account's own services as the task role.
     ///
     /// The invocation itself is read by the shared reading of that program, so an invocation
     /// it performs nothing of — another command group, another command, an option, an operand

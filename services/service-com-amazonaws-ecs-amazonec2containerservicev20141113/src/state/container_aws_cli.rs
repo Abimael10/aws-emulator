@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The AWS CLI as a container's session provides it: the `aws s3` transfers one container's
-//! program asks for, really performed against this emulator's own object store as the task
-//! role.
+//! The AWS CLI as a container's session provides it: the `aws s3` transfers and the `aws sns`
+//! publish one container's program asks for, really performed against this emulator's own
+//! services as the task role.
 //!
 //! # The rule this module implements
 //!
@@ -15,22 +15,31 @@
 //! the policies in force on that role: a container whose task role lacks the action is refused
 //! by Amazon S3, and the command reports that refusal and exits as a failed transfer.
 //!
+//! The same holds of a command line that NOTIFIES rather than transfers: `aws sns publish`
+//! "sends a message to an Amazon SNS topic", so the subscribers of the topic a container's
+//! program names receive the message it published, and a task role that may not perform the
+//! action is refused by Amazon SNS — the command reports that refusal and exits with the status
+//! the CLI answers a service error with.
+//!
 //! What ONE command line asks for, and the calls that carry it, are the workspace's shared
-//! reading of that program ([`::service_common::aws_s3_cli`]) — the same one every service that
-//! runs a caller-supplied command line uses, so two of them cannot carry a different file or
-//! answer a different status. Both of the CLI's object command groups are provided: the
-//! file-oriented `aws s3` commands and the low-level `aws s3api` object operations. What this
-//! module adds is the container's own half: the FILES a local path names (the container's layer
-//! and the volumes mounted into it, [`super::container_filesystem`]), the CREDENTIAL the calls
-//! present ([`super::task_role_credentials`]), and the bound one command's calls are made
-//! inside.
+//! reading of that program ([`::service_common::aws_s3_cli`] for the object commands,
+//! [`::service_common::aws_sns_cli`] for the notification one) — the same one every service
+//! that runs a caller-supplied command line uses, so two of them cannot carry a different file,
+//! publish a different message or answer a different status. Both of the CLI's object command
+//! groups are provided: the file-oriented `aws s3` commands and the low-level `aws s3api`
+//! object operations. What this module adds is the container's own half: the FILES a local path
+//! names (the container's layer and the volumes mounted into it,
+//! [`super::container_filesystem`]), the CREDENTIAL the calls present
+//! ([`super::task_role_credentials`]), and the bound one command's calls are made inside.
 //!
 //! Every call goes over the framework's in-process callback, through this workspace's one
-//! construction of that client ([`::service_common::s3_client`]) — the same transport a
-//! client's own S3 request takes, so the object a container wrote is the object a later
-//! `GetObject` of that bucket reads. Nothing is dialled, resolved or opened, and no host file
-//! is read or written. The credential is held HERE and never reaches the program: it is not in
-//! the session's variables, in its filesystem, or in anything the container writes.
+//! construction of each client ([`::service_common::s3_client`],
+//! [`::service_common::sns_client`]) — the same transport a client's own request to those
+//! services takes, so the object a container wrote is the object a later `GetObject` of that
+//! bucket reads and the message it published is the one that topic's subscribers receive.
+//! Nothing is dialled, resolved or opened, and no host file is read or written. The credential
+//! is held HERE and never reaches the program: it is not in the session's variables, in its
+//! filesystem, or in anything the container writes.
 //!
 //! # Bounds
 //!
@@ -46,6 +55,7 @@ use ::service_common::aws_s3_cli::{
     self as cli, Location, ObjectAddress, Requested, NO_CREDENTIAL_LOCATED, TRANSFER_FAILED,
     TRANSFER_SUCCEEDED,
 };
+use ::service_common::aws_sns_cli as sns_cli;
 use ::service_common::posix_shell_files::ShellFiles;
 
 /// How many bytes ONE transfer carries.
@@ -60,7 +70,8 @@ pub const MAX_TRANSFERRED_BYTES: usize = 256 * 1024;
 ///
 /// THIS NUMBER IS THE EMULATOR'S, not an AWS duration: the call is in-process, so a command
 /// whose call cannot be answered reports that bound rather than being left outstanding for the
-/// rest of the container's run.
+/// rest of the container's run. It is the bound on every command of this module, whichever
+/// service the command's calls reach.
 pub const CALL_BUDGET: Duration = Duration::from_secs(5);
 
 /// The provider name the credential a transfer is signed with carries: it names this emulator
@@ -122,8 +133,8 @@ impl ::std::fmt::Debug for TaskRoleCredential {
     }
 }
 
-/// The AWS CLI one container's session provides: the `aws s3` transfers of that container,
-/// made against this emulator's object store as the task role.
+/// The AWS CLI one container's session provides: the `aws s3` transfers and the `aws sns`
+/// publish of that container, made against this emulator's own services as the task role.
 ///
 /// Built per container run ([`super::container_runtime`]) and shared with the session
 /// performing it, which is why it holds no mutable state of its own.
@@ -196,6 +207,9 @@ impl ContainerAwsCli {
         if let Some(call) = cli::requested_api(arguments) {
             return Some(self.performed_api(&call, files).await);
         }
+        if let Some(call) = sns_cli::requested_publish(arguments) {
+            return Some(self.performed_publish(&call).await);
+        }
         let requested = cli::requested(arguments)?;
         let word = requested.reported_word();
         let shown = requested.shown();
@@ -220,6 +234,45 @@ impl ContainerAwsCli {
                 output: format!("{word}: {shown}\n"),
                 errors: String::new(),
             }),
+        }
+    }
+
+    /// Perform one PUBLISH (`aws sns publish …`) and answer what the CLI reports for it: the
+    /// response document on standard output, or the service's own refusal on standard error with
+    /// the status that refusal gives the command
+    /// ([`::service_common::aws_sns_cli::COMMAND_SERVICE_ERROR`]).
+    ///
+    /// The call is signed as the task role, exactly as this module's transfers are, so Amazon
+    /// SNS judges it against the policies in force on that role and the topic's own policy. A
+    /// task holding no credential at all makes no call: that is the CLI's own failure, with no
+    /// refusal to report.
+    async fn performed_publish(&self, call: &sns_cli::PublishCall) -> CliOutcome {
+        let region = call.region.as_deref().unwrap_or(&self.region);
+        let client = match self.notification_client(region) {
+            Ok(client) => client,
+            Err(detail) => {
+                return CliOutcome {
+                    status: sns_cli::COMMAND_ERROR,
+                    output: String::new(),
+                    errors: format!("{detail}\n"),
+                }
+            }
+        };
+        match self.made(sns_cli::published(&client, call)).await {
+            Ok(document) => CliOutcome {
+                status: sns_cli::COMMAND_SUCCEEDED,
+                output: if document.is_empty() {
+                    String::new()
+                } else {
+                    format!("{document}\n")
+                },
+                errors: String::new(),
+            },
+            Err(detail) => CliOutcome {
+                status: sns_cli::COMMAND_SERVICE_ERROR,
+                output: String::new(),
+                errors: format!("{detail}\n"),
+            },
         }
     }
 
@@ -454,7 +507,7 @@ impl ContainerAwsCli {
         match ::tokio::time::timeout(CALL_BUDGET, call).await {
             Ok(answered) => answered,
             Err(_elapsed) => Err(format!(
-                "The transfer was stopped because this command's calls ran past the \
+                "The command was stopped because this command's calls ran past the \
                  {CALL_BUDGET:?} this emulator gives them."
             )),
         }
@@ -484,6 +537,34 @@ impl ContainerAwsCli {
                 ),
             )),
             TaskRoleCredential::Emulator => Ok(::service_common::s3_client::s3_client(
+                &self.callback,
+                region,
+            )),
+            TaskRoleCredential::Absent => Err(NO_CREDENTIAL_LOCATED.to_string()),
+        }
+    }
+
+    /// The Amazon SNS client this command's call is made with, addressed to `region`: the same
+    /// in-process transport and the same credential as this module's transfers
+    /// ([`Self::client`]), through this workspace's one construction of that hop.
+    fn notification_client(&self, region: &str) -> Result<::aws_sdk_sns::Client, String> {
+        match &self.credential {
+            TaskRoleCredential::Session {
+                access_key_id,
+                secret_access_key,
+                session_token,
+            } => Ok(::service_common::sns_client::sns_client_signed_as(
+                &self.callback,
+                region,
+                ::aws_sdk_sns::config::Credentials::new(
+                    access_key_id.clone(),
+                    secret_access_key.clone(),
+                    Some(session_token.clone()),
+                    None,
+                    TASK_CREDENTIAL_SOURCE,
+                ),
+            )),
+            TaskRoleCredential::Emulator => Ok(::service_common::sns_client::sns_client(
                 &self.callback,
                 region,
             )),

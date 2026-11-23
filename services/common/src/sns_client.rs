@@ -31,10 +31,41 @@ use smithy_server_runtime::EmbeddedEmulator;
 /// emulator's own: the caller's `Authorization` header is never forwarded.
 #[must_use]
 pub fn sns_client(callback: &EmbeddedEmulator, region: &str) -> ::aws_sdk_sns::Client {
+    client_signing_with(callback, region, callback.aws_credentials_provider())
+}
+
+/// The same client, signing every call it makes as `credentials` rather than with the
+/// emulator's own.
+///
+/// What a service uses when the publish it makes is one ANOTHER principal makes through it — a
+/// container's own program publishing as the task role, say — so Amazon SNS authorizes it
+/// against the policies in force on that principal and against the topic's own policy, exactly
+/// as it authorizes any other signed request. The credentials are a session an emulated service
+/// minted through the token service; nothing here constructs an access key id or a secret.
+#[must_use]
+pub fn sns_client_signed_as(
+    callback: &EmbeddedEmulator,
+    region: &str,
+    credentials: ::aws_sdk_sns::config::Credentials,
+) -> ::aws_sdk_sns::Client {
+    client_signing_with(
+        callback,
+        region,
+        ::aws_sdk_sns::config::SharedCredentialsProvider::new(credentials),
+    )
+}
+
+/// The ONE builder both constructions above share, so the hop is configured one way whoever the
+/// call is signed as.
+fn client_signing_with(
+    callback: &EmbeddedEmulator,
+    region: &str,
+    credentials: impl ::aws_sdk_sns::config::ProvideCredentials + 'static,
+) -> ::aws_sdk_sns::Client {
     let config = ::aws_sdk_sns::Config::builder()
         .behavior_version(::aws_sdk_sns::config::BehaviorVersion::latest())
         .http_client(callback.http_client())
-        .credentials_provider(callback.aws_credentials_provider())
+        .credentials_provider(credentials)
         .region(::aws_sdk_sns::config::Region::new(region.to_string()))
         .endpoint_url(format!("https://sns.{region}.amazonaws.com"))
         .retry_config(::aws_sdk_sns::config::retry::RetryConfig::disabled())
