@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the template from [`crate::state`] and answers 204 with an empty body — unless
+//! another stored resource still references it, which is the modelled 409
+//! `ConflictException`. `@idempotent`: deleting a template that is already absent is still
+//! a success.
 //!
 //! ## Shape of an operation
 //!
@@ -167,20 +162,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTemplate"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteTemplateErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the template store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // `@idempotent`, and this operation declares no `ResourceNotFoundException`: an
+        // identifier that names no template is already in the state the caller asked for,
+        // so it is a success with nothing to remove.
+        let Some(template_id) = store.resolve_template_id(&input.template_identifier) else {
+            return Ok(DeleteTemplateOutput);
+        };
+
+        // A template another resource is built on cannot be removed from under it: while a
+        // stored policy still associates this template, the delete is REFUSED with the
+        // modelled `ConflictException` stating `RESOURCE_IN_USE_MESSAGE`, and the template
+        // stays readable. The reference graph itself is `crate::state`'s, so every caller
+        // of it agrees on one copy.
+        let referenced = store.templates.get(&template_id).is_some_and(|template| {
+            store.is_referenced(&template.template_arn, &template.template_id)
+        });
+        if referenced {
+            return Err(
+                DeleteTemplateErrorModeled::ConflictException(ConflictException {
+                    message: crate::state::RESOURCE_IN_USE_MESSAGE.to_string(),
+                    resource_id: Some(template_id),
+                    resource_type: Some(crate::state::RESOURCE_TYPE_TEMPLATE.to_string()),
+                })
+                .into(),
+            );
+        }
+
+        store.templates.remove(&template_id);
+        // The idempotency records too: a token that produced this template can no longer
+        // replay it, so keeping the row would only hold memory for an id no call can read
+        // again.
+        store.forget_idempotent_calls_for(&template_id);
+        Ok(DeleteTemplateOutput)
     }
 }
