@@ -238,7 +238,10 @@ impl Emulator {
     }
 
     /// The recorded events whose `eventName` is `event_name`, oldest first.
-    fn recorded_named(&self, event_name: &str) -> Vec<Value> {
+    ///
+    /// `pub(crate)` so a sibling suite on this harness reads the assumes a vend records
+    /// through the same reader rather than a second copy of it.
+    pub(crate) fn recorded_named(&self, event_name: &str) -> Vec<Value> {
         self.recorded_events()
             .into_iter()
             .filter(|event| event.get("eventName") == Some(&json!(event_name)))
@@ -431,12 +434,26 @@ async fn a_vend_is_a_session_of_the_role_the_pool_resolves() {
             "case {case:?}: expected <RoleId>:{VENDED_ROLE_SESSION_NAME}, got {user_id}"
         );
 
-        // Asked again inside the window, the identity has the same session.
+        // Asked again, the identity is handed ANOTHER session of the same role: a vend
+        // mints, so the second answer names the same identity and stands for the same role
+        // while carrying its own credential.
         let again = emulator.ok("GetCredentialsForIdentity", &request).await;
+        let (again_access_key_id, _) = vended(&again);
+        assert_ne!(
+            again_access_key_id, access_key_id,
+            "case {case:?}: a second vend must mint a new session, got {again_access_key_id} \
+             twice"
+        );
+        let (status, body) = emulator.caller_identity(again_access_key_id).await;
         assert_eq!(
-            again, issued,
-            "case {case:?}: a second vend inside the window answered {again}, expected \
-             {issued}"
+            status, 200,
+            "case {case:?}: GetCallerIdentity under the re-vended credential expected 200, \
+             got {status} with {body}"
+        );
+        assert_eq!(
+            element(&body, "Arn"),
+            expected_session_arn(role_name),
+            "case {case:?}: the re-vended session stands for {role_name} too, got {body}"
         );
     }
 }

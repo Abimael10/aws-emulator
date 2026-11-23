@@ -763,10 +763,9 @@ async fn get_id_refuses_an_unauthenticated_call_when_the_pool_forbids_it() {
 }
 
 /// RULE: `GetCredentialsForIdentity` issues credentials that belong to the one identity
-/// asked for, with an expiration in the future, and hands the same session back while it
-/// is still valid.
+/// asked for, with an expiration in the future, and mints a NEW session on every call.
 #[tokio::test]
-async fn credentials_are_per_identity_and_stable_while_valid() {
+async fn credentials_are_per_identity_and_freshly_minted_per_call() {
     let emulator = Emulator::new();
     // A vend is a session of the pool's role, so the pool is configured with the roles it
     // vends; what the session STANDS FOR is `super::vended_role_session`'s own rule.
@@ -833,11 +832,32 @@ async fn credentials_are_per_identity_and_stable_while_valid() {
             "case {case:?}: a SecretKey was issued to two identities: {issued}"
         );
 
-        // Asked again inside the validity window, the identity has the same session.
+        // Asked again, the identity is handed its own second session: no member of the
+        // credential is the first call's, and the vend still names the identity it was
+        // asked for.
         let again = emulator.ok("GetCredentialsForIdentity", &vend).await;
         assert_eq!(
-            again, issued,
-            "case {case:?}: a second call inside the validity window answered {again}, expected {issued}"
+            again["IdentityId"].as_str(),
+            Some(identity_id.as_str()),
+            "case {case:?}: a second vend names the identity it was asked for, got {again}"
+        );
+        for member in ["AccessKeyId", "SecretKey", "SessionToken"] {
+            let first = issued["Credentials"][member].as_str().unwrap_or_default();
+            let second = again["Credentials"][member].as_str().unwrap_or_default();
+            assert!(
+                !second.is_empty() && second != first,
+                "case {case:?}: a second vend must mint its own Credentials.{member}, got \
+                 {second:?} against {first:?}"
+            );
+        }
+        assert!(
+            access_keys.insert(
+                again["Credentials"]["AccessKeyId"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            ),
+            "case {case:?}: the re-vended AccessKeyId was issued before: {again}"
         );
     }
 }

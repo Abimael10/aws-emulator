@@ -3,8 +3,8 @@
 //! @op DeleteIdentities
 //! DELETES the named identities of this account's identity pools, one by one: every login
 //! the identity's pool indexed against it is forgotten (so presenting that login again is
-//! seen as a NEW user), the pool's listing no longer names it, and the credentials and
-//! OpenID Connect tokens issued for it speak for nobody. A named id this service holds no
+//! seen as a NEW user), the pool's listing no longer names it, and the OpenID Connect
+//! tokens issued for it speak for nobody. A named id this service holds no
 //! identity for is already deleted, so the call is idempotent and two overlapping batches
 //! leave the same final state. Being a developer-credentials operation that names no single
 //! pool, the whole call is authorized once against the account's identity pools before

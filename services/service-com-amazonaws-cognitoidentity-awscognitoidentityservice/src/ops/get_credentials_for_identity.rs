@@ -2,7 +2,24 @@
 
 //! @op GetCredentialsForIdentity
 //! Issues the credentials of an `sts:AssumeRoleWithWebIdentity` session of the pool's
-//! resolved role, and holds them for the identity until they expire.
+//! resolved role, a FRESH session on every call.
+//!
+//! ## One session per call
+//!
+//! Every served vend mints its own session: the `Credentials` answered carry an
+//! `AccessKeyId`, `SecretKey` and `SessionToken` triple this call alone was handed, and no
+//! call is answered with a session an earlier one was given. The exchange is the assume it
+//! is passed through as — "If the token is for cognito-identity.amazonaws.com, it will be
+//! passed through to Security Token Service with the appropriate role for the token" (this
+//! operation's own doc) — and an assume mints a session, so a caller that asks again gets
+//! another one, which is what lets it pick up a change in what the role may do and what
+//! makes each session separately attributable where a call it signs is recorded. A session
+//! handed out earlier is untouched by the next vend: it is the token service's, valid for
+//! its own window, so this service keeps no per-identity record of it and revokes nothing
+//! by vending again. Minting per call is bounded where the sessions live: the token
+//! service's registry holds at most its own stated number of sessions that have not expired
+//! and gives up the expired ones to make room, so a vend it cannot record is refused rather
+//! than answered with a credential nothing resolves.
 //!
 //! ## Which role the session stands for
 //!
@@ -335,9 +352,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
         input: &GetCredentialsForIdentityInput,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<GetCredentialsForIdentityOutput, GetCredentialsForIdentityError> {
-        use crate::state::{
-            IssuedCredentials, MappedRole, VendedAssume, INVALID_POOL_CONFIGURATION_MESSAGE,
-        };
+        use crate::state::{MappedRole, VendedAssume, INVALID_POOL_CONFIGURATION_MESSAGE};
         use ::std::collections::HashMap;
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -370,7 +385,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
         // are copied out, so the identity-pool store is not held while the IAM and STS
         // stores in the same engine are read.
         let resolved = {
-            let mut store = state.lock();
+            let store = state.lock();
 
             let Some(identity) = store.identities.get(&input.identity_id) else {
                 return Err(GetCredentialsForIdentityErrorModeled::ResourceNotFoundException(
@@ -612,29 +627,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
                 );
             };
 
-            // Every session whose window the clock has closed is forgotten here — by this
-            // service, by the emulator's credential store and by the session registry — so
-            // a request still presenting one is refused and no store holds an expired
-            // session for the life of the process.
-            let expired = store.purge_expired_credentials(now);
-
             ResolvedVend {
                 identity_pool_id,
                 methods,
                 role_arn,
-                expired,
-                held: store.credentials.get(&input.identity_id).cloned(),
                 requested_tags,
             }
         };
-
-        for access_key_id in &resolved.expired {
-            crate::state::discard_vended_role_session(
-                &*self.engine,
-                ctx.credential_store(),
-                access_key_id,
-            );
-        }
 
         // Nothing is assumed that the account does not hold and no trust policy admits:
         // the role the pool names, and its trust policy's grant to the Cognito Identity
@@ -682,75 +681,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
             return Err(refused());
         }
 
-        // What survived the sweep is still valid and stands for the role THIS call
-        // resolved, so a caller that asks twice inside the window gets one session.
-        let issued = match resolved
-            .held
-            .filter(|held| held.role_arn == resolved.role_arn)
-        {
-            Some(issued) => issued,
-            None => {
-                let vended = crate::state::mint_vended_role_session(
-                    &*self.engine,
-                    ctx.credential_store(),
-                    &role,
-                    now,
-                    CREDENTIAL_VALIDITY,
-                    &context,
-                    &resolved.requested_tags,
-                );
-                // A vend that could not be recorded is refused rather than answered with a
-                // credential no later call can resolve.
-                let vended = match vended {
-                    Ok(vended) => vended,
-                    Err(why) => {
-                        return Err(GetCredentialsForIdentityErrorModeled::InternalErrorException(
-                            InternalErrorException { message: Some(why) },
-                        )
-                        .into())
-                    }
-                };
-                let duration_seconds = i32::try_from(CREDENTIAL_VALIDITY.as_secs())
-                    .unwrap_or(i32::MAX)
-                    .min(role.max_session_duration);
-                crate::state::record_vended_assume(
-                    &*self.engine,
-                    ctx.parts(),
-                    &VendedAssume {
-                        role: &role,
-                        session: &vended,
-                        identity_pool_id: &resolved.identity_pool_id,
-                        identity_id: &input.identity_id,
-                        // The Region the vend was served in is the POOL's own, which its
-                        // `REGION:GUID` id carries: `GetCredentialsForIdentity` is modelled
-                        // `@optionalAuth` and a client calls it with no credential scope at
-                        // all, so the request itself names no Region.
-                        region: crate::state::region_of(&resolved.identity_pool_id),
-                        duration_seconds,
-                    },
-                );
-                let issued = IssuedCredentials {
-                    access_key_id: vended.access_key_id,
-                    secret_key: vended.secret_key,
-                    session_token: vended.session_token,
-                    expiration: vended.expiration,
-                    role_arn: resolved.role_arn.clone(),
-                };
-                state
-                    .lock()
-                    .credentials
-                    .insert(input.identity_id.clone(), issued.clone());
-                issued
+        // The session itself: minted HERE, for THIS call, so the triple the caller is
+        // handed is one no earlier vend was given. Nothing of an earlier session is read or
+        // given back — it stays valid in the token service's registry for its own window.
+        let vended = crate::state::mint_vended_role_session(
+            &*self.engine,
+            ctx.credential_store(),
+            &role,
+            now,
+            CREDENTIAL_VALIDITY,
+            &context,
+            &resolved.requested_tags,
+        );
+        // A vend that could not be recorded is refused rather than answered with a
+        // credential no later call can resolve.
+        let vended = match vended {
+            Ok(vended) => vended,
+            Err(why) => {
+                return Err(GetCredentialsForIdentityErrorModeled::InternalErrorException(
+                    InternalErrorException { message: Some(why) },
+                )
+                .into())
             }
         };
+        let duration_seconds = i32::try_from(CREDENTIAL_VALIDITY.as_secs())
+            .unwrap_or(i32::MAX)
+            .min(role.max_session_duration);
+        crate::state::record_vended_assume(
+            &*self.engine,
+            ctx.parts(),
+            &VendedAssume {
+                role: &role,
+                session: &vended,
+                identity_pool_id: &resolved.identity_pool_id,
+                identity_id: &input.identity_id,
+                // The Region the vend was served in is the POOL's own, which its
+                // `REGION:GUID` id carries: `GetCredentialsForIdentity` is modelled
+                // `@optionalAuth` and a client calls it with no credential scope at
+                // all, so the request itself names no Region.
+                region: crate::state::region_of(&resolved.identity_pool_id),
+                duration_seconds,
+            },
+        );
 
         Ok(GetCredentialsForIdentityOutput {
             identity_id: Some(input.identity_id.clone()),
             credentials: Some(Credentials {
-                access_key_id: Some(issued.access_key_id),
-                secret_key: Some(issued.secret_key),
-                session_token: Some(issued.session_token),
-                expiration: Some(::aws_smithy_types::DateTime::from(issued.expiration)),
+                access_key_id: Some(vended.access_key_id),
+                secret_key: Some(vended.secret_key),
+                session_token: Some(vended.session_token),
+                expiration: Some(::aws_smithy_types::DateTime::from(vended.expiration)),
             }),
         })
     }
@@ -766,10 +746,6 @@ struct ResolvedVend {
     methods: Vec<String>,
     /// The ARN of the role this vend assumes.
     role_arn: String,
-    /// The access key ids of the sessions the clock has expired, to be forgotten.
-    expired: Vec<String>,
-    /// The session this identity already holds, if any.
-    held: Option<crate::state::IssuedCredentials>,
     /// The session tags the assume asks to attach, in tag-key order: the principal tags the
     /// pool maps for the providers the presented logins were made under.
     requested_tags: Vec<(String, String)>,

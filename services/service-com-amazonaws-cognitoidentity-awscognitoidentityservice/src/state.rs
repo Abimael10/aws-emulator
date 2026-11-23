@@ -2346,20 +2346,6 @@ fn unresolved_login_token_refusal(token: &str) -> LoginTokenRefusal {
     }
 }
 
-/// The credentials `GetCredentialsForIdentity` issued for one identity. The id and the
-/// secrets are the emulator's own credential store's: a handler never constructs them.
-#[derive(Debug, Clone)]
-pub struct IssuedCredentials {
-    pub access_key_id: String,
-    pub secret_key: String,
-    pub session_token: String,
-    pub expiration: SystemTime,
-    /// The ARN of the pool role this session was assumed of, so a later vend hands the
-    /// same session back only while it still stands for the role THAT call resolves — a
-    /// vend for another role is another session.
-    pub role_arn: String,
-}
-
 /// Per-service state for com-amazonaws-cognitoidentity-awscognitoidentityservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
@@ -2395,8 +2381,6 @@ pub struct ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
     /// the caller, and any separator they may also contain would make two distinct logins
     /// share a key.
     pub login_index: HashMap<(String, String, String), String>,
-    /// The credentials outstanding for an identity, by `IdentityId`.
-    pub credentials: HashMap<String, IssuedCredentials>,
     /// The OpenID Connect tokens outstanding, by the token itself, as `GetOpenIdToken`
     /// and `GetOpenIdTokenForDeveloperIdentity` minted them. A token is a bearer of the
     /// identity it names, so the record is what tells this service which identity and
@@ -2623,9 +2607,9 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
         ))
     }
 
-    /// Merge the identity `merged_away` of this pool INTO `survivor`, and report the access
-    /// key ids whose credentials the caller must now forget (`None` when there was no such
-    /// pair of this pool's identities to merge, so nothing was written).
+    /// Merge the identity `merged_away` of this pool INTO `survivor`, reporting whether
+    /// there was such a pair of this pool's identities to merge (`false` when there was
+    /// not, so nothing was written).
     ///
     /// Every login `merged_away` was reached through — its developer user identifiers and
     /// its federated logins alike — now resolves to `survivor`, which is left carrying the
@@ -2638,9 +2622,7 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
     /// the issuances stand and the identity they name keeps being the one they were minted
     /// for. A role session already vended for it keeps working too: that credential is a
     /// session of the IAM role, held by the token service's registry until its own expiry, and
-    /// a merge of two identities is not its revocation; what this service gives up is only its
-    /// own record of the session outstanding for an identity no login reaches, so a later vend
-    /// is a fresh one.
+    /// a merge of two identities is not its revocation.
     ///
     /// The RECORD of `merged_away` nevertheless stays stored, in `identities` and in the
     /// pool's listing order, with its logins emptied and `disabled` set: a merge takes the
@@ -2709,7 +2691,6 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
             identity.logins.sort();
             identity.last_modified_date = now;
         }
-        self.credentials.remove(merged_away);
         true
     }
 
@@ -2755,25 +2736,6 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
                 .count();
             linked.len() + fresh > MAX_LOGIN_PROVIDERS_PER_IDENTITY
         })
-    }
-
-    /// Forget every credential whose validity window has closed, and report the access
-    /// key ids the caller must now delete from the emulator's credential store. The clock
-    /// made these due: they are swept whenever credentials are issued, so an expired
-    /// session is not held for the life of the process.
-    pub fn purge_expired_credentials(&mut self, now: SystemTime) -> Vec<String> {
-        let expired: Vec<(String, String)> = self
-            .credentials
-            .iter()
-            .filter(|(_, issued)| issued.expiration <= now)
-            .map(|(identity_id, issued)| (identity_id.clone(), issued.access_key_id.clone()))
-            .collect();
-        let mut revoked = Vec::with_capacity(expired.len());
-        for (identity_id, access_key_id) in expired {
-            self.credentials.remove(&identity_id);
-            revoked.push(access_key_id);
-        }
-        revoked
     }
 
     /// Forget every OpenID Connect token whose validity window has closed — the window a
@@ -3115,12 +3077,12 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
     }
 
     /// Remove ONE identity with everything that named it — the logins its pool indexed
-    /// against it, its place in the pool's listing order, the record of the session
-    /// outstanding for it and the OpenID Connect tokens issued for it. `false` when this
+    /// against it, its place in the pool's listing order and the OpenID Connect tokens
+    /// issued for it. `false` when this
     /// service holds no such identity, so nothing was written.
     ///
-    /// The teardown [`Self::delete_identity_pool`] does for the logins, session records and
-    /// tokens of every identity of a pool, plus the RECORD itself, which only this
+    /// The teardown [`Self::delete_identity_pool`] does for the logins and tokens of every
+    /// identity of a pool, plus the RECORD itself, which only this
     /// transition removes: once the identity is gone, a login that resolved to it resolves
     /// nothing (so presenting it again is a NEW user), a listing of the pool no longer names
     /// it, and the tokens that spoke for it speak for nobody. Removing the
@@ -3130,9 +3092,8 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
     ///
     /// What it does NOT reach is the ROLE SESSION a vend already handed out: the credential
     /// is a session of the IAM role the pool resolved, held in the token service's registry
-    /// until its own expiry, so what goes here is only this service's record of which
-    /// session this identity holds — the identity's lease on re-vending the same credential,
-    /// not the credential itself.
+    /// until its own expiry, so removing an identity never revokes a credential a caller is
+    /// already holding.
     pub fn delete_identity(&mut self, identity_id: &str) -> bool {
         let Some(identity) = self.identities.remove(identity_id) else {
             return false;
@@ -3144,21 +3105,18 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
             .retain(|(pool, _, _), linked| !(*pool == identity.identity_pool_id && linked == identity_id));
         self.open_id_tokens
             .retain(|_, issued| issued.identity_id != identity_id);
-        self.credentials.remove(identity_id);
         true
     }
 
-    /// Remove a pool with everything that belongs to it — its login index entries, the
-    /// records of the sessions outstanding for its identities, the OIDC tokens it issued,
+    /// Remove a pool with everything that belongs to it — its login index entries, the OIDC
+    /// tokens it issued,
     /// the listing order of its identities and the principal-tag attribute maps of its
     /// providers. `false` when no such pool is stored.
     ///
     /// A pool's lifecycle does not reach a ROLE SESSION already vended for one of its
     /// identities: that credential is a session of the IAM role the pool resolved, kept by
     /// the token service's registry until its own expiry, so deleting the pool stops further
-    /// vends without touching a session already in a caller's hands. What goes here is this
-    /// service's own record of which session each identity holds — the lease that lets a
-    /// second vend inside the window hand back the same credential.
+    /// vends without touching a session already in a caller's hands.
     ///
     /// What the pool does NOT take with it is the RECORD of each identity it minted: an
     /// identity belongs to the pool that minted it and names it for as long as the record
@@ -3186,9 +3144,6 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
             .identities_by_pool
             .remove(identity_pool_id)
             .unwrap_or_default();
-        for identity_id in &identity_ids {
-            self.credentials.remove(identity_id);
-        }
         self.orphaned_identities.extend(identity_ids);
         while self.orphaned_identities.len() > MAX_ORPHANED_IDENTITY_RECORDS {
             if let Some(evicted) = self.orphaned_identities.pop_front() {
@@ -3839,27 +3794,6 @@ pub fn mint_vended_role_session<Eng: Send + Sync + 'static>(
         assumed_role_arn,
         assumed_role_id,
     })
-}
-
-/// Forget a session this service vended, in both stores that hold it: the credential store
-/// (so a request still presenting it no longer verifies) and the STS session registry (so
-/// it names no identity either), and in the account's session directory (so no record of a
-/// later call names a credential nobody holds).
-pub fn discard_vended_role_session<Eng: Send + Sync + 'static>(
-    engine: &Eng,
-    store: &CredentialStore,
-    access_key_id: &str,
-) {
-    ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state::forget_audited_session(
-        engine,
-        access_key_id,
-    );
-    match sts_state(engine) {
-        Some(registry) => registry.lock().discard(access_key_id, store),
-        None => {
-            let _ = store.delete(access_key_id);
-        }
-    }
 }
 
 /// What the audit record of one vended assume reports.
