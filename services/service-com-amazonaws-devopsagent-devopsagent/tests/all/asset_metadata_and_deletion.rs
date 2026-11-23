@@ -13,7 +13,9 @@ use bytes::Bytes;
 use serde_json::{json, Map, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use service_com_amazonaws_devopsagent_devopsagent::state::{ASSET_STATUS_ACTIVE, ASSET_TYPE_RULES};
+use service_com_amazonaws_devopsagent_devopsagent::state::{
+    ASSET_STATUS_ACTIVE, ASSET_TYPE_RULES, MAX_ASSET_FILE_PATH_LEN,
+};
 
 /// A SigV4 credential scope naming this service's signing name (`aidevops`), which
 /// is how the router resolves which service claims a request. Signature
@@ -800,5 +802,198 @@ async fn deleting_a_file_removes_it_and_takes_a_one_file_asset_with_it() {
     assert_eq!(
         status, 200,
         "refusals: expected 200 reading kept.md, got {status}: {kept}"
+    );
+}
+
+/// The path of the one file the assets of
+/// [`deleting_a_file_refuses_every_path_that_names_no_file_of_the_asset`] hold.
+const HELD_FILE_PATH: &str = "dir/held.md";
+
+/// RULE: the file a delete names is named relative to the asset's own root, so a
+/// value the greedy `{path+}` label admits that cannot name a file of the asset —
+/// one starting at a root, or one walking out of it through a parent segment — is
+/// refused as an invalid `path` reporting that member, a path of an admissible form
+/// the asset holds no file at reports no such file, and neither refusal moves the
+/// asset to another revision or touches the file it holds.
+#[tokio::test]
+async fn deleting_a_file_refuses_every_path_that_names_no_file_of_the_asset() {
+    let router = new_router();
+    let space = create_space(&router, "file-delete-refusal-space").await;
+
+    // The rows differ along the form of the value the label carries: where it
+    // starts, how deep it is, and where its parent segments sit. Each is built only
+    // from characters `AssetFilePath` admits (`smithy_query(query="shape",
+    // shape="AssetFilePath")`: `^[a-zA-Z0-9_./ ()-]+$`, 1..512), so every row
+    // reaches the handler rather than the framework's own member validation.
+    let escaping: Vec<(&str, &str)> = vec![
+        ("a path that starts at a root", "/escape.md"),
+        ("a root path into the asset's own directory", "/dir/held.md"),
+        ("a path that walks out of the asset", "../escape.md"),
+        (
+            "a path that walks out of a subdirectory of the asset",
+            "dir/../../escape.md",
+        ),
+        ("a path whose interior segment walks out", "dir/../held.md"),
+        ("a parent segment alone", ".."),
+        ("a path whose last segment walks out", "dir/.."),
+        (
+            "a path that walks out and back into the asset",
+            "dir/../dir/held.md",
+        ),
+    ];
+
+    for (case, path) in &escaping {
+        let asset = create_one_file_asset(&router, &space, case).await;
+        let (status, refused) = call(
+            &router,
+            "DELETE",
+            &asset_file_uri(&space, &asset, path),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: deleting {path:?} answered {status}: {refused}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "ValidationException",
+            "case {case:?}: deleting {path:?} answered {:?}",
+            error_code(&refused)
+        );
+        assert_eq!(
+            error_message(&refused),
+            format!("{path} does not name a file of the asset"),
+            "case {case:?}: deleting {path:?} said {:?}",
+            error_message(&refused)
+        );
+        // The refusal reports the member it is about.
+        assert_eq!(
+            refused["fieldList"][0]["path"].as_str(),
+            Some("path"),
+            "case {case:?}: deleting {path:?} reported fieldList {:?}",
+            refused["fieldList"]
+        );
+
+        assert_asset_untouched(&router, &space, &asset, case).await;
+    }
+
+    // A path of an admissible form that the asset holds no file at names nothing to
+    // delete. The rows differ along the form of the absent path: a sibling of the
+    // held file, a file at the asset's root, a deeper path, one built from the rest
+    // of the characters the pattern admits, the held path under another directory,
+    // and the held path at the length bound.
+    let longest = format!("{}.md", "z".repeat(MAX_ASSET_FILE_PATH_LEN - 3));
+    let absent: Vec<(&str, &str)> = vec![
+        ("a sibling of the held file", "dir/absent.md"),
+        ("a file at the asset's root", "absent.md"),
+        ("a deeper path", "dir/nested/deeper/absent.bin"),
+        (
+            "a path of the pattern's punctuation",
+            "(archive)-v1.0_final.md",
+        ),
+        ("the held file under another directory", "other/held.md"),
+        ("a path at the length bound", longest.as_str()),
+    ];
+
+    for (case, path) in &absent {
+        let asset = create_one_file_asset(&router, &space, case).await;
+        let (status, refused) = call(
+            &router,
+            "DELETE",
+            &asset_file_uri(&space, &asset, path),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: deleting {path:?} answered {status}: {refused}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "ResourceNotFoundException",
+            "case {case:?}: deleting {path:?} answered {:?}",
+            error_code(&refused)
+        );
+        assert_eq!(
+            error_message(&refused),
+            format!("Asset file not found: {path}"),
+            "case {case:?}: deleting {path:?} said {:?}",
+            error_message(&refused)
+        );
+
+        assert_asset_untouched(&router, &space, &asset, case).await;
+    }
+
+    // The path the asset really holds is served, so what the rows above refuse is
+    // the path they name and not the delete itself.
+    let asset = create_one_file_asset(&router, &space, "the held path").await;
+    let (status, deleted) = call(
+        &router,
+        "DELETE",
+        &asset_file_uri(&space, &asset, HELD_FILE_PATH),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "deleting {HELD_FILE_PATH:?} answered {status}: {deleted}"
+    );
+}
+
+/// Create an asset whose content is the single file at [`HELD_FILE_PATH`] and
+/// return its id.
+async fn create_one_file_asset(router: &MultiServiceRouter, space: &str, case: &str) -> String {
+    let (status, created) = call(
+        router,
+        "POST",
+        &create_asset_uri(space),
+        Some(json!({
+            "assetType": "artifact",
+            "metadata": {"title": case},
+            "content": {"file": {"path": HELD_FILE_PATH, "body": {"text": "held"}}},
+        })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "case {case:?}: expected 201 from CreateAsset, got {status}: {created}"
+    );
+    created["asset"]["assetId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: no assetId in {created}"))
+        .to_string()
+}
+
+/// Assert that the asset is still at the revision it was created at and still
+/// holds its one file: a refused delete persists nothing.
+async fn assert_asset_untouched(router: &MultiServiceRouter, space: &str, asset: &str, case: &str) {
+    let (status, read) = call(router, "GET", &asset_uri(space, asset), None).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected 200 from GetAsset after the refusal, got {status}: {read}"
+    );
+    assert_eq!(
+        read["asset"]["version"],
+        json!(1),
+        "case {case:?}: the asset is at revision {:?} after the refusal",
+        read["asset"]["version"]
+    );
+    let (status, held) = call(
+        router,
+        "GET",
+        &asset_file_uri(space, asset, HELD_FILE_PATH),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected 200 reading {HELD_FILE_PATH:?} after the refusal, got {status}: {held}"
+    );
+    assert_eq!(
+        held["file"]["path"].as_str(),
+        Some(HELD_FILE_PATH),
+        "case {case:?}: the held file reads back as {:?}",
+        held["file"]["path"]
     );
 }
