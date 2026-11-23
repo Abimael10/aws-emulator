@@ -40,7 +40,7 @@ use sts::state::{
 
 use super::sts_sessions::{
     call, element, emulator_account, emulator_with_iam, member, now_secs, query, timestamp_secs,
-    LONG_TERM_KEY,
+    trust_policy, LONG_TERM_KEY,
 };
 
 /// IAM's awsQuery API version, the `Version` the three account-level federation calls carry.
@@ -855,5 +855,190 @@ async fn request_tags_become_claims_until_the_payload_budget_is_passed() {
             "case {case:?}: expected the account's issuer, got {:?}",
             verified.claim_str("iss")
         );
+    }
+}
+
+/// The audience every row below names: one relying party, since what the rows differ along
+/// is the GRANTS the caller holds rather than anything of the request.
+const ONE_AUDIENCE: [&str; 1] = ["https://relying.party"];
+
+/// How long the session each row mints is granted, which is the ceiling a token minted under
+/// it is measured against.
+const GRANTED_SESSION_SECONDS: i64 = 900;
+
+/// One row: the case, and the identity-based document embedded in the role whose session
+/// makes the calls. Every document PERMITS the operation — the rows differ only in how widely
+/// — so a row that is still refused shows the refusal was not an authorization verdict.
+type GrantRow = (&'static str, &'static str);
+
+/// RULE: both of this operation's 403 refusals are decided by state the SERVER holds — the
+/// account's outbound web identity federation flag, and the remaining lifetime of the
+/// credential that signed the request — and never by the grants in the caller's own
+/// identity-based documents: a caller those documents permit outright is refused all the
+/// same while the server's state withholds a token, and served the moment that state admits
+/// one.
+///
+/// Rows span how widely the documents in force on the calling session permit the call: this
+/// action alone on every resource, this action beside another of the service, every action on
+/// every resource, and every action of this service beside a deny of an unrelated one. Each
+/// row is driven through the real account flag (IAM's own Enable/Disable operations) and a
+/// real assumed-role session, so what decides is the state those calls left behind.
+#[tokio::test]
+async fn the_server_side_refusals_are_independent_of_the_callers_own_grants() {
+    let (router, _engine) = emulator_with_iam();
+
+    let rows: [GrantRow; 4] = [
+        (
+            "a session granted this action on every resource",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sts:GetWebIdentityToken","Resource":"*"}]}"#,
+        ),
+        (
+            "a session granted this action beside another of the service",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["sts:GetCallerIdentity","sts:GetWebIdentityToken"],"Resource":"*"}]}"#,
+        ),
+        (
+            "a session granted every action on every resource",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"#,
+        ),
+        (
+            "a session granted every action of this service, denying an unrelated one",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sts:*","Resource":"*"},{"Effect":"Deny","Action":"iam:DeleteUser","Resource":"*"}]}"#,
+        ),
+    ];
+
+    for (index, (case, document)) in rows.into_iter().enumerate() {
+        // The role the session speaks for, and the documents in force on it: both written
+        // through IAM's own operations, so the grants this row is about are the ones that
+        // service stored.
+        let role_name = format!("WebIdentityTokenGrant{index}");
+        let (status, body) = query(
+            &router,
+            LONG_TERM_KEY,
+            IAM_SIGNING_NAME,
+            IAM_API_VERSION,
+            "CreateRole",
+            &[
+                ("RoleName", role_name.clone()),
+                ("AssumeRolePolicyDocument", trust_policy(&["sts:AssumeRole"])),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: CreateRole must succeed, got {status} {body}"
+        );
+        let (status, body) = query(
+            &router,
+            LONG_TERM_KEY,
+            IAM_SIGNING_NAME,
+            IAM_API_VERSION,
+            "PutRolePolicy",
+            &[
+                ("RoleName", role_name.clone()),
+                ("PolicyName", "web-identity-token".to_string()),
+                ("PolicyDocument", document.to_string()),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: PutRolePolicy must succeed, got {status} {body}"
+        );
+
+        let (status, body) = call(
+            &router,
+            LONG_TERM_KEY,
+            "AssumeRole",
+            &[
+                (
+                    "RoleArn",
+                    format!("arn:aws:iam::{}:role/{role_name}", emulator_account()),
+                ),
+                ("RoleSessionName", "probe".to_string()),
+                ("DurationSeconds", GRANTED_SESSION_SECONDS.to_string()),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: AssumeRole must succeed, got {status} {body}"
+        );
+        let session_key = member(case, &body, "AccessKeyId");
+        let session_ends = timestamp_secs(case, &member(case, &body, "Expiration"));
+
+        // The account has the feature off, so the permitted caller is told the ACCOUNT's
+        // entitlement is missing — not that it may not call the operation.
+        let params = token_params(&ONE_AUDIENCE, "RS256", Some(MIN_DURATION_SECONDS));
+        let (status, body) = call(&router, &session_key, ACTION, &borrowed(&params)).await;
+        assert_eq!(
+            (status, element(&body, "Code").as_deref()),
+            (
+                403,
+                Some("OutboundWebIdentityFederationDisabledException")
+            ),
+            "case {case:?}: expected the disabled-feature refusal, got {status} {body}"
+        );
+        let message = member(case, &body, "Message");
+        assert_eq!(
+            message, FEDERATION_DISABLED_MESSAGE,
+            "case {case:?}: expected {FEDERATION_DISABLED_MESSAGE:?}, got {message:?}"
+        );
+        assert!(
+            element(&body, "WebIdentityToken").is_none(),
+            "case {case:?}: a refused call must vend no token: {body}"
+        );
+
+        enable_federation(&router).await;
+
+        // A duration inside the member's own range but past what is left of the calling
+        // session is the escalation refusal, whatever the caller is permitted to do.
+        let params = token_params(&ONE_AUDIENCE, "RS256", Some(MAX_DURATION_SECONDS));
+        let (status, body) = call(&router, &session_key, ACTION, &borrowed(&params)).await;
+        assert_eq!(
+            (status, element(&body, "Code").as_deref()),
+            (403, Some("SessionDurationEscalationException")),
+            "case {case:?}: expected the escalation refusal, got {status} {body}"
+        );
+        let message = member(case, &body, "Message");
+        assert_eq!(
+            message, SESSION_DURATION_ESCALATION_MESSAGE,
+            "case {case:?}: expected {SESSION_DURATION_ESCALATION_MESSAGE:?}, got {message:?}"
+        );
+        assert!(
+            element(&body, "WebIdentityToken").is_none(),
+            "case {case:?}: a refused call must vend no token: {body}"
+        );
+
+        // The same session asking for a duration inside its remaining lifetime is served,
+        // and the token it gets expires before the session that asked for it.
+        let params = token_params(&ONE_AUDIENCE, "RS256", Some(MIN_DURATION_SECONDS));
+        let asked_from = now_secs();
+        let (status, body) = call(&router, &session_key, ACTION, &borrowed(&params)).await;
+        let asked_until = now_secs();
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected a token, got {status} {body}"
+        );
+        let token = member(case, &body, "WebIdentityToken");
+        assert_eq!(
+            token.split('.').count(),
+            3,
+            "case {case:?}: expected a compact JWS, got {token:?}"
+        );
+        let expiration = timestamp_secs(case, &member(case, &body, "Expiration"));
+        assert!(
+            (asked_from + MIN_DURATION_SECONDS..=asked_until + MIN_DURATION_SECONDS)
+                .contains(&expiration),
+            "case {case:?}: expected an expiry {MIN_DURATION_SECONDS}s after the call, \
+             got {expiration} against a call between {asked_from} and {asked_until}"
+        );
+        assert!(
+            expiration < session_ends,
+            "case {case:?}: expected a token expiring before the session's {session_ends}, \
+             got {expiration}"
+        );
+
+        // Left off again, so the next row starts from the same account state this one did.
+        disable_federation(&router).await;
     }
 }
