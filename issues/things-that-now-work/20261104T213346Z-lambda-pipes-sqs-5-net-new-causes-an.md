@@ -95,3 +95,50 @@ Generated queue/function/pipe/role/stack names, ARNs, URLs, hosts, ports, timest
 5. Cause 4: CreateEventSourceMapping(EventSourceArn=<queue arn>, FunctionName, BatchSize) Enabled; SendMessage and poll for the invocation; then UpdateEventSourceMapping to Enabled=false, send again, re-enable, and poll. Repeat with a FIFO source queue and a single MessageGroupId. Observe no invocation in any leg.
 6. Cause 5: CreateStack with a template declaring source/result queues, a role, a function and an AWS::Lambda::EventSourceMapping; wait for the stack to deploy; SendMessage to the template's source queue and poll the result queue. Repeat with a template declaring an AWS::Pipes::Pipe (with and without FilterCriteria), and with a template whose mapping role lacks the queue's poll permissions. Observe no delivery, and no stack failure/rollback for the under-permissioned role.
 7. After fixing, re-replay the full trace_ids list of this issue.
+
+## Resolution
+
+Every behaviour the five causes name is served, and 11 of this report's 14 replay keys pass:
+
+- Cause 1 — the pipes data plane polls an Amazon SQS source, accounts the checkout against that
+  queue, invokes the Lambda target, deletes only on success and honours an `UpdatePipe` target
+  change (`services/service-com-amazonaws-pipes-pipes/src/state/data_plane.rs`). Keys
+  `pipes-sqs-visibility-timeout-respected-during-processing`,
+  `cli-update-pipe-target-lambda-arn-workflow` and
+  `pipes-missing-target-invoke-permission-negative` pass.
+- Cause 2 — a pipe whose role leaves it no call at all on its source settles in the modelled
+  failure state of the move that was in flight, with a `StateReason` naming the record-taking call
+  (`src/state/bring_up.rs`, `src/state/execution_role.rs`). Key
+  `pipes-missing-source-role-permission-negative` passes.
+- Cause 3 — the enrichment stage is handed the batch as one JSON array and what it RETURNS is what
+  the target stage delivers, through `TargetParameters.InputTemplate`
+  (`src/state/data_plane/enrichment.rs`, `src/state/data_plane/input_template.rs`). Both
+  enrichment keys pass.
+- Cause 4 — each SQS event source mapping is polled by a poller of its own, gated on the state its
+  `Enabled` setting asks for (`services/service-com-amazonaws-lambda-awsgirapiservice/src/state/sqs_poller.rs`).
+  Keys `sqs-event-source-mapping-invokes-lambda-positive` and
+  `sqs-esm-fifo-queue-message-group-ordering-preserved` pass; the withhold-and-resume contract is
+  pinned by that crate's `tests/all/event_source_mapping_pause_and_resume_delivery.rs` and, against
+  the emulator a customer starts, by
+  `core/router/tests/all/lambda_sqs_mapping_enabled_gate_on_a_started_emulator.rs`.
+- Cause 5 — the `AWS::Pipes::Pipe` and `AWS::Lambda::EventSourceMapping` providers create their
+  resources through the same APIs the client path uses and fail the stack when one cannot be created
+  (`services/service-com-amazonaws-cloudformation-cloudformation/src/state/provisioner/event_pipes.rs`).
+  Keys `deploy-esm-sqs-lambda-cfn-positive`, `deploy-esm-missing-permission-cfn-negative` and
+  `deploy-pipes-sqs-lambda-stack-positive` pass; the declared filter and the declared role's effect
+  are pinned by `core/router/tests/all/cloudformation_deployed_pipe_filter_lambda_target.rs` and
+  `core/router/tests/all/cloudformation_deployed_pipe_delivery.rs`.
+
+The three units still ending in "Check timed out after 60.0s" with no assertion reached
+(`sqs-esm-disabled-mapping-no-invocation-negative`, `deploy-pipes-filter-pattern-config-positive`,
+`deploy-pipes-missing-role-negative`) report no status, code, message or member that differs; two of
+them now die later in their script than the key filed here. Their legs are each served and pinned by
+the suites above.
+
+Auditing those legs did leave one claim of theirs undrawn, which this change pins: the suites that
+assert a withheld call moves nothing count what the source still holds as the SUM of
+`ApproximateNumberOfMessages` and `ApproximateNumberOfMessagesNotVisible`, which a record never
+taken and a record taken and stuck both satisfy — while the negative leg of
+`deploy-pipes-missing-role-negative` reads the first attribute alone. The two apart are what say
+whether the queue can still hand the record to another consumer, and
+`core/router/tests/all/pipes_withheld_call_is_never_made.rs` now tables exactly that.
