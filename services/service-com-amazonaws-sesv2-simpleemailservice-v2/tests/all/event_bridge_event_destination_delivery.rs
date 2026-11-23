@@ -464,6 +464,43 @@ impl Emulator {
         .await;
     }
 
+    /// An address the account's suppression list already holds, put on it the way a client
+    /// does (`PutSuppressedDestination`, `PUT /v2/email/suppression/addresses`): a send to
+    /// such an address is not attempted at all, which is a failure of its own.
+    pub(crate) async fn given_suppressed(&self, case: &str, address: &str, reason: &str) {
+        // A suppression-list write is permitted only for an account out of the sandbox, which
+        // is what `ProductionAccessEnabled` reports, so the account record carries it before
+        // the write.
+        self.engine
+            .state::<ComAmazonawsSesv2SimpleemailserviceV2State>()
+            .lock()
+            .account
+            .production_access_enabled = true;
+        self.ses_ok(
+            case,
+            "PUT",
+            "/v2/email/suppression/addresses",
+            Some(json!({"EmailAddress": address, "Reason": reason})),
+        )
+        .await;
+    }
+
+    /// The `FeedbackId` the account's suppression list reports for `address`
+    /// (`SuppressedDestinationAttributes$FeedbackId`, "a unique identifier that's generated
+    /// when an email address is added to the suppression list"), or `""` when the list
+    /// reports none.
+    pub(crate) async fn suppressed_feedback_id(&self, case: &str, address: &str) -> String {
+        let reply = self
+            .ses_ok(
+                case,
+                "GET",
+                &format!("/v2/email/suppression/addresses/{address}"),
+                None,
+            )
+            .await;
+        reply.text("/SuppressedDestination/Attributes/FeedbackId")
+    }
+
     /// A queue whose own policy admits the EventBridge delivery; answers its url.
     pub(crate) async fn given_queue(&self, case: &str, name: &str) -> String {
         let created = self.sqs(case, "CreateQueue", &json!({"QueueName": name})).await;
