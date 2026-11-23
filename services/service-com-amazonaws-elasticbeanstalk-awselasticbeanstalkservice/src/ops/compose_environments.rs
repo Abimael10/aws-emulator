@@ -3,14 +3,16 @@
 //! @op ComposeEnvironments
 //! Implemented: scopes the requested version labels to the versions of the application
 //! the request names, reads the environment manifest (`env.yaml`) out of each of those
-//! versions' source bundles, and launches one environment per manifest that NAMES one —
+//! versions' source bundles, and launches one environment per manifest that names one —
 //! or deploys the version to the environment the group already runs under that name,
 //! since this operation "creates or updates a group of environments". A manifest whose
-//! `EnvironmentName` ends in the `+` a group name would complete names no environment
-//! outright, so this operation composes none for it: such a manifest is passed over
-//! rather than composed under a name the group invented, and a request all of whose
-//! manifests are those templates answers an EMPTY environment list and creates nothing.
-//! Each composed environment carries the manifest's name, solution stack, tier, option
+//! `EnvironmentName` ends in the `+` a group name completes is a TEMPLATE for the
+//! group's own name for that environment, so the group name the request carries
+//! completes it (`crate::state::composed_environment_name`) — the same completion every
+//! other operation that names an environment through a manifest performs — and the
+//! targets the manifest's links name are completed the same way, since a link names
+//! another environment of the same group.
+//! Each composed environment carries that name, the manifest's solution stack, tier, option
 //! settings and links to the other environments of the group, starts `Launching` and
 //! reaches `Ready` the way every other launch does — unless the manifest associates no IAM
 //! instance profile with the environment's instances, or IAM will not let this caller pass
@@ -317,16 +319,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "Specify a group name only if the environment name defined in
             // each target environment's manifest ends with a + (plus)
             // character": a manifest name ending in that placeholder is a
-            // TEMPLATE for the per-group name of an environment, and this
-            // operation does not complete it — so such a manifest names no
-            // environment for this call to create or update, and the call
-            // composes none for it rather than inventing the name a group would
-            // have given it. A manifest that names an environment outright is
-            // composed under that name, whatever group the request names.
-            if crate::state::is_group_name_template(&manifest_name) {
-                continue;
-            }
-            let environment_name = manifest_name;
+            // TEMPLATE for the per-group name of an environment, which the
+            // group the request names COMPLETES — so the environment this call
+            // creates or updates for such a manifest is the group's own, and
+            // one application composed into two groups holds two environments
+            // per manifest. A manifest that names an environment outright is
+            // composed under that name, whatever group the request names. The
+            // completion is the one every operation that names an environment
+            // through a manifest rather than through its own `EnvironmentName`
+            // parameter performs.
+            let environment_name = crate::state::composed_environment_name(
+                &manifest_name,
+                input.group_name.as_deref(),
+            );
             // An environment of that name belonging to ANOTHER application is
             // not one this composition may deploy to: "this name must be unique
             // within a region in your account", which is what every launch is
@@ -389,15 +394,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "Links provide connection information in system properties that
             // can be used to connect to another environment in the same group":
             // a link's target is named the way the manifests name environments,
-            // and this call completes no manifest name with the group, so the
-            // environment the link names is the one the manifest wrote.
+            // so a target that is a group template is completed by the group
+            // exactly as the environment's own name is, and the link reports
+            // the environment of this group it really names.
             let environment_links = composed
                 .manifest
                 .links
                 .iter()
                 .map(|(link_name, target)| EnvironmentLink {
                     link_name: Some(link_name.clone()),
-                    environment_name: Some(target.clone()),
+                    environment_name: Some(crate::state::composed_environment_name(
+                        target,
+                        input.group_name.as_deref(),
+                    )),
                 })
                 .collect();
             // "The name of each environment and other required information
@@ -444,8 +453,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         Ok(ComposeEnvironmentsOutput {
-            // Every environment this call composed, which is none at all for a
-            // request whose manifests all name group templates.
+            // Every environment this call composed or updated, one per version
+            // label whose manifest described one.
             environments: Some(environments),
             // Every environment this call composed is reported, so there is no
             // page left for a continuation token to name.
@@ -456,8 +465,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// One environment this call is composing: the version label whose source
 /// bundle carried the manifest, the manifest itself, and the environment it
-/// names — the name as the manifest wrote it, since a manifest whose name is a
-/// group template composes no environment at all.
+/// names — the manifest's name with a group template completed by the group the
+/// request named.
 ///
 /// Every label is resolved to one of these BEFORE the first environment is
 /// touched, so a request with a label that resolves to no manifest leaves the

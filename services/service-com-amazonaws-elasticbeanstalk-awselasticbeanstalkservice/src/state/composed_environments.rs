@@ -25,11 +25,10 @@
 //! belong. Specify a group name only if the environment name defined in each
 //! target environment's manifest ends with a + (plus) character": such a name is
 //! a TEMPLATE for a per-group environment name rather than a name
-//! ([`is_group_name_template`]). A COMPOSITION does not complete one — a
-//! manifest whose name is a template names no environment for it to create or
-//! update, so it composes none — while the operations that take an
-//! `EnvironmentName` of their own and fall back to a manifest for it complete it
-//! with [`composed_environment_name`].
+//! ([`is_group_name_template`]), and the group name the request carries
+//! completes it ([`composed_environment_name`]) — for a composition and for the
+//! operations that take an `EnvironmentName` of their own and fall back to a
+//! manifest for it alike.
 //!
 //! Split out of [`super`], which holds the store the environments live in; the
 //! record a composed launch produces is [`super::environment_launch`]'s, shared
@@ -148,10 +147,9 @@ pub fn is_group_name_template(manifest_name: &str) -> bool {
 /// `GroupName` is "the name of the group to which the target environment
 /// belongs. Specify a group name only if the environment's name is specified in
 /// an environment manifest and not with the environment name parameter", so this
-/// is the completion the operations that name an environment through a manifest
-/// INSTEAD of through their own `EnvironmentName` parameter perform. A
-/// composition names every environment through a manifest, and composes no
-/// environment for a template name at all ([`is_group_name_template`]).
+/// is the completion every operation that names an environment through a
+/// manifest INSTEAD of through its own `EnvironmentName` parameter performs — a
+/// composition, which names every environment through a manifest, included.
 pub fn composed_environment_name(manifest_name: &str, group_name: Option<&str>) -> String {
     match manifest_name.strip_suffix(GROUP_NAME_PLACEHOLDER) {
         Some(stem) => match group_name {
@@ -175,9 +173,9 @@ pub struct ComposedEnvironment<'a> {
     /// specifying one or more application source bundles that belong to the
     /// target application".
     pub version_label: &'a str,
-    /// The environment's name, as its own manifest declared it — a complete
-    /// name, since a composition composes nothing for a group template
-    /// ([`is_group_name_template`]).
+    /// The environment's name: its own manifest's `EnvironmentName`, with a
+    /// group template completed by the group the request named
+    /// ([`composed_environment_name`]).
     pub environment_name: &'a str,
     pub manifest: &'a EnvironmentManifest,
     /// The links this environment reports, with every target already resolved
