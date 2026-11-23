@@ -24,12 +24,19 @@
 //!    `sts:GetCallerIdentity` answers from, so the principal a refusal blames is the one
 //!    the caller reads back for the credentials it signed with), else the IAM user that
 //!    owns the long-term key, else the account's own published credential;
-//! 2. **what it may do** — the identity-based policy documents the IAM store holds for
-//!    that principal and the permissions boundary that caps them, read through the IAM
+//! 2. **what it may do** — the identity-based policy documents the IAM store holds for the
+//!    identity whose documents are IN FORCE for the credential presented and the permissions
+//!    boundary that caps them, read through the IAM
 //!    service's OWN accessors (`principal_policies`, `permissions_boundary_document`),
 //!    where the collection rule itself lives — so a policy `iam:PutUserPolicy` wrote takes
 //!    effect on the next request, deleting it lifts it again, and this service reads an
-//!    identity's permissions exactly as IAM's own authorizer does — and the SESSION POLICIES
+//!    identity's permissions exactly as IAM's own authorizer does. WHICH identity that is
+//!    is STS's own answer for the credential (`sts_store::Caller::identity_policies_arn`):
+//!    the ROLE behind an assumed-role session, and the IAM USER whose long-term credentials
+//!    minted a federated-user session — "the session permissions are the intersection of the
+//!    IAM user policies and the session policies that you pass" (`GetFederationToken`, the
+//!    STS model) — since a federated user is no IAM identity and carries no document of its
+//!    own. Beside them, the SESSION POLICIES
 //!    the mint of this very credential scoped it with
 //!    (`sts_store::session_scoping_documents`), which cap those documents the same way:
 //!    "the resulting session's permissions are the intersection of the role's
@@ -640,6 +647,10 @@ fn caller<Eng: Send + Sync + 'static>(
         .map(|caller| {
             (
                 caller.principal_type(),
+                // WHOSE identity-based documents are in force for this credential, which is
+                // not always the principal it speaks for: read through STS's one answer for
+                // it (`sts_store::Caller::identity_policies_arn`).
+                caller.identity_policies_arn().to_string(),
                 caller.identity,
                 caller.role_arn,
                 caller.session_policies,
@@ -650,12 +661,14 @@ fn caller<Eng: Send + Sync + 'static>(
         // mint scoped.
         None => Ok((
             ::service_common::temporary_credential_classes::PRINCIPAL_TYPE_USER,
+            sts_store::ambient_identity().arn,
             sts_store::ambient_identity(),
             None,
             sts_store::SessionPolicies::default(),
         )),
     };
-    let (principal_type, identity, session_role_arn, session_policies) = match resolved {
+    let (principal_type, policies_arn, identity, session_role_arn, session_policies) = match resolved
+    {
         Ok(resolved) => resolved,
         // The session credential has expired, so it speaks for nobody: no documents, no
         // principal spelling, and every action it asks for falls to the default deny. The
@@ -679,7 +692,14 @@ fn caller<Eng: Send + Sync + 'static>(
     };
 
     let mut caller = Caller {
-        account_credential: identity.arn == sts_store::ambient_identity().arn,
+        // Whether NOTHING identity-based bounds this request is a question about the identity
+        // whose documents are in force for the credential presented, not about the principal
+        // it speaks for: a federated-user session is judged on the IAM user whose long-term
+        // credentials minted it, so a session the account's own published credential minted is
+        // bounded by no document exactly as that credential itself is, while the principal a
+        // refusal names stays the federated user
+        // (`sts_store::identity_is_account_credential`).
+        account_credential: sts_store::identity_is_account_credential(&policies_arn),
         principals: vec![identity.arn.clone()],
         identity_arn: session_role_arn.clone().unwrap_or_else(|| identity.arn.clone()),
         arn: identity.arn,
@@ -735,6 +755,16 @@ fn caller<Eng: Send + Sync + 'static>(
         // An IAM user's permissions are its own, under the ARN it was resolved by.
         let user_arn = caller.arn.clone();
         caller.read_policies_of(&store, &user_arn);
+    } else if policies_arn != caller.arn {
+        // The identity whose documents are in force is NOT the principal the credential
+        // speaks for, which is the position a FEDERATED-USER session is in: it is judged on
+        // the documents of the IAM user whose long-term credentials minted it — addressed by
+        // the ARN STS recorded at the mint — because the federated user is no IAM identity
+        // and carries no document of its own. Reading the principal's own ARN instead would
+        // collect no document at all, so every action the session policies allow would fall
+        // to the default deny.
+        let identity_arn = policies_arn.clone();
+        caller.read_policies_of(&store, &identity_arn);
     }
     caller
 }
