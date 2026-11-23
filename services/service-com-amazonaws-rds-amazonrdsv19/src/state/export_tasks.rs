@@ -217,24 +217,30 @@ pub fn export_kms_key_not_accessible_message(key_id: &str) -> String {
 
 /// What the export's key fault carries where the GRANT the export needs could not be created
 /// at all, because the principal it would be created for could not be resolved: the request's
-/// `IamRoleArn` names no role this account holds, so there is nothing to grant
+/// `IamRoleArn` resolves to no role of this account — it names none at all, or this account's
+/// IAM holds none under the name it carries — so there is nothing to grant
 /// `kms:CreateGrant` / `kms:DescribeKey` to ("the caller of this operation must be authorized
 /// to run the following operations", `KmsKeyId`).
 ///
 /// Recorded behavior decides both halves of this answer, because the model declares both
 /// `KMSKeyNotAccessibleFault` and `IamRoleNotFoundFault` for the operation and says nothing
-/// about which input takes which: Amazon RDS answers a syntactically valid `IamRoleArn`
-/// naming no existing role with `KMSKeyNotAccessibleFault` (400), worded as the generic
+/// about which input takes which: Amazon RDS answers an `IamRoleArn` it can resolve no role
+/// for with `KMSKeyNotAccessibleFault` (400), worded as the generic
 /// "specified KMS key" sentence its other key faults carry
 /// ([`kms_key_not_accessible_message`]) rather than as the key's own absence above — it is the
-/// GRANT that failed, not the key. Its one variable part is the `KmsKeyId` the request
-/// carried, echoed exactly as it spelled it, and it names neither the role nor the action.
+/// GRANT that failed, not the key. Its one variable part is the KEY the request's reference
+/// resolves to, named as KMS reports it (the key ARN): the grant would have been created on
+/// that key, which is the thing the sentence is about, so the caller's spelling of the
+/// reference is not what fills it — and the sentence names neither the role nor the action.
+/// Where KMS resolves nothing for the reference there is no key to name, and the reference the
+/// request carried is named instead; the other wording above, which is answered for a
+/// reference KMS itself refused, echoes the reference in every case.
 ///
 /// Stated here beside the family's other wordings, through the one function that builds that
 /// sentence, so the two conditions of the export's key fault each have one place that words
 /// them and neither can drift from the other.
-pub fn export_key_grant_not_created_message(key_id: &str) -> String {
-    kms_key_not_accessible_message(key_id)
+pub fn export_key_grant_not_created_message(key: &str) -> String {
+    kms_key_not_accessible_message(key)
 }
 
 /// What a request whose `SourceArn` names a resource of ANOTHER Region is refused with.

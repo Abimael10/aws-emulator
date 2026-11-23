@@ -6,8 +6,8 @@
 //! The rule under test: **the grant that encrypts an export is created FOR the role the
 //! request names, so an `IamRoleArn` this account's IAM resolves no role for is a grant that
 //! cannot be created — the modelled `KMSKeyNotAccessibleFault` (HTTP 400, `Sender`), worded
-//! as the generic "specified KMS key" sentence naming the `KmsKeyId` the request carried,
-//! exactly as it spelled it, and naming neither the role nor the action.** It is the role,
+//! as the generic "specified KMS key" sentence naming the KEY the request's reference
+//! resolves to, and naming neither the role nor the action.** It is the role,
 //! not the key, that decided the refusal: the key the rows below pass is one KMS holds and
 //! reports enabled, and the sentence a key that is itself unusable carries is a different one
 //! (`cluster_role_and_export_key_refusals` pins that one).
@@ -15,9 +15,9 @@
 //! Two conditions leave the role unresolved, and both are the same answer: IAM reports no
 //! role under the name, and the value names a role of ANOTHER account, whose roles this
 //! account's IAM cannot resolve at all. The rows span both of them, the key reference forms
-//! the sentence echoes (bare key id and key ARN), and a role name under a path — with the
-//! accepted export as the control, so the table cannot pass against a handler that refuses
-//! every request.
+//! the request may carry (bare key id and key ARN, which name ONE key and so leave one
+//! sentence), and a role name under a path — with the accepted export as the control, so the
+//! table cannot pass against a handler that refuses every request.
 //!
 //! Every call goes over the wire as a real awsQuery form POST, with IAM, KMS and Amazon S3
 //! mounted beside this service on ONE engine exactly as the assembled router mounts them, and
@@ -46,11 +46,11 @@ macro_rules! params {
 }
 
 /// The sentence this refusal carries, spelled out here so the table pins the wording rather
-/// than the code under test: the three reasons the one fault covers, naming the key reference
-/// the request passed.
-fn key_not_accessible(key_id: &str) -> String {
+/// than the code under test: the three reasons the one fault covers, naming the key the
+/// request's reference resolved to.
+fn key_not_accessible(key: &str) -> String {
     format!(
-        "The specified KMS key [{key_id}] does not exist, is not enabled or you do not have \
+        "The specified KMS key [{key}] does not exist, is not enabled or you do not have \
          permissions to access it."
     )
 }
@@ -252,7 +252,9 @@ async fn a_role_the_export_grant_cannot_be_created_for_is_the_key_fault() {
 
         let body = expect_error(case, answered, 400, "KMSKeyNotAccessibleFault");
         let message = text(&body, "Message");
-        let expected = key_not_accessible(fixture.key(row.key));
+        // Whichever spelling the row passed, the key it names is the ONE key KMS holds, so
+        // the sentence names that key's ARN.
+        let expected = key_not_accessible(&fixture.key_arn);
         assert_eq!(
             message, expected,
             "case {case:?}: expected the message {expected:?}, got {message:?} in {body}"

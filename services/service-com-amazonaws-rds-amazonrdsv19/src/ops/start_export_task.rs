@@ -310,6 +310,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
         };
 
+        // The export encrypts what it writes under the caller's key, and it does that AS the
+        // role the request names: "the caller of this operation must be authorized to run the
+        // following operations ... kms:CreateGrant kms:DescribeKey" (`KmsKeyId`), which the
+        // export is authorized for by a GRANT created FOR that role. So the grant is resolved
+        // THROUGH the role, which is why a principal that resolves to no role of this account
+        // is decided FIRST, before any statement about the key itself: there is nothing to
+        // create the grant for, which the recorded behaviour of this operation answers as the
+        // modelled `KMSKeyNotAccessibleFault` in its generic "specified KMS key" wording
+        // ([`crate::state::export_key_grant_not_created_message`], which records the answer and
+        // why the two conditions of that fault are worded differently).
+        //
+        // That sentence names the KEY the request's reference resolves to — the key the grant
+        // would have been created on, which is what KMS reports an ARN for — and falls back to
+        // the reference the request carried where KMS resolves nothing for it, because then
+        // there is no key to name.
+        if crate::state::export_grant_is_not_creatable(ctx, &region, &input.iam_role_arn).await {
+            let named = crate::state::export_key_arn(ctx, &region, &input.kms_key_id)
+                .await
+                .unwrap_or_else(|| input.kms_key_id.clone());
+            return Err(StartExportTaskErrorModeled::KMSKeyNotAccessibleFault(
+                KMSKeyNotAccessibleFault {
+                    message: Some(crate::state::export_key_grant_not_created_message(&named)),
+                },
+            )
+            .into());
+        }
+
         // "The ID of the Amazon Web Services KMS key to use to encrypt the data exported to
         // Amazon S3": a key KMS holds nothing under, or one it holds disabled, cannot
         // encrypt the export — the modelled `KMSKeyNotAccessibleFault`. The key is a
@@ -382,17 +409,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // "The provided IAM role must have access to the S3 bucket". The role is resolved and
-        // then judged call by call, and each answer is reported as the fault that answer
-        // carries: a role IAM holds nothing under is a principal the export's KMS GRANT
-        // cannot be created for, which the recorded behaviour of this operation answers as
-        // the key fault in its "specified KMS key" wording
-        // ([`crate::state::export_key_grant_not_created_message`], which also records why the
-        // two conditions of that fault are worded differently); a role IAM HOLDS that the
+        // "The provided IAM role must have access to the S3 bucket". The role IAM holds is
+        // judged call by call, and each answer is reported as the fault that answer carries:
+        // a role IAM HOLDS that the
         // export principal cannot assume is the modelled `IamRoleNotFoundFault`; and a role
         // that can be assumed but cannot make one of the calls the export makes on the
         // destination — because nothing grants it, or because the bucket's own policy denies
         // it — is the modelled `IamRoleMissingPermissionsFault`, naming the first such call.
+        // Whether the value resolves to a role of this account AT ALL was decided above, with
+        // the grant that is created for it.
         match crate::state::export_role_defect(
             ctx,
             &*self.engine,
@@ -402,16 +427,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .await
         {
-            Some(crate::state::ExportRoleDefect::Absent) => {
-                return Err(StartExportTaskErrorModeled::KMSKeyNotAccessibleFault(
-                    KMSKeyNotAccessibleFault {
-                        message: Some(crate::state::export_key_grant_not_created_message(
-                            &input.kms_key_id,
-                        )),
-                    },
-                )
-                .into())
-            }
             Some(crate::state::ExportRoleDefect::NotAssumable) => {
                 return Err(StartExportTaskErrorModeled::IamRoleNotFoundFault(
                     IamRoleNotFoundFault {

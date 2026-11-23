@@ -8,7 +8,9 @@
 //! reports the FIRST answer that stops the export, as the fault that answer carries: a
 //! destination the Region holds nothing under is the bucket fault; a role this account holds
 //! nothing under is a principal the export's KMS grant cannot be created for, so it is the
-//! key fault; a role it HOLDS that the export principal cannot assume is the role-not-found
+//! key fault — worded as the generic "specified KMS key" sentence naming the KEY the request's
+//! reference resolves to, since the grant would have been created on that key — ; a role it
+//! HOLDS that the export principal cannot assume is the role-not-found
 //! fault; and a role that can be assumed but cannot make one of those calls — because nothing
 //! grants it, or because the bucket's own policy denies it — is the missing-permissions
 //! fault, whose sentence names the call that failed rather than a fixed action. A permitted
@@ -330,6 +332,13 @@ fn an_export_is_judged_role_and_destination_call_by_call() {
                 .as_str()
                 .unwrap_or_else(|| panic!("KMS reports the key it minted: {key}"))
                 .to_string();
+            // The same key as KMS NAMES it: the refusal that reports a grant the export could
+            // not create is about the KEY that grant would have been created on, so it names
+            // that key rather than the reference the request spelled it with.
+            let kms_key_arn = key["KeyMetadata"]["Arn"]
+                .as_str()
+                .unwrap_or_else(|| panic!("KMS reports the ARN of the key it minted: {key}"))
+                .to_string();
 
             let bucket_arn = format!("arn:aws:s3:::{BUCKET}");
             let object_arns = vec![bucket_arn.clone(), format!("{bucket_arn}/*")];
@@ -506,7 +515,7 @@ fn an_export_is_judged_role_and_destination_call_by_call() {
                     400,
                     "KMSKeyNotAccessibleFault",
                     format!(
-                        "The specified KMS key [{kms_key_id}] does not exist, is not enabled \
+                        "The specified KMS key [{kms_key_arn}] does not exist, is not enabled \
                          or you do not have permissions to access it."
                     ),
                 ),

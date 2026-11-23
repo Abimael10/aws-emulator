@@ -30,17 +30,12 @@ pub const EXPORT_BUCKET_LOCATION_ACTION: &str = "s3:GetBucketLocation";
 /// Aurora to an S3 bucket: s3:PutObject* ...", `IamRoleArn`).
 pub const EXPORT_OBJECT_WRITE_ACTION: &str = "s3:PutObject";
 
-/// What is wrong with the role an export was asked to run under.
+/// What is wrong with the role an export was asked to run under — beside the question of
+/// whether the value names a role of this account at all, which
+/// [`export_grant_is_not_creatable`] answers on its own because it is the GRANT's question
+/// rather than the role's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportRoleDefect {
-    /// IAM answered that this account holds NO role under the value — it reported none under
-    /// that name, or the value is an IAM role ARN of ANOTHER account, whose roles this
-    /// emulator's IAM cannot resolve at all. The export's KMS grant is created FOR that role,
-    /// so a principal that cannot be resolved
-    /// is a grant that cannot be created, and the request is refused as the key fault that
-    /// failed grant carries ([`super::export_key_grant_not_created_message`], which records
-    /// the answer) rather than as a statement about the role.
-    Absent,
     /// IAM holds the role, and the trust policy it carries does not let the export principal
     /// assume it: the modelled `IamRoleNotFoundFault`, which that one sentence reports as the
     /// principal not being allowed to assume the role or the role not existing.
@@ -53,15 +48,43 @@ pub enum ExportRoleDefect {
     MissingPermissions(&'static str),
 }
 
+/// Whether the GRANT an export needs on its encryption key cannot be created AT ALL, because
+/// the principal it would be created for could not be resolved: the value `role_arn` carries
+/// names no IAM role of this account (it is no IAM role ARN, or it is one of ANOTHER account,
+/// whose roles the only IAM this emulator can ask holds nothing of), or this account's IAM
+/// answered that it holds none under the name it carries.
+///
+/// "The caller of this operation must be authorized to run the following operations ...
+/// kms:CreateGrant kms:DescribeKey" (`KmsKeyId`), and an export is authorized for them by a
+/// grant created FOR the role it runs under ([`take_export_grant`]) — so the grant is resolved
+/// THROUGH that role, and a principal that was never resolved is a grant that cannot be
+/// created. It is a statement about the GRANT rather than about the role, which is why it is
+/// asked on its own and answered before anything else about the key or the role: the KEY's own
+/// policy decides nothing for a request whose principal could not be resolved, and neither
+/// does the destination.
+///
+/// `false` — establish nothing — for every answer this emulator could not get about a value
+/// that DOES name a role of this account: an IAM that is not mounted beside this service, and
+/// an answer that could not be read ([`::service_common::iam_role::role_is_absent`], which is
+/// stated for exactly this question).
+pub async fn export_grant_is_not_creatable(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    role_arn: &str,
+) -> bool {
+    ::service_common::iam_role::role_name(role_arn).is_none()
+        || ::service_common::iam_role::role_is_absent(ctx, region, role_arn).await
+}
+
 /// Judge the export role the way Amazon RDS does before it accepts an export: `None` for a
 /// role the export can run under, and the defect that stops it otherwise.
 ///
 /// `bucket` is the destination, whose own policy is the other half of every call's decision
 /// and whose objects are the resource the object write is authorized on.
 ///
-/// Nothing is refused on an answer this emulator could not get: a value naming no role of
-/// this account, or an IAM that is not mounted beside this service, leaves the role unjudged.
-/// Policies that could not be enumerated leave the IDENTITY half of each call's decision
+/// Nothing is refused on an answer this emulator could not get: an IAM that is not mounted
+/// beside this service leaves a role it holds unjudged. Policies that could not be
+/// enumerated leave the IDENTITY half of each call's decision
 /// untaken — they ground no refusal, and they withdraw none either: the destination's own
 /// explicit deny is an answer the object store gave, so it still refuses the export. Only
 /// what IAM and the object store ANSWERED grounds a defect.
@@ -72,22 +95,11 @@ pub async fn export_role_defect<Eng: Send + Sync + 'static>(
     role_arn: &str,
     bucket: &str,
 ) -> Option<ExportRoleDefect> {
-    // The EXISTENCE of the role is asked first and on its own, because the two answers are
-    // reported as different faults: a role this account holds nothing under is a principal
-    // the export's KMS grant cannot be created for, while a role it HOLDS that does not
-    // trust the export principal is the role's own fault
-    // ([`::service_common::iam_role::role_is_absent`] is stated for exactly this pair).
-    if ::service_common::iam_role::role_is_absent(ctx, region, role_arn).await
-        // A value that is an IAM role ARN of ANOTHER account is the SAME condition: the only
-        // IAM this emulator can resolve a role in is this account's, and the export acts
-        // under the role the request names rather than under the caller, so no grant can be
-        // created for it here either. Answering it identically is also what keeps the KEY's
-        // own policy from deciding a request whose principal was never resolved at all.
-        || (super::is_iam_role_arn(role_arn)
-            && ::service_common::iam_role::role_name(role_arn).is_none())
-    {
-        return Some(ExportRoleDefect::Absent);
-    }
+    // Every question below is a question about a role of THIS account — what its trust
+    // document says, and what its policies let it do — so a value that names none is judged
+    // for nothing here: that it resolves to no role is the GRANT's answer
+    // ([`export_grant_is_not_creatable`]), taken before this.
+    ::service_common::iam_role::role_name(role_arn)?;
     if ::service_common::iam_role::held_role_is_unassumable(
         ctx,
         region,

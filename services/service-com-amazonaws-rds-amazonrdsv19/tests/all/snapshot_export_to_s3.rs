@@ -237,6 +237,9 @@ struct Destination {
     bucket: String,
     role_arn: String,
     key_id: String,
+    /// The ARN of that same key: what a refusal about the KEY the reference resolves to
+    /// names, where one about the reference itself echoes the `key_id` above.
+    key_arn: String,
 }
 
 /// Stand up one destination: a bucket of this Region, a KMS key and a role the export
@@ -244,9 +247,7 @@ struct Destination {
 async fn destination(bucket: &str, role_name: &str) -> Destination {
     let (router, engine) = emulator();
     create_bucket(&router, bucket, REGION).await;
-    let key_id = created_key(&router, "the export's encryption key", None)
-        .await
-        .id;
+    let key = created_key(&router, "the export's encryption key", None).await;
     let role_arn = role(
         &router,
         role_name,
@@ -259,7 +260,8 @@ async fn destination(bucket: &str, role_name: &str) -> Destination {
         engine,
         bucket: bucket.to_string(),
         role_arn,
-        key_id,
+        key_id: key.id,
+        key_arn: key.arn,
     }
 }
 
@@ -924,8 +926,9 @@ async fn each_export_refusal_carries_the_services_own_sentence() {
             // The export's KMS grant is created FOR the role the request names, so a role
             // IAM holds nothing under is a grant that cannot be created: recorded behaviour
             // answers that with the key fault in the generic "specified KMS key" wording —
-            // naming the key the request passed and neither the role nor the action — where
-            // a key that is itself unusable carries the other sentence two rows down.
+            // naming the KEY the request's reference resolves to, and neither the role nor
+            // the action — where a key that is itself unusable carries the other sentence two
+            // rows down, about the reference the request carried.
             case: "a role IAM holds nothing under",
             bucket: None,
             role_arn: Some(absent.clone()),
@@ -935,7 +938,7 @@ async fn each_export_refusal_carries_the_services_own_sentence() {
             message: format!(
                 "The specified KMS key [{}] does not exist, is not enabled or you do not \
                  have permissions to access it.",
-                destination.key_id
+                destination.key_arn
             ),
         },
         RefusalRow {
