@@ -430,6 +430,10 @@ struct Planned {
     now: ::std::time::SystemTime,
     /// The pool's pre-sign-up invocation, or `None` for a pool that configures none.
     dispatch: Option<crate::state::lambda_triggers::Dispatch>,
+    /// The stage this registration dispatched that invocation as, which is also what decides
+    /// whether what the function asked for is applied to the account
+    /// ([`crate::state::lambda_triggers::pre_sign_up::Registration::honours_asked_for`]).
+    registration: crate::state::lambda_triggers::pre_sign_up::Registration,
 }
 
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> SignUp<Eng> {
@@ -701,6 +705,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> SignUp<Eng> {
         // What the pool's pre-sign-up function is handed, built while this lock is still
         // held: the account this registration would store, which is what the function
         // evaluates.
+        let registration = crate::state::lambda_triggers::pre_sign_up::Registration::SignUp;
         let dispatch = crate::state::lambda_triggers::pre_sign_up::pre_sign_up(
             pool,
             crate::state::lambda_triggers::pre_sign_up::Proposed {
@@ -708,7 +713,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> SignUp<Eng> {
                 attributes: &user.attributes,
                 validation_data: input.validation_data.as_deref(),
             },
-            crate::state::lambda_triggers::pre_sign_up::Registration::SignUp,
+            registration,
             caller,
             input.client_metadata.as_ref(),
         );
@@ -718,6 +723,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> SignUp<Eng> {
             user,
             now,
             dispatch,
+            registration,
         })
     }
 
@@ -739,11 +745,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> SignUp<Eng> {
             key,
             mut user,
             now,
+            registration,
             ..
         } = planned;
         // What the function decided is applied BEFORE the account is stored, so the stored
         // user is what this response reports and what every later read of this pool reports.
-        decision.apply(&mut user);
+        decision.apply(&mut user, registration);
 
         let mut guard = state.lock();
         let pool = guard.pool_mut(&user_pool_id).ok_or_else(internal_error)?;

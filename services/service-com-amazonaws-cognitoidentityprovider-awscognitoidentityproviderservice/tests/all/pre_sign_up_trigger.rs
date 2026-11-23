@@ -8,10 +8,12 @@
 //! `LambdaConfig` names a `PreSignUp` function INVOKES that function before anything is
 //! stored — "this trigger evaluates new users and can bypass confirmation, link a federated
 //! user profile, or block sign-up requests" (`LambdaConfigType$PreSignUp`, this service's
-//! model) — and the account is stored as the function left it: a function that bypassed the
-//! registrant's own confirmation leaves it `CONFIRMED` with no code to answer, one that marked
-//! a value verified leaves that value's flag set, and a function that failed registers nobody
-//! and refuses the operation with its modelled Lambda error.
+//! model) — and a function that failed registers nobody and refuses the operation with its
+//! modelled Lambda error, on either stage. What a RETURNING function asked for is about the
+//! registrant's own registration, so the SELF-SERVICE registration is stored as the function
+//! left it — a function that bypassed the registrant's own confirmation leaves it `CONFIRMED`
+//! with no code to answer, one that marked a value verified leaves that value's flag set —
+//! while the administrative create drops it and stores the account as the request stated it.
 //!
 //! The function is the ASSERTION on the event: the caller states in `ValidationData` — which
 //! this trigger is handed as `validationData` — what the event must say about the registration
@@ -23,9 +25,10 @@
 //!
 //! Rows span what the rule generalises over: which member the function asks for (none, each
 //! one alone, all three), whether the registration submitted the value a verified flag is
-//! about, whether client metadata was assigned, which operation reached the stage (the
-//! self-service registration and the administrative create, each with its own
-//! `triggerSource`), and a pool that configures no trigger at all. Nothing here asserts a
+//! about, whether the request stated that flag itself, whether client metadata was assigned,
+//! which operation reached the stage (the self-service registration and the administrative
+//! create, each with its own `triggerSource` and its own treatment of what the function asked
+//! for), and a pool that configures no trigger at all. Nothing here asserts a
 //! value baked into the service: the pool id, the app client id, the function ARN, the
 //! username and the email address all come back from the state the setup calls created.
 
@@ -599,40 +602,50 @@ async fn a_sign_up_is_evaluated_by_the_pools_pre_sign_up_function() {
     }
 }
 
-/// RULE: the same trigger, reached by the administrative create, which reports its own
-/// `triggerSource` — and the confirmation it can bypass is the registrant's own, which an
-/// administratively created account does not owe.
+/// RULE: the administrative create is evaluated by the same trigger — it reports its own
+/// `triggerSource` and is gated on the invocation just as a registration is — but what a
+/// RETURNING function asked for is about the registrant's own registration, so that stage
+/// stores the account as the REQUEST stated it: the bypassed confirmation and the verified
+/// values the function asked for are dropped there, while the self-service registration of
+/// the SAME pool, evaluated by the SAME function, applies them.
 #[tokio::test]
-async fn an_administrative_create_is_evaluated_by_the_same_trigger() {
+async fn an_administrative_create_drops_what_the_trigger_asked_for() {
     let router = router();
     let function_arn = create_function(&router, "pre-create", EVALUATING_HANDLER).await;
-    let (user_pool_id, _client_id) = pool_with_client(
+    let (user_pool_id, client_id) = pool_with_client(
         &router,
         "evaluated-admin",
         json!({ "LambdaConfig": { "PreSignUp": function_arn } }),
     )
     .await;
 
-    // (case, what the function is asked for, expected status, expected verified flags — a
+    // (case, what the function is asked for, whether the create submits a phone number, the
+    //  verified flags the create states ITSELF, expected status, expected verified flags — a
     //  flag the create records nothing for at all reads back as absent)
     type AdminRow = (
         &'static str,
         Vec<(&'static str, &'static str)>,
+        bool,
+        Vec<(&'static str, &'static str)>,
         &'static str,
         Vec<(&'static str, Option<&'static str>)>,
     );
-    let rows: [AdminRow; 3] = [
+    let rows: [AdminRow; 6] = [
         (
             "a function that asks for nothing",
             vec![],
+            false,
+            vec![],
             "FORCE_CHANGE_PASSWORD",
-            vec![("email_verified", None)],
+            vec![("email_verified", None), ("phone_number_verified", None)],
         ),
         (
             "a function that verifies the email address",
             vec![("autoVerifyEmail", "yes")],
+            false,
+            vec![],
             "FORCE_CHANGE_PASSWORD",
-            vec![("email_verified", Some("true"))],
+            vec![("email_verified", None)],
         ),
         (
             // The account an administrator created owes no confirmation of its own: it
@@ -640,12 +653,53 @@ async fn an_administrative_create_is_evaluated_by_the_same_trigger() {
             // not a confirmation this trigger bypasses.
             "a function that bypasses the confirmation",
             vec![("autoConfirmUser", "yes")],
+            false,
+            vec![],
             "FORCE_CHANGE_PASSWORD",
             vec![("email_verified", None)],
         ),
+        (
+            "a function that verifies the phone number the create submitted",
+            vec![("autoVerifyPhone", "yes")],
+            true,
+            vec![],
+            "FORCE_CHANGE_PASSWORD",
+            vec![("phone_number_verified", None), ("email_verified", None)],
+        ),
+        (
+            "a function that asks for all three",
+            vec![
+                ("autoConfirmUser", "yes"),
+                ("autoVerifyEmail", "yes"),
+                ("autoVerifyPhone", "yes"),
+            ],
+            true,
+            vec![],
+            "FORCE_CHANGE_PASSWORD",
+            vec![("email_verified", None), ("phone_number_verified", None)],
+        ),
+        (
+            // What the REQUEST states is stored whatever the function asked for: an
+            // administrator that submits the flag vouches for the value itself.
+            "a create that states the verified flag itself",
+            vec![
+                ("autoConfirmUser", "yes"),
+                ("autoVerifyEmail", "yes"),
+                ("autoVerifyPhone", "yes"),
+            ],
+            false,
+            vec![("email_verified", "true")],
+            "FORCE_CHANGE_PASSWORD",
+            vec![
+                ("email_verified", Some("true")),
+                ("phone_number_verified", None),
+            ],
+        ),
     ];
 
-    for (index, (case, asked, expected_status, expected_flags)) in rows.into_iter().enumerate() {
+    for (index, (case, asked, with_phone, stated, expected_status, expected_flags)) in
+        rows.into_iter().enumerate()
+    {
         let username = format!("invited{index}");
         let email = format!("{username}@example.test");
         let mut statements: Vec<(&str, &str)> = asked.clone();
@@ -658,6 +712,14 @@ async fn an_administrative_create_is_evaluated_by_the_same_trigger() {
         statements.push(("expectClient", CLIENT_ID_NOT_APPLICABLE));
         statements.push(("expectEmail", email.as_str()));
 
+        let mut attributes = vec![json!({ "Name": "email", "Value": email })];
+        if with_phone {
+            attributes.push(json!({ "Name": "phone_number", "Value": PHONE_NUMBER }));
+        }
+        for (flag, value) in &stated {
+            attributes.push(json!({ "Name": flag, "Value": value }));
+        }
+
         let (status, answered) = cognito(
             &router,
             "AdminCreateUser",
@@ -665,7 +727,7 @@ async fn an_administrative_create_is_evaluated_by_the_same_trigger() {
                 "UserPoolId": user_pool_id,
                 "Username": username,
                 "TemporaryPassword": GOOD_PASSWORD,
-                "UserAttributes": [{ "Name": "email", "Value": email }],
+                "UserAttributes": attributes,
                 "ValidationData": validation_data(&statements),
             }),
         )
@@ -690,6 +752,47 @@ async fn an_administrative_create_is_evaluated_by_the_same_trigger() {
             );
         }
     }
+
+    // The other half of the rule, in the SAME pool and evaluated by the SAME function: a
+    // self-service registration IS the registrant's own, so there what the function asked
+    // for is applied.
+    let registrant = "signed-up";
+    let registrant_email = format!("{registrant}@example.test");
+    let statements: Vec<(&str, &str)> = vec![
+        ("autoConfirmUser", "yes"),
+        ("autoVerifyEmail", "yes"),
+        ("expectSource", "PreSignUp_SignUp"),
+        ("expectVersion", EVENT_VERSION),
+        ("expectPool", user_pool_id.as_str()),
+        ("expectUser", registrant),
+        ("expectClient", client_id.as_str()),
+        ("expectEmail", registrant_email.as_str()),
+    ];
+    let registered = ok(
+        &router,
+        "SignUp",
+        &json!({
+            "ClientId": client_id,
+            "Username": registrant,
+            "Password": GOOD_PASSWORD,
+            "UserAttributes": [{ "Name": "email", "Value": registrant_email }],
+            "ValidationData": validation_data(&statements),
+        }),
+    )
+    .await;
+    assert_eq!(
+        registered["UserConfirmed"],
+        json!(true),
+        "the self-service stage applies the bypass the function asked for, got {registered}"
+    );
+    let (stored_status, stored_attributes) = read_back(&router, &user_pool_id, registrant).await;
+    let verified = stored_attributes.get("email_verified").map(String::as_str);
+    assert_eq!(
+        (stored_status.as_str(), verified),
+        ("CONFIRMED", Some("true")),
+        "the self-service stage applies what the function asked for, got {stored_status:?} \
+         and {stored_attributes:?}"
+    );
 }
 
 /// The handler a row of [`an_answer_that_is_not_the_event_registers_nobody`] runs: it answers

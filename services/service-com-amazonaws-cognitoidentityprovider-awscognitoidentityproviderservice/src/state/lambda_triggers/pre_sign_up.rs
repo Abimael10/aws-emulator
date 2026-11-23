@@ -17,7 +17,11 @@
 //! registration and the administrative create. Both model `ValidationData` as "temporary user
 //! attributes that contribute to the outcomes of your pre sign-up Lambda trigger … Your
 //! function can automatically confirm and verify select users" (this service's model), which
-//! is both why they are the stages that reach this trigger and what the answer decides.
+//! is both why they are the stages that reach this trigger and what the answer decides —
+//! about the registrant's OWN registration, so the bypass and the verifications an answer
+//! asks for are applied on the self-service registration alone and dropped on the
+//! administrative create ([`Registration::honours_asked_for`]), which gates on the invocation
+//! all the same.
 //!
 //! The work splits the way every other trigger of this service does ([`super`]):
 //! [`pre_sign_up`] resolves the member and builds the event from the pool read under the state
@@ -73,6 +77,30 @@ impl Registration {
         match self {
             Self::SignUp => "PreSignUp_SignUp",
             Self::AdminCreateUser => "PreSignUp_AdminCreateUser",
+        }
+    }
+
+    /// Whether what a returning function ASKED FOR is applied to the account this stage
+    /// stores ([`Decision::apply`]).
+    ///
+    /// What the answer asks for is about the registrant's own registration: the confirmation
+    /// a registrant owes for the account it signed itself up for, and the values that
+    /// registrant submitted being taken as already proven. Only the self-service
+    /// registration is such a registration, so only there is the answer applied. An
+    /// administratively created account owes a password change rather than a confirmation of
+    /// its own ("must change their password to complete sign-in", `UserStatusType` in this
+    /// service's model) and nothing has proven any value an administrator typed for it, so
+    /// the create stores the account exactly as the request stated it — an explicitly
+    /// submitted verified flag included — and what the function asked for is dropped.
+    ///
+    /// The function still RUNS on both stages and still GATES both ([`super::invoke_gating`]):
+    /// a function that reported an error registers nobody either way. Dropped is what it
+    /// asked FOR, not the invocation.
+    #[must_use]
+    pub fn honours_asked_for(self) -> bool {
+        match self {
+            Self::SignUp => true,
+            Self::AdminCreateUser => false,
         }
     }
 }
@@ -265,7 +293,12 @@ impl Decision {
         })
     }
 
-    /// Apply this decision to `user`, the account the registration is about to store.
+    /// Apply this decision to `user`, the account `registration` is about to store.
+    ///
+    /// What a function asked for is applied only on the stage that honours it
+    /// ([`Registration::honours_asked_for`]): the bypass and the verifications are about the
+    /// registrant's own registration, so an administrative create stores the account as the
+    /// request stated it and drops them.
     ///
     /// The confirmation that is bypassed is the REGISTRANT's own — the one a user that signed
     /// itself up answers with the code the sign-up sent — so it is the account still awaiting
@@ -277,7 +310,10 @@ impl Decision {
     /// A value is marked verified only where the account carries one: the flag records
     /// whether THAT value was confirmed, so there is nothing to record for an attribute the
     /// registration stores no value for.
-    pub fn apply(&self, user: &mut User) {
+    pub fn apply(&self, user: &mut User, registration: Registration) {
+        if !registration.honours_asked_for() {
+            return;
+        }
         if self.confirm_user && user.status == UserStatus::Unconfirmed {
             user.status = UserStatus::Confirmed;
         }

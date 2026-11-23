@@ -5,9 +5,11 @@
 //! `FORCE_CHANGE_PASSWORD` state, and answers with the STORED user.
 //!
 //! A pool carrying a `LambdaConfig.PreSignUp` trigger has that function EVALUATE the account
-//! this create proposes before it is stored, so the answer decides what gets stored — which
-//! of the account's values the pool takes as verified — and a function that failed creates
-//! nobody ([`crate::state::lambda_triggers::pre_sign_up`]).
+//! this create proposes before it is stored, so a function that failed creates nobody — while
+//! what a returning function ASKED FOR (the bypassed confirmation, the verified values) is
+//! about a registrant's own registration and so is dropped on this administrative stage: the
+//! account is stored as the request stated it
+//! ([`crate::state::lambda_triggers::pre_sign_up`]).
 //!
 //! A pool carrying a `LambdaConfig.CustomEmailSender` or `LambdaConfig.CustomSMSSender` has
 //! the INVITATION this create sends over that sender's medium handed to the function it names
@@ -371,6 +373,10 @@ struct Creating {
     user: crate::state::User,
     /// The pool's pre-sign-up invocation, or `None` for a pool that configures none.
     dispatch: Option<crate::state::lambda_triggers::Dispatch>,
+    /// The stage this create dispatched that invocation as, which is also what decides
+    /// whether what the function asked for is applied to the account
+    /// ([`crate::state::lambda_triggers::pre_sign_up::Registration::honours_asked_for`]).
+    registration: crate::state::lambda_triggers::pre_sign_up::Registration,
     /// The invitation this create sends once the account is stored, or `None` where it
     /// sends none.
     invitation: Option<Invitation>,
@@ -781,6 +787,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminCreateUser<E
 
         // What the pool's pre-sign-up function is handed, built while this lock is still
         // held: the account this create would store, which is what the function evaluates.
+        let registration =
+            crate::state::lambda_triggers::pre_sign_up::Registration::AdminCreateUser;
         let dispatch = crate::state::lambda_triggers::pre_sign_up::pre_sign_up(
             pool,
             crate::state::lambda_triggers::pre_sign_up::Proposed {
@@ -788,7 +796,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminCreateUser<E
                 attributes: &user.attributes,
                 validation_data: input.validation_data.as_deref(),
             },
-            crate::state::lambda_triggers::pre_sign_up::Registration::AdminCreateUser,
+            registration,
             caller,
             input.client_metadata.as_ref(),
         );
@@ -804,6 +812,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminCreateUser<E
                 }),
             user,
             dispatch,
+            registration,
         })))
     }
 
@@ -847,7 +856,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminCreateUser<E
         Ok(())
     }
 
-    /// Store the account `creating` decided, as the pool's pre-sign-up function left it, and
+    /// Store the account `creating` decided — as the request stated it, this stage dropping
+    /// what the pool's pre-sign-up function asked for
+    /// ([`crate::state::lambda_triggers::pre_sign_up::Registration::honours_asked_for`]) — and
     /// report it the way every read of this service reports a user.
     ///
     /// Takes this service's lock itself, the pre-sign-up invocation having been made with it
@@ -864,11 +875,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminCreateUser<E
             user_pool_id,
             key,
             mut user,
+            registration,
             ..
         } = creating;
         // What the function decided is applied BEFORE the account is stored, so the stored
-        // user is what this response reports and what every later read of this pool reports.
-        decision.apply(&mut user);
+        // user is what this response reports and what every later read of this pool reports —
+        // and on THIS stage what the function asked for is dropped, the account being stored
+        // as the request stated it.
+        decision.apply(&mut user, registration);
 
         let mut guard = state.lock();
         let pool = guard.pool_mut(&user_pool_id).ok_or_else(internal_error)?;
