@@ -342,6 +342,10 @@ mod lambda_permission;
 mod lambda_scalars;
 use lambda_scalars::lambda_declaration;
 mod lambda_version;
+/// The resources of ONE level of a stack's dependency relation, asked about together, so a
+/// stack operation costs about one coming-up window per LEVEL rather than one per resource
+/// ([`level_readiness`]).
+mod level_readiness;
 /// The Amazon CloudWatch Logs types a stack declares — a log group, a stream inside one and
 /// a metric filter on one: visible to the rest of this service's state because the types'
 /// own NAMES live here, beside the arms that provision them, and more than one module answers
@@ -2390,6 +2394,12 @@ pub async fn reconcile(
     // ([`super::template::replacement_deletes_first`]): each is gone already, so the cleanup
     // phase that takes down what this deployment replaced owes no call about it.
     let mut taken_down: BTreeSet<String> = BTreeSet::new();
+    // The resources this walk has STARTED and not yet asked the owning service about: a
+    // level of the stack's dependency relation is brought up TOGETHER, so the question
+    // "does that service report this resource ready" is put where its answer is needed
+    // rather than before the walk reaches the next declaration
+    // ([`level_readiness::settle`]).
+    let mut coming_up: Vec<level_readiness::ComingUp> = Vec::new();
     let mut declared = declared.into_iter();
     // Every `{{resolve:...}}` DYNAMIC REFERENCE the declarations carry whose store stands
     // OUTSIDE the deployment is resolved by CLOUDFORMATION ITSELF, here, before anything is
@@ -2459,6 +2469,30 @@ pub async fn reconcile(
         // resolved later (a resource withheld behind a dependency still coming up, an output,
         // a client's own call) addresses in vain.
         repoint_identity(&mut resource, &pairs);
+        // THIS is where the level the walk has just started is asked about: the declaration
+        // in hand READS a resource the walk started and has not had an answer about yet, and
+        // "a resource that depends on another is scheduled only once that one has finished",
+        // so the answers are needed now. Asking here rather than as each resource was
+        // created is what makes the resources of one level come up TOGETHER — a level of
+        // several costs about one coming-up window, not one each
+        // ([`level_readiness::settle`]). Everything below judges the answers exactly as it
+        // did when they were read inline: a resource that failed holds back what reads it,
+        // and one still coming up is withheld behind a wait of its own.
+        if !coming_up.is_empty()
+            && awaits_a_dependency(&resource.logical_id, &stack.dependencies, &unpublished)
+        {
+            let reads = needed_by(&stack.dependencies, &resource.logical_id);
+            Box::pin(level_readiness::settle(
+                ctx,
+                region,
+                &mut coming_up,
+                Some(&reads),
+                &mut outcome,
+                &mut failed,
+                &mut unpublished,
+            ))
+            .await;
+        }
         // A resource the walk could not carry out holds back every resource that DEPENDS on
         // it: what such a declaration reads is the resource that failed, so there is nothing
         // its owning service could be asked for, and CloudFormation records no transition for
@@ -3498,104 +3532,24 @@ pub async fn reconcile(
                 // state it is in, and the resource's creation is held open until that
                 // service reports it ready ([`super::stabilising`]) — CloudFormation does
                 // not report a resource created on the strength of an accepted call.
-                let readiness = match owner {
-                    Some(provisioner) => {
-                        // Boxed for the reason the create's own call just above is.
-                        Box::pin(provisioner.readiness(
-                            ctx,
-                            region,
-                            &resource.physical_resource_id,
-                            Some(&resource.properties),
-                        ))
-                        .await
-                    }
-                    None => Ok(Readiness::Ready),
-                };
-                match readiness {
-                    Ok(Readiness::Ready) => {
-                        // That service reports the resource up as the create answered, so the
-                        // identifiers it publishes only for a resource that IS up — the
-                        // address a cluster serves on, the endpoint a stream is written to,
-                        // the outputs a nested stack's child published — are read here as
-                        // well as when a wait releases ([`merge_published_attributes`]): a
-                        // service that reports the resource ready straight away opens no
-                        // wait, and those values would otherwise never reach this resource's
-                        // attributes, so an output or a dependent property reading one would
-                        // resolve to nothing. A read that service refuses leaves the
-                        // attributes as they stand, exactly as it does at a released wait.
-                        Box::pin(merge_published_attributes(ctx, region, &mut resource)).await;
-                        outcome.transitions.push(ResourceTransition::finished(
-                            &resource,
-                            reporting.completed,
-                            None,
-                        ));
-                    }
-                    Ok(Readiness::Pending(state)) => {
-                        // The terminal transition is planned here as it is for any other
-                        // resource; the gate this records is what holds it back until the
-                        // owning service reports the resource ready.
-                        outcome.stabilising.push(Stabilising {
-                            awaited: super::stabilising::Awaited::Ready,
-                            logical_id: resource.logical_id.clone(),
-                            resource_type: resource.resource_type.clone(),
-                            physical_resource_id: resource.physical_resource_id.clone(),
-                            reported_state: state,
-                            // The wait is the OWNING SERVICE's answer about the resource, so
-                            // there is no provider request it is for.
-                            provider_request: None,
-                        });
-                        // A resource that is still coming up has not published the values its
-                        // owning service only reports once it IS up — the address a cluster
-                        // serves on, the endpoint a stream is written to — so nothing that
-                        // READS one of them may be created ahead of that answer
-                        // ([`awaits_a_dependency`]): the document such a create would carry
-                        // does not have the value yet. The dependents are held at waits of
-                        // their own and created by the pass that runs once this one releases
-                        // ([`deferred::resume`]), which is the order CloudFormation creates a
-                        // stack's resources in — the same hold a custom resource whose
-                        // provider has not answered yet puts on the resources that read its
-                        // `Data`.
-                        unpublished.insert(resource.logical_id.clone());
-                        outcome.transitions.push(ResourceTransition::finished(
-                            &resource,
-                            reporting.completed,
-                            None,
-                        ));
-                    }
-                    // The resource exists in that service and is not going to come up, or
-                    // that service could not be asked about it at all: either way the
-                    // create did not go through, so the deployment stops here exactly as it
-                    // does on a refused create. The record keeps `materialised`, so the
-                    // rollback still deletes what the create made.
-                    Ok(ref failure @ (Readiness::Failed(_) | Readiness::Refused(_))) => {
-                        failed.push((resource.logical_id.clone(), reporting.action));
-                        outcome.transitions.push(ResourceTransition::finished(
-                            &resource,
-                            reporting.failed,
-                            Some(provider_failure_reason(
-                                owner,
-                                &resource.physical_resource_id,
-                                failure,
-                            )),
-                        ));
-                        outcome.resources.push(resource);
-                        continue;
-                    }
-                    Err(refusal) => {
-                        failed.push((resource.logical_id.clone(), reporting.action));
-                        outcome.transitions.push(ResourceTransition::finished(
-                            &resource,
-                            reporting.failed,
-                            Some(handler_failure_reason(
-                                owner,
-                                &refusal,
-                                &resource.physical_resource_id,
-                            )),
-                        ));
-                        outcome.resources.push(resource);
-                        continue;
-                    }
-                }
+                //
+                // That question is put where its ANSWER is needed — when the walk reaches a
+                // declaration reading this resource, and once more when it is through
+                // ([`level_readiness`]) — and not before the walk reaches the next
+                // declaration: a service that answers it only once the resource has left its
+                // own creation window answers for as long as that window has left to run, so
+                // asking here would cost a level of several independent resources one window
+                // EACH instead of one for the level.
+                unpublished.insert(resource.logical_id.clone());
+                coming_up.push(level_readiness::ComingUp {
+                    logical_id: resource.logical_id.clone(),
+                    resource_type: resource.resource_type.clone(),
+                    physical_resource_id: resource.physical_resource_id.clone(),
+                    declared: resource.properties.clone(),
+                    reporting,
+                });
+                outcome.resources.push(resource);
+                continue;
             }
             Err(refusal) => {
                 failed.push((resource.logical_id.clone(), reporting.action));
@@ -3614,8 +3568,22 @@ pub async fn reconcile(
                 continue;
             }
         }
-        outcome.resources.push(resource);
     }
+    // The LAST level of the walk: every resource it started and has not had an answer about
+    // yet is asked about here, so no resource is ever reported created without its owning
+    // service having said it is ready ([`level_readiness::settle`]). This runs before the
+    // stack-level reason below is composed, so a resource that level reports failed is named
+    // in it exactly as one whose create was refused is.
+    Box::pin(level_readiness::settle(
+        ctx,
+        region,
+        &mut coming_up,
+        None,
+        &mut outcome,
+        &mut failed,
+        &mut unpublished,
+    ))
+    .await;
     // What this walk could not carry through, named in ONE stack-level reason: the field a
     // client parses to recover the set of failed logical ids reports every resource that
     // failed, not only the first of them ([`failed_resource_summary`]). A refusal

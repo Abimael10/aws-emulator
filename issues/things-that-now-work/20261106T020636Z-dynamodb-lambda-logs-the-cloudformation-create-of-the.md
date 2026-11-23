@@ -7,6 +7,26 @@ Issue-Commit: cc6137e930728edc173d6e704b5a7c1716e7fffd
 
 # dynamodb__lambda__logs: the CloudFormation create of the two-stream Onyx handler stack ends ROLLBACK_COMPLETE, so the whole stream-processing lifecycle is unobservable
 
+> _Resolution: the cause as REPORTED — the create ends `ROLLBACK_COMPLETE` with no stack event
+> naming a failing resource — is not present at this commit: this estate's `CreateStack` reaches
+> a terminal `CREATE_COMPLETE` with every declared resource created, the two mappings carry the
+> declared `StartingPosition`/`BatchSize`/`MaximumRetryAttempts` over the two tables'
+> `LatestStreamArn`s, and each table write is delivered to the handler, which
+> `core/router/tests/all/cfn_multi_stream_lambda_logged_lifecycle.rs` pins over one, two and
+> three streams. What was still measurable on this estate was the create's COST: the deployment
+> walk waited one resource's coming-up window out before it asked for the next, so the create
+> cost one window per RESOURCE instead of one per LEVEL of the template's dependency relation.
+> That is fixed here — the walk puts the "is it ready" question to the owning service where its
+> answer is needed rather than before it reaches the next declaration, which is the fix
+> `issues/things-that-do-not-work/20261119T000000Z-cloudformation-independent-stack-resources-come-up-one-window-apart.md`
+> asks for — and `core/router/tests/all/cfn_independent_resources_come_up_together.rs` pins it.
+> The residual on the recorded unit is the six-phase scenario's WALL CLOCK against the harness's
+> own 60 s cap, which the replay attributes to
+> `dynamodb__lambda__logs.e2e-diagnose-onyx-lambda-processing-failure-lifecycle|_reap_log_group#10|Timeout|return`
+> — the key
+> `issues/things-that-do-not-work/20261120T001238Z-dynamodb-lambda-logs-the-dynamodb-stream-processing-failure-lifecycle-never-reaches.md`
+> owns, and which that report itself records as having no AWS-published latency behind it._
+
 > _Note: this issue was identified against the code base at commit `cc6137e930728edc173d6e704b5a7c1716e7fffd`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation
