@@ -657,9 +657,11 @@ fn query_arn(alarm: &Value) -> String {
 
 /// Every run CloudWatch Logs reports for the managed scheduled query `arn` names, over a window
 /// wide enough to hold every instant one of this suite's runs can fall at.
+///
+/// The window's ends are the epoch MILLISECONDS CloudWatch Logs states an epoch instant in.
 async fn trigger_history(emulator: &Emulator, arn: &str) -> Vec<Value> {
     #[allow(clippy::cast_possible_truncation)]
-    let end_time = now_secs() as i64 + 60;
+    let end_time = (now_secs() * 1_000.0) as i64 + 60_000;
     let reported = logs(
         emulator,
         "GetScheduledQueryHistory",

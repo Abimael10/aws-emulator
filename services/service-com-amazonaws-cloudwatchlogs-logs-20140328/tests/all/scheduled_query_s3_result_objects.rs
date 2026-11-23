@@ -161,7 +161,7 @@ async fn settled_record(emulator: &Emulator, case: &str, name: &str) -> Value {
                 &json!({
                     "identifier": name,
                     "startTime": 0,
-                    "endTime": crate::harness::now_ms() / 1_000 + 3_600,
+                    "endTime": crate::harness::now_ms() + 3_600 * 1_000,
                 }),
             )
             .await;
@@ -572,7 +572,7 @@ async fn settled_lookup_table_record(emulator: &Emulator, case: &str, name: &str
                 &json!({
                     "identifier": name,
                     "startTime": 0,
-                    "endTime": crate::harness::now_ms() / 1_000 + 3_600,
+                    "endTime": crate::harness::now_ms() + 3_600 * 1_000,
                 }),
             )
             .await;

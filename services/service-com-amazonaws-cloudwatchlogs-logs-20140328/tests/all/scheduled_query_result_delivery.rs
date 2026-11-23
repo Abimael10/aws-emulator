@@ -153,7 +153,7 @@ async fn processed_destination(
             .logs_ok(
                 case,
                 HISTORY,
-                &json!({"identifier": name, "startTime": 0, "endTime": now_ms() / 1_000 + 3_600}),
+                &json!({"identifier": name, "startTime": 0, "endTime": now_ms() + 3_600 * 1_000}),
             )
             .await;
         let processed = page["triggerHistory"]

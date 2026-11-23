@@ -371,7 +371,7 @@ async fn history(emulator: &Emulator, case: &str, name: &str) -> Vec<Value> {
         .logs_ok(
             case,
             HISTORY,
-            &json!({"identifier": name, "startTime": 0, "endTime": now_ms() / 1_000 + 3_600}),
+            &json!({"identifier": name, "startTime": 0, "endTime": now_ms() + 3_600 * 1_000}),
         )
         .await;
     page["triggerHistory"].as_array().cloned().unwrap_or_default()

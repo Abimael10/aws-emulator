@@ -149,10 +149,11 @@ pub struct ScheduledQueryRecord {
     /// created is [`SCHEDULE_TYPE_CUSTOMER_MANAGED`].
     pub schedule_type: String,
     /// `scheduleStartTime` — "The start time for the scheduled query in Unix epoch format",
-    /// when a call named one.
+    /// when a call named one, in the epoch milliseconds this service states an epoch instant
+    /// in ([`super::scheduled_query_executions`]).
     pub schedule_start_time: Option<i64>,
     /// `scheduleEndTime` — "The end time for the scheduled query in Unix epoch format", when a
-    /// call named one.
+    /// call named one, in the same unit.
     pub schedule_end_time: Option<i64>,
     /// `executionRoleArn` — "The ARN of the IAM role used to execute the query and deliver
     /// results". Required of a create, so every stored query carries one.

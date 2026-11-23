@@ -338,17 +338,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The window SELECTS which executions are reported — both of its ends included, the
-        // way every window of this service is read, and in the epoch SECONDS this operation
-        // states its instants in (`startTime`, `endTime` and `triggeredTimestamp` are all "in
-        // Unix epoch format", the unit this surface states its offsets and query windows in) —
-        // and "only executions with the specified statuses are returned", so a request naming
-        // none is not narrowed by status at all.
+        // way every window of this service is read, and in the epoch MILLISECONDS this service
+        // states an epoch instant in: `startTime`, `endTime` and `triggeredTimestamp` state no
+        // number of seconds of their own ("in Unix epoch format"), so they carry the unit every
+        // other instant of this surface does — and "only executions with the specified statuses
+        // are returned", so a request naming none is not narrowed by status at all.
         let statuses = input.execution_statuses.clone().unwrap_or_default();
         let mut matching: Vec<&crate::state::ScheduledQueryExecution> = recorded
             .iter()
             .filter(|execution| {
-                execution.triggered_secs() >= input.start_time
-                    && execution.triggered_secs() <= input.end_time
+                execution.triggered_ms >= input.start_time
+                    && execution.triggered_ms <= input.end_time
             })
             .filter(|execution| statuses.is_empty() || statuses.contains(&execution.status))
             .collect();

@@ -78,10 +78,10 @@ const HISTORY_DEADLINE: Duration = Duration::from_secs(180);
 /// How long to wait between two looks while polling for one.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// A window that covers every instant a case's runs can fall at, in the epoch SECONDS this
-/// operation states its window in.
+/// A window that covers every instant a case's runs can fall at, in the epoch MILLISECONDS
+/// this operation states its window in.
 fn whole_window() -> (i64, i64) {
-    (0, now_ms() / 1_000 + 24 * 60 * 60)
+    (0, now_ms() + 24 * 60 * 60 * 1_000)
 }
 
 /// Seed [`GROUP`] with [`MESSAGES`], one event per second an hour back, so every run's
@@ -260,7 +260,7 @@ async fn the_history_reports_the_runs_the_schedule_made_due() {
             .as_i64()
             .unwrap_or_else(|| panic!("case {case:?}: a record is triggered at an instant, got {record}"));
         assert!(
-            triggered >= created_at / 1_000 && triggered <= now_ms() / 1_000,
+            triggered >= created_at && triggered <= now_ms(),
             "case {case:?}: expected the run to be triggered between {created_at} and now, got \
              {triggered}"
         );
@@ -297,12 +297,12 @@ async fn the_history_reports_the_runs_the_schedule_made_due() {
         }
 
         // The query itself now reports that run as its last: both members report an execution
-        // that happened. `lastTriggeredTime` is an instant of the RESOURCE, so it carries the
-        // epoch milliseconds its `creationTime` does, while the history states the same run in
-        // the epoch seconds its own window is stated in.
+        // that happened. `lastTriggeredTime` and the history's `triggeredTimestamp` are the
+        // same instant of the same run, stated in the same epoch milliseconds, so the two
+        // values are equal rather than a factor apart.
         let reported = logs.ok(GET, &json!({"identifier": name})).await;
         assert_eq!(
-            reported["lastTriggeredTime"].as_i64().map(|ms| ms / 1_000),
+            reported["lastTriggeredTime"].as_i64(),
             Some(triggered),
             "case {case:?}: the query's last triggered instant is that run's, got {reported}"
         );
@@ -387,7 +387,7 @@ struct Window {
     case: &'static str,
     /// The name the scheduled query is created under.
     name: &'static str,
-    /// Its `scheduleStartTime`, in the epoch seconds this surface states its instants in.
+    /// Its `scheduleStartTime`, in the epoch milliseconds this surface states its instants in.
     start: Option<i64>,
     /// Its `scheduleEndTime`, in the same unit.
     end: Option<i64>,
@@ -405,22 +405,23 @@ struct Window {
 async fn the_schedule_window_and_the_state_decide_whether_a_run_is_due() {
     let logs = Logs::new();
     seed_events(&logs).await;
-    // The window's ends are stated in the epoch SECONDS this surface states its instants in.
-    let now_secs = now_ms() / 1_000;
+    // The window's ends are stated in the epoch MILLISECONDS this surface states its instants
+    // in, the unit its `creationTime` is reported in.
+    let now = now_ms();
 
     let rows: [Window; 4] = [
         Window {
             case: "a query inside its schedule window",
             name: "inside-its-window",
-            start: Some(now_secs - 60),
-            end: Some(now_secs + 3_600),
+            start: Some(now - 60 * 1_000),
+            end: Some(now + 3_600 * 1_000),
             state: "ENABLED",
             due: true,
         },
         Window {
             case: "a query whose window has not begun",
             name: "before-its-window",
-            start: Some(now_secs + 3_600),
+            start: Some(now + 3_600 * 1_000),
             end: None,
             state: "ENABLED",
             due: false,
@@ -429,7 +430,7 @@ async fn the_schedule_window_and_the_state_decide_whether_a_run_is_due() {
             case: "a query whose window has ended",
             name: "after-its-window",
             start: None,
-            end: Some(now_secs - 60),
+            end: Some(now - 60 * 1_000),
             state: "ENABLED",
             due: false,
         },
@@ -527,10 +528,11 @@ async fn query_with_recorded_runs(logs: &Logs, name: &str, runs: &[(&str, i64, &
 }
 
 /// The instant the recorded runs of the tables below are spaced around: each run one minute
-/// apart, within the hour before now, and each at a whole second — the resolution this
-/// operation states its window and its records' instants in.
+/// apart, within the hour before now, and each at an instant whose millisecond part is not
+/// zero — the resolution this operation states its window and its records' instants in, so a
+/// window that named them in whole seconds could not pick one of them out.
 fn run_instants() -> [i64; 5] {
-    let newest = (now_ms() - 60 * 1_000) / 1_000 * 1_000;
+    let newest = (now_ms() - 60 * 1_000) / 1_000 * 1_000 + 457;
     [
         newest - 4 * 60 * 1_000,
         newest - 3 * 60 * 1_000,
@@ -538,11 +540,6 @@ fn run_instants() -> [i64; 5] {
         newest - 60 * 1_000,
         newest,
     ]
-}
-
-/// Those instants as the epoch SECONDS a window names them in.
-fn run_seconds() -> [i64; 5] {
-    run_instants().map(|instant| instant / 1_000)
 }
 
 /// The statuses the recorded runs carry, one per instant: every value of the model's
@@ -576,7 +573,7 @@ fn recorded_runs(instants: &[i64; 5]) -> Vec<(&'static str, i64, &'static str)> 
 struct Filter {
     /// What this row varies, named in every assertion.
     case: &'static str,
-    /// The `startTime` the read asks for, in epoch seconds.
+    /// The `startTime` the read asks for, in epoch milliseconds.
     start_time: i64,
     /// Its `endTime`, in the same unit.
     end_time: i64,
@@ -594,93 +591,93 @@ async fn the_history_is_ordered_newest_first_and_filtered_by_window_and_status()
     seed_events(&logs).await;
     let name = "filtered-runs";
     let instants = run_instants();
-    // The window names its ends in the epoch SECONDS this operation states them in.
-    let seconds = run_seconds();
+    // The window names its ends in the epoch MILLISECONDS this operation states them in, which
+    // is the very unit the records' own instants are kept and reported in.
     query_with_recorded_runs(&logs, name, &recorded_runs(&instants)).await;
     let newest_first: Vec<&str> = RUN_IDS.iter().rev().copied().collect();
 
     let rows: Vec<Filter> = vec![
         Filter {
             case: "a window covering every run",
-            start_time: seconds[0] - 1,
-            end_time: seconds[4] + 1,
+            start_time: instants[0] - 1,
+            end_time: instants[4] + 1,
             statuses: vec![],
             expected: newest_first.clone(),
         },
         Filter {
             case: "a window whose ends are the oldest and the newest run",
-            start_time: seconds[0],
-            end_time: seconds[4],
+            start_time: instants[0],
+            end_time: instants[4],
             statuses: vec![],
             expected: newest_first.clone(),
         },
         Filter {
             case: "a window of the one instant the oldest run was triggered at",
-            start_time: seconds[0],
-            end_time: seconds[0],
+            start_time: instants[0],
+            end_time: instants[0],
             statuses: vec![],
             expected: vec![RUN_IDS[0]],
         },
         Filter {
             case: "a window of the one instant the newest run was triggered at",
-            start_time: seconds[4],
-            end_time: seconds[4],
+            start_time: instants[4],
+            end_time: instants[4],
             statuses: vec![],
             expected: vec![RUN_IDS[4]],
         },
         Filter {
             case: "a window of the middle runs",
-            start_time: seconds[1],
-            end_time: seconds[3],
+            start_time: instants[1],
+            end_time: instants[3],
             statuses: vec![],
             expected: vec![RUN_IDS[3], RUN_IDS[2], RUN_IDS[1]],
         },
         Filter {
             case: "a window wholly before every run",
             start_time: 0,
-            end_time: seconds[0] - 1,
+            end_time: instants[0] - 1,
             statuses: vec![],
             expected: vec![],
         },
         Filter {
             case: "a window wholly after every run",
-            start_time: seconds[4] + 1,
-            end_time: seconds[4] + 60,
+            start_time: instants[4] + 1,
+            end_time: instants[4] + 60,
             statuses: vec![],
             expected: vec![],
         },
         Filter {
             case: "every run of one status",
-            start_time: seconds[0] - 1,
-            end_time: seconds[4] + 1,
+            start_time: instants[0] - 1,
+            end_time: instants[4] + 1,
             statuses: vec!["Complete"],
             expected: vec![RUN_IDS[2], RUN_IDS[0]],
         },
         Filter {
             case: "a status one run carries",
-            start_time: seconds[0] - 1,
-            end_time: seconds[4] + 1,
+            start_time: instants[0] - 1,
+            end_time: instants[4] + 1,
             statuses: vec!["Timeout"],
             expected: vec![RUN_IDS[3]],
         },
         Filter {
             case: "two statuses at once",
-            start_time: seconds[0] - 1,
-            end_time: seconds[4] + 1,
+            start_time: instants[0] - 1,
+            end_time: instants[4] + 1,
             statuses: vec!["Failed", "InvalidQuery"],
             expected: vec![RUN_IDS[4], RUN_IDS[1]],
         },
         Filter {
             case: "a status no run carries",
-            start_time: seconds[0] - 1,
-            end_time: seconds[4] + 1,
+            start_time: instants[0] - 1,
+            end_time: instants[4] + 1,
             statuses: vec!["Running"],
             expected: vec![],
         },
         Filter {
             case: "a status filter narrowed further by the window",
-            start_time: seconds[0],
-            end_time: seconds[1],
+            start_time: instants[0],
+            end_time: instants[1],
             statuses: vec!["Complete"],
             expected: vec![RUN_IDS[0]],
         },
@@ -738,7 +735,6 @@ async fn the_history_is_paged_by_max_results_and_resumed_by_its_token() {
     seed_events(&logs).await;
     let name = "paged-runs";
     let instants = run_instants();
-    let seconds = run_seconds();
     query_with_recorded_runs(&logs, name, &recorded_runs(&instants)).await;
     let whole: Vec<&str> = RUN_IDS.iter().rev().copied().collect();
 
@@ -757,8 +753,8 @@ async fn the_history_is_paged_by_max_results_and_resumed_by_its_token() {
         loop {
             let mut request = json!({
                 "identifier": name,
-                "startTime": seconds[0],
-                "endTime": seconds[4],
+                "startTime": instants[0],
+                "endTime": instants[4],
                 "maxResults": page_size,
             });
             if let Some(token) = &token {
@@ -803,7 +799,6 @@ async fn a_read_of_the_history_refuses_what_it_cannot_answer() {
     seed_events(&logs).await;
     let name = "refused-reads";
     let instants = run_instants();
-    let seconds = run_seconds();
     query_with_recorded_runs(&logs, name, &recorded_runs(&instants)).await;
     let (start_time, end_time) = whole_window();
 
@@ -861,8 +856,8 @@ async fn a_read_of_the_history_refuses_what_it_cannot_answer() {
             HISTORY,
             &json!({
                 "identifier": name,
-                "startTime": seconds[0],
-                "endTime": seconds[4],
+                "startTime": instants[0],
+                "endTime": instants[4],
                 "maxResults": 1,
             }),
         )

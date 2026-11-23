@@ -117,7 +117,7 @@ async fn history(logs: &Logs, name: &str) -> Vec<Value> {
             &json!({
                 "identifier": name,
                 "startTime": 0,
-                "endTime": now_ms() / 1_000 + 24 * 60 * 60,
+                "endTime": now_ms() + 24 * 60 * 60 * 1_000,
             }),
         )
         .await;

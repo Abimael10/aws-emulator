@@ -56,14 +56,17 @@
 //! most [`MAX_RUNS_PER_READ`] runs, each spending the same bounded budget every Insights run
 //! spends; and each run lands once — a second read of the same execution re-runs nothing.
 //!
-//! WHICH UNIT the instants are stated in follows the members themselves: a scheduled query's
-//! schedule window (`scheduleStartTime`, `scheduleEndTime`) and its history's window and
-//! `triggeredTimestamp` are all stated "in Unix epoch format", which on this surface is the
-//! epoch SECONDS its windows and offsets are stated in (`startTimeOffset`, `endTimeOffset`,
-//! `StartQuery$startTime`) — while the instants of the RESOURCE (`creationTime`,
-//! `lastUpdatedTime`, `lastTriggeredTime`) are the epoch milliseconds every record of this
-//! service keeps. The store keeps every instant in milliseconds and converts at the edge
-//! ([`ScheduledQueryExecution::triggered_secs`], [`schedule_instant_ms`]).
+//! WHICH UNIT the instants are stated in follows each member's own documentation: an epoch
+//! instant of this service is stated in MILLISECONDS unless the member itself says it is a
+//! number of seconds. A scheduled query's schedule window (`scheduleStartTime`,
+//! `scheduleEndTime`) and its history's window and `triggeredTimestamp` say only "in Unix
+//! epoch format", so they carry the milliseconds the instants of the RESOURCE (`creationTime`,
+//! `lastUpdatedTime`, `lastTriggeredTime`) and every other record of this service carry —
+//! which is the unit the store keeps them in, so nothing is converted at that edge. Only a
+//! member that states a number of seconds is seconds: the lookback OFFSETS (`startTimeOffset`,
+//! `endTimeOffset`) and the window of the query a run starts (`StartQuery$startTime`,
+//! "specified as epoch time, the number of seconds since January 1, 1970"), which is what
+//! [`execution_window_secs`] converts into.
 
 use ::std::sync::Arc;
 
@@ -154,9 +157,8 @@ pub struct ScheduledQueryExecution {
     /// this run's own rows under it.
     pub query_id: String,
     /// `TriggerHistoryRecord$triggeredTimestamp` — "The timestamp when the scheduled query
-    /// execution was triggered". Kept in the epoch MILLISECONDS the run's own query is created
-    /// at; the history reports it in the epoch seconds that surface states its instants in
-    /// ([`Self::triggered_secs`]).
+    /// execution was triggered". Kept — and reported — in the epoch MILLISECONDS this service
+    /// states an epoch instant in, which is the unit the run's own query is created at.
     pub triggered_ms: i64,
     /// `TriggerHistoryRecord$executionStatus` — "The execution status of the scheduled query
     /// run", one of the [`EXECUTION_STATUS_RUNNING`] family.
@@ -198,14 +200,6 @@ impl ScheduledQueryExecution {
         }
     }
 
-    /// The instant this run was triggered, in the epoch SECONDS this operation states its
-    /// instants in: `triggeredTimestamp`, and the `startTime`/`endTime` of the window a read
-    /// selects by, are "in Unix epoch format" — the unit this same surface states every window
-    /// and offset of a query in (`startTimeOffset`, `endTimeOffset`, `StartQuery$startTime`).
-    pub fn triggered_secs(&self) -> i64 {
-        self.triggered_ms.div_euclid(MILLIS_PER_SECOND)
-    }
-
     /// This execution as the model's `TriggerHistoryRecord`, which is what
     /// `GetScheduledQueryHistory` reports — so one stored execution renders the same way
     /// through any reader of it.
@@ -213,7 +207,7 @@ impl ScheduledQueryExecution {
         TriggerHistoryRecord {
             query_id: Some(self.query_id.clone()),
             execution_status: Some(self.status.clone()),
-            triggered_timestamp: Some(self.triggered_secs()),
+            triggered_timestamp: Some(self.triggered_ms),
             error_message: self.error_message.clone(),
             // A query configured with no destination delivers to none, so the member is
             // reported by nothing rather than as an empty list.
@@ -349,9 +343,9 @@ impl ScheduledQueryRecord {
 /// query the SERVICE manages rather than one this store runs
 /// ([`super::log_alarm_queries`]), so none of them has an instant due here.
 ///
-/// The two ends of the schedule window are the caller's own "Unix epoch format" instants, so
-/// they are read in the epoch SECONDS this surface states its instants in
-/// ([`ScheduledQueryExecution::triggered_secs`]).
+/// The two ends of the schedule window are the caller's own "Unix epoch format" instants,
+/// which state no number of seconds and so are read in the epoch MILLISECONDS this service
+/// states an epoch instant in — the very unit the store keeps its clock in.
 fn due_instants(record: &ScheduledQueryRecord, now_ms: i64) -> Vec<i64> {
     let Some(created_ms) = record.creation_time_ms else {
         return Vec::new();
@@ -362,10 +356,11 @@ fn due_instants(record: &ScheduledQueryRecord, now_ms: i64) -> Vec<i64> {
     let Some(schedule) = super::schedule_of(&record.schedule_expression) else {
         return Vec::new();
     };
-    let eligible_from = schedule_instant_ms(record.schedule_start_time)
+    let eligible_from = record
+        .schedule_start_time
         .unwrap_or(created_ms)
         .max(created_ms);
-    let stops_after = schedule_instant_ms(record.schedule_end_time);
+    let stops_after = record.schedule_end_time;
     let timezone = record.timezone.as_deref();
     let mut candidate = match record.last_triggered_time_ms {
         // Every run after the first falls at the next instant the schedule names after the
@@ -425,17 +420,10 @@ fn execution_window_secs(
     (start_ms / MILLIS_PER_SECOND, end_ms / MILLIS_PER_SECOND)
 }
 
-/// The milliseconds one second holds, the conversion between the epoch seconds this surface
-/// states a scheduled query's windows and instants in and the epoch milliseconds the store
-/// keeps them in.
+/// The milliseconds one second holds, the conversion between the epoch milliseconds this
+/// service states an instant in and the SECONDS the members that say so are stated in — a
+/// query's lookback offsets and the window of the query one run starts.
 const MILLIS_PER_SECOND: i64 = 1_000;
-
-/// One end of a scheduled query's schedule window as an instant of the store's clock:
-/// `scheduleStartTime` and `scheduleEndTime` are stated "in Unix epoch format", the epoch
-/// seconds this surface states its instants in, so the stored value is read as seconds.
-fn schedule_instant_ms(stated: Option<i64>) -> Option<i64> {
-    stated.map(|seconds| seconds.saturating_mul(MILLIS_PER_SECOND))
-}
 
 impl State {
     /// Materialise the executions the clock has ALREADY made due for the scheduled query
