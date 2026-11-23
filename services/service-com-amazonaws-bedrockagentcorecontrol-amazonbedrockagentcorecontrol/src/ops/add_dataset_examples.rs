@@ -195,7 +195,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // source turns out to hold. The guard is released before the source is
         // read, so a read of the caller's object storage cannot hold the store.
         let schema_type = {
-            let store = state.lock();
+            let mut store = state.lock();
+
+            // A dataset whose deletion the clock has already made due is gone
+            // before this write looks for it, so a request naming it is the
+            // modelled 404 rather than an add onto a record on its way out.
+            store.expire_deleted_datasets(arrived);
 
             // A replayed request carrying the same `clientToken` answers with
             // the examples that token first added to THIS dataset, rather than
@@ -243,6 +248,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+
+        // Swept again at the instant the write happens, for the same reason the
+        // dataset is resolved again below: the span the deletion of this dataset
+        // owed could have passed while this request was reading its source.
+        store.expire_deleted_datasets(now);
 
         // Resolved a second time: the dataset could have been deleted, or
         // another write could have started on it, while this request was

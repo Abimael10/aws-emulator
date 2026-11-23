@@ -214,6 +214,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
+        // A dataset whose deletion the clock has already made due is gone before
+        // this create looks at the names this account holds, so the name it
+        // reserved is free again and a create carrying it is not a conflict.
+        store.expire_deleted_datasets(now);
+
         // A replayed request carrying the same `clientToken` answers with the
         // dataset that token first produced, rather than minting a second one:
         // "If this token matches a previous request, the service ignores the

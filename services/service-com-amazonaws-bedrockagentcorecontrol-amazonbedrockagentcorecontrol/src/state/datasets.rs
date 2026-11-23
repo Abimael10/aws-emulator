@@ -28,6 +28,18 @@
 //! entered ([`DatasetExampleRecord`]), because an example is addressed by that
 //! id once it is stored: the add answers the ids it minted, and a later update
 //! or delete names them.
+//!
+//! A DELETION is held here too, as the instant the clock owes it rather than as
+//! a removal the call performs: `DeleteDataset` is asynchronous, so the dataset
+//! reports `DELETING` for one span ([`DATASET_REMOVAL_DELAY`]) and what the
+//! request named — the whole record, or the one version it carried — is gone
+//! from the instant that span passes
+//! ([`super::ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState::expire_deleted_datasets`]).
+//! Nothing sleeps for it, and what a caller observes in that window is the
+//! point: a dataset still readable and reporting `DELETING`, the writes that
+//! status blocks refused as conflicts, and the modelled 404 only once the
+//! removal is due — because that is how a client tells "busy, retry later" from
+//! "gone, stop".
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, SystemTime};
@@ -38,7 +50,8 @@ use ::serde_json::Value;
 use crate::ops::types::{
     AddDatasetExamplesOutput, ConflictException, CreateDatasetInput, CreateDatasetOutput,
     CreateDatasetVersionOutput, DataSourceType, DatasetSummary, DatasetVersionSummary,
-    GetDatasetOutput, ResourceNotFoundException, UpdateDatasetOutput, ValidationException,
+    DeleteDatasetOutput, GetDatasetOutput, ResourceNotFoundException, UpdateDatasetOutput,
+    ValidationException,
 };
 
 use super::{sorted_map, timestamp, VALIDATION_REASON_FIELD_VALIDATION_FAILED};
@@ -133,6 +146,20 @@ pub const DATASET_VERSION_DRAFT: &str = "DRAFT";
 /// straight after the call still observes the transient status, short enough to
 /// keep a client script quick.
 pub const DATASET_SETTLE_DELAY: Duration = Duration::from_secs(3);
+
+/// How long an ACCEPTED dataset deletion stays under way: the span the dataset
+/// reports `DELETING` for before the clock owes the removal of what the request
+/// named — the whole dataset, or the one version it asked for.
+///
+/// `DeleteDataset` answers 202 carrying `status`, so the deletion is accepted
+/// rather than carried out by the call: "Deletes a dataset version or an entire
+/// dataset asynchronously" (`smithy_query doc shape=DeleteDataset`). AWS
+/// documents no duration for it, so the span is the one every other transition
+/// of this resource takes ([`DATASET_SETTLE_DELAY`]), which is long enough that
+/// a caller reading the dataset straight after the delete still observes
+/// `DELETING` — where "read operations are still allowed"
+/// (`smithy_query shape=DatasetStatus`) — and the writes it blocks.
+pub const DATASET_REMOVAL_DELAY: Duration = DATASET_SETTLE_DELAY;
 
 /// How many datasets this emulator will hold.
 ///
@@ -661,10 +688,25 @@ pub struct DatasetRecord {
     /// Why the settled status is a failure state, for a dataset whose ingestion
     /// failed; `None` for one that ingested its source.
     pub failure_reason: Option<String>,
+    /// When the clock owes the removal of this dataset RECORD, for a dataset
+    /// whose whole deletion has been accepted; `None` for one no delete has been
+    /// asked of. Stored, never slept on, exactly as [`Self::settles_at`] is.
+    pub removal_due_at: Option<SystemTime>,
+    /// The versions a delete has been accepted for, each under the instant the
+    /// clock owes its removal: the `DatasetVersion` the request named, so
+    /// `DRAFT` (the working copy, whose EXAMPLES go) and a published version
+    /// number are recorded the same way. A version in here is still reported
+    /// until that instant — a deletion under way is not a deletion done.
+    deleting_versions: BTreeMap<String, SystemTime>,
     /// Every version published from the working copy, in the order they were
     /// published. Grown only through [`Self::publish_version`], which caps it at
     /// [`MAX_VERSIONS_PER_DATASET`].
     versions: Vec<DatasetVersionRecord>,
+    /// The number the next published version carries. Counted rather than
+    /// derived from how many versions the dataset still holds, so a version
+    /// `DeleteDataset` removed does not let the next publication re-use its
+    /// number: a `datasetVersion` addresses one snapshot for good.
+    next_version: u32,
     /// Whether the working copy holds changes no published version reflects,
     /// which is what `draftStatus` reports. True for a dataset no version has
     /// been published from, false from the instant one is.
@@ -717,7 +759,10 @@ impl DatasetRecord {
             settled_status,
             settles_at: now + DATASET_SETTLE_DELAY,
             failure_reason,
+            removal_due_at: None,
+            deleting_versions: BTreeMap::new(),
             versions: Vec::new(),
+            next_version: 1,
             draft_modified: true,
             next_example_seq: 0,
         };
@@ -802,8 +847,10 @@ impl DatasetRecord {
         if self.versions.len() >= MAX_VERSIONS_PER_DATASET {
             return None;
         }
-        // Versions are numbered from one, in publication order.
-        let version = u32::try_from(self.versions.len() + 1).unwrap_or(u32::MAX);
+        // Versions are numbered from one, in publication order, and a number is
+        // never re-used after the version carrying it is deleted.
+        let version = self.next_version;
+        self.next_version = self.next_version.saturating_add(1);
         self.versions.push(DatasetVersionRecord {
             version,
             examples: self.draft_examples.clone(),
@@ -817,6 +864,118 @@ impl DatasetRecord {
         // The publication succeeded, so nothing of an earlier failure is owed.
         self.failure_reason = None;
         Some(version)
+    }
+
+    /// Whether this dataset's own deletion has been accepted and is still under
+    /// way: it reports `DELETING`, and the clock owes the removal of the record.
+    pub fn is_deleting(&self) -> bool {
+        self.removal_due_at.is_some()
+    }
+
+    /// Accept the deletion of the WHOLE dataset at `now`: "if `datasetVersion`
+    /// is absent, deletes all versions and the dataset record itself"
+    /// (`smithy_query doc shape=DeleteDataset`).
+    ///
+    /// The deletion is asynchronous, so this call only accepts it: the dataset
+    /// reports `DELETING` from this instant on — where "read operations are
+    /// still allowed" — and the clock owes the removal of the record, with every
+    /// version published from it, one span later
+    /// ([`DATASET_REMOVAL_DELAY`]). Nothing sleeps for it: the instant is stored
+    /// and a later call materialises what it made due
+    /// ([`super::ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState::expire_deleted_datasets`]).
+    ///
+    /// `DeleteDataset` is `@idempotent`, so a repeat while the deletion is still
+    /// under way leaves the instant it is owed alone rather than pushing the
+    /// removal further out.
+    pub fn accept_deletion(&mut self, now: SystemTime) {
+        if self.is_deleting() {
+            return;
+        }
+        self.transient_status = DATASET_STATUS_DELETING.to_string();
+        self.settled_status = DATASET_STATUS_DELETING.to_string();
+        self.settles_at = now;
+        self.removal_due_at = Some(now + DATASET_REMOVAL_DELAY);
+        // The deletion was accepted, so nothing of an earlier failure is owed.
+        self.failure_reason = None;
+        self.updated_at = now;
+    }
+
+    /// Whether the deletion of the version `label` names has already been
+    /// accepted and is still under way.
+    pub fn version_deletion_accepted(&self, label: &str) -> bool {
+        self.deleting_versions.contains_key(label)
+    }
+
+    /// Accept the deletion of ONE version at `now`: "if provided, deletes only
+    /// that specific version" — the dataset record and every other version it
+    /// holds stay.
+    ///
+    /// Asynchronous like the whole-dataset deletion and owed by the same clock:
+    /// the dataset reports `DELETING` until the span passes, the version it
+    /// named is still readable for exactly that long, and the status it was
+    /// already settled in is what it reports from then on — a version deleted
+    /// out of a dataset whose own ingestion or last mutation FAILED leaves that
+    /// failure, and the reason it carries, exactly as they were.
+    ///
+    /// Idempotent for the same reason [`Self::accept_deletion`] is: a repeat
+    /// naming the version a deletion is already under way for does not re-arm
+    /// the clock.
+    pub fn accept_version_deletion(&mut self, label: &str, now: SystemTime) {
+        if self.version_deletion_accepted(label) {
+            return;
+        }
+        let due_at = now + DATASET_REMOVAL_DELAY;
+        self.deleting_versions.insert(label.to_string(), due_at);
+        self.transient_status = DATASET_STATUS_DELETING.to_string();
+        self.settles_at = due_at;
+        self.updated_at = now;
+    }
+
+    /// Carry out every version deletion of this dataset the clock has already
+    /// made due, which was owed at that instant whether or not anybody called.
+    ///
+    /// A published version is gone from the dataset's history. The `DRAFT` is
+    /// the working copy, which exists for as long as the dataset record does
+    /// ("if absent, defaults to DRAFT" is how every dataset route addresses it),
+    /// so what a delete naming it removes is the examples it holds — leaving a
+    /// working copy whose content no published version reflects.
+    pub fn expire_deleted_versions(&mut self, now: SystemTime) {
+        let due: Vec<String> = self
+            .deleting_versions
+            .iter()
+            .filter(|(_, due_at)| now >= **due_at)
+            .map(|(label, _)| label.clone())
+            .collect();
+        for label in due {
+            self.deleting_versions.remove(&label);
+            if label == DATASET_VERSION_DRAFT {
+                let held_examples = !self.draft_examples.is_empty();
+                self.draft_examples.clear();
+                self.draft_modified = self.draft_modified || held_examples;
+                continue;
+            }
+            // `DatasetVersion` is `^(DRAFT|[0-9]+)$`, so every other label a
+            // request can carry is a published version number.
+            if let Ok(version) = label.parse::<u32>() {
+                self.versions
+                    .retain(|published| published.version != version);
+            }
+        }
+    }
+
+    /// What the delete of `version` of this dataset reports: the five members
+    /// `DeleteDatasetResponse` declares, every one of them off the record this
+    /// delete just wrote, so the status it answers is the one a read of the
+    /// dataset reports and `updatedAt` is "the timestamp when the delete was
+    /// initiated".
+    pub fn delete_output(&self, version: &str, now: SystemTime) -> DeleteDatasetOutput {
+        DeleteDatasetOutput {
+            dataset_arn: self.dataset_arn.clone(),
+            dataset_id: self.dataset_id.clone(),
+            status: self.status_at(now).to_string(),
+            dataset_version: version.to_string(),
+            updated_at: timestamp(self.updated_at),
+        }
     }
 
     /// Append `examples` to the DRAFT working copy, answering the `ExampleId`
@@ -1058,6 +1217,35 @@ impl super::ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolStat
             if !self.datasets.contains_key(&candidate) {
                 return candidate;
             }
+        }
+    }
+
+    /// Carry out every dataset deletion the clock has already made due: the
+    /// datasets whose whole record is owed removal — with the name each of them
+    /// reserved, which is free again from that instant — and, on the datasets
+    /// that remain, the versions whose own deletion is owed
+    /// ([`DatasetRecord::expire_deleted_versions`]).
+    ///
+    /// `DeleteDataset` ACCEPTS the deletion (202) and reports the dataset
+    /// `DELETING`; what it asked to remove goes when the span it owes passes, so
+    /// a caller polling the dataset sees `DELETING` and then the modelled 404.
+    /// The removal is owed by the CLOCK — it was due at this instant whether or
+    /// not anybody called — so every operation that reaches the dataset plane
+    /// materialises it before reading, and nothing ever sleeps for it.
+    pub fn expire_deleted_datasets(&mut self, now: SystemTime) {
+        let due: Vec<String> = self
+            .datasets
+            .iter()
+            .filter(|(_, record)| record.removal_due_at.is_some_and(|at| now >= at))
+            .map(|(dataset_id, _)| dataset_id.clone())
+            .collect();
+        for dataset_id in due {
+            if let Some(record) = self.datasets.remove(&dataset_id) {
+                self.dataset_names.remove(&record.dataset_name);
+            }
+        }
+        for record in self.datasets.values_mut() {
+            record.expire_deleted_versions(now);
         }
     }
 

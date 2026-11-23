@@ -177,6 +177,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
+        // A dataset whose deletion the clock has already made due is gone before
+        // this write looks for it, so a request naming it is the modelled 404
+        // rather than an update of a record on its way out.
+        store.expire_deleted_datasets(now);
+
         // A replayed request carrying the same `clientToken` answers with the
         // dataset that token first updated, rather than applying a second
         // update: "If this token matches a previous request, the service ignores

@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDataset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDataset`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDataset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ACCEPTS the deletion of a dataset, or of ONE version of it, and records it in
+//! [`crate::state`] as the instant the clock owes it: "deletes a dataset version or an
+//! entire dataset asynchronously. If `datasetVersion` is absent, deletes all versions and
+//! the dataset record itself. If provided, deletes only that specific version."
+//!
+//! So the call reports `DELETING` — the status in which "read operations are still
+//! allowed" — and what it named is gone from the instant the span passes: the record and
+//! its whole version history for a request carrying no version, that one snapshot for a
+//! request naming a published version, and the working copy's examples for one naming
+//! `DRAFT`, which exists for as long as the dataset record does. Nothing sleeps for it,
+//! and a caller polling the dataset sees `DELETING` and then the modelled 404.
+//!
+//! `@idempotent`, so a repeat while the deletion is still under way reports that same
+//! deletion instead of re-arming the clock or refusing the call. A dataset BUSY with
+//! another operation — `CREATING` or `UPDATING`, in both of which "all writes are
+//! blocked" — conflicts, because a delete is the strongest write of all.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +174,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDataset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDatasetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDataset"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteDatasetErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the dataset store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A dataset, or a version of one, whose own earlier deletion the clock
+        // has already made due is gone before this call looks for it, so a
+        // repeat past the span is the modelled 404 rather than a second
+        // acceptance.
+        store.expire_deleted_datasets(now);
+
+        let record = store.datasets.get_mut(&input.dataset_id).ok_or_else(|| {
+            DeleteDatasetErrorModeled::ResourceNotFoundException(crate::state::dataset_not_found())
+        })?;
+
+        // "Optional version to delete. If absent, deletes the entire dataset. If
+        // provided, deletes only that specific version." Every spelling
+        // `DatasetVersion` admits beside `DRAFT` is a PUBLISHED version number,
+        // which names a version `CreateDatasetVersion` published from this
+        // dataset, so a number no published version of it carries is the
+        // modelled 404 — the same resolution `GetDataset` performs.
+        let requested = input.dataset_version.as_deref();
+        if let Some(version) = requested.filter(|v| *v != crate::state::DATASET_VERSION_DRAFT) {
+            // The member's pattern admits only `DRAFT` or digits, so anything
+            // else was already refused before this handler ran.
+            let published = version
+                .parse::<u32>()
+                .ok()
+                .and_then(|version| record.version(version));
+            if published.is_none() {
+                return Err(DeleteDatasetErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(crate::state::RESOURCE_DATASET_VERSION),
+                )
+                .into());
+            }
+        }
+
+        // The version this response reports as deleted: the one the request
+        // named, or the working copy every dataset route resolves to when a
+        // request names none — which is what a delete of the whole record takes
+        // with it.
+        let reported_version = requested
+            .unwrap_or(crate::state::DATASET_VERSION_DRAFT)
+            .to_string();
+
+        // `@idempotent`: a repeat of THIS deletion while it is still under way
+        // reports that same deletion rather than re-arming the clock or
+        // conflicting with itself. Which deletion a request asks for is decided
+        // by its shape and not by the version it reports: a request carrying no
+        // version asks for the whole record, which only the whole record's own
+        // deletion answers for. A dataset whose WHOLE deletion is under way is
+        // taking every version with it, so a request naming one of them is
+        // answered by that deletion.
+        let already_under_way = match requested {
+            None => record.is_deleting(),
+            Some(version) => record.is_deleting() || record.version_deletion_accepted(version),
+        };
+        if already_under_way {
+            return Ok(record.delete_output(&reported_version, now));
+        }
+
+        // A dataset whose own ingestion or last mutation is still in flight
+        // blocks every write: "all writes are blocked" while it is `CREATING` or
+        // `UPDATING`, so the request conflicts with the operation already
+        // running on it rather than removing what that one is writing.
+        let status = record.status_at(now).to_string();
+        if crate::state::dataset_blocks_writes(&status) {
+            return Err(DeleteDatasetErrorModeled::ConflictException(
+                crate::state::dataset_status_conflict(&status),
+            )
+            .into());
+        }
+
+        // The deletion is ACCEPTED here (202) and the dataset reports
+        // `DELETING`; what the request named goes when the span the clock owes
+        // passes.
+        match requested {
+            None => record.accept_deletion(now),
+            Some(version) => record.accept_version_deletion(version, now),
+        }
+
+        Ok(record.delete_output(&reported_version, now))
     }
 }

@@ -190,7 +190,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let now = ::std::time::SystemTime::now();
-        let store = state.lock();
+        let mut store = state.lock();
+
+        // A dataset whose deletion the clock has already made due is gone before
+        // this read looks for it, and so is a version whose own deletion is due:
+        // the removal was owed at this instant whether or not anybody called, so
+        // a caller polling the dataset sees `DELETING` and then the modelled 404.
+        store.expire_deleted_datasets(now);
 
         // The store is keyed by the `datasetId` the create minted; an id naming
         // no stored dataset is the modelled 404 rather than an empty envelope.

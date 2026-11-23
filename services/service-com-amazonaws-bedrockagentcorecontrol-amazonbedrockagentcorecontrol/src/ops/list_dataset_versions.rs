@@ -151,7 +151,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the dataset store is unavailable".to_string()),
             })
         })?;
-        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A dataset, or a version of one, whose deletion the clock has already
+        // made due is gone before this listing reads the version history, so a
+        // deleted version is not reported as one the dataset still holds.
+        store.expire_deleted_datasets(now);
 
         // A version is addressed through the dataset it was published from, so
         // an id naming no stored dataset is the modelled 404 rather than an
