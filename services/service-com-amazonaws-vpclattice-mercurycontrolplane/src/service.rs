@@ -39,6 +39,15 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! Beside the modelled operations this service serves ONE request no routing key names: a
+//! service's OWN TRAFFIC, sent to the name `CreateService` published for it. That is the
+//! DATA plane ([`data_plane`]), claimed in [`EmulatedService::can_handle`] and served from
+//! [`EmulatedService::override_operation`], which is what hands it the in-process transport a
+//! `forward` to a `LAMBDA` target group invokes the function over ([`lambda_target`]).
+
+pub mod data_plane;
+mod lambda_target;
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
@@ -100,6 +109,11 @@ fn stated_refusal(refusal: &Refusal) -> Option<Refused> {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The shared engine, for the one request this service serves that names no modelled
+    /// operation: a lattice service's own traffic ([`data_plane`]).
+    engine: Arc<Eng>,
+    /// That traffic's plane, mounted as the operation it is served by.
+    data_plane: data_plane::DataPlane<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -108,7 +122,9 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            data_plane: data_plane::DataPlane::new(Arc::clone(&engine)),
+            engine,
         }
     }
 }
@@ -126,8 +142,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // name. Edit this for anything the model does not express — a signing
         // name shared by several services, or access-key-id-based routing.
         match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
+            Some(key) if key == self.entry.identity().signing_name() => true,
+            // And a SERVICE's own traffic: a request addressed to a service this crate holds
+            // a record for ([`data_plane::claims_parts`]). Such a request names no modelled
+            // operation and carries no credential scope naming this service — its host is the
+            // service's own published DNS name, whose first label names no service of AWS — so
+            // the front door could resolve no target service for it and answered
+            // `404 UnknownService`, for the one address this service told the caller to use.
+            //
+            // The claim is narrowed to a service this crate HOLDS, read from the one shared
+            // store, rather than to a host or a path shape alone, so one request keeps one
+            // claimant.
+            _ => data_plane::claims_parts(&*self.engine, parts),
         }
     }
 
@@ -139,7 +165,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // correctly; `None` (the default) lets the generated routing table resolve
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
+        //
+        // The one request served from here is a lattice SERVICE's own traffic, which names no
+        // modelled operation by construction: no modelled operation is bound at a service's
+        // own request path. It is decided by the SAME rule the claim above used
+        // ([`data_plane::DataPlane::claims`]), so the claim and the serving cannot disagree,
+        // and every other request resolves through the generated routing table.
+        if self.data_plane.claims(req) {
+            return Some(&self.data_plane as _);
+        }
         None
     }
 
@@ -163,10 +197,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this when a request reached this service but named no
         // modeled operation — neither `override_operation` nor the generated
-        // routing table resolved it. Returning `None` renders the protocol-correct
-        // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
+        // routing table resolved it. A lattice service's own traffic is served through
+        // `override_operation` instead ([`data_plane::DataPlane`]), which is what hands that
+        // plane the in-process transport a `forward` to a `LAMBDA` target group invokes the
+        // function over.
+        //
+        // Anything else keeps the protocol-correct default for this service's envelope
+        // (rest -> 501) by returning `None`.
         let _ = req;
         None
     }

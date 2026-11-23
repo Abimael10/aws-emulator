@@ -396,6 +396,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // carry the rule — its output models no rule member — so nothing here is read off
         // the request.
         store.insert_default_rule(&record, &region, now);
+        // The addresses this listener answers at, published for a client of this emulator that
+        // holds the service's own DNS name ([`crate::state::published_listener_addresses`]):
+        // the record is held under the listener's id and withdrawn with the listener itself.
+        let addresses = crate::state::published_listener_addresses(
+            &*self.engine,
+            ctx,
+            &service,
+            &record,
+        );
+        store.data_plane_addresses.insert(id.clone(), addresses);
         store.listeners.insert(id.clone(), record);
         let stored = store
             .listeners

@@ -32,9 +32,14 @@
 //!    `ResourceNotFoundException` — including a listener read through the wrong
 //!    service — and a name the modelled pattern forbids is a 400 `ValidationException`.
 //! 8. Deleting the service deletes its listeners, as `DeleteService` documents.
+//! 9. A listener SERVES the traffic a client sends to the name its service published: the
+//!    request is matched against the listener's rules in priority order, the default rule
+//!    answers what no other rule matches, and a `forward` to a `LAMBDA` target group invokes
+//!    the registered function and answers the client from what it returned. A service no VPC
+//!    association puts a client in a position to reach is served by nothing.
 
 use crate::vpclattice_service_slice::{
-    as_label, expected_arn, is_lattice_id, is_timestamp, Answer, Lattice,
+    as_label, expected_arn, is_lattice_id, is_timestamp, Answer, Fetched, Lattice, REGION,
 };
 
 /// A target-group identifier of the shape `TargetGroupIdentifier` demands
@@ -887,5 +892,527 @@ async fn deleting_a_service_deletes_its_listeners() {
         still_there.status, 200,
         "case the surviving service's listener: expected 200, got {} / {}",
         still_there.status, still_there.body
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Rule 9: a listener SERVES the traffic a client sends to the name its service published.
+// ---------------------------------------------------------------------------------------
+
+/// The runtime the target function is created for, and the module and attribute its package
+/// carries the handler as.
+const TARGET_RUNTIME: &str = "python3.12";
+const TARGET_HANDLER: &str = "lambda_function.lambda_handler";
+
+/// A well-formed execution role ARN, satisfying Lambda's `RoleArn` pattern. No IAM is mounted
+/// in this test target, so nothing is known about it and nothing is refused for it.
+const TARGET_ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambda-exec";
+
+/// The body the well-formed answer carries, which is the FUNCTION's own: it can only reach the
+/// client if the function ran and its response was passed on.
+const TARGET_BODY: &str = "short and stout";
+
+/// How long a case is given for work another component's clock owes before it is a failure,
+/// and how long one look-again cycle pauses.
+///
+/// Generous on purpose: every span crossed here is a stored due instant and nothing sleeps for
+/// one, so a case LOOKS AGAIN until the condition holds. All the deadline is for is that a
+/// move which never comes fails instead of hanging; nothing asserts on elapsed time.
+const DATA_PLANE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+const LOOK_AGAIN: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// The handler the target function runs. It decides what to return from the PATH the event
+/// carries — one package serves every row, which is what the rule generalises over — and
+/// echoes the event back for the row that reads it, so what the client is answered with is
+/// computed from the request the plane handed the function.
+const TARGET_SOURCE: &str = r#"
+import json
+
+
+def lambda_handler(event, context):
+    path = event.get("raw_path") or "/"
+    if path == "/teapot":
+        return {"statusCode": 418, "body": "short and stout"}
+    if path == "/broken":
+        return {"body": "no status at all"}
+    return {
+        "statusCode": 200,
+        "headers": {"content-type": "application/json"},
+        "body": json.dumps(
+            {
+                "method": event.get("method"),
+                "raw_path": path,
+                "query": event.get("query_string_parameters"),
+                "body": event.get("body"),
+                "is_base64_encoded": event.get("is_base64_encoded"),
+                "host": (event.get("headers") or {}).get("host"),
+            }
+        ),
+    }
+"#;
+
+/// A .zip deployment package holding [`TARGET_SOURCE`] as `lambda_function.py`, written in
+/// memory the way a caller uploads one.
+fn target_package() -> Vec<u8> {
+    use std::io::Write as _;
+
+    let mut buffer = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut buffer);
+        let options: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
+        writer
+            .start_file("lambda_function.py", options)
+            .expect("the entry starts");
+        writer
+            .write_all(TARGET_SOURCE.as_bytes())
+            .expect("the entry's bytes");
+        writer.finish().expect("a finished archive");
+    }
+    buffer.into_inner()
+}
+
+/// Create the target function through LAMBDA's own API and answer its ARN, with the activation
+/// span Lambda owes it placed in the past rather than slept for — the same reading every suite
+/// that invokes a freshly created function uses.
+async fn a_target_function(
+    lattice: &Lattice,
+    engine: &std::sync::Arc<engine::InMemoryEngine>,
+    name: &str,
+) -> String {
+    let created = lattice
+        .lambda(
+            "POST",
+            "/2015-03-31/functions",
+            Some(serde_json::json!({
+                "FunctionName": name,
+                "Role": TARGET_ROLE,
+                "Runtime": TARGET_RUNTIME,
+                "Handler": TARGET_HANDLER,
+                "Timeout": 30,
+                "Code": { "ZipFile": ::aws_smithy_types::base64::encode(target_package()) },
+            })),
+        )
+        .await;
+    assert_eq!(
+        created.status, 201,
+        "setup CreateFunction: expected 201, got {} / {}",
+        created.status, created.body
+    );
+    let arn = created.str_field("FunctionArn");
+    let state = engine.state::<
+        service_com_amazonaws_lambda_awsgirapiservice::state::ComAmazonawsLambdaAwsgirapiserviceState,
+    >();
+    let mut store = state.lock();
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
+    for record in store.functions.values_mut() {
+        record.active_due = past;
+    }
+    arn
+}
+
+/// Look again until `read` reports the resource at `path` as `ACTIVE`, or the deadline passes.
+///
+/// Every status this waits out is a stored due instant the clock owes
+/// (`crate::state::CREATE_TRANSITION`), so nothing is slept for and no assertion is made about
+/// how long it took.
+async fn settled_active(lattice: &Lattice, case: &str, path: &str) {
+    let deadline = std::time::Instant::now() + DATA_PLANE_DEADLINE;
+    loop {
+        let read = lattice.call("GET", path, None).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: expected the read of {path} to be served, got {} / {}",
+            read.status, read.body
+        );
+        if read.body["status"].as_str() == Some("ACTIVE") {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: {path} never reported ACTIVE, last read {}",
+            read.body
+        );
+        tokio::time::sleep(LOOK_AGAIN).await;
+    }
+}
+
+/// The JSON document the echoing answer carries, which is the event the plane handed the
+/// function.
+fn echoed(case: &str, answered: &Fetched) -> serde_json::Value {
+    serde_json::from_str(&answered.body).unwrap_or_else(|error| {
+        panic!(
+            "case {case:?}: expected the function's own JSON answer, got {} / {:?} ({error})",
+            answered.status, answered.body
+        )
+    })
+}
+
+/// RULE: a request a client sends to the name a service PUBLISHED is served by that service's
+/// listener — matched against its rules in priority order, with the listener's default rule
+/// answering what no other rule matches — and a `forward` to a `LAMBDA` target group is served
+/// by INVOKING the registered function, the client being answered from the object that
+/// function returned while that object satisfies the response contract.
+///
+/// Every case drives the real wire path: an HTTP request through the router to the published
+/// name, carrying no AWS credential, exactly as a client in an associated VPC sends it. The
+/// function is a real deployment package created through Lambda's OWN API and RUN by the
+/// Lambda emulator mounted on this suite's engine, so nothing here is served from a record a
+/// test invented — the body a row asserts on is one only the function can have produced, and
+/// the event it echoes is the one this plane built from the request.
+///
+/// The rows differ along what the rule generalises over: the request (the verb, the path, a
+/// repeated query parameter, a body, a header), which RULE of the listener the request
+/// matches (a path-prefix rule, a header rule, the default rule), what the matched action is
+/// (a `fixedResponse`, a `forward`), the ADDRESSING the client used (the published host, the
+/// reserved data-plane path), and what the function returned (a 200 with a body, another
+/// status, and an object the contract refuses). Two cases bracket the table with what makes
+/// the path servable at all: the VPC association of the service network, and the listener.
+#[tokio::test]
+async fn a_request_to_the_published_name_is_served_by_the_listeners_rules_and_its_lambda_target() {
+    let (lattice, engine) = Lattice::with_lambda();
+    let function_arn = a_target_function(&lattice, &engine, "lattice-target").await;
+
+    // The control plane, through this service's own API: the network, the service and their
+    // association, the `LAMBDA` target group holding the function, and the HTTP:80 listener
+    // whose default action forwards to that group.
+    let network = lattice
+        .create_service_network(serde_json::json!({ "name": "shop-network" }))
+        .await;
+    assert_eq!(
+        network.status, 201,
+        "setup CreateServiceNetwork: expected 201, got {} / {}",
+        network.status, network.body
+    );
+    let network_id = network.str_field("id");
+    let service = lattice
+        .create_service(serde_json::json!({ "name": "shop" }))
+        .await;
+    assert_eq!(
+        service.status, 201,
+        "setup CreateService: expected 201, got {} / {}",
+        service.status, service.body
+    );
+    let service_id = service.str_field("id");
+    let published = service.body["dnsEntry"]["domainName"]
+        .as_str()
+        .unwrap_or_else(|| panic!("setup CreateService: no dnsEntry.domainName in {}", service.body))
+        .to_string();
+    let associated = lattice.associate(&service_id, &network_id).await;
+    assert_eq!(
+        associated.status, 200,
+        "setup CreateServiceNetworkServiceAssociation: expected 200, got {} / {}",
+        associated.status, associated.body
+    );
+
+    let (group_id, _group_arn) =
+        crate::targets::a_target_group(&lattice, "shop-function", "LAMBDA", None).await;
+    let registered =
+        crate::targets::register_targets(&lattice, &group_id, serde_json::json!([{ "id": function_arn }]))
+            .await;
+    assert_eq!(
+        registered.status, 200,
+        "setup RegisterTargets: expected 200, got {} / {}",
+        registered.status, registered.body
+    );
+
+    let listener = create_listener(
+        &lattice,
+        &service_id,
+        serde_json::json!({
+            "name": "http",
+            "protocol": "HTTP",
+            "port": 80,
+            "defaultAction": {
+                "forward": { "targetGroups": [{ "targetGroupIdentifier": group_id }] },
+            },
+        }),
+    )
+    .await;
+    assert_eq!(
+        listener.status, 201,
+        "setup CreateListener: expected 201, got {} / {}",
+        listener.status, listener.body
+    );
+    let listener_id = listener.str_field("id");
+
+    // Two rules of the listener's own, each with a lower priority value than the default rule
+    // and so evaluated before it: one on a path prefix, one on a header.
+    for rule in [
+        serde_json::json!({
+            "name": "private-paths",
+            "priority": 10,
+            "match": { "httpMatch": { "pathMatch": { "match": { "prefix": "/private" } } } },
+            "action": { "fixedResponse": { "statusCode": 404 } },
+        }),
+        serde_json::json!({
+            "name": "shelved-at-the-back",
+            "priority": 20,
+            "match": {
+                "httpMatch": {
+                    "headerMatches": [{ "name": "x-shelf", "match": { "exact": "back" } }],
+                },
+            },
+            "action": { "fixedResponse": { "statusCode": 500 } },
+        }),
+    ] {
+        let created = crate::rules::create_rule(&lattice, &service_id, &listener_id, rule.clone()).await;
+        assert_eq!(
+            created.status, 201,
+            "setup CreateRule {rule}: expected 201, got {} / {}",
+            created.status, created.body
+        );
+    }
+
+    // The `ACTIVE` statuses the clock owes the service and the target group, waited out by
+    // looking again rather than by sleeping for a span.
+    settled_active(&lattice, "the service", &format!("/services/{service_id}")).await;
+    settled_active(&lattice, "the target group", &format!("/targetgroups/{group_id}")).await;
+
+    // Nothing is in a position to reach the service yet: no VPC is associated with its service
+    // network, so no client of the emulated network could have sent this request and the name
+    // is served by nothing.
+    let unreachable = lattice.fetch("GET", &published, "/", "", &[]).await;
+    assert_eq!(
+        unreachable.status, 404,
+        "case \"no VPC associated with the service network\": expected the name to be served by \
+         nothing, got {} with body {:?}",
+        unreachable.status, unreachable.body
+    );
+
+    // The VPC association is what "enables all the resources within that VPC to be clients and
+    // communicate with other services in the service network", so the path is servable from
+    // here on.
+    let vpc = lattice
+        .call(
+            "POST",
+            "/servicenetworkvpcassociations",
+            Some(serde_json::json!({
+                "serviceNetworkIdentifier": network_id,
+                "vpcIdentifier": "vpc-0123456789abcdef0",
+            })),
+        )
+        .await;
+    assert_eq!(
+        vpc.status, 200,
+        "setup CreateServiceNetworkVpcAssociation: expected 200, got {} / {}",
+        vpc.status, vpc.body
+    );
+
+    // The address the listener answers at is published for a client INSIDE this emulator —
+    // the one a Lambda function or another workload of the emulated network holds — under the
+    // very name the control plane announced.
+    let answering = ::service_common::published_data_planes::PublishedPlanes::of(&*engine)
+        .expect("the engine vends the published-plane records")
+        .answering_service(&format!("{published}:80"));
+    assert_eq!(
+        answering.as_deref(),
+        Some("vpc-lattice"),
+        "expected the published name on the listener's port to be recorded as answered by \
+         this service, got {answering:?}"
+    );
+
+    /// What one row of the data-plane table asks of the service, and what the records earn it.
+    struct Row {
+        case: &'static str,
+        verb: &'static str,
+        /// The host the client addressed.
+        host: String,
+        /// The path and query within it, with `SERVICE` standing for the service's own id.
+        target: &'static str,
+        /// The body the client sent.
+        body: &'static str,
+        /// The headers it carried beside its `Host`.
+        headers: Vec<(&'static str, &'static str)>,
+        /// The status the plane must answer with.
+        status: u16,
+        /// The body it must answer with, where the row pins one; a row whose answer is the
+        /// function's own JSON pins none and is read by `echoed` below.
+        expect_body: Option<&'static str>,
+    }
+    let rows = vec![
+        Row {
+            case: "the in-VPC GET the default rule forwards to the Lambda target",
+            verb: "GET",
+            host: published.clone(),
+            target: "/",
+            body: "",
+            headers: Vec::new(),
+            status: 200,
+            expect_body: None,
+        },
+        Row {
+            case: "a POST carrying a query string and a body",
+            verb: "POST",
+            host: published.clone(),
+            target: "/orders?shelf=front&shelf=back",
+            body: "an order",
+            headers: Vec::new(),
+            status: 200,
+            expect_body: None,
+        },
+        Row {
+            case: "the reserved data-plane path of the same service",
+            verb: "GET",
+            host: format!("vpc-lattice.{REGION}.amazonaws.com"),
+            // The addressing this emulator serves a plane under, with the service named in it.
+            target: "/_aws/vpc-lattice/SERVICE/",
+            body: "",
+            headers: Vec::new(),
+            status: 200,
+            expect_body: None,
+        },
+        Row {
+            case: "a path the higher-priority rule owns",
+            verb: "GET",
+            host: published.clone(),
+            target: "/private/ledger",
+            body: "",
+            headers: Vec::new(),
+            status: 404,
+            expect_body: Some(""),
+        },
+        Row {
+            case: "a header the second rule matches on",
+            verb: "GET",
+            host: published.clone(),
+            target: "/",
+            body: "",
+            headers: vec![("x-shelf", "back")],
+            status: 500,
+            expect_body: Some(""),
+        },
+        Row {
+            case: "a header value neither rule matches, which reaches the target",
+            verb: "GET",
+            host: published.clone(),
+            target: "/",
+            body: "",
+            headers: vec![("x-shelf", "front")],
+            status: 200,
+            expect_body: None,
+        },
+        Row {
+            case: "the status the function itself answered",
+            verb: "GET",
+            host: published.clone(),
+            target: "/teapot",
+            body: "",
+            headers: Vec::new(),
+            status: 418,
+            expect_body: Some(TARGET_BODY),
+        },
+        Row {
+            case: "a function answer the response contract refuses",
+            verb: "GET",
+            host: published.clone(),
+            target: "/broken",
+            body: "",
+            headers: Vec::new(),
+            status: 502,
+            expect_body: Some(""),
+        },
+        Row {
+            case: "a host naming no service of this store",
+            verb: "GET",
+            host: "shop-00000000000000000.localhost".to_string(),
+            target: "/",
+            body: "",
+            headers: Vec::new(),
+            status: 404,
+            expect_body: None,
+        },
+    ];
+    for row in rows {
+        let case = row.case;
+        let target = row.target.replace("SERVICE", &service_id);
+        let answered = lattice
+            .fetch(row.verb, &row.host, &target, row.body, &row.headers)
+            .await;
+        assert_eq!(
+            answered.status, row.status,
+            "case {case:?}: expected HTTP {}, got {} with body {:?}",
+            row.status, answered.status, answered.body
+        );
+        if let Some(expected) = row.expect_body {
+            assert_eq!(
+                answered.body, expected,
+                "case {case:?}: expected body {expected:?}, got {:?}",
+                answered.body
+            );
+        }
+        // An answer the PLANE produced carries no body of the function's: a refused response
+        // is never proxied, and neither is one of a rule's fixed responses.
+        if row.status != 200 && row.status != 418 {
+            assert!(
+                !answered.body.contains("raw_path") && !answered.body.contains(TARGET_BODY),
+                "case {case:?}: nothing of the function's answer may be proxied, got {:?}",
+                answered.body
+            );
+        }
+    }
+
+    // The EVENT the function was handed, as the echoing answer reported it: every value read
+    // off the request this plane served.
+    let answered = lattice
+        .fetch(
+            "POST",
+            &published,
+            "/orders?shelf=front&shelf=back",
+            "an order",
+            &[],
+        )
+        .await;
+    assert_eq!(
+        answered.header("content-type"),
+        Some("application/json"),
+        "case \"the echoed event\": expected the function's own media type, got {:?}",
+        answered.headers
+    );
+    let event = echoed("the echoed event", &answered);
+    for (member, expected) in [
+        ("method", serde_json::json!("POST")),
+        ("raw_path", serde_json::json!("/orders")),
+        // The V1 structure's single-valued member carries the LAST value a repeated name was
+        // given.
+        ("query", serde_json::json!({ "shelf": "back" })),
+        ("body", serde_json::json!("an order")),
+        ("is_base64_encoded", serde_json::json!(false)),
+        ("host", serde_json::json!(published.clone())),
+    ] {
+        assert_eq!(
+            event.get(member).cloned().unwrap_or(serde_json::Value::Null),
+            expected,
+            "case \"the echoed event\": expected {member} {expected}, got {event}"
+        );
+    }
+
+    // The listener is what answers the name: with it deleted, nothing of this emulator serves
+    // the published address at all.
+    let deleted = lattice
+        .call(
+            "DELETE",
+            &format!("/services/{service_id}/listeners/{listener_id}"),
+            None,
+        )
+        .await;
+    assert_eq!(
+        deleted.status, 204,
+        "case the listener deleted: expected 204, got {} / {}",
+        deleted.status, deleted.body
+    );
+    let unserved = lattice.fetch("GET", &published, "/", "", &[]).await;
+    assert_eq!(
+        unserved.status, 404,
+        "case the listener deleted: expected the name to be served by nothing, got {} with \
+         body {:?}",
+        unserved.status, unserved.body
+    );
+    let withdrawn = ::service_common::published_data_planes::PublishedPlanes::of(&*engine)
+        .expect("the engine vends the published-plane records")
+        .answering_service(&format!("{published}:80"));
+    assert_eq!(
+        withdrawn, None,
+        "case the listener deleted: expected the published address withdrawn, got \
+         {withdrawn:?}"
     );
 }

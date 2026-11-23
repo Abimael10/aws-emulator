@@ -32,6 +32,11 @@
 //! [`check_auth_policy_document`], [`auth_policy_state`](
 //! ComAmazonawsVpclatticeMercurycontrolplaneState::auth_policy_state)).
 //!
+//! The ADDRESSES a listener of a service answers at, published so a client of this emulator
+//! that holds the service's own DNS name reaches its data plane, live in the
+//! `data_plane_addresses` child module ([`published_listener_addresses`], whose record the
+//! listener's own create keeps on this store).
+//!
 //! Which resource an ARN names it for, where that resource keeps its TAGS and what a tag
 //! write does to them live in the `tags` child module, which the three tag operations
 //! share ([`tag_target`], [`tags_of`](
@@ -41,11 +46,15 @@
 
 mod announced_dns;
 mod auth_policies;
+mod data_plane_addresses;
 mod tags;
 mod targets;
 mod vpc_associations;
 
-pub use announced_dns::{announced_dns_entry, announced_dns_name, AnnouncedService};
+pub use announced_dns::{
+    announced_dns_entry, announced_dns_name, service_label, AnnouncedService,
+};
+pub use data_plane_addresses::{published_listener_addresses, ListenerAddresses};
 pub use auth_policies::{
     auth_policy_target, check_auth_policy_document, AuthPolicy, AUTH_POLICY_MEMBER,
     AUTH_POLICY_STATE_ACTIVE, AUTH_POLICY_STATE_INACTIVE, AUTH_TYPE_AWS_IAM,
@@ -1581,6 +1590,12 @@ pub struct ComAmazonawsVpclatticeMercurycontrolplaneState {
     /// second create under a taken name is a `ConflictException`. One key per stored
     /// resource, so the resource ceilings bound this map too.
     pub name_index: HashMap<String, String>,
+    /// `<listener id>` -> the addresses that listener answers at, as published for a client
+    /// of this emulator that holds the service's own DNS name
+    /// ([`published_listener_addresses`]). One entry per stored listener, written by the
+    /// create that opened the listener and dropped by [`Self::remove_listener`] — which is
+    /// what withdraws the addresses — so the listener ceilings bound this map too.
+    pub data_plane_addresses: HashMap<String, ListenerAddresses>,
     /// `<operation>/<clientToken>` -> the id the first call created, so a retry with the
     /// same `@idempotencyToken` returns that resource instead of creating a second one.
     pub idempotency_tokens: IdempotencyTokens,
@@ -1743,11 +1758,15 @@ impl ComAmazonawsVpclatticeMercurycontrolplaneState {
     /// removed (`None` when no listener is stored under `listener_id`).
     ///
     /// Its rules go with it (a rule is a resource OF its listener), its name leaves the
-    /// name index so the name and its port are free again, and no `clientToken` record
-    /// outlives the resource it created.
+    /// name index so the name and its port are free again, the addresses it answered at are
+    /// withdrawn ([`published_listener_addresses`]), and no `clientToken` record outlives the
+    /// resource it created.
     pub fn remove_listener(&mut self, listener_id: &str) -> Option<Listener> {
         let removed = self.listeners.remove(listener_id)?;
         self.remove_rules_of(&removed.id);
+        // Dropping the record withdraws the addresses this listener answered at, so nothing is
+        // left recorded as answering for a listener that is gone.
+        self.data_plane_addresses.remove(&removed.id);
         self.name_index
             .remove(&listener_name_key(&removed.service_id, &removed.name));
         self.idempotency_tokens.forget_resource(&removed.id);

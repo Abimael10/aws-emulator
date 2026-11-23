@@ -132,7 +132,7 @@ pub fn announced_dns_entry(
 /// Both members are already drawn from the characters a label carries (`ServiceName` is
 /// `[a-z0-9-]`, `ServiceId` is `svc-[0-9a-z]{17}`), so folding leaves them as they are;
 /// the fold is what keeps the announced value a DNS name whatever a record holds.
-fn service_label(name: &str, id: &str) -> String {
+pub fn service_label(name: &str, id: &str) -> String {
     let distinguisher = id.strip_prefix(super::PREFIX_SERVICE).unwrap_or(id);
     let label = dns_label(&format!("{name}-{distinguisher}"));
     if label.is_empty() {

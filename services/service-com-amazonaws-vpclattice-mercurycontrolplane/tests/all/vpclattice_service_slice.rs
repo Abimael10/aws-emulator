@@ -60,6 +60,27 @@ pub(crate) struct Answer {
     pub(crate) error_code: Option<String>,
 }
 
+/// What one request to the name a SERVICE published answered: the status, the headers and
+/// the bytes, none of which a data-plane answer parses as JSON of its own.
+///
+/// Shared with the suite that drives that plane (`listeners.rs`), so a data-plane request is
+/// made and read one way.
+pub(crate) struct Fetched {
+    pub(crate) status: u16,
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) body: String,
+}
+
+impl Fetched {
+    /// The first value of the header `name` names, read case-insensitively.
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(held, _)| held == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
 impl Answer {
     pub(crate) fn str_field(&self, member: &str) -> String {
         self.body[member]
@@ -83,6 +104,112 @@ impl Lattice {
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(engine));
         Self { router }
+    }
+
+    /// This service and LAMBDA over ONE shared engine, as `core/router/src/lib.rs` mounts
+    /// them, with that engine handed back.
+    ///
+    /// What a `forward` to a `LAMBDA` target group answers with is the run of a real function,
+    /// created through Lambda's own API and performed by the Lambda emulator: the suite that
+    /// drives the data plane needs both services on one engine, and the engine itself for the
+    /// activation span Lambda owes a freshly created function.
+    pub(crate) fn with_lambda() -> (Self, Arc<engine::InMemoryEngine>) {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.set_request_authentication(false);
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        router.register_service(
+            service_com_amazonaws_lambda_awsgirapiservice::EmulatedService::new(Arc::clone(
+                &engine,
+            )),
+        );
+        (Self { router }, engine)
+    }
+
+    /// One request to `host` carrying NO credential, as a client that was handed a service's
+    /// own published name sends it: the data plane's own traffic.
+    pub(crate) async fn fetch(
+        &self,
+        method: &str,
+        host: &str,
+        target: &str,
+        body: &str,
+        headers: &[(&str, &str)],
+    ) -> Fetched {
+        let mut request = http::Request::builder()
+            .method(method)
+            .uri(format!("http://{host}{target}"))
+            .header("host", host);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let request = request
+            .body(bytes::Bytes::from(body.to_owned()))
+            .expect("a valid data-plane request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let headers = response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_ascii_lowercase(), value.to_owned()))
+            })
+            .collect();
+        let body = String::from_utf8_lossy(&response.into_body()).into_owned();
+        Fetched {
+            status,
+            headers,
+            body,
+        }
+    }
+
+    /// One call to LAMBDA's own restJson1 API, signed for that service, for the suite that
+    /// creates the function a target group registers.
+    pub(crate) async fn lambda(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Answer {
+        let host = format!("lambda.{REGION}.amazonaws.com");
+        let payload = body
+            .map(|value| serde_json::to_vec(&value).expect("the test body serializes"))
+            .unwrap_or_default();
+        let request = http::Request::builder()
+            .method(method)
+            .uri(format!("https://{host}{path}"))
+            .header("host", &host)
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/lambda/aws4_request, \
+                     SignedHeaders=host, Signature=abc"
+                ),
+            )
+            .header("content-type", "application/json")
+            .body(bytes::Bytes::from(payload))
+            .expect("a valid test request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let error_code = response
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let bytes = response.into_body();
+        let body = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+        };
+        Answer {
+            status,
+            body,
+            error_code,
+        }
     }
 
     pub(crate) async fn call(
