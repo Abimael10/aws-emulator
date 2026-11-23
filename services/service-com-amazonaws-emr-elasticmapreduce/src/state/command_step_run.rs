@@ -129,6 +129,13 @@ pub async fn resolve_due_step_commands<Eng: Send + Sync + 'static>(
             _ => return,
         }
     };
+    // Whether the cluster's Hive metastore is the one this emulator holds, which is what the
+    // SQL client of its command lines runs its statements against ([`step_sql_cli`]).
+    let metastore_is_the_catalog = state
+        .lock()
+        .clusters
+        .get(cluster_id)
+        .is_some_and(uses_glue_data_catalog);
     // What the cluster's Amazon EC2 instances obtain from their instance profile, resolved
     // once for this call: the credential a step carrying no runtime role of its own presents,
     // which is nothing at all where that profile carries no role those instances may assume.
@@ -172,6 +179,10 @@ pub async fn resolve_due_step_commands<Eng: Send + Sync + 'static>(
         // The CLI this command's environment provides, built per command so each gets its own
         // transfer budget, and presenting that credential on every call it makes.
         let cli = step_object_cli(engine, ctx, region, &credentials, &plan.step_id);
+        // The cluster's SQL client, built per command for the same reason: the statements it
+        // runs read the relations' data through that same program, so one command's reads and
+        // writes share its budget and its credential.
+        let sql = step_sql_cli(engine, metastore_is_the_catalog, cli.clone());
         // One command is performed at a time, so a command another call is still performing —
         // including one that call has already given up waiting for — is not performed a second
         // time: its transfers are real effects on the object store, and a `mv` or an `rm`
@@ -179,7 +190,7 @@ pub async fn resolve_due_step_commands<Eng: Send + Sync + 'static>(
         let Some(claim) = claimed(cluster_id, &plan.step_id) else {
             continue;
         };
-        let Some(outcome) = performed_command(&plan, cli, claim).await else {
+        let Some(outcome) = performed_command(&plan, cli, sql, claim).await else {
             // Nothing answered: the step stays owed an answer, so a later call performs the
             // command rather than this one reporting an outcome nothing produced.
             continue;
@@ -220,6 +231,7 @@ fn claimed(cluster_id: &str, step_id: &str) -> Option<InFlight> {
 async fn performed_command(
     plan: &StepCommandPlan,
     cli: Option<StepObjectCli>,
+    sql: StepSqlCli,
     claim: InFlight,
 ) -> Option<StepOutcome> {
     let command = plan.command.clone();
@@ -227,7 +239,7 @@ async fn performed_command(
         // A command the session answered for nothing of ends the step the way every
         // unaccounted-for submission of this service ends it: in the modelled failure
         // state saying its work was not run, never a status nothing produced.
-        command_outcome(&command, cli).unwrap_or_else(not_executed)
+        command_outcome(&command, cli, Some(sql)).unwrap_or_else(not_executed)
     })
     .await
 }

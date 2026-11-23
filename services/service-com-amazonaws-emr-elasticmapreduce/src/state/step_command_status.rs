@@ -22,11 +22,13 @@
 //! session with a working tree of its own provides (`printf`, `mkdir`, `touch`, `rm`, `tee`,
 //! `ls`, `test`, a nested `sh`/`bash`, `.`/`source` and `sleep`) — a step's command line runs
 //! on a cluster node, which has storage, so it is given the same tree and the same catalog a
-//! cluster's bootstrap script is ([`super::bootstrap_run`]) — beside the ONE program the
-//! environment of a step's command line
-//! provides, the AWS CLI's Amazon S3 transfers ([`super::step_command_transfers`]), which are
-//! really made against this emulator's own object store so the object a step's command line
-//! names exists once the step has run. Every command outside those, and every command FORM or
+//! cluster's bootstrap script is ([`super::bootstrap_run`]) — beside the TWO programs the
+//! environment of a step's command line provides: the cluster's own SQL client
+//! ([`super::step_sql_cli`], which runs the statements it is given against the cluster's Hive
+//! metastore and the data under it) and the AWS CLI's Amazon S3 transfers
+//! ([`super::step_command_transfers`]), which are really made against this emulator's own
+//! object store so the object a step's command line names exists once the step has run. Every
+//! command outside those, and every command FORM or
 //! expansion the session does not perform, is REFUSED with the status a shell gives a command
 //! it could not find, and the step then reports that its work was not run
 //! ([`STEP_NOT_EXECUTED_REASON`]) — never a status nothing produced. Nothing a caller can
@@ -59,14 +61,20 @@
 //!
 //! # What is NOT answered here
 //!
-//! The classes of submission this service answers for itself — a `spark-submit` of a Python
-//! application ([`super::spark_step_run`]), a `spark-submit` whose admission its cluster's own
-//! capacity answers ([`super::spark_submission`]) and a read-only statement resolvable in the
-//! cluster's Hive metastore ([`super::step_runner`]) — answer for themselves, so a step
-//! submitting one of them is never read as a command.
+//! The classes of submission this service answers for itself are never read as a command: a
+//! `spark-submit` of a Python application ([`super::spark_step_run`]), a `spark-submit` whose
+//! admission its cluster's own capacity answers ([`super::spark_submission`]), and a command
+//! line that is NOTHING BUT the cluster's SQL client's own invocation
+//! ([`StepCommand::is_bare_sql_client`]), whose statement the cluster's step runner resolves
+//! against the Hive metastore ([`super::step_runner`]). A command line that does MORE than
+//! invoke that client — a redirection of what it printed, a command after it that carries that
+//! file somewhere — is a command line, and IS answered here: its statements are run by the
+//! client the session performs it with ([`super::step_sql_cli`]), so what the whole line does
+//! happens. Where that client was the stage that failed, the step's failure is the driver's
+//! own error rather than the status alone.
 
 use ::service_common::posix_shell_session::{
-    EnvironmentPrograms, OutputLimits, SessionConfig, ShellSession,
+    layered, EnvironmentPrograms, OutputLimits, SessionConfig, ShellSession,
 };
 
 use super::*;
@@ -148,6 +156,26 @@ impl StepCommand {
         Some(Self::Argv(words))
     }
 
+    /// Whether this command line is NOTHING BUT the cluster's SQL client's own invocation.
+    ///
+    /// A step's own arguments ARE the argv of the command they name: there is no shell
+    /// between them and the program, so no word of them is an operator and a line whose first
+    /// word is that client submits exactly the statements its options carry — which is the
+    /// work the cluster's step runner resolves against the metastore
+    /// ([`read_step_work`]).
+    ///
+    /// A shell PROGRAM is not: it is a script, and the stages around the client in it — a
+    /// redirection of what the client printed, a command after it that carries that file
+    /// somewhere — are part of the step's work, so such a line is performed as a command line
+    /// with the client as one of the session's programs ([`step_sql_cli`]).
+    #[must_use]
+    pub fn is_bare_sql_client(&self) -> bool {
+        match self {
+            Self::Argv(words) => words.first().is_some_and(|word| names_sql_client(word)),
+            Self::Program(_) => false,
+        }
+    }
+
     /// This command as the one line the session reads.
     ///
     /// A shell program is read as it was written. A utility and its arguments are rendered
@@ -179,13 +207,26 @@ const COMMAND_OUTPUT_LIMITS: OutputLimits = OutputLimits {
 /// step failure. Either way the two console streams the command wrote and the status it exited
 /// with are kept for the step's log files ([`StepRunLog`]).
 ///
-/// `cli` is the ONE program the environment of a step's command line provides, so a command
-/// line that carries a file to or from Amazon S3 really carries it; a command performed
-/// WITHOUT one — there is no runtime to make a call on — reaches no object store, and such a
-/// command line is then one the session reports it could not run.
+/// Where the command line's own SQL CLIENT was refused, the step's failure is the DRIVER's
+/// error rather than the status alone ([`StepSqlCli::driver_failure`]): that is what the
+/// statement answered, so it is what a client reading `FailureDetails` is told — the same
+/// error a step submitting that statement on its own reports.
+///
+/// `objects` is the ONE program of the environment that reaches Amazon S3, so a command line
+/// that carries a file to or from it really carries it, and `sql` the cluster's SQL client, so
+/// a command line that runs statements really runs them. A command performed WITHOUT either —
+/// there is no runtime to make a call on — reaches no object store and no metastore, and such
+/// a command line is then one the session reports it could not run.
 #[must_use]
-pub fn command_outcome(command: &StepCommand, cli: Option<StepObjectCli>) -> Option<StepOutcome> {
-    let answered = performed_command(command, cli)?;
+pub fn command_outcome(
+    command: &StepCommand,
+    objects: Option<StepObjectCli>,
+    sql: Option<StepSqlCli>,
+) -> Option<StepOutcome> {
+    // Held beside the session, which takes the client itself: what the client answered about
+    // a refused statement is read back out of it once the command has run.
+    let driver = sql.clone();
+    let answered = performed_command(command, objects, sql)?;
     let log = StepRunLog {
         stdout: console_text(&answered.output),
         stderr: console_text(&answered.errors),
@@ -199,12 +240,15 @@ pub fn command_outcome(command: &StepCommand, cli: Option<StepObjectCli>) -> Opt
             log: Some(log),
         });
     }
-    Some(StepOutcome {
-        state: step_state::FAILED.to_string(),
-        failure: Some(StepFailure {
+    let failure = driver
+        .and_then(|client| client.driver_failure())
+        .unwrap_or_else(|| StepFailure {
             reason: COMMAND_FAILED_REASON.to_string(),
             message: command_failure_message(answered.status),
-        }),
+        });
+    Some(StepOutcome {
+        state: step_state::FAILED.to_string(),
+        failure: Some(failure),
         log: Some(log),
     })
 }
@@ -231,7 +275,7 @@ struct PerformedCommand {
 
 /// What the session answered for `command`, or `None` when it answered for nothing of it.
 ///
-/// The session holds the parse, the allow-list and the one environment program this module's
+/// The session holds the parse, the allow-list and the environment programs this module's
 /// header states, and nothing else: no process is started here. It is given no variables
 /// either — a step's command is handed no environment, so a parameter it expands is one the
 /// command itself set, and the credential the CLI's own calls are signed with is held by that
@@ -242,17 +286,29 @@ struct PerformedCommand {
 ///
 /// What the command WROTE is kept beside that status ([`COMMAND_OUTPUT_LIMITS`]), because the
 /// step's own log files are what a client reads it out of.
-fn performed_command(command: &StepCommand, cli: Option<StepObjectCli>) -> Option<PerformedCommand> {
+fn performed_command(
+    command: &StepCommand,
+    objects: Option<StepObjectCli>,
+    sql: Option<StepSqlCli>,
+) -> Option<PerformedCommand> {
     let config = SessionConfig {
         output: Some(COMMAND_OUTPUT_LIMITS),
         ..SessionConfig::default()
     };
-    let mut session = match cli {
-        Some(cli) => ShellSession::with_programs(
-            BTreeMap::new(),
-            config,
-            Box::new(cli) as Box<dyn EnvironmentPrograms>,
-        ),
+    // The programs the environment of a step's command line provides, asked in order: the
+    // cluster's SQL client and the AWS CLI's Amazon S3 transfers. Each answers only for its
+    // own names, so the order between them decides nothing.
+    let programs: Option<Box<dyn EnvironmentPrograms>> = match (sql, objects) {
+        (Some(sql), Some(objects)) => Some(layered(
+            Box::new(sql) as Box<dyn EnvironmentPrograms>,
+            Box::new(objects) as Box<dyn EnvironmentPrograms>,
+        )),
+        (Some(sql), None) => Some(Box::new(sql) as Box<dyn EnvironmentPrograms>),
+        (None, Some(objects)) => Some(Box::new(objects) as Box<dyn EnvironmentPrograms>),
+        (None, None) => None,
+    };
+    let mut session = match programs {
+        Some(programs) => ShellSession::with_programs(BTreeMap::new(), config, programs),
         None => ShellSession::new(BTreeMap::new(), config),
     }
     // A step's command line runs on a cluster NODE, which has storage of its own: the

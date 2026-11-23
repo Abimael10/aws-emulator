@@ -60,6 +60,22 @@ pub use configuration_classifications::*;
 mod step_runner;
 pub use step_runner::*;
 
+/// The metastore DDL a step's statement submits — the partitions it adds to or removes from
+/// the cluster's Hive metastore — split out of this root as its own concern and re-exported
+/// the same way.
+mod step_metastore_ddl;
+pub use step_metastore_ddl::*;
+
+/// The cluster's SQL client, as the environment of a step's command line provides it; split
+/// out and re-exported the same way.
+mod step_sql_cli;
+pub use step_sql_cli::*;
+
+/// Running the statements that client submits — against the cluster's Hive metastore and the
+/// data its tables point at; split out and re-exported the same way.
+mod step_sql_engine;
+pub use step_sql_engine::*;
+
 /// Announcing a cluster's state changes on the account's default event bus, split out of
 /// this root as its own concern and re-exported the same way.
 mod cluster_events;
@@ -1593,11 +1609,12 @@ pub const STEP_RUN_SPAN: Duration = Duration::from_secs(2);
 /// cluster's own state for — a `spark-submit` of a Python application in Amazon S3
 /// ([`spark_step_run`]), a `spark-submit` its cluster's capacity answers the admission of
 /// ([`spark_submission`]), a read-only statement resolvable in the cluster's metastore
-/// ([`step_runner`]) and a command whose exit status the session-local utilities answer
-/// ([`step_command_status`]). Every other submission — a jar of the submitter's own, a command
-/// this service answers for nothing of — produced no outcome, so the step ENDS in the modelled
-/// failure state with this reason saying exactly why, rather than reporting `COMPLETED` for
-/// work nothing performed.
+/// ([`step_runner`]), a statement whose whole effect is a change to that metastore, which is
+/// applied to it ([`step_metastore_ddl`]), and a command whose exit status the session-local
+/// utilities answer ([`step_command_status`]). Every other submission — a jar of the
+/// submitter's own, a command this service answers for nothing of — produced no outcome, so
+/// the step ENDS in the modelled failure state with this reason saying exactly why, rather
+/// than reporting `COMPLETED` for work nothing performed.
 pub const STEP_NOT_EXECUTED_REASON: &str =
     "This emulator runs the step lifecycle but executes no Hadoop jar, so the step ended \
      without running its application.";

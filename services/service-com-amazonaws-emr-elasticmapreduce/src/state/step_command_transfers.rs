@@ -641,6 +641,65 @@ impl StepObjectCli {
         })
     }
 
+    /// Every object under `prefix` of `bucket`, read as TEXT and answered as `(key, text)` in
+    /// key order — what the cluster's SQL engines read a catalog table's DATA out of
+    /// ([`super::step_sql_engine`]).
+    ///
+    /// The walk is bounded by `max_objects` keys and each object by
+    /// [`MAX_TRANSFERRED_BYTES`], exactly as a transfer of the same object is, and the whole
+    /// of it by what this command has left of [`TRANSFER_BUDGET`]. An object the read could
+    /// not take fails the WHOLE read rather than being left out of it: what decoded without it
+    /// would be a slice of the data, and a query answered from a slice is answered from part of
+    /// what the table holds. A directory marker — a key ending in the separator, which a
+    /// filesystem over the store writes for a directory — holds no data and is no such object.
+    pub(super) fn text_objects_under(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        max_objects: usize,
+    ) -> Result<Vec<(String, String)>, String> {
+        let keys = self.list_objects(bucket, prefix, max_objects)?;
+        let mut texts: Vec<(String, String)> = Vec::with_capacity(keys.len());
+        for key in keys {
+            let address = S3Object {
+                bucket: bucket.to_string(),
+                key: key.clone(),
+            };
+            texts.push((key, self.get_object(&address)?));
+        }
+        Ok(texts)
+    }
+
+    /// The keys under `prefix`, in the store's own order, to `max_objects` of them.
+    fn list_objects(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        max_objects: usize,
+    ) -> Result<Vec<String>, String> {
+        let limit = i32::try_from(max_objects).unwrap_or(i32::MAX);
+        self.made(|| async {
+            let listed = self
+                .client()?
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(prefix)
+                .max_keys(limit)
+                .send()
+                .await
+                .map_err(|error| store_answered("ListObjectsV2", &error))?;
+            Ok(listed
+                .contents()
+                .iter()
+                .filter_map(|object| object.key().map(str::to_string))
+                // A key that ENDS in the separator is the marker a filesystem over the
+                // object store writes for a directory, not a data file.
+                .filter(|key| !key.ends_with('/'))
+                .take(max_objects)
+                .collect())
+        })
+    }
+
     /// Write `contents` as the object at `address`.
     fn put_object(&self, address: &S3Object, contents: &str) -> Result<(), String> {
         if contents.len() > MAX_TRANSFERRED_BYTES {

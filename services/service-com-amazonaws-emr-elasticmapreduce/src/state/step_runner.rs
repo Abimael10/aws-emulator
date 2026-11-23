@@ -15,21 +15,31 @@
 //!   command carries is the work the cluster's Hive and Spark SQL engines are asked to
 //!   run. It is read off the command by PARSING it ([`sqlparser`]), never by matching
 //!   text, and every table it names is resolved in the cluster's Hive metastore
-//!   ([`read_step_work`]).
+//!   ([`read_step_work`]). What is read this way is the statement of a command line that is
+//!   NOTHING BUT that client's own invocation ([`StepCommand::is_bare_sql_client`]): a
+//!   command line that does more than invoke it is a command line, performed with the client
+//!   as one of the session's programs ([`super::step_sql_cli`]), so that the rest of the line
+//!   happens too.
 //! * That metastore is resolvable only when the cluster's configuration selects the AWS
 //!   Glue Data Catalog ([`uses_glue_data_catalog`]) — the one catalog this emulator holds.
 //!   A cluster's own local metastore lives on a master node this emulator does not run, so
 //!   its contents are unknown and no outcome can be grounded in it.
-//! * The statement's own effect has to be nothing but READING ([`StepWork::reads_only`]),
-//!   because that is the class whose outcome follows from resolving it: a statement that
-//!   writes, defines or drops leaves state behind that this emulator does not apply, and
-//!   reporting it `COMPLETED` would make a discarded write look like a stored one.
+//! * The statement's own effect has to be one this emulator can ACCOUNT FOR
+//!   ([`StepWork::accountable`]), which is either of two classes: a statement whose only
+//!   effect is READING, whose outcome follows from resolving every table it names, and a
+//!   statement whose whole effect is a change to the metastore itself — the partitions of a
+//!   table — which is REALLY APPLIED to that catalog ([`super::step_metastore_ddl`]). A
+//!   statement that writes, defines or drops anything else leaves state behind that this
+//!   emulator does not apply, and reporting it `COMPLETED` would make a discarded write look
+//!   like a stored one.
 //!
 //! So a read whose every table resolves ends `COMPLETED` ("for a step to be considered
-//! complete, the main function must exit with a zero exit code", `AddJobFlowSteps` doc),
-//! one naming a table the metastore holds nothing under ends `FAILED` with the driver's
-//! table-not-found, and anything else keeps the cluster runner's own not-executed failure.
-//! Nothing here reports a success for work nothing performed.
+//! complete, the main function must exit with a zero exit code", `AddJobFlowSteps` doc), one
+//! naming a table the metastore holds nothing under ends `FAILED` with the driver's
+//! table-not-found, a metastore change the catalog applied ends `COMPLETED` with that change
+//! readable through the catalog's own API, one the catalog refused ends `FAILED` with the
+//! metastore client's own error, and anything else keeps the cluster runner's own
+//! not-executed failure. Nothing here reports a success for work nothing performed.
 
 use std::ops::ControlFlow;
 use std::time::SystemTime;
@@ -95,15 +105,18 @@ pub struct TableReference {
 /// The work a step's command submits, as the runner reads it off that command.
 ///
 /// `statements` is how many SQL statements the command carries — a command carrying none
-/// submits no work this runner runs. `reads_only` is whether EVERY one of them has no
-/// effect but reading, which is the only class whose outcome this runner can ground
-/// without applying an effect; `tables` is every table those statements read, in the order
-/// they read them, and is collected only for that class.
+/// submits no work this runner runs. `accountable` is whether EVERY one of them is of a
+/// class this runner can account for: a statement whose only effect is reading, or one whose
+/// whole effect is a change to the metastore this emulator holds. `tables` is every table
+/// those statements read, in the order they read them, and `changes` every change they make
+/// to the metastore, in the order they make them; both are collected only while the work
+/// stays accountable.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StepWork {
     pub statements: usize,
-    pub reads_only: bool,
+    pub accountable: bool,
     pub tables: Vec<TableReference>,
+    pub changes: Vec<MetastoreChange>,
 }
 
 /// What a step's work ANSWERED: the state the step ends in, the failure that answer is when
@@ -149,8 +162,9 @@ pub fn table_not_found_message(reference: &TableReference) -> String {
 /// modelled failure state with the reason that says so, never `COMPLETED` for work nothing
 /// performed — and for a statement that WRITES, never a discarded write no later read
 /// could tell from a stored one.
-/// See the module docs: the one class of work this service can account for.
-pub const RESOLVABLE_WORK: &str = "a statement whose only effect is reading";
+/// See the module docs: the classes of work this service can account for.
+pub const RESOLVABLE_WORK: &str =
+    "a statement whose only effect is reading, or one changing the metastore's own partitions";
 
 /// Whether `jar` names [`COMMAND_RUNNER_JAR`], however the submitter spelled its path.
 pub fn names_command_runner(jar: &str) -> bool {
@@ -167,21 +181,22 @@ pub fn names_command_runner(jar: &str) -> bool {
 /// [`MAX_COMMAND_NESTING`]. A `USE` statement moves the database the statements after it
 /// resolve an unqualified name in, exactly as it does in a SQL session.
 ///
-/// A statement whose effect is not reading alone leaves [`StepWork::reads_only`] false and
-/// contributes no table: its effect is one this emulator does not apply, so nothing about
-/// its outcome can be grounded in what the metastore holds.
+/// A statement that neither reads alone nor changes the metastore leaves
+/// [`StepWork::accountable`] false and contributes nothing: its effect is one this emulator
+/// does not apply, so nothing about its outcome can be grounded in what the metastore holds.
 pub fn read_step_work(jar: &str, args: &[String]) -> Option<StepWork> {
     if !names_command_runner(jar) {
         return None;
     }
     let mut work = StepWork {
-        reads_only: true,
+        accountable: true,
         ..StepWork::default()
     };
     let mut database = DEFAULT_DATABASE.to_string();
     collect_statements(args, 0, &mut work, &mut database);
-    if !work.reads_only {
+    if !work.accountable {
         work.tables.clear();
+        work.changes.clear();
     }
     (work.statements > 0).then_some(work)
 }
@@ -206,11 +221,16 @@ fn collect_statements(
                         *database = named;
                         continue;
                     }
-                    if !reads_only(statement) {
-                        work.reads_only = false;
+                    if reads_only(statement) {
+                        collect_tables(statement, database, work);
                         continue;
                     }
-                    collect_tables(statement, database, work);
+                    // The other class this runner accounts for: a statement whose whole
+                    // effect is a change to the metastore itself, which is applied to it.
+                    match metastore_change(statement, database) {
+                        Some(change) => work.changes.push(change),
+                        None => work.accountable = false,
+                    }
                 }
             }
             // Not a statement: the token may be a command line carrying one.
@@ -231,7 +251,7 @@ fn collect_statements(
 }
 
 /// The statements `sql` is, or `None` when it is no SQL at all.
-fn parse_statements(sql: &str) -> Option<Vec<Statement>> {
+pub(super) fn parse_statements(sql: &str) -> Option<Vec<Statement>> {
     // Hive's dialect is the one a cluster's Hive and Spark SQL engines read a statement
     // in, and the parser is what decides whether this argument is a statement at all; the
     // generic dialect is what reads a statement the Hive one does not accept, so a
@@ -257,7 +277,7 @@ fn parse_statements(sql: &str) -> Option<Vec<Statement>> {
 /// A query is that — with the exception of the `WITH … INSERT` / `WITH … UPDATE` forms,
 /// which parse as a query whose BODY writes — and every other statement either defines,
 /// drops or changes something, which is an effect this emulator does not apply.
-fn reads_only(statement: &Statement) -> bool {
+pub(super) fn reads_only(statement: &Statement) -> bool {
     let Statement::Query(query) = statement else {
         return false;
     };
@@ -281,7 +301,7 @@ fn body_reads_only(body: &SetExpr) -> bool {
 /// `USE DATABASE <name>`, `USE SCHEMA <name>`); each names the database a later
 /// unqualified name resolves in. The other forms — a warehouse, a role, a catalog, the
 /// dialect's default — name no database, so they move nothing.
-fn database_used(statement: &Statement) -> Option<String> {
+pub(super) fn database_used(statement: &Statement) -> Option<String> {
     let Statement::Use(used) = statement else {
         return None;
     };
@@ -292,6 +312,14 @@ fn database_used(statement: &Statement) -> Option<String> {
     let rendered = named.to_string();
     let last = rendered.split('.').next_back().map(unquote)?;
     (!last.is_empty()).then(|| last.to_string())
+}
+
+/// Every table `statement` names, resolved in `database` when the name carries no qualifier
+/// of its own — the relations a statement READS, which is what resolving it needs.
+pub(super) fn statement_tables(statement: &Statement, database: &str) -> Vec<TableReference> {
+    let mut work = StepWork::default();
+    collect_tables(statement, database, &mut work);
+    work.tables
 }
 
 /// Every table `statement` names, resolved in `database` when the name carries no
@@ -317,7 +345,7 @@ fn collect_tables(statement: &Statement, database: &str, work: &mut StepWork) {
 ///
 /// A three-part name carries the CATALOG first, and this emulator holds one catalog, so
 /// the database and table are its last two parts.
-fn table_reference(
+pub(super) fn table_reference(
     name: &ObjectName,
     database: &str,
     defined: &[String],
@@ -346,7 +374,7 @@ fn table_reference(
 
 /// The names a statement's own `WITH` clause defines, folded: those name no table of the
 /// metastore.
-fn cte_names(statement: &Statement) -> Vec<String> {
+pub(super) fn cte_names(statement: &Statement) -> Vec<String> {
     let Statement::Query(query) = statement else {
         return Vec::new();
     };
@@ -426,20 +454,27 @@ pub fn configuration_property<'a>(
 /// the cluster's step queue up to `now`.
 ///
 /// The queue, the concurrency slots, the timeline and the stops are the cluster's own step
-/// runner's ([`ClusterRecord::advance_to`]); this adds the two things that need more than the
+/// runner's ([`ClusterRecord::advance_to`]); this adds the things that need more than the
 /// step's own command: whether the cluster ADMITS the submission a `spark-submit` step made
-/// ([`resolve_due_submissions`]), and what the work a step submitted answered, resolved
-/// against the metastore the cluster's configuration selects ([`resolve_outcome`]). A step
-/// whose answer is resolved ends in it; every other step ends as the cluster's runner ends it,
-/// in the modelled failure state saying no application ran ([`STEP_NOT_EXECUTED_REASON`]).
+/// ([`resolve_due_submissions`]), and what the work a step submitted answered — resolved
+/// against the metastore the cluster's configuration selects ([`resolve_outcome`]) or
+/// PERFORMED against it ([`apply_due_metastore_changes`]). A step whose answer is resolved
+/// ends in it; every other step ends as the cluster's runner ends it, in the modelled failure
+/// state saying no application ran ([`STEP_NOT_EXECUTED_REASON`]).
 ///
-/// An answer is resolved ONCE and then stored, before the step's own end comes due, so two
-/// reads of a settled step report the same thing. Scoped to the ONE cluster the request
-/// names, so what a request costs follows from that cluster's own steps rather than from
-/// everything the account holds.
+/// An answer is resolved ONCE and then stored, so two reads of a settled step report the
+/// same thing — and a statement that CHANGES the metastore is performed once for the same
+/// reason, and only after the cluster has STARTED the step that submitted it, which is why
+/// the queue is run before those changes are applied and again after: the change is the
+/// step's execution, so it happens between the step's start and its end rather than while
+/// the step is still queued. Scoped to the ONE cluster the request names, so what a request
+/// costs follows from that cluster's own steps rather than from everything the account
+/// holds.
 ///
-/// Every transition this applies was owed whether or not anybody called, so a reporting
-/// operation may apply it; nothing else about a step changes because it was read.
+/// Every transition this applies was owed whether or not anybody called — including the
+/// execution of a step the cluster has started, whose effect on the metastore was owed at
+/// the same instant — so a reporting operation may apply it; nothing else about a step
+/// changes because it was read.
 pub fn run_due_steps<Eng: Send + Sync + 'static>(
     engine: &Eng,
     store: &mut ComAmazonawsEmrElasticmapreduceState,
@@ -452,10 +487,16 @@ pub fn run_due_steps<Eng: Send + Sync + 'static>(
     resolve_due_submissions(cluster);
     resolve_cluster_outcomes(engine, cluster);
     cluster.advance_to(now);
+    // A step whose statement changes the metastore is owed that change from the instant the
+    // cluster started it, so the queue above has run first; once the change has been applied
+    // the step can reach the state it answered, which is what the second run settles.
+    if apply_due_metastore_changes(engine, cluster, now) {
+        cluster.advance_to(now);
+    }
 }
 
-/// Resolve the answer of every step of this cluster whose work this service can account
-/// for and that has none yet.
+/// Resolve the answer of every step of this cluster whose work is a READ this service can
+/// account for and that has none yet.
 ///
 /// The metastore is read through the ONE Glue Data Catalog store this emulator holds.
 /// LOCK ORDER: the caller holds this service's own store, and this takes the catalog's
@@ -474,7 +515,11 @@ fn resolve_cluster_outcomes<Eng: Send + Sync + 'static>(engine: &Eng, cluster: &
         .iter()
         .enumerate()
         .filter(|(_, step)| step.outcome.is_none() && !step.is_terminal())
-        .filter(|(_, step)| step.work.as_ref().is_some_and(|work| work.reads_only))
+        .filter(|(_, step)| {
+            step.work
+                .as_ref()
+                .is_some_and(|work| work.accountable && work.changes.is_empty())
+        })
         .map(|(index, _)| index)
         .collect();
     if unresolved.is_empty() {
@@ -496,6 +541,110 @@ fn resolve_cluster_outcomes<Eng: Send + Sync + 'static>(engine: &Eng, cluster: &
     };
     for (index, outcome) in resolved {
         cluster.steps[index].outcome = Some(outcome);
+    }
+}
+
+/// PERFORM the metastore change every step of this cluster that has started owes, and record
+/// what the metastore answered; answer whether any step was answered for.
+///
+/// The change is the step's own execution: the statement is applied to the Glue Data Catalog
+/// — the cluster's Hive metastore — so what it added or removed is there for every later
+/// reader, through the catalog's own API and through the next statement a step submits. It
+/// is applied exactly once, because a step that has an answer is never asked again
+/// ([`StepRecord::awaits_metastore_change`]), and only for a step the cluster has STARTED
+/// and is not stopping, so nothing is written for a step that never ran.
+///
+/// A statement the metastore applied ends its step `COMPLETED`; one the metastore refused
+/// ends it `FAILED` carrying that refusal, which is an answer about the submitted work and
+/// so applies the step's `ActionOnFailure` ([`StepRecord::work_answered`]); and a statement
+/// submitted to a metastore this emulator does not hold ends it in the failure that says
+/// nothing ran it. Every statement of one step is applied in the order the command carries
+/// them, and the first refusal is the step's: the statements before it have been applied,
+/// exactly as a SQL client that submits several leaves the ones that ran.
+///
+/// LOCK ORDER: as [`resolve_cluster_outcomes`] — the caller holds this service's store and
+/// the catalog's guard is taken inside it and released before any step is written.
+fn apply_due_metastore_changes<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    cluster: &mut ClusterRecord,
+    now: SystemTime,
+) -> bool {
+    let owed: Vec<usize> = cluster
+        .steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| step.awaits_metastore_change() && step.start_date_time.is_some())
+        .map(|(index, _)| index)
+        .collect();
+    if owed.is_empty() {
+        return false;
+    }
+    // A change is applicable only to the metastore this emulator HOLDS: a cluster whose Hive
+    // metastore is its own master node's has one this emulator does not run, so there is
+    // nothing of it to change ([`uses_glue_data_catalog`]) and the step ends the way every
+    // step whose submission nothing performed ends ([`not_executed`]) rather than staying
+    // `RUNNING` for a statement nothing is going to apply.
+    let catalog = uses_glue_data_catalog(cluster)
+        .then(|| glue_state::service_state(engine))
+        .flatten();
+    let Some(catalog) = catalog else {
+        for index in owed {
+            cluster.steps[index].outcome = Some(not_executed());
+        }
+        return true;
+    };
+    let performed: Vec<(usize, StepOutcome)> = {
+        let mut catalog = catalog.lock();
+        let catalog_id = glue_state::resolve_catalog_id(None);
+        owed.into_iter()
+            .filter_map(|index| {
+                let work = cluster.steps[index].work.clone()?;
+                Some((
+                    index,
+                    performed_outcome(&mut catalog, &catalog_id, &work, now),
+                ))
+            })
+            .collect()
+    };
+    let answered = !performed.is_empty();
+    for (index, outcome) in performed {
+        cluster.steps[index].outcome = Some(outcome);
+    }
+    answered
+}
+
+/// What performing a step's metastore changes ANSWERED, applied in the order the command
+/// carries them.
+///
+/// Every table the work also READS is resolved first, exactly as a read-only statement's is:
+/// a statement naming a table the metastore holds nothing under fails before anything is
+/// written, so a command whose read cannot resolve changes nothing.
+fn performed_outcome(
+    catalog: &mut glue_state::ComAmazonawsGlueAwsglueState,
+    catalog_id: &str,
+    work: &StepWork,
+    now: SystemTime,
+) -> StepOutcome {
+    let read = resolve_outcome(catalog, catalog_id, work);
+    if read.failure.is_some() {
+        return read;
+    }
+    for change in &work.changes {
+        if let Err(failure) = apply_metastore_change(catalog, catalog_id, change, now) {
+            return StepOutcome {
+                state: step_state::FAILED.to_string(),
+                failure: Some(failure),
+                // The statement was performed by the cluster's metastore client rather than
+                // by an engine of this emulator, so no console stream and no exit status of
+                // it exists to report.
+                log: None,
+            };
+        }
+    }
+    StepOutcome {
+        state: step_state::COMPLETED.to_string(),
+        failure: None,
+        log: None,
     }
 }
 

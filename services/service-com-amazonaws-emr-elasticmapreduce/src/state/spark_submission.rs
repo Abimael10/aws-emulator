@@ -717,8 +717,8 @@ pub fn resolve_due_submissions(cluster: &mut ClusterRecord) {
             // The cluster admits it, so what the step ends in is what the work it submitted
             // answered — and for the classes this service answers for itself, that answer is
             // recorded by the path that holds it rather than here: an application this
-            // service RUNS ([`super::spark_step_run`]) and a statement resolved against the
-            // cluster's metastore ([`run_due_steps`]).
+            // service RUNS ([`super::spark_step_run`]) and a statement resolved against or
+            // applied to the cluster's metastore ([`run_due_steps`]).
             //
             // An application file in Amazon S3 is an object this emulator's own object store
             // either holds or does not, and a step is not reported COMPLETED for an
@@ -728,7 +728,7 @@ pub fn resolve_due_submissions(cluster: &mut ClusterRecord) {
             // release installed or its bootstrap put there — which this emulator holds
             // nothing of either way.
             let answered_elsewhere = step.application.is_some()
-                || step.work.as_ref().is_some_and(|work| work.reads_only)
+                || step.work.as_ref().is_some_and(|work| work.accountable)
                 || s3_object(application).is_some();
             Some((
                 index,

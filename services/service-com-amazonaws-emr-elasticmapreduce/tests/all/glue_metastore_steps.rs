@@ -7,20 +7,24 @@
 //! `StepConcurrencyLevel` at a time — and settles in the terminal `StepState` its work
 //! produced, with the `StepTimeline` of the run: `COMPLETED` when the work succeeded and
 //! `FAILED`, carrying the driver's own error, when it did not. The work of a
-//! `command-runner.jar` step is the command its arguments are; a statement that command
-//! submits whose only effect is READING names tables, and a table the cluster's Hive
-//! metastore does not hold fails the step. A step whose work this emulator does not run —
-//! one submitting no statement, one whose statement would leave state behind, or one on a
-//! cluster whose metastore this emulator does not hold — settles in the same modelled
-//! failure state carrying the reason that says its work was not run, never a success for
-//! work nothing performed.
+//! `command-runner.jar` step is the command its arguments are: a command line that is nothing
+//! but the cluster's SQL client submits the statement it carries, which is resolved against
+//! the cluster's Hive metastore — a statement whose only effect is READING names tables, and a
+//! table that metastore does not hold fails the step — and a command line that does more is
+//! performed as a command line, with that client as one of the session's programs
+//! (`crate::glue_metastore_partition_ddl` asserts that form). A step whose work this emulator
+//! does not run — one submitting no statement, one whose statement would leave state behind,
+//! or one on a cluster whose metastore this emulator does not hold — settles in the same
+//! modelled failure state carrying the reason that says its work was not run, never a success
+//! for work nothing performed.
 //!
 //! Every case drives the real HTTP path — `POST /` with an `awsJson1_1` body — through the
-//! router's `dispatch`, against one emulator carrying BOTH Amazon EMR and the Glue Data
-//! Catalog over one shared engine, because the metastore a step resolves its tables in is
-//! that catalog. Nothing reaches into either service's state struct: the catalog is
-//! written through `CreateDatabase`/`CreateTable` and a step is only ever read back
-//! through `DescribeStep` and `ListSteps`.
+//! router's `dispatch`, against one emulator carrying Amazon EMR, the Glue Data Catalog and
+//! Amazon S3 over one shared engine, because the metastore a step resolves its tables in is
+//! that catalog and the data under those tables is objects of that store. Nothing reaches
+//! into any service's state struct: the catalog is written through
+//! `CreateDatabase`/`CreateTable`, its data through S3's own `PutObject`, and a step is only
+//! ever read back through `DescribeStep` and `ListSteps`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,10 +34,16 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::job_flow_lifecycle::{at, INSTANCE_PROFILE, SERVICE_ROLE};
 
-/// How long a poll for a step's terminal state keeps asking. The runner owes a queued
-/// step two clock-owed spans (500 ms each: `PENDING` -> `RUNNING` -> terminal), so this is
-/// several times that and still leaves a failing case to fail fast.
-const SETTLE_BUDGET: Duration = Duration::from_secs(6);
+/// How long a poll for a step's terminal state keeps asking.
+///
+/// The clock-owed spans a case waits through are the cluster's two phases of coming up
+/// (`CLUSTER_PHASE_SPAN`, 3 s each) and the step's own run (`STEP_RUN_SPAN`, 2 s), and a
+/// command-line case also waits for the command its step submits (that command's own
+/// `TRANSFER_BUDGET`, 5 s) — about 13 s of owed time in the longest case. This is a little
+/// over that, so a passing case never meets it (the condition is POLLED, so a wait that is
+/// over costs nothing) and a loaded host has room, while a case that really never settles
+/// fails promptly.
+const SETTLE_BUDGET: Duration = Duration::from_secs(20);
 
 /// How long a poll waits between asks.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -44,6 +54,17 @@ const DATABASE: &str = "sim_catalog_db";
 /// The table that database holds.
 const REGISTERED_TABLE: &str = "orders";
 
+/// The bucket the registered table's data lives in, the prefix its location names and the
+/// key one object of it is at: a query over that table reads the rows that object holds, so
+/// the catalog's tables point at data this emulator really serves.
+const DATA_BUCKET: &str = "sim-catalog";
+const DATA_PREFIX: &str = "orders";
+const DATA_OBJECT: &str = "orders/rows.csv";
+
+/// The rows that object holds, one per line: the table declares one `bigint` column, so one
+/// line is one row.
+const DATA_ROWS: &str = "1\n2\n3\n";
+
 /// A table name the catalog holds nothing under.
 const UNREGISTERED_TABLE: &str = "orders_absent";
 
@@ -51,18 +72,31 @@ const UNREGISTERED_TABLE: &str = "orders_absent";
 /// Amazon EMR documents the Hive metastore client factory for it (see
 /// `crate::state::GLUE_METASTORE_FACTORY_CLASS`).
 const METASTORE_PROPERTY: &str = "hive.metastore.client.factory.class";
-const GLUE_FACTORY: &str = "com.amazonaws.glue.catalog.metastore.AWSGlueDataCatalogHiveClientFactory";
+pub(crate) const GLUE_FACTORY: &str =
+    "com.amazonaws.glue.catalog.metastore.AWSGlueDataCatalogHiveClientFactory";
 
 /// The step states a step never leaves again (`com.amazonaws.emr#StepState`).
 const TERMINAL_STATES: [&str; 4] = ["COMPLETED", "CANCELLED", "FAILED", "INTERRUPTED"];
 
 /// One emulator carrying Amazon EMR and the Glue Data Catalog over one shared engine.
-struct Pairing {
+///
+/// Reached by the suite that asserts the metastore DDL a step performs
+/// (`crate::glue_metastore_partition_ddl`) as well: a step's work is resolved in the Glue
+/// Data Catalog either way, so both suites drive the same pairing rather than standing up
+/// two.
+pub(crate) struct Pairing {
     router: MultiServiceRouter,
 }
 
 impl Pairing {
-    fn new() -> Self {
+    /// The router every call of these suites is dispatched through: the ONE emulator this
+    /// pairing stood up, so a suite that drives Amazon S3's own REST surface beside the two
+    /// `awsJson1_1` services reaches the same engine.
+    pub(crate) fn router(&self) -> &MultiServiceRouter {
+        &self.router
+    }
+
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -70,12 +104,22 @@ impl Pairing {
             service_com_amazonaws_emr_elasticmapreduce::EmulatedService::new(engine.clone()),
         );
         router.register_service(service_com_amazonaws_glue_awsglue::EmulatedService::new(
-            engine,
+            engine.clone(),
         ));
+        // The DATA behind a catalog table is objects of this emulator's own Amazon S3, which
+        // is what a query over such a table reads, so the store is mounted on the same engine
+        // and a statement reads the rows a client really put there.
+        router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(engine));
         Self { router }
     }
 
-    async fn call(&self, service: &str, target: &str, operation: &str, body: Value) -> (u16, Value) {
+    pub(crate) async fn call(
+        &self,
+        service: &str,
+        target: &str,
+        operation: &str,
+        body: Value,
+    ) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -103,7 +147,7 @@ impl Pairing {
         (status, payload)
     }
 
-    async fn emr(&self, operation: &str, body: Value) -> Value {
+    pub(crate) async fn emr(&self, operation: &str, body: Value) -> Value {
         let (status, payload) = self
             .call("elasticmapreduce", "ElasticMapReduce", operation, body)
             .await;
@@ -114,7 +158,7 @@ impl Pairing {
         payload
     }
 
-    async fn glue(&self, operation: &str, body: Value) -> Value {
+    pub(crate) async fn glue(&self, operation: &str, body: Value) -> Value {
         let (status, payload) = self.call("glue", "AWSGlue", operation, body).await;
         assert_eq!(
             status, 200,
@@ -124,8 +168,25 @@ impl Pairing {
     }
 
     /// Register `DATABASE` with one table over an S3 location, the way a client prepares a
-    /// Glue-metastore cluster's catalog.
+    /// Glue-metastore cluster's catalog — and put the table's own data at that location.
     async fn register_catalog(&self) {
+        for (case, uri, body) in [
+            ("CreateBucket", format!("/{DATA_BUCKET}"), ""),
+            (
+                "PutObject",
+                format!("/{DATA_BUCKET}/{DATA_OBJECT}"),
+                DATA_ROWS,
+            ),
+        ] {
+            let (status, answered) =
+                crate::spark_step_application::s3(&self.router, "PUT", &uri, body.as_bytes())
+                    .await;
+            assert!(
+                (200..300).contains(&status),
+                "{case} must succeed, got {status} {}",
+                String::from_utf8_lossy(&answered)
+            );
+        }
         self.glue(
             "CreateDatabase",
             json!({ "DatabaseInput": { "Name": DATABASE } }),
@@ -138,7 +199,7 @@ impl Pairing {
                 "TableInput": {
                     "Name": REGISTERED_TABLE,
                     "StorageDescriptor": {
-                        "Location": "s3://sim-catalog/orders/",
+                        "Location": format!("s3://{DATA_BUCKET}/{DATA_PREFIX}/"),
                         "Columns": [{ "Name": "id", "Type": "bigint" }],
                     },
                 },
@@ -149,7 +210,7 @@ impl Pairing {
 
     /// A Glue-metastore cluster that stays up when it has no steps to run, with
     /// `concurrency` steps running at a time.
-    async fn glue_metastore_cluster(&self, name: &str, concurrency: i32) -> String {
+    pub(crate) async fn glue_metastore_cluster(&self, name: &str, concurrency: i32) -> String {
         self.cluster(
             name,
             concurrency,
@@ -162,7 +223,7 @@ impl Pairing {
     }
 
     /// The same, with the configurations the caller gives.
-    async fn cluster(&self, name: &str, concurrency: i32, configurations: Value) -> String {
+    pub(crate) async fn cluster(&self, name: &str, concurrency: i32, configurations: Value) -> String {
         let out = self
             .emr(
                 "RunJobFlow",
@@ -216,7 +277,7 @@ impl Pairing {
     }
 
     /// `AddJobFlowSteps`, answering the minted step ids in submission order.
-    async fn add_steps(&self, cluster_id: &str, steps: Vec<Value>) -> Vec<String> {
+    pub(crate) async fn add_steps(&self, cluster_id: &str, steps: Vec<Value>) -> Vec<String> {
         let out = self
             .emr(
                 "AddJobFlowSteps",
@@ -245,7 +306,12 @@ impl Pairing {
     }
 
     /// Poll `DescribeStep` until the step is terminal, answering the step as it settled.
-    async fn await_terminal_step(&self, case: &str, cluster_id: &str, step_id: &str) -> Value {
+    pub(crate) async fn await_terminal_step(
+        &self,
+        case: &str,
+        cluster_id: &str,
+        step_id: &str,
+    ) -> Value {
         let deadline = std::time::Instant::now() + SETTLE_BUDGET;
         loop {
             let step = self.describe_step(cluster_id, step_id).await;
@@ -267,7 +333,7 @@ impl Pairing {
 }
 
 /// A `command-runner.jar` step whose command is `args`.
-fn command_step(name: &str, args: Value) -> Value {
+pub(crate) fn command_step(name: &str, args: Value) -> Value {
     json!({
         "Name": name,
         "ActionOnFailure": "CONTINUE",
@@ -276,7 +342,7 @@ fn command_step(name: &str, args: Value) -> Value {
 }
 
 /// A step the runner runs: a SQL client of the cluster, given one statement.
-fn sql_step(name: &str, client: &str, sql: &str) -> Value {
+pub(crate) fn sql_step(name: &str, client: &str, sql: &str) -> Value {
     command_step(name, json!([client, "-e", sql]))
 }
 

@@ -116,10 +116,23 @@ impl StepRecord {
             .as_ref()
             .and_then(|monitoring| monitoring.s3_monitoring_configuration.as_ref());
         let args = config.hadoop_jar_step.args.unwrap_or_default();
+        // The COMMAND the step's arguments are, read once here because the command never
+        // changes ([`StepCommand::of`]).
+        let submitted_command = StepCommand::of(&config.hadoop_jar_step.jar, &args);
         // The work the step's command submits follows from the command, which never
         // changes, so it is read once here and resolved against the metastore when the
         // runner dispatches the step.
-        let work = read_step_work(&config.hadoop_jar_step.jar, &args);
+        //
+        // Only a command line that is NOTHING BUT the cluster's SQL client submits a
+        // statement this way ([`StepCommand::is_bare_sql_client`]): a command line that does
+        // more than invoke that client — a redirection, another command after it — is a
+        // command line, and the statement inside it is run by the client the session performs
+        // it with ([`step_sql_cli`]), so what the whole line does happens rather than only
+        // its statement.
+        let work = submitted_command
+            .as_ref()
+            .filter(|command| command.is_bare_sql_client())
+            .and_then(|_| read_step_work(&config.hadoop_jar_step.jar, &args));
         // The application the command submits, read the same way and for the same reason:
         // the command never changes, and what it submits is what the step will RUN.
         let application = submitted_spark_application(&config.hadoop_jar_step.jar, &args);
@@ -128,13 +141,13 @@ impl StepRecord {
         // cluster can allocate them is resolved against that cluster when the runner
         // dispatches the step.
         let submission = submitted_spark_request(&config.hadoop_jar_step.jar, &args);
-        // The command the step's command line is, read the same way. It is read only for a
-        // step that submits none of the classes above: an application, a submission its
-        // cluster answers the admission of, and a statement resolvable in the cluster's
-        // metastore all answer for themselves, and what the command ANSWERS is the status it
-        // exits with, performed when the step's run ends.
+        // The command the step's command line is. It is kept only for a step that submits none
+        // of the classes above: an application, a submission its cluster answers the admission
+        // of, and a BARE statement resolvable in the cluster's metastore all answer for
+        // themselves, and what the command ANSWERS is the status it exits with, performed when
+        // the step's run ends.
         let command = (work.is_none() && application.is_none() && submission.is_none())
-            .then(|| StepCommand::of(&config.hadoop_jar_step.jar, &args))
+            .then_some(submitted_command)
             .flatten();
         Self {
             id,
@@ -212,6 +225,25 @@ impl StepRecord {
     #[must_use]
     pub fn awaits_command(&self) -> bool {
         self.command.is_some()
+            && self.outcome.is_none()
+            && !self.is_terminal()
+            && self.stop_due_at.is_none()
+    }
+
+    /// Whether this step is still owed the PERFORMANCE of the metastore change its statement
+    /// submitted: its work carries one, nothing has answered for it yet, and the step is
+    /// neither terminal nor stopping.
+    ///
+    /// Such a step does not end ([`Self::run_between`]) for the same reason one awaiting its
+    /// application does not: the state it ends in is what the metastore answered, so it stays
+    /// `RUNNING` until the change has been applied ([`run_due_steps`]) rather than being
+    /// reported COMPLETED or FAILED for a statement nothing performed — and because it is the
+    /// step's own execution, it happens once, between the step's start and its end.
+    #[must_use]
+    pub fn awaits_metastore_change(&self) -> bool {
+        self.work
+            .as_ref()
+            .is_some_and(|work| work.accountable && !work.changes.is_empty())
             && self.outcome.is_none()
             && !self.is_terminal()
             && self.stop_due_at.is_none()
@@ -327,7 +359,11 @@ impl StepRecord {
     /// not end until it has ([`Self::awaits_application`]) — and a statement whose only
     /// effect is reading, submitted to a cluster whose Hive metastore this service holds,
     /// ends `COMPLETED` when every table it names resolves and `FAILED` with the driver's
-    /// table-not-found when one does not ([`run_due_steps`]). A `spark-submit` of anything
+    /// table-not-found when one does not ([`run_due_steps`]). A statement whose whole effect
+    /// is a change to that metastore is PERFORMED against it and ends `COMPLETED` when the
+    /// metastore applied it and `FAILED` carrying the metastore client's own error when it
+    /// refused it ([`step_metastore_ddl`]); such a step does not end until the change has
+    /// been applied ([`Self::awaits_metastore_change`]). A `spark-submit` of anything
     /// else ends in what its cluster's own capacity ANSWERED: the refusal `spark-submit` gives
     /// a submission whose containers the cluster cannot allocate, and `COMPLETED` for one it
     /// admits whose application file is the cluster node's own
@@ -359,10 +395,13 @@ impl StepRecord {
             return;
         }
         if now >= end {
-            // A step whose application has not run yet, or whose command has not been
-            // performed yet, does not end: what it ends in is what that run answers
-            // ([`Self::awaits_application`], [`Self::awaits_command`]).
-            if self.awaits_application() || self.awaits_command() {
+            // A step whose application has not run yet, whose command has not been
+            // performed yet, or whose metastore change has not been applied yet does not
+            // end: what it ends in is what that run, that command or the metastore answers
+            // ([`Self::awaits_application`], [`Self::awaits_command`],
+            // [`Self::awaits_metastore_change`]).
+            if self.awaits_application() || self.awaits_command() || self.awaits_metastore_change()
+            {
                 self.state = step_state::RUNNING.to_string();
                 self.start_date_time = Some(start);
                 return;
