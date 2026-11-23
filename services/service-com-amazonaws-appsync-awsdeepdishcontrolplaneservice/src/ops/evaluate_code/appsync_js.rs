@@ -16,10 +16,11 @@
 //! A FRESH engine per call, so nothing of one evaluation is reachable from the next: no
 //! global, no module instance and no value outlives the call that made it. Inside that
 //! engine the code reaches the language and the host functions of this module's own (the
-//! log, the appended error, the id mint, the DynamoDB marshalling and the record of the
-//! `extensions` calls it made), and a module resolver that answers with ONE
-//! specifier — the `util` helpers AppSync's own resolvers import
-//! ([`crate::service::event_api::handlers::UTILS_MODULE`]) — so an `import` of anything
+//! log, the appended error, the id mint, the DynamoDB marshalling, the relational-database
+//! statement helpers and the record of the `extensions` calls it made), and a module resolver
+//! that answers with the TWO specifiers AppSync's own resolvers import
+//! ([`crate::service::event_api::handlers::UTILS_MODULE`] and [`RDS_UTILS_MODULE`]) — so an
+//! `import` of anything
 //! else fails to resolve rather than reaching a host path. Plain QuickJS registers no
 //! filesystem, process, environment, network, host-library or thread API, and this module
 //! adds none: `dyn-load` is left out of the build (see this crate's `Cargo.toml`).
@@ -72,6 +73,14 @@ use ::serde_json::Value as Json;
 
 use crate::service::event_api::handlers::UTILS_MODULE;
 use crate::state::{now_nanos, splitmix64};
+
+/// The `@aws-appsync/utils/rds` module: the statement builders a resolver over a relational
+/// database writes its request with, as their own module. The `#[path]` is what points this
+/// declaration beside this file, for the reason the one on this module itself states
+/// (`crate::ops::evaluate_code`).
+#[path = "appsync_js/rds_module.rs"]
+mod rds_module;
+use rds_module::{RDS_HOST_FUNCTION, RDS_UTILS_MODULE, RDS_UTILS_MODULE_SOURCE};
 
 /// How long one evaluation may run before it is stopped.
 ///
@@ -960,8 +969,38 @@ fn install_host(ctx: &Ctx<'_>, collected: &Arc<Mutex<Collected>>) -> Result<(), 
         .set("__appsyncDynamoDb", Func::from(dynamodb_helper))
         .map_err(|error| {
             format!("the sandbox DynamoDB helpers could not be installed: {error}")
+        })?;
+    globals
+        .set(RDS_HOST_FUNCTION, Func::from(rds_helper))
+        .map_err(|error| {
+            format!("the sandbox relational database helpers could not be installed: {error}")
         })
 }
+
+/// What one call of a `@aws-appsync/utils/rds` helper came to, as the JSON document the
+/// sandbox reads back: `value` for what the helper answered, or `error` for the fault it
+/// states.
+///
+/// The helpers themselves are the service's ONE reading of them
+/// (`crate::service::graphql_api::relational_database::utilities`), so a statement this
+/// runtime builds and the same statement built by a VELOCITY template carry one SQL text, and
+/// a result both read reports one set of rows. Nothing of the host is reachable through it:
+/// it is a pure transformation of the arguments the call was made with.
+fn rds_helper(helper: String, arguments: String) -> String {
+    use crate::service::graphql_api::relational_database::utilities;
+
+    let args: Vec<::serde_json::Value> =
+        ::serde_json::from_str(&arguments).unwrap_or_default();
+    let answered = match utilities::call(&helper, &args) {
+        Ok(Some(value)) => ::serde_json::json!({"value": value}),
+        Ok(None) => ::serde_json::json!({"error": format!("{NO_SUCH_RDS_HELPER}{helper}")}),
+        Err(fault) => ::serde_json::json!({"error": fault}),
+    };
+    answered.to_string()
+}
+
+/// How a call naming a relational-database helper this runtime does not publish is stated.
+const NO_SUCH_RDS_HELPER: &str = "No such helper: ";
 
 /// What one `util.dynamodb.<helper>` call came to, as the JSON document the sandbox reads
 /// back: `value` for the representation it marshalled, or `error` for the fault it states.
@@ -1387,8 +1426,9 @@ impl Bounds {
     }
 }
 
-/// How an `import` specifier is resolved: to [`UTILS_MODULE`] and to nothing else, so no
-/// host path and no other module is reachable from the evaluated code.
+/// How an `import` specifier is resolved: to the modules this runtime PROVIDES
+/// ([`PROVIDED_MODULES`]) and to nothing else, so no host path and no other module is
+/// reachable from the evaluated code.
 #[derive(Debug, Clone, Copy)]
 struct UtilsResolver;
 
@@ -1400,19 +1440,26 @@ impl Resolver for UtilsResolver {
         name: &str,
         _attributes: Option<ImportAttributes<'js>>,
     ) -> ::rquickjs::Result<String> {
-        if name == UTILS_MODULE {
-            return Ok(UTILS_MODULE.to_string());
+        if PROVIDED_MODULES.contains(&name) {
+            return Ok(name.to_string());
         }
         Err(::rquickjs::Error::new_resolving_message(
             base.to_string(),
             name.to_string(),
-            format!("the only module an APPSYNC_JS runtime provides is {UTILS_MODULE}"),
+            format!(
+                "the modules an APPSYNC_JS runtime provides are {}",
+                PROVIDED_MODULES.join(", ")
+            ),
         ))
     }
 }
 
-/// How the one resolvable module is loaded: from the source this module carries
-/// ([`UTILS_MODULE_SOURCE`]). No path is opened for it.
+/// The modules this runtime provides, each by the specifier an `import` names it with, and
+/// the source each is declared from ([`UtilsLoader`]).
+const PROVIDED_MODULES: &[&str] = &[UTILS_MODULE, RDS_UTILS_MODULE];
+
+/// How a provided module is loaded: from the source this crate carries for it. No path is
+/// opened for either.
 #[derive(Debug, Clone, Copy)]
 struct UtilsLoader;
 
@@ -1423,9 +1470,13 @@ impl Loader for UtilsLoader {
         path: &str,
         _attributes: Option<ImportAttributes<'js>>,
     ) -> ::rquickjs::Result<Module<'js>> {
-        if path != UTILS_MODULE {
+        let source = if path == UTILS_MODULE {
+            UTILS_MODULE_SOURCE
+        } else if path == RDS_UTILS_MODULE {
+            RDS_UTILS_MODULE_SOURCE
+        } else {
             return Err(::rquickjs::Error::new_loading(path.to_string()));
-        }
-        Module::declare(ctx.clone(), path.to_string(), UTILS_MODULE_SOURCE)
+        };
+        Module::declare(ctx.clone(), path.to_string(), source)
     }
 }

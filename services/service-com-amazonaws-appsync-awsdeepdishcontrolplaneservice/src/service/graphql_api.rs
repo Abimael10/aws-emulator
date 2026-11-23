@@ -64,6 +64,7 @@ pub mod mapping_template;
 pub mod metrics;
 pub mod query;
 pub mod realtime;
+pub mod relational_database;
 pub mod role_session;
 pub mod subscription_filters;
 pub mod subscriptions;

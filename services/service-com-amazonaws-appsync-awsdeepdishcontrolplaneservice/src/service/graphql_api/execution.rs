@@ -343,6 +343,12 @@ const DYNAMODB_DATA_SOURCE: &str = "AMAZON_DYNAMODB";
 /// request half rendered to ([`super::http_endpoint`]).
 const HTTP_DATA_SOURCE: &str = crate::state::HTTP_DATA_SOURCE_TYPE;
 
+/// The `DataSourceType` of a data source whose resource is a relational DATABASE: "the data
+/// source is a relational database" (`DataSource$type`), which a step resolving against one
+/// RUNS the statements its request half returned against
+/// ([`super::relational_database`]).
+const RELATIONAL_DATABASE_DATA_SOURCE: &str = crate::state::RELATIONAL_DATABASE_TYPE;
+
 /// The member a request function returns the result of a local resolver in, and — for a data
 /// source that is a function — the event that function is invoked with: AppSync's Lambda
 /// data-source request carries `{"version", "operation", "payload"}`, and the `payload` IS
@@ -1633,7 +1639,10 @@ impl Execution<'_> {
     /// (`Invoke`) or as the one-element list a batched invocation carries (`BatchInvoke`). An
     /// `AMAZON_EVENTBRIDGE` data source is CALLED too: the events the request carries are
     /// published onto the bus it was configured with, and the result is what EventBridge
-    /// answered ([`super::event_bridge`]). Every other type names a resource of another
+    /// answered ([`super::event_bridge`]). A `RELATIONAL_DATABASE` data source is CALLED as
+    /// well: the statements the request carries are run against the database it was configured
+    /// with, and the result is what that database's own HTTP endpoint answered
+    /// ([`super::relational_database`]). Every other type names a resource of another
     /// service, which this endpoint does not call, so the step is one no data source was
     /// called for rather than one answered with a value nothing produced — the distinction
     /// [`DataSourceOutcome`] draws, and what keeps such a refusal reaching the CALLER instead
@@ -1761,6 +1770,35 @@ impl Execution<'_> {
                     authorization_type: data_source.authorization_type.as_deref(),
                     signing_region: data_source.signing_region.as_deref(),
                     signing_service_name: data_source.signing_service_name.as_deref(),
+                    service_role_arn: data_source.service_role_arn.as_deref(),
+                },
+                requested,
+            )
+            .await
+            {
+                Ok(result) => DataSourceOutcome::Result(result),
+                // Carried as a RAISED failure, so the step's own `ctx.error` states the type
+                // the refusal is of and an error of the field reports it as its `errorType`.
+                Err(refused) => DataSourceOutcome::Answered(Failure::Raised(Box::new(Raised {
+                    message: refused.message,
+                    error_type: Some(refused.error_type),
+                    ..Raised::default()
+                }))),
+            },
+            // The statements a `RELATIONAL_DATABASE` data source's request half returned are
+            // RUN against the database the data source was configured with, through the
+            // cluster's own HTTP endpoint — the Amazon RDS Data API this emulator mounts, over
+            // its in-process transport, so no connection is opened
+            // ([`super::relational_database`]).
+            RELATIONAL_DATABASE_DATA_SOURCE => match super::relational_database::answered(
+                self.context,
+                &super::relational_database::Configured {
+                    name: &data_source.name,
+                    source_type: data_source.relational_source_type.as_deref(),
+                    cluster_arn: data_source.cluster_arn.as_deref(),
+                    secret_arn: data_source.secret_arn.as_deref(),
+                    database_name: data_source.database_name.as_deref(),
+                    aws_region: data_source.database_region.as_deref(),
                     service_role_arn: data_source.service_role_arn.as_deref(),
                 },
                 requested,
@@ -2631,6 +2669,16 @@ struct StepDataSource {
     authorization_type: Option<String>,
     signing_region: Option<String>,
     signing_service_name: Option<String>,
+    /// The `relationalDatabaseConfig` of a `RELATIONAL_DATABASE` data source: the source type
+    /// it is reached through and, for the one the model declares, the endpoint settings of the
+    /// cluster holding the database a step runs its statements against
+    /// ([`super::relational_database`]). `None` for every other type, which configures no
+    /// database.
+    relational_source_type: Option<String>,
+    cluster_arn: Option<String>,
+    secret_arn: Option<String>,
+    database_name: Option<String>,
+    database_region: Option<String>,
 }
 
 /// The data source `name` of `api`, or `None` when the API holds none under that name.
@@ -2695,7 +2743,30 @@ fn step_data_source(api: &GraphqlApiRecord, name: Option<&str>) -> Option<StepDa
                 .and_then(|config| config.authorization_config.as_ref())
                 .and_then(|authorization| authorization.aws_iam_config.as_ref())
                 .and_then(|iam| iam.signing_service_name.clone()),
+            relational_source_type: record
+                .relational_database_config
+                .as_ref()
+                .and_then(|config| config.relational_database_source_type.clone()),
+            cluster_arn: rds_endpoint(record)
+                .and_then(|endpoint| endpoint.db_cluster_identifier.clone()),
+            secret_arn: rds_endpoint(record)
+                .and_then(|endpoint| endpoint.aws_secret_store_arn.clone()),
+            database_name: rds_endpoint(record)
+                .and_then(|endpoint| endpoint.database_name.clone()),
+            database_region: rds_endpoint(record)
+                .and_then(|endpoint| endpoint.aws_region.clone()),
         })
+}
+
+/// The `relationalDatabaseConfig.rdsHttpEndpointConfig` of `record`, which is how a
+/// `RELATIONAL_DATABASE` data source of the one source type the model declares is reached
+/// ("Amazon RDS HTTP endpoint settings"), and `None` for a record carrying none.
+fn rds_endpoint(record: &DataSourceRecord) -> Option<&crate::ops::types::RdsHttpEndpointConfig> {
+    record
+        .relational_database_config
+        .as_ref()?
+        .rds_http_endpoint_config
+        .as_ref()
 }
 
 /// The steps a `PIPELINE` resolver invokes, in the order its `pipelineConfig` names them.

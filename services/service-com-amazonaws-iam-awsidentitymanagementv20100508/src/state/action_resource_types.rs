@@ -160,6 +160,16 @@ const SERVICE_ARN_TEMPLATES: &[(&str, &str)] = &[
 /// resource of IAM. An action no row names is performed on its own service's resources,
 /// which is the rule the rows are the exception to.
 const ACTIONS_ON_ANOTHER_SERVICE: &[(&str, &str)] = &[
+    // Every action of the RDS Data API is performed on the DB CLUSTER it addresses, which is
+    // a resource of Amazon RDS: the reference's resource-type column for each of them names
+    // RDS's `cluster`, and a policy that admits a Data API call therefore scopes it to a
+    // cluster ARN.
+    ("rds-data:BatchExecuteStatement", "rds"),
+    ("rds-data:BeginTransaction", "rds"),
+    ("rds-data:CommitTransaction", "rds"),
+    ("rds-data:ExecuteSql", "rds"),
+    ("rds-data:ExecuteStatement", "rds"),
+    ("rds-data:RollbackTransaction", "rds"),
     ("sts:AssumeRole", "iam"),
     ("sts:AssumeRoleWithSAML", "iam"),
     ("sts:AssumeRoleWithWebIdentity", "iam"),
@@ -301,7 +311,7 @@ mod tests {
         // published with a resource type, the service it belongs to, the casing it is
         // written in, and the resource it is asked about (the wildcard, an ARN of its own
         // service, an ARN of another service, and a value that is no ARN).
-        let rows: [(&str, &str, &str, bool); 15] = [
+        let rows: [(&str, &str, &str, bool); 17] = [
             (
                 "a registry token mint, on the wildcard",
                 "ecr:GetAuthorizationToken",
@@ -391,6 +401,18 @@ mod tests {
                 "s3:GetObject",
                 "reports/june.csv",
                 true,
+            ),
+            (
+                "a statement run, on the DB cluster it is run against",
+                "rds-data:ExecuteStatement",
+                "arn:aws:rds:us-west-2:000000000000:cluster:widgets",
+                true,
+            ),
+            (
+                "the same statement run, on a secret",
+                "rds-data:ExecuteStatement",
+                "arn:aws:secretsmanager:us-west-2:000000000000:secret:login",
+                false,
             ),
         ];
 

@@ -254,6 +254,16 @@ pub fn call(path: &[String], args: &[Json], context: &Json) -> Result<Answer, St
             Some(produced) => value(produced),
             None => Err(format!("{NO_SUCH_HELPER}$util.dynamodb.{helper}")),
         },
+        // The relational-database helpers: the statement builders a request template writes
+        // its statements with, and the reading of the result one produced
+        // ([`super::super::relational_database::utilities`]), which is the same reading an
+        // APPSYNC_JS resolver's `@aws-appsync/utils/rds` import reaches.
+        ["rds", helper] => {
+            match super::super::relational_database::utilities::call(helper, args)? {
+                Some(produced) => value(produced),
+                None => Err(format!("{NO_SUCH_HELPER}$util.rds.{helper}")),
+            }
+        }
         // The clock helpers, which read the one clock this process has.
         ["time", "nowISO8601"] => value(Json::String(now_iso8601())),
         ["time", "nowEpochSeconds"] => value(values::number(unix_millis() as f64 / 1000.0)),
