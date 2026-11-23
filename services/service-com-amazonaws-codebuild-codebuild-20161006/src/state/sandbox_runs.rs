@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! What a SANDBOX and the commands submitted to it come to as the clock moves them: the
-//! transitions a sandbox's own record is owed ([`StoredSandbox`]) and the one a command
-//! execution of that sandbox is owed ([`StoredCommandExecution`]).
+//! transitions a sandbox's own record is owed ([`StoredSandbox`]) and what one command
+//! execution of that sandbox records once its session has run it
+//! ([`StoredCommandExecution`]).
 //!
 //! Both are the same rule the rest of this store follows — a transition is due at the
 //! instant it was owed whether or not anybody called, and the reader that finds it due
 //! materialises it — stated here for the sandbox plane rather than beside the build plane's
-//! own records.
+//! own records. What a command execution's own transition WAITS for is the sandbox's session
+//! getting round to it, which
+//! [`ComAmazonawsCodebuildCodebuild20161006State::run_due_command_executions`] drives.
 
 use super::*;
 
@@ -92,6 +95,17 @@ impl StoredSandbox {
         }
     }
 
+    /// Epoch millis this sandbox's session ENDED at — `None` while it is still live.
+    ///
+    /// Read off the instant the record carries, the way [`Self::is_terminal`] is: past it
+    /// the sandbox has no session, so nothing of it can run a command.
+    pub fn ended_millis(&self) -> Option<i64> {
+        self.sandbox
+            .end_time
+            .as_ref()
+            .and_then(|at| at.to_millis().ok())
+    }
+
     /// Move this sandbox to the live state its provisioning span ended in.
     fn run(&mut self) {
         let requested = self.request_millis;
@@ -144,28 +158,45 @@ impl StoredCommandExecution {
         self.command_execution.end_time.is_some()
     }
 
-    /// Materialise this command execution's terminal state once its due instant has
-    /// passed.
+    /// Record what running this command in the sandbox's session answered
+    /// ([`super::sandbox_shell::SandboxShell::run`]): the status it exited with — which is
+    /// `SUCCEEDED` for zero and `FAILED` for anything else — the text it wrote on each
+    /// stream, and the window it occupied.
     ///
-    /// Idempotent and purely a function of the stored instants: an execution that has
-    /// already ended, or whose span has not elapsed, is left alone. It ends in
-    /// [`COMMAND_EXECUTION_STATUS_FAULT`] because nothing here ran the command — see
-    /// [`COMMAND_NOT_EXECUTED_MESSAGE`] — and therefore reports neither an
-    /// `exitCode` nor any `standardOutputContent`: no process exited and no command
-    /// wrote anything.
-    ///
-    /// `startTime` and `endTime` are both the due instant: the attempt was made and
-    /// given up there, so the record carries no run duration for work nothing
-    /// performed.
-    pub fn settle(&mut self, now_millis: i64) {
-        if self.is_terminal() || now_millis < self.settle_due_millis {
+    /// Idempotent in the sense every other settle here is: an execution that has already
+    /// ended is left alone, so a command is run once however many readers arrive.
+    pub fn record_run(&mut self, outcome: &super::sandbox_shell::CommandOutcome) {
+        if self.is_terminal() {
             return;
         }
-        let due = self.settle_due_millis;
-        self.command_execution.status = Some(COMMAND_EXECUTION_STATUS_FAULT.to_string());
-        self.command_execution.start_time = Some(datetime(due));
-        self.command_execution.end_time = Some(datetime(due));
-        self.command_execution.standard_err_content =
-            Some(COMMAND_NOT_EXECUTED_MESSAGE.to_string());
+        self.command_execution.status = Some(
+            if outcome.exit_code == 0 {
+                COMMAND_EXECUTION_STATUS_SUCCEEDED
+            } else {
+                COMMAND_EXECUTION_STATUS_FAILED
+            }
+            .to_string(),
+        );
+        self.command_execution.exit_code = Some(outcome.exit_code.to_string());
+        self.command_execution.standard_output_content = outcome.standard_output.clone();
+        self.command_execution.standard_err_content = outcome.standard_err.clone();
+        self.command_execution.start_time = Some(datetime(outcome.started_millis));
+        self.command_execution.end_time = Some(datetime(outcome.ended_millis));
+    }
+
+    /// End this execution at `ended_millis` because the sandbox's session ended before
+    /// anything could run it: a command can only run in a session, and the sandbox has none
+    /// — stopped by the caller, or reaped by the clock.
+    ///
+    /// It therefore reports neither an `exitCode` nor any output: no program exited and
+    /// nothing wrote anything. [`SANDBOX_STATUS_STOPPED`] is the status the sandbox's own
+    /// session took, which is what ended this command with it.
+    pub fn end_unrun(&mut self, ended_millis: i64) {
+        if self.is_terminal() {
+            return;
+        }
+        self.command_execution.status = Some(SANDBOX_STATUS_STOPPED.to_string());
+        self.command_execution.start_time = Some(datetime(ended_millis));
+        self.command_execution.end_time = Some(datetime(ended_millis));
     }
 }

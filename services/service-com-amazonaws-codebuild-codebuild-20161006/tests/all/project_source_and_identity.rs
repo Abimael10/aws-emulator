@@ -48,7 +48,7 @@ async fn read_project(router: &MultiServiceRouter, name: &str) -> Value {
 /// model states when it is required: "If you specify CODEPIPELINE for the Type property,
 /// don't specify this property. For all of the other types, you must specify Location."
 /// (`NO_SOURCE` is the other type with no source code to locate.) A source that states
-/// none is refused with 400 `InvalidInputException` worded `Invalid source: location is
+/// none is refused with 400 `InvalidInputException` worded `Project source location is
 /// required` — fixed text that quotes nothing of the request — wherever a project's
 /// source is SET, and nothing is stored.
 ///
@@ -64,10 +64,18 @@ async fn a_source_that_has_source_code_must_state_its_location() {
     // their own, named by the service rather than spelled here.
     let needs_no_location = [state::NO_SOURCE_TYPE, state::CODEPIPELINE_SOURCE_TYPE];
 
+    // The sentence itself, which is part of the contract a client matches on, pinned here
+    // and not only against the constant the handlers read.
+    assert_eq!(
+        state::SOURCE_LOCATION_REQUIRED_MESSAGE, "Project source location is required",
+        "the location refusal must carry CodeBuild's own sentence, got {:?}",
+        state::SOURCE_LOCATION_REQUIRED_MESSAGE
+    );
+
     for source_type in SOURCE_TYPE_VALUES {
-        // Fixed text: CodeBuild names the member of the configuration that is incomplete
-        // and the member missing from it, and quotes nothing of the request, so the
-        // sentence is the same for every source type the rule covers.
+        // Fixed text: CodeBuild names the member of the project configuration that is
+        // incomplete and quotes nothing of the request, so the sentence is the same for
+        // every source type the rule covers.
         let expected = state::SOURCE_LOCATION_REQUIRED_MESSAGE;
         // (case, the source the request sets)
         let absent: [(&str, Value); 2] = [

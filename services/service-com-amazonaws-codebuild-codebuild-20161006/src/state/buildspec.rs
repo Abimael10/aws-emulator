@@ -250,7 +250,10 @@ const YES: &str = "yes";
 /// The `EnvironmentVariable$type` whose value IS the value the build sees. The other
 /// two name a parameter or a secret the build would resolve through another service,
 /// which this reading does not do, so a variable of those types sets nothing here.
-const PLAINTEXT_VARIABLE_TYPE: &str = "PLAINTEXT";
+///
+/// Read by the SANDBOX's session too ([`super::sandbox_shell`]), which gives its commands
+/// the same environment variables under the same rule.
+pub(super) const PLAINTEXT_VARIABLE_TYPE: &str = "PLAINTEXT";
 
 /// A buildspec as the parts of it a build runs.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

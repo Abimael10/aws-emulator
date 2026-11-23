@@ -4,14 +4,27 @@
 //! Submits a command to a stored sandbox and persists the execution: this is the ONLY
 //! file to touch for this operation.
 //!
-//! The record is the command the caller asked for, in flight, with its terminal
-//! transition owed by the clock and materialised on the next read
-//! ([`crate::state::StoredCommandExecution::settle`]). A command execution needs a
-//! LIVE sandbox session to act on, so a sandbox that is still queued, or that has
-//! stopped or timed out, is refused. Nothing in this emulator executes a sandbox
-//! command, so the transition ends the execution in `FAULT` with the reason as its
-//! error text, and with no exit code and no output — see
-//! `crate::state::COMMAND_NOT_EXECUTED_MESSAGE`.
+//! The record is the command the caller asked for, in flight, with its run owed by the
+//! clock and performed on the next read
+//! ([`crate::state::ComAmazonawsCodebuildCodebuild20161006State::run_due_command_executions`]).
+//! A command execution needs a LIVE sandbox session to act on, so a sandbox that has
+//! stopped or timed out is refused. The command itself is RUN in the session its sandbox
+//! holds (`crate::state::SandboxShell`), so the execution settles `SUCCEEDED` or `FAILED`
+//! on the status the command exited with and reports that status together with what the
+//! command wrote on each stream.
+//!
+//! What that session is, and what it CANNOT do, is `crate::state::sandbox_shell`'s header:
+//! it is the workspace's one bounded, session-local POSIX session — the same one a build's
+//! phase commands run in — which starts no process (the executing half of the shell project
+//! is deliberately not a dependency of this workspace, so no command name is resolved
+//! against the host's `PATH` and nothing is handed to the host to run), opens no socket, and
+//! reads no host file and no host environment. It performs a fixed catalog of session-local
+//! utilities over its own in-memory tree and fails closed, with the status a shell answers
+//! for a command it cannot run, for every other command name and every form it does not
+//! perform; every bound it runs under is stated there and none is reachable from the
+//! command. That is why the caller's `command` is persisted as sent rather than filtered:
+//! the confinement is the session's, and a shape check here would refuse text AWS accepts
+//! without adding any.
 //!
 //! ## Shape of an operation
 //!
@@ -224,10 +237,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .clone()
                     .unwrap_or_else(|| crate::state::DEFAULT_COMMAND_TYPE.to_string()),
             ),
-            // Nothing has run, so there is no result to report: no exit code, no
-            // stdout, no stderr. The terminal transition fills in the error text that
-            // says why. `logs` stays absent for the same reason the sandbox session's
-            // does — a log stream is created with the container.
+            // Nothing has run the command yet, so there is no result to report: no exit
+            // code, no stdout, no stderr. The run the clock owes it fills them in.
+            // `logs` stays absent for the same reason the sandbox session's does — a log
+            // stream is created with the container.
             exit_code: None,
             standard_output_content: None,
             standard_err_content: None,

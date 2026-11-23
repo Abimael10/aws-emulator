@@ -103,6 +103,9 @@ mod resource_policy_document;
 mod runtime_versions;
 /// What a sandbox and the commands submitted to it come to as the clock moves them.
 mod sandbox_runs;
+/// What ONE command submitted to a sandbox does, in the session that sandbox holds — the
+/// shared bounded session, configured as a sandbox's.
+mod sandbox_shell;
 /// The ZIP archive a build's input and its output travel in.
 mod source_archive;
 /// The refusal this service words itself, whose wire identity no operation's modelled
@@ -131,6 +134,7 @@ pub use identifiers::*;
 pub use project_reference::*;
 pub use resource_policy_document::*;
 pub use runtime_versions::*;
+pub use sandbox_shell::{CommandOutcome, SandboxShell};
 
 /// The ARN service segment for this service, as `emulator_arn`'s first argument
 /// (`arn:aws:codebuild:<region>:<account>:<resource>`). Taken from the model's
@@ -853,39 +857,32 @@ pub const MIN_SANDBOX_IDLE_SPAN_MILLIS: i64 = 5_000;
 /// [`SANDBOX_IDLE_CLOCK_SCALE`].
 pub const MAX_SANDBOX_IDLE_SPAN_MILLIS: i64 = 60_000;
 
-/// How long after `StartCommandExecution` the clock owes a command execution its move
-/// out of [`COMMAND_EXECUTION_STATUS_IN_PROGRESS`].
+/// How long after `StartCommandExecution` the sandbox's session gets to the command it
+/// was handed — the instant the clock owes it its run.
 ///
-/// AWS documents no duration for a command execution — it is however long the command
-/// itself takes — so this span is CHOSEN, inside the 250-750 ms band this project
-/// fixes for an emulated transition. It is deliberately not zero: a caller that reads
-/// an execution straight after starting it still observes it in flight. The due
-/// instant is stored, never slept on.
+/// AWS documents no duration for the wait before a submitted command starts — how long
+/// the command itself then takes is the command's own business ([`sandbox_shell`]) — so
+/// this span is CHOSEN, inside the 250-750 ms band this project fixes for an emulated
+/// transition. It is deliberately not zero: a caller that reads an execution straight
+/// after starting it still observes it in flight. The due instant is stored, never slept
+/// on.
 pub const COMMAND_EXECUTION_SETTLE_MILLIS: i64 = 500;
 
-/// Why an emulated command execution never reports a result.
-///
-/// A command execution runs a shell command inside the sandbox's environment; nothing
-/// in this emulator executes one — there is no shell, container or process here to
-/// hand the command to — so the execution cannot report an exit code or any output. It
-/// ends instead in CodeBuild's own build-system failure status,
-/// [`COMMAND_EXECUTION_STATUS_FAULT`], carrying this explanation — the emulator's own,
-/// never output attributed to the command — as the execution's error text.
-pub const COMMAND_NOT_EXECUTED_MESSAGE: &str = "this emulator does not execute sandbox \
-    commands, so nothing ran this command: it produced no output and no exit code";
-
 /// The status a command execution reports between `StartCommandExecution` and the
-/// transition the clock owes it.
+/// instant the sandbox's session runs it.
 ///
 /// The model types `CommandExecution$status` as a free-form `NonEmptyString`, so the
 /// values reported for it here are the service's own `StatusType` enum values — the
-/// same pair a build's `buildStatus` moves through in this emulator.
+/// same ones a build's `buildStatus` moves through in this emulator.
 pub const COMMAND_EXECUTION_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
 
-/// The terminal status an emulated command execution reaches, for the reason
-/// [`COMMAND_NOT_EXECUTED_MESSAGE`] gives. `FAULT` is the `StatusType` value CodeBuild
-/// reports when the build system itself could not run the work.
-pub const COMMAND_EXECUTION_STATUS_FAULT: &str = "FAULT";
+/// The status a command execution whose command exited ZERO reaches: the command ran to
+/// success, which is the one thing that decides it ([`sandbox_shell`]).
+pub const COMMAND_EXECUTION_STATUS_SUCCEEDED: &str = "SUCCEEDED";
+
+/// The status a command execution whose command exited NON-ZERO reaches. See
+/// [`COMMAND_EXECUTION_STATUS_SUCCEEDED`].
+pub const COMMAND_EXECUTION_STATUS_FAILED: &str = "FAILED";
 
 /// The `CommandType` a `StartCommandExecution` that names none can only mean.
 ///
@@ -1027,6 +1024,15 @@ pub struct ComAmazonawsCodebuildCodebuild20161006State {
     /// modelled member: it is what makes an execution's derived id unique when two
     /// commands of one sandbox are submitted in the same millisecond.
     pub next_command_execution_numbers: BTreeMap<String, i64>,
+    /// The live SESSION of each sandbox that has been handed a command, keyed by sandbox
+    /// id — the environment its command executions run in ([`SandboxShell`]).
+    ///
+    /// Beside the sandbox record rather than inside it: a session holds the variables and
+    /// the working tree its commands have built up, which no reader hands back and which
+    /// nothing may copy — the sandbox runs its commands in ONE of them. Created when the
+    /// first command of a sandbox is run and dropped with the sandbox it belongs to, so it
+    /// never outlives the record ([`Self::enforce_sandbox_ceiling`]).
+    pub sandbox_sessions: BTreeMap<String, SandboxShell>,
     /// Session Manager connections, keyed by the `ssmSession` session id they report.
     ///
     /// Keyed by session id because that is what identifies one connection on the wire
@@ -2477,6 +2483,14 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
         if !evicted_any {
             return;
         }
+        // A session belongs to its sandbox: one whose record is gone can never run another
+        // command, so it goes with it rather than being held for nothing.
+        let Self {
+            sandbox_sessions,
+            sandboxes,
+            ..
+        } = self;
+        sandbox_sessions.retain(|id, _| sandboxes.contains_key(id));
         let mut counters = ::std::mem::take(&mut self.next_sandbox_numbers);
         counters.retain(|name, _| {
             self.projects.contains_key(name) || self.sandboxes_by_project.contains_key(name)
@@ -2582,12 +2596,10 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
         self.next_command_execution_numbers = counters;
     }
 
-    /// Read a command execution of `sandbox_id`, first materialising the transition the
-    /// clock already owes it — the command-execution counterpart of
-    /// [`Self::settled_build`], and the only write a reporting operation makes: the
-    /// move out of [`COMMAND_EXECUTION_STATUS_IN_PROGRESS`] was due at
-    /// `settle_due_millis` whether or not anybody called, and it is computed from the
-    /// stored instants, so repeating it changes nothing.
+    /// Read a command execution of `sandbox_id`, first running the commands the clock owes
+    /// that sandbox ([`Self::run_due_command_executions`]) — the command-execution
+    /// counterpart of [`Self::settled_build`], and the only write a reporting operation
+    /// makes: the run was owed at `settle_due_millis` whether or not anybody called.
     ///
     /// `None` for an id this sandbox did not start, even when another sandbox did: a
     /// command execution is addressed within the sandbox it belongs to, so one
@@ -2598,12 +2610,81 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
         id: &str,
         now_millis: i64,
     ) -> Option<&StoredCommandExecution> {
-        let stored = self.command_executions.get_mut(id)?;
+        self.run_due_command_executions(sandbox_id, now_millis);
+        let stored = self.command_executions.get(id)?;
         if stored.command_execution.sandbox_id.as_deref() != Some(sandbox_id) {
             return None;
         }
-        stored.settle(now_millis);
         Some(stored)
+    }
+
+    /// Run every command of `sandbox_id` whose turn the clock has brought round by
+    /// `now_millis`, in the order the commands were submitted, and record what each one
+    /// answered.
+    ///
+    /// A sandbox runs the commands handed to it one at a time in the ONE session it holds
+    /// ([`SandboxShell`]), so they are run here in submit order and in that session —
+    /// whichever execution a reader asked about. The run happens under this store's lock
+    /// because the session reaches nothing outside this process: it starts no process and
+    /// opens no socket or host file, and what ONE command may cost is bounded where the
+    /// session states its bounds (`::service_common::posix_shell_session`: the per-session
+    /// command budget, the line size, the nesting count, the expansion sizes, the variable
+    /// store and the tree), with the time a command states it took accounted rather than
+    /// slept.
+    ///
+    /// A command's turn comes once its own span has elapsed AND the sandbox's session is
+    /// live: a command submitted to a sandbox still being provisioned is queued by it, and
+    /// runs when the session it needs exists. A command whose sandbox has no session left —
+    /// stopped, reaped, or a record the store no longer holds — never ran at all, and ends
+    /// where that session did ([`StoredCommandExecution::end_unrun`]).
+    pub fn run_due_command_executions(&mut self, sandbox_id: &str, now_millis: i64) {
+        let Some(ids) = self.command_executions_by_sandbox.get(sandbox_id).cloned() else {
+            return;
+        };
+        // The sandbox is settled first, so the session a command is to run in is the one the
+        // clock has already moved: provisioned, or ended.
+        let (live_from_millis, ended_millis, variables) = match self.sandboxes.get_mut(sandbox_id) {
+            Some(sandbox) => {
+                sandbox.settle(now_millis);
+                (
+                    sandbox.settle_due_millis,
+                    sandbox.ended_millis(),
+                    sandbox_shell::session_variables(&sandbox.sandbox),
+                )
+            }
+            // A sandbox the store no longer holds has no session either, and none is coming.
+            None => (now_millis, Some(now_millis), BTreeMap::new()),
+        };
+        let Self {
+            command_executions,
+            sandbox_sessions,
+            ..
+        } = self;
+        for id in ids {
+            let Some(stored) = command_executions.get_mut(&id) else {
+                continue;
+            };
+            if stored.is_terminal() {
+                continue;
+            }
+            let run_at_millis = stored.settle_due_millis.max(live_from_millis);
+            // The session ended before this command's turn came, so nothing ran it.
+            if let Some(ended) = ended_millis.filter(|ended| *ended <= run_at_millis) {
+                stored.end_unrun(ended);
+                continue;
+            }
+            if now_millis < run_at_millis {
+                // Every execution after this one was submitted later, so its own turn is
+                // later still.
+                break;
+            }
+            let command = stored.command_execution.command.clone().unwrap_or_default();
+            let outcome = sandbox_sessions
+                .entry(sandbox_id.to_string())
+                .or_insert_with(|| SandboxShell::new(variables.clone()))
+                .run(&command, run_at_millis);
+            stored.record_run(&outcome);
+        }
     }
 
     /// Persist the connection `stored` under the session id `id`, first dropping the
@@ -4575,13 +4656,10 @@ pub const CODEPIPELINE_SOURCE_TYPE: &str = "CODEPIPELINE";
 /// from, carried by the modelled `InvalidInputException`.
 ///
 /// Fixed text, under [`SANDBOX_NOT_FOUND_MESSAGE`]'s rule: it names the member of the
-/// project configuration that is incomplete and the member missing from it, and quotes
-/// nothing of the request — so the sentence is the same for every source type the rule
-/// covers. It is the sentence CodeBuild states for the same rule on the OTHER member that
-/// needs a location, the project's artifacts (`Invalid artifacts: location is required`),
-/// with the member at fault swapped for this one. Recorded behaviour — the model states no
-/// message for the error.
-pub const SOURCE_LOCATION_REQUIRED_MESSAGE: &str = "Invalid source: location is required";
+/// project configuration that is incomplete and quotes nothing of the request — so the
+/// sentence is the same for every source type the rule covers. Recorded behaviour — the
+/// model states no message for the error.
+pub const SOURCE_LOCATION_REQUIRED_MESSAGE: &str = "Project source location is required";
 
 /// Why `source` states no location it could be built from, as the message the modelled
 /// `InvalidInputException` carries — or `None` when it states one, or needs none.

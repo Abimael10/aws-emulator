@@ -13,18 +13,18 @@
 //! run in its session, so a sandbox the account does not hold is refused with
 //! `ResourceNotFoundException` and one whose session has ENDED — stopped, or timed out —
 //! with `InvalidInputException` stating the status it is in, and in both cases nothing
-//! is persisted; a sandbox that is still being provisioned takes the submission. Nothing
-//! in
-//! this emulator executes a sandbox command, so the transition the clock owes an
-//! execution ends it in `FAULT` with the reason as its error text and with no exit
-//! code and no output.
+//! is persisted; a sandbox that is still being provisioned takes the submission. The
+//! command is then RUN in the session its sandbox holds, so the execution settles
+//! `SUCCEEDED` or `FAILED` on the status the command exited with and reports that status
+//! together with the text the command wrote on each stream (the whole of that rule is
+//! `tests/all/sandbox_command_runs.rs`'s subject).
 //!
 //! Each suite in `tests/all/` drives the wire itself, so the harness below (the
 //! router, `call`, the project body) is this suite's own — the sibling suite's copy is
 //! private to it.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_codebuild_codebuild_20161006::ops::types::{CommandExecution, Sandbox};
@@ -42,11 +42,13 @@ const REGION: &str = "us-west-2";
 /// The access key id every request below is signed with.
 const ACCESS_KEY_ID: &str = "AKIDCODEBUILDCOMMANDS";
 
-/// Long enough for a command execution's clock-owed terminal transition to have
-/// fallen due (the service settles it [`state::COMMAND_EXECUTION_SETTLE_MILLIS`]
-/// after `StartCommandExecution`).
-const PAST_THE_SETTLE_SPAN: Duration =
-    Duration::from_millis(state::COMMAND_EXECUTION_SETTLE_MILLIS as u64 + 400);
+/// How long a wait below gives the condition it waits for. Generous on purpose: the wait
+/// ends on the CONDITION, and the deadline is only there so a condition that never holds
+/// fails the test instead of hanging it.
+const CONDITION_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long such a wait leaves before looking again.
+const LOOK_AGAIN_AFTER: Duration = Duration::from_millis(20);
 
 /// How far out a SEEDED sandbox's own transition is put, in millis. This suite is
 /// about a command execution's clock, so the sandbox it submits to must not settle
@@ -255,6 +257,27 @@ async fn batch_get_command_executions(
     body
 }
 
+/// Look again until the execution `id` of `sandbox_id` has LEFT `IN_PROGRESS`, which the
+/// sandbox's session brings about on its own clock, and hand back the whole read.
+///
+/// Waits for the condition rather than for a span: nothing here depends on how fast the
+/// host runs.
+async fn settled_execution(router: &MultiServiceRouter, sandbox_id: &str, id: &str) -> Value {
+    let ids = [id.to_string()];
+    let deadline = Instant::now() + CONDITION_DEADLINE;
+    let mut last = Value::Null;
+    while Instant::now() < deadline {
+        last = batch_get_command_executions(router, sandbox_id, &ids).await;
+        if last["commandExecutions"][0]["status"]
+            != json!(state::COMMAND_EXECUTION_STATUS_IN_PROGRESS)
+        {
+            return last;
+        }
+        tokio::time::sleep(LOOK_AGAIN_AFTER).await;
+    }
+    panic!("the execution {id:?} never left IN_PROGRESS, last read {last}");
+}
+
 /// The `__type` an error body carries, for asserting the error code a client branches
 /// on.
 fn error_type(body: &Value) -> String {
@@ -445,11 +468,10 @@ async fn each_submission_mints_a_distinct_execution_and_keeps_submit_order() {
     }
 }
 
-/// RULE: the terminal transition is owed by the CLOCK, so it is materialised from the
-/// stored instants when the execution is read — once, and identically on every later
-/// read. Nothing here runs a sandbox container, so the execution ends in CodeBuild's
-/// build-system failure status with the reason as its error text, and with no exit
-/// code and no output.
+/// RULE: the run is owed by the CLOCK, so it is performed from the stored instants when
+/// the execution is read — once, and reported identically on every later read. The
+/// command runs in the sandbox's own session, so the execution ends on the status that
+/// command exited with and carries what it wrote.
 #[tokio::test]
 async fn a_command_execution_settles_once_from_stored_state_and_never_changes_again() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -472,29 +494,32 @@ async fn a_command_execution_settles_once_from_stored_state_and_never_changes_ag
         "an execution read straight after submitting it is still in flight, got {early}"
     );
 
-    tokio::time::sleep(PAST_THE_SETTLE_SPAN).await;
-
-    let settled =
-        batch_get_command_executions(&router, &sandbox_id, std::slice::from_ref(&id)).await;
+    // The run is owed by the clock: look again until the record has left the transient
+    // state rather than waiting a fixed span for it.
+    let settled = settled_execution(&router, &sandbox_id, &id).await;
     let record = settled["commandExecutions"][0].clone();
     assert_eq!(
         record["status"],
-        json!(state::COMMAND_EXECUTION_STATUS_FAULT),
-        "an execution no sandbox shell ran must end in FAULT, got {record}"
+        json!(state::COMMAND_EXECUTION_STATUS_SUCCEEDED),
+        "a command that exited zero must end SUCCEEDED, got {record}"
     );
     assert_eq!(
-        record["standardErrContent"],
-        json!(state::COMMAND_NOT_EXECUTED_MESSAGE),
-        "the execution must say why it produced nothing, got {record}"
+        record["exitCode"],
+        json!("0"),
+        "the execution must report the status the command exited with, got {record}"
+    );
+    assert_eq!(
+        record["standardOutputContent"],
+        json!("ok\n"),
+        "the execution must carry what the command wrote to stdout, got {record}"
     );
     assert!(
-        record["exitCode"].is_null() && record["standardOutputContent"].is_null(),
-        "nothing exited and nothing wrote to stdout, got {record}"
+        record["standardErrContent"].is_null(),
+        "the command wrote nothing to stderr, so nothing is reported for it, got {record}"
     );
     assert!(
         record["endTime"].is_number() && record["endTime"] == record["startTime"],
-        "the attempt was made and given up at one instant, so no run duration is \
-         reported, got {record}"
+        "a command that stated no time of its own occupies one instant, got {record}"
     );
     assert_eq!(
         record["submitTime"], submitted["submitTime"],
@@ -505,7 +530,7 @@ async fn a_command_execution_settles_once_from_stored_state_and_never_changes_ag
         "settling must not change the command submitted, got {record}"
     );
 
-    // Read again: identical, because it was computed once from the stored instants.
+    // Read again: identical, because the command was run once and recorded.
     let reread = batch_get_command_executions(&router, &sandbox_id, &[id]).await;
     assert_eq!(
         reread["commandExecutions"][0], record,
