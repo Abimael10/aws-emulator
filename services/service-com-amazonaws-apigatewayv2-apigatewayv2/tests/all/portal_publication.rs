@@ -161,7 +161,7 @@ impl Build {
 const EVERY_BUILD: [Build; 3] = [Build::Publish, Build::Disable, Build::Preview];
 
 /// Create a portal and answer `(PortalId, PortalDefaultDomainName)` — the id every build
-/// addresses it by and the generated host its preview URL is derived from.
+/// addresses it by and the domain name this emulator generates for it.
 async fn create_portal(emulator: &MultiServiceRouter, case: &str, display_name: &str) -> (String, String) {
     let request = json!({
         "authorization": { "none": {} },
@@ -534,9 +534,9 @@ async fn preview_portal_builds_a_preview_without_changing_what_the_portal_publis
 
         accepted(&emulator, case, Build::Preview, &portal_id, Option::None).await;
 
-        // The preview URL names THIS portal: it is served on the domain API Gateway
-        // generates and manages for the portal.
-        let expected_url = format!("https://{default_domain}/preview");
+        // The preview URL names THIS portal, and is served at the address this emulator
+        // serves the portal's site at — a `host:port` on this machine, since a client has
+        // to be able to fetch it — under the preview's own path.
         let building = get_portal(&emulator, case, &portal_id).await;
         let status = preview_member(case, &building, "previewStatus");
         assert!(
@@ -547,10 +547,22 @@ async fn preview_portal_builds_a_preview_without_changing_what_the_portal_publis
             status, PREVIEW_STATUS_PREVIEW_IN_PROGRESS,
             "case {case:?}: expected the started preview to be in progress, got {building}"
         );
-        assert_eq!(
-            preview_member(case, &building, "previewUrl"),
+        let expected_url = preview_member(case, &building, "previewUrl");
+        let fetchable = expected_url
+            .strip_prefix("https://")
+            .and_then(|rest| rest.strip_suffix("/preview"))
+            .and_then(|authority| authority.parse::<std::net::SocketAddr>().ok())
+            .is_some_and(|address| address.ip().is_loopback() && address.port() != 0);
+        assert!(
+            fetchable,
+            "case {case:?}: expected a preview URL a client on this machine can fetch, got \
+             {expected_url:?}"
+        );
+        assert_ne!(
             expected_url,
-            "case {case:?}: expected the preview URL of this portal, got {building}"
+            format!("https://{default_domain}/preview"),
+            "case {case:?}: the portal's default domain name carries no port, so it is no \
+             address to announce a preview at, got {expected_url:?}"
         );
         assert_eq!(
             publish_status(case, &building),

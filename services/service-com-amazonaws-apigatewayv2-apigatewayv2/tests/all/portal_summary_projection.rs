@@ -221,18 +221,31 @@ fn assert_preview(case: &str, portal_id: &str, item: &Value, previewed: bool) {
             .and_then(Value::as_str)
             .unwrap_or_default();
         // The preview is served on the portal's OWN site, so the URL is built on the
-        // address that portal publishes — which is the value that names this portal
-        // rather than any other.
-        let published = item
-            .get("endpointConfiguration")
-            .and_then(|endpoint| endpoint.get("portalDefaultDomainName"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+        // address this emulator serves that site at — the `host:port` of the socket the
+        // portal was given, which is an address a client on this machine can fetch. It is
+        // not the portal's default domain NAME, which carries no port at all.
+        let (authority, path) = url
+            .strip_prefix("https://")
+            .and_then(|rest| rest.split_once('/'))
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: expected the preview URL of {portal_id} to be an https \
+                     URL with a path, got {item}"
+                )
+            });
         assert_eq!(
-            url,
-            format!("https://{published}/preview"),
-            "case {case:?}: expected the preview URL on the address {portal_id} publishes, \
-             got {item}"
+            path, "preview",
+            "case {case:?}: expected the preview's own path on {portal_id}, got {item}"
+        );
+        let address = authority.parse::<std::net::SocketAddr>().unwrap_or_else(|error| {
+            panic!(
+                "case {case:?}: expected the preview URL of {portal_id} to name an address a \
+                 client can fetch, got {authority:?}: {error}"
+            )
+        });
+        assert!(
+            address.ip().is_loopback() && address.port() != 0,
+            "case {case:?}: expected an address of this machine, got {authority:?}"
         );
     } else {
         assert_eq!(

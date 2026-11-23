@@ -683,10 +683,11 @@ async fn the_preview_url_serves_the_portals_current_content_once_it_is_ready() {
 }
 
 /// The address a portal ANNOUNCES is one the client that created it can fetch, whichever
-/// endpoint that client reached this emulator at: `portalDefaultDomainName` is the
-/// `host:port` of the socket this emulator serves the portal's site on, the site is served at
-/// the ROOT of it, and the preview URL `Preview$PreviewUrl` announces is that same address
-/// with the preview's own path.
+/// endpoint that client reached this emulator at: `portalDefaultDomainName` is the domain
+/// name this emulator generates for the portal and answers for host-style, the site is served
+/// at the ROOT of it, and the preview URL `Preview$PreviewUrl` announces names the `host:port`
+/// of the socket the portal was given — an address a client dials — with the preview's own
+/// path.
 #[tokio::test]
 async fn a_portal_announces_a_preview_url_its_creator_can_fetch() {
     // (case, the host CreatePortal was addressed at)
@@ -718,17 +719,18 @@ async fn a_portal_announces_a_preview_url_its_creator_can_fetch() {
             .get("endpointConfiguration")
             .cloned()
             .unwrap_or(Value::Null);
-        // The address the portal publishes is one this emulator answers on, whichever
+        // The name the portal publishes is one this emulator answers for, whichever
         // endpoint this create was addressed at.
         let announced = as_str(&endpoint, "portalDefaultDomainName");
-        assert!(
-            announced.parse::<std::net::SocketAddr>().is_ok(),
-            "case {case:?}: the portal must publish an address a client can fetch, got \
-             {endpoint}"
+        crate::portal_lifecycle::assert_published_domain_name(
+            case,
+            &announced,
+            &portal_id,
+            REGION,
         );
 
-        // It is the address that SERVES the portal: a client that fetches what it was
-        // announced reaches this portal's page once a publish has settled.
+        // It is the name that SERVES the portal: a client that asks this emulator for what
+        // it was announced reaches this portal's page once a publish has settled.
         let page = fetch(&emulator, &announced, "/").await;
         refused(
             &format!("{case}: before the publish"),
@@ -740,8 +742,9 @@ async fn a_portal_announces_a_preview_url_its_creator_can_fetch() {
         let page = fetch_path_until_served(&emulator, case, &announced, "/").await;
         served(case, &page, &portal_id);
 
-        // The preview URL the service announces is built from that same address, and the
-        // preview is served there.
+        // The preview URL the service announces names the address this emulator serves the
+        // portal's site at — the `host:port` a client dials — and the preview is served at
+        // its path on the portal's domain too.
         let (status, started) = call_at_host(
             &emulator,
             host,
@@ -774,12 +777,21 @@ async fn a_portal_announces_a_preview_url_its_creator_can_fetch() {
             .get("preview")
             .map(|preview| as_str(preview, "previewUrl"))
             .unwrap_or_default();
-        assert_eq!(
-            preview_url,
-            format!("https://{announced}/{PORTAL_PREVIEW_SEGMENT}"),
-            "case {case:?}: the preview URL must name the announced address, got {read}"
-        );
         let preview_path = format!("/{PORTAL_PREVIEW_SEGMENT}");
+        assert_eq!(
+            preview_url.strip_prefix("https://").and_then(|rest| {
+                rest.split_once('/')
+                    .filter(|(authority, _path)| {
+                        authority
+                            .parse::<std::net::SocketAddr>()
+                            .is_ok_and(|address| address.ip().is_loopback())
+                    })
+                    .map(|(_authority, path)| format!("/{path}"))
+            }),
+            Some(preview_path.clone()),
+            "case {case:?}: the preview URL must name an address on this machine with the \
+             preview's own path, got {read}"
+        );
         let page = fetch_path_until_served(
             &emulator,
             &format!("{case}: the preview"),

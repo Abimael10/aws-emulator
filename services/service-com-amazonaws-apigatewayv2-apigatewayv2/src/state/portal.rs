@@ -39,11 +39,10 @@ pub struct Portal {
     /// client to the portal (`Preview$PreviewUrl`) names one address for the life of the
     /// record.
     ///
-    /// It is the same address `EndpointConfigurationResponse$PortalDefaultDomainName`
-    /// publishes, because the site is served at the ROOT of it; the two differ only on an
-    /// emulator that could open no socket at all, where the member carries the name API
-    /// Gateway's own zone would use and this carries whatever address the create was
-    /// addressed at ([`announced_portal_site_base`]).
+    /// It is NOT the value `EndpointConfigurationResponse$PortalDefaultDomainName` publishes:
+    /// that member is a domain NAME and carries no port, while this is the `host:port` a
+    /// client dials. On an emulator that could open no socket at all this carries the address
+    /// the create was addressed at instead ([`announced_portal_site_base`]).
     pub site_base: String,
     pub included_portal_product_arns: Vec<String>,
     /// The logo image URI the caller supplied, if any. Not a member of any modelled

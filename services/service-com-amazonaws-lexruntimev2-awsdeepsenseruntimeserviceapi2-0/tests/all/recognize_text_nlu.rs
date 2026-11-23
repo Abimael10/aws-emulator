@@ -889,9 +889,8 @@ async fn a_turn_addressed_to_a_locale_with_no_built_model_is_refused() {
     // address refusals are worded differently: a `botId`/`botAliasId` pair that
     // resolves to no alias names both ids, while a locale with no built model
     // carries the fixed BotId/BotLocale sentence. The READ of that session
-    // resolves the SAME address, so on every row it carries the SAME sentence as
-    // the turn: the session behind an address Amazon Lex V2 cannot serve is never
-    // reported, as absent or otherwise.
+    // resolves no address at all — it reports the session held under the four
+    // labels — so on every row it carries the absent-session sentence instead.
     let rows: Vec<(&str, String, String)> = vec![
         (
             "the bot's own locale, never built",
@@ -959,9 +958,9 @@ async fn a_turn_addressed_to_a_locale_with_no_built_model_is_refused() {
             refused.json()
         );
 
-        // The read of that session resolves the same address, so it carries the
-        // same sentence: the absence of the bot address is never reported as the
-        // absence of a session.
+        // The read reports the SESSION held under those labels, and the refused
+        // turn started none, so on every row it is the absent session that is
+        // reported — never the address, which a read does not resolve.
         let read = emulator.send("GET", path, None).await;
         assert_eq!(
             read.status, 404,
@@ -969,10 +968,11 @@ async fn a_turn_addressed_to_a_locale_with_no_built_model_is_refused() {
             read.status,
             String::from_utf8_lossy(&read.body)
         );
+        let absent = "The session for user unbuilt doesn\u{2019}t exist or has expired.";
         assert_eq!(
             at(&read.json(), "/message").as_deref(),
-            Some(expected_message.as_str()),
-            "case {case:?}: expected the read refused with {expected_message:?}, got {:?}",
+            Some(absent),
+            "case {case:?}: expected the read refused with {absent:?}, got {:?}",
             read.json()
         );
     }

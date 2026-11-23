@@ -10,10 +10,14 @@
 //!
 //! RULE B: a request whose `engineType` is not a member of the modelled `EngineType` set
 //! is refused by every operation that takes the member with HTTP 400
-//! `BadRequestException`, `errorAttribute` naming `engineType`, and Amazon MQ's own
-//! sentence for that error class: "Broker engine [<the value the request sent>] is
-//! invalid." — fixed text whose only variable part is the rejected value, with no list of
-//! accepted values appended.
+//! `BadRequestException` and `errorAttribute` naming `engineType`, worded as Amazon MQ
+//! words that refusal for the operation's own class: a CATALOG FILTER
+//! (`DescribeBrokerEngineTypes`, `DescribeBrokerInstanceOptions`) earns "Broker engine
+//! [<the value the request sent>] is invalid." — fixed text whose only variable part is
+//! the rejected value, with no list of accepted values appended — while a request naming
+//! the engine of a resource it would create (`CreateBroker`, `CreateConfiguration`) earns
+//! the member's own sentence, "Broker engine type [<the value the request sent>] is
+//! invalid. Valid values are: [<the modelled value set, comma-space separated>]".
 //!
 //! The tables span what the rules generalise over rather than one recorded request: every
 //! engine type the model enumerates crossed with every version it offers and with the
@@ -295,7 +299,7 @@ fn engine_types_outside_the_set() -> Vec<String> {
 }
 
 /// RULE B: every operation that takes `engineType` refuses a value outside the modelled
-/// set with Amazon MQ's own sentence, naming the member and no accepted values.
+/// set with Amazon MQ's own sentence for that operation class, naming the member at fault.
 #[tokio::test]
 async fn an_engine_type_outside_the_modelled_set_is_refused_the_same_way_everywhere() {
     let mq = Mq::new("us-east-1");
@@ -303,19 +307,23 @@ async fn an_engine_type_outside_the_modelled_set_is_refused_the_same_way_everywh
 
     for engine_type in engine_types_outside_the_set() {
         // Each operation that takes the member: both catalog reads, which take it as a
-        // query-string filter, and both creates, which take it in the body.
-        let requests: Vec<(String, &str, &str, Option<Value>)> = vec![
+        // query-string filter, and both creates, which take it in the body. The last
+        // field of a row is whether the operation takes it as a catalog FILTER, which is
+        // what decides the sentence.
+        let requests: Vec<(String, &str, &str, Option<Value>, bool)> = vec![
             (
                 format!("{ENGINE_TYPES_PATH}?engineType={engine_type}"),
                 "GET",
                 "DescribeBrokerEngineTypes",
                 None,
+                true,
             ),
             (
                 format!("{INSTANCE_OPTIONS_PATH}?engineType={engine_type}"),
                 "GET",
                 "DescribeBrokerInstanceOptions",
                 None,
+                true,
             ),
             (
                 "/v1/brokers".to_string(),
@@ -329,16 +337,18 @@ async fn an_engine_type_outside_the_modelled_set_is_refused_the_same_way_everywh
                     "publiclyAccessible": false,
                     "users": [{"username": "admin", "password": "SuperSecret123"}],
                 })),
+                false,
             ),
             (
                 "/v1/configurations".to_string(),
                 "POST",
                 "CreateConfiguration",
                 Some(json!({"name": "outside-the-set", "engineType": engine_type})),
+                false,
             ),
         ];
 
-        for (path, method, operation, body) in requests {
+        for (path, method, operation, body, filters_a_catalog) in requests {
             let case = format!("{operation} with engineType {engine_type:?}");
             let (status, code, answer) = mq.call_with_code(method, &path, body).await;
             assert_eq!(
@@ -354,7 +364,13 @@ async fn an_engine_type_outside_the_modelled_set_is_refused_the_same_way_everywh
                 Some("engineType"),
                 "case {case:?}: the refusal must name the member at fault, got {answer:?}"
             );
-            let expected = format!("Broker engine [{engine_type}] is invalid.");
+            let expected = match filters_a_catalog {
+                true => format!("Broker engine [{engine_type}] is invalid."),
+                false => format!(
+                    "Broker engine type [{engine_type}] is invalid. Valid values are: [{}]",
+                    ENGINE_TYPE_VALUES.join(", ")
+                ),
+            };
             assert_eq!(
                 answer.get("message").and_then(Value::as_str),
                 Some(expected.as_str()),

@@ -5,13 +5,14 @@
 //! Removes the stored session addressed by the four `@httpLabel` values and
 //! echoes the four back. A later `GetSession` for that key is a 404.
 //!
-//! The bot ADDRESS is resolved first, against the control plane that holds the
-//! bot — "if you specify a bot or alias ID that doesn't exist, you receive a
-//! BadRequestException. If the locale doesn't exist in the bot, or if the locale
-//! hasn't been enabled for the alias", the same — so a `botId`/`botAliasId` pair
-//! that is no alias of that bot, and a locale the version it points at cannot
-//! serve, are refused AS the address rather than as a session that is not there.
-//! Only then is the session store touched, so a refused delete removes nothing.
+//! What this operation resolves is the SESSION held under those four labels, and
+//! nothing else: a session is stored under the whole address, so a delete that
+//! finds none removes nothing and is reported as the session that is not there —
+//! whichever label of the address names nothing — with the sentence Amazon Lex V2
+//! states an absent session in ([`crate::state::session_not_found_message`]). The
+//! three calls that interpret an utterance or seed a dialog state need the bot's
+//! own built model and so resolve the address; removing the session held at an
+//! address does not.
 //!
 //! ## Shape of an operation
 //!
@@ -91,7 +92,6 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::bot_model::{servable_address, AddressRefused, LocaleUnavailable};
 use crate::state::SessionKey;
 use std::time::SystemTime;
 
@@ -130,33 +130,6 @@ impl From<DeleteSessionErrorModeled> for DeleteSessionError {
     fn from(modeled: DeleteSessionErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
-}
-
-/// The bot alias and locale the request addresses resolve to nothing this
-/// runtime can serve, or the control plane that holds them cannot be reached at
-/// all.
-///
-/// Two distinct misconfigurations, worded as Amazon Lex V2 words each: an alias
-/// id that is not an alias of that bot resolves to nothing at all, while a
-/// locale with no model has none to hold a conversation in. Both are the
-/// modelled `ResourceNotFoundException`, and both are answered BEFORE the
-/// session store is touched, so a refused delete removes nothing.
-fn locale_unavailable(
-    error: LocaleUnavailable,
-    bot_id: &str,
-    bot_alias_id: &str,
-) -> DeleteSessionError {
-    match error.refusal(bot_id, bot_alias_id) {
-        AddressRefused::NotFound(message) => {
-            DeleteSessionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message,
-            })
-        }
-        AddressRefused::Internal(message) => {
-            DeleteSessionErrorModeled::InternalServerException(InternalServerException { message })
-        }
-    }
-    .into()
 }
 
 /// The `DeleteSession` operation.
@@ -203,21 +176,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // A session is a conversation with ONE bot alias in one locale, so the
-        // bot/alias PAIR and that version's locale are resolved against the
-        // control plane before this runtime's own store is touched: "if you
-        // specify a bot or alias ID that doesn't exist, you receive a
-        // BadRequestException", and so does a locale the version the alias
-        // points at cannot serve. The refusal happens first, so a refused
-        // delete removes nothing.
-        servable_address(
-            &*self.engine,
-            &input.bot_id,
-            &input.bot_alias_id,
-            &input.locale_id,
-        )
-        .map_err(|error| locale_unavailable(error, &input.bot_id, &input.bot_alias_id))?;
-
         let key = SessionKey::new(
             &input.bot_id,
             &input.bot_alias_id,
@@ -227,7 +185,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Deleting a session that is not there — or one the clock has already
         // expired — removes nothing, so it is the modelled 404 rather than a
-        // success that claims a removal.
+        // success that claims a removal, and that is the answer for every address
+        // nothing is stored under, since the session is held under the whole
+        // address.
         if state
             .lock()
             .remove_session(&key, SystemTime::now())

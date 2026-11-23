@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePortal
-//! IMPLEMENTED: mints a `PortalId` and its ARN, opens the socket this emulator serves the
-//! portal's website on (`crate::service::portal_socket`) and publishes the address it landed
-//! on as the portal's default domain, resolves the endpoint configuration the request asked
+//! IMPLEMENTED: mints a `PortalId` and its ARN, announces the default domain name this
+//! emulator generates for the portal (a name in the zone this emulator answers in, which
+//! its own portal data plane claims host-style), opens the socket this emulator serves the
+//! portal's website on (`crate::service::portal_socket`) and keeps the address it landed on
+//! for the portal's URL-typed members, resolves the endpoint configuration the request asked
 //! for, persists a [`crate::state::Portal`] record under that id, and answers with that
 //! STORED record. This is the ONLY file to touch for this operation.
 //!
@@ -303,37 +305,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (portal_id, store.portal_id_seed)
         };
 
-        // The address this record PUBLISHES has to be one a client can fetch: the socket this
-        // portal's website is reached on is opened with the store's guard released, and the
-        // record is written once it has landed — so the value `PortalDefaultDomainName`
-        // reports is the address that socket answers on, and so is every URL-typed member
-        // that sends a client to the site.
+        // The portal's default domain name is the NAME this emulator announces for it — a
+        // domain name, which is what the member holds, in the zone this emulator may
+        // announce in and which its own portal data plane answers for host-style
+        // (`crate::state::announced_portal_default_domain_name`). The ADDRESS a client
+        // dials is a different value: the socket this portal's website is reached on is
+        // opened with the store's guard released, and every URL-typed member that sends a
+        // client to the site carries the `host:port` that socket answers on.
+        let portal_default_domain_name = crate::state::announced_portal_default_domain_name(
+            &portal_id,
+            &region,
+            ctx.parts(),
+            ctx.endpoint().as_str(),
+        );
         let opened = crate::service::portal_socket::open_for_portal(
             &*self.engine,
             ctx.callback().clone(),
             &portal_id,
         )
         .await;
-        let (portal_default_domain_name, site_base, socket) = match opened {
-            Ok(opened) => (
-                opened.authority.clone(),
-                opened.authority,
-                Some(opened.listener),
-            ),
+        let (site_base, socket) = match opened {
+            Ok(opened) => (opened.authority, Some(opened.listener)),
             Err(reason) => {
-                // An emulator that could not open a socket for this portal publishes the name
-                // API Gateway's own zone would carry: the record is still created — its whole
-                // control plane is unaffected — and only the address nothing serves is what a
-                // client cannot reach.
+                // An emulator that could not open a socket for this portal serves the site
+                // at the portal's own endpoint on this emulator's front door, which is the
+                // address `announced_portal_site_base` names: the record is still created —
+                // its whole control plane is unaffected — and only the socket of its own is
+                // missing.
                 ::tracing::warn!(
                     %portal_id,
                     %reason,
-                    "this portal is published under the name API Gateway's own zone would \
-                     carry: no socket of this emulator could be opened for it"
+                    "this portal's website is announced at this emulator's own endpoint: no \
+                     socket of this emulator could be opened for it"
                 );
                 (
-                    crate::state::portal_default_domain_name(&portal_id, &region),
-                    crate::state::announced_portal_site_base(&portal_id, &region, ctx.parts()),
+                    crate::state::announced_portal_site_base(
+                        &portal_id,
+                        &region,
+                        ctx.parts(),
+                        ctx.endpoint().as_str(),
+                    ),
                     ::std::option::Option::None,
                 )
             }
@@ -373,8 +384,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.endpoint_configuration,
             ),
             // Where this emulator SERVES that portal's website, which is what the portal's
-            // URL-typed members name: the same address its default domain publishes, since
-            // the site is served at the root of that address.
+            // URL-typed members name: the `host:port` of the socket the portal was given,
+            // which is the address a client on this machine dials.
             site_base,
             included_portal_product_arns,
             logo_uri: input.logo_uri,

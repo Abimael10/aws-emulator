@@ -1,22 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Every call addressed by the four session `@httpLabel`s resolves the BOT
-//! ADDRESS first, end to end over HTTP.
+//! What each call addressed by the four session `@httpLabel`s resolves, end to
+//! end over HTTP.
 //!
 //! The rule under test: a session call names a bot, an alias of that bot, a
-//! locale of the version the alias points at and a session id, and Amazon Lex V2
-//! resolves the bot address against the bot's own definition before it answers
-//! anything about the session — "if the bot, alias, or session identifier
-//! doesn't exist, Amazon Lex V2 returns a BadRequestException. If the locale
-//! doesn't exist or is not enabled for the alias, you receive a
-//! BadRequestException"
-//! (`smithy_query(query="doc",shape="GetSession",
-//! model_path="services/service-com-amazonaws-lexruntimev2-awsdeepsenseruntimeserviceapi2-0/smithy-model/com-amazonaws-lexruntimev2-awsdeepsenseruntimeserviceapi2-0.json")`,
-//! and the same two sentences on `DeleteSession`). So an address that resolves to
-//! no alias of that bot, or to a locale that version cannot serve, is refused AS
-//! the address — by the read and the delete exactly as by the three calls that
-//! interpret input or seed a dialog state — and only an address that resolves can
-//! report a session as absent.
+//! locale of the version the alias points at and a session id. A call that
+//! INTERPRETS an utterance or SEEDS a dialog state needs the bot's own built
+//! model, so it resolves that address first and refuses it as the address — an
+//! alias id that is no alias of that bot, or a locale that version cannot serve,
+//! is the modelled 404 in Amazon Lex V2's own words for the condition it hit. The
+//! two calls that only REPORT or REMOVE the session held under those labels
+//! resolve no address: the session is stored under the whole address, so a lookup
+//! that finds none is reported as the session that is not there, whichever label
+//! of the address names nothing.
 //!
 //! The rows span what the rule generalises over:
 //!
@@ -24,15 +20,13 @@
 //!   under, a well-formed `botAliasId` the bot does not have, an alias of ANOTHER
 //!   bot, a locale the bot has no record for, and a locale that was created but
 //!   never built — beside the fully resolving address as the control;
-//! * every operation the four labels address, including the two that only report
-//!   or remove the session held under them;
+//! * every operation the four labels address, on both sides of that rule;
 //! * the `sessionId` the absent-session sentence names, over the forms
 //!   `SessionId` admits (`smithy_query(query="shape",shape="SessionId")`:
 //!   `@length 2..100`, pattern `^[0-9a-zA-Z._:-]+$`) — at both ends of its length
 //!   and over each character class;
 //! * and the round trip through an address that resolves: a session seeded there
-//!   is reported back, removed and then reported absent, so resolving the address
-//!   withholds nothing a caller stored.
+//!   is reported back, removed and then reported absent.
 //!
 //! A control plane that drops the locale UNDER a stored session is the same rule
 //! over time, and is asserted in `bot_addressing.rs`.
@@ -161,8 +155,10 @@ fn session_ids() -> Vec<(&'static str, String)> {
 }
 
 /// RULE: an address that resolves to no alias of the bot, or to a locale the
-/// alias's version cannot serve, is refused as the ADDRESS by every call the four
-/// labels address — the same sentence, whichever operation asked.
+/// alias's version cannot serve, is refused as the ADDRESS by the three calls
+/// that interpret an utterance or seed a dialog state, while the read and the
+/// delete report the session held under those labels — which nothing stored, so
+/// they state the absent session.
 #[tokio::test]
 async fn every_session_call_refuses_an_address_that_resolves_to_nothing() {
     let emulator = Emulator::new();
@@ -261,10 +257,17 @@ async fn every_session_call_refuses_an_address_that_resolves_to_nothing() {
                 "case {case}: expected ResourceNotFoundException, got {:?}",
                 reply.error_type()
             );
+            // The read and the delete report the SESSION held under the labels,
+            // which is absent here; the other three resolve the address and are
+            // refused as the address.
+            let expected = match call.answers_from_a_stored_session() {
+                true => session_absent(&session_id),
+                false => expected.clone(),
+            };
             let message = reply.error_message();
             assert_eq!(
-                &message, expected,
-                "case {case}: expected the address's own sentence {expected:?}, got {message:?}"
+                message, expected,
+                "case {case}: expected {expected:?}, got {message:?}"
             );
 
             // The refusal had no effect: the same session id on the bot's own

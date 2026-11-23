@@ -1,26 +1,35 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The address a portal PUBLISHES, dialled over a real connection.
+//! The address a portal's site is SERVED at, dialled over a real connection, and the NAME it
+//! publishes for it.
 //!
 //! The rule these cases assert, one level above the recorded case that filed the issue (one
 //! portal created with `Authorization={None:{}}` and API Gateway's default domain, published,
 //! probed, disabled and probed again):
 //!
-//! > An address this service reports for a client to FETCH is an address the endpoint the
-//! > caller is talking to ANSWERS on, whatever endpoint that caller reached this emulator at.
-//! > For a portal that address is `EndpointConfigurationResponse$PortalDefaultDomainName` —
-//! > the host the portal's site is served on, "generated and managed by API Gateway" — so a
-//! > client that reads it off `CreatePortal` or `GetPortal` and opens a connection to it is
-//! > served the build of the portal's last settled publish at its root, is refused while the
-//! > portal has nothing live, and reaches nothing at all once the portal is deleted.
+//! > `EndpointConfigurationResponse$PortalDefaultDomainName` is a DOMAIN NAME this service
+//! > generates for the portal — "generated and managed by API Gateway" — so it carries host
+//! > labels and nothing else, and it is a name THIS emulator answers for: a request
+//! > addressed to it is served the build of the portal's last settled publish at its root,
+//! > is refused while the portal has nothing live, and reaches nothing at all once the portal
+//! > is deleted. The ADDRESS a client dials is the `host:port` of the socket this emulator
+//! > serves that site on, which the portal announces through its URL-typed members
+//! > (`Preview$PreviewUrl`), because a domain name carries no port.
 //!
 //! The sibling suites (`portal_data_plane`, `portal_publication_revocation`) assert WHAT that
-//! address answers through this emulator's own front door. What is asserted HERE is the half
-//! those cannot see: that the published value is an address on this machine, that a client
-//! which dials exactly what it was told completes a connection there, and that the connection
-//! stops being accepted when the portal goes — because a value naming a host nothing on this
-//! machine resolves passes every in-process check and still leaves the portal's site
-//! unreachable.
+//! name answers through this emulator's own front door. What is asserted HERE is the half
+//! those cannot see: that the portal is reached over a REAL connection, addressed by the name
+//! the service itself published, and that the connection stops being accepted when the portal
+//! goes — because a site nothing on this machine serves passes every in-process check and is
+//! still unreachable.
+//!
+//! The rows span what the rule generalises over: the endpoint the CREATE was addressed at
+//! (this service's own AWS host, the emulator's own endpoint as an IP literal with a port, a
+//! loopback name with a port), the portal's `EndpointConfiguration` alternative (API
+//! Gateway's default domain and a domain the account brought with its certificate), and the
+//! `Authorization` alternative (`None` and a `CognitoConfig`). The publication states each
+//! row walks are the flow itself: nothing published, published, a path with no page,
+//! disabled, re-probed, and deleted.
 //!
 //! The rows span what the rule generalises over: the endpoint the CREATE was addressed at
 //! (this service's own AWS host, the emulator's own endpoint as an IP literal with a port, a
@@ -145,50 +154,118 @@ async fn control(
     call_at_host(emulator, row.endpoint_host, REGION, method, uri, body).await
 }
 
-/// Assert `published` is an address on THIS machine that a client can open a connection to:
-/// what the member exists for is a consumer dialling it.
-fn assert_dialable(case: &str, published: &str) {
-    let address = published
+/// Assert `address` is an address on THIS machine that a client can open a connection to:
+/// what the portal's site is served at has to be dialable.
+fn assert_dialable(case: &str, address: &str) {
+    let parsed = address
         .parse::<std::net::SocketAddr>()
         .unwrap_or_else(|error| {
             panic!(
-                "case {case:?}: expected portalDefaultDomainName to be an address a client \
-                 can dial, got {published:?}: {error}"
+                "case {case:?}: expected the portal's site to be served at an address a \
+                 client can dial, got {address:?}: {error}"
             )
         });
     assert!(
-        address.ip().is_loopback(),
-        "case {case:?}: expected an address of this machine, got {published:?}"
+        parsed.ip().is_loopback(),
+        "case {case:?}: expected an address of this machine, got {address:?}"
     );
     assert_ne!(
-        address.port(),
+        parsed.port(),
         0,
-        "case {case:?}: expected a port a client can dial, got {published:?}"
+        "case {case:?}: expected a port a client can dial, got {address:?}"
     );
 }
 
-/// Dial `published` for `path` until `holds` is true of the answer, and answer that probe.
-/// `waited_for` names the condition in the failure message.
+/// The `host:port` the portal's own site is served at, read off the URL the portal announces
+/// its preview at (`Preview$PreviewUrl`, the one URL-typed member that carries that address).
+fn site_address(case: &str, preview_url: &str) -> String {
+    let authority = preview_url
+        .strip_prefix("https://")
+        .and_then(|rest| rest.split_once('/'))
+        .map(|(authority, _path)| authority.to_string())
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: expected an https preview URL with a path, got \
+                 {preview_url:?}"
+            )
+        });
+    assert_dialable(case, &authority);
+    authority
+}
+
+/// Start a preview on `portal_id` and answer the `Preview$PreviewUrl` the portal reports
+/// once that build has SETTLED — the one URL-typed member that names the address this
+/// emulator serves the portal's site at.
+///
+/// The wait is for the CONDITION (the preview reporting itself ready), never for a fixed
+/// time, and it is waited out before anything else is asked of the portal, because a build in
+/// flight is what a portal refuses another build for.
+async fn preview_url_once_ready(emulator: &MultiServiceRouter, row: &Row, case: &str, portal_id: &str) -> String {
+    let (status, body) = control(
+        emulator,
+        row,
+        "POST",
+        &format!("/v2/portals/{portal_id}/preview"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 202,
+        "case {case:?}: expected 202 from PreviewPortal, got {status} {body}"
+    );
+    let deadline = std::time::Instant::now() + CONDITION_DEADLINE;
+    loop {
+        let (status, read) = control(
+            emulator,
+            row,
+            "GET",
+            &format!("/v2/portals/{portal_id}"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from GetPortal, got {status} {read}"
+        );
+        let preview = read.get("preview").cloned().unwrap_or(Value::Null);
+        if as_str(&preview, "previewStatus") == PREVIEW_READY {
+            return as_str(&preview, "previewUrl");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: the preview of {portal_id} never settled, last read {read}"
+        );
+        tokio::time::sleep(PROBE_INTERVAL).await;
+    }
+}
+
+/// The `Preview$PreviewStatus` of a preview whose build has come due
+/// (`smithy_query(query="shape", shape="PreviewStatus")`).
+const PREVIEW_READY: &str = "PREVIEW_READY";
+
+/// Dial `address` for `path`, addressed by `host`, until `holds` is true of the answer, and
+/// answer that probe. `waited_for` names the condition in the failure message.
 ///
 /// The wait is for the CONDITION, never for a fixed time: the address is asked again until the
 /// condition holds or [`CONDITION_DEADLINE`] passes, so neither a fast nor a loaded host
 /// changes what the case observes.
 async fn probe_until(
     case: &str,
-    published: &str,
+    address: &str,
+    host: &str,
     path: &str,
     waited_for: &str,
     holds: impl Fn(&Answer) -> bool,
 ) -> Answer {
     let deadline = std::time::Instant::now() + CONDITION_DEADLINE;
     loop {
-        let answer = request_as(case, published, path, published).await;
+        let answer = request_as(case, address, path, host).await;
         if holds(&answer) {
             return answer;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "case {case:?}: {published}{path} never answered {waited_for}, last answer \
+            "case {case:?}: {host}{path} never answered {waited_for}, last answer \
              {answer:?}"
         );
         tokio::time::sleep(PROBE_INTERVAL).await;
@@ -210,14 +287,14 @@ fn assert_page(case: &str, answer: &Answer, portal_id: &str) {
     );
 }
 
-/// Whether a client can still open a connection to `published`.
+/// Whether a client can still open a connection to `address`.
 ///
-/// The port is the one the portal published and the host is the loopback literal this
-/// emulator's listeners bind, so nothing here dials off this machine. Answers as soon as the
-/// connection is accepted or refused; [`CONDITION_DEADLINE`] is only the bound that keeps a
-/// dial nothing ever answers from hanging the suite.
-async fn connects(published: &str) -> bool {
-    let Ok(address) = published.parse::<std::net::SocketAddr>() else {
+/// The port is the one the portal's site is served at and the host is the loopback literal
+/// this emulator's listeners bind, so nothing here dials off this machine. Answers as soon as
+/// the connection is accepted or refused; [`CONDITION_DEADLINE`] is only the bound that keeps
+/// a dial nothing ever answers from hanging the suite.
+async fn connects(address: &str) -> bool {
+    let Ok(address) = address.parse::<std::net::SocketAddr>() else {
         return false;
     };
     let dialed = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, address.port()));
@@ -228,7 +305,7 @@ async fn connects(published: &str) -> bool {
 }
 
 /// The whole flow a consumer of a published portal drives, over real connections to the
-/// address the service itself reported.
+/// address the service itself reported, addressed by the name it published.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_client_that_dials_the_published_address_is_served_the_portals_site() {
     for row in rows() {
@@ -247,11 +324,11 @@ async fn a_client_that_dials_the_published_address_is_served_the_portals_site() 
             .cloned()
             .unwrap_or(Value::Null);
         let published = as_str(&endpoint, "portalDefaultDomainName");
-        assert_dialable(case, &published);
+        crate::portal_lifecycle::assert_published_domain_name(case, &published, &portal_id, REGION);
 
-        // The reader reports the same address, so a client that goes through `GetPortal` —
-        // which is what a client that did not make the create does — dials what the create
-        // published.
+        // The reader reports the same name, so a client that goes through `GetPortal` —
+        // which is what a client that did not make the create does — addresses what the
+        // create published.
         let (status, read) = control(
             &emulator,
             row,
@@ -270,16 +347,28 @@ async fn a_client_that_dials_the_published_address_is_served_the_portals_site() 
         );
         assert_eq!(
             read_published, published,
-            "case {case:?}: expected GetPortal to report the published address, got {read}"
+            "case {case:?}: expected GetPortal to report the published name, got {read}"
         );
 
-        // Nothing has published this portal, so the address ANSWERS — a connection is
+        // The ADDRESS that name is served at is the portal's own socket, which the portal
+        // announces through the one URL-typed member that carries it: a preview is built
+        // here so the portal reports one, and the preview's own page is asserted below.
+        let preview_url = preview_url_once_ready(&emulator, row, case, &portal_id).await;
+        let address = site_address(case, &preview_url);
+        assert_eq!(
+            preview_url,
+            format!("https://{address}/{PORTAL_PREVIEW_SEGMENT}"),
+            "case {case:?}: expected the preview URL on the address the site is served at, \
+             got {preview_url:?}"
+        );
+
+        // Nothing has published this portal, so the published NAME answers — a connection is
         // accepted and an HTTP answer comes back — with the refusal a site with nothing live
         // earns, rather than with the page or with nothing at all.
-        let answer = request_as(case, &published, "/", &published).await;
+        let answer = request_as(case, &address, "/", &published).await;
         assert_eq!(
             answer.status, FORBIDDEN,
-            "case {case:?}: expected {FORBIDDEN} from the published address before the first \
+            "case {case:?}: expected {FORBIDDEN} from the published name before the first \
              publish, got {answer:?}"
         );
 
@@ -296,57 +385,30 @@ async fn a_client_that_dials_the_published_address_is_served_the_portals_site() 
             status, 202,
             "case {case:?}: expected 202 from PublishPortal, got {status} {body}"
         );
-        let answer = probe_until(case, &published, "/", "the portal's page", |answer| {
-            answer.status == SERVED
-        })
+        let answer = probe_until(
+            case,
+            &address,
+            &published,
+            "/",
+            "the portal's page",
+            |answer| answer.status == SERVED,
+        )
         .await;
         assert_page(case, &answer, &portal_id);
 
-        // A path the portal has no page at is its own class on that same address.
-        let answer = request_as(case, &published, "/nowhere", &published).await;
+        // A path the portal has no page at is its own class on that same name.
+        let answer = request_as(case, &address, "/nowhere", &published).await;
         assert_eq!(
             answer.status, NOT_FOUND,
             "case {case:?}: expected {NOT_FOUND} for a path the portal has no page at, got \
              {answer:?}"
         );
 
-        // The preview the portal announces is on the same address, and is served there once
-        // its build has come due.
-        let (status, body) = control(
-            &emulator,
-            row,
-            "POST",
-            &format!("/v2/portals/{portal_id}/preview"),
-            None,
-        )
-        .await;
-        assert_eq!(
-            status, 202,
-            "case {case:?}: expected 202 from PreviewPortal, got {status} {body}"
-        );
-        let (status, read) = control(
-            &emulator,
-            row,
-            "GET",
-            &format!("/v2/portals/{portal_id}"),
-            None,
-        )
-        .await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: expected 200 from GetPortal, got {status} {read}"
-        );
-        let preview_url = read
-            .get("preview")
-            .map(|preview| as_str(preview, "previewUrl"))
-            .unwrap_or_default();
-        assert_eq!(
-            preview_url,
-            format!("https://{published}/{PORTAL_PREVIEW_SEGMENT}"),
-            "case {case:?}: expected the preview URL on the published address, got {read}"
-        );
+        // The preview the portal announced is served at its own path, once its build has
+        // come due.
         let answer = probe_until(
             case,
+            &address,
             &published,
             &format!("/{PORTAL_PREVIEW_SEGMENT}"),
             "the portal's preview",
@@ -370,7 +432,7 @@ async fn a_client_that_dials_the_published_address_is_served_the_portals_site() 
             "case {case:?}: expected 204 from DisablePortal, got {status} {body}"
         );
         for probe in 1..=3 {
-            let answer = request_as(case, &published, "/", &published).await;
+            let answer = request_as(case, &address, "/", &published).await;
             assert_eq!(
                 answer.status, FORBIDDEN,
                 "case {case:?}: probe {probe} after the disable must find nothing served, got \
@@ -393,22 +455,24 @@ async fn a_client_that_dials_the_published_address_is_served_the_portals_site() 
             "case {case:?}: expected 204 from DeletePortal, got {status} {body}"
         );
         assert!(
-            !connects(&published).await,
-            "case {case:?}: expected {published} to accept no connection once the portal is \
+            !connects(&address).await,
+            "case {case:?}: expected {address} to accept no connection once the portal is \
              deleted"
         );
     }
 }
 
-/// One portal, one address: every portal of the account is published at an address of its
-/// own, and each serves ITS own site rather than another portal's.
+/// One portal, one name and one address: every portal of the account publishes a name of its
+/// own and is served at an address of its own, and each serves ITS own site rather than
+/// another portal's.
 #[tokio::test(flavor = "multi_thread")]
 async fn each_portals_published_address_serves_only_its_own_site() {
     let case = "two portals of one account, both published";
     let emulator = emulator();
     let row = &rows()[0];
 
-    let mut portals: Vec<(String, String)> = Vec::new();
+    // (portal id, the name it published, the address its site is served at)
+    let mut portals: Vec<(String, String, String)> = Vec::new();
     for index in 0..2 {
         let (status, created) = control(
             &emulator,
@@ -433,7 +497,10 @@ async fn each_portals_published_address_serves_only_its_own_site() {
                 .unwrap_or(&Value::Null),
             "portalDefaultDomainName",
         );
-        assert_dialable(case, &published);
+        crate::portal_lifecycle::assert_published_domain_name(case, &published, &portal_id, REGION);
+        // The address that name is served at, read off the portal's own preview URL.
+        let preview_url = preview_url_once_ready(&emulator, row, case, &portal_id).await;
+        let address = site_address(case, &preview_url);
         let (status, body) = control(
             &emulator,
             row,
@@ -446,23 +513,32 @@ async fn each_portals_published_address_serves_only_its_own_site() {
             status, 202,
             "case {case:?}: expected 202 from PublishPortal, got {status} {body}"
         );
-        portals.push((portal_id, published));
+        portals.push((portal_id, published, address));
     }
 
     assert_ne!(
         portals[0].1, portals[1].1,
+        "case {case:?}: expected each portal its own published name, got {portals:?}"
+    );
+    assert_ne!(
+        portals[0].2, portals[1].2,
         "case {case:?}: expected each portal its own address, got {portals:?}"
     );
-    for (portal_id, published) in &portals {
-        let answer = probe_until(case, published, "/", "the portal's page", |answer| {
-            answer.status == SERVED
-        })
+    for (portal_id, published, address) in &portals {
+        let answer = probe_until(
+            case,
+            address,
+            published,
+            "/",
+            "the portal's page",
+            |answer| answer.status == SERVED,
+        )
         .await;
         assert_page(case, &answer, portal_id);
         let other = portals
             .iter()
-            .find(|(other_id, _)| other_id != portal_id)
-            .map(|(other_id, _)| other_id.clone())
+            .find(|(other_id, _, _)| other_id != portal_id)
+            .map(|(other_id, _, _)| other_id.clone())
             .unwrap_or_default();
         assert!(
             !answer

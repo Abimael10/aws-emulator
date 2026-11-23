@@ -169,11 +169,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `engineType` and `storageType` name values the model enumerates
         // (`EngineType`, `BrokerStorageType`), so a value outside the set is refused
-        // naming the member at fault rather than quietly matching nothing. Same
-        // sentence as every other operation of this service states it with.
+        // naming the member at fault rather than quietly matching nothing. A catalog
+        // FILTER carries this operation class's own sentence for the engine type
+        // (`state::validate_engine_type_filter`), which names no accepted values.
         if let Some(engine_type) = engine_type {
-            state::validate_enum("engineType", engine_type, ENGINE_TYPE_VALUES)
-                .map_err(bad_request)?;
+            state::validate_engine_type_filter(engine_type).map_err(bad_request)?;
         }
         if let Some(storage_type) = storage_type {
             validate_catalog_storage_type(storage_type).map_err(bad_request)?;

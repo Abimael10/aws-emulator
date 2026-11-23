@@ -18,10 +18,11 @@
 //! actually built.
 //!
 //! Resolving the ADDRESS — the bot/alias pair and the locale behind it — is the
-//! other half of the same reading, and every operation the four session labels
-//! address resolves it here, including the two that only report or remove the
-//! session held under those labels
-//! ([`servable_address`]).
+//! other half of the same reading, and every operation that interprets an
+//! utterance or seeds a dialog state resolves it here ([`built_locale`]). The two
+//! operations that only report or remove the session held under those labels
+//! resolve no address at all: the session is stored under the whole address, so a
+//! lookup that finds none is the answer they owe.
 
 use crate::ops::types::{Button, ImageResponseCard, Message, Value};
 use crate::state::FALLBACK_INTENT;
@@ -392,27 +393,6 @@ pub fn built_locale<Eng: Send + Sync + 'static>(
         nlu_intent_confidence_threshold,
         intents,
     })
-}
-
-/// Resolve the address alone: the bot, the alias and the locale the four labels
-/// of a session call name, without copying out the model a turn is interpreted
-/// against.
-///
-/// What this answers is whether Amazon Lex V2 can serve the bot address at all —
-/// "if the bot, alias, or session identifier doesn't exist … if the locale
-/// doesn't exist or is not enabled for the alias" — which every operation
-/// addressed by those labels resolves, including the two that only report or
-/// remove the session held under them.
-pub fn servable_address<Eng: Send + Sync + 'static>(
-    engine: &Eng,
-    bot_id: &str,
-    bot_alias_id: &str,
-    locale_id: &str,
-) -> Result<(), LocaleUnavailable> {
-    let control_plane =
-        lexmodels::state::service_state(engine).ok_or(LocaleUnavailable::StoreUnavailable)?;
-    let mut control_plane = control_plane.lock();
-    servable_version(&mut control_plane, bot_id, bot_alias_id, locale_id).map(|_| ())
 }
 
 /// The bot version the addressed pair resolves to, once that version's locale is

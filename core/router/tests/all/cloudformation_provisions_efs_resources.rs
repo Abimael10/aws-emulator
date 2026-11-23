@@ -743,11 +743,12 @@ async fn a_stack_provisions_the_efs_estate_its_template_declares() {
                 reported["RootDirectory"]
             );
             // The POSIX identifiers the type publishes as STRINGS reach Amazon EFS as the
-            // numbers its own model types them as, at every depth the declaration nests them,
-            // and the identity is reported with the secondary group list it holds.
+            // numbers its own model types them as, at every depth the declaration nests them.
+            // The declaration names no secondary group, and `PosixUser$SecondaryGids` is
+            // optional with no default, so the identity carries no such list.
             assert_eq!(
                 reported["PosixUser"],
-                json!({"Uid": 1001, "Gid": 1001, "SecondaryGids": []}),
+                json!({"Uid": 1001, "Gid": 1001}),
                 "case {case:?}: expected the declared POSIX user as the numbers that service \
                  types them as, got {:?}",
                 reported["PosixUser"]

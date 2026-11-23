@@ -167,11 +167,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `engineType` names values the model enumerates (`EngineType`), so a value
         // outside the set is refused naming the member at fault rather than quietly
-        // matching nothing. Same sentence as every other operation of this service
-        // states it with.
+        // matching nothing. A catalog FILTER carries this operation class's own
+        // sentence (`state::validate_engine_type_filter`), which names no accepted
+        // values.
         if let Some(engine_type) = engine_type {
-            state::validate_enum("engineType", engine_type, ENGINE_TYPE_VALUES)
-                .map_err(bad_request)?;
+            state::validate_engine_type_filter(engine_type).map_err(bad_request)?;
         }
 
         // `maxResults` carries the modelled `@range(min: 1, max: 100)`, which this

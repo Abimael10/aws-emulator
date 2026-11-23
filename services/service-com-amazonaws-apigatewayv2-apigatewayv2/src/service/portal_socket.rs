@@ -2,17 +2,17 @@
 
 //! The SOCKET a portal's website is reached on, and what a request made there is served by.
 //!
-//! `CreatePortal` mints an address a CONSUMER fetches: the portal's default domain name is
-//! "generated and managed by API Gateway"
+//! `CreatePortal` mints a portal whose site a CONSUMER fetches: the portal's default domain
+//! name is "generated and managed by API Gateway"
 //! (`EndpointConfigurationResponse$PortalDefaultDomainName`), and what `PublishPortal` builds
-//! is served on it — so a client that reads that member off the create or off `GetPortal` and
-//! asks for its root expects the portal's site, and expects to stop getting it once
+//! is served under it — so a client that reads that member off the create or off `GetPortal`
+//! and asks for its root expects the portal's site, and expects to stop getting it once
 //! `DisablePortal` has taken the publication down.
 //!
-//! A name under API Gateway's own zone resolves to nothing on the machine this emulator runs
-//! on, so each portal is given a socket of the EMULATOR's own
-//! ([`crate::state::portal_transport`]) and publishes the `host:port` that socket answers on.
-//! This module is the handler the core hands each connection accepted there:
+//! A domain name carries no port, so the ADDRESS a client dials is one of this emulator's own:
+//! each portal is given a socket ([`crate::state::portal_transport`]) whose `host:port` the
+//! portal's URL-typed members carry. This module is the handler the core hands each connection
+//! accepted there:
 //!
 //! 1. encryption is negotiated in band, because the address is published for `https` callers
 //!    and the handshake's first bytes have to be read by this socket to tell a TLS client from
@@ -55,16 +55,16 @@ const FORBIDDEN: u16 = super::data_plane::FORBIDDEN_STATUS;
 const FORBIDDEN_MESSAGE: &str = super::data_plane::FORBIDDEN_MESSAGE;
 
 /// Open the socket the portal `portal_id` is reached on, answering the socket itself and the
-/// `host:port` it landed on — the address that record publishes as its
-/// `PortalDefaultDomainName`.
+/// `host:port` it landed on — the address that record's URL-typed members send a client to.
 ///
 /// The core owns the socket, the interface, the port and the connection caps; this hands it
 /// the handler and answers the HANDLE, which the caller remembers on this service's own store
 /// once the record is written ([`crate::state::portal_transport`]) — so a create that is
 /// refused after this point leaves nothing listening and displaces no socket another portal
 /// holds. Dropping the handle closes the port. `Err` when this service was mounted on an
-/// engine with no listener surface, or when the core could not bind: the caller then publishes
-/// the name API Gateway's own zone would carry, which no client on this machine resolves.
+/// engine with no listener surface, or when the core could not bind: the portal's site is then
+/// served at this emulator's own endpoint behind the reserved data-plane marker, the address
+/// `crate::state::announced_portal_site_base` names.
 ///
 /// `callback` is the in-process transport a request accepted there is served over — the handle
 /// the operation that mints the portal is given (`OperationContext::callback`), kept for the
@@ -119,7 +119,7 @@ pub async fn open_for_portal<Eng: Send + Sync + 'static>(
 /// The socket one portal is reached on, before the record that owns it is written: the address
 /// it landed on, and the handle whose life is that record's.
 pub struct Opened {
-    /// The `host:port` a client fetches, which is what the record publishes.
+    /// The `host:port` a client fetches, which is what the record's URL-typed members carry.
     pub authority: String,
     /// The listener itself. Dropping it closes the port, which is what a create refused after
     /// the socket was opened does.

@@ -326,12 +326,12 @@ async fn create_portal_persists_the_record_and_get_portal_reports_it_back() {
         // `LastModified` is the instant this call stored the record.
         let last_modified = instant(case, &created, "lastModified");
 
-        // The resolved endpoint configuration: the address the portal's site is published
-        // at always, the account's own domain and certificate only when the request brought
-        // one.
+        // The resolved endpoint configuration: the name the portal's site is published
+        // under always, the account's own domain and certificate only when the request
+        // brought one.
         let endpoint = endpoint_configuration(case, &created);
         let default_domain = as_str(&endpoint, "portalDefaultDomainName");
-        assert_published_address(case, &default_domain);
+        assert_published_domain_name(case, &default_domain, &portal_id, REGION);
         let hosted_zone = as_str(&endpoint, "portalDomainHostedZoneId");
         assert!(
             hosted_zone.starts_with('Z')
@@ -525,9 +525,10 @@ async fn the_generated_endpoint_values_follow_the_requests_region() {
         );
         let endpoint = endpoint_configuration(region, &created);
         let domain = as_str(&endpoint, "portalDefaultDomainName");
-        // The default domain is the address this emulator serves the portal's site on, so it
-        // names no Region: the hosted zone the Region decides is asserted below.
-        assert_published_address(region, &domain);
+        // The generated default domain name carries the portal's own id and the Region the
+        // portal lives in, so a portal of another Region is named in that Region; the hosted
+        // zone the Region decides is asserted below.
+        assert_published_domain_name(region, &domain, &portal_id, region);
         by_region.push((
             region,
             domain,
@@ -827,30 +828,59 @@ async fn an_account_holds_at_most_the_portals_its_quota_allows() {
 /// `__stringMin3Max256` (`smithy_query(query="shape", shape="EndpointConfigurationResponse")`).
 const DOMAIN_NAME_LENGTH: (usize, usize) = (3, 256);
 
-/// Assert `value` is the address this emulator PUBLISHES a portal's site at: within the
-/// modelled length bound, and a `host:port` on this machine that a client can open a
-/// connection to — the member exists for a consumer to fetch the portal's site at, so a name
-/// nothing on this machine resolves is no value for it.
-fn assert_published_address(case: &str, value: &str) {
+/// The zone this emulator announces a name of its own in when the request reached it at an
+/// ADDRESS rather than at a name: the zone RFC 6761 reserves for the loopback interface,
+/// which is the interface the core binds on
+/// (`service_common::data_plane_addressing::LOOPBACK_ZONE`). Every case in this suite
+/// reaches the emulator at a loopback address, at the loopback name, or at one of AWS's own
+/// hosts — which is no zone of this emulator's to announce in — so every one of them is
+/// announced here.
+pub(crate) const ANNOUNCED_ZONE: &str = "localhost";
+
+/// Assert `value` is the default domain name this emulator GENERATES for the portal
+/// `portal_id` of `region`.
+///
+/// `PortalDefaultDomainName` is "the portal default domain name. This domain name is
+/// generated and managed by API Gateway", typed `__stringMin3Max256`, so the value is a
+/// DOMAIN NAME: dot-separated host labels, within the modelled length, with no scheme, no
+/// `:port` and no path — a client resolves it, writes it in a `Host` header and points a
+/// CNAME or a Route 53 alias record at it. AWS generates
+/// `p-{portalId}.apigw-portal.{region}.on.aws`; this emulator generates the same labels in
+/// the zone it may announce in ([`ANNOUNCED_ZONE`]), so the name leads back to this process.
+pub(crate) fn assert_published_domain_name(
+    case: &str,
+    value: &str,
+    portal_id: &str,
+    region: &str,
+) {
     let (min, max) = DOMAIN_NAME_LENGTH;
     let length = value.chars().count();
     assert!(
         (min..=max).contains(&length),
         "case {case:?}: expected a value of {min}..{max} characters, got {length} in {value:?}"
     );
-    let address = value.parse::<std::net::SocketAddr>().unwrap_or_else(|error| {
-        panic!(
-            "case {case:?}: expected an address a client can fetch, got {value:?}: {error}"
-        )
-    });
+    // A domain name carries host labels and nothing else, so neither an authority's port
+    // separator nor a path separator belongs in it.
     assert!(
-        address.ip().is_loopback(),
-        "case {case:?}: expected an address of this machine, got {value:?}"
+        !value.contains(':') && !value.contains('/'),
+        "case {case:?}: expected a bare domain name with no port and no path, got {value:?}"
     );
-    assert_ne!(
-        address.port(),
-        0,
-        "case {case:?}: expected a port a client can dial, got {value:?}"
+    let labels: Vec<&str> = value.split('.').collect();
+    assert!(
+        labels.len() >= 4
+            && labels.iter().all(|label| {
+                !label.is_empty()
+                    && label
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            }),
+        "case {case:?}: expected dot-separated host labels, got {value:?}"
+    );
+    assert_eq!(
+        value,
+        format!("p-{portal_id}.apigw-portal.{region}.{ANNOUNCED_ZONE}"),
+        "case {case:?}: expected the name generated for this portal in this Region, got \
+         {value:?}"
     );
 }
 
@@ -953,10 +983,10 @@ async fn portal_of_row(
     (as_str(&created, "portalId"), created)
 }
 
-/// `EndpointConfigurationResponse$PortalDefaultDomainName` is the address the portal's site
-/// is SERVED on by the endpoint the caller is talking to — the `host:port` of the socket this
-/// emulator opened for the portal — whichever endpoint that caller reached this service at,
-/// and the same value on every operation that reports the portal.
+/// `EndpointConfigurationResponse$PortalDefaultDomainName` is the domain name this emulator
+/// GENERATES for the portal — the portal's own labels in the zone this emulator answers in,
+/// which its portal data plane claims host-style — whichever endpoint the caller reached this
+/// service at, and the same value on every operation that reports the portal.
 #[tokio::test]
 async fn every_portal_reader_reports_the_address_its_site_is_served_on() {
     for row in domain_rows() {
@@ -967,7 +997,12 @@ async fn every_portal_reader_reports_the_address_its_site_is_served_on() {
         // Settled once, when the portal was created: the endpoint a later caller reaches
         // this emulator at never moves it.
         let expected = default_domain_name(case, &created);
-        assert_published_address(&format!("{case}: CreatePortal"), &expected);
+        assert_published_domain_name(
+            &format!("{case}: CreatePortal"),
+            &expected,
+            &portal_id,
+            row.region,
+        );
 
         // A domain the account brought is reported beside it and displaces nothing.
         assert_eq!(
@@ -997,7 +1032,12 @@ async fn every_portal_reader_reports_the_address_its_site_is_served_on() {
             read_domain, expected,
             "case {case:?}: expected the same published address from GetPortal, got {read}"
         );
-        assert_published_address(&format!("{case}: GetPortal"), &read_domain);
+        assert_published_domain_name(
+            &format!("{case}: GetPortal"),
+            &read_domain,
+            &portal_id,
+            row.region,
+        );
 
         let (status, patched) = call_at_host(
             &emulator,
@@ -1021,7 +1061,12 @@ async fn every_portal_reader_reports_the_address_its_site_is_served_on() {
             "case {case:?}: expected the same published address from UpdatePortal, got \
              {patched}"
         );
-        assert_published_address(&format!("{case}: UpdatePortal"), &patched_domain);
+        assert_published_domain_name(
+            &format!("{case}: UpdatePortal"),
+            &patched_domain,
+            &portal_id,
+            row.region,
+        );
 
         let (status, listed) =
             call_at_host(&emulator, row.host, row.region, "GET", "/v2/portals", None).await;
@@ -1047,12 +1092,17 @@ async fn every_portal_reader_reports_the_address_its_site_is_served_on() {
             "case {case:?}: expected the same published address in the portal's summary, \
              got {listed}"
         );
-        assert_published_address(&format!("{case}: ListPortals"), &listed_domain);
+        assert_published_domain_name(
+            &format!("{case}: ListPortals"),
+            &listed_domain,
+            &portal_id,
+            row.region,
+        );
     }
 }
 
-/// One portal, one address: portals of the same account are published at different
-/// addresses, however the client that created them addressed this emulator.
+/// One portal, one name: portals of the same account are published under different domain
+/// names, however the client that created them addressed this emulator.
 #[tokio::test]
 async fn each_portal_is_published_at_an_address_of_its_own() {
     let emulator = emulator();
@@ -1060,7 +1110,7 @@ async fn each_portal_is_published_at_an_address_of_its_own() {
     for row in domain_rows() {
         let (portal_id, created) = portal_of_row(&emulator, &row).await;
         let domain = default_domain_name(row.case, &created);
-        assert_published_address(row.case, &domain);
+        assert_published_domain_name(row.case, &domain, &portal_id, row.region);
         assert!(
             !held.iter().any(|(_, seen)| seen == &domain),
             "case {:?}: the published address {domain:?} is already held, by {held:?}",
@@ -1096,7 +1146,7 @@ async fn the_published_default_domain_serves_the_portals_published_page() {
     )
     .await;
     let domain = default_domain_name(case, &created);
-    assert_published_address(case, &domain);
+    assert_published_domain_name(case, &domain, &portal_id, REGION);
 
     let (status, published) = call_at_host(
         &emulator,

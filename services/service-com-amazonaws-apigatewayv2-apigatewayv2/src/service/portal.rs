@@ -208,10 +208,11 @@ fn resolve<'s, 'r>(
 /// The portal whose own domain `host` is, or `None` for a host no portal of this service
 /// records.
 ///
-/// Both domains a portal reports are its own: the default one it publishes — the address of
-/// the socket this emulator serves its site on ([`crate::state::portal_transport`]), which
-/// carries the PORT that address answers on — and the `DomainName` the account brought ("You
-/// can provide a custom domain to override this value").
+/// Both domains a portal reports are its own: the default one it publishes — the name this
+/// emulator generates for it in the zone it answers in
+/// ([`crate::state::announced_portal_default_domain_name`]), which carries host labels and no
+/// port — and the `DomainName` the account brought ("You can provide a custom domain to
+/// override this value").
 ///
 /// A host is compared case-insensitively (RFC 4343) and without its userinfo, BOTH as the
 /// request wrote it (with the `:port`, which is what matches a published address) and with the

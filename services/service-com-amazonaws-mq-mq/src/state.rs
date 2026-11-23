@@ -937,17 +937,15 @@ pub fn fingerprint_of(parts: &[String]) -> String {
 
 /// The sentence Amazon MQ states when it refuses a value outside an enumerated
 /// member's value set: fixed text per MEMBER, with the rejected value taken
-/// verbatim from the request.
+/// verbatim from the request, then the values the member does accept — for
+/// `engineType`, "Broker engine type [<value>] is invalid. Valid values are:
+/// [ACTIVEMQ, RABBITMQ]". See [`enum_subject`] for the subject each member is
+/// named by.
 ///
-/// `engineType` has its own sentence, and it names no accepted values: the
-/// recorded refusal of an engine type outside the model's set is "Broker engine
-/// [<value>] is invalid." — the subject is "Broker engine" and there is no
-/// valid-values suffix. Every other member is stated the way
-/// [`enum_subject`] describes.
+/// The CATALOG operations word the same member's refusal differently — see
+/// [`validate_engine_type_filter`], which is the sentence an engine-type FILTER
+/// earns.
 fn enum_refusal_message(attribute: &str, value: &str, allowed: &[&str]) -> String {
-    if attribute == ENGINE_TYPE_ATTRIBUTE {
-        return format!("Broker engine [{value}] is invalid.");
-    }
     format!(
         "{} [{value}] is invalid. Valid values are: [{}]",
         enum_subject(attribute),
@@ -955,10 +953,28 @@ fn enum_refusal_message(attribute: &str, value: &str, allowed: &[&str]) -> Strin
     )
 }
 
-/// The wire name of the member that names a broker engine, the one member whose
-/// enum refusal Amazon MQ words without a valid-values list
-/// ([`enum_refusal_message`]).
+/// The wire name of the member that names a broker engine.
 const ENGINE_TYPE_ATTRIBUTE: &str = "engineType";
+
+/// Refuse an `engineType` FILTER — the query parameter the two catalog operations
+/// (`DescribeBrokerEngineTypes`, `DescribeBrokerInstanceOptions`) narrow their
+/// published catalog by — that names no engine the model enumerates.
+///
+/// Amazon MQ words this refusal per operation CLASS, not per member: a catalog
+/// filter earns "Broker engine [<value>] is invalid." — fixed text whose only
+/// variable part is the rejected value, with no list of accepted values appended
+/// — while a request naming the engine of a resource it would create or update
+/// earns the member's own sentence ([`enum_refusal_message`]). `errorAttribute`
+/// names the same member either way.
+pub fn validate_engine_type_filter(value: &str) -> Result<(), Invalid> {
+    if crate::ops::types::ENGINE_TYPE_VALUES.contains(&value) {
+        return Ok(());
+    }
+    Err(Invalid::new(
+        ENGINE_TYPE_ATTRIBUTE,
+        format!("Broker engine [{value}] is invalid."),
+    ))
+}
 
 /// The subject Amazon MQ names when it refuses a value outside an enumerated
 /// member's value set.
@@ -972,6 +988,8 @@ const ENGINE_TYPE_ATTRIBUTE: &str = "engineType";
 /// name, which keeps the sentence well-formed for any member added later.
 fn enum_subject(attribute: &str) -> &str {
     match attribute {
+        // "Required. The broker engine type." (`CreateBrokerRequest$EngineType`)
+        ENGINE_TYPE_ATTRIBUTE => "Broker engine type",
         // "Required. The broker's deployment mode." (`CreateBrokerRequest$DeploymentMode`)
         "deploymentMode" => "Broker deployment mode",
         // "The broker's storage type." (`CreateBrokerRequest$StorageType`)

@@ -643,19 +643,17 @@ pub struct AccessPoint {
 }
 
 /// The POSIX identity an access point is created with, as every read of it reports it: the
-/// identity the request named, with the SECONDARY GROUP list that identity holds.
+/// identity the request named, exactly as it named it.
 ///
-/// `PosixUser$SecondaryGids` is a list member ("Secondary POSIX group IDs used for all file
-/// system operations using this access point"), so an identity the request named no secondary
-/// group for is one with NO secondary group — an empty list — rather than one whose list is
-/// unknown: a list member of a stored structure is reported as the list it holds. A request
-/// that named no `PosixUser` at all named no identity, which is a different answer and stays
-/// absent.
+/// `PosixUser$SecondaryGids` is OPTIONAL and carries no `@default` ("Secondary POSIX group
+/// IDs used for all file system operations using this access point",
+/// `smithy_query(query="shape",shape="PosixUser")`), so an identity the request named no
+/// secondary group for holds NO secondary-group list at all, and restJson1 leaves an unset
+/// member out of the body rather than emitting an empty array for it; a request that named
+/// the list is reported with the list it named. A request that named no `PosixUser` at all
+/// named no identity, which is a different answer and stays absent too.
 pub fn posix_identity(requested: Option<PosixUser>) -> Option<PosixUser> {
-    requested.map(|identity| PosixUser {
-        secondary_gids: Some(identity.secondary_gids.unwrap_or_default()),
-        ..identity
-    })
+    requested
 }
 
 impl AccessPoint {

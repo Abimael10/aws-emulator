@@ -3,19 +3,18 @@
 //! The TRANSPORT of a portal's website: the core-owned socket each `Portal` of this account
 //! is reached at.
 //!
-//! `EndpointConfigurationResponse$PortalDefaultDomainName` is the address a CONSUMER of a
-//! developer portal fetches — "this domain name is generated and managed by API Gateway" —
-//! so a client that reads it off `CreatePortal` or `GetPortal` and asks for its root expects
-//! the portal's site. A name under API Gateway's own zone resolves to nothing on the machine
-//! this emulator runs on, so a portal that published one published an address no client could
-//! reach, and everything publishing a portal exists for — the site being served on the
-//! address the service itself reported, and stopping on `DisablePortal` — was unobservable.
-//!
-//! So each portal gets a socket of the EMULATOR's own, opened through the core
+//! `EndpointConfigurationResponse$PortalDefaultDomainName` is the domain name a CONSUMER of a
+//! developer portal resolves — "this domain name is generated and managed by API Gateway" —
+//! and it carries host labels only, so it names no port a client could dial. A name under API
+//! Gateway's own zone resolves to nothing on the machine this emulator runs on either, so the
+//! name this emulator announces is minted in the zone it answers in
+//! (`crate::state::announced_portal_default_domain_name`) and the portal's site is also served
+//! at an ADDRESS of this emulator's own: each portal gets a socket opened through the core
 //! (`engine.listeners()`, which owns the socket, the bind interface, the port range and the
-//! connection caps), and the record publishes the `host:port` that socket answers on — the
-//! same practice a custom domain name follows for its own published address
-//! ([`super::domain_name_transport`]). A client dials exactly what it was told.
+//! connection caps), and the record keeps the `host:port` that socket answers on as the base
+//! of every URL-typed member that sends a client to the site — the same practice a custom
+//! domain name follows for its own published address ([`super::domain_name_transport`]). A
+//! client dials exactly what it was told.
 //!
 //! The socket is the ADDRESS, not the data plane: what a request it accepts is answered BY —
 //! the build of the portal's last settled publish, its preview, or the refusal a portal

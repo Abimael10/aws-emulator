@@ -102,6 +102,16 @@ fn round_trip_table() -> Vec<Shape> {
             expected_name: None,
         },
         Shape {
+            // One secondary group: between the identity that names the member not at all and
+            // the row below that fills it to the modelled maximum.
+            case: "a POSIX identity with one secondary group",
+            posix_user: Some(json!({ "Uid": 1001, "Gid": 1001, "SecondaryGids": [2001] })),
+            root_directory: None,
+            expected_root_directory: json!({ "Path": "/" }),
+            tags: Vec::new(),
+            expected_name: None,
+        },
+        Shape {
             // `PosixUser$Uid`/`$Gid` accept "values from 0 to 2^32 (4294967295)" and
             // `SecondaryGids` is modelled `length 0..16`, so this row is every bound at
             // once.
@@ -229,16 +239,11 @@ async fn create_access_point_stores_every_shape_and_reads_it_back() {
             "RootDirectory": shape.expected_root_directory.clone(),
             "Tags": Value::Array(shape.tags.clone()),
         });
-        // The POSIX identity is reported with the SECONDARY GROUP list it holds: that member
-        // is a list, so an identity created with no secondary group is reported with an EMPTY
-        // one rather than without the member at all.
+        // The POSIX identity is reported exactly as the request named it: `SecondaryGids` is
+        // optional and carries no default, so an identity created with no secondary group is
+        // reported WITHOUT the member, and one created with a list is reported with it.
         expected["PosixUser"] = match shape.posix_user.clone() {
-            Some(mut identity) => {
-                if identity.get("SecondaryGids").is_none() {
-                    identity["SecondaryGids"] = Value::Array(Vec::new());
-                }
-                identity
-            }
+            Some(identity) => identity,
             None => Value::Null,
         };
         expected["Name"] = match shape.expected_name {
@@ -463,7 +468,7 @@ async fn a_reused_client_token_never_mints_a_second_access_point() {
         &access_points(&described)[0],
         &json!({
             "RootDirectory": { "Path": "/first" },
-            "PosixUser": { "Uid": 1, "Gid": 1, "SecondaryGids": [] },
+            "PosixUser": { "Uid": 1, "Gid": 1 },
             "FileSystemId": file_system_id,
         }),
     );
