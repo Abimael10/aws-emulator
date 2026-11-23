@@ -6,8 +6,10 @@
 //! The lenses a workload is reviewed against are held on the WORKLOAD —
 //! `Workload$Lenses`, the list `AssociateLenses` adds to, every read of the workload
 //! reports and every lens review of it is derived from — so this operation resolves the
-//! workload and every lens its `LensAliases` names against the store, and drops the
-//! review of each lens named, along with the answers and notes recorded under it.
+//! workload and every lens its `LensAliases` names against the store, and drops each lens
+//! named from that list, which is what stops its review being reported. The answers and
+//! notes recorded under that review are review state and are kept, so associating the same
+//! lens again reports the review as it stood.
 //!
 //! ## Reaching this service's state
 //!
@@ -232,7 +234,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `LensAliases` is `@length(min: 1)`, so the boundary validator has already refused
         // a request that names none and at least one review is dropped here. A list naming
         // the same lens twice drops it once, because every entry was resolved above against
-        // the reviews as they stood before any removal.
+        // the reviews as they stood before any removal. What is dropped is the ASSOCIATION:
+        // the answers and notes recorded under each review are kept
+        // (`crate::state::WorkloadRecord::disassociate_lens`), so this hides a review rather
+        // than resetting it.
         for lens in &input.lens_aliases {
             workload.disassociate_lens(lens);
         }

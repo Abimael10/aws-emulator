@@ -36,13 +36,21 @@ pub struct WorkloadRecord {
     /// then `QuestionId`. An answer lives on the workload rather than in a map of its
     /// own because a milestone records the workload BY VALUE: freezing the workload
     /// freezes the answers it had, which is what a milestone read reports.
+    ///
+    /// Keyed by lens alias INDEPENDENTLY of whether that lens is currently associated
+    /// ([`Self::disassociate_lens`]): what a lens's questions were answered is review
+    /// state, which the association does not carry. Only a lens the workload reviews is
+    /// reported, so an entry of a lens it no longer reviews reaches no read until that
+    /// lens is associated again.
     pub answers: BTreeMap<String, BTreeMap<String, AnswerRecord>>,
     /// What a caller has written to this workload's lens reviews, by lens ALIAS (as
     /// [`lens_alias`] resolves it, so one entry however the request named the lens). A
     /// lens whose review nothing has been written to carries no entry.
     ///
     /// Held on the WORKLOAD for the reason the answers above are: a milestone records the
-    /// workload by value, so freezing the workload freezes what its reviews said.
+    /// workload by value, so freezing the workload freezes what its reviews said — and
+    /// kept past a disassociation for the reason they are, so associating the same lens
+    /// again reports the review as it stood.
     pub lens_review_records: BTreeMap<String, LensReviewRecord>,
     /// The profiles associated with this workload, in association order.
     ///
@@ -98,14 +106,18 @@ impl WorkloadRecord {
             .any(|attached| lens_alias(attached) == lens_alias(lens))
     }
 
-    /// Drop the review of one lens from this workload: the lens itself, the answers
-    /// recorded against its review and whatever a caller wrote to that review.
+    /// Drop one lens from this workload, so the workload no longer reviews it.
     ///
-    /// A lens review is not a resource of its own — it exists exactly while that lens is
-    /// associated with the workload ([`Self::reviews_lens`]) — so dropping the lens drops
-    /// the review, and the answers and notes held under it go with it rather than
-    /// surviving to reappear under a later association. A milestone records the workload
-    /// BY VALUE, so a milestone taken before this still reports the review as it stood.
+    /// Which lenses the workload is reviewed against is what the ASSOCIATION records
+    /// (`Workload$Lenses`), so disassociating a lens removes it from that list and nothing
+    /// else: a lens review is reported exactly while its lens is associated
+    /// ([`Self::reviews_lens`]), while the answers recorded for that lens's questions and
+    /// whatever a caller wrote to its review are review STATE, which this keeps — so the
+    /// review is hidden rather than reset, and associating the same lens again reports it
+    /// as it stood. That state is keyed by lens ALIAS independently of the association, so
+    /// nothing a read derives from it reaches a lens the workload does not review. A
+    /// milestone records the workload BY VALUE, so a milestone taken before this still
+    /// reports the review as it stood.
     ///
     /// Idempotent in the lens and in the SPELLING of it: a lens is one lens however it is
     /// named ([`lens_alias`]), so every entry naming the same lens goes and the order of
@@ -115,8 +127,6 @@ impl WorkloadRecord {
     pub fn disassociate_lens(&mut self, lens: &str) {
         let alias = lens_alias(lens);
         self.lenses.retain(|attached| lens_alias(attached) != alias);
-        self.answers.remove(alias);
-        self.lens_review_records.remove(alias);
     }
 
     /// Whether a profile ARN names a profile associated with this workload.

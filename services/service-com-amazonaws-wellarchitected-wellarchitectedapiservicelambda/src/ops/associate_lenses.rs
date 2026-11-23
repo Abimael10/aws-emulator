@@ -250,7 +250,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A lens review is a review against ONE version of the lens, so associating a lens
         // pins the version its content is published as right now — the same pin a create
         // that applies lenses records, resolved from the one place that rule lives and
-        // BEFORE the workload is taken for writing.
+        // BEFORE the workload is taken for writing. A lens the workload reviewed BEFORE and
+        // no longer does keeps the review state it had, so the pin resolved here is only
+        // used for a lens this workload has no review of.
         let reviews = store.applied_workload_lens_reviews(&fresh);
 
         let workload = store.workloads.get_mut(&input.workload_id).ok_or_else(|| {
@@ -259,10 +261,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         for (alias, record) in reviews {
-            // A lens associated for the first time gets the review that association pins;
-            // one the workload already reviews was filtered out above, so no pin is
-            // overwritten and no review the workload holds is reset.
-            workload.lens_review_records.insert(alias, record);
+            // Associating a lens makes its review readable again rather than resetting it:
+            // the answers recorded for that lens's questions and whatever a caller wrote to
+            // its review survive a disassociation
+            // (`crate::state::WorkloadRecord::disassociate_lens`), so a lens the workload
+            // reviewed before comes back as it stood — the version its review is against
+            // included, which is what `UpgradeLensReview` moves. Only a lens with no stored
+            // review takes the pin this association resolved, and a lens the workload
+            // already reviews was filtered out above.
+            workload.lens_review_records.entry(alias).or_insert(record);
         }
         workload.lenses.extend(fresh);
         // The lenses are a member of the workload (`Workload$Lenses`), so associating one

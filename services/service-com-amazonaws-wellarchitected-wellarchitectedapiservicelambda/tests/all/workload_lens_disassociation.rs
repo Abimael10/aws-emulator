@@ -6,8 +6,10 @@
 //! "Disassociate a lens from a workload" (`smithy_query(query="doc",
 //! shape="DisassociateLenses")`) drops, from the workload the request names, the review of
 //! every DISTINCT lens its `LensAliases` name — a lens is one lens however it is spelled,
-//! so an alias and that lens's ARN name the same review — along with the answers and notes
-//! recorded under that review, and reports the change through `Workload$UpdatedAt`. Both
+//! so an alias and that lens's ARN name the same review — and reports the change through
+//! `Workload$UpdatedAt`. It is an ASSOCIATION operation: the review stops being reported,
+//! while the answers and notes recorded under it are kept, so re-associating the same lens
+//! reports that review as it stood. Both
 //! identifiers are resolved before anything is removed, so a workload that is not stored is
 //! a modelled 404 over the `WORKLOAD` resource type and a lens the workload does not review
 //! is the modelled 400 naming `LensAlias`, each removing nothing. Two refusals bound
@@ -747,12 +749,12 @@ async fn a_custom_lens_is_disassociated_by_its_arn() {
     );
 }
 
-/// Dropping a lens drops the review's own data with it: the answers recorded against that
-/// review and the notes written to it are gone, and a later association of the same lens
-/// starts from an unanswered review. A milestone records the workload BY VALUE, so a
-/// milestone taken before the disassociation still reports the lens it froze.
+/// Dropping a lens hides its review and keeps what was recorded under it: while the lens is
+/// detached the review answers nothing, and associating the same lens again reports the
+/// answer and the notes exactly as they stood. A milestone records the workload BY VALUE, so
+/// a milestone taken before the disassociation still reports the lens it froze.
 #[tokio::test]
-async fn disassociating_a_lens_drops_the_answers_and_notes_of_its_review() {
+async fn disassociating_a_lens_hides_its_review_and_keeps_what_was_recorded_under_it() {
     let client = Client::new();
     let workload_id = created_workload(
         &client,
@@ -794,11 +796,7 @@ async fn disassociating_a_lens_drops_the_answers_and_notes_of_its_review() {
         "UpdateLensReview must record the notes, got {noted:?}"
     );
 
-    let read = get_answer(&client, &workload_id, "serverless", question_id).await;
-    assert_eq!(
-        read.status, 200,
-        "the recorded answer must be readable before the lens is dropped, got {read:?}"
-    );
+    let before = reported_answer(&client, &workload_id, "serverless", question_id, "kept").await;
 
     // A milestone freezes the workload as it stands, reviews and answers included.
     let milestone = client
@@ -865,47 +863,349 @@ async fn disassociating_a_lens_drops_the_answers_and_notes_of_its_review() {
         "the milestone must still report the lens it froze, got {frozen_lenses:?}"
     );
 
-    // Associating the same lens again starts from an unanswered review: the answers and the
-    // notes went with the review that was dropped.
+    // Associating the same lens again reports the review as it stood: the detach hid it, it
+    // did not reset it.
     let again = associate_lenses(&client, &workload_id, &["serverless".to_string()]).await;
     assert_eq!(
         again.status, 200,
         "the lens must be associable again, got {again:?}"
     );
-    let reread = get_answer(&client, &workload_id, "serverless", question_id).await;
+    let after = reported_answer(&client, &workload_id, "serverless", question_id, "kept").await;
     assert_eq!(
-        reread.status, 200,
-        "the new review must answer the question again, got {reread:?}"
+        after, before,
+        "the re-associated review must report the answer recorded before the detach, expected \
+         {before:?}, got {after:?}"
     );
-    let reported = reread.body.get("Answer").cloned().unwrap_or(Value::Null);
     assert_eq!(
-        reported.get("Risk").and_then(Value::as_str),
-        Some(state::RISK_UNANSWERED),
-        "a question of the new review must be UNANSWERED, got {reread:?}"
+        after.get("SelectedChoices").and_then(Value::as_array),
+        Some(&vec![json!(question.choice_id(0))]),
+        "the recorded selection must come back, got {after:?}"
     );
-    assert!(
-        reported
-            .get("SelectedChoices")
-            .and_then(Value::as_array)
-            .is_none_or(|selected| selected.is_empty()),
-        "the dropped review's selected choices must not come back, got {reread:?}"
-    );
-    assert!(
-        reported.get("Notes").is_none(),
-        "the dropped answer's notes must not come back, got {reread:?}"
+    assert_eq!(
+        after.get("Notes").and_then(Value::as_str),
+        Some("an answer under test"),
+        "the recorded answer notes must come back, got {after:?}"
     );
     let review = get_lens_review(&client, &workload_id, "serverless").await;
     assert_eq!(
         review.status, 200,
-        "the new review must be readable, got {review:?}"
+        "the restored review must be readable, got {review:?}"
     );
-    assert!(
+    assert_eq!(
         review
             .body
             .get("LensReview")
             .and_then(|review| review.get("Notes"))
-            .is_none(),
-        "the dropped review's notes must not come back, got {review:?}"
+            .and_then(Value::as_str),
+        Some("notes under test"),
+        "the review's own notes must come back, got {review:?}"
+    );
+}
+
+/// One row of the restored-review table: which AWS-official lens the workload reviews, how
+/// each request spells it, how many of its questions carry an answer before the detach, and
+/// whether the review itself carries notes.
+struct RestoredReviewCase {
+    case: &'static str,
+    name: &'static str,
+    /// The lens under test, as its catalog alias (`state::AWS_OFFICIAL_LENS_ALIASES`).
+    lens: &'static str,
+    /// How the create spells the lens, then the disassociation, then the re-association:
+    /// `None` for the bare alias, `Some(region)` for that lens's official ARN in `region`.
+    created: Option<&'static str>,
+    detached: Option<&'static str>,
+    reattached: Option<&'static str>,
+    /// How many of the lens's questions are answered before the detach.
+    answered: usize,
+    /// Whether the row writes notes to the lens review itself before the detach.
+    lens_notes: bool,
+}
+
+/// One lens as a request spells it: the bare alias, or that lens's official ARN in a Region
+/// — "either the lens alias … or the lens ARN" (`smithy_query(query="doc",
+/// shape="LensAlias")`), and a lens is one lens however it is spelled.
+fn spelled(lens: &str, region: Option<&str>) -> String {
+    match region {
+        Some(region) => official_lens_arn(region, lens),
+        None => lens.to_string(),
+    }
+}
+
+/// The `Answer` a lens review reports for one question, as `GetAnswer` carries it.
+async fn reported_answer(
+    client: &Client,
+    workload_id: &str,
+    lens: &str,
+    question_id: &str,
+    case: &str,
+) -> Value {
+    let read = get_answer(client, workload_id, lens, question_id).await;
+    assert_eq!(
+        read.status, 200,
+        "case {case:?}: expected GetAnswer 200, got {read:?}"
+    );
+    read.body
+        .get("Answer")
+        .cloned()
+        .unwrap_or_else(|| panic!("case {case:?}: GetAnswer must report an Answer, got {read:?}"))
+}
+
+/// Detaching a lens and attaching it again leaves the review as it was: every answer
+/// recorded before the detach is the answer the restored review reports, whichever spelling
+/// each request named the lens by and however many questions were answered.
+#[tokio::test]
+async fn a_re_associated_lens_review_reports_what_was_recorded_before_the_detach() {
+    // The rows differ along what the rule generalises over: which lens is detached, which
+    // SPELLING each of the three requests names it by (a bare alias or that lens's ARN,
+    // whose Region deliberately varies), how many of the lens's questions carry an answer,
+    // and whether the review itself carries notes.
+    let rows = vec![
+        RestoredReviewCase {
+            case: "one answer, one spelling throughout",
+            name: "lens-restore-alias",
+            lens: "serverless",
+            created: None,
+            detached: None,
+            reattached: None,
+            answered: 1,
+            lens_notes: false,
+        },
+        RestoredReviewCase {
+            case: "two answers and review notes, re-attached by the lens's ARN",
+            name: "lens-restore-two-answers",
+            lens: "iot",
+            created: None,
+            detached: None,
+            reattached: Some("us-east-1"),
+            answered: 2,
+            lens_notes: true,
+        },
+        RestoredReviewCase {
+            case: "attached by its ARN, detached by alias, re-attached by an ARN elsewhere",
+            name: "lens-restore-by-arn",
+            lens: "serverless",
+            created: Some("us-east-1"),
+            detached: None,
+            reattached: Some("eu-west-1"),
+            answered: 1,
+            lens_notes: true,
+        },
+    ];
+
+    for row in rows {
+        let client = Client::new();
+        let created = spelled(row.lens, row.created);
+        let workload_id = created_workload(
+            &client,
+            row.name,
+            &[state::FRAMEWORK_LENS_ALIAS.to_string(), created.clone()],
+        )
+        .await;
+
+        // The questions and the choices come off the lens content the service answers from
+        // (`state::lens_questions`), so a row states a lens and a COUNT rather than wire ids.
+        let questions = state::lens_questions(row.lens);
+        assert!(
+            questions.len() >= row.answered,
+            "case {:?}: the {} lens must ask at least {} questions, it asks {}",
+            row.case,
+            row.lens,
+            row.answered,
+            questions.len()
+        );
+        let mut recorded: Vec<(String, Value)> = Vec::new();
+        for question in questions.iter().take(row.answered) {
+            let write = update_answer(
+                &client,
+                &workload_id,
+                &created,
+                question.question_id,
+                json!({
+                    "SelectedChoices": [question.choice_id(0)],
+                    "Notes": format!("notes on {}", question.question_id),
+                }),
+            )
+            .await;
+            assert_eq!(
+                write.status, 200,
+                "case {:?}: UpdateAnswer must record the answer, got {write:?}",
+                row.case
+            );
+            let reported =
+                reported_answer(&client, &workload_id, &created, question.question_id, row.case)
+                    .await;
+            recorded.push((question.question_id.to_string(), reported));
+        }
+        if row.lens_notes {
+            let noted = update_lens_review(
+                &client,
+                &workload_id,
+                &created,
+                json!({ "LensNotes": format!("notes of {}", row.case) }),
+            )
+            .await;
+            assert_eq!(
+                noted.status, 200,
+                "case {:?}: UpdateLensReview must record the notes, got {noted:?}",
+                row.case
+            );
+        }
+
+        let detached = spelled(row.lens, row.detached);
+        let answer = disassociate_lenses(&client, &workload_id, std::slice::from_ref(&detached))
+            .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {:?}: expected DisassociateLenses 200, got {answer:?}",
+            row.case
+        );
+
+        // A detached lens is not reviewed: it leaves the workload's reviews and its answers
+        // are not readable until it is associated again.
+        let reviews = reviewed_lenses(&client, &workload_id, row.case).await;
+        assert!(
+            !reviews
+                .iter()
+                .any(|alias| state::lens_alias(alias) == row.lens),
+            "case {:?}: the detached lens must leave the workload's reviews, got {reviews:?}",
+            row.case
+        );
+        let refused = get_answer(&client, &workload_id, &detached, &recorded[0].0).await;
+        assert_field_validation(
+            row.case,
+            &refused,
+            "LensAlias",
+            &format!(
+                "No lens review for lens alias {detached} was found in workload {workload_id}."
+            ),
+        );
+
+        let reattached = spelled(row.lens, row.reattached);
+        let again = associate_lenses(&client, &workload_id, std::slice::from_ref(&reattached)).await;
+        assert_eq!(
+            again.status, 200,
+            "case {:?}: the lens must be associable again, got {again:?}",
+            row.case
+        );
+
+        for (question_id, before) in &recorded {
+            let after =
+                reported_answer(&client, &workload_id, &reattached, question_id, row.case).await;
+            assert_eq!(
+                &after, before,
+                "case {:?}: the restored review must report the answer recorded for \
+                 {question_id} before the detach, expected {before:?}, got {after:?}",
+                row.case
+            );
+        }
+        if row.lens_notes {
+            let review = get_lens_review(&client, &workload_id, &reattached).await;
+            assert_eq!(
+                review.status, 200,
+                "case {:?}: the restored review must be readable, got {review:?}",
+                row.case
+            );
+            assert_eq!(
+                review
+                    .body
+                    .get("LensReview")
+                    .and_then(|review| review.get("Notes"))
+                    .and_then(Value::as_str),
+                Some(format!("notes of {}", row.case).as_str()),
+                "case {:?}: the review's own notes must come back, got {review:?}",
+                row.case
+            );
+        }
+    }
+}
+
+/// A CUSTOM lens's review is restored the same way, risk included: the answer the restored
+/// review reports carries the selection and the notes recorded before the detach, and the
+/// `Risk` the lens's own `riskRules` derive for that selection — the kind of lens changes
+/// nothing about the rule.
+#[tokio::test]
+async fn a_re_associated_custom_lens_review_reports_the_risk_its_rules_derive() {
+    let client = Client::new();
+    let workload_id = created_workload(
+        &client,
+        "lens-restore-custom",
+        &[state::FRAMEWORK_LENS_ALIAS.to_string()],
+    )
+    .await;
+
+    // One pillar, one question, two choices, and the risk rules this document authors for
+    // such a question (`super::custom_lens_import::authored_risk_rules`): every choice in
+    // place clears the question, one of the two reduces it, anything thinner is the default.
+    let document = lens_document("Restorable lens", None, &[("governance", 1, 2)]).to_string();
+    let lens_arn = imported_arn(
+        &import(&client, &document, None, "tok-import-restorable", None).await,
+        "custom",
+    );
+    let published = create_version(&client, &lens_arn, "1.0", Some(true), "tok-publish-restorable")
+        .await;
+    assert_eq!(
+        published.status, 200,
+        "CreateLensVersion must publish the imported lens, got {published:?}"
+    );
+    let associated = associate_lenses(&client, &workload_id, std::slice::from_ref(&lens_arn)).await;
+    assert_eq!(
+        associated.status, 200,
+        "the published custom lens must be associable, got {associated:?}"
+    );
+
+    // The question and choice ids are the document's own, as it names them.
+    let question_id = "governance_q0";
+    let choice_id = "governance_q0_c0";
+    let write = update_answer(
+        &client,
+        &workload_id,
+        &lens_arn,
+        question_id,
+        json!({ "SelectedChoices": [choice_id], "Notes": "one best practice in place" }),
+    )
+    .await;
+    assert_eq!(
+        write.status, 200,
+        "UpdateAnswer must record the answer, got {write:?}"
+    );
+    let before = reported_answer(&client, &workload_id, &lens_arn, question_id, "custom").await;
+    assert_eq!(
+        before.get("Risk").and_then(Value::as_str),
+        Some(state::RISK_MEDIUM),
+        "one of the two best practices in place must grade the question MEDIUM, got {before:?}"
+    );
+
+    let answer = disassociate_lenses(&client, &workload_id, std::slice::from_ref(&lens_arn)).await;
+    assert_eq!(
+        answer.status, 200,
+        "the custom lens must be disassociated, got {answer:?}"
+    );
+    let again = associate_lenses(&client, &workload_id, std::slice::from_ref(&lens_arn)).await;
+    assert_eq!(
+        again.status, 200,
+        "the custom lens must be associable again, got {again:?}"
+    );
+
+    let after = reported_answer(&client, &workload_id, &lens_arn, question_id, "custom").await;
+    assert_eq!(
+        after, before,
+        "the restored review must report the answer recorded before the detach, expected \
+         {before:?}, got {after:?}"
+    );
+    assert_eq!(
+        after.get("SelectedChoices").and_then(Value::as_array),
+        Some(&vec![json!(choice_id)]),
+        "the recorded selection must come back, got {after:?}"
+    );
+    assert_eq!(
+        after.get("Notes").and_then(Value::as_str),
+        Some("one best practice in place"),
+        "the recorded notes must come back, got {after:?}"
+    );
+    assert_eq!(
+        after.get("Risk").and_then(Value::as_str),
+        Some(state::RISK_MEDIUM),
+        "the risk the lens's rules derive for that selection must come back, got {after:?}"
     );
 }
 

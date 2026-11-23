@@ -2487,13 +2487,14 @@ impl ReviewTemplateRecord {
     /// Drop the review of one lens from this template: the lens itself, the answers
     /// recorded against its review and whatever a caller wrote to that review.
     ///
-    /// The mirror of [`WorkloadRecord::disassociate_lens`], and for the same reason: a lens
-    /// review is not a resource of its own — it exists exactly while that lens is applied
-    /// to the template ([`Self::applies_lens`]) — so dropping the lens drops the review,
-    /// and the answers and notes held under it go with it rather than surviving to reappear
-    /// under a later apply. A workload created from this template copied its lenses, notes
-    /// and answers at create time (`CreateWorkload`), so it keeps them: the workload is not
-    /// a child of the template.
+    /// A lens review of a template is not a resource of its own — it exists exactly while
+    /// that lens is applied to the template ([`Self::applies_lens`]) — so dropping the lens
+    /// drops the review, and the answers and notes held under it go with it rather than
+    /// surviving to reappear under a later apply. Unlike
+    /// [`WorkloadRecord::disassociate_lens`], which ends only the ASSOCIATION and keeps the
+    /// review's recorded state for a later association of the same lens. A workload created
+    /// from this template copied its lenses, notes and answers at create time
+    /// (`CreateWorkload`), so it keeps them: the workload is not a child of the template.
     ///
     /// Idempotent in the lens and in the SPELLING of it: a lens is one lens however it is
     /// named ([`lens_alias`]), so every entry naming the same lens goes and the order of
