@@ -258,7 +258,7 @@ fn encoded(value: &str) -> String {
 }
 
 /// The `/tags/{resourceArn}` path for `resource_arn`.
-fn tags_path(resource_arn: &str) -> String {
+pub(crate) fn tags_path(resource_arn: &str) -> String {
     format!("/tags/{}", encoded(resource_arn))
 }
 
@@ -280,7 +280,7 @@ fn gateway_arn(gateway_id: &str) -> String {
 }
 
 /// The ARN of a link, addressed from one of its two ends.
-fn link_arn(gateway_id: &str, link_id: &str) -> String {
+pub(crate) fn link_arn(gateway_id: &str, link_id: &str) -> String {
     ::engine::emulator_arn(
         "rtbfabric",
         REGION,

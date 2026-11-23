@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteOutboundExternalLink
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteOutboundExternalLink`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteOutboundExternalLink::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +148,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteOutboundExternalLink` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteOutboundExternalLinkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteOutboundExternalLink"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteOutboundExternalLinkErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the rtbfabric emulator has no state store for this request"
+                        .to_string(),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+        store.settle_all(now);
+
+        // An outbound external link is addressed only through the requester gateway
+        // it was opened from — the pair the `@http` URI carries — so a pair naming no
+        // stored link is the not-found, exactly as `GetOutboundExternalLink` reports
+        // it. The release takes the record, the tags it carried and the client-token
+        // record its create wrote, so nothing later reports a link the store no
+        // longer holds.
+        let Some(released) =
+            store.release_outbound_external_link(&input.gateway_id, &input.link_id)
+        else {
+            return Err(
+                DeleteOutboundExternalLinkErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(DeleteOutboundExternalLinkOutput {
+            link_id: released.link_id,
+            // Terminal: the record is gone, so nothing further is owed on it.
+            status: crate::state::LINK_STATUS_DELETED.to_string(),
+        })
     }
 }

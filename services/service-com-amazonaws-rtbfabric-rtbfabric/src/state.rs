@@ -714,6 +714,31 @@ impl ComAmazonawsRtbfabricRtbfabricState {
         Some(released)
     }
 
+    /// Release the outbound external link `link_id` on the requester gateway
+    /// `gateway_id`: the record, and with it the tags it carried and the
+    /// client-token record its create wrote
+    /// ([`forget_released_client_tokens`](Self::forget_released_client_tokens)).
+    ///
+    /// The pair IS this map's key, so the release addresses exactly the link
+    /// [`find_outbound_external_link`](Self::find_outbound_external_link) reports: a
+    /// link with one end outside the fabric is addressed only through the gateway it
+    /// was opened from. No routing rule is held to it — a rule is created only on a
+    /// link between two gateways — so the record is all there is to let go of.
+    ///
+    /// `None` when that pair names no stored link, which is the not-found the caller
+    /// is answered with.
+    pub fn release_outbound_external_link(
+        &mut self,
+        gateway_id: &str,
+        link_id: &str,
+    ) -> Option<OutboundExternalLink> {
+        let released = self
+            .outbound_external_links
+            .remove(&(gateway_id.to_string(), link_id.to_string()))?;
+        self.forget_released_client_tokens();
+        Some(released)
+    }
+
     /// Whether a LIVE link already joins these two gateways, in either
     /// orientation: a link is one record with two ends, readable and deletable
     /// from both, so the reverse create would be a second record for the same

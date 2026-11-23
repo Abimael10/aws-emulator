@@ -4,6 +4,7 @@
 //! `CreateResponderGateway`, `GetRequesterGateway`, `GetResponderGateway`,
 //! `CreateLink`, `GetLink`, `ListLinks`, `DeleteLink`,
 //! `CreateOutboundExternalLink`, `GetOutboundExternalLink`,
+//! `DeleteOutboundExternalLink`,
 //! `CreateInboundExternalLink` and `GetInboundExternalLink`, driven over the wire
 //! through the router the production emulator uses.
 //!
@@ -25,10 +26,16 @@ use service_com_amazonaws_rtbfabric_rtbfabric::ops::types::{
     REQUESTER_GATEWAY_STATUS_VALUES, RESPONDER_GATEWAY_STATUS_VALUES,
 };
 use service_com_amazonaws_rtbfabric_rtbfabric::state::{
-    GATEWAY_QUOTA, PROVISIONING_DELAY, RESOURCE_NOT_FOUND_MESSAGE, TAGS_PER_RESOURCE_QUOTA,
+    GATEWAY_QUOTA, PROVISIONING_DELAY, RESOURCE_NOT_FOUND_MESSAGE, TAGGING_UNRESOLVED_CODE,
+    TAGGING_UNRESOLVED_MESSAGE, TAGGING_UNRESOLVED_STATUS, TAGS_PER_RESOURCE_QUOTA,
 };
 use service_com_amazonaws_rtbfabric_rtbfabric::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
+
+// The link ARN and the `/tags/{resourceArn}` path are the tagging suite's reading of
+// this service's one ARN form, reused here rather than restated: the release below
+// has to address exactly the record that surface addresses.
+use crate::resource_tagging::{link_arn, tags_path};
 
 /// The region the test signs for; it is also the zone the gateways' assigned
 /// domain names must sit under.
@@ -2555,6 +2562,347 @@ async fn an_outbound_external_link_resolves_only_through_the_gateway_that_opened
     assert_eq!(
         status, 404,
         "case {case:?}: expected the link of a released gateway to be gone, got {status} {gone:?}"
+    );
+}
+
+// --- releasing an outbound external link ---------------------------------------
+//
+// `DeleteOutboundExternalLink` is the other half of that surface, and the rule under
+// test is about state rather than about one recorded request: the delete releases
+// the ONE record the (`gatewayId`, `linkId`) pair addresses — the link, the tags it
+// carried and the client-token record its create wrote — answers with that id and
+// the terminal status, leaves every other link of the gateway alone, and refuses a
+// pair naming no stored link with the modelled not-found, having released nothing.
+
+/// The terminal status a released link reports, from `LINK_STATUS_VALUES`.
+const EXTERNAL_LINK_RELEASED_STATUS: &str = "DELETED";
+
+/// One row of the outbound-external-link release table.
+struct ReleaseRow {
+    case: &'static str,
+    /// Which row of [`external_rows`] the released link is created from, so the
+    /// table spans a link carrying no tags, one tag and several, and the whole range
+    /// of endpoints those rows state.
+    link_row: usize,
+    /// How many outbound external links the gateway holds. The first is released;
+    /// every other one has to survive.
+    held: usize,
+    /// Whether to wait for the status the clock owes the link before releasing it,
+    /// so the table spans a link still settling and one already settled.
+    settled: bool,
+}
+
+/// The release table. The rows differ along what the rule generalises over: how many
+/// links the gateway holds, which shape of create the released link was stored from
+/// (its tags included), and whether the clock had already settled it.
+const RELEASE_ROWS: &[ReleaseRow] = &[
+    ReleaseRow {
+        case: "the gateway's only link, carrying no tags, still settling",
+        link_row: 0,
+        held: 1,
+        settled: false,
+    },
+    ReleaseRow {
+        case: "the gateway's only link, once the clock has settled it",
+        link_row: 1,
+        held: 1,
+        settled: true,
+    },
+    ReleaseRow {
+        case: "one of three links, the released one carrying three tags",
+        link_row: 2,
+        held: 3,
+        settled: false,
+    },
+    ReleaseRow {
+        case: "one of two links, released at the endpoint length bound once settled",
+        link_row: 4,
+        held: 2,
+        settled: true,
+    },
+];
+
+impl Fabric {
+    /// `DELETE /requester-gateway/{gatewayId}/outbound-external-link/{linkId}`.
+    async fn delete_outbound_external_link(
+        &self,
+        gateway_id: &str,
+        link_id: &str,
+    ) -> (u16, Value) {
+        self.send(
+            "DELETE",
+            &outbound_external_link_path(gateway_id, link_id),
+            None,
+        )
+        .await
+    }
+}
+
+#[tokio::test]
+async fn deleting_an_outbound_external_link_releases_the_record_it_addresses() {
+    let shapes = external_rows();
+    for row in RELEASE_ROWS {
+        let case = row.case;
+        let fabric = Fabric::new();
+        let gateway_id = fabric.requester_gateway(case, "token-requester").await;
+
+        // Every link this gateway holds, the one to be released first, each from a
+        // different row of the create table so no two are the same request.
+        let mut link_ids: Vec<String> = Vec::new();
+        for n in 0..row.held {
+            let shape = &shapes[(row.link_row + n) % shapes.len()];
+            let (status, created) = fabric
+                .create_outbound_external_link(
+                    &gateway_id,
+                    shape.create_body(&format!("token-link-{n}")),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the create of link #{n} to answer 200, got {status} {created:?}"
+            );
+            link_ids.push(text(&created, "linkId"));
+        }
+        let released = link_ids[0].clone();
+        let shape = &shapes[row.link_row];
+
+        if row.settled {
+            fabric
+                .poll_settled_outbound_external_link(case, &gateway_id, &released)
+                .await;
+        }
+
+        // The tags the create assigned are reported for the link while it is stored:
+        // a tag map is not a store of its own, it lives on the record.
+        let arn = link_arn(&gateway_id, &released);
+        let expected_tags = if shape.tags.is_null() {
+            json!({})
+        } else {
+            shape.tags.clone()
+        };
+        let (status, listed) = fabric.send("GET", &tags_path(&arn), None).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected ListTagsForResource on the stored link to answer 200, got {status} {listed:?}"
+        );
+        assert!(
+            same_json(&listed["tags"], &expected_tags),
+            "case {case:?}: expected the link's stored tags {expected_tags:?}, got {:?}",
+            listed["tags"]
+        );
+
+        let (status, answered) = fabric
+            .delete_outbound_external_link(&gateway_id, &released)
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected DeleteOutboundExternalLink to answer 200, got {status} {answered:?}"
+        );
+        assert_eq!(
+            text(&answered, "linkId"),
+            released,
+            "case {case:?}: expected the delete to report the link it released, got {answered:?}"
+        );
+        assert_eq!(
+            text(&answered, "status"),
+            EXTERNAL_LINK_RELEASED_STATUS,
+            "case {case:?}: expected the terminal status of a released link, got {answered:?}"
+        );
+        assert!(
+            LINK_STATUS_VALUES.contains(&text(&answered, "status").as_str()),
+            "case {case:?}: expected a modelled LinkStatus member, got {answered:?}"
+        );
+
+        // The reader no longer resolves it, with this service's fixed not-found
+        // sentence...
+        let (status, gone) = fabric
+            .read_outbound_external_link(&gateway_id, &released)
+            .await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected the released link to be unreadable, got {status} {gone:?}"
+        );
+        assert_eq!(
+            text(&gone, "message"),
+            RESOURCE_NOT_FOUND_MESSAGE,
+            "case {case:?}: expected the service's not-found sentence, got {gone:?}"
+        );
+        // ...and nor does the tagging surface, because the tags went with the record
+        // rather than outliving it.
+        let (status, unresolved) = fabric.send("GET", &tags_path(&arn), None).await;
+        assert_eq!(
+            status, TAGGING_UNRESOLVED_STATUS,
+            "case {case:?}: expected the released link's ARN to resolve to nothing, got {status} {unresolved:?}"
+        );
+        assert_eq!(
+            text(&unresolved, "__type"),
+            TAGGING_UNRESOLVED_CODE,
+            "case {case:?}: expected this surface's unresolved-ARN code, got {unresolved:?}"
+        );
+        assert_eq!(
+            text(&unresolved, "message"),
+            TAGGING_UNRESOLVED_MESSAGE,
+            "case {case:?}: expected this surface's unresolved-ARN wording, got {unresolved:?}"
+        );
+
+        // Only the addressed link went: every other link of this gateway still reads
+        // back, and the gateway counts exactly those that remain.
+        for (n, surviving) in link_ids[1..].iter().enumerate() {
+            let (status, read) = fabric
+                .read_outbound_external_link(&gateway_id, surviving)
+                .await;
+            assert_eq!(
+                (status, text(&read, "linkId")),
+                (200, surviving.clone()),
+                "case {case:?}: expected link #{} to survive the release, got {status} {read:?}",
+                n + 1
+            );
+        }
+        let (status, gateway) = fabric
+            .send("GET", &format!("/requester-gateway/{gateway_id}"), None)
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected GetRequesterGateway to answer 200, got {status} {gateway:?}"
+        );
+        assert_eq!(
+            gateway["totalLinksCount"],
+            json!(row.held - 1),
+            "case {case:?}: expected the gateway to count only the links it still holds, got {:?}",
+            gateway["totalLinksCount"]
+        );
+
+        // The client token that minted the released link is forgotten with it: the
+        // same token mints a NEW link rather than replaying an id the store no
+        // longer holds.
+        let (status, reused) = fabric
+            .create_outbound_external_link(&gateway_id, shape.create_body("token-link-0"))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the retried create to answer 200, got {status} {reused:?}"
+        );
+        let minted = text(&reused, "linkId");
+        assert_ne!(
+            minted, released,
+            "case {case:?}: expected the retry to mint a new link, got the released id"
+        );
+        let (status, read) = fabric
+            .read_outbound_external_link(&gateway_id, &minted)
+            .await;
+        assert_eq!(
+            (status, text(&read, "linkId")),
+            (200, minted.clone()),
+            "case {case:?}: expected the newly minted link to resolve, got {status} {read:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn deleting_an_outbound_external_link_refuses_a_pair_that_names_no_stored_link() {
+    let case = "pairs that address no stored outbound external link";
+    let fabric = Fabric::new();
+    let shape = &external_rows()[0];
+
+    let gateway_id = fabric.requester_gateway(case, "token-requester").await;
+    let other_gateway_id = fabric.requester_gateway(case, "token-other").await;
+    let (status, responder) = fabric
+        .send(
+            "POST",
+            "/responder-gateway",
+            Some(ROWS[0].responder_body("token-responder")),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected CreateResponderGateway to answer 200, got {status} {responder:?}"
+    );
+    let responder_id = text(&responder, "gatewayId");
+
+    let (status, created) = fabric
+        .create_outbound_external_link(&gateway_id, shape.create_body("token-released"))
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected the create to answer 200, got {status} {created:?}"
+    );
+    let released = text(&created, "linkId");
+    let (status, answered) = fabric
+        .delete_outbound_external_link(&gateway_id, &released)
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected the first delete to answer 200, got {status} {answered:?}"
+    );
+
+    let (status, kept) = fabric
+        .create_outbound_external_link(&gateway_id, shape.create_body("token-kept"))
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected the second create to answer 200, got {status} {kept:?}"
+    );
+    let kept_id = text(&kept, "linkId");
+
+    // Every id below satisfies the modelled patterns, so the refusal is the
+    // handler's not-found rather than a constraint refusal. A link is addressed
+    // only through the gateway it was opened from, so a stored link's id under
+    // another gateway names no link at all — and neither does one a delete has
+    // already released.
+    for (what, delete_gateway, delete_link) in [
+        (
+            "the link a delete already released",
+            gateway_id.clone(),
+            released.clone(),
+        ),
+        (
+            "a gateway nothing created",
+            "rtb-gw-nothing".to_string(),
+            kept_id.clone(),
+        ),
+        (
+            "a link nothing minted",
+            gateway_id.clone(),
+            "link-nothing".to_string(),
+        ),
+        (
+            "a stored link's id under another requester gateway",
+            other_gateway_id.clone(),
+            kept_id.clone(),
+        ),
+        (
+            "a responder gateway's id",
+            responder_id.clone(),
+            kept_id.clone(),
+        ),
+    ] {
+        let (status, refused) = fabric
+            .delete_outbound_external_link(&delete_gateway, &delete_link)
+            .await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected the delete of {what} to answer 404, got {status} {refused:?}"
+        );
+        assert_eq!(
+            text(&refused, "__type"),
+            "ResourceNotFoundException",
+            "case {case:?}: expected the modelled error code for {what}, got {refused:?}"
+        );
+        assert_eq!(
+            text(&refused, "message"),
+            RESOURCE_NOT_FOUND_MESSAGE,
+            "case {case:?}: expected the service's not-found sentence for {what}, got {refused:?}"
+        );
+    }
+
+    // A refused delete releases nothing: the link that IS stored still reads back.
+    let (status, read) = fabric
+        .read_outbound_external_link(&gateway_id, &kept_id)
+        .await;
+    assert_eq!(
+        (status, text(&read, "linkId")),
+        (200, kept_id.clone()),
+        "case {case:?}: expected the stored link to survive every refused delete, got {status} {read:?}"
     );
 }
 
