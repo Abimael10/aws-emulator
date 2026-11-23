@@ -648,6 +648,17 @@ pub(crate) fn return_values(
             attributes.insert("VpcLinkId".to_string(), id.clone());
             (id, attributes)
         }
+        // "Ref returns the client certificate ID"; Fn::GetAtt: ClientCertificateId. API
+        // Gateway MINTS the id — a template declares the certificate's description but not its
+        // identifier, and only that service can issue the certificate the id names — so the
+        // stand-in takes the same shape and is REPLACED by the id
+        // `GenerateClientCertificate` really minted, which is what
+        // [`identity_is_service_assigned`] names this type for.
+        APIGATEWAY_CLIENT_CERTIFICATE => {
+            let id = api_gateway_assigned_id(APIGATEWAY_CLIENT_CERTIFICATE_ID_SALT, name);
+            attributes.insert("ClientCertificateId".to_string(), id.clone());
+            (id, attributes)
+        }
         // "Ref returns the API ID"; Fn::GetAtt: ApiEndpoint ("The default endpoint for an
         // API"), ApiId and ExecuteApiArn — the api's own identity, the endpoint it is
         // invoked on and the ARN of that invoke surface, every one of them a value only API

@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Applying a CHANGED declaration to one of the records a REST API is built out of — the api
-//! itself, a resource of it, a method on that resource, a deployment of them and the stage
-//! that serves one — through the call API Gateway publishes for a record that EXISTS.
+//! Applying a CHANGED declaration to a record of this control plane that API Gateway
+//! publishes a PATCH call for: the five a REST API is built out of — the api itself, a
+//! resource of it, a method on that resource, a deployment of them and the stage that serves
+//! one — and the client certificate a stage presents to its backend.
 //!
 //! ## The rule this module implements
 //!
 //! A deployment that changes a resource's declaration applies that change to the resource
 //! that is already there, through the owning service's own update call. API Gateway publishes
 //! one for each of these records — `UpdateRestApi`, `UpdateResource`, `UpdateMethod`,
-//! `UpdateDeployment` and `UpdateStage`, each a `PATCH` whose `patchOperations` name the
+//! `UpdateDeployment`, `UpdateStage` and `UpdateClientCertificate`, each a `PATCH` whose
+//! `patchOperations` name the
 //! pointers that service lets a caller write — so a changed declaration of one of them is a
 //! change CloudFormation CARRIES OUT, and only a change no pointer of that call can express
 //! leaves the resource as it is.
@@ -37,6 +39,8 @@
 //! them, which a put of the changed declaration overwrites exactly as the create made them.
 
 use super::*;
+
+use super::client_certificate::{client_certificate_uri, CLIENT_CERTIFICATE_PROPERTIES};
 
 /// One property a patch call writes: the property a declaration states it under, the JSON
 /// Pointer that call writes it on, and how a declaration that no longer states it is
@@ -68,6 +72,10 @@ pub(super) async fn update(
         Kind::Method => update_method(ctx, region, resource, declared).await,
         Kind::Deployment => update_deployment(ctx, region, resource, declared).await,
         Kind::Stage => update_stage(ctx, region, resource, declared).await,
+        // The client certificate's own patch call, which is the one record here that is not
+        // part of an api: `UpdateClientCertificate` re-describes the certificate the stack
+        // minted ([`update_client_certificate`]).
+        Kind::ClientCertificate => update_client_certificate(ctx, region, resource, declared).await,
         // Every other kind is answered by its own module, which [`super::update`] reaches
         // directly; nothing dispatches them here.
         Kind::VpcLink
@@ -680,6 +688,81 @@ async fn update_stage(
 fn stage_arn(region: &str, api_id: &str, stage_name: &str) -> String {
     format!(
         "arn:aws:{API_GATEWAY_SIGNING_NAME}:{region}::/restapis/{api_id}/stages/{stage_name}"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// AWS::ApiGateway::ClientCertificate
+// ---------------------------------------------------------------------------
+
+/// The one property `UpdateClientCertificate` writes, on the pointer that call names it by.
+///
+/// Source: that operation's own patch surface — the member of the `ClientCertificate` shape a
+/// patch may name — against the type's property set. The material API Gateway issued and the
+/// window it is valid over are no part of a declaration, and the identifier is read-only, so
+/// the description is the whole of it; it is cleared with `remove`, the op a member that may be
+/// absent takes.
+const CLIENT_CERTIFICATE_UPDATED: &[Patchable] = &[("Description", "/description", Some(REMOVE))];
+
+/// Apply a changed `AWS::ApiGateway::ClientCertificate` declaration to the certificate that
+/// exists: the description is `UpdateClientCertificate`'s one patch, and the tags are that
+/// service's own tagging calls, which address the certificate by ARN.
+///
+/// The certificate's MATERIAL is untouched by either call — a changed declaration re-describes
+/// the certificate the stack minted rather than issuing another one — so the identifier the
+/// stack published goes on naming the same record.
+async fn update_client_certificate(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Option<Created>, Refusal> {
+    refuse_unpublished_properties(
+        &resource.resource_type,
+        declared,
+        CLIENT_CERTIFICATE_PROPERTIES,
+    )?;
+    let handled: Vec<&str> = CLIENT_CERTIFICATE_UPDATED
+        .iter()
+        .map(|(property, _, _)| *property)
+        .chain(["Tags"])
+        .collect();
+    if changed_elsewhere(&resource.properties, declared, &handled) {
+        return Ok(None);
+    }
+    let Some(patches) =
+        scalar_patches(&resource.properties, declared, CLIENT_CERTIFICATE_UPDATED)
+    else {
+        return Ok(None);
+    };
+    let client_certificate_id = own_id(resource)?.to_string();
+    if !patches.is_empty() {
+        patched(
+            ctx,
+            region,
+            &client_certificate_uri(&client_certificate_id),
+            patches,
+        )
+        .await?;
+    }
+    retag(
+        ctx,
+        region,
+        &client_certificate_arn(region, &client_certificate_id),
+        &resource.properties,
+        declared,
+    )
+    .await?;
+    Ok(Some(Created::default()))
+}
+
+/// The ARN API Gateway names a CLIENT CERTIFICATE by, which is what its tagging calls address:
+/// that service's own REST path for the certificate, in the account-less form its model
+/// declares (`arn:aws:apigateway:{region}::/clientcertificates/{id}`).
+fn client_certificate_arn(region: &str, client_certificate_id: &str) -> String {
+    format!(
+        "arn:aws:{API_GATEWAY_SIGNING_NAME}:{region}::/clientcertificates/\
+         {client_certificate_id}"
     )
 }
 

@@ -97,6 +97,21 @@ pub const APIGATEWAY_USAGE_PLAN_KEY: &str = "AWS::ApiGateway::UsagePlanKey";
 /// service minted ([`crate::state::provisioning::apigateway_rest_api`]).
 pub const APIGATEWAY_VPC_LINK: &str = "AWS::ApiGateway::VpcLink";
 
+/// `AWS::ApiGateway::ClientCertificate`: the certificate API Gateway presents to the backend
+/// behind a stage that authenticates the caller with mutual TLS — the record a stage names in
+/// its `ClientCertificateId` — which a stack really mints in that service
+/// ([`crate::state::provisioning::apigateway_rest_api`]).
+///
+/// "Ref returns the client certificate ID", which is also this type's one `Fn::GetAtt`
+/// attribute (`ClientCertificateId`): `GenerateClientCertificate` (`POST /clientcertificates`)
+/// takes no identifier and answers the `clientCertificateId` it minted, and every call on one
+/// takes that id (`GetClientCertificate$clientCertificateId`,
+/// `DeleteClientCertificate$clientCertificateId`, `Stage$clientCertificateId`). A template
+/// declares the certificate's DESCRIPTION and its tags, never its id, which is why
+/// [`identity_is_service_assigned`] names this type: the identifier in force is the one that
+/// service minted.
+pub const APIGATEWAY_CLIENT_CERTIFICATE: &str = "AWS::ApiGateway::ClientCertificate";
+
 /// `AWS::ApiGateway::RequestValidator`: the validator a method names in its
 /// `requestValidatorId`, which decides whether the request's parameters and its payload are
 /// checked before the method's integration is reached — so a stack whose validator exists
@@ -263,6 +278,7 @@ pub(crate) const APIGATEWAY_REQUEST_VALIDATOR_ID_SALT: &str = "apigateway/reques
 pub(crate) const APIGATEWAY_USAGE_PLAN_ID_SALT: &str = "apigateway/usage-plan-id";
 pub(crate) const APIGATEWAY_USAGE_PLAN_KEY_ID_SALT: &str = "apigateway/usage-plan-key-id";
 pub(crate) const APIGATEWAY_VPC_LINK_ID_SALT: &str = "apigateway/vpc-link-id";
+pub(crate) const APIGATEWAY_CLIENT_CERTIFICATE_ID_SALT: &str = "apigateway/client-certificate-id";
 pub(crate) const APIGATEWAY_ACCOUNT_ID_SALT: &str = "apigateway/account-id";
 pub(crate) const APIGATEWAYV2_API_ID_SALT: &str = "apigatewayv2/api-id";
 pub(crate) const APIGATEWAYV2_API_MAPPING_ID_SALT: &str = "apigatewayv2/api-mapping-id";

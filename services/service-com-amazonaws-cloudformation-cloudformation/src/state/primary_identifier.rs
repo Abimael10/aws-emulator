@@ -215,6 +215,10 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         // model needs no row: it is identified by the `Name` it is keyed under, which step 3
         // above answers from the conventional name property.)
         APIGATEWAY_REQUEST_VALIDATOR => "RequestValidatorId",
+        // A CLIENT CERTIFICATE, identified by the `ClientCertificateId` API Gateway minted —
+        // "Ref returns the client certificate ID", the handle every call on one takes. The
+        // type declares no name a client could name one by.
+        APIGATEWAY_CLIENT_CERTIFICATE => "ClientCertificateId",
         APIGATEWAY_USAGE_PLAN | APIGATEWAY_USAGE_PLAN_KEY => "Id",
         // The account settings of the REST control plane, identified by the id the resource
         // publishes as `Id`: the settings are a singleton, so the type declares no name a

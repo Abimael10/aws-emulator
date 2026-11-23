@@ -50,6 +50,12 @@ pub fn client_certificate_expiration(
 /// certificate's subject — and no subject alternative name is set, because the certificate
 /// authenticates an API Gateway stage rather than a host.
 ///
+/// The DER the generator produced is wrapped in the PEM container itself
+/// ([`CERTIFICATE_PEM_TAG`], [`PEM_LINE_ENDING`]) rather than through the generator's own
+/// convenience encoder, which picks its line ending from the host it was compiled for: what
+/// `ClientCertificate$pemEncodedCertificate` carries is a property of the API, not of the
+/// machine the emulator runs on.
+///
 /// The private half is generated here and dropped: API Gateway keeps it ("the generated
 /// certificate's private key is managed by API Gateway"), and the `ClientCertificate` shape
 /// declares no member for it, so nothing this service stores or reports can present it.
@@ -70,8 +76,22 @@ pub fn mint_client_certificate_pem(
     params.distinguished_name = subject;
     params.not_before = ::rcgen::date_time_ymd(from_year, from_month, from_day);
     params.not_after = ::rcgen::date_time_ymd(to_year, to_month, to_day);
-    Some(params.self_signed(&key).ok()?.pem())
+    let issued = params.self_signed(&key).ok()?;
+    Some(::pem::encode_config(
+        &::pem::Pem::new(CERTIFICATE_PEM_TAG, issued.der().to_vec()),
+        ::pem::EncodeConfig::new().set_line_ending(PEM_LINE_ENDING),
+    ))
 }
+
+/// The PEM label a certificate is encapsulated under, which is what makes the text open with
+/// `-----BEGIN CERTIFICATE-----` and close with the matching end line.
+const CERTIFICATE_PEM_TAG: &str = "CERTIFICATE";
+
+/// The line ending API Gateway writes a generated certificate's PEM with: `CRLF`, the ending
+/// the encapsulation boundaries and every base64 line of a reported
+/// `ClientCertificate$pemEncodedCertificate` are terminated by — so the text begins with
+/// `-----BEGIN CERTIFICATE-----\r\n`.
+const PEM_LINE_ENDING: ::pem::LineEnding = ::pem::LineEnding::CRLF;
 
 /// What `GenerateClientCertificate` answers when [`mint_client_certificate_pem`] issues no
 /// material.

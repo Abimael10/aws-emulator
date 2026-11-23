@@ -6,7 +6,8 @@
 //! four that govern who reaches that stage — the authorizer that decides a request, the api
 //! key a caller presents, the usage plan that meters a key and the association that puts a
 //! key in a plan — and, in [`vpc_link`], the VPC link a private integration reaches a VPC
-//! through.
+//! through, beside the client certificate a stage presents to its backend
+//! ([`client_certificate`]).
 //!
 //! This is the per-type half of provisioning for those types, the half
 //! [`super::super::provisioner`] holds for every other type this emulator creates; it lives
@@ -58,7 +59,10 @@
 //! * `AWS::ApiGateway::VpcLink` is `CreateVpcLink` (`POST /vpclinks`), the one create here
 //!   that answers a resource still being provisioned ([`vpc_link`]);
 //! * the two types that decide what a deployed method VALIDATES a request against are
-//!   `CreateRequestValidator` and `CreateModel` ([`request_validation`]).
+//!   `CreateRequestValidator` and `CreateModel` ([`request_validation`]);
+//! * `AWS::ApiGateway::ClientCertificate` is `GenerateClientCertificate`
+//!   (`POST /clientcertificates`), the one create here that MINTS material of its own: the
+//!   certificate a stage presents to its backend ([`client_certificate`]).
 //!
 //! A declared property no call here carries is REFUSED rather than dropped: an api reported
 //! created with less than its declaration asked for is the shallow success these arms exist
@@ -81,8 +85,8 @@ use crate::state::provisioner::{
     tags_of, API_GATEWAY_NOT_FOUND, API_GATEWAY_SIGNING_NAME,
 };
 use crate::state::template::{
-    APIGATEWAY_ACCOUNT, APIGATEWAY_DEPLOYMENT, APIGATEWAY_RESOURCE, APIGATEWAY_REST_API,
-    APIGATEWAY_VPC_LINK,
+    APIGATEWAY_ACCOUNT, APIGATEWAY_CLIENT_CERTIFICATE, APIGATEWAY_DEPLOYMENT, APIGATEWAY_RESOURCE,
+    APIGATEWAY_REST_API, APIGATEWAY_VPC_LINK,
 };
 use crate::state::StoredResource;
 
@@ -101,6 +105,12 @@ mod request_validation;
 /// same reason: it is the one type here whose create leaves the resource still coming up, so
 /// its arms are the only ones that read a status back. Reached through the same [`Kind`].
 mod vpc_link;
+
+/// The client certificate API Gateway presents to the backend behind a stage, in a module of
+/// its own for the same reason: it is the one record here whose create MINTS material of its
+/// own — an issued certificate and the window it is valid over — rather than configuring the
+/// api. Reached through the same [`Kind`].
+mod client_certificate;
 
 /// Applying a CHANGED declaration to one of the five records a REST API is built out of, in
 /// a module of its own so that neither file grows past the length a change to this repository
@@ -165,6 +175,9 @@ pub(in crate::state) enum Kind {
     /// `AWS::ApiGateway::Account`, whose arms are [`account`]'s: the account-level settings
     /// of this control plane rather than a resource of it.
     Account,
+    /// `AWS::ApiGateway::ClientCertificate`, whose arms are [`client_certificate`]'s: a
+    /// record of the ACCOUNT, like a VPC link, rather than one inside an api.
+    ClientCertificate,
     /// One of the four types that govern ACCESS to a REST API, whose arms are
     /// [`access_control`]'s. Which of them it is travels with the kind, as the kind itself
     /// travels with [`super::Owner`].
@@ -185,6 +198,7 @@ pub(super) fn kind_of(resource_type: &str) -> Option<Kind> {
         APIGATEWAY_STAGE => Kind::Stage,
         APIGATEWAY_VPC_LINK => Kind::VpcLink,
         APIGATEWAY_ACCOUNT => Kind::Account,
+        APIGATEWAY_CLIENT_CERTIFICATE => Kind::ClientCertificate,
         _ => {
             if let Some(kind) = access_control::kind_of(resource_type) {
                 return Some(Kind::AccessControl(kind));
@@ -220,6 +234,11 @@ pub(super) async fn create(
         // ARN, and the account is no resource of that service, so there is no call that could
         // carry one.
         Kind::Account => account::create(ctx, region, resource).await,
+        // A client certificate is minted with the tags the declaration and the stack give it:
+        // `GenerateClientCertificate` takes them in its own `tags` member.
+        Kind::ClientCertificate => {
+            client_certificate::create(ctx, region, resource, propagated).await
+        }
         Kind::AccessControl(kind) => {
             access_control::create(ctx, region, kind, resource, propagated).await
         }
@@ -253,6 +272,7 @@ pub(super) async fn readiness(
         | Kind::Deployment
         | Kind::Stage
         | Kind::Account
+        | Kind::ClientCertificate
         | Kind::AccessControl(_)
         | Kind::RequestValidation(_) => Ok(Readiness::Ready),
     }
@@ -262,7 +282,8 @@ pub(super) async fn readiness(
 /// [`super::Owner::update`].
 ///
 /// A changed declaration of the api, of a resource of it, of a method on that resource, of a
-/// deployment of them or of the stage that serves one is applied through the PATCH call API
+/// deployment of them, of the stage that serves one or of a client certificate is applied
+/// through the PATCH call API
 /// Gateway publishes for that record ([`in_place`]), which is how that service changes one:
 /// only a change no pointer of that call can express — a property that is fixed when the
 /// resource is created — is reported as NOT applied (`Ok(None)`) rather than as a success that
@@ -281,9 +302,12 @@ pub(super) async fn update(
 ) -> Result<Option<Created>, Refusal> {
     match kind {
         Kind::Account => account::update(ctx, region, resource, declared).await,
-        Kind::RestApi | Kind::Resource | Kind::Method | Kind::Deployment | Kind::Stage => {
-            in_place::update(ctx, region, kind, resource, declared).await
-        }
+        Kind::RestApi
+        | Kind::Resource
+        | Kind::Method
+        | Kind::Deployment
+        | Kind::Stage
+        | Kind::ClientCertificate => in_place::update(ctx, region, kind, resource, declared).await,
         Kind::VpcLink | Kind::AccessControl(_) | Kind::RequestValidation(_) => Ok(None),
     }
 }
@@ -341,6 +365,9 @@ pub(super) async fn delete(
         // none for a singleton, so the setting this resource put there is CLEARED through the
         // one call it has ([`account::delete`]).
         Kind::Account => return account::delete(ctx, region, resource).await,
+        // A client certificate is a record of the ACCOUNT, addressed by the identifier that
+        // service minted, so its own module takes it away ([`client_certificate::delete`]).
+        Kind::ClientCertificate => return client_certificate::delete(ctx, region, resource).await,
         Kind::AccessControl(kind) => {
             return access_control::delete(ctx, region, kind, resource).await
         }
@@ -435,6 +462,9 @@ pub(super) async fn actual_configuration(
         // The account settings are read by a call carrying no identifier, so that arm reads
         // them itself rather than through the address a resource of this control plane has.
         Kind::Account => return account::actual_configuration(ctx, region).await,
+        Kind::ClientCertificate => {
+            return client_certificate::actual_configuration(ctx, region, resource).await
+        }
         Kind::AccessControl(kind) => {
             return access_control::actual_configuration(ctx, region, kind, resource).await
         }

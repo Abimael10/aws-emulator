@@ -163,10 +163,25 @@ fn seconds(body: &Value, member: &str, case: &str) -> i64 {
 /// published in, whose body is base64 that decodes to a DER SEQUENCE spanning every decoded
 /// byte — which is what a client that parses the member gets, rather than text in the shape
 /// of a certificate.
+///
+/// Including the LINE ENDING the armour is written with: API Gateway writes a generated
+/// certificate's PEM with `CRLF`, so the text opens with `-----BEGIN CERTIFICATE-----\r\n` and
+/// every line of it is terminated the same way — a property of the API rather than of the
+/// machine the emulator runs on.
 fn assert_pem_certificate(pem: &str, case: &str) {
     const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
     const END: &str = "-----END CERTIFICATE-----";
+    const CRLF: &str = "\r\n";
 
+    assert!(
+        pem.starts_with(&format!("{BEGIN}{CRLF}")),
+        "case {case}: expected the PEM to open with {BEGIN:?} and a CRLF, got {pem:?}"
+    );
+    assert!(
+        pem.split(CRLF).all(|line| !line.ends_with('\r') && !line.contains('\n')),
+        "case {case}: expected every PEM line to be terminated by a CRLF and nothing else, got \
+         {pem:?}"
+    );
     let trimmed = pem.trim_end();
     let body = trimmed
         .strip_prefix(BEGIN)

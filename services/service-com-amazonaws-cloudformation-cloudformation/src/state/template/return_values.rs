@@ -534,6 +534,7 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         APIGATEWAY_API_KEY => &["APIKeyId"],
         APIGATEWAY_AUTHORIZER => &["AuthorizerId"],
         APIGATEWAY_REQUEST_VALIDATOR => &["RequestValidatorId"],
+        APIGATEWAY_CLIENT_CERTIFICATE => &["ClientCertificateId"],
         APIGATEWAY_ACCOUNT | APIGATEWAY_USAGE_PLAN | APIGATEWAY_USAGE_PLAN_KEY => &["Id"],
         APIGATEWAYV2_API => &["ApiEndpoint", "ApiId", "ExecuteApiArn"],
         APIGATEWAYV2_API_MAPPING => &["ApiMappingId"],
@@ -716,6 +717,12 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // reaches a VPC through it — takes that id, and a template declares the link's name
         // rather than its identifier.
         || resource_type == APIGATEWAY_VPC_LINK
+        // A CLIENT CERTIFICATE is one more, for the reason its own constant records
+        // ([`APIGATEWAY_CLIENT_CERTIFICATE`]): `GenerateClientCertificate` takes no identifier
+        // and ISSUES the certificate, answering the `clientCertificateId` API Gateway minted,
+        // every call on one — and the stage that presents it to a backend — takes that id, and
+        // a template declares the certificate's description rather than its identifier.
+        || resource_type == APIGATEWAY_CLIENT_CERTIFICATE
         // Every AWS AppSync type is one more, for the reason [`appsync`] records:
         // `CreateGraphqlApi` takes the API's name and no identifier and answers the `apiId`
         // it minted beside the ARN built on it, each child's create is addressed by that id
