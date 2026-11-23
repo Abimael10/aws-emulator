@@ -26,6 +26,12 @@
 //! 6. **Every catalog row is modelled data**: each value is one the matching Smithy enum
 //!    carries and each name satisfies its member's `@length`, and the catalog spans every
 //!    value a caller can filter on, which is what makes rule 2's table meaningful.
+//! 7. **A model a customization job accepts is published under a training-qualified id
+//!    beside its on-demand one, and only while a customization of it is still offered**:
+//!    a DEPRECATED model (`LEGACY`) takes no new customization job, so the catalog
+//!    carries it under its base id alone — no row of it publishes a customization and no
+//!    listing reports a training-qualified row for it — while the qualified id goes on
+//!    naming the same published model and still resolves to that base row.
 //!
 //! Expectations come from the model
 //! (`smithy_query(query="operation",operation="ListFoundationModels")` and
@@ -45,7 +51,7 @@ use service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice::state::{
 };
 
 use crate::support::{
-    emulator, error_code, expected_foundation_model_projection, Emulator, Reply, REGION,
+    emulator, error_code, expected_foundation_model_projection, label, Emulator, Reply, REGION,
 };
 
 /// The one path `ListFoundationModels` is bound to
@@ -578,3 +584,218 @@ fn the_catalog_spans_every_value_a_caller_can_filter_on() {
 /// `ModelCustomization` — the customization AWS offered for the Amazon Titan text models,
 /// which are past their end of life, so the catalog offers no model for it.
 const CONTINUED_PRE_TRAINING: &str = "CONTINUED_PRE_TRAINING";
+
+// ---------------------------------------------------------------------------------------
+// 7. The training-qualified id of a model, and the deprecated model that has none.
+// ---------------------------------------------------------------------------------------
+
+/// `FoundationModelLifecycleStatus` — the status of a deprecated model.
+const LEGACY: &str = "LEGACY";
+
+/// The member of a summary this section reads a row's lifecycle out of.
+fn listed_status(case: &str, summary: &Value) -> String {
+    summary
+        .get("modelLifecycle")
+        .and_then(|lifecycle| lifecycle.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: a summary must carry modelLifecycle.status, got {summary:?}")
+        })
+        .to_string()
+}
+
+/// The `customizationsSupported` a summary reports.
+fn listed_customizations(case: &str, summary: &Value) -> Vec<String> {
+    summary
+        .get("customizationsSupported")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: a summary must carry customizationsSupported, got {summary:?}")
+        })
+        .iter()
+        .map(|value| value.as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// Every id that is a proper `:`-separated PREFIX of `model_id`, longest first: the ids a
+/// training-qualified id is stripped back to, at a `:` boundary only, the way a base model
+/// id embedded in a resource is resolved (`CustomModelArn` admits
+/// `([:][a-z0-9-]{1,63}){0,2}` after the model id,
+/// `smithy_query(query="operation",operation="CreateCustomModelDeployment")`).
+fn qualifier_prefixes(model_id: &str) -> Vec<&str> {
+    let mut prefixes = Vec::new();
+    let mut candidate = model_id;
+    while let Some((shorter, _)) = candidate.rsplit_once(':') {
+        prefixes.push(shorter);
+        candidate = shorter;
+    }
+    prefixes
+}
+
+#[tokio::test]
+async fn a_deprecated_model_is_published_under_its_base_id_alone() {
+    let emu = emulator();
+    let case = "the whole catalog";
+    let listed = summaries(case, &list(&emu, "").await);
+    let rows: Vec<(String, String, Vec<String>)> = listed
+        .iter()
+        .map(|summary| {
+            let id = summary
+                .get("modelId")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("case {case:?}: a summary must carry modelId"))
+                .to_string();
+            (
+                id.clone(),
+                listed_status(&id, summary),
+                listed_customizations(&id, summary),
+            )
+        })
+        .collect();
+    assert!(
+        rows.iter().any(|(_, status, _)| status == LEGACY),
+        "setup: the catalog must publish a deprecated model for this rule to bite, got {} \
+         rows",
+        rows.len()
+    );
+
+    // A deprecated model takes no new customization job, so no row of one publishes a
+    // customization …
+    for (id, status, customizations) in &rows {
+        if status != LEGACY {
+            continue;
+        }
+        assert!(
+            customizations.is_empty(),
+            "case {id:?}: a deprecated model takes no new customization job, so it publishes \
+             no customization, got {customizations:?}"
+        );
+    }
+    // … and no row is the training-qualified variant of one.
+    for (id, _, _) in &rows {
+        for prefix in qualifier_prefixes(id) {
+            let base = rows
+                .iter()
+                .find(|(listed_id, _, _)| listed_id == prefix)
+                .map(|(_, status, _)| status.as_str());
+            assert_ne!(
+                base,
+                Some(LEGACY),
+                "case {id:?}: {prefix:?} is deprecated, so no training-qualified row is \
+                 published for it, yet {id:?} is listed beside it"
+            );
+        }
+    }
+}
+
+/// One `:`-qualified identifier a client may address a published model by: the catalog row
+/// it names, and whether the catalog publishes a row of its OWN under it — which the
+/// model's lifecycle decides.
+struct Variant {
+    identifier: &'static str,
+    base: &'static str,
+    own_row: bool,
+}
+
+/// The identifiers rule 7 splits: the training-qualified ids of the catalog's deprecated
+/// models, published under no row of their own, beside the qualified ids of models that are
+/// still available, which ARE rows of their own — one published with a single qualifier, one
+/// with two, and from another provider.
+const VARIANTS: &[Variant] = &[
+    Variant {
+        identifier: "cohere.command-text-v14:7:4k",
+        base: "cohere.command-text-v14",
+        own_row: false,
+    },
+    Variant {
+        identifier: "cohere.command-light-text-v14:7:4k",
+        base: "cohere.command-light-text-v14",
+        own_row: false,
+    },
+    Variant {
+        identifier: "amazon.titan-embed-image-v1:0",
+        base: "amazon.titan-embed-image-v1:0",
+        own_row: true,
+    },
+    Variant {
+        identifier: "amazon.titan-embed-text-v1:2:8k",
+        base: "amazon.titan-embed-text-v1:2:8k",
+        own_row: true,
+    },
+];
+
+#[tokio::test]
+async fn a_training_qualified_identifier_reads_the_row_it_names() {
+    let emu = emulator();
+    let listed = listed_ids("the whole catalog", &list(&emu, "").await);
+    for row in VARIANTS {
+        let case = row.identifier;
+        let carried = listed.iter().any(|id| id == case);
+        assert_eq!(
+            carried, row.own_row,
+            "case {case:?}: the catalog publishes a row of its own under this id: {}, got \
+             {carried}",
+            row.own_row
+        );
+        assert!(
+            listed.iter().any(|id| id == row.base),
+            "case {case:?}: the model's base id {:?} must be listed, got {} rows without it",
+            row.base,
+            listed.len()
+        );
+
+        let reply = emu
+            .call("GET", &format!("{PATH}/{}", label(case)), None)
+            .await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case:?}: a qualified id names a published model, so a read of it must \
+             answer 200, got {} {:?}",
+            reply.status, reply.body
+        );
+        let published = FOUNDATION_MODELS
+            .iter()
+            .find(|model| model.model_id == row.base)
+            .unwrap_or_else(|| panic!("case {case:?}: the catalog must carry {:?}", row.base));
+        assert_eq!(
+            reply.get("modelDetails"),
+            expected_foundation_model_projection(published, REGION),
+            "case {case:?}: the read must report the row the id resolves to, {:?}",
+            row.base
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_customization_filter_reports_no_deprecated_model() {
+    let emu = emulator();
+    for customization in MODEL_CUSTOMIZATION_VALUES {
+        let case = format!("byCustomizationType={customization}");
+        for summary in summaries(&case, &list(&emu, &case).await) {
+            let id = summary
+                .get("modelId")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("case {case:?}: a summary must carry modelId"))
+                .to_string();
+            assert!(
+                listed_customizations(&case, &summary)
+                    .iter()
+                    .any(|value| value == customization),
+                "case {case:?}: {id:?} is listed, so it must publish {customization:?}"
+            );
+            assert_ne!(
+                listed_status(&case, &summary),
+                LEGACY,
+                "case {case:?}: {id:?} is deprecated, so no customization is offered for it"
+            );
+        }
+    }
+
+    // The one customization the catalog publishes variant rows for must still narrow the
+    // listing to something, or the rule above would hold vacuously.
+    let case = "byCustomizationType=FINE_TUNING";
+    assert!(
+        !summaries(case, &list(&emu, case).await).is_empty(),
+        "case {case:?}: the catalog must publish a model offered for FINE_TUNING"
+    );
+}

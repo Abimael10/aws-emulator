@@ -251,6 +251,10 @@ pub(super) const fn also_provisioned(model: FoundationModel) -> FoundationModel 
 /// customization job names, so the customizations belong to the variant's row and the
 /// on-demand row publishes none. One published model, two ids a client may address it by,
 /// each publishing what it is offered for.
+///
+/// Only while the model still takes a customization, though: a deprecated model
+/// ([`LIFECYCLE_LEGACY`]) accepts no new customization job, so no variant row is published
+/// for one (see [`FOUNDATION_MODELS`]).
 pub(super) const fn customizable(
     model: FoundationModel,
     customizations_supported: &'static [&'static str],
@@ -290,6 +294,16 @@ pub(super) const fn customizable(
 /// Every value of each member a caller can filter on is carried by a row — except the
 /// customization AWS offered only for models that are past their end of life, which no
 /// offered row carries — so a filter on one of them narrows the catalog to the rows that do.
+///
+/// A model a customization job accepts is published under a second, TRAINING-QUALIFIED id
+/// beside its on-demand one ([`customizable`]), and that second row is published only while
+/// a customization of the model is still offered: a DEPRECATED model ([`LIFECYCLE_LEGACY`])
+/// takes no new customization job, so AWS publishes no training-qualified row for one and
+/// the catalog carries a deprecated model under its base id alone — which is why no row here
+/// is both deprecated and customizable. The qualified id goes on naming the same published
+/// model, so it still resolves to that base row
+/// ([`FoundationModelCatalog::qualified_model`]) and the inference plane goes on serving it;
+/// it is simply not a catalog entry of its own for a listing to report.
 ///
 /// A row whose published attributes differ from the three kinds below — a model a
 /// customization job accepts, or a deprecated one — is written out member by member; every
@@ -609,25 +623,6 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
             end_of_life_at: "2027-06-30T00:00:00Z",
         }),
     },
-    // The same model under the training-qualified id a customization names.
-    FoundationModel {
-        model_id: "cohere.command-light-text-v14:7:4k",
-        model_name: "Command Light",
-        provider_name: "Cohere",
-        model_family: "Command",
-        input_modalities: IN_TEXT,
-        output_modalities: OUT_TEXT,
-        response_streaming_supported: true,
-        customizations_supported: FINE_TUNING,
-        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        features_supported: BATCH_ONLY,
-        lifecycle_status: LIFECYCLE_LEGACY,
-        start_of_life_time: "2023-09-28T00:00:00Z",
-        legacy_window: Some(LegacyWindow {
-            entered_at: "2025-04-30T00:00:00Z",
-            end_of_life_at: "2027-06-30T00:00:00Z",
-        }),
-    },
     FoundationModel {
         model_id: "cohere.command-text-v14",
         model_name: "Command",
@@ -637,25 +632,6 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         output_modalities: OUT_TEXT,
         response_streaming_supported: true,
         customizations_supported: NO_CUSTOMIZATION,
-        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        features_supported: BATCH_ONLY,
-        lifecycle_status: LIFECYCLE_LEGACY,
-        start_of_life_time: "2023-09-28T00:00:00Z",
-        legacy_window: Some(LegacyWindow {
-            entered_at: "2025-04-30T00:00:00Z",
-            end_of_life_at: "2027-06-30T00:00:00Z",
-        }),
-    },
-    // The same model under the training-qualified id a customization names.
-    FoundationModel {
-        model_id: "cohere.command-text-v14:7:4k",
-        model_name: "Command",
-        provider_name: "Cohere",
-        model_family: "Command",
-        input_modalities: IN_TEXT,
-        output_modalities: OUT_TEXT,
-        response_streaming_supported: true,
-        customizations_supported: FINE_TUNING,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
         features_supported: BATCH_ONLY,
         lifecycle_status: LIFECYCLE_LEGACY,
