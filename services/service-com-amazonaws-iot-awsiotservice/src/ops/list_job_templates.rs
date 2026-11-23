@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListJobTemplates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListJobTemplates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListJobTemplates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Returns a list of job templates": one entry per job template the account holds, in
+//! the order the store keys them by — the `jobTemplateId`, which the model documents as
+//! "A unique identifier for the job template" — paged by `maxResults` and resumed by
+//! `nextToken`. A pure READ: nothing here writes, so a later caller sees what this one
+//! saw.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +142,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListJobTemplates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListJobTemplatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListJobTemplates"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListJobTemplatesErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+            .into());
+        };
+        // `ctx` carries request metadata only; this listing needs none of it — every
+        // member a listed entry carries, the ARN included, is read off the record the
+        // create minted.
+        let _ = ctx;
+
+        // The continuation token is resolved BEFORE the store is reached: a request whose
+        // `nextToken` is not one THIS listing issued is refused whatever the store holds.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                let Some(resume_after) = crate::state::decode_page_marker(token, LISTING_SCOPE)
+                else {
+                    return Err(ListJobTemplatesErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: Some(
+                                "nextToken is not a continuation token of this listing".to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                };
+                Some(resume_after)
+            }
+        };
+        // `maxResults` is "The maximum number of results to return in the list" and
+        // documents no default, so a request that names none asks for every entry this
+        // listing admits on one page ([`MAX_PAGE_SIZE`]). A value outside the modelled
+        // range is refused BEFORE this handler runs, so the clamp is an unreachable
+        // backstop rather than a coercion of a bad request, and it is taken against the
+        // bound this operation's own member declares.
+        let page_size = input.max_results.map_or(MAX_PAGE_SIZE, |max_results| {
+            max_results.clamp(1, MAX_PAGE_SIZE)
+        }) as usize;
+
+        // A pure read of the job-template store: "Returns a list of job templates", so
+        // every record the account holds is a row of this listing.
+        let store = state.lock();
+        // The registry IS the store keyed by `jobTemplateId`, so the listing's order is
+        // that order — ascending by id, which is what makes a page boundary meaningful for
+        // a `@paginated` listing.
+        let ids: Vec<String> = store.job_templates.keys().cloned().collect();
+
+        // One page of that order, resumed after the position the caller's own token names
+        // ([`crate::state::page_of`]) — the same paging every other `@paginated` listing
+        // of this service uses, so a token is issued and read one way.
+        let (page, next_token) =
+            crate::state::page_of(ids, LISTING_SCOPE, resume_after.as_deref(), page_size);
+
+        // Each entry is projected from the stored record, so what this listing reports and
+        // what `DescribeJobTemplate` reports cannot drift.
+        Ok(ListJobTemplatesOutput {
+            // `JobTemplateSummaryList` carries no length constraint, so an account holding
+            // no template answers with an EMPTY list rather than an absent member: "the
+            // account holds none" is an answer, not a missing one.
+            job_templates: Some(
+                page.iter()
+                    .filter_map(|job_template_id| store.job_templates.get(job_template_id))
+                    .map(crate::state::RegisteredJobTemplate::summary)
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }
+
+/// The largest page `LaserMaxResults` admits (`range 1..250`,
+/// `smithy_query(query="operation",operation="ListJobTemplates")`), which is also the most
+/// entries one page of this listing may carry.
+const MAX_PAGE_SIZE: i32 = 250;
+
+/// The LISTING a continuation token belongs to. This operation takes no filter and no
+/// direction, so there is exactly ONE listing of job templates and its scope is a
+/// constant — a token of any other listing of this service is still refused, because the
+/// scope is what [`crate::state::decode_page_marker`] compares.
+const LISTING_SCOPE: &str = "job-templates";

@@ -29,7 +29,7 @@ use std::time::SystemTime;
 
 use crate::ops::types::{
     AbortConfig, DescribeJobTemplateOutput, JobExecutionsRetryConfig, JobExecutionsRolloutConfig,
-    MaintenanceWindow, PresignedUrlConfig, TimeoutConfig,
+    JobTemplateSummary, MaintenanceWindow, PresignedUrlConfig, TimeoutConfig,
 };
 
 /// How many job templates this emulator keeps for the account.
@@ -182,6 +182,22 @@ impl RegisteredJobTemplate {
             job_executions_retry_config: self.job_executions_retry_config.clone(),
             maintenance_windows: self.maintenance_windows.clone(),
             destination_package_versions: self.destination_package_versions.clone(),
+        }
+    }
+
+    /// The record as a LISTING entry — `JobTemplateSummary`, "An object that contains
+    /// information about the job template".
+    ///
+    /// Projected from the SAME stored record the reader describes, so a listing entry and
+    /// the describe of the template it names cannot drift: every member the summary
+    /// declares (the ARN, the id, the description and the instant of the create) is the one
+    /// [`Self::to_description`] reports.
+    pub fn summary(&self) -> JobTemplateSummary {
+        JobTemplateSummary {
+            job_template_arn: Some(self.job_template_arn.clone()),
+            job_template_id: Some(self.job_template_id.clone()),
+            description: Some(self.description.clone()),
+            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
         }
     }
 }
