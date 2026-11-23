@@ -4514,6 +4514,11 @@ pub mod replication;
 /// it makes) here, so it is reached as `crate::state::key_grant::…` like every other part of
 /// this store.
 pub mod key_grant;
+/// WHICH KMS key a repository's contents are encrypted under — the key its stored
+/// `encryptionConfiguration` reports, resolved against KMS — in `state/encryption_key.rs`.
+/// Declared (and not glob re-exported, so a handler names the KMS hop it makes) here, so it is
+/// reached as `crate::state::encryption_key::…` like every other part of this store.
+pub mod encryption_key;
 mod image_scan;
 mod layer_download;
 /// The two refusals of a rule ACROSS members this registry raises, worded in the clause

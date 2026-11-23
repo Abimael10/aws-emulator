@@ -328,6 +328,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that is encrypted anyway, so KMS's own answer about the key is relayed as the
         // modelled `KmsException` and nothing is created.
         let mut granted = Vec::new();
+        // WHICH key a KMS-encrypted repository is protected with is reported by the key's own
+        // ARN, resolved against KMS: the request names the key by "the alias, key ID, or full
+        // ARN", or names none at all, and none of those says which key protects the repository
+        // (`crate::state::encryption_key`).
+        let mut reported_key = encryption.kms_key.clone();
         if let Some(kms_key) = crate::state::key_grant::granted_key(&encryption) {
             match crate::state::key_grant::take(
                 ctx,
@@ -337,7 +342,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .await
             {
-                crate::state::key_grant::Taken::Grants(grants) => granted = grants,
+                crate::state::key_grant::Taken::Grants(grants) => {
+                    // The grants were taken on the key KMS RESOLVED the request's reference
+                    // to, by that key's own ARN, so the repository reports the same key its
+                    // authorizations are held on.
+                    reported_key = grants
+                        .first()
+                        .map(|grant| grant.key_arn.clone())
+                        .or(reported_key);
+                    granted = grants;
+                }
                 crate::state::key_grant::Taken::Refused { kms_error, message } => {
                     return Err(CreateRepositoryErrorModeled::KmsException(KmsException {
                         message: Some(message),
@@ -349,7 +363,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // repository is created and holds no grant (see that module's docs).
                 crate::state::key_grant::Taken::Unknown => {}
             }
+        } else if crate::state::encryption_key::under_a_kms_key(&encryption) {
+            // A KMS encryption type naming no key of the account's: "if no key is specified,
+            // the default Amazon Web Services managed KMS key for Amazon ECR will be used", so
+            // the repository is protected by THAT key and reports it. It is the account's own
+            // managed key rather than a key of the caller's, so no authorization is taken on it
+            // (`crate::state::key_grant`).
+            reported_key = crate::state::encryption_key::aws_managed_key(ctx, &region).await;
         }
+        // The configuration the repository carries from here on names the key the resolution
+        // settled on, so every later reader of the record — `DescribeRepositories` included —
+        // reports the same key the create did.
+        let encryption = EncryptionConfiguration {
+            encryption_type: encryption.encryption_type,
+            kms_key: reported_key,
+        };
 
         // Judged again under the SAME guard the record is written with: the grants above were
         // taken with no store lock held, so another call may have taken the name in the
