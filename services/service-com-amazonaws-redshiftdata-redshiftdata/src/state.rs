@@ -87,6 +87,18 @@ pub mod object_store;
 /// `COPY`: the rows a load reads out of Amazon S3, and the rows it rejects.
 pub mod copy_load;
 
+/// What the last `COPY` of a session loaded, which `PG_LAST_COPY_COUNT()`
+/// reports.
+pub mod load_counters;
+
+/// `ANALYZE COMPRESSION`: the encoding each analysed column would be stored
+/// under, and what that would save.
+pub mod analyze_compression;
+
+/// The compression encoding each column of a table is stored under, which
+/// `PG_TABLE_DEF` reports.
+pub mod column_encodings;
+
 /// `UNLOAD`: the objects an export writes to Amazon S3, and its manifest.
 pub mod unload_export;
 
@@ -1414,6 +1426,15 @@ pub struct Database {
     /// connection's key: `SET` on one connection changes nothing on another,
     /// which is what makes a parameter a session's own.
     settings: HashMap<String, session_settings::SessionSettings>,
+    /// What the last `COPY` on each connection loaded, which that connection's
+    /// `PG_LAST_COPY_COUNT()` reports ([`load_counters`]) — the only place a
+    /// load's ingested row count is reported, since the statement record keeps
+    /// `ResultRows` at zero for one.
+    load_counts: load_counters::SessionLoadCounts,
+    /// The compression encoding each column of each table is stored under, as
+    /// its `CREATE TABLE` declared it ([`column_encodings`]), which
+    /// `PG_TABLE_DEF` reports.
+    encodings: column_encodings::ColumnEncodings,
 }
 
 impl Database {
@@ -1505,6 +1526,8 @@ impl Database {
             external: external_schemas::ExternalSchemas::default(),
             system: system_tables::SystemLog::default(),
             settings: HashMap::new(),
+            load_counts: load_counters::SessionLoadCounts::default(),
+            encodings: column_encodings::ColumnEncodings::default(),
         })
     }
 
@@ -2294,6 +2317,15 @@ fn run_statement(
     effects.bound.record_query(query);
     let queued = SystemTime::now();
     let (label, assignment) = assigned_queue(database, plane, effects.scope.key());
+    // `PG_LAST_COPY_COUNT()` reports what the last `COPY` of THIS connection
+    // loaded, so the implementation the statement about to run finds on the
+    // engine is the one carrying that connection's count.
+    if let Err(error) = load_counters::install(
+        &database.connection,
+        database.load_counts.loaded(effects.scope.key()),
+    ) {
+        return Err(ExecutionFailure::Engine(error));
+    }
     let produced = carry_out(
         database, sql, parameters, binding, budget, plane, effects, query,
     );
@@ -2375,6 +2407,18 @@ fn carry_out(
     );
     if changes_data && matches!(produced, Ok(Produced::Affected(_))) {
         effects.connection.changed = true;
+    }
+    // A `CREATE TABLE` that declared how its columns are COMPRESSED is read for
+    // that declaration once the table is really there: the engine is handed the
+    // table without the storage attributes, and what the catalogue reports for
+    // each column's encoding is this record ([`column_encodings`]).
+    if produced.is_ok() {
+        if let Some(declared) = column_encodings::declared(sql) {
+            let table = redshift_sql::engine_table_name(&declared.table, &database.schemas);
+            database
+                .encodings
+                .record(&table, declared.columns, MAX_ENCODED_TABLES);
+        }
     }
     produced
 }
@@ -2497,7 +2541,10 @@ fn warehouse_statement(
 ) -> Result<Produced, ExecutionFailure> {
     use warehouse_statements::WarehouseStatement;
     match statement {
-        WarehouseStatement::Copy(copy) => copy_into(database, copy, plane, query),
+        WarehouseStatement::Copy(copy) => copy_into(database, copy, plane, connection, query),
+        WarehouseStatement::AnalyzeCompression(analyze) => {
+            analyse_compression(database, analyze, budget)
+        }
         WarehouseStatement::Unload(unload) => unload_from(database, unload, plane),
         WarehouseStatement::CreateExternalSchema(external) => {
             create_external_schema(database, external, plane)
@@ -2533,11 +2580,31 @@ fn warehouse_statement(
     }
 }
 
+/// The rows a statement that neither returned nor affected any reports.
+///
+/// A `COPY` reports this: `ResultRows` is "either the number of rows returned
+/// from the SQL statement or the number of rows affected", and the rows a load
+/// ingested are neither — they are the session's to report (see [`copy_into`]).
+const NO_REPORTED_ROWS: i64 = 0;
+
+/// How many tables one database keeps the declared column encodings of
+/// ([`column_encodings`]). Bounded as every other map this service grows on
+/// request is: a table whose entry made room for another one reads back under
+/// the automatic encoding of each column's type.
+const MAX_ENCODED_TABLES: usize = 4_096;
+
 /// `COPY`: load the objects the statement names into the table it names.
+///
+/// The rows it ingested are the SESSION's to report: the statement record's
+/// `ResultRows` is "either the number of rows returned from the SQL statement or
+/// the number of rows affected", and a load's count is neither, so the load
+/// reports no rows and the count is recorded against the connection for
+/// `PG_LAST_COPY_COUNT()` ([`load_counters`]).
 fn copy_into(
     database: &mut Database,
     copy: &warehouse_statements::CopyStatement,
     plane: &data_plane::DataPlane,
+    connection: &str,
     query: i64,
 ) -> Result<Produced, ExecutionFailure> {
     let target = redshift_sql::engine_table_name(&copy.table, &database.schemas);
@@ -2556,7 +2623,10 @@ fn copy_into(
     match loaded {
         Ok(loaded) => {
             database.system.record_load_errors(loaded.rejected);
-            Ok(Produced::Affected(loaded.rows))
+            database
+                .load_counts
+                .record(connection, loaded.rows, MAX_RETAINED_SESSIONS);
+            Ok(Produced::Affected(NO_REPORTED_ROWS))
         }
         // The rows that could not be loaded are recorded, and the statement
         // fails with the engine's own load-failure line, which is what points a
@@ -2575,6 +2645,36 @@ fn copy_into(
         }
         Err(copy_load::LoadFailure::Engine(error)) => Err(ExecutionFailure::Engine(error)),
     }
+}
+
+/// `ANALYZE COMPRESSION`: report the encoding each analysed column would be
+/// stored under, and how much space that would save.
+///
+/// A READ: the analysis reads the rows the tables hold and changes nothing about
+/// them.
+fn analyse_compression(
+    database: &Database,
+    statement: &warehouse_statements::AnalyzeCompressionStatement,
+    budget: &mut Retention,
+) -> Result<Produced, ExecutionFailure> {
+    let report =
+        analyze_compression::analyse(&database.connection, statement, &database.schemas).map_err(
+            |failure| match failure {
+                analyze_compression::AnalysisFailure::Engine(error) => {
+                    ExecutionFailure::Engine(error)
+                }
+                analyze_compression::AnalysisFailure::Refused(message) => {
+                    ExecutionFailure::Warehouse(message)
+                }
+            },
+        )?;
+    execute_once(
+        &database.connection,
+        &analyze_compression::report_sql(&report),
+        &[],
+        Binding::Referenced,
+        budget,
+    )
 }
 
 /// `UNLOAD`: run the query the statement carries and write its rows to Amazon
@@ -2643,6 +2743,7 @@ fn prepare_references(
             &mut database.system,
             &plane.facts.database,
             &queues,
+            &database.encodings,
             &system,
         )?;
     }
@@ -2744,6 +2845,9 @@ fn close_connection(
     // A connection that is gone holds no session parameters either: the next
     // statement on a connection of its own reads their defaults.
     database.settings.remove(scope.key());
+    // Nor what a load on it counted: a session's load count goes with the
+    // session.
+    database.load_counts.forget(scope.key());
     for execution in executions {
         for relation in std::mem::take(&mut execution.connection.temp_created) {
             drop_temp_relation(database, &scope.relations().engine_name(&relation));

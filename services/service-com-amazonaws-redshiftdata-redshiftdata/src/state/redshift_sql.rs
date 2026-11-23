@@ -590,7 +590,7 @@ impl VisitorMut for Rewriter<'_> {
 /// literal or a comment is part of that literal or comment and starts no
 /// statement. `None` for a statement the tokenizer cannot read at all, which is
 /// one the engine reports rather than this module.
-fn significant_tokens(sql: &str) -> Option<Vec<Token>> {
+pub(super) fn significant_tokens(sql: &str) -> Option<Vec<Token>> {
     let dialect = RedshiftSqlDialect {};
     let tokens = Tokenizer::new(&dialect, sql).tokenize().ok()?;
     let mut kept: Vec<Token> = tokens

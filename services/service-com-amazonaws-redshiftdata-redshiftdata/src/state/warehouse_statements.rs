@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The statements of the DATA WAREHOUSE's own vocabulary, read from the token
-//! stream: `COPY`, `UNLOAD`, `CREATE EXTERNAL SCHEMA`, `SET`, `RESET` and
-//! `SHOW`.
+//! stream: `COPY`, `UNLOAD`, `CREATE EXTERNAL SCHEMA`, `ANALYZE COMPRESSION`,
+//! `SET`, `RESET` and `SHOW`.
 //!
 //! These are statements of Amazon Redshift rather than of the SQL standard, and
 //! the dialect-aware parser this crate reads a statement with models none of
@@ -16,7 +16,8 @@
 //! What is read is the FORM of the statement, never what it does: a `COPY`
 //! names a source, an authorization and a format, and reading it is what lets
 //! the executors behind it ([`super::copy_load`], [`super::unload_export`],
-//! [`super::external_schemas`], [`super::session_settings`]) do the work. An
+//! [`super::external_schemas`], [`super::analyze_compression`],
+//! [`super::session_settings`]) do the work. An
 //! option this engine cannot carry out is deliberately NOT read: the statement
 //! then goes to the engine as the caller wrote it and the engine reports on it,
 //! which is better than reporting a load or an export that did something other
@@ -25,7 +26,7 @@
 //!
 //! Source for the grammars and for every default below: the Amazon Redshift
 //! *SQL reference* entries for `COPY`, `UNLOAD`, `CREATE EXTERNAL SCHEMA`,
-//! `SET`, `RESET` and `SHOW`.
+//! `ANALYZE COMPRESSION`, `SET`, `RESET` and `SHOW`.
 
 use sqlparser::tokenizer::Token;
 
@@ -54,6 +55,10 @@ pub enum WarehouseStatement {
         /// default value").
         value: Option<String>,
     },
+    /// `ANALYZE COMPRESSION [ <table> [ ( <column> [, …] ) ] ] [ COMPROWS
+    /// <numrows> ]`: report the compression encoding each analysed column would
+    /// be stored under, and how much space that would save.
+    AnalyzeCompression(AnalyzeCompressionStatement),
     /// `RESET { <parameter> | ALL }`: give a parameter, or every parameter, back
     /// its default.
     Reset {
@@ -109,9 +114,10 @@ pub struct CopyStatement {
     /// `IGNOREHEADER`: how many leading lines of each object are a header and
     /// are not rows.
     pub ignore_header: u64,
-    /// `MAXERROR`: how many rows may fail to load before the load itself fails.
-    /// "If the load returns the error count, the load fails" — the default is
-    /// zero, so one bad row fails the load.
+    /// `MAXERROR`: the number of rejected rows at which the load itself fails.
+    /// "If the load returns the error_count number or greater, the load fails" —
+    /// so the load tolerates one fewer rejected row than this number, and the
+    /// default of zero fails on the first one.
     pub max_error: u64,
     /// `MANIFEST`: the source names a manifest listing the objects to load
     /// rather than the data itself.
@@ -178,6 +184,20 @@ impl CopyStatement {
             DataFormat::Delimited | DataFormat::Json => DEFAULT_DELIMITED_DELIMITER,
         }
     }
+}
+
+/// `ANALYZE COMPRESSION`, as the caller wrote it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnalyzeCompressionStatement {
+    /// The table's name parts, as written; empty when the statement names none,
+    /// which analyses every table of the database.
+    pub table: Vec<String>,
+    /// The columns it names, in its order; empty when it names none, which
+    /// analyses every column of the table.
+    pub columns: Vec<String>,
+    /// `COMPROWS`: "the number of rows to be used as the sample size for
+    /// compression analysis", or `None` for the default sample size.
+    pub comprows: Option<u64>,
 }
 
 /// `UNLOAD`, as the caller wrote it.
@@ -326,6 +346,11 @@ pub fn parse(tokens: &[Token]) -> Option<WarehouseStatement> {
     }
     if is_keyword(head, "show") {
         return show(&tokens[1..]);
+    }
+    // `ANALYZE COMPRESSION` only: a plain `ANALYZE`, which collects statistics
+    // and reports nothing, is left to the engine.
+    if is_keyword(head, "analyze") || is_keyword(head, "analyse") {
+        return analyze_compression(tokens.get(1..)?);
     }
     if is_keyword(head, "create") {
         return create_external(&tokens[1..]);
@@ -976,6 +1001,37 @@ fn property_list(tokens: &[Token]) -> Option<(NamedValues, &[Token])> {
             _ => return None,
         }
     }
+}
+
+/// `ANALYZE COMPRESSION [ <table> [ ( <column> [, …] ) ] ] [ COMPROWS
+/// <numrows> ]`, after the leading `ANALYZE`.
+fn analyze_compression(tokens: &[Token]) -> Option<WarehouseStatement> {
+    if !is_keyword(tokens.first()?, "compression") {
+        return None;
+    }
+    let mut statement = AnalyzeCompressionStatement {
+        table: Vec::new(),
+        columns: Vec::new(),
+        comprows: None,
+    };
+    let mut rest = tokens.get(1..)?;
+    // "ANALYZE COMPRESSION [ [ table_name ] [ ( column_name [, …] ) ] ]": a
+    // statement that names no table analyses every table of the database.
+    if rest.first().is_some_and(|head| !is_keyword(head, "comprows")) {
+        let (table, after_name) = qualified_name(rest)?;
+        let (columns, after_columns) = column_list(after_name);
+        statement.table = table;
+        statement.columns = columns;
+        rest = after_columns;
+    }
+    if let Some(after) = value_clause(rest, "comprows") {
+        statement.comprows = Some(count(after.first()?)?);
+        rest = after.get(1..)?;
+    }
+    // Anything left is a clause this grammar does not read, which leaves the
+    // whole statement unread.
+    rest.is_empty()
+        .then_some(WarehouseStatement::AnalyzeCompression(statement))
 }
 
 /// `SET [ SESSION | LOCAL ] <parameter> { TO | = } { <value> | DEFAULT }`, after

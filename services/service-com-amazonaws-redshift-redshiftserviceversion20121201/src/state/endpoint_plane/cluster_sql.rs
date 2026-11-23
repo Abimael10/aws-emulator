@@ -223,11 +223,11 @@ impl SqlDialect for ClusterSql {
                 }
                 DialectReading::Run(verb.to_string())
             }
-            // The statements of the warehouse's own vocabulary that reach
-            // Amazon S3 or the AWS Glue Data Catalog. They are the Data API's
-            // to run — that is where this emulator's loads, exports and
-            // external schemas live — so a session on this endpoint is told so
-            // rather than answered as though a load had happened.
+            // The statements of the warehouse's own vocabulary. They are the
+            // Data API's to run — that is where this emulator's loads, exports,
+            // external schemas, session parameters and compression analyses
+            // live — so a session on this endpoint is told so rather than
+            // answered as though one had happened.
             Translated::Warehouse(statement) => DialectReading::Refused(EngineError::new(
                 EngineErrorKind::FeatureNotSupported,
                 format!(
@@ -661,6 +661,7 @@ fn warehouse_statement_verb(
         WarehouseStatement::Unload(_) => "UNLOAD",
         WarehouseStatement::CreateExternalSchema(_) => "CREATE EXTERNAL SCHEMA",
         WarehouseStatement::CreateExternalTable(_) => "CREATE EXTERNAL TABLE",
+        WarehouseStatement::AnalyzeCompression(_) => "ANALYZE COMPRESSION",
         WarehouseStatement::Set { .. } => "SET",
         WarehouseStatement::Reset { .. } => "RESET",
         WarehouseStatement::Show { .. } => "SHOW",

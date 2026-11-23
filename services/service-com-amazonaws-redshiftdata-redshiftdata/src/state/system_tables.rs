@@ -6,7 +6,8 @@
 //! Amazon Redshift records what it ran. A client reads that record with SQL —
 //! `STL_QUERY` for the queries a database ran and the label each one carried,
 //! `STL_WLM_QUERY` and `STV_WLM_QUERY_STATE` for the workload-management queue
-//! they were assigned to, `STL_LOAD_ERRORS` for the rows a `COPY` could not load
+//! they were assigned to, `STL_LOAD_ERRORS` for the rows a `COPY` could not load,
+//! `PG_TABLE_DEF` for how each column of each table is declared and stored
 //! — so the record has to be READABLE as tables of the database the queries ran
 //! in, not merely held somewhere.
 //!
@@ -38,6 +39,7 @@ pub const SYSTEM_TABLES: &[&str] = &[
     "stl_load_errors",
     "stv_blocklist",
     "svv_table_info",
+    "pg_table_def",
 ];
 
 /// How many queries ONE database's log keeps. The log grows one statement at a
@@ -241,6 +243,7 @@ pub fn materialise(
     log: &mut SystemLog,
     database: &str,
     queues: &[super::session_settings::QueueConfig],
+    encodings: &super::column_encodings::ColumnEncodings,
     tables: &[&'static str],
 ) -> rusqlite::Result<()> {
     for table in tables {
@@ -253,11 +256,94 @@ pub fn materialise(
             "stl_load_errors" => materialise_load_errors(connection, log)?,
             "stv_blocklist" => materialise_blocklist(connection, log)?,
             "svv_table_info" => materialise_table_info(connection, log, database)?,
+            "pg_table_def" => materialise_table_def(connection, encodings)?,
             _ => {}
         }
     }
     Ok(())
 }
+
+/// `PG_TABLE_DEF`: "information about table columns".
+///
+/// One row per column of each table the database holds, read off the engine's
+/// own catalog — the table's schema and name, the column's name and the type it
+/// was declared with, and whether a NULL is allowed in it — beside the
+/// compression encoding the column is stored under, which is what the table's
+/// `CREATE TABLE` declared for it ([`super::column_encodings`]). `distkey` and
+/// `sortkey` describe how a CLUSTER distributes and orders a table's rows, which
+/// this engine does not model, so nothing is claimed for them.
+fn materialise_table_def(
+    connection: &rusqlite::Connection,
+    encodings: &super::column_encodings::ColumnEncodings,
+) -> rusqlite::Result<()> {
+    create(
+        connection,
+        "pg_table_def",
+        "schemaname VARCHAR(128), tablename VARCHAR(128), \"column\" VARCHAR(128), \
+         type VARCHAR(128), encoding VARCHAR(32), distkey BOOLEAN, sortkey INTEGER, \
+         \"notnull\" BOOLEAN",
+    )?;
+    let mut listing = connection.prepare(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
+         ORDER BY name",
+    )?;
+    let held: Vec<(String, Option<String>)> = listing
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<(String, Option<String>)>>>()?;
+    drop(listing);
+    let mut described: Vec<Vec<rusqlite::types::Value>> = Vec::new();
+    for (name, definition) in held {
+        let (schema, table) = super::split_relation(&name);
+        // What the relation DECLARES about each of its columns, read from its
+        // own definition.
+        let declared = super::column_origins::declared_columns(definition.as_deref());
+        let quoted = name.replace('"', "\"\"");
+        let probe = match connection.prepare(&format!("SELECT * FROM \"{quoted}\" LIMIT 0")) {
+            Ok(probe) => probe,
+            // A relation the engine cannot prepare a read of declares no column
+            // this reader can report.
+            Err(_unreadable) => continue,
+        };
+        for column in probe.columns() {
+            use rusqlite::types::Value;
+            let declared_type = column.decl_type().map(str::to_ascii_lowercase);
+            let nullable = declared
+                .get(&column.name().to_ascii_lowercase())
+                .is_none_or(|declared| declared.nullable);
+            described.push(vec![
+                Value::Text(schema.to_string()),
+                Value::Text(table.to_string()),
+                Value::Text(column.name().to_string()),
+                Value::Text(super::column_encodings::reported_type(
+                    declared_type.as_deref(),
+                )),
+                Value::Text(super::column_encodings::reported_encoding(
+                    encodings.declared(&name, column.name()),
+                    declared_type.as_deref(),
+                )),
+                Value::Integer(i64::from(NOT_DISTRIBUTED)),
+                Value::Integer(NOT_SORTED),
+                Value::Integer(i64::from(!nullable)),
+            ]);
+        }
+    }
+    let mut insert = connection.prepare(
+        "INSERT INTO temp.pg_table_def (schemaname, tablename, \"column\", type, encoding, \
+         distkey, sortkey, \"notnull\") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    )?;
+    for row in described {
+        insert.execute(rusqlite::params_from_iter(row))?;
+    }
+    Ok(())
+}
+
+/// `distkey`: "whether the column is the distribution key for the table". This
+/// engine stores a table in one place, so no column is one.
+const NOT_DISTRIBUTED: bool = false;
+
+/// `sortkey`: "the order of the column in the sort key", which is zero for a
+/// column that is not part of one — and none is here, for the same reason.
+const NOT_SORTED: i64 = 0;
 
 /// `SVV_TABLE_INFO`: "summary information about tables in the database".
 ///

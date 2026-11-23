@@ -16,8 +16,8 @@
 //! * a row the target's columns cannot take is REJECTED and recorded in the
 //!   cluster's `STL_LOAD_ERRORS` ([`super::system_tables`]) with the published
 //!   error code and reason for what was wrong with it;
-//! * a load that rejected more rows than `MAXERROR` allows FAILS — "if the load
-//!   returns the error count, the load fails" — in the engine's own load-failure
+//! * a load whose rejected rows REACH `MAXERROR` FAILS — "if the load returns
+//!   the error_count number or greater, the load fails" — in the engine's own load-failure
 //!   wording ([`load_failure_message`]), and leaves the table as it was: the
 //!   rows are parsed before any of them is inserted, so a failed load inserts
 //!   none of them.
@@ -252,9 +252,13 @@ pub fn load(
         }
     }
 
-    // "MAXERROR … If the load returns the error count, the load fails": a load
-    // that rejected more rows than it was allowed to inserts none of them.
-    if rejected.len() as u64 > statement.max_error {
+    // "MAXERROR [AS] error_count … If the load returns the error_count number
+    // or greater, the load fails": the threshold is REACHED rather than
+    // exceeded, so a load tolerates one fewer rejected row than the number it
+    // names, and the default of zero fails on the first one. A load that
+    // rejected nothing breaches no threshold, whatever the number is. A load
+    // that breaches it inserts none of its rows.
+    if rejected.len() as u64 >= statement.max_error.max(1) {
         return Err(LoadFailure::Rejected(rejected));
     }
     // "NOLOAD … checks the validity of the data file without actually loading
@@ -271,7 +275,7 @@ pub fn load(
 
 /// The columns of the target table, as the ENGINE declares them: each column's
 /// name and the type it was declared with.
-fn target_columns(
+pub(super) fn target_columns(
     connection: &rusqlite::Connection,
     target: &str,
 ) -> rusqlite::Result<Vec<Column>> {
@@ -288,12 +292,12 @@ fn target_columns(
 
 /// One column of the target table.
 #[derive(Debug, Clone)]
-struct Column {
+pub(super) struct Column {
     /// Its name, as the engine holds it.
-    name: String,
+    pub(super) name: String,
     /// The type it was declared with, lower-cased, or `None` for a column
     /// declared without one.
-    declared: Option<String>,
+    pub(super) declared: Option<String>,
 }
 
 /// The columns the load writes, in the order the record's fields map onto them:
@@ -804,7 +808,7 @@ fn is_null(statement: &CopyStatement, field: &str, class: TypeClass) -> bool {
 /// The coarse class of a declared column type, which is what decides how a
 /// field is read into it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TypeClass {
+pub(super) enum TypeClass {
     Integer,
     Decimal,
     Float,
@@ -823,7 +827,7 @@ impl TypeClass {
     /// `BIGINT`/`INT8`, `DECIMAL`/`NUMERIC`, `REAL`/`FLOAT4`,
     /// `DOUBLE PRECISION`/`FLOAT8`/`FLOAT`, `BOOLEAN`/`BOOL`, `CHAR`/`VARCHAR`
     /// and their aliases, `DATE`, `TIME`, `TIMESTAMP`/`TIMESTAMPTZ`.
-    fn of(declared: &str) -> Self {
+    pub(super) fn of(declared: &str) -> Self {
         let name = declared
             .split(['(', ' '])
             .next()
@@ -846,7 +850,7 @@ impl TypeClass {
 
 /// The declared length a character type carries — `VARCHAR(16)` is sixteen
 /// characters — or `None` for a type that declares none.
-fn declared_length(declared: &str) -> Option<usize> {
+pub(super) fn declared_length(declared: &str) -> Option<usize> {
     let (_, rest) = declared.split_once('(')?;
     let (length, _) = rest.split_once(')')?;
     length.trim().parse().ok()
@@ -985,7 +989,7 @@ fn type_name(declared: &str, class: TypeClass) -> &'static str {
 
 /// The leading name of a declared type, lower-cased and without its parameters:
 /// `DECIMAL(10,2)` is a `decimal`.
-fn type_head(declared: &str) -> String {
+pub(super) fn type_head(declared: &str) -> String {
     declared
         .split(['(', ' '])
         .next()

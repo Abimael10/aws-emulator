@@ -17,8 +17,8 @@
 //! 1. a `COPY` loads the rows the objects at its source carry, in whichever
 //!    format and with whichever options the statement names;
 //! 2. a row the target's columns cannot take is REJECTED and recorded in
-//!    `STL_LOAD_ERRORS`, and a load that rejects more rows than `MAXERROR`
-//!    allows fails and loads nothing;
+//!    `STL_LOAD_ERRORS`, and a load whose rejected rows reach `MAXERROR` fails
+//!    and loads nothing;
 //! 3. a load or an export whose IAM role may not read or write the objects
 //!    fails with Amazon S3's own refusal, raised inside the cluster's request;
 //! 4. an `UNLOAD` writes the query's rows as objects and, with `MANIFEST`, a
@@ -977,8 +977,8 @@ async fn a_rejected_row_fails_the_load_and_is_recorded_in_the_load_errors() {
     }
 }
 
-/// `MAXERROR` is how many rows a load may reject and still succeed: up to that
-/// many are skipped and recorded, and the rows that parsed are loaded.
+/// `MAXERROR` is the number of rejected rows at which a load fails: below it the
+/// rejected rows are skipped and recorded, and the rows that parsed are loaded.
 #[tokio::test]
 async fn maxerror_lets_a_load_skip_the_rows_it_rejects() {
     let harness = Harness::new();
@@ -995,7 +995,7 @@ async fn maxerror_lets_a_load_skip_the_rows_it_rejects() {
     )
     .await;
     for (index, (case, maxerror, loaded)) in [
-        ("one rejection allowed", "MAXERROR 1", "2"),
+        ("one rejection allowed", "MAXERROR 2", "2"),
         ("more rejections allowed than there are", "MAXERROR 5", "2"),
     ]
     .into_iter()
