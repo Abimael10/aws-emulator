@@ -169,7 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let arn = crate::state::resource_arn(
             &region,
             crate::state::USER_PROFILE_ARN_KIND,
-            &format!("{}/{}", input.domain_id, input.user_profile_name),
+            &crate::state::user_profile_resource_id(&input.domain_id, &input.user_profile_name),
         );
         let key = crate::state::user_profile_key(&input.domain_id, &input.user_profile_name);
 
@@ -293,6 +293,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // carried and nothing the request never named.
                 user_settings: input.user_settings,
                 tags: input.tags.unwrap_or_default(),
+                // Nothing has signed in as this profile yet, so it holds no presigned-URL
+                // grant; `CreatePresignedDomainUrl` is what records one.
+                grants: Vec::new(),
                 // A profile comes up `Pending` and owes the clock its `InService`, so a
                 // caller that reads it straight back still observes the transient status.
                 status: crate::state::USER_PROFILE_STATUS_PENDING.to_string(),

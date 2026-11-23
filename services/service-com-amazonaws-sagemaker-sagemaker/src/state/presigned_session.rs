@@ -4,9 +4,10 @@
 //! caller is ADDRESSED, the token it carries, and what a fetch of that address resolves
 //! to.
 //!
-//! Four operations answer a URL whose whole point is that the caller FETCHES it later —
+//! Five operations answer a URL whose whole point is that the caller FETCHES it later —
 //! `CreatePresignedNotebookInstanceUrl`, `CreatePartnerAppPresignedUrl`,
-//! `CreatePresignedMlflowAppUrl` and `CreatePresignedMlflowTrackingServerUrl`. Such a URL
+//! `CreatePresignedMlflowAppUrl`, `CreatePresignedMlflowTrackingServerUrl` and
+//! `CreatePresignedDomainUrl`. Such a URL
 //! has to lead back to THIS emulator: a host of
 //! AWS's own (`<name>.notebook.<region>.sagemaker.aws`) resolves to nothing a client of
 //! the emulator can reach, so every flow the operation exists for fails with a name or
@@ -39,6 +40,55 @@ pub const PRESIGNED_SESSION_AUTH_SEGMENT: &str = "auth";
 
 /// The query field the grant token travels in, as AWS's presigned URLs name it.
 pub const PRESIGNED_SESSION_TOKEN_FIELD: &str = "authToken";
+
+/// The query field a presigned Studio-domain URL carries the landing page in, named after
+/// the modelled `LandingUri` member it is taken from: "The landing page that the user is
+/// directed to when accessing the presigned URL."
+pub const PRESIGNED_SESSION_LANDING_URI_FIELD: &str = "landingUri";
+
+/// The query field a presigned Studio-domain URL carries the space the session lands in,
+/// named after the modelled `SpaceName` member it is taken from.
+pub const PRESIGNED_SESSION_SPACE_FIELD: &str = "spaceName";
+
+/// How long a presigned Studio-domain URL stays valid when the request names no
+/// `ExpiresInSeconds`: the value that member's model doc publishes ("The number of seconds
+/// until the pre-signed URL expires. This value defaults to 300."), i.e. the "default
+/// timeout of 5 minutes" the operation's own doc states.
+pub const DEFAULT_DOMAIN_URL_EXPIRES_IN_SECONDS: i32 = 300;
+
+/// How long the session a presigned Studio-domain URL opens lasts when the request names no
+/// `SessionExpirationDurationInSeconds`: the value that member's model doc publishes ("The
+/// session expiration duration in seconds. This value defaults to 43200."), i.e. the
+/// "JupyterLab session default expiration time" of 12 hours the operation's own doc states.
+pub const DEFAULT_DOMAIN_URL_SESSION_SECONDS: i32 = 43_200;
+
+/// Why a Studio domain that does not authenticate against IAM can hand out no presigned
+/// domain URL: the subject form the Studio refusals name a domain with
+/// ([`crate::state::domain_not_found`]), then the `AuthMode` that stands in the way, because
+/// the operation "can only be called when the authentication mode equals IAM".
+pub fn domain_url_needs_iam_auth_mode(domain_arn: &str, auth_mode: &str) -> String {
+    format!(
+        "Unable to create a presigned domain URL for Domain [{domain_arn}] because its \
+         AuthMode is {auth_mode} instead of {AUTH_MODE_IAM}."
+    )
+}
+
+/// Why a Studio domain the service has not finished provisioning can hand out no presigned
+/// domain URL: the same subject form [`domain_url_needs_iam_auth_mode`] names the domain
+/// with, then the status that stands in the way.
+///
+/// The URL signs its holder in to the apps and the file system of the domain, which exist
+/// only once the domain reports [`DOMAIN_STATUS_IN_SERVICE`], so a domain in any other
+/// status has no session to open. Worded for THIS operation rather than with the sentence a
+/// create that hangs a resource off a domain is refused with
+/// ([`crate::state::domain_not_in_service_refusal`]), because this call creates no member of
+/// the domain.
+pub fn domain_url_needs_domain_in_service(domain_arn: &str, status: &str) -> String {
+    format!(
+        "Unable to create a presigned domain URL for Domain [{domain_arn}] because it is in \
+         {status} status instead of {DOMAIN_STATUS_IN_SERVICE}."
+    )
+}
 
 /// The resource kind a partner AI app's ARN carries, i.e. the `<kind>` in
 /// [`resource_arn`], as the modelled `PartnerAppArn` pattern spells it
@@ -144,8 +194,9 @@ pub fn mint_session_token(store: &::emulator_server::CredentialStore) -> Option<
 /// without end.
 ///
 /// One function for every resource that publishes a presigned session (a notebook
-/// instance, a partner AI app, an MLflow App, an MLflow tracking server), so they cannot
-/// drift on which grants a resource keeps or on how long a URL stays valid.
+/// instance, a partner AI app, an MLflow App, an MLflow tracking server, a Studio user
+/// profile), so they cannot drift on which grants a resource keeps or on how long a URL
+/// stays valid.
 pub fn record_presigned_grant(
     grants: &mut Vec<PresignedUrlGrant>,
     token: String,
@@ -200,6 +251,7 @@ impl ComAmazonawsSagemakerSagemakerState {
         &self,
         kind: &str,
         resource: &str,
+        now: SystemTime,
     ) -> Option<(String, &[PresignedUrlGrant], bool)> {
         if kind == NOTEBOOK_INSTANCE_ARN_KIND {
             let notebook = self.notebook_instances.get(resource)?;
@@ -236,6 +288,23 @@ impl ComAmazonawsSagemakerSagemakerState {
             // held.
             return Some((server.arn.clone(), &server.grants, true));
         }
+        if kind == USER_PROFILE_ARN_KIND {
+            // A presigned domain URL signs its holder in to the domain AS one user profile,
+            // so the subject is that profile: the address names it by the resource field of
+            // its own ARN ([`user_profile_resource_id`]) — the pair that identifies it —
+            // split back apart here.
+            let (domain_id, user_profile_name) = resource.split_once('/')?;
+            let profile = self.user_profile(domain_id, user_profile_name, now)?;
+            // The session is the profile's own inside its domain, so neither may be on its
+            // way out: a Studio resource the service is tearing down serves nothing to sign
+            // in to any more.
+            let serving = !profile.is_deleting()
+                && self
+                    .domains
+                    .get(domain_id)
+                    .is_some_and(|domain| !domain.is_deleting());
+            return Some((profile.arn.clone(), &profile.grants, serving));
+        }
         None
     }
 
@@ -254,7 +323,8 @@ impl ComAmazonawsSagemakerSagemakerState {
         token: &str,
         now: SystemTime,
     ) -> PresignedSession {
-        let Some((subject_arn, grants, serving)) = self.presigned_session_subject(kind, resource)
+        let Some((subject_arn, grants, serving)) =
+            self.presigned_session_subject(kind, resource, now)
         else {
             return PresignedSession::Unknown;
         };

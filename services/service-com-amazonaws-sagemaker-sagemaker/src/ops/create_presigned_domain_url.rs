@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePresignedDomainUrl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePresignedDomainUrl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePresignedDomainUrl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints the Studio sign-in URL for one user profile of a Studio domain this account holds:
+//! the address THIS emulator serves the session at ([`crate::state::presigned_session_url`])
+//! with an opaque grant token this call records on the profile, valid for the window the
+//! request asked for (the documented 5 minutes by default) and opening a session of the
+//! requested duration (12 hours by default). A `DomainId`, a `UserProfileName` or a
+//! `SpaceName` this account holds nothing under is refused with the modelled
+//! `ResourceNotFound`; a domain that is not `InService`, or one whose members authenticate
+//! against IAM Identity Center rather than IAM ("This operation can only be called when the
+//! authentication mode equals IAM"), is refused with a 400 `ValidationException`, since the
+//! operation models no error for either.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +170,171 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePresignedDomainUrl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePresignedDomainUrlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePresignedDomainUrl"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // The two windows a request that names neither carries, both documented by the
+        // members they default: the window the URL itself stays valid for and the session it
+        // opens once it is followed. A supplied value is already inside the modelled
+        // `@range` (`ExpiresInSeconds` 5..300, `SessionExpirationDurationInSeconds`
+        // 1800..43200), refused before this handler runs.
+        let expires_in = input
+            .expires_in_seconds
+            .unwrap_or(crate::state::DEFAULT_DOMAIN_URL_EXPIRES_IN_SECONDS);
+        let session_duration = input
+            .session_expiration_duration_in_seconds
+            .unwrap_or(crate::state::DEFAULT_DOMAIN_URL_SESSION_SECONDS);
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+
+        let mut store = state.lock();
+        // The removals the clock already completed are materialised first, so a domain whose
+        // teardown is done is gone here too — and so is everything that hung off it. Each
+        // was due at its stored instant whether or not anybody called, so this call's
+        // observer makes no difference to the result.
+        store.release_deleted_domains(now);
+        store.release_deleted_user_profiles(now);
+        store.release_deleted_spaces(now);
+
+        // The URL signs its holder in to the DOMAIN the request names, so an id this account
+        // holds no domain under has nothing to presign: the modelled `ResourceNotFound`,
+        // worded from the `DomainId` the request supplied — all this caller said about the
+        // domain — the way every refusal of a call addressing a member of a domain names it.
+        let Some(domain) = store.domain_mut(&input.domain_id, now) else {
+            return Err(CreatePresignedDomainUrlErrorModeled::ResourceNotFound(
+                ResourceNotFound {
+                    message: Some(crate::state::domain_id_not_found(&input.domain_id)),
+                },
+            )
+            .into());
+        };
+        // The provisioning the clock already owed is materialised BEFORE the request is
+        // weighed, so a domain whose `InService` had fallen due serves the URL rather than
+        // being refused from the `Pending` it had already left.
+        domain.settle_status(now);
+        let domain_arn = domain.arn.clone();
+        let domain_status = domain.status.clone();
+        let auth_mode = domain.auth_mode.clone();
+
+        // "This operation can only be called when the authentication mode equals IAM": the
+        // IAM role or user calling it is what defines the permissions of the app the URL
+        // opens, so a domain whose members authenticate against IAM Identity Center signs
+        // nobody in this way. The operation models no error for that, hence a 400
+        // `ValidationException` rather than the scaffold's 501.
+        if auth_mode != crate::state::AUTH_MODE_IAM {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::domain_url_needs_iam_auth_mode(&domain_arn, &auth_mode),
+            ));
+        }
+        // The URL grants access to the apps and the file system of the domain, which exist
+        // only once the domain's own provisioning has settled: while it is still `Pending` —
+        // or `Failed`, or on its way out — there is no session to sign in to. This call
+        // creates no member of the domain, so the refusal is this operation's own sentence
+        // rather than the one a create of a member is refused with.
+        if domain_status != crate::state::DOMAIN_STATUS_IN_SERVICE {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::domain_url_needs_domain_in_service(&domain_arn, &domain_status),
+            ));
+        }
+
+        // A named space is where the session lands, so it has to be one the domain holds: a
+        // name no `CreateSpace` took resolves to nothing the URL could open.
+        if let Some(space_name) = input.space_name.as_deref() {
+            if !store.holds_space(&input.domain_id, space_name, now) {
+                return Err(CreatePresignedDomainUrlErrorModeled::ResourceNotFound(
+                    ResourceNotFound {
+                        message: Some(crate::state::space_arn_not_found(
+                            &region,
+                            &input.domain_id,
+                            space_name,
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The URL signs its holder in AS this profile ("The name of the UserProfile to
+        // sign-in as"), so the grant belongs to the profile the STORE holds: a name the
+        // domain holds no profile under has nothing to sign in as. This operation's subject
+        // IS that profile, so the refusal names it by the ARN the requested pair resolves to.
+        let Some(profile) = store.user_profile_mut(&input.domain_id, &input.user_profile_name, now)
+        else {
+            return Err(CreatePresignedDomainUrlErrorModeled::ResourceNotFound(
+                ResourceNotFound {
+                    message: Some(crate::state::user_profile_arn_not_found(
+                        &region,
+                        &input.domain_id,
+                        &input.user_profile_name,
+                    )),
+                },
+            )
+            .into());
+        };
+        // The transition the clock already owed this profile, materialised the way the rest
+        // of its slice materialises it, so the profile this URL signs in as is not left
+        // behind in a status that fell due before the call.
+        profile.settle_status(now);
+        let arn = profile.arn.clone();
+        // Read off the STORED profile, so the address names the profile that exists rather
+        // than the spelling the request carried — `UserProfileName` "is not case sensitive".
+        let resource = crate::state::user_profile_resource_id(&profile.domain_id, &profile.name);
+
+        // The grant is recorded ON the profile, so the URL names a token this store holds
+        // rather than one invented per response. The token authenticates the session when it
+        // is presented back at the address below, which makes it a SECRET: it is minted by
+        // the emulator's credential store and removed from it again, never constructed here
+        // (see `crate::state::mint_session_token`). A mint that answered nothing leaves no
+        // URL to report, and this operation models no server fault, so the honest answer is
+        // "this emulator did not serve it".
+        let Some(token) = crate::state::mint_session_token(ctx.credential_store()) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        // Through the crate's one presigned-grant record, which is also what BOUNDS the
+        // grants one profile keeps: it releases every grant whose session the clock has
+        // already ended and keeps at most `crate::state::GRANT_HISTORY_CAP` of them, so a
+        // caller asking for URL after URL cannot grow this store without end.
+        let grant = crate::state::record_presigned_grant(
+            &mut profile.grants,
+            token,
+            now,
+            ::std::time::Duration::from_secs(u64::try_from(expires_in).unwrap_or_default()),
+            session_duration,
+        );
+        // Where the session lands, carried in the URL the way AWS's own presigned domain URL
+        // carries it: the space the request named and the landing page it asked for, each
+        // only when the request named one.
+        let mut landing: Vec<(&str, &str)> = Vec::new();
+        if let Some(space_name) = input.space_name.as_deref() {
+            landing.push((crate::state::PRESIGNED_SESSION_SPACE_FIELD, space_name));
+        }
+        if let Some(landing_uri) = input.landing_uri.as_deref() {
+            landing.push((
+                crate::state::PRESIGNED_SESSION_LANDING_URI_FIELD,
+                landing_uri,
+            ));
+        }
+        // The URL the caller opens later has to lead back to THIS emulator, on the endpoint
+        // the request arrived on: the domain's own Studio host (which `DescribeDomain` still
+        // reports, as AWS reports it) resolves to nothing a client of this emulator can
+        // reach, so a caller that did what this operation exists for — fetch the URL to be
+        // signed in to Studio — would get a name-resolution error instead of a session.
+        // `crate::service::presigned_session` serves that address.
+        let authorized_url = crate::state::presigned_session_url(
+            ctx,
+            crate::state::USER_PROFILE_ARN_KIND,
+            &resource,
+            &grant.token,
+            &landing,
+        );
+        drop(store);
+
+        // Minting a credential changed state, so the call leaves the audit record a create
+        // leaves — the operation, the profile's ARN and the access key id the request
+        // presented, never the token.
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreatePresignedDomainUrlOutput {
+            authorized_url: Some(authorized_url),
+        })
     }
 }

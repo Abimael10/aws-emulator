@@ -44,6 +44,16 @@ pub const USER_PROFILE_SORT_BY_LAST_MODIFIED_TIME: &str = "LastModifiedTime";
 /// the id has to identify one profile across calls without depending on the Region the
 /// caller signed for — which a profile's ARN does carry.
 pub fn user_profile_page_id(domain_id: &str, user_profile_name: &str) -> String {
+    user_profile_resource_id(domain_id, user_profile_name)
+}
+
+/// How one user profile is identified by the pair that owns it: `<DomainId>/<name>`.
+///
+/// This is the resource field of the profile's own ARN, fixed by `UserProfileArn`'s
+/// modelled pattern (`…:user-profile/`), and so also the identifier the presigned-session
+/// address names the profile by ([`presigned_session_path`]). Stated once here so the
+/// create, the readers and the session route cannot spell the one identity differently.
+pub fn user_profile_resource_id(domain_id: &str, user_profile_name: &str) -> String {
     format!("{domain_id}/{user_profile_name}")
 }
 
@@ -114,7 +124,7 @@ pub fn user_profile_arn_not_found(region: &str, domain_id: &str, user_profile_na
         resource_arn(
             region,
             USER_PROFILE_ARN_KIND,
-            &format!("{domain_id}/{user_profile_name}")
+            &user_profile_resource_id(domain_id, user_profile_name)
         )
     )
 }
@@ -148,6 +158,12 @@ pub fn user_profile_not_deletable(arn: &str, status: &str) -> String {
 /// Identity Center, i.e. the one the single-sign-on members of a user profile belong to.
 /// The enum's other member is `IAM` (`smithy_query(query="shape", shape="AuthMode")`).
 pub const AUTH_MODE_IAM_IDENTITY_CENTER: &str = "SSO";
+
+/// `AuthMode`'s other member: the domain authenticates its members against IAM, with the
+/// calling IAM role or user defining what an opened session may do. Named here beside
+/// [`AUTH_MODE_IAM_IDENTITY_CENTER`] because `CreatePresignedDomainUrl` "can only be called
+/// when the authentication mode equals IAM", which is the one fact that weighs it.
+pub const AUTH_MODE_IAM: &str = "IAM";
 
 /// The two members of a `CreateUserProfile` request that carry the user's identity in the
 /// directory the domain authenticates against, in the order the refusals below name them.
@@ -206,6 +222,15 @@ pub struct UserProfile {
     pub single_sign_on_user_value: Option<String>,
     pub user_settings: Option<UserSettings>,
     pub tags: Vec<Tag>,
+    /// The presigned-URL grants `CreatePresignedDomainUrl` recorded for this profile, i.e.
+    /// the tokens that sign their holder in to the domain AS this profile, newest last.
+    ///
+    /// Written through the crate's one presigned-grant record
+    /// ([`record_presigned_grant`]), which is also what bounds the list and releases the
+    /// grants whose session the clock has already ended, so this store cannot grow without
+    /// end. The same record a notebook instance, a partner app and an MLflow server keep
+    /// ([`PresignedUrlGrant`]), because the grants carry the same thing.
+    pub grants: Vec<PresignedUrlGrant>,
     pub status: String,
     pub creation_time: SystemTime,
     pub last_modified_time: SystemTime,
@@ -309,11 +334,25 @@ impl ComAmazonawsSagemakerSagemakerState {
         user_profile_name: &str,
         now: SystemTime,
     ) -> bool {
-        self.domain_resolves(domain_id, now)
-            && self
-                .user_profiles
-                .get(&user_profile_key(domain_id, user_profile_name))
-                .is_some_and(|profile| !profile.is_released(now))
+        self.user_profile(domain_id, user_profile_name, now)
+            .is_some()
+    }
+
+    /// [`Self::user_profile_mut`], for a caller that only READS the profile — the lookup a
+    /// reporting path resolves the `(DomainId, UserProfileName)` pair with, under exactly
+    /// the same rule about which pairs resolve.
+    pub fn user_profile(
+        &self,
+        domain_id: &str,
+        user_profile_name: &str,
+        now: SystemTime,
+    ) -> Option<&UserProfile> {
+        if !self.domain_resolves(domain_id, now) {
+            return None;
+        }
+        self.user_profiles
+            .get(&user_profile_key(domain_id, user_profile_name))
+            .filter(|profile| !profile.is_released(now))
     }
 
     /// Drop every user profile whose removal the clock already completed, and with it the

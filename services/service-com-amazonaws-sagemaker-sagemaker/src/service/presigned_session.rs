@@ -5,7 +5,8 @@
 //!
 //! A presigned URL is a GRANT, not a formatted string:
 //! `CreatePresignedNotebookInstanceUrl`, `CreatePartnerAppPresignedUrl`,
-//! `CreatePresignedMlflowAppUrl` and `CreatePresignedMlflowTrackingServerUrl` each record a
+//! `CreatePresignedMlflowAppUrl`, `CreatePresignedMlflowTrackingServerUrl` and
+//! `CreatePresignedDomainUrl` each record a
 //! [`crate::state::PresignedUrlGrant`] on the resource they are asked about and publish a
 //! URL addressing that resource on the endpoint the request arrived on
 //! ([`crate::state::presigned_session_url`]). Fetching that URL is how the caller opens the
@@ -62,7 +63,7 @@ const ANONYMOUS: &[&str] = &[];
 #[derive(Debug, PartialEq, Eq)]
 struct Addressed {
     /// The resource kind the address names (`notebook-instance`, `partner-app`,
-    /// `mlflow-app`, `mlflow-tracking-server`).
+    /// `mlflow-app`, `mlflow-tracking-server`, `user-profile`).
     kind: String,
     /// The resource's own identifier within that kind.
     resource: String,
@@ -187,6 +188,7 @@ fn addressed(method: &str, uri: &str) -> Option<Addressed> {
         crate::state::PARTNER_APP_ARN_KIND,
         crate::state::MLFLOW_APP_ARN_KIND,
         crate::state::TRACKING_SERVER_KIND,
+        crate::state::USER_PROFILE_ARN_KIND,
     ];
     if !kinds.contains(&kind.as_str()) {
         return None;

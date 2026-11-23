@@ -159,6 +159,9 @@ pub(crate) fn seed_studio_owner(
             single_sign_on_user_value: None,
             user_settings: None,
             tags: Vec::new(),
+            // Nothing has signed in as this seeded profile, so it holds no presigned-URL
+            // grant.
+            grants: Vec::new(),
             // Seeded already `InService`, as the domain above is.
             status: USER_PROFILE_STATUS_IN_SERVICE.to_string(),
             creation_time: when,
