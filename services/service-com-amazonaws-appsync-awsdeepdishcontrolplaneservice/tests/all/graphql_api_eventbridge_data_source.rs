@@ -23,9 +23,11 @@
 //! The rows span what the rule generalises over: how many events one request carries (one,
 //! several, the most a publication carries and one past it), which of them the bus's rules
 //! match, the members an event states (`resources` and `time` beside the three required ones),
-//! the member that makes a request one this data source cannot act on, and what the role's
+//! the member that makes a request one this data source cannot act on, what the role's
 //! documents say (an allow for this bus, an allow for another bus, an allow for another action,
-//! an explicit deny, and no document at all).
+//! an explicit deny, and no document at all), and which KIND of step resolves the field — a
+//! `UNIT` resolver on the data source, and a FUNCTION of a `PIPELINE` resolver on it, alone in
+//! its pipeline or after a step that resolves against no data source at all.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,15 +60,18 @@ const CREATION_DEADLINE: Duration = Duration::from_secs(60);
 const RUNTIME: (&str, &str) = ("APPSYNC_JS", "1.0.0");
 
 /// The schema every API of this suite is created with: one mutation that publishes the events
-/// it is handed, answering what EventBridge reported about them, and the two further mutations
-/// the case about a data source this endpoint does not call attaches its resolvers to.
+/// it is handed, answering what EventBridge reported about them, the two further mutations the
+/// case about a data source this endpoint does not call attaches its resolvers to, and the two
+/// the pipeline case attaches its own to.
 const SCHEMA: &str = "schema { query: Query mutation: Mutation }\n\
                       \n\
                       type Query {\n  ping: String\n}\n\
                       \n\
                       type Mutation {\n  publish(events: AWSJSON!): Published\n  \
                       publishCoded(events: AWSJSON!): Published\n  \
-                      publishTemplated(events: AWSJSON!): Published\n}\n\
+                      publishTemplated(events: AWSJSON!): Published\n  \
+                      publishPiped(events: AWSJSON!): Published\n  \
+                      publishStashedPiped(events: AWSJSON!): Published\n}\n\
                       \n\
                       type Published {\n  failedCount: Int\n  eventIds: [String]\n}\n";
 
@@ -91,6 +96,50 @@ const DATA_SOURCE: &str = "ordersBus";
 /// The name of the data source of a type this endpoint does NOT call, which one case attaches
 /// its own resolvers to.
 const UNCALLED_DATA_SOURCE: &str = "ordersTable";
+
+/// The data source the step that publishes NOTHING resolves against: `NONE` is "There is no
+/// data source", so the step of a two-step pipeline that only stashes the events is bound to
+/// one of that type.
+const STASH_DATA_SOURCE: &str = "localSteps";
+
+/// The names the pipelines of the pipeline case invoke their functions by. `ResourceName`
+/// admits only identifier characters.
+const PUBLISHER_FUNCTION: &str = "publisher";
+const STASHER_FUNCTION: &str = "stasher";
+
+/// The mutations the pipeline case drives: one resolved by a pipeline over the publishing
+/// function alone, one by a pipeline that stashes the events in an earlier step.
+const ONE_STEP_FIELD: &str = "publishPiped";
+const TWO_STEP_FIELD: &str = "publishStashedPiped";
+
+/// The function that PUBLISHES, as one step of a pipeline: the same request half the suite's
+/// `UNIT` resolver has, reading the events an earlier step stashed where one did, and the
+/// mutation's own argument otherwise.
+const PUBLISHER_CODE: &str = "export function request(ctx) {\n\
+                              let events = ctx.stash.events;\n\
+                              if (!events) { events = JSON.parse(ctx.args.events); }\n\
+                              return {operation: 'PutEvents', events: events};\n\
+                              }\n\
+                              export function response(ctx) {\n\
+                              if (ctx.error) { util.error(ctx.error.message, ctx.error.type); }\n\
+                              return {\n\
+                              failedCount: ctx.result.FailedEntryCount,\n\
+                              eventIds: ctx.result.Entries.map(function (e) { return e.EventId; }),\n\
+                              };\n\
+                              }\n";
+
+/// The step BEFORE it in the two-step pipeline: it stashes the events the mutation carries and
+/// publishes nothing of its own.
+const STASHER_CODE: &str = "export function request(ctx) {\n\
+                            ctx.stash.events = JSON.parse(ctx.args.events);\n\
+                            return {payload: null};\n\
+                            }\n\
+                            export function response(ctx) { return ctx.result; }\n";
+
+/// The pipeline resolver's own halves, which surround its functions: the before step asks
+/// nothing of its own and the after step answers what the last function produced.
+const PIPELINE_CODE: &str = "export function request(ctx) { return {}; }\n\
+                             export function response(ctx) { return ctx.prev.result; }\n";
 
 /// The source the bus's rule matches on, and one no rule of these cases matches.
 const MATCHED_SOURCE: &str = "com.demo.orders";
@@ -677,6 +726,275 @@ async fn a_call_that_failed_is_reported_even_where_the_response_half_ignores_the
             "case {case:?}: a field whose call failed carries no value, got {answered}"
         );
     }
+}
+
+/// RULE: it is the data source a STEP resolves against that decides what that step does, so a
+/// FUNCTION of a `PIPELINE` resolver bound to an `AMAZON_EVENTBRIDGE` data source publishes
+/// exactly as a `UNIT` resolver bound to one does — onto that data source's configured bus,
+/// under the role it names — whatever the pipeline runs around it.
+#[tokio::test]
+async fn a_function_of_a_pipeline_publishes_onto_the_data_sources_bus_too() {
+    let router = emulator();
+    let bus = given_bus(&router, "piped").await;
+    let elsewhere = given_bus(&router, "piped-elsewhere").await;
+    let queue = given_queue(&router, "piped-queue").await;
+    given_rule(&router, &bus, "piped-rule", &queue, MATCHED_SOURCE).await;
+    // Two APIs on the SAME bus, differing only in what the data source's role is allowed:
+    // the publication onto this bus, and the publication onto another one.
+    let allowed = given_role(&router, "appsync-piped-allowed", Some(&allowing(&bus))).await;
+    let withheld = given_role(
+        &router,
+        "appsync-piped-withheld",
+        Some(&allowing(&elsewhere)),
+    )
+    .await;
+    let allowed = create_api(&router, "piped-allowed", &bus, &allowed).await;
+    let withheld = create_api(&router, "piped-withheld", &bus, &withheld).await;
+    for api in [&allowed, &withheld] {
+        given_pipelines(&router, &api.api_id).await;
+    }
+
+    /// What one row expects of the pipeline it drives.
+    enum Outcome {
+        /// The publication is made: the details the rule's queue must receive, in order.
+        Published(Vec<Value>),
+        /// It is not: what the error of the field must state, and the `errorType` it is of.
+        Refused(&'static str, &'static str),
+    }
+    /// One row: the API whose data-source role decides the publication, the field whose
+    /// pipeline publishes, the events the mutation is handed and what must come of them.
+    struct Row<'a> {
+        case: &'a str,
+        api: &'a Api,
+        field: &'a str,
+        events: Vec<Value>,
+        outcome: Outcome,
+    }
+    let order = |id: &str| json!({"orderId": id});
+    let event = |id: &str, source: &str| {
+        json!({"source": source, "detailType": DETAIL_TYPE, "detail": order(id)})
+    };
+    let rows: Vec<Row> = vec![
+        Row {
+            case: "a pipeline whose only function publishes one event",
+            api: &allowed,
+            field: ONE_STEP_FIELD,
+            events: vec![event("P-1", MATCHED_SOURCE)],
+            outcome: Outcome::Published(vec![order("P-1")]),
+        },
+        Row {
+            case: "a pipeline whose only function publishes a batch, each event routed on its \
+                   own",
+            api: &allowed,
+            field: ONE_STEP_FIELD,
+            events: vec![
+                event("P-2", UNMATCHED_SOURCE),
+                event("P-3", MATCHED_SOURCE),
+                event("P-4", MATCHED_SOURCE),
+            ],
+            outcome: Outcome::Published(vec![order("P-3"), order("P-4")]),
+        },
+        Row {
+            case: "a publishing function that is the second step of its pipeline",
+            api: &allowed,
+            field: TWO_STEP_FIELD,
+            events: vec![event("P-5", MATCHED_SOURCE)],
+            outcome: Outcome::Published(vec![order("P-5")]),
+        },
+        Row {
+            case: "a publishing function the earlier step of its pipeline handed a batch",
+            api: &allowed,
+            field: TWO_STEP_FIELD,
+            events: vec![event("P-6", MATCHED_SOURCE), event("P-7", MATCHED_SOURCE)],
+            outcome: Outcome::Published(vec![order("P-6"), order("P-7")]),
+        },
+        Row {
+            case: "a request this data source cannot act on, reached through a pipeline",
+            api: &allowed,
+            field: ONE_STEP_FIELD,
+            events: vec![
+                event("P-8", MATCHED_SOURCE),
+                json!({
+                    "source": MATCHED_SOURCE, "detailType": DETAIL_TYPE,
+                    "detail": "not-an-object",
+                }),
+            ],
+            outcome: Outcome::Refused("[events][1][detail]", REQUEST_ERROR_TYPE),
+        },
+        Row {
+            case: "the same, in the second step of its pipeline",
+            api: &allowed,
+            field: TWO_STEP_FIELD,
+            events: vec![json!({
+                "source": MATCHED_SOURCE, "detailType": DETAIL_TYPE, "detail": [1, 2],
+            })],
+            outcome: Outcome::Refused("[events][0][detail]", REQUEST_ERROR_TYPE),
+        },
+        Row {
+            case: "a pipeline function whose data-source role is allowed another bus only",
+            api: &withheld,
+            field: ONE_STEP_FIELD,
+            events: vec![event("P-9", MATCHED_SOURCE)],
+            outcome: Outcome::Refused("events:PutEvents", ACCESS_DENIED_ERROR_TYPE),
+        },
+        Row {
+            case: "the same, in the second step of its pipeline",
+            api: &withheld,
+            field: TWO_STEP_FIELD,
+            events: vec![event("P-10", MATCHED_SOURCE)],
+            outcome: Outcome::Refused("events:PutEvents", ACCESS_DENIED_ERROR_TYPE),
+        },
+    ];
+    for row in &rows {
+        let case = row.case;
+        let answered = published_through(case, row.api, row.field, &row.events).await;
+        let delivered = delivered_before_sentinel(case, &router, &bus, &queue, case).await;
+        match &row.outcome {
+            Outcome::Published(expected) => {
+                assert_eq!(
+                    answered["errors"].as_array(),
+                    None,
+                    "case {case:?}: a publication the data source can make reports no error, \
+                     got {answered}"
+                );
+                let published = &answered["data"][row.field];
+                assert_eq!(
+                    published["failedCount"],
+                    json!(0),
+                    "case {case:?}: expected no failed entry, got {answered}"
+                );
+                let ids: Vec<String> = published["eventIds"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|id| id.as_str().unwrap_or_default().to_string())
+                    .collect();
+                assert_eq!(
+                    ids.len(),
+                    row.events.len(),
+                    "case {case:?}: expected one event id per event published, got {answered}"
+                );
+                assert!(
+                    ids.iter().all(|id| !id.is_empty()),
+                    "case {case:?}: every published event carries the id EventBridge minted, \
+                     got {answered}"
+                );
+                assert_eq!(
+                    &delivered, expected,
+                    "case {case:?}: expected the rule's queue to receive {expected:?}, got \
+                     {delivered:?}"
+                );
+            }
+            Outcome::Refused(states, error_type) => {
+                let error = &answered["errors"][0];
+                let message = error["message"].as_str().unwrap_or_default();
+                assert!(
+                    message.contains(states),
+                    "case {case:?}: expected the refusal to state {states:?}, got {answered}"
+                );
+                // The step that did not resolve is the FUNCTION of the pipeline, which the
+                // error of the field names.
+                assert!(
+                    message.contains(PUBLISHER_FUNCTION),
+                    "case {case:?}: expected the error to name the step that did not resolve, \
+                     got {answered}"
+                );
+                assert_eq!(
+                    error["errorType"].as_str(),
+                    Some(*error_type),
+                    "case {case:?}: expected the error type of this refusal, got {answered}"
+                );
+                assert_eq!(
+                    answered["data"][row.field],
+                    Value::Null,
+                    "case {case:?}: a field that did not resolve carries no value, got \
+                     {answered}"
+                );
+                assert!(
+                    delivered.is_empty(),
+                    "case {case:?}: a publication that was not made delivers nothing, got \
+                     {delivered:?}"
+                );
+            }
+        }
+    }
+}
+
+/// Attach the two `PIPELINE` resolvers the pipeline case drives to `api_id`: one over the
+/// publishing function alone, one over a step that stashes the events followed by it.
+///
+/// The step that stashes resolves against a data source of the `NONE` type ("There is no data
+/// source"), so the only step of either pipeline that CALLS anything is the publishing one.
+async fn given_pipelines(router: &MultiServiceRouter, api_id: &str) {
+    let (status, created) = appsync(
+        router,
+        "POST",
+        &format!("/v1/apis/{api_id}/datasources"),
+        Some(json!({"name": STASH_DATA_SOURCE, "type": "NONE"})),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "CreateDataSource for the local steps must answer 200, got {created}"
+    );
+    let publisher = given_function(router, api_id, PUBLISHER_FUNCTION, DATA_SOURCE, PUBLISHER_CODE)
+        .await;
+    let stasher =
+        given_function(router, api_id, STASHER_FUNCTION, STASH_DATA_SOURCE, STASHER_CODE).await;
+    for (field, functions) in [
+        (ONE_STEP_FIELD, vec![publisher.clone()]),
+        (TWO_STEP_FIELD, vec![stasher, publisher.clone()]),
+    ] {
+        let (status, resolver) = appsync(
+            router,
+            "POST",
+            &format!("/v1/apis/{api_id}/types/Mutation/resolvers"),
+            Some(json!({
+                "fieldName": field,
+                "kind": "PIPELINE",
+                "pipelineConfig": {"functions": functions},
+                "code": PIPELINE_CODE,
+                "runtime": {"name": RUNTIME.0, "runtimeVersion": RUNTIME.1},
+            })),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "CreateResolver for {field} must answer 200, got {resolver}"
+        );
+    }
+}
+
+/// Create one pipeline function on `data_source`, defined by `code`, and answer the id a
+/// pipeline invokes it by.
+async fn given_function(
+    router: &MultiServiceRouter,
+    api_id: &str,
+    name: &str,
+    data_source: &str,
+    code: &str,
+) -> String {
+    let (status, created) = appsync(
+        router,
+        "POST",
+        &format!("/v1/apis/{api_id}/functions"),
+        Some(json!({
+            "name": name,
+            "dataSourceName": data_source,
+            "code": code,
+            "runtime": {"name": RUNTIME.0, "runtimeVersion": RUNTIME.1},
+        })),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "CreateFunction for {name} must answer 200, got {created}"
+    );
+    created["functionConfiguration"]["functionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("CreateFunction answers the function's id, got {created}"))
+        .to_string()
 }
 
 /// POST one mutation publishing `events` to the API's own endpoint, as a client does, and
