@@ -783,6 +783,32 @@ pub fn instance_family(instance_type: &str) -> Option<&str> {
         .filter(|family| !family.is_empty())
 }
 
+/// The trailing token every instance type this service publishes carries: an instance
+/// type of this service is `<family>.<size>.search`.
+pub(super) const INSTANCE_TYPE_TOKEN: &str = ".search";
+
+/// The trailing token the SAME instance types are spelled with on the legacy
+/// Elasticsearch line — `<family>.<size>.elasticsearch`, the spelling the predecessor
+/// service's own `ESPartitionInstanceType` value set carries
+/// (`service-com-amazonaws-elasticsearchservice-amazonelasticsearchservice2015`).
+pub(super) const LEGACY_INSTANCE_TYPE_TOKEN: &str = ".elasticsearch";
+
+/// `instance_type` rendered in the legacy Elasticsearch spelling: the same family and the
+/// same size, with this service's trailing token read as the legacy one.
+///
+/// The two spellings name ONE instance type — the suffix was renamed with the engine, and
+/// the two services publish the same hardware under their own token — so a sentence that
+/// names a type in the legacy spelling still names the type the request asked for. A
+/// value that does not end in this service's token is spelled some other way already and
+/// is rendered as written, so nothing is invented for a value naming no instance type at
+/// all.
+pub fn legacy_instance_type(instance_type: &str) -> String {
+    match instance_type.strip_suffix(INSTANCE_TYPE_TOKEN) {
+        Some(head) => format!("{head}{LEGACY_INSTANCE_TYPE_TOKEN}"),
+        None => instance_type.to_string(),
+    }
+}
+
 /// The catalog entry `instance_type` belongs to, and `None` for a value the service
 /// publishes no instance type for — a family the catalog does not carry, a size that
 /// family is not offered in, or a value that is not `<family>.<size>.search` at all.
@@ -1563,6 +1589,13 @@ pub fn warm_storage_refusal(cluster: Option<&ClusterConfig>) -> Option<Validatio
 /// than stored, and the refusal names the instance type the request carried, which is the
 /// value the caller has to change. The link below it is [`warm_storage_refusal`] and the
 /// one above it [`cold_storage_refusal`].
+///
+/// This sentence names that type in the LEGACY Elasticsearch spelling
+/// ([`legacy_instance_type`]): the warm tier predates the rename of the instance-type
+/// suffix, and the service states this refusal in the spelling of the line it was
+/// introduced on, so the family and size are the request's and only the trailing token is
+/// the legacy one. Both spellings denote the same instance type, so the sentence still
+/// names the value the caller sent.
 pub fn warm_instance_type_refusal(cluster: Option<&ClusterConfig>) -> Option<ValidationException> {
     let cluster = cluster?;
     if !cluster.warm_enabled.unwrap_or(false) {
@@ -1572,9 +1605,10 @@ pub fn warm_instance_type_refusal(cluster: Option<&ClusterConfig>) -> Option<Val
     if offers_warm_storage(instance_type) {
         return None;
     }
+    let named = legacy_instance_type(instance_type);
     Some(ValidationException {
         message: Some(format!(
-            "Warm storage is not available for the {instance_type} instance type. Select a \
+            "Warm storage is not available for the {named} instance type. Select a \
              different instance type."
         )),
     })

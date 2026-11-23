@@ -15,6 +15,11 @@
 //! `ValidationException` naming that instance type, no domain is created or changed, and
 //! the same cluster on an instance type that does offer it is served.
 //!
+//! That sentence names the offending type in the LEGACY Elasticsearch spelling — the
+//! requested family and size with the trailing `.search` token read as `.elasticsearch`,
+//! the spelling the predecessor service publishes the same hardware under — which
+//! [`legacy_spelling`] renders and every row below asserts.
+//!
 //! The rows differ along what the rule generalises over: the instance family (every
 //! burstable one, at several sizes, against general-purpose, compute-, memory- and
 //! storage-optimized ones), whether the call is a create or an update, and whether the
@@ -31,10 +36,23 @@ use super::domain_lifecycle::{
 /// release rather than two.
 const ENGINE_VERSION: &str = "OpenSearch_2.11";
 
-/// The refusal's fixed text around the instance type it names.
-fn unavailable_message(instance_type: &str) -> String {
+/// A requested instance type in the legacy Elasticsearch spelling: the same family and
+/// size with this service's trailing `.search` token read as `.elasticsearch`, which is
+/// the spelling the predecessor service's own `ESPartitionInstanceType` value set carries
+/// for the same hardware.
+fn legacy_spelling(instance_type: &str) -> String {
+    let head = instance_type
+        .strip_suffix(".search")
+        .unwrap_or_else(|| panic!("case {instance_type:?}: this suite names requested types"));
+    format!("{head}.elasticsearch")
+}
+
+/// The refusal's fixed text around the instance type it names, which it names in the
+/// legacy spelling whatever spelling the request used.
+fn unavailable_message(requested_type: &str) -> String {
+    let named = legacy_spelling(requested_type);
     format!(
-        "Warm storage is not available for the {instance_type} instance type. Select a \
+        "Warm storage is not available for the {named} instance type. Select a \
          different instance type."
     )
 }
@@ -171,6 +189,46 @@ async fn a_warm_tier_on_an_instance_type_that_offers_none_is_refused() {
             read.status, RECORDED_NOT_FOUND_STATUS,
             "case {instance_type:?}: a refused create must provision no domain, got {} with {:?}",
             read.status, read.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_refusal_names_the_instance_type_in_the_legacy_spelling() {
+    let emulator = Emulator::new();
+
+    // One row per requested spelling the rule generalises over: each burstable family the
+    // release offers, at several sizes. Whatever size and family the request named, the
+    // sentence carries those two tokens unchanged and the legacy trailing token, and never
+    // the token the request itself used.
+    for (index, requested_type) in WITHOUT_WARM_STORAGE.iter().enumerate() {
+        let answer = emulator
+            .create(json!({
+                "DomainName": format!("warm-spelling-{index}"),
+                "EngineVersion": ENGINE_VERSION,
+                "ClusterConfig": warm_cluster(requested_type),
+            }))
+            .await;
+        let stated = answer.body["message"].as_str().unwrap_or_default().to_owned();
+        let named = legacy_spelling(requested_type);
+        assert!(
+            stated.contains(&format!(" {named} instance type.")),
+            "case {requested_type:?}: expected the refusal to name {named:?}, got {stated:?}"
+        );
+        assert!(
+            !stated.contains(requested_type),
+            "case {requested_type:?}: the refusal must not echo the requested spelling, got \
+             {stated:?}"
+        );
+        // The family and the size the request named are the sentence's own: only the
+        // trailing token is the legacy one.
+        let mut tokens = requested_type.split('.');
+        let family = tokens.next().unwrap_or_default();
+        let size = tokens.next().unwrap_or_default();
+        assert_eq!(
+            named,
+            format!("{family}.{size}.elasticsearch"),
+            "case {requested_type:?}: expected the requested family and size kept, got {named:?}"
         );
     }
 }
