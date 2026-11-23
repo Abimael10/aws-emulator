@@ -10,8 +10,9 @@
 //! by its key id or key ARN — the only two forms this member accepts, so an identifier
 //! that names an alias is refused for its kind.
 //!
-//! The emulator mints no AWS managed keys, so it has no `aws/<service>` aliases and no
-//! predefined ones to report: every entry here is an alias a caller created.
+//! Every alias a caller created is reported, and so is a predefined `aws/<service-name>`
+//! alias once a call has associated it with this account's Amazon Web Services managed key
+//! for that service (see `DescribeKey`).
 //!
 //! ## Shape of an operation
 //!

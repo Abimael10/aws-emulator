@@ -54,6 +54,7 @@ pub mod cloud_hsm;
 // re-exported here, so every `crate::state::…` path a handler uses is unchanged by
 // where the item lives.
 mod asymmetric;
+mod aws_managed;
 mod call_request_id;
 mod cryptography;
 mod ed25519ph;
@@ -67,6 +68,7 @@ mod pagination;
 mod signatures;
 
 pub use asymmetric::*;
+pub use aws_managed::*;
 pub use call_request_id::*;
 pub use cryptography::*;
 pub use grants::*;
@@ -890,7 +892,12 @@ impl ComAmazonawsKmsTrentserviceState {
         // material KMS generated, so its material is the material that key spec
         // calls for rather than a kind named here.
         let material = mint_material(key_spec_profile(KEY_SPEC_SYMMETRIC_DEFAULT)?)?;
-        let key = Cmk::aws_managed(mint_key_id(false), region.to_string(), material);
+        let key = Cmk::aws_managed(
+            mint_key_id(false),
+            region.to_string(),
+            material,
+            aws_managed_key_description(alias_name)?,
+        );
         let key_id = key.key_id.clone();
         self.insert_key(key);
         self.insert_alias(Alias::new(
@@ -2811,13 +2818,22 @@ impl Cmk {
     /// the key carries that rotation schedule from the instant it exists — and the
     /// key is one no caller of this account administers, so a call that would change
     /// that schedule holds no permission for it
-    /// ([`authorization::authorize_key_administration`]). No description is invented:
-    /// the per-service wording KMS gives these keys is not in the model.
-    pub fn aws_managed(key_id: String, region: String, material: KeyMaterial) -> Self {
+    /// ([`authorization::authorize_key_administration`]).
+    ///
+    /// `description` is the default-key wording KMS seeds the managed key of that
+    /// service with ([`aws_managed_key_description`]): the key exists because a service
+    /// needs one, so it is described from the instant it exists rather than left blank
+    /// for a caller to fill — no caller of this account may describe it.
+    pub fn aws_managed(
+        key_id: String,
+        region: String,
+        material: KeyMaterial,
+        description: String,
+    ) -> Self {
         let mut key = Self::new(
             key_id,
             region,
-            String::new(),
+            description,
             KEY_USAGE_ENCRYPT_DECRYPT.to_string(),
             KEY_SPEC_SYMMETRIC_DEFAULT.to_string(),
             ORIGIN_AWS_KMS.to_string(),
