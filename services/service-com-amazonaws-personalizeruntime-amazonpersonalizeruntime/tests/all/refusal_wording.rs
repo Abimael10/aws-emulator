@@ -4,12 +4,11 @@
 //! read, over a table of inputs rather than one recorded request:
 //!
 //! 1. A value outside the modelled `@pattern` is a boundary `ValidationException`
-//!    (HTTP 400) whose clause names the member path, the value the request carried and
-//!    the expression that value has to satisfy — the pattern WITHOUT the `^`/`$` anchors
-//!    the model writes to make the match total. The anchors are the ONLY thing this
-//!    service changes about the clause: the rejected value is echoed for a `@pattern`
-//!    exactly as it is for a violated `@range` bound, and is withheld only where the
-//!    model marks the value `@sensitive`.
+//!    (HTTP 400) whose clause names the member path and the expression that value has to
+//!    satisfy — the pattern WITHOUT the `^`/`$` anchors the model writes to make the match
+//!    total — and echoes NO value. Amazon Personalize states every clause that way,
+//!    whatever constraint the value broke and whether or not the model marks that member
+//!    `@sensitive`.
 //! 2. `GetActionRecommendations` carries no `@required` on `campaignArn`, so a request
 //!    that names no campaign reaches the handler; it is `InvalidInputException`
 //!    (HTTP 400) reporting the campaign ARN the request gave — `null` for an absent
@@ -45,21 +44,21 @@ const NAME_PATTERN_UNANCHORED: &str = r"[a-zA-Z0-9][a-zA-Z0-9\-_]*";
 /// `AttributeValue` / `FilterAttributeValue` as `length 0..1000`, `sensitive: true`).
 const MAX_SENSITIVE_VALUE: usize = 1000;
 
-/// The clause this service states for `value` at `member` missing a modelled `@pattern`
-/// whose anchor-free rendering is `expression`: the member, the value the request carried
-/// and the expression it has to satisfy.
-fn pattern_fragment(member: &str, value: &str, expression: &str) -> String {
+/// The clause this service states for a value at `member` missing a modelled `@pattern`
+/// whose anchor-free rendering is `expression`: the member and the expression it has to
+/// satisfy, and no value.
+fn pattern_fragment(member: &str, expression: &str) -> String {
     format!(
-        "Value '{value}' at '{member}' failed to satisfy constraint: Member must satisfy \
+        "Value at '{member}' failed to satisfy constraint: Member must satisfy \
          regular expression pattern: {expression}"
     )
 }
 
 /// [`pattern_fragment`] inside the envelope of a request whose only violation it is.
-fn pattern_clause(member: &str, value: &str, expression: &str) -> String {
+fn pattern_clause(member: &str, expression: &str) -> String {
     format!(
         "1 validation error detected: {}",
-        pattern_fragment(member, value, expression)
+        pattern_fragment(member, expression)
     )
 }
 
@@ -70,7 +69,7 @@ const FILTER: &str = "arn:aws:personalize:us-east-1:000000000000:filter/any";
 const CAMPAIGN: &str = "arn:aws:personalize:us-east-1:000000000000:campaign/any";
 
 #[tokio::test]
-async fn a_value_outside_the_arn_pattern_names_the_member_the_value_and_the_unanchored_pattern() {
+async fn a_value_outside_the_arn_pattern_names_the_member_and_the_unanchored_pattern() {
     assert!(
         ARN_PATTERN == format!("^{ARN_PATTERN_UNANCHORED}$"),
         "the unanchored expression must be the modelled pattern minus its anchors, got \
@@ -140,9 +139,15 @@ async fn a_value_outside_the_arn_pattern_names_the_member_the_value_and_the_unan
             );
             assert_eq!(
                 refusal.message,
-                pattern_clause(member, value, ARN_PATTERN_UNANCHORED),
-                "case {route} {member} {form}: expected the clause to name the member, the value \
-                 the request carried and the unanchored pattern, got {:?}",
+                pattern_clause(member, ARN_PATTERN_UNANCHORED),
+                "case {route} {member} {form}: expected the clause to name the member and the \
+                 unanchored pattern and to echo no value, got {:?}",
+                refusal.message
+            );
+            assert!(
+                !refusal.message.contains(value),
+                "case {route} {member} {form}: the submitted value must not be echoed back, got \
+                 {:?}",
                 refusal.message
             );
         }
@@ -209,13 +214,9 @@ async fn a_value_outside_a_non_arn_pattern_is_stated_the_same_way_an_arn_is() {
         );
         assert_eq!(
             refusal.message,
-            pattern_clause(
-                "promotions.1.member.name",
-                &value,
-                NAME_PATTERN_UNANCHORED
-            ),
-            "case promotion name with {form}: expected the clause to name the member, the value \
-             the request carried and the unanchored pattern, got {:?}",
+            pattern_clause("promotions.1.member.name", NAME_PATTERN_UNANCHORED),
+            "case promotion name with {form}: expected the clause to name the member and the \
+             unanchored pattern and to echo no value, got {:?}",
             refusal.message
         );
     }
@@ -225,10 +226,10 @@ async fn a_value_outside_a_non_arn_pattern_is_stated_the_same_way_an_arn_is() {
 async fn a_clause_about_a_sensitive_value_names_the_member_and_no_value() {
     let emulator = Emulator::new();
 
-    // The exception to the echo, and the only one the model states: `Context`'s and
-    // `FilterValues`'s map VALUES are `@sensitive`, so a clause about one names the member
-    // path and withholds what the caller sent. Each row sends one character past that
-    // shape's `@length` ceiling, the one constraint those shapes carry.
+    // `Context`'s and `FilterValues`'s map VALUES are the shapes the model marks
+    // `@sensitive`, and a clause about one reads exactly as every other clause of this
+    // service does: the member path and the requirement, and no value. Each row sends one
+    // character past that shape's `@length` ceiling, the one constraint those shapes carry.
     let past_the_ceiling = "v".repeat(MAX_SENSITIVE_VALUE + 1);
     let rows: [(&str, &str, serde_json::Value); 3] = [
         (
@@ -288,11 +289,12 @@ async fn a_clause_about_a_sensitive_value_names_the_member_and_no_value() {
 }
 
 #[tokio::test]
-async fn a_violation_of_another_class_keeps_the_frameworks_clause() {
+async fn a_violation_of_another_class_states_the_member_and_no_value_too() {
     let emulator = Emulator::new();
 
-    // `numResults` is modelled `range 0..`, so a negative value is a `@range` violation
-    // — a class this service does not reword, so its clause still echoes the value.
+    // `numResults` is modelled `range 0..`, so a negative value is a `@range` violation — a
+    // different class from a `@pattern`, stated by the same rule: the member and the
+    // requirement, and no value.
     let refusal = emulator
         .refusal(
             RECOMMENDATIONS,
@@ -310,16 +312,14 @@ async fn a_violation_of_another_class_keeps_the_frameworks_clause() {
     );
     assert_eq!(
         refusal.message,
-        "1 validation error detected: Value '-1' at 'numResults' failed to satisfy constraint: \
-         Member must have value greater than or equal to 0",
-        "case negative numResults: expected the framework's own clause, got {:?}",
+        format!("1 validation error detected: {RANGE_CLAUSE}"),
+        "case negative numResults: expected the member and the requirement and no value, got {:?}",
         refusal.message
     );
 }
 
-/// One clause of a request that breaks `numResults`'s `@range` minimum, as the framework
-/// states it.
-const RANGE_CLAUSE: &str = "Value '-1' at 'numResults' failed to satisfy constraint: Member \
+/// One clause of a request that breaks `numResults`'s `@range` minimum.
+const RANGE_CLAUSE: &str = "Value at 'numResults' failed to satisfy constraint: Member \
                             must have value greater than or equal to 0";
 
 #[tokio::test]
@@ -327,16 +327,16 @@ async fn a_request_that_violates_two_classes_at_once_states_both_in_one_envelope
     let emulator = Emulator::new();
 
     // Two violations in ONE request: the envelope counts both and joins them with `; `, and
-    // each clause carries the subject its own member earns — the value the request sent,
-    // whichever class it failed and whatever shape the member targets, and no value at all
-    // where the model marks the value `@sensitive`. So one envelope never states two
-    // members of the same sensitivity two different ways.
+    // every clause reads the same way — the member path and the requirement, and no value —
+    // whichever class it failed, whatever shape the member targets and whether or not the
+    // model marks that value `@sensitive`. So one envelope never states two members two
+    // different ways.
     let sensitive = "v".repeat(MAX_SENSITIVE_VALUE + 1);
     let rows: [(&str, serde_json::Value, String, String); 3] = [
         (
             "an ARN pattern and a range bound",
             json!({ "campaignArn": "not-an-arn", "userId": "user-1", "numResults": -1 }),
-            pattern_fragment("campaignArn", "not-an-arn", ARN_PATTERN_UNANCHORED),
+            pattern_fragment("campaignArn", ARN_PATTERN_UNANCHORED),
             RANGE_CLAUSE.to_string(),
         ),
         (
@@ -347,11 +347,7 @@ async fn a_request_that_violates_two_classes_at_once_states_both_in_one_envelope
                 "numResults": -1,
                 "promotions": [{ "name": "-bad-name", "percentPromotedItems": 50 }],
             }),
-            pattern_fragment(
-                "promotions.1.member.name",
-                "-bad-name",
-                NAME_PATTERN_UNANCHORED,
-            ),
+            pattern_fragment("promotions.1.member.name", NAME_PATTERN_UNANCHORED),
             RANGE_CLAUSE.to_string(),
         ),
         (
@@ -361,7 +357,7 @@ async fn a_request_that_violates_two_classes_at_once_states_both_in_one_envelope
                 "userId": "user-1",
                 "context": { "GENRE": sensitive },
             }),
-            pattern_fragment("campaignArn", "not-an-arn", ARN_PATTERN_UNANCHORED),
+            pattern_fragment("campaignArn", ARN_PATTERN_UNANCHORED),
             format!(
                 "Value at 'context.GENRE' failed to satisfy constraint: Member must have length \
                  less than or equal to {MAX_SENSITIVE_VALUE}"
@@ -387,6 +383,161 @@ async fn a_request_that_violates_two_classes_at_once_states_both_in_one_envelope
             "case {case}: expected one of {either:?}, got {:?}",
             refusal.message
         );
+    }
+}
+
+/// The modelled `@length` ceiling on `Name`, which `Promotion$name` targets
+/// (`smithy_query(query="shape",shape="Name")` reports `length 1..63`).
+const MAX_PROMOTION_NAME: usize = 63;
+
+/// One boundary refusal: the request that earns it, the member path its clause names, the
+/// requirement that clause states, and the bytes the request submitted there.
+struct BoundaryClause {
+    case: &'static str,
+    route: &'static str,
+    body: serde_json::Value,
+    member: &'static str,
+    requirement: String,
+    /// What the request carried at that member, which no clause may quote back. `None` for
+    /// a member the request did not carry at all.
+    submitted: Option<String>,
+}
+
+#[tokio::test]
+async fn every_boundary_clause_names_the_member_and_the_requirement_and_echoes_no_value() {
+    // The rule, over the CLASSES of constraint a request can break on this service rather
+    // than over one recorded request: whatever the class, whatever shape the member targets
+    // and whether or not the model marks that value `@sensitive`, the clause names the member
+    // path and the requirement and quotes no value — and a `@pattern` requirement is quoted
+    // without the anchors the model writes.
+    let emulator = Emulator::new();
+
+    let sensitive = "v".repeat(MAX_SENSITIVE_VALUE + 1);
+    let long_name = "a".repeat(MAX_PROMOTION_NAME + 1);
+    let rows: Vec<BoundaryClause> = vec![
+        BoundaryClause {
+            case: "an ARN member outside its pattern",
+            route: RECOMMENDATIONS,
+            body: json!({ "campaignArn": "not-an-arn", "userId": "user-1" }),
+            member: "campaignArn",
+            requirement: format!(
+                "Member must satisfy regular expression pattern: {ARN_PATTERN_UNANCHORED}"
+            ),
+            submitted: Some("not-an-arn".to_string()),
+        },
+        BoundaryClause {
+            case: "another ARN member, on another operation, outside the same pattern",
+            route: PERSONALIZE_RANKING,
+            body: json!({
+                "campaignArn": CAMPAIGN,
+                "userId": "user-1",
+                "inputList": ["item-1"],
+                "filterArn": "arn:aws:s3:::bucket/key",
+            }),
+            member: "filterArn",
+            requirement: format!(
+                "Member must satisfy regular expression pattern: {ARN_PATTERN_UNANCHORED}"
+            ),
+            submitted: Some("arn:aws:s3:::bucket/key".to_string()),
+        },
+        BoundaryClause {
+            case: "a non-ARN member nested in a list, outside its own pattern",
+            route: RECOMMENDATIONS,
+            body: json!({
+                "campaignArn": CAMPAIGN,
+                "userId": "user-1",
+                "promotions": [{ "name": "_promo", "percentPromotedItems": 25 }],
+            }),
+            member: "promotions.1.member.name",
+            requirement: format!(
+                "Member must satisfy regular expression pattern: {NAME_PATTERN_UNANCHORED}"
+            ),
+            submitted: Some("_promo".to_string()),
+        },
+        BoundaryClause {
+            case: "an integer member under its range minimum",
+            route: ACTION_RECOMMENDATIONS,
+            body: json!({ "campaignArn": CAMPAIGN, "userId": "user-1", "numResults": -5 }),
+            member: "numResults",
+            requirement: "Member must have value greater than or equal to 0".to_string(),
+            submitted: Some("-5".to_string()),
+        },
+        BoundaryClause {
+            case: "a string member past its length maximum",
+            route: RECOMMENDATIONS,
+            body: json!({
+                "campaignArn": CAMPAIGN,
+                "userId": "user-1",
+                "promotions": [{ "name": long_name.clone(), "percentPromotedItems": 25 }],
+            }),
+            member: "promotions.1.member.name",
+            requirement: format!(
+                "Member must have length less than or equal to {MAX_PROMOTION_NAME}"
+            ),
+            submitted: Some(long_name.clone()),
+        },
+        BoundaryClause {
+            case: "a sensitive map value past its length maximum",
+            route: RECOMMENDATIONS,
+            body: json!({
+                "campaignArn": CAMPAIGN,
+                "userId": "user-1",
+                "context": { "GENRE": sensitive.clone() },
+            }),
+            member: "context.GENRE",
+            requirement: format!(
+                "Member must have length less than or equal to {MAX_SENSITIVE_VALUE}"
+            ),
+            submitted: Some(sensitive.clone()),
+        },
+        BoundaryClause {
+            case: "a required member the request left out",
+            route: PERSONALIZE_RANKING,
+            body: json!({ "campaignArn": CAMPAIGN, "userId": "user-1" }),
+            member: "inputList",
+            requirement: "Member must not be null".to_string(),
+            submitted: None,
+        },
+    ];
+
+    for row in rows {
+        let submitted = row.submitted.clone();
+        let refusal = emulator.refusal(row.route, row.body).await;
+        assert_eq!(
+            (
+                refusal.status,
+                refusal.code.as_str(),
+                refusal.errortype.as_str()
+            ),
+            (400, "ValidationException", "ValidationException"),
+            "case {}: expected the boundary's 400 ValidationException, got {refusal:?}",
+            row.case
+        );
+        let expected = format!(
+            "1 validation error detected: Value at '{}' failed to satisfy constraint: {}",
+            row.member, row.requirement
+        );
+        assert_eq!(
+            refusal.message, expected,
+            "case {}: expected {expected:?}, got {:?}",
+            row.case, refusal.message
+        );
+        if let Some(submitted) = submitted {
+            assert!(
+                !refusal.message.contains(&submitted),
+                "case {}: the submitted value must never be quoted back, got {:?}",
+                row.case,
+                refusal.message
+            );
+        }
+        for anchor in ["^arn", "^[a-zA-Z0-9]", ".+$", "*$"] {
+            assert!(
+                !refusal.message.contains(anchor),
+                "case {}: a quoted pattern must carry no {anchor:?} anchor, got {:?}",
+                row.case,
+                refusal.message
+            );
+        }
     }
 }
 

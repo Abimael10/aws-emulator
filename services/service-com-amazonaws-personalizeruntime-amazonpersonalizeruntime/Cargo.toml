@@ -24,8 +24,8 @@ tracing = { workspace = true }
 # `service-common` carries this tree's ONE caller-supplied-ARN parse, which the
 # inference registry reads the resource type a `campaignArn` / `recommenderArn` /
 # `filterArn` claims with (`src/state.rs`, `require_resource_kind`), and this tree's ONE
-# anchor-free rendering of a modelled `@pattern`, which the boundary refusal quotes the
-# expression with (`src/service.rs`, `clause`).
+# rendering of the AWS validation envelope, which the boundary refusal is stated through
+# (`src/service.rs`, `refused`).
 service-common = { path = "../common" }
 # Deterministic, request-derived scoring and opaque recommendation ids
 # (`src/state/scoring.rs`): SHA-256 as a stable mixing function, hex for the id.

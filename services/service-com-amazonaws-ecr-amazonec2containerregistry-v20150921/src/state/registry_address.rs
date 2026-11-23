@@ -184,9 +184,9 @@ pub fn dialled_registry_region(authority: &str) -> Option<String> {
 /// The path after the first `/` is exactly the repository name, so a client composes a tag, a
 /// digest or a `/v2` path on what it was handed and the reference reads back as the
 /// repository it names (`super::registry_pull::parse_reference`, which reads a reference
-/// written on this address and one written on the registry host AWS publishes alike).
-pub fn repository_uri(announced_authority: &str, name: &str) -> String {
-    format!("{}/{name}", announced_authority.trim_end_matches('/'))
+/// written on this authority and one written on the zone AWS publishes alike).
+pub fn repository_uri(published_authority: &str, name: &str) -> String {
+    format!("{}/{name}", published_authority.trim_end_matches('/'))
 }
 
 /// `<registry id>.dkr.ecr.<region>.<zone>[:<port>]` — the authority this registry PUBLISHES
@@ -243,8 +243,8 @@ pub fn published_registry_authority(
 ///
 /// It is the host every repository of that registry is addressed under ON AWS, so it is the
 /// spelling a client's own reference may be written in. What this registry PUBLISHES for a
-/// repository is not this host but the address this emulator answers the caller at
-/// ([`repository_uri`]), because nothing here answers for a name AWS serves.
+/// repository is this layout anchored on the zone and port this emulator is reached at
+/// ([`published_registry_authority`]), because nothing here answers for a name AWS serves.
 pub fn registry_host(registry_id: &str, region: &str) -> String {
     registry_host_in_zone(registry_id, region, registry_dns_suffix(region))
 }
@@ -395,9 +395,9 @@ pub const PARTITION_DNS_SUFFIXES: [(&str, &str); 6] = [
 /// the registry's address, which here is the address this emulator answers the registry API
 /// on, because that URL is DIALLED as it is handed over, with the credential the token
 /// carries, and the endpoint the caller already reached is the one address this service
-/// knows it can reach. A repository's own URI is published on that same endpoint, with the
-/// repository's name as its path and no scheme, which is the form that member carries
-/// ([`repository_uri`]).
+/// knows it can reach. A repository's own URI is published on that endpoint's zone and port
+/// instead, under the registry host layout and with the repository's name as its path, which
+/// is the form that member carries ([`published_registry_authority`], [`repository_uri`]).
 pub fn registry_login_url(announced_endpoint: &str) -> String {
     format!("https://{announced_endpoint}")
 }

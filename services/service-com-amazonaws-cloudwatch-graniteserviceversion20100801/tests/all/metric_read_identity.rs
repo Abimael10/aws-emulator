@@ -398,6 +398,84 @@ async fn a_read_over_the_datapoint_cap_is_refused_with_the_count_it_asked_for() 
 }
 
 #[tokio::test]
+async fn the_count_a_capped_read_names_is_the_periods_of_the_range_the_request_named() {
+    let router = build_router();
+    let now = crate::harness::now_secs();
+
+    // The complement of the row above: the range the request names does NOT sit on a clock
+    // window of its period, so the count the refusal states can only come from the request's
+    // own `StartTime`, `EndTime` and `Period` — the documented rounding decides which windows
+    // are read, not how many datapoints were asked for. The rows differ along the offset the
+    // range is skewed by (a fraction of a period, most of one, one past the start of one), the
+    // period, and how many periods the range spans.
+    //
+    // (case, the period, how many of those periods the range spans, the offset the range is
+    // skewed by)
+    let rows: Vec<(&str, i64, i64, f64)> = vec![
+        (
+            "a fortnight of one-minute periods, skewed by a second",
+            60,
+            14 * 24 * 60,
+            1.0,
+        ),
+        (
+            "a fortnight and one period of one-minute periods, skewed by most of a period",
+            60,
+            14 * 24 * 60 + 1,
+            59.0,
+        ),
+        (
+            "five-minute periods, skewed by one second past a window",
+            300,
+            4_000,
+            1.0,
+        ),
+        (
+            "one-hour periods, skewed by half a period",
+            3_600,
+            1_800,
+            1_800.0,
+        ),
+    ];
+
+    for (case, period, periods, offset) in rows {
+        let span = f64::from(period as i32);
+        let end = (now / span).floor() * span + offset;
+        let start = end - span * periods as f64;
+        assert!(
+            periods > MAX_DATAPOINTS,
+            "case {case:?}: the row must ask for more than the cap, got {periods}"
+        );
+        let (status, body) = call(
+            &router,
+            "GetMetricStatistics",
+            &read("Skewed", start, end, period, None),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidParameterCombinationException",
+            "case {case:?}: expected the combination fault, got {body}"
+        );
+        let expected = format!(
+            "You have requested up to {periods} datapoints, which exceeds the limit of \
+             {MAX_DATAPOINTS}. You may reduce the datapoints requested by increasing Period, or \
+             decreasing the time range."
+        );
+        assert_eq!(
+            error_message(&body),
+            expected,
+            "case {case:?}: expected {expected:?}, got {:?}",
+            error_message(&body)
+        );
+    }
+}
+
+#[tokio::test]
 async fn the_two_statistic_members_are_one_either_or_combination() {
     let router = build_router();
     let at = recent();

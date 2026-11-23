@@ -310,10 +310,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the rounded start falls inside, read whole rather than cut off at an instant in the
         // middle of it ([`crate::state::first_window_start`]).
         let start = crate::state::first_window_start(requested_start, input.period, now);
-        // How many data points this call asks for: one per window it lays over the range, which
-        // is what the cap is on ("The maximum number of data points returned from a single call
-        // is 1,440") and what the refusal names.
-        let requested_datapoints = ((end - start) / period).ceil();
+        // How many data points this call ASKED for: the periods of the window the caller named,
+        // at the period the caller named — the two numbers the refusal states come from the
+        // request and the cap, and nothing else ("The maximum number of data points returned
+        // from a single call is 1,440"). Counted over the REQUESTED range rather than over the
+        // rounded one, because the rounding above decides which windows are READ and not how
+        // many datapoints were requested: a caller that moves its `StartTime` by less than one
+        // period has asked for the same number of datapoints, and a range of exactly N periods
+        // is reported as N however the instants it names sit inside their clock windows.
+        let requested_datapoints = ((end - requested_start) / period).ceil();
         if requested_datapoints > MAX_DATAPOINTS {
             return Err(invalid_combination(crate::state::datapoint_cap_exceeded(
                 requested_datapoints,

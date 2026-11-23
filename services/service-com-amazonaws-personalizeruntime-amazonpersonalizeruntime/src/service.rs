@@ -40,68 +40,36 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
-};
+use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
 
-/// The error code the framework answers an input-constraint violation with, and the
-/// one the recordings show this service answering: `ValidationException` (HTTP 400).
-/// Restated here because `override_refusal` replaces the code and the message
-/// together, and only the message changes below.
-const VALIDATION_EXCEPTION: &str = "ValidationException";
-
-/// Whether `violation` is the class this service words itself: a violated `@pattern`.
-fn is_pattern(violation: &Violation) -> bool {
-    matches!(violation.kind, ViolationKind::Pattern(_))
-}
-
-/// One clause of this service's `ValidationException` message.
+/// How Amazon Personalize states a request its own boundary refused, or `None` to keep the
+/// framework's wording.
 ///
-/// A clause states WHICH value was refused and WHAT it had to satisfy, and this service
-/// changes exactly ONE thing about the framework's own sentence: a violated `@pattern` is
-/// quoted WITHOUT the `^`/`$` anchors the model writes to make the match total. The SUBJECT
-/// half is not this service's to choose — a validation message is the only place a service
-/// reports the offending input back, so the clause echoes the value the caller submitted
-/// whatever class that value failed, and names no value only where the model marks the value
-/// `@sensitive` (`Context`'s and `FilterValues`'s map values are the only sensitive shapes
-/// this service's inputs reach; the framework's walk hides a sensitive value for every
-/// class). The requirement is restated here, not rewritten, by handing the unanchored
-/// expression back to the framework's own clause builder, so no class of violation and no
-/// member can drift into a different sentence for being one shape rather than another.
-fn clause(violation: &Violation) -> String {
-    match &violation.kind {
-        ViolationKind::Pattern(pattern) => {
-            let mut stated = violation.clone();
-            stated.kind = ViolationKind::Pattern(::service_common::validation::unanchored(pattern));
-            stated.message()
-        }
-        _ => violation.message(),
-    }
-}
-
-/// This service's `ValidationException` message: the AWS envelope
-/// (`N validation error(s) detected: `) over one clause per violation.
+/// The envelope is AWS's (`N validation error(s) detected: ` over one clause per violated
+/// constraint, joined with `; `), and two things about a CLAUSE are this service family's own:
 ///
-/// `None` declines the refusal — leaving the framework's wording untouched — for a
-/// request with no `@pattern` violation in it, since that is the only class this file
-/// words differently. A request that mixes one with another class IS reworded, so the
-/// pattern clause loses its anchors while every other clause reads exactly as the
-/// framework would have stated it — and every clause of the envelope, pattern clause
-/// included, names the value its own member carried.
-fn pattern_envelope(violations: &[Violation]) -> Option<String> {
-    if !violations.iter().any(is_pattern) {
-        return None;
-    }
-    let clauses: Vec<String> = violations.iter().map(clause).collect();
-    match clauses.len() {
-        0 => None,
-        1 => Some(format!("1 validation error detected: {}", clauses[0])),
-        n => Some(format!(
-            "{n} validation errors detected: {}",
-            clauses.join("; ")
-        )),
-    }
+/// * a clause names the offending MEMBER PATH and the CONSTRAINT it broke and states NO
+///   value — `Value at '<path>' failed to satisfy constraint: <requirement>` — neither the
+///   bytes a present member submitted nor the `null` an absent member would otherwise be
+///   stated with;
+/// * a `@pattern` requirement is quoted WITHOUT the `^`/`$` a whole-value pattern is written
+///   with, so a caller that lifts the expression out of the message and pre-validates its own
+///   input compiles the expression the service advertises.
+///
+/// Both are the renderings recorded for the sibling data plane of the same service family
+/// (Amazon Personalize Events, whose `datasetArn` targets this very `Arn` shape), so the
+/// whole family states one dialect. Nothing else is chosen here: the envelope, the count, the
+/// member paths, the requirement half of every clause and the `@pattern` rendering are
+/// [`service_common::validation_message`]'s and the framework's, so no class of violation and
+/// no member can drift into a sentence of its own.
+///
+/// The CODE travels with the message and is the shared renderer's `ValidationException`
+/// (HTTP 400), which is also what the framework already answered, so only the words change.
+fn refused(refusal: &Refusal) -> Option<Refused> {
+    // `true` for EVERY member path: this service withholds the value in every clause, whatever
+    // constraint the value broke and whether or not the model marks that member `@sensitive`.
+    ::service_common::validation_message::aws_validation_refusal_withholding(refusal, |_| true)
 }
 
 /// The first path segment of a URI, or `None` for the root path.
@@ -202,18 +170,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // required member, or a value outside a declared bound) to let this
         // service reword it.
         //
-        // Amazon Personalize Runtime states a violated `@pattern` without the model's
-        // anchors; the code stays the `ValidationException` (HTTP 400) the framework would
-        // have answered, so only the expression a clause quotes changes, and only for that
-        // class — every other refusal, authentication included, keeps the framework's
-        // wording because `pattern_envelope` declines it.
-        match refusal {
-            Refusal::Invalid(violations) => Some(Refused {
-                code: VALIDATION_EXCEPTION.to_string(),
-                message: pattern_envelope(violations)?,
-            }),
-            _ => None,
-        }
+        // Amazon Personalize names the member and the requirement and echoes no value, and
+        // quotes a `@pattern` without the model's anchors; see [`refused`]. Only an
+        // input-constraint refusal is reworded — an authentication refusal is a different
+        // failure with a different code and status, and nothing about it is this service's to
+        // word — so it declines everything else and keeps the framework's wording.
+        refused(refusal)
     }
 
     fn override_routing_error(
