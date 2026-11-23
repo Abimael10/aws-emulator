@@ -485,6 +485,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             sequence: 0,
         };
         require_members_of_type(&entry).map_err(bad_request)?;
+        // And every `providerARNs` entry has to NAME a user pool, since that is the pool whose
+        // tokens the authorizer would accept ([`crate::state::user_pool_state`]): checked
+        // before the store lock is taken, so an authorizer that could authorize nothing never
+        // reaches the records at all.
+        crate::state::user_pool_state::require_provider_user_pools(&entry).map_err(bad_request)?;
 
         let mut store = state.lock();
         {

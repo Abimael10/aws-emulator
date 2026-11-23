@@ -457,6 +457,25 @@ pub(super) async fn actual_configuration(
     }
 }
 
+/// Which `HandlerErrorCode` class the provider of one of this api's types puts a refusal
+/// carrying `code` in; see
+/// [`Owner::handler_error_class`](super::Owner::handler_error_class).
+///
+/// Each of these types has a resource provider of its OWN, so the mapping from the owning
+/// service's error codes onto the plugin's classes is per TYPE rather than per service: the
+/// module that owns a type states the mapping its provider was recorded wording, and every
+/// other type here reports the class the error code itself falls in.
+pub(super) fn handler_error_class(
+    kind: Kind,
+    code: &str,
+    classified: &'static str,
+) -> &'static str {
+    match kind {
+        Kind::AccessControl(kind) => access_control::handler_error_class(kind, code, classified),
+        _ => classified,
+    }
+}
+
 /// The properties API Gateway's own read of an api reports, as `(property, member)` pairs.
 ///
 /// The SCALAR configuration alone: `Tags` are left out because the tags a resource carries

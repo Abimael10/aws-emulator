@@ -1856,6 +1856,12 @@ impl Owner {
             Self::ApiGatewayRestApi(_) if code == API_GATEWAY_VALIDATION => {
                 super::HANDLER_ERROR_SERVICE_FAILED
             }
+            // Its MODELLED errors are mapped per TYPE, because each of these types has a
+            // provider of its own: the module that owns a type states the mapping its provider
+            // was recorded wording ([`apigateway_rest_api::handler_error_class`]).
+            Self::ApiGatewayRestApi(kind) => {
+                apigateway_rest_api::handler_error_class(kind, code, classified)
+            }
             // A MOUNT TARGET's provider reports the one-mount-target-per-Availability-Zone
             // refusal as a resource that ALREADY EXISTS: a zone that already holds this file
             // system's mount target is the place the declaration asks for one, and that is a

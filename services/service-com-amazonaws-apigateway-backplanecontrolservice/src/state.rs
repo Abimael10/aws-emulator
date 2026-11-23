@@ -4885,6 +4885,11 @@ pub mod acm_certificate_state;
 /// against; see that module.
 pub mod load_balancer_state;
 
+/// Whether a `COGNITO_USER_POOLS` authorizer's `providerARNs` entry NAMES an Amazon Cognito
+/// user pool — what every write of that member is checked against, and the one reading of a
+/// user-pool ARN both planes share; see that module.
+pub mod user_pool_state;
+
 /// The usage a usage plan's QUOTA is metered against — the requests each of its API keys
 /// sent on each day, and the daily log of used and remaining quota a read reports from
 /// them; re-exported whole, so a handler still reaches each name as `crate::state::…`.

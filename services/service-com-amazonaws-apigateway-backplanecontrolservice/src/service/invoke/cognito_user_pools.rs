@@ -75,14 +75,11 @@ use ::service_common::jwt;
 
 use crate::state::AuthorizerEntry;
 
-/// The service namespace a user pool's ARN names, which is the user-pool service's own
-/// `arnNamespace`.
-const USER_POOL_ARN_VENDOR: &str = "cognito-idp";
-
-/// The resource prefix a user pool's ARN carries:
-/// `arn:aws:cognito-idp:{region}:{account}:userpool/{pool-id}`, the form
-/// `Authorizer$providerARNs` lists.
-const USER_POOL_ARN_RESOURCE: &str = "userpool/";
+// The one reading of a user-pool ARN this crate has, which the control plane resolves a
+// written `providerARNs` entry through too ([`crate::state::user_pool_state`]): the pools an
+// authorizer lists and the pools a write of that member is admitted for are the same member
+// read the same way.
+use crate::state::user_pool_state::user_pool_id_of;
 
 /// What this authorizer made of the token the request presented.
 #[derive(Debug)]
@@ -250,10 +247,10 @@ fn scopes_satisfied(token: &jwt::CompactJws, required: &[String]) -> bool {
 ///
 /// The pools the authorizer lists are what is looked UP — not the pool the token claims — so a
 /// token naming a pool this emulator holds but the authorizer does not list resolves no key set
-/// and is refused. Each listed ARN's `userpool/{id}` resource names the pool, the token's `iss`
-/// has to be an issuer that pool publishes (`UserPool::publishes_issuer`, which is the pool's
-/// id on an endpoint this emulator serves it at), and what is read out of the pool is the
-/// PUBLIC key set it publishes.
+/// and is refused. Each listed ARN's `userpool/{id}` resource names the pool
+/// ([`user_pool_id_of`]), the token's `iss` has to be an issuer that pool publishes
+/// (`UserPool::publishes_issuer`, which is the pool's id on an endpoint this emulator serves it
+/// at), and what is read out of the pool is the PUBLIC key set it publishes.
 fn accepted_issuer_key_set<Eng: Send + Sync + 'static>(
     engine: &Eng,
     authorizer: &AuthorizerEntry,
@@ -272,20 +269,8 @@ fn accepted_issuer_key_set<Eng: Send + Sync + 'static>(
         .map(|pool| pool.jwks())
 }
 
-/// The user-pool id a `providerARNs` entry names, or `None` for a value that names no user
-/// pool.
-///
-/// The ARN's resource is [`USER_POOL_ARN_RESOURCE`] then the pool's own id, which is the form
-/// `Authorizer$providerARNs` lists; the tree's one ARN parse reads the six fields so this
-/// agrees with every other service on what an ARN is.
-fn user_pool_id_of(arn: &str) -> Option<&str> {
-    let parsed = ::service_common::arn::parse(arn.trim())?;
-    if parsed.vendor != USER_POOL_ARN_VENDOR {
-        return None;
-    }
-    let id = parsed.resource.strip_prefix(USER_POOL_ARN_RESOURCE)?.trim();
-    (!id.is_empty() && !id.contains('/')).then_some(id)
-}
+// The user-pool ARN reading the lookup above applies is shared with the control plane
+// (`crate::state::user_pool_state`), which resolves the same member when it is WRITTEN.
 
 /// Why the token's audience does not satisfy `authorizer`'s `identityValidationExpression`, or
 /// `None` when it does — including when the authorizer declares none, which matches every

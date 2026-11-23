@@ -590,6 +590,23 @@ const SDK_PROVIDER_SHAPES: &[(&str, &str, SdkDiagnostic)] = &[
         "UpdateRestApi",
         SdkDiagnostic::Attempts,
     ),
+    // The `AWS::ApiGateway::Authorizer` type's provider ([`provisioning::apigateway_rest_api::
+    // access_control`]) words the ATTEMPT-counting shape too, where that service's entry above
+    // carries the bare envelope its DEPLOYMENT provider words. Read from the recorded
+    // `ResourceStatusReason` of an `AWS::ApiGateway::Authorizer` declaring a `COGNITO_USER_POOLS`
+    // authorizer whose `ProviderARNs` entry names no Amazon Cognito user pool (in the behavioral
+    // corpus `simparity-behavioral-aws-v1`, check `apigateway__cloudformation__cognito-idp.\
+    // deploy-apigateway-cognito-authorizer-invalid-provider-arn-rejected`, whose reason reads
+    // `Resource handler returned message: "<the service's sentence> (Service: ApiGateway, Status
+    // Code: 400, Request ID: …) (SDK Attempt Count: …)" (RequestToken: …, HandlerErrorCode: …)`).
+    // That is the one reason RECORDED for this provider; the calls it makes on an authorizer it
+    // already created word the shape it words, and a recording of one of them is what would
+    // correct them.
+    (
+        crate::state::provisioner::API_GATEWAY_SIGNING_NAME,
+        "CreateAuthorizer",
+        SdkDiagnostic::Attempts,
+    ),
     // AWS Elemental MediaConvert's three TRANSCODING types — the queue a stack's jobs run in,
     // the job template they are created from and the preset an output is written with
     // ([`provisioning::mediaconvert_resources`]) — are provisioned by a provider that words the

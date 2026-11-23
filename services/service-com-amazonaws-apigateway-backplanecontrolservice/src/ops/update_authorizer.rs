@@ -371,6 +371,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         require_members_of_type(&updated)
             .map_err(PatchFailure::BadRequest)
             .map_err(patch_failure)?;
+        // And every `providerARNs` entry of it has to NAME a user pool, the same precondition
+        // the create turns on the record it would store
+        // ([`crate::state::user_pool_state`]): a patch that adds an entry naming no pool is
+        // refused rather than stored.
+        crate::state::user_pool_state::require_provider_user_pools(&updated)
+            .map_err(PatchFailure::BadRequest)
+            .map_err(patch_failure)?;
 
         api.authorizers
             .insert(input.authorizer_id.clone(), updated.clone());

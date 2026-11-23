@@ -283,10 +283,15 @@ async fn create_authorizer(
         }
     }
     refuse_missing(resource, &request, AUTHORIZER_REQUIRED)?;
-    let answered = call_rest_json(
+    // The OPERATION is stated, because this provider's own SDK generation words a diagnostic
+    // its service's other providers do not ([`sdk_diagnostics::SDK_PROVIDER_SHAPES`]): a
+    // refusal API Gateway answers this create with is reported in the shape that provider's
+    // exception carries.
+    let answered = call_rest_json_named(
         ctx,
         API_GATEWAY_SIGNING_NAME,
         region,
+        "CreateAuthorizer",
         "POST",
         &authorizers_uri(&required(resource, REST_API_ID)?),
         Some(&Value::Object(request)),
@@ -628,6 +633,39 @@ pub(super) async fn actual_configuration(
         }
         Err(refusal) if refusal.code == API_GATEWAY_NOT_FOUND => Ok(None),
         Err(refusal) => Err(refusal),
+    }
+}
+
+/// The error code API Gateway refuses a request it found a fault IN THE REQUEST with: its
+/// `BadRequestException`, "the submitted request is not valid, for example, the input is
+/// incomplete or incorrect"
+/// (`smithy_query(query="operation",operation="CreateAuthorizer")` declares it at httpError
+/// 400).
+const API_GATEWAY_BAD_REQUEST: &str = "BadRequestException";
+
+/// Which `HandlerErrorCode` class the provider of one of these types puts a refusal carrying
+/// `code` in; see [`super::handler_error_class`].
+///
+/// The AUTHORIZER's provider reports a refusal of its create under the plugin's ALREADY-EXISTS
+/// class rather than under the class the owning service's code falls in: it maps that service's
+/// `BadRequestException` onto that class, as the recorded `ResourceStatusReason` of an
+/// `AWS::ApiGateway::Authorizer` whose `ProviderARNs` entry names no Amazon Cognito user pool
+/// carries (in the behavioral corpus `simparity-behavioral-aws-v1`, check `apigateway__\
+/// cloudformation__cognito-idp.deploy-apigateway-cognito-authorizer-invalid-provider-arn-\
+/// rejected`, whose reason closes `HandlerErrorCode: AlreadyExists`). A mapping is the
+/// provider's own artifact and is not derivable from the code, which is why it is recorded
+/// here beside the calls that provider makes; the other three types' providers report the
+/// class their service's code falls in.
+pub(super) fn handler_error_class(
+    kind: Kind,
+    code: &str,
+    classified: &'static str,
+) -> &'static str {
+    match kind {
+        Kind::Authorizer if code == API_GATEWAY_BAD_REQUEST => {
+            crate::state::provisioning::HANDLER_ERROR_ALREADY_EXISTS
+        }
+        _ => classified,
     }
 }
 
