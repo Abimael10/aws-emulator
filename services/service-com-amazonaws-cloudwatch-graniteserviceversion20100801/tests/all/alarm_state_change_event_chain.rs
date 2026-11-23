@@ -15,11 +15,19 @@
 //! stands at the next transition is a state no event of that alarm ever announced.
 //!
 //! The rows differ along what the rule generalises over: WHAT drove each transition (a state a
-//! caller forced, a datapoint the alarm's own evaluation graded, and the two mixed), HOW MANY
-//! transitions the alarm went through, and WHETHER the state the alarm carries was RE-STATED
-//! under it between two transitions — a write that states the state the alarm is already in
-//! moves it nowhere, so it publishes nothing while leaving the alarm carrying another
-//! explanation of that state than the event announced.
+//! caller forced, a datapoint the alarm's own evaluation graded, a window with no datapoint at
+//! all, and those mixed), HOW MANY transitions the alarm went through, WHICH states it moved
+//! through, WHETHER the state the alarm carries was RE-STATED under it between two transitions —
+//! a write that states the state the alarm is already in moves it nowhere, so it publishes
+//! nothing while leaving the alarm carrying another explanation of that state than the event
+//! announced — and WHETHER the states being chained carry a DECISION RECORD at all: a state an
+//! evaluation decided carries the record of THAT evaluation, while the state a creation left the
+//! alarm in carries an explanation and no record, since nothing was evaluated for it.
+//!
+//! What that makes the chain assert, member for member, is that the record a state is announced
+//! with is the record it is still reported with when the alarm moves out of it — the span of the
+//! series and the instant of the evaluation that PUT the alarm in that state, and never the span
+//! or the instant of the later evaluation that took it out.
 //!
 //! The events are ordered by the instant each reports rather than by the order they were read
 //! off the queue, so what is asserted is the chain itself and not the delivery order of a
@@ -256,12 +264,21 @@ async fn publish(emulator: &Emulator, alarm: &str, value: f64) {
     .await;
 }
 
-/// Take whatever has been delivered to the queue at `url` and add it to `held`.
+/// Take whatever has been delivered to the queue at `url` and add it to `held`, BY EVENT ID: a
+/// standard queue delivers a message at least once, and a message a reader takes without deleting
+/// it becomes visible again once its visibility timeout passes — so one event read more than once
+/// is still one event, de-duplicated here by the `id` the bus gave it, the way a consumer
+/// following one alarm does.
 async fn collect(emulator: &Emulator, url: &str, held: &mut Vec<Value>) {
     for message in received_messages(emulator, url).await {
         let body = message["Body"].as_str().unwrap_or_default();
         if let Ok(parsed) = serde_json::from_str::<Value>(body) {
-            held.push(parsed);
+            let already_held = parsed
+                .get("id")
+                .is_some_and(|id| held.iter().any(|event| event.get("id") == Some(id)));
+            if !already_held {
+                held.push(parsed);
+            }
         }
     }
 }
@@ -520,6 +537,248 @@ async fn two_evaluated_transitions_chain() {
          threshold, got {held:?}"
     );
     assert_the_chain_joins_up(case, &held, None);
+}
+
+/// The alarm the three-link evaluated row drives: the same series, but treating a window with no
+/// datapoint as MISSING ("missing — the alarm does not consider missing data points when
+/// evaluating whether to change state", `PutMetricAlarmInput$TreatMissingData`), so the alarm's
+/// own evaluation moves it back to the state its creation left it in once the series stops; and
+/// folded by MAXIMUM over one window, so each state is decided by one window and its record names
+/// that window.
+async fn given_alarm_that_treats_missing_data_as_missing(emulator: &Emulator, name: &str) {
+    monitoring(
+        emulator,
+        "PutMetricAlarm",
+        &json!({
+            "AlarmName": name,
+            "AlarmDescription": "the alarm of this row",
+            "Namespace": NAMESPACE,
+            "MetricName": METRIC,
+            "Dimensions": [{"Name": "QueueName", "Value": name}],
+            "Statistic": "Maximum",
+            "Period": PERIOD,
+            "EvaluationPeriods": 1,
+            "DatapointsToAlarm": 1,
+            "Threshold": THRESHOLD,
+            "ComparisonOperator": "GreaterThanThreshold",
+            "TreatMissingData": "missing",
+            "ActionsEnabled": false,
+        }),
+    )
+    .await;
+}
+
+/// Wait until an event reporting `state` has reached the queue WITHOUT publishing anything
+/// meanwhile: the evaluation this waits for is the one a window holding no datapoint decides, so
+/// the row looks at the alarm as well as at the queue and publishes nothing. The wait is for the
+/// CONDITION rather than for a span.
+async fn until_unpublished_state(
+    emulator: &Emulator,
+    url: &str,
+    alarm: &str,
+    state: &str,
+    held: &mut Vec<Value>,
+) {
+    for _ in 0..looks() {
+        reported_state(emulator, alarm).await;
+        collect(emulator, url, held).await;
+        if holds_state(held, state) {
+            return;
+        }
+        tokio::time::sleep(LOOK_INTERVAL).await;
+    }
+    collect(emulator, url, held).await;
+}
+
+/// The DECISION RECORD one state document carries (`reasonData`, which is the alarm's
+/// `StateReasonData`), or `None` for a state no evaluation decided.
+fn decision_record(state: &Value) -> Option<&str> {
+    state.pointer("/reasonData").and_then(Value::as_str)
+}
+
+/// The instant a decision record reports the evaluation it records was made at (`queryDate`), as
+/// seconds.
+fn record_query_instant(case: &str, record: &str) -> f64 {
+    let parsed: Value = serde_json::from_str(record).unwrap_or_else(|error| {
+        panic!("case {case:?}: expected the decision record {record} to be JSON, got {error}")
+    });
+    parsed
+        .get("queryDate")
+        .and_then(Value::as_str)
+        .and_then(document_instant_secs)
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: expected a queryDate in the decision record {record}")
+        })
+}
+
+/// The state value one event reports moving the alarm TO.
+fn announced_value(event: &Value) -> String {
+    event
+        .pointer("/detail/state/value")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// RULE, over THREE links the alarm's own evaluations made and over the DECISION RECORD each
+/// state was announced with: the alarm breaches, recovers, and is then moved back by a window
+/// holding no datapoint at all. Every event reports as the state it moved out of the whole state
+/// document the event before it announced — the record included — so the record a consumer reads
+/// for the state that ended is the record of the evaluation that CREATED that state and not of
+/// the one that ended it. The alarm's first transition moves it out of the state its creation
+/// left it in, which carries an explanation and no record, because nothing was evaluated for it.
+#[tokio::test]
+async fn evaluated_transitions_chain_with_the_record_each_state_was_announced_with() {
+    let case = "three evaluated transitions, the last one decided by a window with no datapoint";
+    let emulator = emulator_with_a_bus();
+    let alarm = "chain-missing-data";
+    let queue = given_target_queue(&emulator, "chain-missing-data-q").await;
+    given_alarm_that_treats_missing_data_as_missing(&emulator, alarm).await;
+    given_rule_for_alarm(&emulator, case, "chain-missing-data-rule", alarm, &queue).await;
+
+    // The state the CREATION left the alarm in: the state its first transition moves out of.
+    let created = reported_state(&emulator, alarm).await;
+    assert_eq!(
+        created["value"],
+        json!(INSUFFICIENT_DATA),
+        "case {case:?}: expected the creation to leave the alarm in {INSUFFICIENT_DATA}, got \
+         {created}"
+    );
+    assert_eq!(
+        created["reasonData"],
+        Value::Null,
+        "case {case:?}: nothing is evaluated at creation, so the state a creation leaves carries \
+         no decision record, got {created}"
+    );
+
+    let mut held: Vec<Value> = Vec::new();
+    until_evaluated(&emulator, &queue, alarm, BREACHING, "ALARM", &mut held).await;
+    until_evaluated(&emulator, &queue, alarm, NOT_BREACHING, "OK", &mut held).await;
+    // Publishing STOPS here: what moves this alarm back is a window holding no datapoint at all.
+    until_unpublished_state(&emulator, &queue, alarm, INSUFFICIENT_DATA, &mut held).await;
+
+    let ordered = in_transition_order(&held);
+    let states: Vec<String> = ordered.iter().map(announced_value).collect();
+    assert_eq!(
+        states.first().map(String::as_str),
+        Some("ALARM"),
+        "case {case:?}: expected the breaching datapoints to move the alarm into ALARM first, \
+         got the states {states:?} from {held:?}"
+    );
+    assert_eq!(
+        states.last().map(String::as_str),
+        Some(INSUFFICIENT_DATA),
+        "case {case:?}: expected the stopped series to move the alarm back to \
+         {INSUFFICIENT_DATA} last, got the states {states:?} from {held:?}"
+    );
+    let recovered_at = states.iter().position(|state| state == "OK");
+    assert!(
+        recovered_at.is_some_and(|at| at > 0 && at + 1 < states.len()),
+        "case {case:?}: expected the alarm to be moved out of ALARM into OK and only then back \
+         to {INSUFFICIENT_DATA}, got the states {states:?} from {held:?}"
+    );
+
+    assert_the_chain_joins_up(case, &held, None);
+
+    // And the tuple the alarm ITSELF serves is the one its last event announced: one stored
+    // explanation per state, read the same by a consumer of the bus and by a caller of
+    // `DescribeAlarms`.
+    let reported = reported_state(&emulator, alarm).await;
+    let last_announced = ordered
+        .last()
+        .and_then(|event| event.pointer("/detail/state").cloned())
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        reported,
+        json!({
+            "value": last_announced.pointer("/value").cloned().unwrap_or(Value::Null),
+            "reason": last_announced.pointer("/reason").cloned().unwrap_or(Value::Null),
+            "reasonData": last_announced
+                .pointer("/reasonData")
+                .cloned()
+                .unwrap_or(Value::Null),
+        }),
+        "case {case:?}: expected the alarm to go on reporting the state its last event announced \
+         ({last_announced}), got {reported}"
+    );
+
+    // The one state with no record of its own is the state the CREATION left: the first event
+    // reports its explanation and no record, rather than a record of an evaluation that had not
+    // happened while the alarm was in it.
+    let left_at_creation = ordered[0]
+        .pointer("/detail/previousState")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        left_at_creation.pointer("/reason").and_then(Value::as_str),
+        created["reason"].as_str(),
+        "case {case:?}: expected the first transition to move the alarm out of the state its \
+         creation left it in ({created}), got {left_at_creation}"
+    );
+    assert_eq!(
+        decision_record(&left_at_creation),
+        None,
+        "case {case:?}: expected the state a creation left to be reported with no decision \
+         record, got {left_at_creation}"
+    );
+
+    // Every later link: the record of the state an event moved OUT OF is the record that state
+    // was announced with, which is the record of an EARLIER evaluation than the one that moved
+    // the alarm on — never the record the emitting evaluation computed for itself.
+    for pair in ordered.windows(2) {
+        let announced = pair[0]
+            .pointer("/detail/state")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let reached = pair[1]
+            .pointer("/detail/state")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let left = pair[1]
+            .pointer("/detail/previousState")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let announced_record = decision_record(&announced).unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: expected an evaluated state to be announced with a decision \
+                 record, got {announced}"
+            )
+        });
+        let reached_record = decision_record(&reached).unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: expected an evaluated state to be announced with a decision \
+                 record, got {reached}"
+            )
+        });
+        let left_record = decision_record(&left).unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: expected the state an event moved out of to be reported with the \
+                 record it was announced with ({announced_record}), got {left}"
+            )
+        });
+        assert_eq!(
+            left_record, announced_record,
+            "case {case:?}: expected the transition {} to report the record the state it moved \
+             out of was announced with, got {left_record}",
+            pair[1]
+        );
+        assert_ne!(
+            left_record, reached_record,
+            "case {case:?}: expected the record of the state the transition {} left to be \
+             another evaluation's than the record of the state it reached, got {left_record} for \
+             both",
+            pair[1]
+        );
+        let left_at = record_query_instant(case, left_record);
+        let reached_at = record_query_instant(case, reached_record);
+        assert!(
+            left_at < reached_at,
+            "case {case:?}: expected the record of the state the transition {} left to be the \
+             one computed BEFORE the record of the state it reached, got {left_at} against \
+             {reached_at}",
+            pair[1]
+        );
+    }
 }
 
 /// RULE, over the two drivers MIXED: a state a caller forces out of a state the evaluation
