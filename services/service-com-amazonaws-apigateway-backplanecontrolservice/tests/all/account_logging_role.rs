@@ -132,6 +132,36 @@ pub(crate) async fn replace_role(
         .await
 }
 
+/// The IAM path AWS's managed push-to-CloudWatch-Logs service role is held under, which is
+/// where an operator creates the account's CloudWatch role.
+pub(crate) const SERVICE_ROLE_PATH: &str = "/service-role/";
+
+/// Install the account's CloudWatch role: create the role `name` under [`SERVICE_ROLE_PATH`]
+/// with a trust policy admitting API Gateway, then store its ARN as the account's
+/// `cloudwatchRoleArn`. Answers the ARN installed.
+///
+/// API Gateway writes a stage's access and execution logs AS this role, so installing it is the
+/// prerequisite of every suite that asserts a delivered record. `pub(crate)` so that
+/// prerequisite is stood up in ONE place beside the calls it is made of rather than once per
+/// suite.
+pub(crate) async fn install_cloudwatch_role(gateway: &Gateway, name: &str) -> String {
+    create_role(
+        gateway,
+        name,
+        SERVICE_ROLE_PATH,
+        &trusting("apigateway.amazonaws.com"),
+    )
+    .await;
+    let arn = role_arn(SERVICE_ROLE_PATH, name);
+    let installed = replace_role(gateway, &arn).await;
+    assert_eq!(
+        installed.status, 200,
+        "setup UpdateAccount {ROLE_POINTER} = {arn:?}: expected 200, got {} with {:?}",
+        installed.status, installed.body
+    );
+    arn
+}
+
 /// The `cloudwatchRoleArn` `GetAccount` reports, or `None` when it reports none.
 pub(crate) async fn reported_role(gateway: &Gateway) -> Option<String> {
     let answer = gateway.call("GET", "/account", None).await;

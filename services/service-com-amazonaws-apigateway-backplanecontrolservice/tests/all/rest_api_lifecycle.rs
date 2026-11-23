@@ -199,6 +199,23 @@ pub(crate) fn gateway_with_dynamodb_and_iam() -> Gateway {
     gateway
 }
 
+/// One emulator with this service, Amazon DynamoDB, AWS IAM AND Amazon CloudWatch Logs
+/// mounted on ONE shared engine.
+///
+/// What a deployed stage LOGS about a request it served through an `AWS` integration spans all
+/// four: the table service answers the call the integration makes, IAM holds both the role the
+/// call is made under and the account's CloudWatch role, and the stage's execution log lands in
+/// CloudWatch Logs' own store. Built on [`gateway_with_dynamodb_and_iam`], so there is still one
+/// place each of those services is mounted.
+pub(crate) fn gateway_with_dynamodb_iam_and_logs() -> Gateway {
+    let mut gateway = gateway_with_dynamodb_and_iam();
+    let engine = Arc::clone(&gateway.engine);
+    gateway.router.register_service(
+        service_com_amazonaws_cloudwatchlogs_logs_20140328::EmulatedService::new(engine),
+    );
+    gateway
+}
+
 /// One emulator with this service, Amazon SNS, Amazon SQS and IAM mounted on ONE shared
 /// engine.
 ///

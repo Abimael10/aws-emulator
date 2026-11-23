@@ -1000,8 +1000,26 @@ pub(crate) async fn trace_of(
         .collect()
 }
 
+/// How many records of `trace` open with `prefix`, which is what a payload line is counted by:
+/// one line per transformation point the request crossed, and none where the settings in force
+/// wrote none.
+///
+/// `pub(crate)` for the reason [`emulator`] gives: every sibling suite that judges which payload
+/// lines a request left counts them the same way
+/// ([`crate::stage_execution_log_service_integration_levels`]).
+pub(crate) fn records_opening_with(trace: &[String], prefix: &str) -> usize {
+    trace
+        .iter()
+        .filter(|record| record.starts_with(prefix))
+        .count()
+}
+
 /// The text the one record of `trace` opening with `prefix` carries after it.
-fn traced_payload(trace: &[String], case: &str, prefix: &str) -> String {
+///
+/// `pub(crate)` for the reason [`emulator`] gives: a sibling suite reads the payload a traced
+/// line carries the same way
+/// ([`crate::stage_execution_log_service_integration_levels`]).
+pub(crate) fn traced_payload(trace: &[String], case: &str, prefix: &str) -> String {
     let opening: Vec<&String> = trace
         .iter()
         .filter(|record| record.starts_with(prefix))
@@ -1050,10 +1068,7 @@ async fn a_data_trace_carries_the_payloads_of_every_transformation_point() {
 
         for prefix in PAYLOAD_PREFIXES {
             let prefix = traced_line(&request_id, prefix);
-            let found = trace
-                .iter()
-                .filter(|record| record.starts_with(&prefix))
-                .count();
+            let found = records_opening_with(&trace, &prefix);
             assert_eq!(
                 found,
                 usize::from(data_trace),
