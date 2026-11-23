@@ -8,7 +8,10 @@
 //! domain holds is untouched. A value the profile does not carry under that key names no
 //! association to remove, so the whole request is refused with
 //! `ResourceNotFoundException` (404) and NOTHING is written — the same refusal an unknown
-//! domain or profile gets, each with its own wording.
+//! domain or profile gets, each with its own wording. A completed removal is also one
+//! action in the profile's history: it appends exactly one `DELETED_PROFILE_KEY` record
+//! describing an action on the profile itself, beside the `ADDED_PROFILE_KEY` records of
+//! the associations, and a refused one appends none.
 //!
 //! Each test asserts that over a SET of inputs — key names and values of different
 //! shapes, counts, forms and sizes — rather than for one recorded request. Every case
@@ -568,6 +571,362 @@ async fn a_key_value_the_profiles_own_attributes_populate_outlives_the_associati
             found.contains(&both),
             "case {case:?}: expected {both} still to be found by its own member's pair, \
              got {found:?}"
+        );
+    }
+}
+
+/// Every history record of one profile, oldest action first, narrowed by the filters the
+/// request carries — one page large enough for every action these tests take
+/// (`MaxResults` is `@range(1..100)`).
+async fn history(
+    emulator: &Emulator,
+    case: &str,
+    domain: &str,
+    profile_id: &str,
+    filters: Value,
+) -> Vec<Value> {
+    let mut body = json!({ "ProfileId": profile_id });
+    for (member, value) in filters.as_object().expect("the filters are an object") {
+        body[member] = value.clone();
+    }
+    let (status, response) = emulator
+        .post(
+            &format!("/domains/{domain}/profiles/history-records?max-results=100"),
+            body,
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected ListProfileHistoryRecords 200 for {filters:?}, got \
+         {status} {response:?}"
+    );
+    response
+        .get("ProfileHistoryRecords")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_else(|| panic!("case {case:?}: no ProfileHistoryRecords in {response:?}"))
+}
+
+/// One string member of a record, or the empty string where it carries none.
+fn member(record: &Value, name: &str) -> String {
+    record
+        .get(name)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The `ActionType`s of a listing, in the order it reported them.
+fn action_types(records: &[Value]) -> Vec<String> {
+    records
+        .iter()
+        .map(|record| member(record, "ActionType"))
+        .collect()
+}
+
+/// The `ObjectTypeName` a record about the PROFILE itself carries: the standard profile
+/// model this service names a profile's own data by, the one an `ObjectTypeField$Target`
+/// such as `_profile.Address.PostalCode` is rooted at.
+const STANDARD_PROFILE: &str = "_profile";
+
+/// The principal a record performed by a caller's request reports: the one identity this
+/// emulator's credential speaks for.
+fn caller_principal() -> String {
+    ::service_common::caller_principal::ambient_user_arn()
+}
+
+/// One step of a key-history case: an association, a removal that succeeds, or a removal
+/// the profile cannot make.
+enum Step {
+    Add(&'static str, Vec<&'static str>),
+    Delete(&'static str, Vec<&'static str>),
+    RefusedDelete(&'static str, Vec<&'static str>),
+}
+
+/// One key-history case: the steps taken on a fresh profile, and the whole history they
+/// leave, oldest first.
+struct KeyHistory {
+    case: &'static str,
+    steps: Vec<Step>,
+    expected: Vec<&'static str>,
+}
+
+/// The shapes a profile's key history can take. The rows differ along what the rule
+/// generalises over: how many values one call names, how many calls the values are spread
+/// over, how many distinct keys are involved, whether a removal is asked for in another
+/// form of the value it was associated in, whether the same pair is associated again after
+/// a removal, and whether a step was refused.
+fn key_histories() -> Vec<KeyHistory> {
+    vec![
+        KeyHistory {
+            case: "one association and its removal",
+            steps: vec![
+                Step::Add("_ctrContactId", vec!["ctr-1"]),
+                Step::Delete("_ctrContactId", vec!["ctr-1"]),
+            ],
+            expected: vec!["CREATED", "ADDED_PROFILE_KEY", "DELETED_PROFILE_KEY"],
+        },
+        KeyHistory {
+            case: "three values associated at once, removed one call at a time",
+            steps: vec![
+                Step::Add("_orderId", vec!["o-1", "o-2", "o-3"]),
+                Step::Delete("_orderId", vec!["o-1"]),
+                Step::Delete("_orderId", vec!["o-2"]),
+                Step::Delete("_orderId", vec!["o-3"]),
+            ],
+            expected: vec![
+                "CREATED",
+                "ADDED_PROFILE_KEY",
+                "DELETED_PROFILE_KEY",
+                "DELETED_PROFILE_KEY",
+                "DELETED_PROFILE_KEY",
+            ],
+        },
+        KeyHistory {
+            case: "values associated one call at a time, removed in one call",
+            steps: vec![
+                Step::Add("_orderId", vec!["p-1"]),
+                Step::Add("_orderId", vec!["p-2"]),
+                Step::Delete("_orderId", vec!["p-1", "p-2"]),
+            ],
+            expected: vec![
+                "CREATED",
+                "ADDED_PROFILE_KEY",
+                "ADDED_PROFILE_KEY",
+                "DELETED_PROFILE_KEY",
+            ],
+        },
+        KeyHistory {
+            case: "two different keys, each associated and removed in turn",
+            steps: vec![
+                Step::Add("LoyaltyId", vec!["L-1"]),
+                Step::Delete("LoyaltyId", vec!["L-1"]),
+                Step::Add("_zendeskTicketId", vec!["7"]),
+                Step::Delete("_zendeskTicketId", vec!["7"]),
+            ],
+            expected: vec![
+                "CREATED",
+                "ADDED_PROFILE_KEY",
+                "DELETED_PROFILE_KEY",
+                "ADDED_PROFILE_KEY",
+                "DELETED_PROFILE_KEY",
+            ],
+        },
+        KeyHistory {
+            case: "a value removed in another casing than it was associated in",
+            steps: vec![
+                Step::Add("_fullName", vec!["Ada Lovelace"]),
+                Step::Delete("_fullName", vec!["ADA LOVELACE"]),
+            ],
+            expected: vec!["CREATED", "ADDED_PROFILE_KEY", "DELETED_PROFILE_KEY"],
+        },
+        KeyHistory {
+            case: "the same pair associated again after its removal, then removed again",
+            steps: vec![
+                Step::Add("k", vec!["v"]),
+                Step::Delete("k", vec!["v"]),
+                Step::Add("k", vec!["v"]),
+                Step::Delete("k", vec!["v"]),
+            ],
+            expected: vec![
+                "CREATED",
+                "ADDED_PROFILE_KEY",
+                "DELETED_PROFILE_KEY",
+                "ADDED_PROFILE_KEY",
+                "DELETED_PROFILE_KEY",
+            ],
+        },
+        KeyHistory {
+            case: "a refused removal between two that succeed",
+            steps: vec![
+                Step::Add("crm-system_7", vec!["c-1", "c-2"]),
+                Step::Delete("crm-system_7", vec!["c-1"]),
+                Step::RefusedDelete("crm-system_7", vec!["c-never"]),
+                Step::RefusedDelete("crm-system_7", vec![]),
+                Step::Delete("crm-system_7", vec!["c-2"]),
+            ],
+            expected: vec![
+                "CREATED",
+                "ADDED_PROFILE_KEY",
+                "DELETED_PROFILE_KEY",
+                "DELETED_PROFILE_KEY",
+            ],
+        },
+    ]
+}
+
+/// A completed removal appends exactly ONE `DELETED_PROFILE_KEY` record to the profile's
+/// history, whatever the number of values it removed, in the order the actions happened
+/// and beside the `ADDED_PROFILE_KEY` records of the associations — and a refused removal
+/// appends none.
+#[tokio::test]
+async fn every_completed_removal_appends_one_history_record_in_order() {
+    let emulator = Emulator::new();
+    emulator.create_domain("keyhistdom", 30).await;
+
+    for row in key_histories() {
+        let KeyHistory { case, steps, expected } = row;
+        // One profile per case, carrying no standard member that would populate a
+        // predefined key of its own: what the case is about is the keys associated with it.
+        let profile_id = emulator
+            .create_profile("keyhistdom", json!({ "Attributes": { "case": case } }))
+            .await;
+
+        for step in &steps {
+            match step {
+                Step::Add(key_name, values) => {
+                    associate(&emulator, case, "keyhistdom", &profile_id, key_name, values).await;
+                }
+                Step::Delete(key_name, values) => {
+                    let (status, body) =
+                        delete_key(&emulator, "keyhistdom", &profile_id, key_name, values).await;
+                    assert_eq!(
+                        status, 200,
+                        "case {case:?}: expected DeleteProfileKey 200 for {key_name:?}={values:?}, \
+                         got {status} {body:?}"
+                    );
+                }
+                Step::RefusedDelete(key_name, values) => {
+                    let (status, body) =
+                        delete_key(&emulator, "keyhistdom", &profile_id, key_name, values).await;
+                    assert_key_not_found(case, status, &body);
+                }
+            }
+        }
+
+        let listed = history(&emulator, case, "keyhistdom", &profile_id, json!({})).await;
+        assert_eq!(
+            action_types(&listed),
+            expected
+                .iter()
+                .map(|action| (*action).to_string())
+                .collect::<Vec<String>>(),
+            "case {case:?}: expected the history {expected:?}, got {:?} from {listed:?}",
+            action_types(&listed)
+        );
+    }
+}
+
+/// Each `DELETED_PROFILE_KEY` record describes an action on the PROFILE itself: it names
+/// the standard profile model, names no profile object, reports the principal whose
+/// request performed it, carries an `Id` of the modelled shape, and — being a log entry
+/// nothing updates afterwards — reports no `LastUpdatedAt`. Each filter the listing
+/// carries selects it by one of those members.
+#[tokio::test]
+async fn a_removal_record_describes_an_action_on_the_profile_itself() {
+    let emulator = Emulator::new();
+    emulator.create_domain("keyrecdom", 30).await;
+    let profile_id = emulator
+        .create_profile("keyrecdom", json!({ "Attributes": { "who": "subject" } }))
+        .await;
+
+    // Removals of different shapes, so what is asserted below holds for every record
+    // rather than for one: several keys, one value and several at once.
+    for (case, key_name, added, deleted) in [
+        ("one value of a predefined key", "_ctrContactId", vec!["r-1"], vec!["r-1"]),
+        (
+            "two values of a caller's own key at once",
+            "LoyaltyId",
+            vec!["L-1", "L-2"],
+            vec!["L-1", "L-2"],
+        ),
+        (
+            "one value of several under one key",
+            "_orderId",
+            vec!["q-1", "q-2"],
+            vec!["q-2"],
+        ),
+    ] {
+        associate(&emulator, case, "keyrecdom", &profile_id, key_name, &added).await;
+        let (status, body) =
+            delete_key(&emulator, "keyrecdom", &profile_id, key_name, &deleted).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected DeleteProfileKey 200, got {status} {body:?}"
+        );
+    }
+
+    let removals = history(
+        &emulator,
+        "the removal records",
+        "keyrecdom",
+        &profile_id,
+        json!({ "ActionType": "DELETED_PROFILE_KEY" }),
+    )
+    .await;
+    assert_eq!(
+        removals.len(),
+        3,
+        "expected one record per completed removal, got {removals:?}"
+    );
+
+    let mut ids = std::collections::BTreeSet::new();
+    for record in &removals {
+        assert_eq!(
+            member(record, "ObjectTypeName"),
+            STANDARD_PROFILE,
+            "expected the standard profile model as the object type, got {record:?}"
+        );
+        assert!(
+            record.get("ProfileObjectUniqueKey").is_none(),
+            "an action on the profile itself names no profile object, got {record:?}"
+        );
+        assert_eq!(
+            member(record, "PerformedBy"),
+            caller_principal(),
+            "expected the calling principal in PerformedBy, got {record:?}"
+        );
+        let id = member(record, "Id");
+        assert!(
+            id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "expected an Id matching ^[a-f0-9]{{32}}$, got {id:?}"
+        );
+        assert!(
+            ids.insert(id.clone()),
+            "expected every record to carry its own Id, got {id:?} twice"
+        );
+        assert!(
+            record.get("CreatedAt").is_some(),
+            "CreatedAt is required, got {record:?}"
+        );
+        assert!(
+            record.get("LastUpdatedAt").is_none(),
+            "nothing updates a record after the action it describes, got {record:?}"
+        );
+    }
+
+    // Each filter selects the removal records by one of the members asserted above, and a
+    // value no removal record carries selects none of them.
+    for (case, filters, expected) in [
+        (
+            "the object type of the standard profile",
+            json!({ "ActionType": "DELETED_PROFILE_KEY", "ObjectTypeName": STANDARD_PROFILE }),
+            3usize,
+        ),
+        (
+            "the calling principal",
+            json!({ "ActionType": "DELETED_PROFILE_KEY", "PerformedBy": caller_principal() }),
+            3,
+        ),
+        (
+            "an object type no removal is about",
+            json!({ "ActionType": "DELETED_PROFILE_KEY", "ObjectTypeName": "Contact_Record" }),
+            0,
+        ),
+        (
+            "another principal",
+            json!({
+                "ActionType": "DELETED_PROFILE_KEY",
+                "PerformedBy": "arn:aws:iam::000000000000:user/someone-else",
+            }),
+            0,
+        ),
+    ] {
+        let listed = history(&emulator, case, "keyrecdom", &profile_id, filters.clone()).await;
+        assert_eq!(
+            listed.len(),
+            expected,
+            "case {case:?}: expected {expected} record(s) for {filters:?}, got {listed:?}"
         );
     }
 }
