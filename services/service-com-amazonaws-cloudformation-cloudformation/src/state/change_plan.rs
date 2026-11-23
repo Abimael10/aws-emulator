@@ -126,7 +126,12 @@ mod update_replace_policy {
 }
 
 /// The `ResourceAttribute` a property-level change targets.
-const PROPERTIES_ATTRIBUTE: &str = "Properties";
+///
+/// `pub(in crate::state)` because the refusal that reads whether an update MOVES a resource's
+/// identity picks the property-level details out of a change by it
+/// ([`super::custom_named_replacement`]): one spelling of the attribute, so the detail a
+/// comparison writes and the detail that refusal looks for cannot drift apart.
+pub(in crate::state) const PROPERTIES_ATTRIBUTE: &str = "Properties";
 
 /// One property-level change behind a `Modify`, as the modelled `ResourceChangeDetail`
 /// carries it.

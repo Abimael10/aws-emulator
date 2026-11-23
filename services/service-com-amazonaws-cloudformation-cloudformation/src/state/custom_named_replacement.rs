@@ -30,7 +30,13 @@
 //! * an update that states a DIFFERENT name, which is the rename the refusal asks for — or
 //!   that states the same name under a DIFFERENT PARENT, for a type whose name identifies a
 //!   resource only within one ([`super::template::name_scope`]): nothing holds that name
-//!   there, so the replacement can be created under it;
+//!   there, so the replacement can be created under it. That covers the name or the parent
+//!   a declaration reads off ANOTHER RESOURCE of the stack that this same update RECREATES:
+//!   the comparison resolves such a reference against the resource the stack holds right now,
+//!   on both of its sides, so the two evaluated declarations read alike while the deployment
+//!   will create the replacement under the identifier that resource's own replacement really
+//!   gets — and the plan reports that as a change to the very property the identity is read
+//!   from ([`identity_moves`]);
 //! * a resource whose identity its OWNING SERVICE assigns
 //!   ([`template::identity_is_service_assigned`]), whose declared name is only what the
 //!   resource is called: that service mints the replacement an identifier of its own, and two
@@ -47,7 +53,7 @@
 //! quota that document is already held to
 //! ([`super::template::MAX_RESOURCES_PER_TEMPLATE`]).
 
-use super::change_plan::{replacement, StoredResourceChange};
+use super::change_plan::{change_source, replacement, StoredResourceChange, PROPERTIES_ATTRIBUTE};
 use super::provisioning::ResourceTransition;
 use super::{change_action, resource_status, template, DeployedResource};
 
@@ -129,15 +135,52 @@ pub fn refused_replacement(
     planned: &[StoredResourceChange],
     deployed: &[DeployedResource],
 ) -> Option<RefusedReplacement> {
+    let recreated = recreated_resources(planned);
     planned
         .iter()
-        .find_map(|change| refused_change(change, deployed))
+        .find_map(|change| refused_change(change, deployed, &recreated))
+}
+
+/// The logical ids this plan gives a NEW physical resource: the resources it RECREATES, and
+/// the ones it deletes and creates again under a changed type — which a plan reports as the
+/// `Remove` of the old resource beside the `Add` of the new one.
+///
+/// The same reading the comparison itself makes of its own plan
+/// ([`super::change_plan::computed_changes`] collects exactly these before it reports the
+/// references to them), because that is what a reference to one of them resolving differently
+/// afterwards follows from. A `Conditional` replacement counts: the value deciding it is one
+/// this service could not evaluate, so the resource MAY be recreated — and a replacement whose
+/// identity might move is not one CloudFormation is known to be unable to perform.
+fn recreated_resources(planned: &[StoredResourceChange]) -> ::std::collections::BTreeSet<&str> {
+    let mut recreated = ::std::collections::BTreeSet::new();
+    for change in planned {
+        let recreates = match change.action.as_str() {
+            change_action::MODIFY => change
+                .replacement
+                .as_deref()
+                .is_some_and(|planned| planned != replacement::FALSE),
+            change_action::ADD => planned.iter().any(|other| {
+                other.action == change_action::REMOVE
+                    && other.logical_resource_id == change.logical_resource_id
+            }),
+            _ => false,
+        };
+        if recreates {
+            recreated.insert(change.logical_resource_id.as_str());
+        }
+    }
+    recreated
 }
 
 /// Whether this one planned change is a replacement CloudFormation cannot perform.
+///
+/// `recreated` is the set of resources this plan gives a new physical resource
+/// ([`recreated_resources`]), which is what says whether a reference inside this declaration
+/// will resolve to something else once the update runs.
 fn refused_change(
     change: &StoredResourceChange,
     deployed: &[DeployedResource],
+    recreated: &::std::collections::BTreeSet<&str>,
 ) -> Option<RefusedReplacement> {
     if change.action != change_action::MODIFY {
         return None;
@@ -185,10 +228,260 @@ fn refused_change(
     {
         return None;
     }
+    // ...and under an identity no change THIS UPDATE makes moves. A comparison resolves a
+    // reference to another resource of the stack against the resource that stack HOLDS, on
+    // both of its sides, because the identifier a recreated resource will carry does not exist
+    // yet ([`super::change_plan::computed_changes`]) — so a name, or a parent, that a
+    // declaration reads off a resource this update RECREATES reads above as the value in
+    // force, while the deployment creates the replacement under the identifier that resource's
+    // own replacement will really have. The plan reports that as a change to this very
+    // property ([`identity_moves`]), and such a replacement has an identity of its own, so
+    // nothing is refused.
+    if identity_moves(change, &property, recreated) {
+        return None;
+    }
     Some(RefusedReplacement {
         logical_id: change.logical_resource_id.clone(),
         resource_type: change.resource_type.clone(),
         physical_resource_id: change.physical_resource_id.clone(),
         name: declared_name.to_string(),
     })
+}
+
+/// Whether the plan reports that this change gives the resource a DIFFERENT identity: one of
+/// the property-level details behind it targets the property the resource is named by, or one
+/// of the properties that SCOPE that name ([`template::name_scope_properties`]), and reports
+/// the value as one a reference to ANOTHER RESOURCE of the stack drives.
+///
+/// Those are the details a comparison records for a property whose value will change because
+/// the resource it reads is itself RECREATED — "if the resource is recreated, it will have a
+/// new physical ID, so all references to that resource will also be updated" — which is the
+/// one change to an identity that comparing the two evaluated declarations cannot show: both
+/// sides are resolved against the resource the stack holds right now, so the property reads
+/// the same on both.
+///
+/// So the resource the detail names as the entity that caused it has to be one this plan
+/// recreates (`recreated`, from [`recreated_resources`]; the detail's causing entity is a
+/// logical id, or an attribute path whose first segment is one). A detail naming any other
+/// resource is a property whose declaration merely READS differently while resolving to the
+/// value the comparison above already compared — the identity stands still, and the
+/// replacement is refused.
+///
+/// `name_property` is the property this declaration is named by.
+fn identity_moves(
+    change: &StoredResourceChange,
+    name_property: &str,
+    recreated: &::std::collections::BTreeSet<&str>,
+) -> bool {
+    let scoping = template::name_scope_properties(&change.resource_type);
+    change.details.iter().any(|detail| {
+        let names_the_identity = detail
+            .name
+            .as_deref()
+            .is_some_and(|name| name == name_property || scoping.contains(&name));
+        let reads_a_recreated_resource = matches!(
+            detail.change_source.as_deref(),
+            Some(change_source::RESOURCE_REFERENCE) | Some(change_source::RESOURCE_ATTRIBUTE)
+        ) && detail.causing_entity.as_deref().is_some_and(|entity| {
+            recreated.contains(template::resource_of(entity))
+        });
+        detail.attribute == PROPERTIES_ATTRIBUTE && names_the_identity && reads_a_recreated_resource
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::change_plan::{evaluation, requires_recreation, StoredChangeDetail};
+
+    /// One property-level detail of a plan, as a comparison records it: `causing_entity` is the
+    /// entity the comparison attributes the change to — a logical id for a `Ref`, an
+    /// `<id>.<attribute>` path for an `Fn::GetAtt`.
+    fn detail(property: &str, change_source: Option<&str>, causing_entity: &str) -> StoredChangeDetail {
+        StoredChangeDetail {
+            attribute: PROPERTIES_ATTRIBUTE.to_string(),
+            name: Some(property.to_string()),
+            requires_recreation: requires_recreation::ALWAYS.to_string(),
+            evaluation: evaluation::STATIC.to_string(),
+            change_source: change_source.map(ToString::to_string),
+            causing_entity: Some(causing_entity.to_string()),
+            drifted: None,
+            values: None,
+        }
+    }
+
+    /// One planned `Modify` carrying those details.
+    fn modification(resource_type: &str, details: Vec<StoredChangeDetail>) -> StoredResourceChange {
+        StoredResourceChange {
+            action: change_action::MODIFY.to_string(),
+            logical_resource_id: "Child".to_string(),
+            resource_type: resource_type.to_string(),
+            physical_resource_id: Some("a-child".to_string()),
+            scope: vec![PROPERTIES_ATTRIBUTE.to_string()],
+            replacement: Some(replacement::TRUE.to_string()),
+            details,
+            policy_action: None,
+            resource_drift_status: None,
+            nested_change_set_id: None,
+            before_context: None,
+            after_context: None,
+        }
+    }
+
+    /// Which planned changes MOVE the identity a replacement would be created under, and which
+    /// say nothing about it.
+    ///
+    /// The rows span what the rule generalises over: which half of the identity the detail
+    /// targets (the resource's own name property, the property that SCOPES that name), which
+    /// form of reference drives it (a `Ref`, an `Fn::GetAtt` path), a detail on a property that
+    /// is no part of the identity, a detail the template's own text caused rather than a
+    /// reference, a detail naming a resource this plan does NOT recreate, and a change with no
+    /// property-level detail at all.
+    #[test]
+    fn only_a_reference_to_a_recreated_resource_moves_the_identity() {
+        struct Row {
+            case: &'static str,
+            resource_type: &'static str,
+            name_property: &'static str,
+            details: Vec<StoredChangeDetail>,
+            expected: bool,
+        }
+        let stream = crate::state::provisioning::logs_resources::LOGS_LOG_STREAM;
+        // The one resource the plan of these rows recreates.
+        let recreated: ::std::collections::BTreeSet<&str> = ["Group"].into_iter().collect();
+        let rows = vec![
+            Row {
+                case: "the parent the name is scoped by, read through a Ref",
+                resource_type: stream,
+                name_property: "LogStreamName",
+                details: vec![detail(
+                    "LogGroupName",
+                    Some(change_source::RESOURCE_REFERENCE),
+                    "Group",
+                )],
+                expected: true,
+            },
+            Row {
+                case: "that same parent read through an Fn::GetAtt",
+                resource_type: stream,
+                name_property: "LogStreamName",
+                details: vec![detail(
+                    "LogGroupName",
+                    Some(change_source::RESOURCE_ATTRIBUTE),
+                    "Group.Arn",
+                )],
+                expected: true,
+            },
+            Row {
+                case: "the resource's own name, composed out of a reference",
+                resource_type: stream,
+                name_property: "LogStreamName",
+                details: vec![detail(
+                    "LogStreamName",
+                    Some(change_source::RESOURCE_REFERENCE),
+                    "Group",
+                )],
+                expected: true,
+            },
+            Row {
+                case: "a property that is no part of the identity",
+                resource_type: crate::state::provisioning::logs_resources::LOGS_METRIC_FILTER,
+                name_property: "FilterName",
+                details: vec![detail(
+                    "FilterPattern",
+                    Some(change_source::RESOURCE_REFERENCE),
+                    "Group",
+                )],
+                expected: false,
+            },
+            Row {
+                case: "the identity restated by the template itself",
+                resource_type: stream,
+                name_property: "LogStreamName",
+                details: vec![detail(
+                    "LogStreamName",
+                    Some(change_source::DIRECT_MODIFICATION),
+                    "Group",
+                )],
+                expected: false,
+            },
+            Row {
+                case: "the identity reading a resource this plan does not recreate",
+                resource_type: stream,
+                name_property: "LogStreamName",
+                details: vec![detail(
+                    "LogGroupName",
+                    Some(change_source::RESOURCE_REFERENCE),
+                    "AnotherGroup",
+                )],
+                expected: false,
+            },
+            Row {
+                case: "a change with no property-level detail",
+                resource_type: stream,
+                name_property: "LogStreamName",
+                details: Vec::new(),
+                expected: false,
+            },
+        ];
+        for row in rows {
+            let case = row.case;
+            let change = modification(row.resource_type, row.details);
+            let moved = identity_moves(&change, row.name_property, &recreated);
+            assert_eq!(
+                moved, row.expected,
+                "case {case:?}: expected the identity to move: {}, got {moved}",
+                row.expected
+            );
+        }
+    }
+
+    /// Which logical ids a plan gives a NEW physical resource ([`recreated_resources`]): a
+    /// change that recreates the resource, a `Conditional` one that may, and a resource
+    /// re-typed into a `Remove` beside an `Add` — against a change that leaves the physical
+    /// resource where it is, and an `Add` of a resource nothing removes.
+    #[test]
+    fn the_recreated_resources_are_the_ones_given_a_new_physical_resource() {
+        let planned = vec![
+            StoredResourceChange {
+                logical_resource_id: "Replaced".to_string(),
+                ..modification("AWS::Logs::LogGroup", Vec::new())
+            },
+            StoredResourceChange {
+                logical_resource_id: "MayBeReplaced".to_string(),
+                replacement: Some(replacement::CONDITIONAL.to_string()),
+                ..modification("AWS::Logs::LogGroup", Vec::new())
+            },
+            StoredResourceChange {
+                logical_resource_id: "Changed".to_string(),
+                replacement: Some(replacement::FALSE.to_string()),
+                ..modification("AWS::Logs::LogGroup", Vec::new())
+            },
+            StoredResourceChange {
+                logical_resource_id: "Retyped".to_string(),
+                action: change_action::REMOVE.to_string(),
+                replacement: None,
+                ..modification("AWS::Logs::LogGroup", Vec::new())
+            },
+            StoredResourceChange {
+                logical_resource_id: "Retyped".to_string(),
+                action: change_action::ADD.to_string(),
+                replacement: None,
+                ..modification("AWS::Logs::LogStream", Vec::new())
+            },
+            StoredResourceChange {
+                logical_resource_id: "Added".to_string(),
+                action: change_action::ADD.to_string(),
+                replacement: None,
+                ..modification("AWS::Logs::LogStream", Vec::new())
+            },
+        ];
+        let recreated = recreated_resources(&planned);
+        let expected: ::std::collections::BTreeSet<&str> =
+            ["Replaced", "MayBeReplaced", "Retyped"].into_iter().collect();
+        assert_eq!(
+            recreated, expected,
+            "expected the recreated resources {expected:?}, got {recreated:?}"
+        );
+    }
 }

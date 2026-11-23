@@ -25,8 +25,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::stack_lifecycle::{
-    call, create_stack, describe_stack, member, router, wait_for_the_transition, xml_blocks,
-    xml_text, ACCOUNT_ID, REGION,
+    call, create_stack, describe_stack, member, router, settled_stack, wait_for_the_transition,
+    xml_blocks, xml_text, ACCOUNT_ID, REGION,
 };
 
 /// The awsJson version Amazon CloudWatch Logs's model declares (`awsJson1_1`), and the
@@ -946,9 +946,11 @@ async fn a_moved_custom_named_filter_is_created_on_the_group_now_declared() {
 /// The template of the rename case: a named group with one stream in it, the group's ARN and
 /// the stream's own name as outputs.
 ///
-/// The STREAM's name is left to CloudFormation, which is what makes the rename performable:
-/// renaming the group replaces the stream too, and the replacement is created under a name of
-/// its own (`renaming_a_group_with_a_custom_named_stream_is_refused` below is the other side).
+/// The STREAM's name is left to CloudFormation here
+/// (`renaming_a_group_with_a_custom_named_stream_replaces_it_in_the_new_group` is the same
+/// rename with the stream NAMED): renaming the group replaces the stream too, and either way
+/// the replacement is created inside the group now declared, which holds no stream of that
+/// name.
 fn rename_template(group: &str) -> String {
     json!({
         "Resources": {
@@ -970,8 +972,9 @@ fn rename_template(group: &str) -> String {
     .to_string()
 }
 
-/// The same template with the stream NAMED, which is what makes the same rename
-/// unperformable.
+/// The same template with the stream NAMED, which is the other form of the same rename: the
+/// stream's name identifies it only INSIDE its log group, so the replacement is created under
+/// that name in the group now declared.
 fn named_stream_rename_template(group: &str, stream: &str) -> String {
     let mut template: Value =
         serde_json::from_str(&rename_template(group)).expect("the rename template is JSON");
@@ -1150,12 +1153,13 @@ async fn renaming_a_declared_log_group_replaces_the_group_and_its_stream() {
     );
 }
 
-/// RULE (the other side of the rename above): a stream the template NAMES cannot be carried
-/// into a renamed group, because the replacement that rename requires of the stream would have
-/// to be created under the name the stream already holds — so the update is refused, the stack
-/// rolls back, and the group, the stream and the events in it are left exactly as they were.
+/// RULE (the same rename with the stream NAMED): a stream's name identifies it only INSIDE
+/// the log group that holds it, so the replacement the rename requires of the stream is
+/// created under that same name in the group now declared — nothing holds the name there. The
+/// update completes, the replaced group is gone with the events that were in it, and the
+/// renamed group holds the re-created stream.
 #[tokio::test]
-async fn renaming_a_group_with_a_custom_named_stream_is_refused() {
+async fn renaming_a_group_with_a_custom_named_stream_replaces_it_in_the_new_group() {
     let router = router();
     let stack = "logs-group-rename-named-stream";
     let (old_group, new_group) = ("named-rename-before", "named-rename-after");
@@ -1172,8 +1176,7 @@ async fn renaming_a_group_with_a_custom_named_stream_is_refused() {
         status, 200,
         "case {case:?}: expected HTTP 200 from CreateStack, got {status} with {body}"
     );
-    wait_for_the_transition().await;
-    let (_, body) = describe_stack(&router, stack).await;
+    let body = settled_stack(&router, case, stack).await;
     assert_eq!(
         xml_text(&body, "StackStatus").as_deref(),
         Some("CREATE_COMPLETE"),
@@ -1187,7 +1190,7 @@ async fn renaming_a_group_with_a_custom_named_stream_is_refused() {
         &json!({
             "logGroupName": old_group,
             "logStreamName": stream,
-            "logEvents": [{"timestamp": now_ms(), "message": "before the refused rename"}]
+            "logEvents": [{"timestamp": now_ms(), "message": "before the rename"}]
         }),
     )
     .await;
@@ -1196,7 +1199,7 @@ async fn renaming_a_group_with_a_custom_named_stream_is_refused() {
         "case {case:?}: expected the group to accept an event, got {status} with {document}"
     );
 
-    let case = "the revision that would rename the group under the named stream";
+    let case = "the revision that renames the group under the named stream";
     let (status, body) = call(
         &router,
         "UpdateStack",
@@ -1213,56 +1216,78 @@ async fn renaming_a_group_with_a_custom_named_stream_is_refused() {
         status, 200,
         "case {case:?}: expected HTTP 200 from UpdateStack, got {status} with {body}"
     );
-    wait_for_the_transition().await;
-    wait_for_the_transition().await;
-    let (_, body) = describe_stack(&router, stack).await;
+    let body = settled_stack(&router, case, stack).await;
     assert_eq!(
         xml_text(&body, "StackStatus").as_deref(),
-        Some("UPDATE_ROLLBACK_COMPLETE"),
-        "case {case:?}: expected the refused rename to roll the stack back, got {body} with \
-         the resource failures {:?}",
+        Some("UPDATE_COMPLETE"),
+        "case {case:?}: expected the rename to complete, got {body} with the resource \
+         failures {:?}",
         failure_reasons(&router, stack).await
     );
-    let reasons = failure_reasons(&router, stack).await;
-    let wanted = format!(
-        "CloudFormation cannot update a stack when a custom-named resource requires replacing. \
-         Rename {stream} and update the stack again."
+    assert_eq!(
+        output(&body, "GroupName").as_deref(),
+        Some(new_group),
+        "case {case:?}: expected the stack to publish the replacement group's name, got {body}"
     );
-    assert!(
-        reasons.contains(&wanted),
-        "case {case:?}: expected the refusal {wanted:?}, got {reasons:?}"
+    // The stream was replaced with the group it lives in, and the template names it, so the
+    // stack publishes that same name for the replacement.
+    assert_eq!(
+        output(&body, "StreamName").as_deref(),
+        Some(stream),
+        "case {case:?}: expected the stack to publish the named stream, got {body}"
     );
 
-    // Nothing was asked of CloudWatch Logs: the group the stack created is still there, with
-    // its stream and the event that was written to it, and the renamed group was never made.
+    // The group the create made is gone, and so are the events that were in it; the group now
+    // declared holds the re-created stream under the name the template states.
     assert!(
-        group_exists(&router, old_group).await,
-        "case {case:?}: expected the group the create made to be left alone"
+        !group_exists(&router, old_group).await,
+        "case {case:?}: expected the replaced group to have been deleted"
     );
     assert!(
-        !group_exists(&router, new_group).await,
-        "case {case:?}: expected the group the refused rename named never to be created"
+        group_exists(&router, new_group).await,
+        "case {case:?}: expected the group now declared to have been created"
     );
-    let held = stream_names(&router, old_group).await;
+    let held = stream_names(&router, new_group).await;
     assert_eq!(
         held,
         vec![stream.to_string()],
-        "case {case:?}: expected the group to still hold exactly its stream, got {held:?}"
+        "case {case:?}: expected the renamed group to hold exactly the re-created stream, got \
+         {held:?}"
     );
     let (status, document) = logs(
         &router,
         "GetLogEvents",
-        &json!({"logGroupName": old_group, "logStreamName": stream}),
+        &json!({"logGroupName": new_group, "logStreamName": stream}),
     )
     .await;
     assert_eq!(
         status, 200,
-        "case {case:?}: expected the stream to still be readable, got {status} with {document}"
+        "case {case:?}: expected the re-created stream to be readable, got {status} with \
+         {document}"
     );
     assert_eq!(
-        document["events"][0]["message"],
-        json!("before the refused rename"),
-        "case {case:?}: expected the stream to keep the event it took, got {document}"
+        document
+            .get("events")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0),
+        "case {case:?}: expected the re-created stream to carry none of the replaced group's \
+         events, got {document}"
+    );
+    let (status, document) = logs(
+        &router,
+        "PutLogEvents",
+        &json!({
+            "logGroupName": new_group,
+            "logStreamName": stream,
+            "logEvents": [{"timestamp": now_ms(), "message": "after the rename"}]
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected the renamed group to accept an event on the re-created \
+         stream, got {status} with {document}"
     );
 }
 
