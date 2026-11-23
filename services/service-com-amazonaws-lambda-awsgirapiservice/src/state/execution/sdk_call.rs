@@ -116,23 +116,34 @@ impl Input {
 
     /// An INTEGER member, as the model's own `integer` shape carries it: a value outside what
     /// that shape can hold stops the call rather than being sent truncated.
+    ///
+    /// Read from EITHER spelling an SDK takes such a member in: the number itself, and the
+    /// decimal text of it. A whole number an operation binds to its request's query string
+    /// travels as decimal text, which is why the SDKs model several of those members as text
+    /// and a handler passes `"1"` where another passes `1` — the two ask for the very same
+    /// call, so neither spelling stops it. What still stops the call is a value that is no
+    /// whole number this shape can hold, whichever spelling it arrived in: that one would have
+    /// to be sent as something other than what the handler asked for.
+    ///
+    /// Stated for every member this reader is asked for, deliberately: it is handed a member's
+    /// NAME and not its shape, so which members one SDK spells as text is not a fact available
+    /// here — and a value read from either spelling carries the same number into the same
+    /// call, so the one rule costs no fidelity on a member an SDK spells as a number.
     pub(super) fn integer(&self, name: &str) -> Result<Option<i32>, Refusal> {
-        match self.members.get(name) {
-            None | Some(Value::Null) => Ok(None),
-            Some(Value::Number(number)) => number
-                .as_i64()
-                .and_then(|held| i32::try_from(held).ok())
-                .map(Some)
-                .ok_or_else(|| {
-                    Refusal::NotMade(format!(
-                        "the call's {name} is not a whole number this operation can carry, got \
-                         {number}"
-                    ))
-                }),
-            Some(other) => Err(Refusal::NotMade(format!(
-                "the call's {name} must be a number, got {other}"
-            ))),
-        }
+        let carried = match self.members.get(name) {
+            None | Some(Value::Null) => return Ok(None),
+            Some(spelled @ (Value::Number(_) | Value::String(_))) => spelled,
+            Some(other) => {
+                return Err(Refusal::NotMade(format!(
+                    "the call's {name} must be a number, got {other}"
+                )))
+            }
+        };
+        whole_number(carried).map(Some).ok_or_else(|| {
+            Refusal::NotMade(format!(
+                "the call's {name} is not a whole number this operation can carry, got {carried}"
+            ))
+        })
     }
 
     /// A member whose shape is a LIST OF STRINGS, read as the values it holds; an empty list
@@ -279,6 +290,20 @@ impl Input {
             "the call carries no {name}, which this {} operation requires",
             self.service
         ))
+    }
+}
+
+/// The whole number `spelled` carries, in either spelling an SDK takes an `integer` member
+/// in: the number itself, or the decimal text of it.
+///
+/// `None` for a value that is no whole number an `integer` shape can hold — a fraction, a
+/// magnitude past the shape's range, or text that spells no number at all — which is what
+/// stops the call that would otherwise carry something else.
+fn whole_number(spelled: &Value) -> Option<i32> {
+    match spelled {
+        Value::Number(number) => number.as_i64().and_then(|held| i32::try_from(held).ok()),
+        Value::String(text) => text.parse().ok(),
+        _ => None,
     }
 }
 
@@ -704,6 +729,63 @@ mod tests {
                     answered.ok(),
                     Some(carried),
                     "case {case:?}: expected the call to carry {carried:?}"
+                ),
+                None => assert!(
+                    answered.is_err(),
+                    "case {case:?}: expected a call that was not made, got {:?}",
+                    answered.ok()
+                ),
+            }
+        }
+    }
+
+    /// RULE: an `integer` member is read in EITHER spelling an SDK takes it in — the number
+    /// itself, or the decimal text of it, which is how an SDK models a whole number an
+    /// operation binds to its request's query string — so the two spellings carry the same
+    /// value into the same call; a value that is no whole number the shape can hold stops the
+    /// call whichever spelling it arrived in. The rows differ along the spelling and along the
+    /// value: a number and the text of that number, a negative one both ways, the bounds of
+    /// the shape as text, text one past a bound, text spelling no number at all, and a
+    /// fraction.
+    #[test]
+    fn an_integer_member_is_read_in_either_spelling() {
+        let ceiling = i64::from(i32::MAX);
+        let floor = i64::from(i32::MIN);
+        // The document's own text for the member, and the value the call then carries —
+        // `None` for a call that is not made at all.
+        let rows: [(&str, String, Option<i32>); 10] = [
+            ("a number", "7".to_string(), Some(7)),
+            ("the decimal text of that number", "\"7\"".to_string(), Some(7)),
+            ("a negative number", "-3".to_string(), Some(-3)),
+            ("the decimal text of a negative number", "\"-3\"".to_string(), Some(-3)),
+            ("text spelling zero", "\"0\"".to_string(), Some(0)),
+            (
+                "text spelling the largest value the shape carries",
+                format!("\"{ceiling}\""),
+                Some(i32::MAX),
+            ),
+            (
+                "text spelling the smallest value the shape carries",
+                format!("\"{floor}\""),
+                Some(i32::MIN),
+            ),
+            (
+                "text spelling one past the largest",
+                format!("\"{}\"", ceiling + 1),
+                None,
+            ),
+            ("text spelling no number at all", "\"a few\"".to_string(), None),
+            ("a fraction", "1.5".to_string(), None),
+        ];
+        for (case, held, expected) in rows {
+            let input = Input::read(SERVICE, &format!(r#"{{"MaxItems":{held}}}"#))
+                .expect("the row's document is an object");
+            let answered = input.integer("MaxItems");
+            match expected {
+                Some(carried) => assert_eq!(
+                    answered.ok(),
+                    Some(Some(carried)),
+                    "case {case:?}: expected the call to carry {carried}"
                 ),
                 None => assert!(
                     answered.is_err(),
