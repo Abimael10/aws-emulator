@@ -155,7 +155,11 @@ async fn describe_user(emulator: &Emulator, case: &str, user_id: &str) -> Reply 
 
 /// Every engine version `DescribeCacheEngineVersions` publishes for `engine`,
 /// over the wire — the catalog a client resolves a floor against.
-async fn published_versions(emulator: &Emulator, engine: &str) -> Vec<String> {
+///
+/// `pub(crate)` because another suite of this crate resolves a floor against the
+/// same published catalog, and a second copy of this pager would be a second
+/// thing to keep correct.
+pub(crate) async fn published_versions(emulator: &Emulator, engine: &str) -> Vec<String> {
     let mut versions: Vec<String> = Vec::new();
     let mut marker: Option<String> = None;
     loop {
