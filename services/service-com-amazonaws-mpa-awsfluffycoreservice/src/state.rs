@@ -204,7 +204,11 @@
 //!
 //! * [`authorize_resource_arn`] — an operation that identifies its resource by ARN is
 //!   refused with `AccessDeniedException` (403) when that ARN is outside the caller's
-//!   own account, whatever is stored under it.
+//!   own account, whatever is stored under it. The decision is read off the ARN's own
+//!   account field, so it is made before anything about the resource that ARN names —
+//!   including whether its resource id is one this service could have minted — is read:
+//!   [`screen_identity_source_arn`] is that order for the member that ADDRESSES an
+//!   identity source.
 //! * [`ComAmazonawsMpaAwsfluffycoreserviceState::visible_session`] — an operation
 //!   addressed by a SESSION ARN is refused with `AccessDeniedException` (403) when that
 //!   ARN resolves to no session the caller can see, because this service does not
@@ -233,7 +237,8 @@
 //!   ([`is_malformed_arn_violation`]) for the members it does.
 //! * [`invalid_identity_source_arn`] / [`INVALID_IDENTITY_SOURCE_ARN_MESSAGE`] — the one
 //!   message the two operations ADDRESSED BY an identity source's ARN refuse a value that
-//!   addresses none with ([`addresses_identity_source`]); it names the member it rejected.
+//!   addresses none with ([`addresses_identity_source`], raised in the order
+//!   [`screen_identity_source_arn`] fixes); it names the member it rejected.
 //! * [`reserved_tag_key`] — the one message every path that WRITES tags refuses a key in
 //!   the [`RESERVED_TAG_KEY_PREFIX`] namespace with ([`names_reserved_tag_key`]), raised
 //!   through the one ordered tag-write gate [`tag_write_breach`] below, which is also
@@ -2470,11 +2475,65 @@ pub fn is_identity_source_id(id: &str) -> bool {
 /// The screen both operations that take an `IdentitySourceArn` in their URI label apply,
 /// so `GetIdentitySource` and `DeleteIdentitySource` cannot disagree about which values
 /// name an identity source at all. A value this answers `false` for is refused with
-/// [`invalid_identity_source_arn`] (400) before the account boundary and before any
-/// lookup.
+/// [`invalid_identity_source_arn`] (400) before any lookup — but the account boundary is
+/// decided in between: see [`screen_identity_source_arn`], which is the order both
+/// operations read the member in.
 #[must_use]
 pub fn addresses_identity_source(arn: &str) -> bool {
     is_identity_source_arn(arn) && arn_resource_id(arn).is_some_and(is_identity_source_id)
+}
+
+/// Why an operation ADDRESSED BY an identity source's ARN cannot act on the value it was
+/// given, as [`screen_identity_source_arn`] decides it. Each variant carries the modelled
+/// error of its class, so a handler maps it onto its own error channel and words nothing
+/// itself.
+#[derive(Debug)]
+pub enum IdentitySourceArnRefusal {
+    /// The value names no identity source of this service at all: `ValidationException`
+    /// (400), [`invalid_identity_source_arn`].
+    Invalid(ValidationException),
+    /// The value is an identity source's ARN in an account that is not the caller's:
+    /// `AccessDeniedException` (403), [`cross_account_access_denied`].
+    Denied(AccessDeniedException),
+}
+
+/// Whether an operation addressed by an identity source's ARN may act on `arn`, decided in
+/// the ONE order both such operations apply. `action` is the operation's name (`Self::NAME`
+/// in a handler), which an authorization refusal names as the IAM action
+/// `mpa:<action>`.
+///
+/// 1. The ARN GRAMMAR ([`is_identity_source_arn`]) — a value that is not an ARN of this
+///    service's identity-source kind identifies no resource at all, so no owner can be
+///    read out of it. This is the class the framework's constraint boundary refuses for a
+///    member that carries an ARN `@pattern`; this member carries none
+///    (`length(max: 1000)` only), so it is refused here, with the sentence that names the
+///    member ([`invalid_identity_source_arn`], 400).
+/// 2. The ACCOUNT BOUNDARY ([`authorize_resource_arn`]) — an identity-source ARN whose
+///    account field is not the caller's is an AUTHORIZATION decision, read off the ARN
+///    itself before anything about the resource it names is: `AccessDeniedException`
+///    (403).
+/// 3. Only then THIS SERVICE'S OWN ID NAMESPACE ([`is_identity_source_id`], through
+///    [`addresses_identity_source`] — the grammar it re-reads has already held) — an
+///    identity-source id is minted by this service, so whether a value is one this service
+///    could have issued is a question about the caller's OWN account, which is reached
+///    only once the ARN is known to name a resource in it: `ValidationException` (400).
+///
+/// So the account boundary precedes every check on the resource the ARN names: a caller
+/// asking about another account's resource is told it may not, never that its request was
+/// malformed.
+pub fn screen_identity_source_arn(action: &str, arn: &str) -> Result<(), IdentitySourceArnRefusal> {
+    if !is_identity_source_arn(arn) {
+        return Err(IdentitySourceArnRefusal::Invalid(
+            invalid_identity_source_arn(),
+        ));
+    }
+    authorize_resource_arn(action, arn).map_err(IdentitySourceArnRefusal::Denied)?;
+    if !addresses_identity_source(arn) {
+        return Err(IdentitySourceArnRefusal::Invalid(
+            invalid_identity_source_arn(),
+        ));
+    }
+    Ok(())
 }
 
 /// The id an ARN's resource field carries after the resource kind: the segment after its

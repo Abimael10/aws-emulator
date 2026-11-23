@@ -13,24 +13,31 @@
 //! materialises the removal for every later reader — nothing sleeps, and no read starts
 //! a deletion.
 //!
+//! The member is read in the one order both operations addressed by an identity source's
+//! ARN apply ([`crate::state::screen_identity_source_arn`]):
+//!
 //! * `IdentitySourceArn` carries no ARN `@pattern` of its own here (`length(max: 1000)`
-//!   only), so the malformed-ARN class is decided FIRST by this handler, against what the
-//!   member ADDRESSES ([`crate::state::addresses_identity_source`]): a value that is not
-//!   an ARN this service could have minted for an identity source — another service's
-//!   namespace, another resource kind of this service, a partition outside the
-//!   `aws` family, an account that is not twelve digits, a missing resource id, a resource
-//!   id that is not an identity-source id of this service
-//!   ([`crate::state::is_identity_source_id`]), or no ARN at all — names no identity
-//!   source whatever this store holds, so it is refused with the sentence that NAMES the
-//!   member it rejected ([`crate::state::invalid_identity_source_arn`]):
-//!   `ValidationException` (400), never reported as a deletion that was carried out. The
+//!   only), so the malformed-ARN class is decided FIRST by this handler, against the ARN
+//!   GRAMMAR of this service's identity-source kind
+//!   ([`crate::state::is_identity_source_arn`]): a value naming another service's
+//!   namespace, another resource kind of this service, a partition outside the `aws`
+//!   family, an account that is not twelve digits, a missing resource id, or no ARN at
+//!   all names no identity source whatever this store holds, so it is refused with the
+//!   sentence that NAMES the member it rejected
+//!   ([`crate::state::invalid_identity_source_arn`]): `ValidationException` (400), never
+//!   reported as a deletion that was carried out.
+//! * The account boundary is decided next, before anything about the resource the ARN
+//!   names is read: an identity-source ARN outside the caller's own account is refused
+//!   with `AccessDeniedException` (403) ([`crate::state::authorize_resource_arn`]), so an
+//!   unauthorized deletion is never reported as a completed one — and never as a
+//!   malformed request, since the account is read off the ARN while the id form below is
+//!   a question about the caller's own account.
+//! * An identity-source ARN of the caller's own account whose resource id is not one this
+//!   service could have minted ([`crate::state::is_identity_source_id`]) addresses no
+//!   identity source either, so it earns that same `ValidationException` (400). The whole
 //!   screen is the one `get_identity_source.rs` applies to the same member, so this
 //!   service answers one value that addresses no identity source one way whichever
 //!   operation is asked.
-//! * The account boundary is decided next, before the source is resolved: an
-//!   identity-source ARN outside the caller's own account is refused with
-//!   `AccessDeniedException` (403) ([`crate::state::authorize_resource_arn`]), so an
-//!   unauthorized deletion is never reported as a completed one.
 //! * An identity-source ARN under which this store holds no identity source is a success
 //!   that changes
 //!   nothing: the operation is `@idempotent` and its model declares NO
@@ -221,26 +228,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        // `IdentitySourceArn` carries no ARN `@pattern` here, so the malformed-ARN class
-        // is refused by this handler, with the sentence that names the member it rejected
-        // (`crate::state::invalid_identity_source_arn`, 400), rather than by the boundary.
-        // A value that is not an ARN this service could have minted for an identity source
-        // — including one whose resource id is not an identity-source id of this service —
-        // addresses no identity source, so it is refused as that class rather than reported
-        // as a delete that was carried out: the same screen `get_identity_source.rs`
-        // applies to the same member.
-        if !crate::state::addresses_identity_source(&input.identity_source_arn) {
-            return Err(DeleteIdentitySourceErrorModeled::ValidationException(
-                crate::state::invalid_identity_source_arn(),
-            )
-            .into());
-        }
-        // The account boundary is evaluated BEFORE the resource is resolved: a
-        // destructive call on an ARN outside the caller's account is refused with the
-        // modelled `AccessDeniedException` (403) rather than reported as "already
-        // absent".
-        crate::state::authorize_resource_arn(Self::NAME, &input.identity_source_arn)
-            .map_err(DeleteIdentitySourceErrorModeled::AccessDeniedException)?;
+        // Both classes an `IdentitySourceArn` can be refused for, in the ONE order this
+        // service decides them (`crate::state::screen_identity_source_arn`, the order
+        // `get_identity_source.rs` reads the same member in): the ARN grammar first (400,
+        // the sentence that names the member), then the account boundary (403), and only
+        // then whether the resource id is one this service could have minted (400). A
+        // destructive call on an ARN outside the caller's account is therefore refused as
+        // an authorization failure — never reported as "already absent", and never as a
+        // malformed request.
+        crate::state::screen_identity_source_arn(Self::NAME, &input.identity_source_arn).map_err(
+            |refusal| match refusal {
+                crate::state::IdentitySourceArnRefusal::Invalid(exception) => {
+                    DeleteIdentitySourceErrorModeled::ValidationException(exception)
+                }
+                crate::state::IdentitySourceArnRefusal::Denied(exception) => {
+                    DeleteIdentitySourceErrorModeled::AccessDeniedException(exception)
+                }
+            },
+        )?;
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteIdentitySourceError::Modeled(
                 DeleteIdentitySourceErrorModeled::InternalServerException(

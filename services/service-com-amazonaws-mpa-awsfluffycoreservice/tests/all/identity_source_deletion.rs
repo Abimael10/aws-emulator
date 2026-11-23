@@ -13,7 +13,8 @@
 //! is `AccessDeniedException` (403), decided before the source is resolved; and a value
 //! that is not an ARN of this service's identity-source resource — the kind of ARN the
 //! member addresses, down to the form of the resource id — is `ValidationException` (400),
-//! decided before the account boundary and before anything is looked up.
+//! decided before anything is looked up (the ARN's grammar before the account boundary,
+//! the form of its resource id after it: [`state::screen_identity_source_arn`]).
 //!
 //! The tables below span that class along what the rule generalises over: the stored
 //! source's status when the delete is issued (`CREATING` and `ACTIVE`, the two statuses a
@@ -588,7 +589,8 @@ async fn an_identity_source_outside_the_callers_account_is_denied_before_resolut
 /// the member addresses, down to the form of its resource id — is refused with the
 /// sentence that names the member it rejected:
 /// `ValidationException` (400) with [`state::INVALID_IDENTITY_SOURCE_ARN_MESSAGE`],
-/// decided before the account boundary and before anything is looked up.
+/// decided before anything is looked up. Every row names the caller's own account, where
+/// the account boundary has nothing to refuse.
 #[tokio::test]
 async fn a_malformed_identity_source_arn_is_refused() {
     let harness = Harness::new();

@@ -10,11 +10,17 @@
 //! value — including an otherwise well-formed identity-source ARN of the caller's own
 //! account — as the value that addresses no identity source: `ValidationException` (400)
 //! with the sentence that NAMES the rejected member
-//! ([`state::INVALID_IDENTITY_SOURCE_ARN_MESSAGE`]), on both operations identically,
-//! before the account boundary and before any existence lookup. An ARN whose id IS in
-//! that form addresses an identity source, so it reaches each operation's own answer for
-//! one the store holds nothing under: the read's `ResourceNotFoundException` (404) and the
-//! `@idempotent` delete's success that writes nothing.
+//! ([`state::INVALID_IDENTITY_SOURCE_ARN_MESSAGE`]), on both operations identically and
+//! before any existence lookup. An ARN whose id IS in that form addresses an identity
+//! source, so it reaches each operation's own answer for one the store holds nothing
+//! under: the read's `ResourceNotFoundException` (404) and the `@idempotent` delete's
+//! success that writes nothing.
+//!
+//! Whose id it is comes first, though: whether an id is one this service could have minted
+//! is a question about the CALLER'S OWN account, so the account boundary
+//! ([`state::screen_identity_source_arn`]) is decided before that screen — an
+//! identity-source ARN naming another account earns `AccessDeniedException` (403) whatever
+//! the form of its resource id.
 //!
 //! The tables span the class the rule generalises over: the FORM of the id (a UUID, a
 //! word, a dotted or underscored name, another service's id form, the prefix alone, the
@@ -33,6 +39,7 @@ use serde_json::Value;
 use service_com_amazonaws_mpa_awsfluffycoreservice::state;
 
 use crate::approval_team_lifecycle::{encode_label, error_code, text, Harness, REGION};
+use crate::authorization_gate::expected_denial;
 use crate::identity_source_deletion::{create_source, delete_source, listed_status, stored};
 
 /// `@length(max: 1000)` on `GetIdentitySource$IdentitySourceArn` and
@@ -62,6 +69,15 @@ impl Op {
                     .await
             }
             Self::Delete => delete_source(harness, value).await,
+        }
+    }
+
+    /// The IAM action an authorization refusal of this operation names (`mpa:<action>`):
+    /// the operation being invoked.
+    fn action(self) -> &'static str {
+        match self {
+            Self::Get => "GetIdentitySource",
+            Self::Delete => "DeleteIdentitySource",
         }
     }
 }
@@ -206,38 +222,134 @@ async fn an_id_outside_the_minted_form_is_refused_by_every_operation() {
     );
 }
 
-/// The id form is screened BEFORE the account boundary and before any lookup: an ARN whose
-/// id is outside the form earns the 400 even when it names another account, while an ARN
-/// whose id IS in the form and names another account earns the boundary's 403.
+/// The ACCOUNT BOUNDARY is decided before the id-form screen: an identity-source ARN of
+/// this service naming an account that is not the caller's earns
+/// `AccessDeniedException` (403) — with the implicit-deny message naming the caller
+/// principal, the action invoked and the ARN the request carried — WHATEVER the form of its
+/// resource id, while those same ids in the caller's own account earn the id-form screen's
+/// 400. The account is read off the ARN itself, so it is settled before anything about the
+/// resource that ARN names.
 #[tokio::test]
-async fn the_id_form_is_screened_before_the_account_boundary() {
+async fn the_account_boundary_is_decided_before_the_id_form_screen() {
     let harness = Harness::new();
-    let foreign = "999999999999";
+    let bystander = create_source(&harness, 1, 0).await;
+    let owned_id = bystander
+        .rsplit('/')
+        .next()
+        .expect("the resource id of a minted ARN")
+        .to_string();
 
+    // (case, partition, region, account) — rows differ along the one field the boundary
+    // keys on, and along the partition and region around it. `aws(-[^:]+)?` and
+    // `[a-z0-9-]{1,20}` are the partition and region segments of this service's ARN
+    // patterns (`ApprovalTeamArn`).
+    let foreign_accounts: [(&str, &str, &str, &str); 4] = [
+        ("another account", "aws", REGION, "999999999999"),
+        (
+            "an account one digit from the caller's",
+            "aws",
+            REGION,
+            "000000000001",
+        ),
+        ("another account in another region", "aws", "eu-west-1", "999999999999"),
+        (
+            "another account in the GovCloud partition",
+            "aws-us-gov",
+            "us-gov-west-1",
+            "100000000000",
+        ),
+    ];
+
+    // Every id form of this suite, in and out of the one this service mints, plus the
+    // resource id of a source the caller DOES own: the decision reads the account, never
+    // the resource.
+    let mut ids: Vec<(String, String)> = ids_outside_the_minted_form()
+        .into_iter()
+        .chain(ids_in_the_minted_form())
+        .map(|(case, id)| (case.to_string(), id))
+        .collect();
+    ids.push(("a resource id the caller owns".to_string(), owned_id));
+
+    for (account_case, partition, region, account) in foreign_accounts {
+        for (id_case, id) in &ids {
+            let value = source_arn(partition, region, account, id);
+            let case = format!("{id_case} in {account_case}");
+            for op in Op::ALL {
+                let (status, body) = op.call(&harness, &value).await;
+                assert_eq!(
+                    status, 403,
+                    "case {case:?} on {op:?}: expected HTTP 403, got {status} with {body:?}"
+                );
+                assert_eq!(
+                    error_code(&body),
+                    "AccessDeniedException",
+                    "case {case:?} on {op:?}: expected error code AccessDeniedException, got \
+                     {body:?}"
+                );
+                assert_eq!(
+                    text(&body, "Message"),
+                    expected_denial(op.action(), &value),
+                    "case {case:?} on {op:?}: expected the implicit-deny message naming \
+                     mpa:{} and the ARN asked for, got {body:?}",
+                    op.action()
+                );
+            }
+        }
+    }
+
+    // `@length(max: 1000)` on the member: a foreign ARN padded in its id to that bound is
+    // the same refusal, and the message quoting it is held to the bound
+    // `AccessDeniedException$Message` declares.
+    let padded = {
+        let base = source_arn("aws", REGION, "999999999999", "");
+        format!(
+            "{base}{}",
+            "0".repeat(MAX_IDENTITY_SOURCE_ARN - base.len())
+        )
+    };
+    for op in Op::ALL {
+        let (status, body) = op.call(&harness, &padded).await;
+        assert_eq!(
+            status, 403,
+            "case \"an ARN at the member's maximum length in another account\" on {op:?}: \
+             expected HTTP 403, got {status} with {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "AccessDeniedException",
+            "case \"an ARN at the member's maximum length in another account\" on {op:?}: \
+             expected error code AccessDeniedException, got {body:?}"
+        );
+        assert_eq!(
+            text(&body, "Message"),
+            expected_denial(op.action(), &padded),
+            "case \"an ARN at the member's maximum length in another account\" on {op:?}: \
+             expected the implicit-deny message cut to the modelled bound, got {body:?}"
+        );
+    }
+
+    // The same ids in the caller's OWN account: the boundary has nothing to refuse there,
+    // so the ones outside the minted form reach the id-form screen's 400.
     for (case, id) in ids_outside_the_minted_form() {
-        let value = source_arn("aws", REGION, foreign, &id);
+        let value = own_arn(&id);
         for op in Op::ALL {
             let (status, body) = op.call(&harness, &value).await;
-            assert_refused(&format!("{case} in another account"), op, &value, status, &body);
+            assert_refused(case, op, &value, status, &body);
         }
     }
 
-    for (case, id) in ids_in_the_minted_form() {
-        let value = source_arn("aws", REGION, foreign, &id);
-        for op in Op::ALL {
-            let (status, body) = op.call(&harness, &value).await;
-            assert_eq!(
-                status, 403,
-                "case {case:?} on {op:?}: expected HTTP 403, got {status} with {body:?}"
-            );
-            assert_eq!(
-                error_code(&body),
-                "AccessDeniedException",
-                "case {case:?} on {op:?}: expected error code AccessDeniedException, got \
-                 {body:?}"
-            );
-        }
-    }
+    // Not one refused call moved the store: the caller's own source is still reported, and
+    // nothing was recorded for any ARN that was refused.
+    assert!(
+        listed_status(&harness, &bystander).await.is_some(),
+        "a refused call removed the caller's own identity source"
+    );
+    let store = state::service_state(&*harness.engine).expect("the service store");
+    let remaining = store.lock().identity_sources.len();
+    assert_eq!(
+        remaining, 1,
+        "the store holds {remaining} source(s), expected only the bystander"
+    );
 }
 
 /// An id IN the minted form addresses an identity source, so each operation gives its own

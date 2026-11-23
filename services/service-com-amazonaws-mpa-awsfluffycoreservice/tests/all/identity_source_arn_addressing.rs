@@ -8,7 +8,7 @@
 //! this service could have minted for that kind names no such resource whatever the store
 //! holds and is refused with the sentence that names the member it rejected
 //! (`ValidationException`, 400, [`state::INVALID_IDENTITY_SOURCE_ARN_MESSAGE`]) — before
-//! the account boundary and before any lookup — whichever operation reads the member. Neither the
+//! any lookup — whichever operation reads the member. Neither the
 //! member's modelled constraints (`String`, `@length(max: 1000)`, no `@pattern`, from
 //! `smithy_query(query="shape",shape="DeleteIdentitySourceRequest,GetIdentitySourceRequest")`)
 //! nor the operation's own error set changes which values address a resource: the two
@@ -309,12 +309,13 @@ async fn an_identity_source_arn_holding_nothing_reaches_each_operations_own_answ
     }
 }
 
-/// The addressing screen is decided BEFORE the account boundary: an identity-source ARN of
-/// another account is the boundary's 403 on both operations, while a value that addresses
-/// no identity source is the 400 above even when its fifth field is the caller's own
-/// account.
+/// The ARN GRAMMAR is decided BEFORE the account boundary: a value that is no
+/// identity-source ARN of this service earns the 400 above — there is no account field in
+/// it to authorize against — while an identity-source ARN of another account is the
+/// boundary's 403 on both operations (`identity_source_id_form.rs` tables that order over
+/// the form of the resource id, which is screened AFTER the boundary).
 #[tokio::test]
-async fn the_addressing_screen_is_decided_before_the_account_boundary() {
+async fn the_arn_grammar_is_decided_before_the_account_boundary() {
     let harness = Harness::new();
     let own_account = engine::emulator_account_id();
 
