@@ -80,8 +80,8 @@ async fn live_list(router: &MultiServiceRouter, name: &str) -> (String, String) 
     )
 }
 
-/// The forms a value takes that could be no identifier of a namespaced resource at all:
-/// `(case, value)`.
+/// The forms a value takes that are no identifier CloudFront writes at all — neither a
+/// namespaced one nor one of the entity-identifier alphabet: `(case, value)`.
 ///
 /// `minted` is the id a create really handed out and `name` the list's own name, so the rows
 /// are built from this run's record rather than from literals.
@@ -94,8 +94,8 @@ fn unreadable(minted: &str, name: &str) -> Vec<(String, String)> {
         ),
         ("the list's own name".to_string(), name.to_string()),
         (
-            "another resource kind's id".to_string(),
-            "EDFDVBD6EXAMPLE".to_string(),
+            "a UUID, the shape of a kind whose ids carry no namespace".to_string(),
+            "f9a6a0b4-8d39-4a1e-9f67-1b0f7f5d2c3e".to_string(),
         ),
         ("a lone separator".to_string(), "-".to_string()),
         (
@@ -110,7 +110,9 @@ fn unreadable(minted: &str, name: &str) -> Vec<(String, String)> {
 ///
 /// `Id` is a plain `string` in the model — no pattern and no length — so the namespace label,
 /// the body's width, the body's alphabet and the separator are all parts nothing may refuse a
-/// value on, and each row varies one of them.
+/// value on, and each row varies one of them; the last row carries no namespace at all and is
+/// written in the alphabet CloudFront writes an entity identifier in, which is the other form
+/// an identifier it issued takes.
 fn readable_but_absent() -> Vec<(String, String)> {
     vec![
         (
@@ -132,6 +134,10 @@ fn readable_but_absent() -> Vec<(String, String)> {
         (
             "the same label under the other separator".to_string(),
             "ipl_0123456789abcdef0".to_string(),
+        ),
+        (
+            "an id written in the entity-identifier alphabet".to_string(),
+            "IAL1A2B3C4D5E6".to_string(),
         ),
     ]
 }

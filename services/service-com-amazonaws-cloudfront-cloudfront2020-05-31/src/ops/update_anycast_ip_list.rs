@@ -5,14 +5,18 @@
 //! Updates the Anycast static IP list `Id` names: the address type and the IPAM CIDR
 //! ranges it runs under become the ones submitted, the list re-enters its transient status
 //! while they reach the edge locations, and a fresh version token is minted. What the REQUEST
-//! alone decides about `Id` is decided FIRST: a value that could be no identifier of a
-//! namespaced resource at all ([`crate::state::is_namespaced_resource_id`]) is the argument
-//! this operation cannot read, 400 `InvalidArgument`, exactly as the read of the same
-//! resource (`GetAnycastIpList`) answers it — before the store is consulted and before the
-//! `If-Match` precondition, neither of which can say anything about an identifier that
-//! addresses nothing. An identifier the operation CAN read that no stored list carries is
+//! alone decides about `Id` is decided FIRST: a value written in NO form CloudFront writes an
+//! identifier in ([`crate::state::addresses_an_anycast_ip_list`]) is the argument this
+//! operation cannot read, 400 `InvalidArgument`, exactly as the read of the same resource
+//! (`GetAnycastIpList`) answers it — before the store is consulted and before the `If-Match`
+//! precondition, neither of which can say anything about an identifier that addresses
+//! nothing. An identifier the operation CAN read that no stored list carries is
 //! `EntityNotFound`, and an `If-Match` that is not the list's current version is refused
 //! before anything is written.
+//!
+//! The TARGET is therefore resolved before anything the BODY submits is read: an identifier no
+//! list answers to is the absent list whatever `IpAddressType` or `IpamCidrConfigs` the request
+//! carries.
 //!
 //! ## Shape of an operation
 //!
@@ -171,11 +175,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What the REQUEST alone decides about the id is whether it could be an identifier
         // CloudFront issued at all: `Id` carries no pattern in the model, so neither the
         // namespace label nor the width or alphabet of the body is a constraint to refuse a
-        // value on, and a value of that form is resolved below. A value of NO such form
-        // addresses no list for a version to belong to, so it is refused here — before the
-        // lookup and before the precondition — with the same argument failure the read of
+        // value on, and a value written in either form CloudFront writes an identifier in is
+        // resolved below ([`crate::state::addresses_an_anycast_ip_list`]). A value of NO such
+        // form addresses no list for a version to belong to, so it is refused here — before
+        // the lookup and before the precondition — with the same argument failure the read of
         // this resource answers.
-        if !crate::state::is_namespaced_resource_id(&input.id) {
+        if !crate::state::addresses_an_anycast_ip_list(&input.id) {
             return Err(UpdateAnycastIpListErrorModeled::InvalidArgument(
                 crate::state::invalid_id_format("Id"),
             )

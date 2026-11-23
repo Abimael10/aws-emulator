@@ -498,6 +498,10 @@ async fn an_update_is_refused_on_an_absent_list_and_on_a_version_that_is_not_cur
             "aip_1A2B3C4D5E6F7G8H9J0K1L".to_string(),
         ),
         (
+            "an id written in the entity-identifier alphabet",
+            "IAL1A2B3C4D5E6".to_string(),
+        ),
+        (
             "a value of another namespace entirely",
             "not-an-id".to_string(),
         ),
@@ -534,7 +538,10 @@ async fn an_update_is_refused_on_an_absent_list_and_on_a_version_that_is_not_cur
             "the namespace label with no separator",
             "ipl0123456789abcdef0".to_string(),
         ),
-        ("another resource kind's id", "EDFDVBD6EXAMPLE".to_string()),
+        (
+            "a UUID, the shape of a kind whose ids carry no namespace",
+            "f9a6a0b4-8d39-4a1e-9f67-1b0f7f5d2c3e".to_string(),
+        ),
         ("a lone separator", "-".to_string()),
     ] {
         let answer = update_anycast_ip_list(

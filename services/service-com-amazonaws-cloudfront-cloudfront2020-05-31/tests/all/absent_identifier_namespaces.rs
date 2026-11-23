@@ -316,7 +316,10 @@ fn could_be_no_identifier() -> Vec<(&'static str, String)> {
             "a body outside the identifier alphabet",
             "dt_NEVER.MINTED".to_string(),
         ),
-        ("a grossly malformed value", "A".repeat(512)),
+        (
+            "a grossly malformed value, in no identifier alphabet",
+            "a".repeat(512),
+        ),
         ("a lone separator", "-".to_string()),
         (
             "a UUID, which carries no namespace label",

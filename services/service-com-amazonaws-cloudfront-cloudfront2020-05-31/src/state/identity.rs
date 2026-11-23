@@ -959,6 +959,27 @@ pub fn is_namespaced_resource_id(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+/// Whether `value` could ADDRESS an Anycast static IP list: it is written in one of the forms
+/// CloudFront writes an identifier in at all — a namespace-labelled opaque identifier
+/// ([`is_namespaced_resource_id`]) or the alphabet an ENTITY identifier is written in
+/// ([`is_entity_id_form`]).
+///
+/// What the operations addressed by one read of the value, and ALL they read: `Id` is a plain
+/// `string` `@httpLabel` on both of them
+/// (`smithy_query(query="operation",operation="GetAnycastIpList,UpdateAnycastIpList")`) — no
+/// `@pattern`, no `@length` — so neither a namespace label, nor the width or alphabet of a
+/// body, nor the presence of a separator at all is a property these routes may refuse a value
+/// on. The `ipl-` + hex form this emulator MINTS is one namespace such an identifier is
+/// written under and the uppercase-and-digit alphabet is another, and WHICH identifier of
+/// either was ever issued is a property of the STORE: a value of either form that no list
+/// answers to is the list reported ABSENT (the recorded contract of these routes), while a
+/// value written in NEITHER — in lower case around no separator, as a UUID, as a word or as a
+/// name — was never an identifier at all and is the identifier a route reports it cannot READ
+/// ([`invalid_id_format`]).
+pub fn addresses_an_anycast_ip_list(value: &str) -> bool {
+    is_namespaced_resource_id(value) || is_entity_id_form(value)
+}
+
 /// Whether `value` is written in the characters CloudFront writes an ENTITY IDENTIFIER in:
 /// a non-empty run of the id alphabet ([`is_token_byte`] — decimal digits and uppercase
 /// ASCII letters), carrying no separator and no lower case.

@@ -58,3 +58,21 @@ Cause 2:
 3. Repeat with a well-formed body (IpAddressType=ipv4) -> this one already answers EntityNotFound, showing the ordering is only wrong when the body is invalid.
 
 Or replay the check ids in trace_ids.
+
+## Resolution
+
+Cause 2 is FIXED here; cause 1 was already fixed on the mainline this branch forked from and
+its check replays green.
+
+- Cause 1 ALREADY FIXED: the edge applies each response-headers-policy header under its own
+  `Override` against the headers the answer already carries, so a custom-header entry with
+  `Override` false leaves the origin's value in place (`service::edge::response_headers::put`,
+  covered end to end by `tests/all/edge_deployed_distribution_effects.rs` and
+  `tests/all/edge_response_headers_policy.rs`).
+- Cause 2 FIXED: the operations addressed by an Anycast static IP list `Id` read of the value
+  only whether it is written in a form CloudFront writes an identifier in at all — under a
+  namespace label, or in the alphabet an entity identifier is written in — and resolve every
+  such value against the store, so an identifier of the entity alphabet that no list answers
+  to is `EntityNotFound` (404) rather than `InvalidArgument` (400). The ordering the recording
+  shows follows from that: the target is resolved before anything the body submits is read.
+

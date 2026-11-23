@@ -4,8 +4,8 @@
 //!
 //! Reports the Anycast static IP list `Id` names, read from the one record
 //! `CreateAnycastIpList` stored, together with the version token of that record. An `Id`
-//! outside the shape an Anycast static IP list id takes is `InvalidArgument`, decided
-//! before the store is consulted; a well-formed id no stored list carries is
+//! written in no form CloudFront writes an identifier in is `InvalidArgument`, decided
+//! before the store is consulted; an id it CAN read that no stored list carries is
 //! `EntityNotFound`.
 //!
 //! A REPORTING operation: it writes nothing of its own, and materialises only the
@@ -155,10 +155,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // CloudFront issued at all: `Id` carries no pattern in the model, so neither the
         // namespace label nor the width or alphabet of the body is a constraint to refuse a
         // value on — the `ipl-` + hex form this service MINTS is one namespace an Anycast
-        // static IP list id is written under, not the only one. A value of that form is
-        // resolved against the store below, so one that was never issued is a list that is
-        // ABSENT rather than an argument this operation cannot read.
-        if !crate::state::is_namespaced_resource_id(&input.id) {
+        // static IP list id is written under and the entity-identifier alphabet is another,
+        // not the only ones ([`crate::state::addresses_an_anycast_ip_list`]). A value of
+        // either form is resolved against the store below, so one that was never issued is a
+        // list that is ABSENT rather than an argument this operation cannot read.
+        if !crate::state::addresses_an_anycast_ip_list(&input.id) {
             return Err(GetAnycastIpListErrorModeled::InvalidArgument(
                 crate::state::invalid_id_format("Id"),
             )
