@@ -72,16 +72,16 @@ const DRY_RUN_STATUS: u16 = 412;
 /// A retention period long enough that nothing in this suite reaches its end. Stands for the
 /// `RetentionPeriod` of the Recycle Bin rule that retained the snapshot, which is the `rbin`
 /// service's value rather than one this crate owns.
-const LONG_RETENTION: Duration = Duration::from_secs(3_600);
+pub(super) const LONG_RETENTION: Duration = Duration::from_secs(3_600);
 
 /// One row of the restore table: the case, the size of the volume the snapshot is taken of,
 /// whether that volume is encrypted, and the description and tags the snapshot carries.
-struct SnapshotRow {
-    case: &'static str,
-    volume_size: i32,
-    encrypted: bool,
-    description: Option<&'static str>,
-    tags: &'static [(&'static str, &'static str)],
+pub(super) struct SnapshotRow {
+    pub(super) case: &'static str,
+    pub(super) volume_size: i32,
+    pub(super) encrypted: bool,
+    pub(super) description: Option<&'static str>,
+    pub(super) tags: &'static [(&'static str, &'static str)],
 }
 
 /// One call of `action` signed for the Region the snapshot suites use.
@@ -119,7 +119,10 @@ async fn create_volume(
 
 /// Take one snapshot of a freshly minted volume, as the row describes it, and answer the
 /// snapshot's id and the id of the volume it was taken of.
-async fn create_snapshot(router: &MultiServiceRouter, row: &SnapshotRow) -> (String, String) {
+pub(super) async fn create_snapshot(
+    router: &MultiServiceRouter,
+    row: &SnapshotRow,
+) -> (String, String) {
     let case = row.case;
     let volume_id = create_volume(router, case, row.volume_size, row.encrypted).await;
     let mut params = vec![p("VolumeId", &volume_id)];
@@ -149,7 +152,7 @@ async fn create_snapshot(router: &MultiServiceRouter, row: &SnapshotRow) -> (Str
 }
 
 /// `DescribeSnapshots` for one snapshot id: the HTTP status and the body.
-async fn describe(router: &MultiServiceRouter, snapshot_id: &str) -> (u16, String) {
+pub(super) async fn describe(router: &MultiServiceRouter, snapshot_id: &str) -> (u16, String) {
     invoke(router, "DescribeSnapshots", &indexed("SnapshotId", &[snapshot_id])).await
 }
 
@@ -179,7 +182,12 @@ async fn wait_until_completed(router: &MultiServiceRouter, case: &str, snapshot_
 
 /// Retain `snapshot_id` in the Recycle Bin for `retention`, the way a `DeleteSnapshot`
 /// covered by a retention rule will — through the state primitive the bin is written through.
-fn recycle(engine: &engine::InMemoryEngine, case: &str, snapshot_id: &str, retention: Duration) {
+pub(super) fn recycle(
+    engine: &engine::InMemoryEngine,
+    case: &str,
+    snapshot_id: &str,
+    retention: Duration,
+) {
     let store = engine.state::<Ec2State>();
     let mut guard = store.lock();
     assert!(
@@ -217,7 +225,7 @@ fn stored_bytes(engine: &engine::InMemoryEngine) -> usize {
 }
 
 /// A restore of `snapshot_id`, with whatever extra members the case needs.
-async fn restore(
+pub(super) async fn restore(
     router: &MultiServiceRouter,
     snapshot_id: &str,
     extra: &[(String, String)],
@@ -690,7 +698,10 @@ async fn create_available_rule(router: &MultiServiceRouter, row: &RuleRow) -> St
 }
 
 /// `ListSnapshotsInRecycleBin` with `params`: the HTTP status and the body.
-async fn list_bin(router: &MultiServiceRouter, params: &[(String, String)]) -> (u16, String) {
+pub(super) async fn list_bin(
+    router: &MultiServiceRouter,
+    params: &[(String, String)],
+) -> (u16, String) {
     invoke(router, "ListSnapshotsInRecycleBin", params).await
 }
 
