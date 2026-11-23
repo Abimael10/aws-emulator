@@ -22,6 +22,8 @@
 //! Amazon ECS and AWS Lambda calls over their own wires — so what is asserted is what a client
 //! that deploys the template and then reads the resources back observes.
 
+use std::time::{Duration, Instant};
+
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -62,6 +64,77 @@ pub(crate) async fn cloudwatch(
         request,
     )
     .await
+}
+
+/// How long a caller waits for a history item an alarm's own writer owes, and how often it
+/// looks again. Generous, so a loaded host cannot decide a case: what is waited for is the item
+/// APPEARING, never a span of the clock.
+const HISTORY_DEADLINE: Duration = Duration::from_secs(30);
+/// See [`HISTORY_DEADLINE`].
+const HISTORY_LOOK_AGAIN: Duration = Duration::from_millis(50);
+
+/// Every `AlarmHistoryItems` entry of the type `item_type` the alarm `name` recorded, each as
+/// the parsed `HistoryData` document it carries ("Data about the alarm, in JSON format.",
+/// `AlarmHistoryItem$HistoryData`).
+///
+/// `item_type` is one of `HistoryItemType`'s values
+/// (`smithy_query(query="shape",shape="HistoryItemType")`). The ONE reader of an alarm's
+/// history in this target, taking the type as a parameter, so the suite over the action a
+/// declared topic policy decides and the suite over the transition a declared alarm records
+/// cannot drift on how that history is read.
+pub(crate) async fn alarm_history_items(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+    item_type: &str,
+) -> Vec<Value> {
+    let (code, history) = cloudwatch(
+        router,
+        "DescribeAlarmHistory",
+        &json!({"AlarmName": name, "HistoryItemType": item_type}),
+    )
+    .await;
+    assert_eq!(
+        code, 200,
+        "case {case:?}: expected HTTP 200 from DescribeAlarmHistory, got {code} with {history}"
+    );
+    history["AlarmHistoryItems"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|item| {
+            let data = item["HistoryData"].as_str().unwrap_or_default();
+            serde_json::from_str(data).unwrap_or_else(|error| {
+                panic!("case {case:?}: HistoryData is not JSON ({error}): {data}")
+            })
+        })
+        .collect()
+}
+
+/// The same read, answered once that history holds at least one item: the record is written as
+/// the change it reports completes, so a caller looks again for it the way a client polling the
+/// history does rather than waiting out a span. The WHOLE list comes back, so a caller that
+/// asserts how many items there are needs no second read.
+pub(crate) async fn settled_alarm_history_items(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+    item_type: &str,
+) -> Vec<Value> {
+    let deadline = Instant::now() + HISTORY_DEADLINE;
+    loop {
+        let items = alarm_history_items(router, case, name, item_type).await;
+        if !items.is_empty() {
+            return items;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the alarm {name:?} to record a {item_type} history item, \
+             got none"
+        );
+        tokio::time::sleep(HISTORY_LOOK_AGAIN).await;
+    }
 }
 
 /// Call one Amazon ECS operation through the same router, signed for `ecs`.

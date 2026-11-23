@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::cloudwatch_alarm_and_ecs_service_resources::cloudwatch;
+use crate::cloudwatch_alarm_and_ecs_service_resources::{cloudwatch, settled_alarm_history_items};
 use crate::dynamodb_table_resources::failure_reasons;
 use crate::elbv2_resource_provisioning::poll_to_terminal;
 use crate::stack_lifecycle::{
@@ -355,48 +355,18 @@ async fn arrived_until(
     held
 }
 
-/// The `Action` items the alarm `name` recorded, as the parsed `HistoryData` of each.
-async fn action_items(router: &MultiServiceRouter, case: &str, name: &str) -> Vec<Value> {
-    let (status, history) = cloudwatch(
-        router,
-        "DescribeAlarmHistory",
-        &json!({"AlarmName": name, "HistoryItemType": "Action"}),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: expected HTTP 200 from DescribeAlarmHistory, got {status} {history}"
-    );
-    history["AlarmHistoryItems"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .iter()
-        .map(|item| {
-            let data = item["HistoryData"].as_str().unwrap_or_default();
-            serde_json::from_str(data).unwrap_or_else(|error| {
-                panic!("case {case:?}: HistoryData is not JSON ({error}): {data}")
-            })
-        })
-        .collect()
-}
-
-/// Read the alarm's `Action` history until it holds one item or the deadline passes: the
-/// record is written as the action completes, so a row reads it the way a client polling the
-/// history does.
+/// The newest `Action` item the alarm `name` recorded, once it has recorded one: the record is
+/// written as the action completes, so a row reads it the way a client polling the history
+/// does. The read itself is the target's one alarm-history reader, called for this suite's own
+/// item type.
 async fn settled_action_item(router: &MultiServiceRouter, case: &str, name: &str) -> Value {
-    let deadline = Instant::now() + DELIVERY_DEADLINE;
-    loop {
-        let items = action_items(router, case, name).await;
-        if let Some(item) = items.into_iter().next() {
-            return item;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "case {case:?}: the alarm {name} must record the action it executed"
-        );
-        tokio::time::sleep(LOOK_AGAIN).await;
-    }
+    settled_alarm_history_items(router, case, name, "Action")
+        .await
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: the alarm {name} must record the action it executed")
+        })
 }
 
 /// One row: the document the stack declares for its topic, and how many notifications the

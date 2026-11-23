@@ -318,8 +318,13 @@ pub(crate) async fn alarms_named(
 ///
 /// An alarm's state is EVALUATED rather than written by the caller, and the first evaluation
 /// is due a span after the write that configured it, so the state is polled for until it holds
-/// — never waited out for a fixed time.
-async fn settled_alarm(
+/// — never waited out for a fixed time. The state the alarm LAST reported comes back whether or
+/// not it reached `expected`, so the caller asserts which state was due.
+///
+/// `pub(crate)` for the reason [`alarms_named`] is: the suite over the alarm a SYNTHESIZED
+/// template declares (`synthesized_template_alarm_reaches_cloudwatch.rs`) waits for an
+/// evaluation through this one reader rather than spelling that poll again.
+pub(crate) async fn settled_alarm(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
