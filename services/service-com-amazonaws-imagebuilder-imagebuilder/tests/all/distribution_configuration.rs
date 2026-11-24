@@ -609,13 +609,12 @@ async fn the_arn_carries_a_normalized_name_and_that_name_is_taken_once() {
 async fn a_region_appears_at_most_once_in_the_distributions_list() {
     let router = emulator();
 
-    // (case, the distributions, the Region the refusal names — `None` for a list that
-    // names each Region once and is stored)
-    let rows: Vec<(&str, Value, Option<&str>)> = vec![
+    // (case, the distributions, whether the list names one Region twice)
+    let rows: Vec<(&str, Value, bool)> = vec![
         (
             "one Region, named once",
             json!([ami_entry("us-west-2")]),
-            None,
+            false,
         ),
         (
             "three Regions, each named once",
@@ -624,12 +623,12 @@ async fn a_region_appears_at_most_once_in_the_distributions_list() {
                 ami_entry("us-east-1"),
                 ami_entry("eu-west-1"),
             ]),
-            None,
+            false,
         ),
         (
             "the same Region twice, adjacent",
             json!([ami_entry("us-west-2"), ami_entry("us-west-2")]),
-            Some("us-west-2"),
+            true,
         ),
         (
             "the same Region twice, with another between them",
@@ -638,7 +637,7 @@ async fn a_region_appears_at_most_once_in_the_distributions_list() {
                 ami_entry("us-east-1"),
                 ami_entry("eu-west-1"),
             ]),
-            Some("eu-west-1"),
+            true,
         ),
         (
             "the same Region twice, carrying different settings",
@@ -652,40 +651,34 @@ async fn a_region_appears_at_most_once_in_the_distributions_list() {
                     "amiDistributionConfiguration": {"description": "two"},
                 },
             ]),
-            Some("ap-south-1"),
+            true,
         ),
     ];
 
-    for (n, (case, distributions, duplicate)) in rows.into_iter().enumerate() {
+    for (n, (case, distributions, refused)) in rows.into_iter().enumerate() {
         let name = format!("duplicate-case-{n}");
         let body = create_body(&name, &format!("token-dup-{n}"), distributions, json!({}));
         let (status, answer) = create(&router, &body).await;
-        match duplicate {
-            None => assert_eq!(
+        if refused {
+            assert_refused(case, status, &answer, 400, "InvalidParameterValueException");
+            // The sentence names the member whose value was refused and the requirement that
+            // value had to satisfy, and nothing of the request: neither the Region the list
+            // repeated nor the position it repeated it at appears in it.
+            let expected = "The value supplied for parameter 'distributions' is not valid. A \
+                            region may appear in a distribution configuration at most once.";
+            let actual = error_message(case, &answer);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected the message {expected:?}, got {actual:?}"
+            );
+            // A refused create stores nothing: the name it asked for is still free.
+            let (status, read) = get(&router, &arn_of(REGION, &name)).await;
+            assert_refused(case, status, &read, 404, "ResourceNotFoundException");
+        } else {
+            assert_eq!(
                 status, 200,
                 "case {case:?}: expected HTTP 200, got {status} with {answer}"
-            ),
-            Some(region) => {
-                assert_refused(
-                    case,
-                    status,
-                    &answer,
-                    400,
-                    "InvalidParameterCombinationException",
-                );
-                let expected = format!(
-                    "The distributions list can name each target Region at most once, and it \
-                     names {region} more than once."
-                );
-                let actual = error_message(case, &answer);
-                assert_eq!(
-                    actual, expected,
-                    "case {case:?}: expected the message {expected:?}, got {actual:?}"
-                );
-                // A refused create stores nothing: the name it asked for is still free.
-                let (status, read) = get(&router, &arn_of(REGION, &name)).await;
-                assert_refused(case, status, &read, 404, "ResourceNotFoundException");
-            }
+            );
         }
     }
 }
@@ -857,7 +850,7 @@ async fn a_dry_run_validates_and_stores_nothing() {
         status,
         &answer,
         400,
-        "InvalidParameterCombinationException",
+        "InvalidParameterValueException",
     );
 
     // The dry run filed no receipt either, so the token it carried is still free for the

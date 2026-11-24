@@ -4201,20 +4201,6 @@ pub fn infrastructure_configuration_exists_message() -> String {
     "The resource already exists.".to_string()
 }
 
-/// Why a create whose distributions name one Region twice is refused.
-///
-/// The rule is the `distributions` member's own: "Each entry defines how output images are
-/// distributed in one target Amazon Web Services Region. A Region can appear at most once
-/// in the list." The wording names the member, the requirement and the Region the request
-/// repeated.
-#[must_use]
-pub fn duplicate_distribution_region_message(region: &str) -> String {
-    format!(
-        "The distributions list can name each target Region at most once, and it names \
-         {region} more than once."
-    )
-}
-
 /// Why a create was not performed because the request asked only for validation.
 ///
 /// From the `dryRun` member's own documentation: "Validates the required permissions

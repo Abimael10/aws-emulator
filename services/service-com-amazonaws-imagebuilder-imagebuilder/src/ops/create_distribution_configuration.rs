@@ -235,50 +235,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
 
-        // Three requirements of a distribution entry live in the model's prose rather than in
-        // a constraint, so the walk cannot refuse them: the entry has to configure at least
-        // one output for its target, it has to name a target Region this service can
-        // distribute through, and the output AMI it names has to be named per build
-        // ([`crate::state::refused_distribution_entry`]). They are read per ENTRY, before the
-        // list is read as a set. An entry that configures NO output is a value of the
-        // `distributions` entry itself that this operation does not accept, and so is the AMI
-        // name that does not name each build; a target that offers no AMI distribution refuses
-        // the entry's AMI settings TOGETHER with the Region they would apply in — a
-        // combination of parameters this operation does not accept.
-        if let Some(refused) = crate::state::refused_distribution_entry(&input.distributions) {
+        // Four requirements of `distributions` live in the model's prose rather than in a
+        // constraint, so the walk cannot refuse them: each ENTRY has to configure at least one
+        // output for its target, has to name a target Region this service can distribute
+        // through and has to name its output AMI per build, and the LIST may name each target
+        // Region at most once ([`crate::state::refused_distributions`], the one reading a
+        // create and an update share). The entries are read first, each on its own, and the
+        // list is read as a set once every entry has been accepted.
+        //
+        // The class each refusal is answered in follows what is wrong with the value: a value
+        // breaking a requirement of the member it sits on is refused as that VALUE, while a
+        // target this service cannot reach refuses the entry's AMI settings — admissible on
+        // their own — TOGETHER with the Region they would apply in.
+        if let Some(refused) = crate::state::refused_distributions(&input.distributions) {
             let message = Some(refused.message());
-            return Err(match refused.why {
-                crate::state::RefusedEntryRequirement::UnreachableTarget(_) => {
+            return Err(match refused.class() {
+                crate::state::RefusedParameterClass::Combination => {
                     CreateDistributionConfigurationErrorModeled::InvalidParameterCombinationException(
                         InvalidParameterCombinationException { message },
                     )
                 }
-                crate::state::RefusedEntryRequirement::WithoutOutputs
-                | crate::state::RefusedEntryRequirement::AmiNameWithoutBuildDate => {
+                crate::state::RefusedParameterClass::Value => {
                     CreateDistributionConfigurationErrorModeled::InvalidParameterValueException(
                         InvalidParameterValueException { message },
                     )
                 }
             }
             .into());
-        }
-
-        // `distributions`' own rule, read as a SET once every entry has been read on its own:
-        // "A Region can appear at most once in the list"
-        // ([`crate::state::duplicate_distribution_region`], the one reading a create and an
-        // update share).
-        if let Some(duplicate) = crate::state::duplicate_distribution_region(&input.distributions)
-        {
-            return Err(
-                CreateDistributionConfigurationErrorModeled::InvalidParameterCombinationException(
-                    InvalidParameterCombinationException {
-                        message: Some(crate::state::duplicate_distribution_region_message(
-                            duplicate,
-                        )),
-                    },
-                )
-                .into(),
-            );
         }
 
         let fingerprint = crate::state::distribution_configuration_request_fingerprint(&input);

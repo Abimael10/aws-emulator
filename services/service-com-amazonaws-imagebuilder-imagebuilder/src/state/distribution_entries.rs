@@ -21,10 +21,19 @@
 //!   requirement on the value's CONTENT, which the member's `@pattern` admits either way, so
 //!   a name the tag is missing from is refused rather than stored.
 //!
-//! A refusal names the parameter whose value it refused at the entry's own position
-//! ([`RefusedEntry::message`]) — the entry itself when the entry as a whole configures no
-//! output, and the entry's own member when one member's value is what broke a requirement —
-//! and the entries are read in the order the request wrote them.
+//! `distributions` also carries a requirement of its own, which holds over the list as a WHOLE
+//! rather than over any one entry: "A Region can appear at most once in the list"
+//! (`smithy_query(query="operation",operation="CreateDistributionConfiguration")`), read once
+//! every entry has been read on its own ([`refused_distributions`]).
+//!
+//! A refusal names the parameter whose value it refused at the offending member's own path
+//! ([`RefusedDistributions::message`]) — the list itself when the list as a whole breaks its
+//! own requirement, the entry when the entry as a whole configures no output, and the entry's
+//! own member when one member's value is what broke a requirement — and the entries are read in
+//! the order the request wrote them.
+//!
+//! Which CLASS of parameter refusal carries that sentence follows what is wrong with the value
+//! ([`RefusedParameterClass`]), not which requirement it broke.
 
 use crate::ops::types::Distribution;
 
@@ -46,6 +55,15 @@ const AMI_NAME_MEMBER: &str = "name";
 /// The dynamic tag an output AMI's name has to include, as the member's own documentation
 /// writes it.
 const BUILD_DATE_TAG: &str = "{{ imagebuilder:buildDate }}";
+
+/// The requirement the `distributions` list as a whole has to satisfy, as the member's own
+/// documentation states it: "A Region can appear at most once in the list"
+/// (`smithy_query(query="operation",operation="CreateDistributionConfiguration")`).
+///
+/// FIXED text: the requirement is what the member admits, so neither the Region the request
+/// repeated nor the position it repeated it at appears in it.
+const AT_MOST_ONE_ENTRY_PER_REGION_REQUIREMENT: &str =
+    "A region may appear in a distribution configuration at most once.";
 
 /// One entry of `distributions` this service cannot accept: where it sits, and which of its
 /// requirements it broke.
@@ -72,6 +90,87 @@ pub enum RefusedEntryRequirement<'entry> {
     AmiNameWithoutBuildDate,
 }
 
+/// Why this service cannot accept the `distributions` a request carried: one of the
+/// requirements an ENTRY is read by, or the requirement the list as a whole is read by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusedDistributions<'list> {
+    /// One entry broke one of its own requirements ([`refused_distribution_entry`]).
+    Entry(RefusedEntry<'list>),
+    /// The list names one target Region more than once, which "A Region can appear at most
+    /// once in the list" does not admit. Carries nothing of the request: the sentence names
+    /// the member and the requirement only.
+    TargetNamedTwice,
+}
+
+/// Which CLASS of parameter refusal a `distributions` value this service cannot accept is
+/// answered in.
+///
+/// Read from what is wrong with the value rather than from which requirement it broke: a value
+/// that breaks a requirement of the member it sits on is refused as that VALUE, while a value
+/// admissible on its own that cannot be combined with another member of the request is refused
+/// as that COMBINATION — "two mutually exclusive parameters, or a parameter without its
+/// required companion parameter"
+/// (`smithy_query(query="shape",shape="InvalidParameterCombinationException")`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusedParameterClass {
+    /// The parameter's own value is one this service does not accept.
+    Value,
+    /// The parameter's value is admissible on its own and cannot be combined with another
+    /// member of the request.
+    Combination,
+}
+
+/// Why this service cannot accept `distributions`, or `None` when every entry satisfies the
+/// requirements an entry is read by and the list satisfies its own.
+///
+/// The ENTRIES are read first, each on its own and in the order the request wrote them, and the
+/// list is read as a SET only once every entry has been accepted: an entry that describes no
+/// distribution at all is refused as that entry, whether or not another entry names its target
+/// too. A create and an update read their lists through this one reading, so one wording rule
+/// and one refusal class are applied on every path.
+#[must_use]
+pub fn refused_distributions(distributions: &[Distribution]) -> Option<RefusedDistributions<'_>> {
+    if let Some(refused) = refused_distribution_entry(distributions) {
+        return Some(RefusedDistributions::Entry(refused));
+    }
+    duplicate_distribution_region(distributions).map(|_| RefusedDistributions::TargetNamedTwice)
+}
+
+impl RefusedDistributions<'_> {
+    /// The sentence this service refuses the list in, stated in the ONE sentence every refused
+    /// parameter of this service is stated in
+    /// (`service_common::validation_message::parameter_value_mismatch`): the path of the member
+    /// whose value was refused, and then the requirement that value had to satisfy.
+    #[must_use]
+    pub fn message(&self) -> String {
+        match self {
+            Self::Entry(entry) => entry.message(),
+            Self::TargetNamedTwice => ::service_common::validation_message::parameter_value_mismatch(
+                DISTRIBUTIONS_MEMBER,
+                AT_MOST_ONE_ENTRY_PER_REGION_REQUIREMENT,
+            ),
+        }
+    }
+
+    /// Which class of parameter refusal carries that sentence.
+    #[must_use]
+    pub fn class(&self) -> RefusedParameterClass {
+        match self {
+            // A target this service cannot distribute through refuses the entry's AMI
+            // settings, which are admissible on their own, TOGETHER with the Region they would
+            // apply in.
+            Self::Entry(RefusedEntry {
+                why: RefusedEntryRequirement::UnreachableTarget(_),
+                ..
+            }) => RefusedParameterClass::Combination,
+            // Everything else is a value of `distributions` — of one entry, of a member inside
+            // one entry, or of the list as a whole — that breaks a requirement of the member it
+            // sits on.
+            Self::Entry(_) | Self::TargetNamedTwice => RefusedParameterClass::Value,
+        }
+    }
+}
+
 /// Which requirement of an entry of `distributions` a request broke, with the position of the
 /// entry that broke it, or `None` when every entry satisfies all three.
 ///
@@ -89,9 +188,9 @@ pub fn refused_distribution_entry(distributions: &[Distribution]) -> Option<Refu
 ///
 /// `distributions`' own rule: "Each entry defines how output images are distributed in one
 /// target Amazon Web Services Region. A Region can appear at most once in the list." Two
-/// entries for one Region are two settings for the same target, which is a combination of
-/// parameters this service does not accept — so a create and an update read their lists as a
-/// SET through this one reading, after each entry has been read on its own.
+/// entries for one Region are a value of `distributions` that breaks the list's own
+/// requirement — so a create and an update read their lists as a SET through this one reading,
+/// after each entry has been read on its own ([`refused_distributions`]).
 #[must_use]
 pub fn duplicate_distribution_region(distributions: &[Distribution]) -> Option<&str> {
     let mut targets: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
@@ -317,6 +416,14 @@ mod tests {
         &'row str,
         Vec<(&'row str, Outputs<'row>)>,
         Option<RefusedEntry<'row>>,
+    );
+
+    /// One row of the list-wide table: the case, the entries as (target, outputs), and what a
+    /// refusal of the list as a whole reports.
+    type ListRow<'row> = (
+        &'row str,
+        Vec<(&'row str, Outputs<'row>)>,
+        Option<RefusedDistributions<'row>>,
     );
 
     /// RULE: an entry that carries none of the members that distribute an output to its
@@ -619,6 +726,170 @@ mod tests {
         ];
 
         for (case, refused, expected) in rows {
+            let actual = refused.message();
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// RULE: the entries are read first, each on its own, and the list is read as a SET only
+    /// once every entry has been accepted — so an entry that breaks one of its own
+    /// requirements is reported as that entry even when another entry names its target too.
+    #[test]
+    fn the_entries_are_read_before_the_list_is_read_as_a_set() {
+        // (case, the entries as (target, outputs), what a refusal of the list reports)
+        let rows: Vec<ListRow<'_>> = vec![
+            (
+                "one entry naming one target",
+                vec![("us-west-2", Outputs::Ami(None))],
+                None,
+            ),
+            (
+                "three targets, each named once",
+                vec![
+                    ("us-west-2", Outputs::Ami(None)),
+                    ("eu-west-1", Outputs::Container),
+                    ("ap-south-1", Outputs::S3Export),
+                ],
+                None,
+            ),
+            (
+                "one target named twice, adjacent",
+                vec![
+                    ("us-west-2", Outputs::Ami(None)),
+                    ("us-west-2", Outputs::Container),
+                ],
+                Some(RefusedDistributions::TargetNamedTwice),
+            ),
+            (
+                "one target named twice, with another between them",
+                vec![
+                    ("eu-west-1", Outputs::Ami(None)),
+                    ("us-east-1", Outputs::S3Export),
+                    ("eu-west-1", Outputs::FastLaunch(1)),
+                ],
+                Some(RefusedDistributions::TargetNamedTwice),
+            ),
+            (
+                "one target named three times",
+                vec![
+                    ("us-east-1", Outputs::Ami(None)),
+                    ("us-east-1", Outputs::Ami(None)),
+                    ("us-east-1", Outputs::Ami(None)),
+                ],
+                Some(RefusedDistributions::TargetNamedTwice),
+            ),
+            (
+                "a repeated target whose second entry configures no output",
+                vec![
+                    ("us-west-2", Outputs::Ami(None)),
+                    ("us-west-2", Outputs::Nothing),
+                ],
+                Some(RefusedDistributions::Entry(RefusedEntry {
+                    index: 1,
+                    why: RefusedEntryRequirement::WithoutOutputs,
+                })),
+            ),
+            (
+                "a repeated target neither of whose entries this service can reach",
+                vec![
+                    ("us-nowhere-1", Outputs::Ami(None)),
+                    ("us-nowhere-1", Outputs::Ami(None)),
+                ],
+                Some(RefusedDistributions::Entry(RefusedEntry {
+                    index: 0,
+                    why: RefusedEntryRequirement::UnreachableTarget("us-nowhere-1"),
+                })),
+            ),
+            (
+                "a repeated target whose first entry names its AMI by no build",
+                vec![
+                    ("eu-central-1", Outputs::Ami(Some("golden"))),
+                    ("eu-central-1", Outputs::Ami(None)),
+                ],
+                Some(RefusedDistributions::Entry(RefusedEntry {
+                    index: 0,
+                    why: RefusedEntryRequirement::AmiNameWithoutBuildDate,
+                })),
+            ),
+            (
+                "an empty list, which names no target twice",
+                vec![],
+                None,
+            ),
+        ];
+
+        for (case, entries, expected) in rows {
+            let distributions: Vec<Distribution> = entries
+                .iter()
+                .map(|(region, outputs)| entry(region, *outputs))
+                .collect();
+            let actual = refused_distributions(&distributions);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// RULE: a `distributions` value that breaks a requirement of the member it sits on is
+    /// refused as that VALUE and the list's own requirement is one of them; only a value
+    /// admissible on its own that cannot be combined with another member of the request is
+    /// refused as a COMBINATION.
+    #[test]
+    fn the_refusal_class_follows_what_is_wrong_with_the_value() {
+        // (case, the refusal, its class, the sentence it carries)
+        let rows = [
+            (
+                "a list naming one target twice",
+                RefusedDistributions::TargetNamedTwice,
+                RefusedParameterClass::Value,
+                "The value supplied for parameter 'distributions' is not valid. A region may \
+                 appear in a distribution configuration at most once.",
+            ),
+            (
+                "an entry configuring no output",
+                RefusedDistributions::Entry(RefusedEntry {
+                    index: 2,
+                    why: RefusedEntryRequirement::WithoutOutputs,
+                }),
+                RefusedParameterClass::Value,
+                "The value supplied for parameter 'distributions[2]' is not valid. One or more \
+                 outputs should be provided for each region in a distribution configuration.",
+            ),
+            (
+                "an entry naming its output AMI by no build",
+                RefusedDistributions::Entry(RefusedEntry {
+                    index: 0,
+                    why: RefusedEntryRequirement::AmiNameWithoutBuildDate,
+                }),
+                RefusedParameterClass::Value,
+                "The value supplied for parameter \
+                 'distributions[0].amiDistributionConfiguration.name' is not valid. The EC2 \
+                 AMI name must contain '{{ imagebuilder:buildDate }}' to ensure that the name \
+                 will be unique.",
+            ),
+            (
+                "an entry naming a target this service cannot reach",
+                RefusedDistributions::Entry(RefusedEntry {
+                    index: 1,
+                    why: RefusedEntryRequirement::UnreachableTarget("us-nowhere-1"),
+                }),
+                RefusedParameterClass::Combination,
+                "The value supplied for parameter \
+                 'distributions[1].amiDistributionConfiguration' is not valid. AMI \
+                 Distribution is not available in 'us-nowhere-1'.",
+            ),
+        ];
+
+        for (case, refused, class, expected) in rows {
+            let actual = refused.class();
+            assert_eq!(
+                actual, class,
+                "case {case:?}: expected the class {class:?}, got {actual:?}"
+            );
             let actual = refused.message();
             assert_eq!(
                 actual, expected,

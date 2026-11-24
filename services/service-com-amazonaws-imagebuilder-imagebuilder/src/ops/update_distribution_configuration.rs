@@ -228,42 +228,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
 
         // The replacement list is read by the requirements a create reads its own by, in the
-        // same order and with the same sentences: a list this operation stores is one a
+        // same order, with the same sentences and in the same refusal classes
+        // ([`crate::state::refused_distributions`]): a list this operation stores is one a
         // create would have stored. Read BEFORE anything is written, so a refused update
         // leaves the stored configuration as it was.
-        if let Some(refused) = crate::state::refused_distribution_entry(&input.distributions) {
+        if let Some(refused) = crate::state::refused_distributions(&input.distributions) {
             let message = Some(refused.message());
-            return Err(match refused.why {
-                crate::state::RefusedEntryRequirement::UnreachableTarget(_) => {
+            return Err(match refused.class() {
+                crate::state::RefusedParameterClass::Combination => {
                     UpdateDistributionConfigurationErrorModeled::InvalidParameterCombinationException(
                         InvalidParameterCombinationException { message },
                     )
                 }
-                crate::state::RefusedEntryRequirement::WithoutOutputs
-                | crate::state::RefusedEntryRequirement::AmiNameWithoutBuildDate => {
+                crate::state::RefusedParameterClass::Value => {
                     UpdateDistributionConfigurationErrorModeled::InvalidParameterValueException(
                         InvalidParameterValueException { message },
                     )
                 }
             }
             .into());
-        }
-
-        // `distributions`' own rule, read as a SET once every entry has been read on its own:
-        // "A Region can appear at most once in the list" — the same reading a create's list is
-        // read by ([`crate::state::duplicate_distribution_region`]).
-        if let Some(duplicate) = crate::state::duplicate_distribution_region(&input.distributions)
-        {
-            return Err(
-                UpdateDistributionConfigurationErrorModeled::InvalidParameterCombinationException(
-                    InvalidParameterCombinationException {
-                        message: Some(crate::state::duplicate_distribution_region_message(
-                            duplicate,
-                        )),
-                    },
-                )
-                .into(),
-            );
         }
 
         let fingerprint = crate::state::distribution_configuration_update_fingerprint(&input);

@@ -584,12 +584,11 @@ async fn an_arn_naming_no_configuration_is_reported_missing() {
 /// list as it was.
 #[tokio::test]
 async fn a_replacement_names_each_target_region_at_most_once() {
-    // (case, the replacement list, the Region a refusal names)
-    let rows: Vec<(&str, Value, &str)> = vec![
+    // (case, the replacement list)
+    let rows: Vec<(&str, Value)> = vec![
         (
             "the same Region twice, adjacent",
             json!([entry(REGION, None), entry(REGION, None)]),
-            REGION,
         ),
         (
             "the same Region twice, with another between them",
@@ -598,7 +597,6 @@ async fn a_replacement_names_each_target_region_at_most_once() {
                 entry("us-east-1", None),
                 entry("eu-west-1", None),
             ]),
-            "eu-west-1",
         ),
         (
             "the same Region twice, carrying different settings",
@@ -606,28 +604,22 @@ async fn a_replacement_names_each_target_region_at_most_once() {
                 entry("ap-south-1", Some("one-{{ imagebuilder:buildDate }}")),
                 entry("ap-south-1", Some("two-{{ imagebuilder:buildDate }}")),
             ]),
-            "ap-south-1",
         ),
     ];
 
-    for (index, (case, replacement, duplicate)) in rows.into_iter().enumerate() {
+    for (index, (case, replacement)) in rows.into_iter().enumerate() {
         let router = emulator();
         let name = format!("duplicate-target-{index}");
         let arn = stored(&router, &name).await;
 
         let body = update_body(&arn, &format!("token-dup-{index}"), replacement, json!({}));
         let (status, answer) = update_in(&router, REGION, &body).await;
-        assert_refused(
-            case,
-            status,
-            &answer,
-            400,
-            "InvalidParameterCombinationException",
-        );
-        let expected = format!(
-            "The distributions list can name each target Region at most once, and it names \
-             {duplicate} more than once."
-        );
+        assert_refused(case, status, &answer, 400, "InvalidParameterValueException");
+        // The sentence names the member whose value was refused and the requirement that
+        // value had to satisfy, and nothing of the request: the Region the list repeated is
+        // no part of it.
+        let expected = "The value supplied for parameter 'distributions' is not valid. A \
+                        region may appear in a distribution configuration at most once.";
         let actual = error_message(case, &answer);
         assert_eq!(
             actual, expected,
