@@ -146,12 +146,13 @@ pub fn unusable_parameters(findings: &[(&str, Unusable)]) -> Option<ParameterRef
 ///
 /// An EMPTY value bound nothing at all, so the request never named a target and the
 /// request-binding layer reports it; a value that is present but BLANK did bind, so it
-/// reached this service's own validation, which cannot use it. A label is never the
+/// reached this service's own validation, which cannot use it (blankness itself is the
+/// `NonEmptyString` form, stated in [`super::member_form`]). A label is never the
 /// sentence-less class: this service names every label it refuses.
 pub fn unusable_label(value: &str) -> Option<Unusable> {
     if value.is_empty() {
         Some(Unusable::Unbound)
-    } else if value.trim().is_empty() {
+    } else if !super::member_form::is_non_empty_string(value) {
         Some(Unusable::Unreadable)
     } else {
         None

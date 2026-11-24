@@ -30,6 +30,11 @@ pub mod delete_configuration_set_types;
 pub mod event_destination_records;
 pub mod get_configuration_set_event_destinations_types;
 pub mod list_configuration_sets_types;
+/// The form a value bound to one of this model's named string shapes must take — not a
+/// modelled shape, so it carries no `_types` suffix and is NOT glob-re-exported: a caller
+/// names the module (`types::member_form::is_word_characters_with_delimiters`), which keeps
+/// the shape whose form is being applied visible at the call site.
+pub mod member_form;
 /// How this service words a refusal of a parameter it cannot use — not a modelled shape,
 /// so it carries no `_types` suffix and is NOT glob-re-exported: a caller names the module
 /// (`types::refusal_wording::invalid_parameters`), which keeps the sentence's origin

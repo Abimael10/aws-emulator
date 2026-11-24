@@ -164,13 +164,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // exist gets. The layer, and so the sentence, is `refusal_wording`'s to decide.
         //
         // The destination is filed under `EventDestinationName`, so a blank or absent one
-        // names nothing to create: a parameter this service's validation cannot use. The
-        // name is stored EXACTLY as sent — trimming is only how blankness is detected,
-        // because `Update`/`Delete` resolve the destination by the raw
-        // `{EventDestinationName}` path label.
+        // names nothing to create: a parameter this service's validation cannot use. Which
+        // values the member's shape admits is `types::member_form`'s to state
+        // (`NonEmptyString`, for every member targeting it). The name is stored EXACTLY as
+        // sent — trimming is only how blankness is detected, because `Update`/`Delete`
+        // resolve the destination by the raw `{EventDestinationName}` path label.
         let named_destination = input
             .event_destination_name
-            .filter(|name| !name.trim().is_empty());
+            .filter(|name| super::types::member_form::is_non_empty_string(name));
         let unusable: Vec<(&str, super::types::refusal_wording::Unusable)> = [
             super::types::refusal_wording::unusable_label(input.configuration_set_name.as_str())
                 .map(|why| ("ConfigurationSetName", why)),

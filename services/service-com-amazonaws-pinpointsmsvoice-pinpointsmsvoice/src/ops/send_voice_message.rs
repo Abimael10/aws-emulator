@@ -166,20 +166,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
 
-        // There is no message without a recipient, and the member's shape is
-        // `NonEmptyString`, so a blank or absent destination is a parameter this
-        // service's validation cannot use. The number is recorded EXACTLY as sent —
-        // trimming is only how blankness is detected.
+        // Every parameter of this request this handler's own validation can reject is read
+        // BEFORE anything is refused, and a finding is recorded for each in the order the
+        // input binds them (`ConfigurationSetName`, `DestinationPhoneNumber`,
+        // `OriginationPhoneNumber` —
+        // `smithy_query(query="operation",operation="SendVoiceMessage",model_path="services/service-com-amazonaws-pinpointsmsvoice-pinpointsmsvoice/smithy-model/com-amazonaws-pinpointsmsvoice-pinpointsmsvoice.json")`),
+        // so the ONE refusal the request earns reports every one of them rather than
+        // whichever was looked at first. Which values each member admits is decided by its
+        // SHAPE, stated once per shape in `types::member_form` — so a name this service
+        // files no configuration set under is not a name a sent message can claim to have
+        // used either.
+        //
+        // There is no message without a recipient, and `DestinationPhoneNumber`'s shape is
+        // `NonEmptyString`, so a blank or absent destination is a parameter this service's
+        // validation cannot use. `OriginationPhoneNumber` targets that same shape but is
+        // optional, so binding nothing is served (the request simply names no origination
+        // number) while a blank value is refused like any other unusable one. Each value
+        // is recorded EXACTLY as sent — trimming is only how blankness is detected.
         let destination = input
             .destination_phone_number
-            .filter(|number| !number.trim().is_empty())
-            .ok_or_else(|| {
-                SendVoiceMessageErrorModeled::BadRequestException(BadRequestException {
-                    message: Some(super::types::refusal_wording::invalid_parameters(&[
-                        "DestinationPhoneNumber",
-                    ])),
-                })
-            })?;
+            .filter(|number| super::types::member_form::is_non_empty_string(number));
+        let unusable: Vec<(&str, super::types::refusal_wording::Unusable)> = [
+            super::types::member_form::unusable_optional_member(
+                input.configuration_set_name.as_deref(),
+                super::types::member_form::is_word_characters_with_delimiters,
+            )
+            .map(|why| ("ConfigurationSetName", why)),
+            destination.is_none().then_some((
+                "DestinationPhoneNumber",
+                super::types::refusal_wording::Unusable::Unreadable,
+            )),
+            super::types::member_form::unusable_optional_member(
+                input.origination_phone_number.as_deref(),
+                super::types::member_form::is_non_empty_string,
+            )
+            .map(|why| ("OriginationPhoneNumber", why)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+
+        let destination = match destination {
+            Some(number) if unusable.is_empty() => number,
+            // Any of those parameters unusable: ONE refusal, naming every one of them.
+            _ => {
+                let message = super::types::refusal_wording::unusable_parameters(&unusable)
+                    .and_then(|refusal| refusal.message);
+                return Err(SendVoiceMessageErrorModeled::BadRequestException(
+                    BadRequestException { message },
+                )
+                .into());
+            }
+        };
 
         // `VoiceMessageContent` holds one message body of one kind: exactly one of
         // `PlainTextMessage`, `SSMLMessage` and `CallInstructionsMessage`. None of them
