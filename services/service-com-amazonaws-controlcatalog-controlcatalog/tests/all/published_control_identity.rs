@@ -311,10 +311,111 @@ const PUBLISHED_CONTROLS: &[PublishedControl] = &[
         governed_resources: &["AWS::EC2::SecurityGroup"],
         implementation: (CONFIG_RULE, "INCOMING_SSH_DISABLED"),
     },
+    // The rest of the AWS Config-implemented surface this catalog records a published
+    // identity for: controls published under a `CONFIG.…` designator beside Control Tower
+    // controls published under their `AWS-GR_…` identifier, spanning both parameter
+    // summaries, every severity the catalog ranks them at and both control scopes (an
+    // account-wide check over IAM users and Regional checks over Regional resources).
+    PublishedControl {
+        alias: "CONFIG.APIGATEWAY.DT.10",
+        identifier: "aayte0p9vah5rp97z6yfbytl2",
+        name: "Checks if all methods in Amazon API Gateway stages have logging enabled",
+        severity: "MEDIUM",
+        parameter_requirement_summary: "OPTIONAL",
+        governed_resources: &["AWS::ApiGateway::Stage", "AWS::ApiGatewayV2::Stage"],
+        implementation: (CONFIG_RULE, "API_GW_EXECUTION_LOGGING_ENABLED"),
+    },
+    PublishedControl {
+        alias: "CONFIG.KMS.DT.3",
+        identifier: "7305ygy72ra2amwqjl1bqrmrw",
+        name: "Checks if automatic key rotation is enabled for each key and matches to \
+               the key ID of the customer created AWS KMS key",
+        severity: "MEDIUM",
+        parameter_requirement_summary: "NONE",
+        governed_resources: &["AWS::KMS::Key"],
+        implementation: (CONFIG_RULE, "CMK_BACKING_KEY_ROTATION_ENABLED"),
+    },
+    PublishedControl {
+        alias: "CONFIG.DYNAMODB.DT.4",
+        identifier: "a0ufrfbomg90qbskltuop262u",
+        name: "Checks if the Amazon DynamoDB table is encrypted with AWS Key Management \
+               Service (KMS)",
+        severity: "MEDIUM",
+        parameter_requirement_summary: "OPTIONAL",
+        governed_resources: &["AWS::DynamoDB::Table"],
+        implementation: (CONFIG_RULE, "DYNAMODB_TABLE_ENCRYPTED_KMS"),
+    },
+    PublishedControl {
+        alias: "CONFIG.ELASTICFILESYSTEM.DT.8",
+        identifier: "8qmzz7l2841u6bvwpkiug38ta",
+        name: "Checks if Amazon Elastic File System (Amazon EFS) file systems are \
+               encrypted",
+        severity: "MEDIUM",
+        parameter_requirement_summary: "OPTIONAL",
+        governed_resources: &["AWS::EFS::FileSystem"],
+        implementation: (CONFIG_RULE, "EFS_ENCRYPTED_CHECK"),
+    },
+    PublishedControl {
+        alias: "CONFIG.OPENSEARCH.DT.9",
+        identifier: "70u9gks728rcr33237rckvzbo",
+        name: "Checks if Amazon OpenSearch Service domains have encryption at rest \
+               enabled",
+        severity: "MEDIUM",
+        parameter_requirement_summary: "NONE",
+        governed_resources: &["AWS::OpenSearchService::Domain"],
+        implementation: (CONFIG_RULE, "OPENSEARCH_ENCRYPTED_AT_REST"),
+    },
+    PublishedControl {
+        alias: "AWS-GR_EC2_INSTANCE_NO_PUBLIC_IP",
+        identifier: "4v7xtm83uvvyulk1wwpm4qm3s",
+        name: "Detect whether any Amazon EC2 instance has an associated public IPv4 \
+               address",
+        severity: "HIGH",
+        parameter_requirement_summary: "NONE",
+        governed_resources: &["AWS::EC2::Instance"],
+        implementation: (CONFIG_RULE, "EC2_INSTANCE_NO_PUBLIC_IP"),
+    },
+    PublishedControl {
+        alias: "AWS-GR_EKS_ENDPOINT_NO_PUBLIC_ACCESS",
+        identifier: "aeellyghb27pbehyzua1nyena",
+        name: "Detect whether an Amazon EKS endpoint is blocked from public access",
+        severity: "HIGH",
+        parameter_requirement_summary: "NONE",
+        governed_resources: &["AWS::EKS::Cluster"],
+        implementation: (CONFIG_RULE, "EKS_ENDPOINT_NO_PUBLIC_ACCESS"),
+    },
+    PublishedControl {
+        alias: "AWS-GR_LAMBDA_FUNCTION_PUBLIC_ACCESS_PROHIBITED",
+        identifier: "b2gzofz99eb7nsuj5g8wcimse",
+        name: "Detect whether the AWS Lambda function policy attached to the Lambda \
+               resource blocks public access",
+        severity: "CRITICAL",
+        parameter_requirement_summary: "NONE",
+        governed_resources: &["AWS::Lambda::Function"],
+        implementation: (CONFIG_RULE, "LAMBDA_FUNCTION_PUBLIC_ACCESS_PROHIBITED"),
+    },
+    PublishedControl {
+        alias: "AWS-GR_MFA_ENABLED_FOR_IAM_CONSOLE_ACCESS",
+        identifier: "1fvktjhpo9wdpt3pjb2wsz7nt",
+        name: "Disallow console access to IAM users without MFA",
+        severity: "MEDIUM",
+        parameter_requirement_summary: "NONE",
+        governed_resources: &["AWS::IAM::User"],
+        implementation: (CONFIG_RULE, "MFA_ENABLED_FOR_IAM_CONSOLE_ACCESS"),
+    },
+    PublishedControl {
+        alias: "AWS-GR_RDS_INSTANCE_PUBLIC_ACCESS_CHECK",
+        identifier: "4jc77cq1lcr7g64xywwypykv8",
+        name: "Disallow public access to RDS database instances",
+        severity: "CRITICAL",
+        parameter_requirement_summary: "NONE",
+        governed_resources: &["AWS::RDS::DBInstance"],
+        implementation: (CONFIG_RULE, "RDS_INSTANCE_PUBLIC_ACCESS_CHECK"),
+    },
 ];
 
 /// The instant the catalog publishes as a control's release time (`CreateTime`), in
-/// seconds since the Unix epoch, for the control this suite's table records one for:
+/// seconds since the Unix epoch, for each control this suite's table records one for:
 /// `(identifier, release instant)`.
 ///
 /// Source: the Control Catalog's own published control list, which dates each control it
@@ -322,7 +423,14 @@ const PUBLISHED_CONTROLS: &[PublishedControl] = &[
 /// wider rule — every control's published text and instant, and controls released
 /// together carrying ONE instant — is owned by `all/published_control_release_record.rs`;
 /// this row is here because the identity it belongs to is this suite's subject.
-const PUBLISHED_RELEASE_INSTANTS: &[(&str, i64)] = &[("4x11tie7h25sws4g7ilakhcb7", 1_594_166_400)];
+const PUBLISHED_RELEASE_INSTANTS: &[(&str, i64)] = &[
+    ("4x11tie7h25sws4g7ilakhcb7", 1_594_166_400),
+    ("aayte0p9vah5rp97z6yfbytl2", 1_779_840_000),
+    ("7305ygy72ra2amwqjl1bqrmrw", 1_540_339_200),
+    ("a0ufrfbomg90qbskltuop262u", 1_590_364_800),
+    ("8qmzz7l2841u6bvwpkiug38ta", 1_563_408_000),
+    ("70u9gks728rcr33237rckvzbo", 1_637_193_600),
+];
 
 /// Page sizes the filtered walks below are driven with: the service's own default, one
 /// control per page, a partial page and the modeled maximum of `MaxListControlsResults`
@@ -750,6 +858,120 @@ async fn a_published_control_is_dated_with_the_catalogs_release_instant() {
                 *release_time,
                 "case {case}: GetControl must report the same release instant, got \
                  {read_back:?}"
+            );
+        }
+    }
+}
+
+/// A control the catalog publishes under a designator is served under its OWN published
+/// ARN carrying that designator — never under an identity derived from the row behind it,
+/// which no client could resolve and no alias lookup could find.
+///
+/// Driven through the `Implementations.Types` filter a client walks one implementing
+/// surface with, at every page size, because the identity has to hold on the filtered page
+/// as much as on the unfiltered walk; and the ARN each page carries is read back through
+/// `GetControl`, which is the only thing a harvested ARN is good for.
+///
+/// `all/published_controls.rs` owns the catalog-wide designator rules — that a designator
+/// belongs to the surface that issues it and names one control — so what is asserted here
+/// is narrower and per row: the published ARN and name behind each designator of this
+/// suite's identity table, and that no control over one of those implementing rules is
+/// served without the designators the catalog publishes it under.
+#[tokio::test]
+async fn a_designated_control_is_served_under_its_published_arn_and_designator() {
+    /// The filter a client walking the AWS Config-implemented surface sends, as the
+    /// `ControlFilter` documentation spells it ("you can filter for controls implemented
+    /// as Amazon Web Services Config Rules by specifying AWS::Config::ConfigRule as a
+    /// type").
+    const CONFIG_RULE_FILTER: &str =
+        r#"{"Filter":{"Implementations":{"Types":["AWS::Config::ConfigRule"]}}}"#;
+
+    let emulator = Emulator::new();
+
+    // The rows of the identity table this rule holds for: every control published over
+    // an AWS Config managed rule, under either designator family.
+    let rows: Vec<&PublishedControl> = PUBLISHED_CONTROLS
+        .iter()
+        .filter(|row| row.implementation.0 == CONFIG_RULE)
+        .collect();
+    for prefix in ["CONFIG.", "AWS-GR_"] {
+        assert!(
+            rows.iter().any(|row| row.alias.starts_with(prefix)),
+            "case {prefix}: the table must span this designator family for the rule to be \
+             tested"
+        );
+    }
+
+    for page_size in PAGE_SIZES {
+        let served = drain(
+            &emulator,
+            "/list-controls",
+            "Controls",
+            page_size,
+            CONFIG_RULE_FILTER,
+        )
+        .await;
+
+        // The controls the filtered page carries, grouped by the rule behind them: a
+        // designator names a control, so which control carries it is what is asserted,
+        // not which row of this crate produced it.
+        let mut per_rule: BTreeMap<&str, Vec<&Value>> = BTreeMap::new();
+        for control in &served {
+            if let Some(identifier) = control["Implementation"]["Identifier"].as_str() {
+                per_rule.entry(identifier).or_default().push(control);
+            }
+        }
+
+        for row in &rows {
+            let rule = row.implementation.1;
+            let case = format!("{} maxResults={page_size:?}", row.alias);
+            let over_rule = per_rule.get(rule).unwrap_or_else(|| {
+                panic!("case {case}: the catalog publishes a control over {rule}, got none")
+            });
+            // Every control published over the rule carries the designators it is
+            // published under: an emptied list leaves the alias-to-control lookup
+            // unanswerable.
+            for control in over_rule {
+                assert!(
+                    !aliases(control).is_empty(),
+                    "case {case}: every control over {rule} is published under a \
+                     designator, got {control:?}"
+                );
+            }
+            let designated: Vec<&&Value> = over_rule
+                .iter()
+                .filter(|control| aliases(control).contains(&row.alias.to_string()))
+                .collect();
+            assert_eq!(
+                designated.len(),
+                1,
+                "case {case}: expected exactly one control published under this \
+                 designator, got {designated:?}"
+            );
+            let expected_arn = catalog_arn(row.identifier);
+            assert_eq!(
+                designated[0]["Arn"].as_str(),
+                Some(expected_arn.as_str()),
+                "case {case}: expected the catalog's own ARN {expected_arn}, got {:?}",
+                designated[0]["Arn"]
+            );
+            assert_eq!(
+                designated[0]["Name"].as_str(),
+                Some(row.name),
+                "case {case}: expected the catalog's published name, got {:?}",
+                designated[0]["Name"]
+            );
+
+            let read_back = emulator
+                .ok(
+                    "/get-control",
+                    &format!(r#"{{"ControlArn":"{expected_arn}"}}"#),
+                )
+                .await;
+            assert!(
+                aliases(&read_back).contains(&row.alias.to_string()),
+                "case {case}: GetControl must resolve the published ARN to the control \
+                 published under this designator, got {read_back:?}"
             );
         }
     }

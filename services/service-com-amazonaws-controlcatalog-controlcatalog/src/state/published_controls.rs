@@ -1313,16 +1313,15 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     // record is left absent rather than invented.
     ControlSeed {
         slug: "acm-certificate-expiration-check",
-        name: "Checks if AWS Certificate Manager Certificates in your account are marked \
-               for expiration within the specified number of days",
+        name: "Checks whether ACM Certificates in your account are marked for expiration \
+               within the specified number of days",
         // The implementing AWS Config managed rule's own published description, reproduced
         // as the catalog publishes it for a control under a `CONFIG.…` designator: the
         // rule's documented text, whose first sentence is the control's published name.
-        description: "Checks if AWS Certificate Manager Certificates in your account are \
-                      marked for expiration within the specified number of days. \
-                      Certificates provided by ACM are automatically renewed. ACM does \
-                      not automatically renew certificates that you import. The rule is \
-                      NON_COMPLIANT if your certificates are about to expire.",
+        description: "Checks whether ACM Certificates in your account are marked for \
+                      expiration within the specified number of days. Certificates \
+                      provided by ACM are automatically renewed. ACM does not \
+                      automatically renew certificates that you import.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: CONFIG_RULE,
@@ -1397,7 +1396,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("EFS_ENCRYPTED_CHECK"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["CONFIG.ELASTICFILESYSTEM.DT.8"],
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
@@ -1411,15 +1410,16 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         name: "Checks if the Amazon DynamoDB table is encrypted with AWS Key Management \
                Service (KMS)",
         description: "Checks if the Amazon DynamoDB table is encrypted with AWS Key \
-                      Management Service (KMS). The rule is NON_COMPLIANT if the table \
-                      is not encrypted with a KMS key, or if it is encrypted with a key \
-                      the rule's input parameter does not name.",
+                      Management Service (KMS). The rule is NON_COMPLIANT if the Amazon \
+                      DynamoDB table is not encrypted with AWS KMS. The rule is also \
+                      NON_COMPLIANT if the encrypted AWS KMS key is not present in \
+                      kmsKeyArns input parameter.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("DYNAMODB_TABLE_ENCRYPTED_KMS"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["CONFIG.DYNAMODB.DT.4"],
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
@@ -1430,14 +1430,12 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "sns-encrypted-kms",
-        name: "Checks if an Amazon Simple Notification Service (Amazon SNS) topic is \
-               encrypted with AWS Key Management Service (AWS KMS)",
-        description: "Checks if an Amazon Simple Notification Service (Amazon SNS) topic \
-                      is encrypted with AWS Key Management Service (AWS KMS). The rule \
-                      is NON_COMPLIANT if an Amazon SNS topic is not encrypted with AWS \
-                      KMS. Optionally, you can specify the AWS KMS key ARNs, the AWS KMS \
-                      key aliases, or the AWS KMS key IDs the topic has to be encrypted \
-                      with.",
+        name: "Checks if SNS topics are encrypted with AWS Key Management Service (AWS \
+               KMS)",
+        description: "Checks if SNS topics are encrypted with AWS Key Management Service \
+                      (AWS KMS). The rule is NON_COMPLIANT if an SNS topic is not \
+                      encrypted with AWS KMS. Optionally, specify the key ARNs, the alias \
+                      ARNs, the alias name, or the key IDs for the rule to check.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: CONFIG_RULE,
@@ -1487,7 +1485,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("OPENSEARCH_ENCRYPTED_AT_REST"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["CONFIG.OPENSEARCH.DT.9"],
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
@@ -1522,8 +1520,8 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         name: "Checks if Amazon Redshift clusters require TLS/SSL encryption to connect \
                to SQL clients",
         description: "Checks if Amazon Redshift clusters require TLS/SSL encryption to \
-                      connect to SQL clients. The rule is NON_COMPLIANT if the cluster's \
-                      parameter group does not require an encrypted connection.",
+                      connect to SQL clients. The rule is NON_COMPLIANT if any Amazon \
+                      Redshift cluster has parameter require_SSL not set to true.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: CONFIG_RULE,
@@ -1589,8 +1587,8 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "s3-bucket-logging-enabled",
-        name: "Checks whether logging is enabled for your S3 buckets",
-        description: "Checks whether logging is enabled for your S3 buckets. The rule is \
+        name: "Checks if logging is enabled for your S3 buckets",
+        description: "Checks if logging is enabled for your S3 buckets. The rule is \
                       NON_COMPLIANT if logging is not enabled.",
         behavior: DETECTIVE,
         severity: MEDIUM,
@@ -1629,12 +1627,10 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "elb-logging-enabled",
-        name: "Checks if the Application Load Balancer and the Classic Load Balancer have \
-               logging enabled",
-        description: "Checks if the Application Load Balancer and the Classic Load \
-                      Balancer have logging enabled. The rule is NON_COMPLIANT if the \
-                      access_logs.s3.enabled is false or access_logs.S3.bucket is not \
-                      equal to the s3BucketName that you provided.",
+        name: "Checks whether the Application Load Balancers and the Classic Load \
+               Balancers have logging enabled",
+        description: "Checks whether the Application Load Balancers and the Classic Load \
+                      Balancers have logging enabled.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: CONFIG_RULE,
@@ -1654,16 +1650,16 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "api-gw-execution-logging-enabled",
-        name: "Checks that all methods in Amazon API Gateway stages have logging enabled",
-        description: "Checks that all methods in Amazon API Gateway stages have logging \
+        name: "Checks if all methods in Amazon API Gateway stages have logging enabled",
+        description: "Checks if all methods in Amazon API Gateway stages have logging \
                       enabled. The rule is NON_COMPLIANT if logging is not enabled, or if \
-                      the logging level is not one the rule's input parameter names.",
+                      loggingLevel is neither ERROR nor INFO.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("API_GW_EXECUTION_LOGGING_ENABLED"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["CONFIG.APIGATEWAY.DT.10"],
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
@@ -1674,16 +1670,18 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "ec2-instance-no-public-ip",
-        name: "Checks whether Amazon Elastic Compute Cloud (Amazon EC2) instances have a \
-               public IP association",
-        description: "Checks whether Amazon Elastic Compute Cloud (Amazon EC2) instances \
-                      have a public IP association. The rule is NON_COMPLIANT if the \
-                      instance has a public IP address associated with it.",
+        name: "Detect whether any Amazon EC2 instance has an associated public IPv4 \
+               address",
+        description: "Detects whether any Amazon Elastic Compute Cloud (Amazon EC2) \
+                      instance has an associated public IPv4 address. The rule is \
+                      NON_COMPLIANT if the publicIp field is present in the Amazon EC2 \
+                      instance configuration item. This rule applies only to IPv4 \
+                      addresses.",
         behavior: DETECTIVE,
         severity: HIGH,
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("EC2_INSTANCE_NO_PUBLIC_IP"),
-        control_tower_identifier: None,
+        control_tower_identifier: Some("AWS-GR_EC2_INSTANCE_NO_PUBLIC_IP"),
         designators: NO_DESIGNATORS,
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
@@ -1695,16 +1693,16 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "rds-instance-public-access-check",
-        name: "Checks whether Amazon Relational Database Service (Amazon RDS) instances \
-               are not publicly accessible",
-        description: "Checks whether Amazon Relational Database Service (Amazon RDS) \
-                      instances are not publicly accessible. The rule is NON_COMPLIANT if \
-                      the publiclyAccessible field of the instance configuration is true.",
+        name: "Disallow public access to RDS database instances",
+        // Control Tower's own published description for the control it publishes, which
+        // is what the catalog publishes for a control carrying an `AWS-GR_…` designator.
+        description: "Secure your Amazon RDS database instances by disallowing public \
+                      access.",
         behavior: DETECTIVE,
         severity: CRITICAL,
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("RDS_INSTANCE_PUBLIC_ACCESS_CHECK"),
-        control_tower_identifier: None,
+        control_tower_identifier: Some("AWS-GR_RDS_INSTANCE_PUBLIC_ACCESS_CHECK"),
         designators: NO_DESIGNATORS,
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
@@ -1716,16 +1714,16 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "lambda-function-public-access-prohibited",
-        name: "Checks whether the AWS Lambda function policy attached to the Lambda \
-               resource prohibits public access",
-        description: "Checks whether the AWS Lambda function policy attached to the \
-                      Lambda resource prohibits public access. The rule is NON_COMPLIANT \
-                      if the policy allows public access.",
+        name: "Detect whether the AWS Lambda function policy attached to the Lambda \
+               resource blocks public access",
+        description: "Detects whether the AWS Lambda function policy attached to the \
+                      Lambda resource blocks public access. The rule is NON_COMPLIANT if \
+                      the AWS Lambda function policy allows public access.",
         behavior: DETECTIVE,
         severity: CRITICAL,
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("LAMBDA_FUNCTION_PUBLIC_ACCESS_PROHIBITED"),
-        control_tower_identifier: None,
+        control_tower_identifier: Some("AWS-GR_LAMBDA_FUNCTION_PUBLIC_ACCESS_PROHIBITED"),
         designators: NO_DESIGNATORS,
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
@@ -1737,16 +1735,15 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "eks-endpoint-no-public-access",
-        name: "Checks whether the Amazon Elastic Kubernetes Service (Amazon EKS) endpoint \
-               is not publicly accessible",
-        description: "Checks whether the Amazon Elastic Kubernetes Service (Amazon EKS) \
-                      endpoint is not publicly accessible. The rule is NON_COMPLIANT if \
-                      the cluster's endpoint is publicly accessible.",
+        name: "Detect whether an Amazon EKS endpoint is blocked from public access",
+        description: "Detects whether an Amazon Elastic Kubernetes Service (Amazon EKS) \
+                      endpoint is blocked from public access. The rule is NON_COMPLIANT \
+                      if the Amazon EKS endpoint is publicly accessible.",
         behavior: DETECTIVE,
         severity: HIGH,
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("EKS_ENDPOINT_NO_PUBLIC_ACCESS"),
-        control_tower_identifier: None,
+        control_tower_identifier: Some("AWS-GR_EKS_ENDPOINT_NO_PUBLIC_ACCESS"),
         designators: NO_DESIGNATORS,
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
@@ -1871,17 +1868,18 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "cmk-backing-key-rotation-enabled",
-        name: "Checks if automatic key rotation is enabled for each AWS Key Management \
-               Service (AWS KMS) customer managed key",
-        description: "Checks if automatic key rotation is enabled for each AWS Key \
-                      Management Service (AWS KMS) customer managed key. The rule is \
-                      NON_COMPLIANT if automatic key rotation is not enabled for the key.",
+        name: "Checks if automatic key rotation is enabled for each key and matches to \
+               the key ID of the customer created AWS KMS key",
+        description: "Checks if automatic key rotation is enabled for each key and \
+                      matches to the key ID of the customer created AWS KMS key. The rule \
+                      is NON_COMPLIANT if the AWS Config recorder role for a resource \
+                      does not have the kms:DescribeKey permission.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("CMK_BACKING_KEY_ROTATION_ENABLED"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["CONFIG.KMS.DT.3"],
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
@@ -1892,18 +1890,18 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "mfa-enabled-for-iam-console-access",
-        name: "Checks whether multi-factor authentication (MFA) is enabled for all Amazon \
-               Web Services Identity and Access Management (IAM) users that use a console \
-               password",
-        description: "Checks whether multi-factor authentication (MFA) is enabled for all \
-                      Amazon Web Services Identity and Access Management (IAM) users that \
-                      use a console password. The rule is NON_COMPLIANT if an IAM user \
-                      with a console password has no MFA device enabled.",
+        name: "Disallow console access to IAM users without MFA",
+        // Control Tower's own published description for the control it publishes, as for
+        // the control over every IAM user above (`iam-user-mfa-enabled`).
+        description: "Protect your account by requiring multi-factor authentication (MFA) \
+                      for any AWS Identity and Access Management (IAM) user with console \
+                      access. MFA adds an extra authentication code on top of a user name \
+                      and password.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("MFA_ENABLED_FOR_IAM_CONSOLE_ACCESS"),
-        control_tower_identifier: None,
+        control_tower_identifier: Some("AWS-GR_MFA_ENABLED_FOR_IAM_CONSOLE_ACCESS"),
         designators: NO_DESIGNATORS,
         scope: GLOBAL,
         deployable_regions: NO_REGIONS,
@@ -1985,12 +1983,12 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "vpc-default-security-group-closed",
-        name: "Checks whether the default security group of any Amazon Virtual Private \
-               Cloud (Amazon VPC) does not allow inbound or outbound traffic",
-        description: "Checks whether the default security group of any Amazon Virtual \
-                      Private Cloud (Amazon VPC) does not allow inbound or outbound \
-                      traffic. The rule is NON_COMPLIANT if the default security group \
-                      has one or more inbound or outbound rules.",
+        name: "Checks if the default security group of any Amazon Virtual Private Cloud \
+               (Amazon VPC) does not allow inbound or outbound traffic",
+        description: "Checks if the default security group of any Amazon Virtual Private \
+                      Cloud (Amazon VPC) does not allow inbound or outbound traffic. The \
+                      rule is NON_COMPLIANT if the default security group has one or more \
+                      inbound or outbound traffic rules.",
         behavior: DETECTIVE,
         severity: HIGH,
         implementation_type: CONFIG_RULE,
@@ -2688,6 +2686,73 @@ pub(super) const PUBLISHED_CATALOG_RECORDS: &[PublishedCatalogRecord] = &[
         slug: "vpc-default-security-group-closed",
         identifier: "3ucly6t3j33t5zhbzy45l619n",
         release_time: Some(1_534_291_200),
+    },
+    // The AWS Config-implemented controls the catalog publishes under a `CONFIG.…`
+    // designator whose published identifier and release instant this catalog records
+    // alongside the group above.
+    PublishedCatalogRecord {
+        slug: "api-gw-execution-logging-enabled",
+        identifier: "aayte0p9vah5rp97z6yfbytl2",
+        // The catalog's own release instant for this control, which coincides with the
+        // instant recorded above for the controls released in the same release
+        // (`acm-pca-certificate-authority-tagged`, `securityhub-config-1`) because the
+        // catalog released them together, not because it is inferred from them.
+        release_time: Some(1_779_840_000),
+    },
+    PublishedCatalogRecord {
+        slug: "cmk-backing-key-rotation-enabled",
+        identifier: "7305ygy72ra2amwqjl1bqrmrw",
+        release_time: Some(1_540_339_200),
+    },
+    PublishedCatalogRecord {
+        slug: "dynamodb-table-encrypted-kms",
+        identifier: "a0ufrfbomg90qbskltuop262u",
+        // The catalog's own release instant for this control; it is the instant recorded
+        // above for `rds-snapshot-encrypted` and `redshift-require-tls-ssl` because the
+        // catalog released those controls over encryption at rest together.
+        release_time: Some(1_590_364_800),
+    },
+    PublishedCatalogRecord {
+        slug: "efs-encrypted-check",
+        identifier: "8qmzz7l2841u6bvwpkiug38ta",
+        // The catalog's own release instant for this control, the same instant it dates
+        // `cloudwatch-log-group-encrypted` above with.
+        release_time: Some(1_563_408_000),
+    },
+    PublishedCatalogRecord {
+        slug: "opensearch-encrypted-at-rest",
+        identifier: "70u9gks728rcr33237rckvzbo",
+        release_time: Some(1_637_193_600),
+    },
+    // The Control Tower controls an AWS Config managed rule implements whose published
+    // identifier this catalog records while the instant the catalog released them is not
+    // recorded here: the identifier and the instant are separate published facts, so a
+    // record holds the one this crate holds and the other is derived from the row's slug
+    // (see `super::minted_release_time`).
+    PublishedCatalogRecord {
+        slug: "ec2-instance-no-public-ip",
+        identifier: "4v7xtm83uvvyulk1wwpm4qm3s",
+        release_time: None,
+    },
+    PublishedCatalogRecord {
+        slug: "eks-endpoint-no-public-access",
+        identifier: "aeellyghb27pbehyzua1nyena",
+        release_time: None,
+    },
+    PublishedCatalogRecord {
+        slug: "lambda-function-public-access-prohibited",
+        identifier: "b2gzofz99eb7nsuj5g8wcimse",
+        release_time: None,
+    },
+    PublishedCatalogRecord {
+        slug: "mfa-enabled-for-iam-console-access",
+        identifier: "1fvktjhpo9wdpt3pjb2wsz7nt",
+        release_time: None,
+    },
+    PublishedCatalogRecord {
+        slug: "rds-instance-public-access-check",
+        identifier: "4jc77cq1lcr7g64xywwypykv8",
+        release_time: None,
     },
 ];
 
