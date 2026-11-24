@@ -20,6 +20,12 @@
 //! filtered to one account when the request names one, ascending by account and
 //! then by contract start, and paged by `maxResults`/`nextToken`.
 //!
+//! A `nextToken` is a position among the contracts ONE request selected, so it
+//! carries the selection it was minted under — the period and the account
+//! filter — and a token offered to a request that selects other contracts is
+//! refused with the modeled `ValidationException` rather than applied as a cut
+//! point of that other walk.
+//!
 //! The month a request names is one the shared `BusinessSupportBillingMonth`
 //! shape documents support for — the current month or an earlier one — so a
 //! month that has not begun is refused with the modeled `ValidationException`
@@ -187,30 +193,78 @@ fn invalid_field(member: &str, constraint: &str) -> ListBusinessSupportSubscript
     .into()
 }
 
+/// What the members that choose the sequence this read walks name, in the order
+/// a `nextToken` carries their values: the period a reported contract has to
+/// overlap, and the account a request narrows the history to.
+///
+/// The words the refusal of a token minted for another sequence uses, so the
+/// message names the member that put the caller on another walk.
+const SCOPE_BILLING_PERIOD: &str = "billing period";
+const SCOPE_ACCOUNT_FILTER: &str = "account filter";
+
+/// The period the request asks about as the one scope field a `nextToken`
+/// carries for it: both ends, since both decide which contracts the walk holds.
+///
+/// It is the RESOLVED period rather than the members that spelled it, so two
+/// requests asking about the same period — one naming the billing month, one
+/// naming that month's two bounds as `startDate`/`endDate` — share a scope and
+/// one resumes the other's walk.
+fn billing_period_scope(window_start: f64, window_end: f64) -> String {
+    format!("{window_start}..{window_end}")
+}
+
+/// The account the request narrows the history to, as the scope field a
+/// `nextToken` carries for it: the 12-digit `accountId` it names, or — for a
+/// request that names none, whose answer "includes subscription history for all
+/// accounts" — the empty string, which the modeled `AccountId` pattern
+/// (`^[0-9]{12}$`) admits for no account.
+fn account_filter_scope(account_id: Option<&str>) -> &str {
+    account_id.unwrap_or_default()
+}
+
 /// The contract key a `nextToken` resumes after, or a `ValidationException`
-/// when the token is not one THIS read issued under this store's key — one this
-/// service cannot read back, one a caller assembled, and one it minted for
-/// another of its paginated reads, whose payload is a cut point of another
-/// sequence. The token format and the refusal's wording live in `crate::state`,
+/// when the token is no cut point of the sequence THIS request selects: one this
+/// service cannot read back, one a caller assembled, one it minted for another
+/// of its paginated reads, and one it minted while walking another selection of
+/// contracts — another period, or another account — whose cut point names some
+/// other contract of this walk, or none at all.
+///
+/// A cursor is a position among the entries the request selects, so a token is
+/// usable only by a request that selects the same ones: comparing a cut point of
+/// another selection against these keys would drop every contract of this walk
+/// that sorts at or below it — contracts the walk the token came from never
+/// reported — and answer that truncated page with a 200. `maxResults` is
+/// deliberately NOT part of the scope: a page size is how much of one walk a
+/// caller takes, not which contracts the walk is over.
+///
+/// The token format and the unusable-token wording live in `crate::state`,
 /// shared with this service's other paginated reads.
 fn resume_key(
     key: &crate::state::PageTokenKey,
     read_by: &str,
     token: &str,
+    scope: &[(&str, &str)],
 ) -> Result<String, ListBusinessSupportSubscriptionHistoryError> {
-    crate::state::decode_page_token(key, read_by, token).ok_or_else(|| {
-        ListBusinessSupportSubscriptionHistoryErrorModeled::ValidationException(
-            ValidationException {
-                message: crate::state::PAGE_TOKEN_REFUSAL.to_string(),
-                reason: crate::state::VALIDATION_REASON_CANNOT_PARSE.to_string(),
-                field_list: Some(vec![ValidationExceptionField {
-                    name: "nextToken".to_string(),
-                    message: crate::state::PAGE_TOKEN_FIELD_REFUSAL.to_string(),
-                }]),
-            },
-        )
-        .into()
-    })
+    match crate::state::decode_scoped_page_token(key, read_by, token, scope) {
+        crate::state::ScopedPageToken::Cursor(cursor) => Ok(cursor),
+        crate::state::ScopedPageToken::OtherSequence(names) => Err(invalid_field(
+            "nextToken",
+            &format!("must have been issued for the {names} the request names"),
+        )),
+        crate::state::ScopedPageToken::Unusable => Err(
+            ListBusinessSupportSubscriptionHistoryErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::PAGE_TOKEN_REFUSAL.to_string(),
+                    reason: crate::state::VALIDATION_REASON_CANNOT_PARSE.to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "nextToken".to_string(),
+                        message: crate::state::PAGE_TOKEN_FIELD_REFUSAL.to_string(),
+                    }]),
+                },
+            )
+            .into(),
+        ),
+    }
 }
 
 /// The billing month the request asks about: the one it names, or — from the
@@ -331,9 +385,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The key the store's tokens are authenticated under, taken off the
         // store by value so the walk below can borrow the records it reports.
+        // The sequence this request selects — the period a contract has to
+        // overlap and the account the history is narrowed to — travels in every
+        // `nextToken` of this walk, so a cut point of another selection is
+        // refused instead of being applied to this one.
         let page_key = state.page_token_key();
+        let billing_period = billing_period_scope(window_start, window_end);
+        let scope = [
+            (SCOPE_BILLING_PERIOD, billing_period.as_str()),
+            (
+                SCOPE_ACCOUNT_FILTER,
+                account_filter_scope(input.account_id.as_deref()),
+            ),
+        ];
         let resume_after = match input.next_token.as_deref() {
-            Some(token) => Some(resume_key(&page_key, Self::NAME, token)?),
+            Some(token) => Some(resume_key(&page_key, Self::NAME, token, &scope)?),
             None => None,
         };
         let limit = input
@@ -393,8 +459,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page: Vec<(String, BusinessSupportSubscriptionContract)> =
             remaining.by_ref().take(limit).collect();
         let next_token = if remaining.next().is_some() {
-            page.last()
-                .map(|(key, _)| crate::state::encode_page_token(&page_key, Self::NAME, key))
+            page.last().map(|(key, _)| {
+                crate::state::encode_scoped_page_token(&page_key, Self::NAME, &scope, key)
+            })
         } else {
             None
         };

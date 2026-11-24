@@ -977,7 +977,6 @@ async fn a_support_charge_token_is_a_cut_point_in_one_billing_month() {
 async fn a_token_still_resumes_a_read_whose_members_only_narrow_one_sequence() {
     let (router, engine) = emulator_with_engine();
     seed(&engine);
-    seed_earlier_month(&engine);
     // Two CUSTOM views beside the account's PRIMARY one, so the billing-view
     // list has a walk of three and a type filter narrows it.
     plant_source_views(
@@ -986,12 +985,17 @@ async fn a_token_still_resumes_a_read_whose_members_only_narrow_one_sequence() {
     );
 
     // Each row is a read whose members only choose which entries of ONE ordered
-    // walk are reported: the date range of the account's credit history, the
-    // month a contract of the account's Support history has to overlap, the type
-    // of the account's billing views. The cursor is still a position in that one
-    // walk, so the narrowed request resumes from it rather than refusing it, and
-    // what it reports is exactly the tail of its own walk that follows the
-    // cursor — which each row names.
+    // walk are reported: the date range of the account's credit history and the
+    // type of the account's billing views. The cursor is still a position in
+    // that one walk, so the narrowed request resumes from it rather than
+    // refusing it, and what it reports is exactly the tail of its own walk that
+    // follows the cursor — which each row names.
+    //
+    // `ListBusinessSupportSubscriptionHistory` is NOT a row here: a request that
+    // names another `billingMonth` asks about another PERIOD, which selects
+    // contracts the walked period does not hold rather than a subset of them, so
+    // that read refuses such a token — see
+    // `business_support_subscription_history_token_scope.rs`.
     let rows: Vec<(&'static str, Value, Value, Vec<String>)> = vec![
         (
             "GetCreditAllocationHistory",
@@ -1009,16 +1013,6 @@ async fn a_token_still_resumes_a_read_whose_members_only_narrow_one_sequence() {
             // months the narrowed range covers still follow it (its `endDate`
             // falls in 2025-02, which the month-keyed range includes).
             vec!["2025-02".to_string(), "2025-01".to_string()],
-        ),
-        (
-            "ListBusinessSupportSubscriptionHistory",
-            json!({ "billingMonth": PAST_MONTH }),
-            json!({ "billingMonth": EARLIER_MONTH }),
-            // The walk ascends by account and then by the month a contract
-            // starts in, and the cursor is the lower Business-plan account's
-            // PAST_MONTH contract, so the other account's EARLIER_MONTH
-            // contract is what follows it.
-            vec![THIRD_MEMBER_ACCOUNT_ID.to_string()],
         ),
         (
             "ListBillingViews",

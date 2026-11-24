@@ -40,8 +40,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// A second and third 12-digit account, added to the consolidated billing
 /// family so the payer account's answer covers their bills.
-const MEMBER_ACCOUNT_ID: &str = "123456789012";
-const OTHER_MEMBER_ACCOUNT_ID: &str = "210987654321";
+pub(crate) const MEMBER_ACCOUNT_ID: &str = "123456789012";
+pub(crate) const OTHER_MEMBER_ACCOUNT_ID: &str = "210987654321";
 
 /// A 12-digit account that is NOT in the consolidated billing family, so no
 /// bill of its own belongs to the payer account's answer.
@@ -49,14 +49,14 @@ const OUTSIDE_ACCOUNT_ID: &str = "999999999999";
 
 /// Billing months far enough in the past that the clock cannot move them, so
 /// only the rows about the default month depend on today's date.
-const JANUARY: &str = "2024-01";
-const FEBRUARY: &str = "2024-02";
-const MARCH: &str = "2024-03";
+pub(crate) const JANUARY: &str = "2024-01";
+pub(crate) const FEBRUARY: &str = "2024-02";
+pub(crate) const MARCH: &str = "2024-03";
 const APRIL: &str = "2024-04";
 
 /// One router over ONE shared engine — what `core/router` builds in production,
 /// so every call in a test observes the same state.
-fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -93,12 +93,12 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u1
 }
 
 /// One `ListBusinessSupportSubscriptionHistory` call.
-async fn history(router: &MultiServiceRouter, request: &Value) -> (u16, Value) {
+pub(crate) async fn history(router: &MultiServiceRouter, request: &Value) -> (u16, Value) {
     call(router, "ListBusinessSupportSubscriptionHistory", request).await
 }
 
 /// The `__type` an awsJson error body carries, without its namespace prefix.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -111,7 +111,7 @@ fn error_code(body: &Value) -> String {
 /// An RFC 3339 UTC instant as the epoch seconds the modeled `Timestamp` carries
 /// on the awsJson wire — read from the date text, so an expected contract bound
 /// is never computed by the arithmetic under test.
-fn instant(rfc3339: &str) -> f64 {
+pub(crate) fn instant(rfc3339: &str) -> f64 {
     DateTime::from_str(rfc3339, Format::DateTime)
         .unwrap_or_else(|error| panic!("{rfc3339:?} is an instant: {error}"))
         .as_secs_f64()
@@ -119,7 +119,7 @@ fn instant(rfc3339: &str) -> f64 {
 
 /// Persist one account-month bill recording `plan`, and put the account in the
 /// consolidated billing family unless it is the one deliberately left outside.
-fn persist(
+pub(crate) fn persist(
     engine: &Arc<engine::InMemoryEngine>,
     bills: &[(&'static str, &'static str, &'static str)],
 ) {
@@ -163,7 +163,7 @@ fn resident(engine: &Arc<engine::InMemoryEngine>) -> usize {
 
 /// Every contract a response reports, in the order it reports them, as
 /// (account, plan, contract start, contract end).
-fn reported(body: &Value) -> Vec<(String, String, f64, f64)> {
+pub(crate) fn reported(body: &Value) -> Vec<(String, String, f64, f64)> {
     body["subscriptionContracts"]
         .as_array()
         .unwrap_or_else(|| panic!("the response must carry subscriptionContracts, got {body}"))
