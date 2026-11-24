@@ -54,6 +54,13 @@ use super::bucket_lifecycle::{create_bucket, router, send, Answer};
 #[path = "bucket_encryption/authorization.rs"]
 mod authorization;
 
+/// That the blocked set this subresource REPORTS is the very set a write supplying its own
+/// encryption key is judged by, over the same table of configurations. A child of THIS suite
+/// for the reason the authorization cover is: it drives its puts and its reads through this
+/// module's payload writer and reported-rule reader, and the `#[path]` is what keeps it one.
+#[path = "bucket_encryption/blocked_types_in_force.rs"]
+mod blocked_types_in_force;
+
 /// The XML namespace botocore puts on an S3 request payload.
 ///
 /// `pub(crate)` with the two value lists below it: the delete suite beside this one
