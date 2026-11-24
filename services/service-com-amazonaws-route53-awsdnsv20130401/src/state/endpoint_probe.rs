@@ -29,10 +29,17 @@
 //! (`OperationContext::callback`, the handle the health-check writes hand this plane) and
 //! carries NO credential, which is what a health checker sends: no socket is opened, no name
 //! is resolved and nothing leaves this process, so what a checker can observe is exactly what
-//! a service of this emulator serves to everyone. An endpoint nothing here serves is one no
-//! checker of this emulator can connect to, and it is reported as the transport failure it is
+//! a service of this emulator serves to everyone. What it IS attributed is the checker's own
+//! ADDRESS ([`SOURCE_ADDRESS_HEADER`]): a checker's request arrives from an address inside a
+//! block `GetCheckerIpRanges` publishes — the address the observation is reported under
+//! ([`super::checker_address`]) — and that publication exists so a customer can admit the
+//! checkers and nobody else, so an endpoint whose access control is conditioned on those
+//! blocks answers a probe exactly as it answers Route 53's own. An endpoint nothing here
+//! serves is one no checker of this emulator can connect to, and it is reported as the
+//! transport failure it is
 //! ([`STATUS_CONNECTION_FAILED`]) rather than as a success nothing observed. The one endpoint
-//! a checker does not dial is the API that HOLDS the health check ([`addresses_this_service`]):
+//! a checker does not dial is the API that HOLDS the health check ([`aimed_at_this_service`],
+//! which reads both the address the request is dialled at and the name it carries):
 //! a checker is a client outside the service it reports to, so a probe is never a call back
 //! onto this plane, and one round of probing is bounded as a whole in the time it may take
 //! ([`super::health_check_status`]).
@@ -43,9 +50,9 @@ use ::aws_smithy_types::body::SdkBody;
 use ::smithy_server_runtime::EmbeddedEmulator;
 
 use super::{
-    health_check_member_given, ENDPOINT_HEALTH_CHECK_TYPES, HEALTH_CHECK_TYPE_TCP,
-    STATUS_FAILURE_PREFIX, STATUS_SUCCESS_PREFIX, STATUS_TCP_CONNECTION_ESTABLISHED,
-    STRING_MATCH_HEALTH_CHECK_TYPES, TLS_HEALTH_CHECK_TYPES,
+    checker_address, checker_regions_of, health_check_member_given, ENDPOINT_HEALTH_CHECK_TYPES,
+    HEALTH_CHECK_TYPE_TCP, STATUS_FAILURE_PREFIX, STATUS_SUCCESS_PREFIX,
+    STATUS_TCP_CONNECTION_ESTABLISHED, STRING_MATCH_HEALTH_CHECK_TYPES, TLS_HEALTH_CHECK_TYPES,
 };
 use crate::ops::types::HealthCheckConfig;
 
@@ -104,6 +111,15 @@ const HTTP_PORT: i32 = 80;
 /// is what a request carrying no path addresses.
 const DEFAULT_RESOURCE_PATH: &str = "/";
 
+/// The header a request states the address it was MADE FROM in, and so the header a probe
+/// states the checker's own address ([`ProbeTarget::checker`]) in.
+///
+/// The one spelling every service of this emulator reads a request's source address from
+/// (`aws:SourceIp` in a policy decision, the `sourceIPAddress` of a published event), whose
+/// first entry is the address the request was made from. Nothing of the probe's own identity
+/// travels with it beyond that: a checker holds no credential.
+const SOURCE_ADDRESS_HEADER: &str = "x-forwarded-for";
+
 /// How long one probe waits for the endpoint's answer before reporting that it did not reach
 /// it.
 ///
@@ -157,6 +173,19 @@ pub struct ProbeTarget {
     pub uri: String,
     /// The `Host` header the request carries, which is the name the endpoint serves under.
     pub host: String,
+    /// The ENDPOINT the checker connects to, as the configuration names it and without the
+    /// port: the `IPAddress` where the configuration carries one, else the name
+    /// `FullyQualifiedDomainName` resolves. It is what [`ProbeTarget::uri`]'s authority is
+    /// built from, so it and the `Host` header can name two different hosts — which is why
+    /// the one endpoint a checker does not dial is checked against BOTH
+    /// ([`aimed_at_this_service`]).
+    pub endpoint: String,
+    /// The CHECKER's own address the probe is made from: the address of the first health
+    /// checker the observation is reported under ([`super::checker_address`]), which is an
+    /// address inside a block `GetCheckerIpRanges` publishes. `None` only for a configuration
+    /// no health-checking Region resolves an address for, where the probe states no address of
+    /// its own.
+    pub checker: Option<String>,
 }
 
 /// Where a probe of `config` goes, following `HealthCheckConfig`'s own rules for the endpoint,
@@ -192,7 +221,7 @@ pub fn probe_target(config: &HealthCheckConfig) -> Option<ProbeTarget> {
     let authority = if endpoint.contains(':') {
         format!("[{endpoint}]")
     } else {
-        endpoint
+        endpoint.clone()
     };
     // "If you specify a value of 80 for Port and HTTP or HTTP_STR_MATCH for Type, Route 53
     // passes the value of FullyQualifiedDomainName to the endpoint in the Host header […] If
@@ -207,7 +236,26 @@ pub fn probe_target(config: &HealthCheckConfig) -> Option<ProbeTarget> {
     Some(ProbeTarget {
         uri: format!("{scheme}://{authority}:{port}{}", resource_path(config)),
         host,
+        endpoint,
+        checker: checker_source_address(config),
     })
+}
+
+/// The address a probe of `config` is made FROM: the address of the first health checker the
+/// observation is reported under — the Regions this check is checked from in the modelled
+/// `HealthCheckRegion` order ([`checker_regions_of`]), each with the address it reports under
+/// ([`checker_address`]).
+///
+/// `GetCheckerIpRanges` publishes "a list of the IP ranges used by Amazon Route 53 health
+/// checkers to check the health of your resources", which exists so a customer can admit the
+/// checkers and nobody else; a checker's request therefore arrives from an address inside one
+/// of those blocks, and this is that address. The reported observation and the request are
+/// attributed the SAME address, so what a peer endpoint's access control reads is the address
+/// the API says the checker checks from.
+fn checker_source_address(config: &HealthCheckConfig) -> Option<String> {
+    checker_regions_of(config)
+        .into_iter()
+        .find_map(checker_address)
 }
 
 /// The path a probe of `config` requests: `ResourcePath` as it was given — "the path, if any,
@@ -244,7 +292,7 @@ pub async fn probe(
     // came back round onto this plane would be a checker assessing the thing that made it —
     // and the answer it carried would say nothing about any endpoint. Nothing dials it, so
     // nothing answers the checker, which is the report below.
-    if addresses_this_service(&target.host) {
+    if aimed_at_this_service(&target) {
         return Some(ProbeReport::failed(STATUS_CONNECTION_FAILED.to_string()));
     }
     Some(match fetch(transport, &target).await {
@@ -255,13 +303,50 @@ pub async fn probe(
     })
 }
 
+/// Whether a probe of `target` would reach THIS service's own API at all.
+///
+/// BOTH names the target carries are read, because a configuration can carry two: the request
+/// is dialled at [`ProbeTarget::endpoint`] (the `IPAddress` where one is given) while it
+/// carries [`ProbeTarget::host`] as its `Host` header (the
+/// `FullyQualifiedDomainName` where one is given), so a check naming this plane as the address
+/// to connect to and anything at all as the name would otherwise be dialled — a probe round is
+/// driven from the status plane, so a probe that re-entered it would make a checker's work
+/// recurse. Either name reaching this service is the fact [`probe`] reports as the connection
+/// nothing made.
+fn aimed_at_this_service(target: &ProbeTarget) -> bool {
+    [target.endpoint.as_str(), target.host.as_str()]
+        .into_iter()
+        .any(addresses_this_service)
+}
+
 /// Whether `host` addresses THIS service's own API — the plane that holds the health check and
 /// makes the probe — read by the front door's own host reader
 /// (`service_common::data_plane_addressing::service_named_by_host`), so a probe reads a host
 /// exactly as the router routes one.
+///
+/// The PORT is taken off first: a `Host` header carries one for a port the scheme is not served
+/// on ([`probe_target`]), and a port is not part of the name the router reads.
 fn addresses_this_service(host: &str) -> bool {
-    ::service_common::data_plane_addressing::service_named_by_host(host)
+    ::service_common::data_plane_addressing::service_named_by_host(named_host(host))
         .is_some_and(|named| named == OWN_ENDPOINT_PREFIX)
+}
+
+/// `host` without the port an authority or a `Host` header may carry, which is not part of the
+/// name: a bracketed IPv6 literal is the address between its brackets, and a name is everything
+/// in front of a trailing `:<port>`. A bare IPv6 literal carries colons of its own and keeps
+/// them.
+fn named_host(host: &str) -> &str {
+    if let Some(bracketed) = host.strip_prefix('[') {
+        return bracketed.split(']').next().unwrap_or(bracketed);
+    }
+    match host.rsplit_once(':') {
+        Some((name, port))
+            if !name.contains(':') && !port.is_empty() && port.chars().all(|digit| digit.is_ascii_digit()) =>
+        {
+            name
+        }
+        _ => host,
+    }
 }
 
 /// What the criterion `config`'s `Type` sets makes of an answer: `status` came back from the
@@ -353,12 +438,21 @@ enum Fetched {
 /// own and nothing of the service's. So a probe observes exactly what the endpoint serves to
 /// everyone — a surface this emulator serves unsigned answers it, and one that requires a
 /// signature answers its own refusal, which is reported as the answer it is.
+///
+/// It does state WHERE IT CAME FROM ([`ProbeTarget::checker`], stated in
+/// [`SOURCE_ADDRESS_HEADER`]): a checker's request arrives from one of the published checker
+/// addresses, which is what an endpoint admitting exactly those blocks answers normally and
+/// what every service of this emulator reads a request's source address from.
 async fn fetch(transport: &EmbeddedEmulator, target: &ProbeTarget) -> Fetched {
     use ::aws_smithy_runtime_api::client::http::HttpConnector as _;
 
-    let built = ::http::Request::get(target.uri.as_str())
-        .header(::http::header::HOST, target.host.as_str())
-        .body(SdkBody::empty());
+    let building = ::http::Request::get(target.uri.as_str())
+        .header(::http::header::HOST, target.host.as_str());
+    let building = match target.checker.as_deref() {
+        Some(checker) => building.header(SOURCE_ADDRESS_HEADER, checker),
+        None => building,
+    };
+    let built = building.body(SdkBody::empty());
     let Ok(request) = built else {
         // A URI or a host the transport cannot even be handed is an endpoint nothing was
         // asked about, which is the same fact as one nothing serves.
@@ -732,6 +826,182 @@ mod tests {
                  {target:?}",
                 row.uri,
                 row.host
+            );
+        }
+    }
+
+    /// Whether `address` lies inside the `a.b.c.d/nn` block `cidr`.
+    ///
+    /// The test's own reading of a published block, so the probe plane and this table cannot
+    /// agree on a wrong one.
+    fn inside(cidr: &str, address: &str) -> bool {
+        let (network, prefix) = cidr
+            .split_once('/')
+            .unwrap_or_else(|| panic!("the published block {cidr:?} carries a prefix length"));
+        let network: u32 = network
+            .parse::<::std::net::Ipv4Addr>()
+            .unwrap_or_else(|_| panic!("the published block {cidr:?} carries an address"))
+            .into();
+        let address: u32 = address
+            .parse::<::std::net::Ipv4Addr>()
+            .unwrap_or_else(|_| panic!("the checker address {address:?} is an address"))
+            .into();
+        let prefix: u32 = prefix
+            .parse()
+            .unwrap_or_else(|_| panic!("the published block {cidr:?} carries a prefix length"));
+        // The published bounds of an IPv4 prefix length: a /0 covers the whole space and a /32
+        // one address, so anything past 32 is not a block at all.
+        assert!(
+            prefix <= 32,
+            "the published block {cidr:?} carries a prefix length of at most 32"
+        );
+        let mask = u32::MAX.checked_shl(32 - prefix).unwrap_or(0);
+        network & mask == address & mask
+    }
+
+    #[test]
+    fn the_probe_is_made_from_the_address_of_the_checker_it_is_reported_under() {
+        // A checker's request arrives from an address inside a block `GetCheckerIpRanges`
+        // publishes, which is the address the observation is reported under. The rows differ
+        // along what decides WHICH checker that is — the Regions the configuration asks to be
+        // checked from: none named (every health-checking Region), one named, several named,
+        // the last of them named, and a Region the enum does not carry beside one it does.
+        let every: Vec<String> = Vec::new();
+        let rows: Vec<(&str, Option<Vec<String>>)> = vec![
+            ("no Region named, so every health checker", None),
+            ("an empty Region list, read the same way", Some(every)),
+            (
+                "one Region named",
+                Some(vec!["eu-west-1".to_string()]),
+            ),
+            (
+                "several Regions named, reported in the modelled order",
+                Some(vec!["us-west-2".to_string(), "ap-southeast-1".to_string()]),
+            ),
+            (
+                "the last Region of the modelled list",
+                Some(vec!["us-west-2".to_string()]),
+            ),
+            (
+                "a Region the enum does not carry beside one it does",
+                Some(vec!["eu-central-9".to_string(), "sa-east-1".to_string()]),
+            ),
+        ];
+        let blocks = crate::state::checker_ip_ranges();
+        for (case, regions) in rows {
+            for kind in ENDPOINT_HEALTH_CHECK_TYPES {
+                let config = HealthCheckConfig {
+                    regions: regions.clone(),
+                    ..config(kind, "MARKER")
+                };
+                let target = probe_target(&config)
+                    .unwrap_or_else(|| panic!("case {case:?} ({kind}): an endpoint check has a target"));
+                let checker = target.checker.clone().unwrap_or_else(|| {
+                    panic!("case {case:?} ({kind}): expected the probe to state a checker address, got {target:?}")
+                });
+                // It is the address the FIRST checker the observation is reported under
+                // reports from, and it lies inside a published block — the two facts an
+                // endpoint admitting exactly those blocks is checked by.
+                let reported = checker_regions_of(&config)
+                    .into_iter()
+                    .find_map(checker_address);
+                assert_eq!(
+                    Some(checker.clone()),
+                    reported,
+                    "case {case:?} ({kind}): expected the probe to be made from the address of \
+                     the checker it is reported under, got {checker:?} against {reported:?}"
+                );
+                assert!(
+                    blocks.iter().any(|block| inside(block, &checker)),
+                    "case {case:?} ({kind}): expected {checker:?} inside a block \
+                     GetCheckerIpRanges publishes, got none of {blocks:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_probe_is_never_aimed_at_the_api_that_holds_the_health_check() {
+        // A configuration carries TWO names — the endpoint the checker connects to
+        // (`IPAddress`) and the name the request carries (`FullyQualifiedDomainName`) — and
+        // either of them naming this service's own API is a probe that would come back round
+        // onto the plane that made it. The rows differ along WHICH member names it, the port
+        // (the one the scheme is served on, which the `Host` header carries no port for, and
+        // another, which it does), the root label's dot, and an endpoint of another service of
+        // this emulator, which a checker does dial.
+        let rows: [(&str, &str, &str, Option<i32>, bool); 8] = [
+            (
+                "the name is this service's own endpoint",
+                "",
+                "route53.amazonaws.com",
+                Some(80),
+                true,
+            ),
+            (
+                "the name is this service's own endpoint on another port",
+                "",
+                "route53.amazonaws.com",
+                Some(8080),
+                true,
+            ),
+            (
+                "the name is this service's own endpoint, written with the root label's dot",
+                "",
+                "route53.amazonaws.com.",
+                None,
+                true,
+            ),
+            (
+                "the ADDRESS the checker connects to is this service, behind another name",
+                "route53.amazonaws.com",
+                "site.example.com",
+                Some(80),
+                true,
+            ),
+            (
+                "the address is this service on a port of its own",
+                "route53.amazonaws.com",
+                "site.example.com",
+                Some(8080),
+                true,
+            ),
+            (
+                "a regional endpoint of this service",
+                "",
+                "route53.us-west-2.amazonaws.com",
+                None,
+                true,
+            ),
+            (
+                "another service of this emulator, which a checker does dial",
+                "",
+                "site.s3-website-us-west-2.amazonaws.com",
+                Some(80),
+                false,
+            ),
+            (
+                "an endpoint of the caller's own",
+                "192.0.2.10",
+                "site.example.com",
+                Some(8080),
+                false,
+            ),
+        ];
+        for (case, address, domain, port, own) in rows {
+            let config = HealthCheckConfig {
+                r#type: "HTTP_STR_MATCH".to_string(),
+                ip_address: (!address.is_empty()).then(|| address.to_string()),
+                fully_qualified_domain_name: (!domain.is_empty()).then(|| domain.to_string()),
+                port,
+                search_string: Some("MARKER".to_string()),
+                ..HealthCheckConfig::default()
+            };
+            let target = probe_target(&config)
+                .unwrap_or_else(|| panic!("case {case:?}: an endpoint check has a target"));
+            assert_eq!(
+                aimed_at_this_service(&target),
+                own,
+                "case {case:?}: expected aimed at this service {own}, got {target:?}"
             );
         }
     }

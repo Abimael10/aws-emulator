@@ -120,41 +120,31 @@ const EVENT_DETAIL_SEPARATOR: char = ':';
 /// The `s3:<Type>:*` suffix that stands for every event of one type.
 const EVENT_WILDCARD_SUFFIX: &str = ":*";
 
-/// The header a proxy in front of this emulator states the address it forwarded a request
-/// for in, whose FIRST entry is the client's own — the same reading every other service in
-/// this tree takes of a request's source address.
-const FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
-
-/// The address a request carries when nothing forwarded it: this emulator serves its API
-/// over the loopback interface, so a connection that reached it came from the local host.
-const LOOPBACK_SOURCE_ADDRESS: &str = "127.0.0.1";
+/// The header a request states the address it was made from in, whose FIRST entry is the
+/// client's own — the one spelling this service reads it under
+/// ([`super::FORWARDED_FOR_HEADER`]).
+const FORWARDED_FOR_HEADER: &str = super::FORWARDED_FOR_HEADER;
 
 /// The address the request `parts` was made from, as a published event states it.
 ///
-/// Read from the CONNECTION rather than from anything the request body says: the first
-/// entry of [`FORWARDED_FOR_HEADER`] when a proxy stated the client it forwarded for, and
-/// otherwise [`LOOPBACK_SOURCE_ADDRESS`], the host every connection to this emulator is
-/// made from — the same reading this tree's other services take of a request's source
-/// address.
+/// Read from the CONNECTION rather than from anything the request body says, through the one
+/// reading this service takes of that question ([`super::stated_source_address`]): the first
+/// entry of [`FORWARDED_FOR_HEADER`] when a request stated the client it was forwarded for,
+/// and otherwise the loopback host every connection to this emulator is made from — the same
+/// address a policy decision about the request's network is taken against
+/// ([`super::source_address`]), so an event's `sourceIPAddress` and an `aws:SourceIp` clause
+/// cannot name two different addresses for one request.
 ///
 /// The member this fills is an ADDRESS ("`sourceIPAddress`: IP address where request came
-/// from"), so the forwarded entry is published only when it IS one: a header carrying
-/// anything else names no address this event could report and is answered with the
-/// loopback host, which also bounds the value a record carries to one parsed address
-/// however long a header the transport accepted.
+/// from"), so the stated entry is published only when it IS one.
 #[must_use]
 pub fn request_source_address(parts: &::http::request::Parts) -> String {
-    parts
-        .headers
-        .get(FORWARDED_FOR_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').next())
-        .map(str::trim)
-        .and_then(|address| address.parse::<::std::net::IpAddr>().ok())
-        .map_or_else(
-            || LOOPBACK_SOURCE_ADDRESS.to_string(),
-            |address| address.to_string(),
-        )
+    super::stated_source_address(
+        parts
+            .headers
+            .get(FORWARDED_FOR_HEADER)
+            .and_then(|value| value.to_str().ok()),
+    )
 }
 
 /// Which object change happened, which is what decides the `Event` value a configuration

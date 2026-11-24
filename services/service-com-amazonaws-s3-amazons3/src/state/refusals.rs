@@ -2617,16 +2617,35 @@ const VALUE_SPACE_PREFIXES: [(&str, &str); 7] = [
 /// about it states nothing. The caller is passed with NO principal spellings at all, which
 /// is exactly what the anonymous caller is: only a statement whose principal element reaches
 /// EVERY principal is about its request, and one naming an account or a role is not.
+///
+/// The request's own NETWORK is answered beside it ([`source_ip_conditions`], the keys this
+/// decision publishes): a grant to every principal conditioned on `aws:SourceIp` is the
+/// documented way to publish content to a set of addresses and to nobody else — the shape a
+/// bucket admitting a service's published checker blocks carries — so such a clause is
+/// DECIDED against the address the request was made from rather than left undecided, which
+/// would grant nothing to anybody.
 pub fn policy_decision_for_anonymous(
     policy: &str,
     action: &str,
     resource: &str,
 ) -> ::service_common::iam_authorization::Decision {
+    let context = source_ip_conditions();
     ::service_common::iam_authorization::resource_decision(
         policy,
-        &::service_common::iam_authorization::Request::new(action, resource, &[]),
+        &::service_common::iam_authorization::Request::new(action, resource, &[])
+            .with_context(&context)
+            .with_published_keys(ANONYMOUS_PUBLISHED_CONDITION_KEYS),
     )
 }
+
+/// The condition keys the ANONYMOUS decision ([`policy_decision_for_anonymous`]) ANSWERS, and
+/// so declares this service models for it: the address the request was made from.
+///
+/// Absence of a published key from the context means "the request carries no value", which IAM
+/// reads under a negated operator, an `IfExists` spelling and a `Null` clause; every other key
+/// leaves its statement undecided. This decision names no principal at all, so it publishes
+/// none of the keys that describe one.
+const ANONYMOUS_PUBLISHED_CONDITION_KEYS: &[&str] = &[SOURCE_IP_KEY];
 
 /// The IAM action an object READ is authorized under: "To use `GetObject`, you must have
 /// the `READ` access to the object (or version)" (`GetObject`'s own documentation), which
@@ -2660,7 +2679,7 @@ pub(super) const SECURE_TRANSPORT_VALUE: &str = "true";
 /// The condition keys a request judged here carries a value for, and so DECLARES it models
 /// — the keys whose absence from a policy's clause is decided rather than unknown. Every
 /// other key keeps the fail-closed reading ([`Bucket::caller_is_denied`]).
-pub(super) const REQUEST_CONDITION_KEYS: &[&str] = &[SECURE_TRANSPORT_KEY];
+pub(super) const REQUEST_CONDITION_KEYS: &[&str] = &[SECURE_TRANSPORT_KEY, SOURCE_IP_KEY];
 
 /// The condition-key FAMILY the TAGS of the bucket a request addressed are named in, each
 /// member after the tag key it carries: `aws:ResourceTag/Team` holds the value of the bucket

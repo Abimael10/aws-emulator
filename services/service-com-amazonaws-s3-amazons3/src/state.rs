@@ -4546,6 +4546,9 @@ mod refusals;
 mod renames;
 // One session `CreateSession` vended, and what it is scoped to.
 mod sessions;
+// The address the request being served was made from, and the condition key a clause about
+// the requester's network is decided against.
+pub mod source_address;
 // The bucket map itself, and the operations the store performs on it.
 mod store;
 // The customer-provided key an SSE-C write supplies, and what a read of such an object must
@@ -4580,6 +4583,7 @@ pub use sse_customer::{
     customer_key_encryption, read_refusal, requested_customer_key, CustomerKey,
     CustomerKeyRejection, SSE_CUSTOMER_ALGORITHM,
 };
+pub use source_address::*;
 pub use store::*;
 pub use tag_key_origin::*;
 pub use uploads::*;

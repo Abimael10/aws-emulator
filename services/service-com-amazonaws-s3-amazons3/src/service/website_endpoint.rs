@@ -265,6 +265,18 @@ impl<Eng: Send + Sync + 'static> WebsiteEndpoint<Eng> {
     /// Serve one website-endpoint request.
     fn serve(&self, ctx: &OperationContext<'_>) -> RtResponse {
         let parts = ctx.parts();
+        // The ADDRESS this request was made from, recorded before anything is decided about
+        // what the site serves it: every website request is the ANONYMOUS principal's, so
+        // what it may read is what the bucket grants to EVERYONE — and a grant conditioned
+        // on the requester's network is decided against that address
+        // ([`crate::state::source_address`]). This surface is served outside the wire codec,
+        // which is where every other request of this service records it.
+        crate::state::source_address::remember(
+            parts
+                .headers
+                .get(crate::state::FORWARDED_FOR_HEADER)
+                .and_then(|value| value.to_str().ok()),
+        );
         let Some(addressed) = addressed_website(parts) else {
             // Nothing routes here without one of this surface's two addresses, so this cannot
             // be reached; a bare 404 is the honest answer to an address that names no bucket

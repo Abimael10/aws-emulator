@@ -1618,18 +1618,42 @@ fn elements_as_attributes(document: &[u8]) -> Option<Vec<u8>> {
 /// two components off a request URI, and one reader for both keeps the request this
 /// service ROUTES and the request it DESERIALIZES from disagreeing about which path and
 /// which query string arrived.
+///
+/// The QUERY is split off FIRST, and only then is an authority looked for: a server request
+/// arrives in origin form (`/<bucket>/<key>?<query>`), so a `://` anywhere in such a URI is
+/// part of the query or of an object key rather than a scheme separator — and a path read
+/// from after it would be one the request never addressed, while every address decision of
+/// this module (which bucket, which access point, which labels) is taken from this one value.
+/// An absolute-form URI is still read as one, because what precedes its separator is a SCHEME:
+/// the characters a scheme is spelled in ("ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )",
+/// RFC 3986 §3.1), starting at the very beginning of the URI.
 pub(super) fn request_path(uri: &str) -> &str {
-    let after_authority = match uri.find("://") {
-        None => uri,
-        Some(scheme_end) => match uri[scheme_end + 3..].find('/') {
+    let path_and_authority = uri.split('?').next().unwrap_or(uri);
+    match authority_separator(path_and_authority) {
+        None => path_and_authority,
+        Some(scheme_end) => match path_and_authority[scheme_end + 3..].find('/') {
             None => "/",
-            Some(path_start) => &uri[scheme_end + 3 + path_start..],
+            Some(path_start) => &path_and_authority[scheme_end + 3 + path_start..],
         },
-    };
-    after_authority
-        .split('?')
+    }
+}
+
+/// Where the `://` that separates a SCHEME from an authority sits in `uri`, or `None` for a
+/// URI in the origin form a server request arrives in.
+///
+/// It is a separator only when everything in front of it is a scheme and the scheme opens the
+/// URI: "scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )" (RFC 3986 §3.1). So a `://` that
+/// a path or a key happens to carry separates nothing.
+fn authority_separator(uri: &str) -> Option<usize> {
+    let separator = uri.find("://")?;
+    let scheme = uri.get(..separator)?;
+    let mut characters = scheme.chars();
+    let opens = characters
         .next()
-        .unwrap_or(after_authority)
+        .is_some_and(|first| first.is_ascii_alphabetic());
+    let spelled = characters
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.'));
+    (opens && spelled).then_some(separator)
 }
 
 /// The query component of a request URI (everything after the first `?`), or the empty
@@ -3374,6 +3398,15 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         // records `None` rather than leaving the previous request's note behind.
         let through_access_point = self.served_access_point(request);
         crate::state::access_points::remember(through_access_point.clone());
+        // And the ADDRESS the request was made FROM, for the decisions taken about the network
+        // it arrived over: a bucket policy clause over `aws:SourceIp` confines a grant — or a
+        // refusal — to a set of addresses, and the seams that decide one are handed the store
+        // rather than the request (see [`crate::state::source_address`]). Recorded for EVERY
+        // request this service reads, so the note a decision reads is always its own
+        // request's.
+        crate::state::source_address::remember(
+            request.headers().get(crate::state::FORWARDED_FOR_HEADER),
+        );
         // The request's address in the PATH-STYLE form every route of this service is bound
         // in ([`Self::path_style_path`]), which is the path the three notes below and the
         // `@httpLabel` members are read from: a virtual-hosted-style request's bucket comes
@@ -3842,5 +3875,74 @@ impl ServerProtocol for UnwrappedXmlRestXml {
     ) -> Result<Self::Response, ProtocolError> {
         self.inner
             .serialize_event_stream_message(event_type, is_exception, event, event_schema)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_path_read_off_a_request_is_the_one_it_addressed() {
+        // Every address decision of this module is taken from this one reader, so the rows
+        // differ along the FORM the URI arrives in and along what the parts of it that are
+        // not the request target happen to carry: the origin form a server request arrives
+        // in, the absolute form, a query, a query whose own value spells a URI, an object key
+        // that spells one, and an authority with no path at all.
+        let rows: [(&str, &str, &str, &str); 9] = [
+            ("the origin form", "/bucket/key", "/bucket/key", ""),
+            ("the origin form with a query", "/bucket/key?acl", "/bucket/key", "acl"),
+            ("the service root", "/", "/", ""),
+            (
+                "a query whose value spells a URI",
+                "/bucket/key?website-redirect=http://alias/evil",
+                "/bucket/key",
+                "website-redirect=http://alias/evil",
+            ),
+            (
+                "a key that spells a URI",
+                "/bucket/https://alias/evil",
+                "/bucket/https://alias/evil",
+                "",
+            ),
+            (
+                "the absolute form",
+                "https://s3.us-east-1.amazonaws.com/bucket/key",
+                "/bucket/key",
+                "",
+            ),
+            (
+                "the absolute form with a query",
+                "https://s3.us-east-1.amazonaws.com/bucket/key?uploads",
+                "/bucket/key",
+                "uploads",
+            ),
+            (
+                "an authority with no path",
+                "https://s3.us-east-1.amazonaws.com",
+                "/",
+                "",
+            ),
+            (
+                "an authority with no path and a query",
+                "https://s3.us-east-1.amazonaws.com?list-type=2",
+                "/",
+                "list-type=2",
+            ),
+        ];
+        for (case, uri, path, query) in rows {
+            assert_eq!(
+                request_path(uri),
+                path,
+                "case {case:?}: expected the path {path:?} of {uri:?}, got {:?}",
+                request_path(uri)
+            );
+            assert_eq!(
+                request_query(uri),
+                query,
+                "case {case:?}: expected the query {query:?} of {uri:?}, got {:?}",
+                request_query(uri)
+            );
+        }
     }
 }

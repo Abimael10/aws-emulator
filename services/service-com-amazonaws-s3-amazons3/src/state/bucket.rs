@@ -684,7 +684,9 @@ impl Bucket {
     /// over one of them is DECIDED: the guardrail clause AWS publishes for a bucket policy —
     /// a `Deny` of everything that did not arrive over a secure transport — holds for no
     /// request this emulator serves, and the same clause stated the other way holds for
-    /// every one. A bucket under ABAC answers the keys naming its own tags beside them
+    /// every one; and a clause over the requester's own ADDRESS is decided against the
+    /// address the request was made from ([`crate::state::source_ip_conditions`]). A bucket
+    /// under ABAC answers the keys naming its own tags beside them
     /// ([`Bucket::resource_tag_conditions`]), so a `Deny` conditioned on one of those is
     /// decided here too.
     ///
@@ -713,6 +715,11 @@ impl Bucket {
             SECURE_TRANSPORT_KEY.to_string(),
             SECURE_TRANSPORT_VALUE.to_string(),
         )];
+        // And the NETWORK the request arrived from, which is what a clause over the
+        // requester's address is decided against ([`crate::state::source_ip_conditions`]) —
+        // the same value the full authorization gate and the anonymous decision answer that
+        // key with.
+        context.extend(crate::state::source_ip_conditions());
         // The bucket's own TAGS, which a clause over the resource-tag family is decided
         // against while ABAC is enabled on it ([`Bucket::resource_tag_conditions`]) — the
         // same keys the full authorization gate answers for a request addressed here.
@@ -1128,7 +1135,8 @@ impl Bucket {
     ///   that is ignored admits nobody;
     /// * a bucket policy statement that allows [`GET_OBJECT_ACTION`] on this object to
     ///   every principal ([`policy_decision_for_anonymous`]) — unless
-    ///   `RestrictPublicBuckets` is on, which "restricts access to … buckets with public
+    ///   `RestrictPublicBuckets` is on AND this bucket's policy is PUBLIC, which
+    ///   "restricts access to … buckets with public
     ///   policies to only AWS service principals and authorized users within the bucket
     ///   owner's account" (`PublicAccessBlockConfiguration$RestrictPublicBuckets`), a set
     ///   this caller is in neither of. An explicit `Deny` refuses the read whatever the
@@ -1200,11 +1208,17 @@ impl Bucket {
     /// ignored admits nobody. The bucket policy is then asked about the request
     /// ([`policy_decision_for_anonymous`], which reaches a statement whose principal element
     /// names every principal and no other), and a grant it makes is withheld while
-    /// `RestrictPublicBuckets` is on — which "restricts access to … buckets with public
-    /// policies to only AWS service principals and authorized users within the bucket owner's
-    /// account" (`PublicAccessBlockConfiguration$RestrictPublicBuckets`), a set this caller is
-    /// in neither of. An explicit `Deny` refuses the call whatever the ACL grants, the way IAM
-    /// combines the two.
+    /// `RestrictPublicBuckets` is on AND this bucket's policy is PUBLIC — the setting
+    /// "restricts access to … buckets with PUBLIC policies to only AWS service principals and
+    /// authorized users within the bucket owner's account"
+    /// (`PublicAccessBlockConfiguration$RestrictPublicBuckets`), a set this caller is in
+    /// neither of. WHICH policies those are is the one classification this service makes of a
+    /// document ([`policy_grants_public_access`], what `GetBucketPolicyStatus` reports and what
+    /// `BlockPublicPolicy` refuses a put of): a statement held back by a `Condition` fixing the
+    /// values of one of the keys that name identities or sources — a grant to a set of
+    /// ADDRESSES, the documented way to publish content to named networks while Block Public
+    /// Access is on — is not public, so this setting does not withhold its grant. An explicit
+    /// `Deny` refuses the call whatever the ACL grants, the way IAM combines the two.
     ///
     /// A Requester Pays bucket refuses it ahead of all of that
     /// ([`Self::requester_pays_anonymous_refusal`]): there is no account to charge. And a
@@ -1232,8 +1246,16 @@ impl Bucket {
         if let Some(message) = self.requester_pays_anonymous_refusal() {
             return Some(message);
         }
+        // `RestrictPublicBuckets` restricts the grants of a PUBLIC policy and no others, so
+        // the setting is read together with this bucket's own document: a policy restricted to
+        // fixed values of one of the keys that name identities or sources is not public, and
+        // the access it grants is the access it names.
         let restricted = settings_in_force(self.public_access_block(), account)
-            .restrict_public_buckets;
+            .restrict_public_buckets
+            && self
+                .policy
+                .as_deref()
+                .is_some_and(policy_grants_public_access);
         let by_policy = self
             .policy
             .as_deref()

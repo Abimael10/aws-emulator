@@ -1484,14 +1484,7 @@ impl StoredHealthCheck {
     /// that value list rather than by the request keeps two reads of one health
     /// check in the same order, and drops a Region the enum does not carry.
     pub fn checker_regions(&self) -> Vec<&'static str> {
-        let requested = self.config.regions.as_deref().unwrap_or(&[]);
-        HEALTH_CHECK_REGION_VALUES
-            .iter()
-            .copied()
-            .filter(|region| {
-                requested.is_empty() || requested.iter().any(|asked| asked == region)
-            })
-            .collect()
+        checker_regions_of(&self.config)
     }
 
     /// The instant of the most recent probe of this health check's endpoint, in
@@ -1623,6 +1616,28 @@ pub const STATUS_SUCCESS_PREFIX: &str = "Success: ";
 /// reader of its current status describe one probe the same way.
 pub const STATUS_FAILURE_PREFIX: &str = "Failure: ";
 
+/// The health-checking Regions a health check whose configuration is `config` is
+/// checked from, in the modelled `HealthCheckRegion` order — the one reading of
+/// that rule, which both a stored check's own report
+/// ([`StoredHealthCheck::checker_regions`]) and the probe plane that has only a
+/// configuration in hand ([`endpoint_probe`]) ask.
+///
+/// `HealthCheckConfig$Regions` is "one Region element for each region from which
+/// you want Amazon Route 53 health checkers to check the specified endpoint",
+/// and "if you don't specify any regions, Route 53 health checkers automatically
+/// performs checks from all of the regions that are listed under Valid Values" —
+/// the `HealthCheckRegion` values. Ordering by that value list rather than by the
+/// request keeps two reads of one health check in the same order, and drops a
+/// Region the enum does not carry.
+pub fn checker_regions_of(config: &HealthCheckConfig) -> Vec<&'static str> {
+    let requested = config.regions.as_deref().unwrap_or(&[]);
+    HEALTH_CHECK_REGION_VALUES
+        .iter()
+        .copied()
+        .filter(|region| requested.is_empty() || requested.iter().any(|asked| asked == region))
+        .collect()
+}
+
 /// The address the health checker in `region` reports from, when `region` is one
 /// the service checks from.
 ///
@@ -1636,6 +1651,11 @@ pub const STATUS_FAILURE_PREFIX: &str = "Failure: ";
 /// address inside that block. It is a function of those two tables alone, so
 /// every read of one health check reports the same checker address, and every
 /// address it reports is inside a block `GetCheckerIpRanges` publishes.
+///
+/// It is also the address the checker's own PROBE of the endpoint is made FROM
+/// ([`endpoint_probe::probe_target`]): the address a checker reports under is the
+/// address its request arrives from, which is what lets an endpoint admit the
+/// published checker blocks and nobody else and still be checked.
 pub fn checker_address(region: &str) -> Option<String> {
     let position = HEALTH_CHECK_REGION_VALUES
         .iter()

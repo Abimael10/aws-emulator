@@ -16,8 +16,8 @@
 //! * the CONTEXT the request carries — the condition keys a statement may be written over,
 //!   taken from the request's own members ([`ObjectWriteContext`]) and from the facts this
 //!   gate holds for every request ([`global_conditions`]: who the caller is, its unique id,
-//!   which account it and the resource belong to, and the Region the request addressed;
-//!   [`multi_factor_auth_conditions`]: whether the credential that
+//!   which account it and the resource belong to, the Region the request addressed and the
+//!   ADDRESS it was made from; [`multi_factor_auth_conditions`]: whether the credential that
 //!   signed was MFA-backed) — so a clause over one of them is DECIDED rather than
 //!   unknown, which is what makes a policy that conditions a write on an encryption header,
 //!   or a grant that conditions a read on the resource's owning account, enforceable at all;
@@ -39,8 +39,8 @@ use ::service_common::iam_authorization::{
 };
 
 use crate::state::{
-    caller_principal_arn, explicit_resource_policy_denial, ACCESS_DENIED_CODE,
-    ACCESS_DENIED_MESSAGE, ACCESS_DENIED_STATUS,
+    caller_principal_arn, explicit_resource_policy_denial, source_ip_conditions,
+    ACCESS_DENIED_CODE, ACCESS_DENIED_MESSAGE, ACCESS_DENIED_STATUS, SOURCE_IP_KEY,
 };
 
 /// The condition key saying whether the request arrived over a secure transport: "whether
@@ -252,6 +252,7 @@ const DATA_ACCESS_POINT_ACCOUNT_KEY: &str = "s3:DataAccessPointAccount";
 /// tests holds the two to that relation.
 pub const PUBLISHED_CONDITION_KEYS: &[&str] = &[
     SECURE_TRANSPORT_KEY,
+    SOURCE_IP_KEY,
     ACL_KEY,
     STORAGE_CLASS_KEY,
     SERVER_SIDE_ENCRYPTION_KEY,
@@ -287,6 +288,7 @@ pub const PUBLISHED_CONDITION_KEYS: &[&str] = &[
 /// decides one.
 pub const CALLER_FREE_CONDITION_KEYS: &[&str] = &[
     SECURE_TRANSPORT_KEY,
+    SOURCE_IP_KEY,
     ACL_KEY,
     STORAGE_CLASS_KEY,
     SERVER_SIDE_ENCRYPTION_KEY,
@@ -339,8 +341,10 @@ pub fn resource_conditions() -> Vec<(String, String)> {
 
 /// [`resource_conditions`] together with the keys naming the PRINCIPAL that signed the
 /// request — who it is ([`PRINCIPAL_ARN_KEY`]), which account it belongs to
-/// ([`PRINCIPAL_ACCOUNT_KEY`]) and its unique id ([`USER_ID_KEY`]) — and the Region the
-/// request addressed ([`REQUESTED_REGION_KEY`]).
+/// ([`PRINCIPAL_ACCOUNT_KEY`]) and its unique id ([`USER_ID_KEY`]) — the Region the
+/// request addressed ([`REQUESTED_REGION_KEY`]) and the ADDRESS it was made from
+/// ([`SOURCE_IP_KEY`], answered from the connection by
+/// [`crate::state::source_ip_conditions`]).
 ///
 /// `identity_arn` is the ARN of the identity whose policies are in force — the ROLE behind an
 /// assumed-role session, the user behind a long-term key (see [`PRINCIPAL_ARN_KEY`]) — and
@@ -359,6 +363,10 @@ pub fn global_conditions(
     requested_region: &str,
 ) -> Vec<(String, String)> {
     let mut context = resource_conditions();
+    // What the CONNECTION this request arrived on answers, which is a fact of the request
+    // alone like the endpoint it addressed: the address it was made from, against which a
+    // clause confining a grant — or a refusal — to a set of addresses is decided.
+    context.extend(source_ip_conditions());
     if !requested_region.is_empty() {
         context.push((
             REQUESTED_REGION_KEY.to_string(),
@@ -558,10 +566,11 @@ pub fn read_conditions() -> Vec<(String, String)> {
 /// nothing about the request leaves the bucket's own owner able to act on it.
 ///
 /// This decision does NOT resolve the signing identity — the principal above is this
-/// service's stand-in for the account itself — so it answers only the resource's owning
-/// account ([`resource_conditions`]) and publishes [`CALLER_FREE_CONDITION_KEYS`]: a clause
-/// over who the caller is stays undecided here rather than being decided against a principal
-/// nothing read off the request.
+/// service's stand-in for the account itself — so it answers only the facts of the request
+/// and of the resource: the resource's owning account ([`resource_conditions`]) and the
+/// address the request was made from ([`crate::state::source_ip_conditions`]). It publishes
+/// [`CALLER_FREE_CONDITION_KEYS`]: a clause over who the caller is stays undecided here
+/// rather than being decided against a principal nothing read off the request.
 pub fn policy_denial(
     policy: Option<&str>,
     action: &str,
@@ -574,6 +583,7 @@ pub fn policy_denial(
     principals.extend(account_principals(&caller));
     let mut context = conditions.to_vec();
     context.extend(resource_conditions());
+    context.extend(source_ip_conditions());
     let outcome = resource_outcome_prepared(
         &PreparedDocument::read(policy),
         &Request::new(action, resource, &principals)
