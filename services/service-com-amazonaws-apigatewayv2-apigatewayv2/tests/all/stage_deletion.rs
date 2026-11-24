@@ -325,6 +325,9 @@ async fn deleting_a_stage_keeps_the_deployment_it_served() {
     let emulator = emulator();
     let case = "a stage serving a deployment";
     let api_id = create_api(&emulator, case, &http_api("deployed-stage-api")).await;
+    // A deployment freezes the api's routes, so an api holding none cannot be deployed at
+    // all (`crate::api_lifecycle::deployable_route`).
+    crate::api_lifecycle::deployable_route(&emulator, case, &api_id).await;
     let stage_name = create_stage(&emulator, case, &api_id, &json!({ "stageName": "prod" })).await;
     let (status, deployment) = call(
         &emulator,

@@ -359,6 +359,18 @@ async fn an_announced_endpoint_is_claimed_in_every_state_of_the_api() {
         .map_or(endpoint.as_str(), |(_scheme, host)| host)
         .to_string();
 
+    // The api is given one route that matches NO path this test probes: a deployment
+    // freezes the api's routes, so an api holding none cannot be deployed at all, while a
+    // route for `/items` leaves every probe of `/orders` matching nothing.
+    let (status, route) = call(
+        &emulator,
+        "POST",
+        &format!("/v2/apis/{api_id}/routes"),
+        Some(json!({ "routeKey": "GET /items" })),
+    )
+    .await;
+    assert_eq!(status, 201, "CreateRoute must answer 201, got {status} {route}");
+
     // Each step of the sequence a client runs, probed right after it: an api with no
     // stage, a stage with no deployment, and a deployed stage whose route matches nothing.
     let answer = send(&emulator, &host, "GET", "/orders", &[]).await;

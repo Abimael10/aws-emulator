@@ -264,6 +264,14 @@ fn stated_violation(violation: &Violation) -> Option<String> {
         ("priority", ViolationKind::MinValue(_) | ViolationKind::MaxValue(_)) => {
             Some(crate::state::routing_rule_priority_range_message())
         }
+        // `CreateAuthorizer$AuthorizerResultTtlInSeconds` and the update's, whose shape
+        // declares the window a cached decision's lifetime has to fall in
+        // (`IntegerWithLengthBetween0And3600`, range 0..3600). Stated as the whole window,
+        // in the member's own unit, whichever bound the value sat outside of.
+        (
+            "authorizerResultTtlInSeconds",
+            ViolationKind::MinValue(_) | ViolationKind::MaxValue(_),
+        ) => Some(crate::state::authorizer_result_ttl_range_message()),
         // `CreateIntegration$IntegrationType`, the `@required` member that targets the
         // `IntegrationType` enum. A value OUTSIDE that enum names no integration type
         // this service can read, exactly as an absent member does, so both are refused

@@ -45,14 +45,18 @@ fn websocket_api(name: &str) -> Value {
     })
 }
 
-/// Create one api and answer its `ApiId`.
+/// Create one api, give it one route so it can be deployed, and answer its `ApiId`.
 async fn create_api(emulator: &MultiServiceRouter, case: &str, request: &Value) -> String {
     let (status, created) = call(emulator, "POST", "/v2/apis", Some(request.clone())).await;
     assert_eq!(
         status, 201,
         "case {case:?}: expected 201 from CreateApi, got {status} {created}"
     );
-    as_str(&created, "apiId")
+    let api_id = as_str(&created, "apiId");
+    // A deployment freezes the api's routes, so an api with none cannot be deployed at all
+    // (`crate::api_lifecycle::deployable_route`) — and every row here deploys its api.
+    crate::api_lifecycle::deployable_route(emulator, case, &api_id).await;
+    api_id
 }
 
 /// Create one deployment under `api_id` and answer its `DeploymentId`.

@@ -746,6 +746,27 @@ pub fn identity_source_limit_message() -> String {
     )
 }
 
+/// The window a cached authorizer decision's TTL has to fall in, from the shape every
+/// writer of that member targets (`IntegerWithLengthBetween0And3600`, range 0..3600 — "An
+/// integer with a value between [0-3600]").
+pub const AUTHORIZER_RESULT_TTL_RANGE: (i32, i32) = (0, 3600);
+
+/// The sentence API Gateway refuses an `AuthorizerResultTtlInSeconds` outside
+/// [`AUTHORIZER_RESULT_TTL_RANGE`] with.
+///
+/// The service states this member's refusal in the member's OWN terms — the whole window a
+/// TTL has to fall in, in the unit the member is expressed in — rather than in the generic
+/// "value at path failed to satisfy constraint" form, and it echoes neither the rejected
+/// value nor the wire spelling of the member. Built from the modelled bounds, so it cannot
+/// drift from the constraint it explains.
+pub fn authorizer_result_ttl_range_message() -> String {
+    format!(
+        "Authorizer result TTL outside allowable range. TTL must be between {} and {} \
+         seconds.",
+        AUTHORIZER_RESULT_TTL_RANGE.0, AUTHORIZER_RESULT_TTL_RANGE.1
+    )
+}
+
 /// The `AuthorizerType` value that selects a JWT authorizer, from the generated
 /// `AUTHORIZER_TYPE_VALUES` catalog (`JWT | REQUEST`); the integration test
 /// `the_authorizer_type_names_are_the_modelled_catalog` pins these two names against

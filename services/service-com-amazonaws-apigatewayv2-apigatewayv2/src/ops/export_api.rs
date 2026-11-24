@@ -180,8 +180,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
         if !OUTPUT_TYPE_VALUES.contains(&input.output_type.as_str()) {
+            // API Gateway words this refusal in the member's OWN terms: it states the
+            // output type that was asked for, verbatim and unquoted, and then the whole
+            // catalog it admits. The catalog comes from `OUTPUT_TYPE_VALUES`, so the
+            // sentence cannot drift from the set this operation actually serves.
             return Err(bad_request(format!(
-                "Invalid value for OutputType: '{}'. Valid values are: {}.",
+                "Output type is {}. Output type should be one of following : {}.",
                 input.output_type,
                 OUTPUT_TYPE_VALUES.join(", ")
             )));

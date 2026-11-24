@@ -52,7 +52,7 @@ use crate::api_lifecycle::{as_str, call, emulator, error_code, REGION};
 
 /// The specification an export asks for: "OAS30, for OpenAPI 3.0, is the only supported
 /// value" (`ExportApi$Specification`).
-const OAS30: &str = "OAS30";
+pub(crate) const OAS30: &str = "OAS30";
 
 /// The document-level extensions and the operation-level one an export carries, each named
 /// as this service's own definition reader reads it.
@@ -294,7 +294,7 @@ async fn get_bytes(emulator: &MultiServiceRouter, uri: &str) -> (u16, Vec<u8>) {
 }
 
 /// Export `api_id` with the query the case asks for: `(status, body as text)`.
-async fn export_text(
+pub(crate) async fn export_text(
     emulator: &MultiServiceRouter,
     api_id: &str,
     specification: &str,
@@ -1182,7 +1182,8 @@ async fn an_export_request_outside_what_the_operation_serves_is_refused() {
             format!("{OAS30}?outputType=XML"),
             400,
             "BadRequestException",
-            "Invalid value for OutputType: 'XML'. Valid values are: JSON, YAML.".to_string(),
+            "Output type is XML. Output type should be one of following : JSON, YAML."
+                .to_string(),
         ),
         (
             "an output type it serves, spelled in lower case",
@@ -1190,7 +1191,8 @@ async fn an_export_request_outside_what_the_operation_serves_is_refused() {
             format!("{OAS30}?outputType=yaml"),
             400,
             "BadRequestException",
-            "Invalid value for OutputType: 'yaml'. Valid values are: JSON, YAML.".to_string(),
+            "Output type is yaml. Output type should be one of following : JSON, YAML."
+                .to_string(),
         ),
         (
             "an export algorithm version other than the only supported one",

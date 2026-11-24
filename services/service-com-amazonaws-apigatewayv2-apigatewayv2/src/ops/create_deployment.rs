@@ -3,7 +3,8 @@
 //! @op CreateDeployment
 //! IMPLEMENTED: mints a `DeploymentId` and persists a [`crate::state::Deployment`]
 //! record under its parent api, pointing the named stage at it when the request names
-//! one. This is the ONLY file to touch for this operation.
+//! one. An api holding no route has nothing to freeze, so deploying it is refused before
+//! anything is minted. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -209,6 +210,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A deployment FREEZES the api's routes for a stage to serve
+        // ([`crate::state::Api::deployable_configuration`]), so an api holding no route at
+        // all holds nothing a deployment could publish and nothing a stage released to it
+        // could answer: the call is refused rather than minting a deployment that reports
+        // itself released while serving no request. Weighed before anything is minted, so
+        // the refused call leaves the api's deployments and stages exactly as they were,
+        // and weighed for EVERY protocol — a route is what either protocol's data plane
+        // matches a request against, so neither has anything to deploy without one.
+        if api.routes.is_empty() {
+            return Err(CreateDeploymentErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(NO_VALID_ROUTES_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
         // A deployment FREEZES the api's routes for a stage to serve, and a WEBSOCKET api
         // serves a frame ONLY through the target of the route that matched it — there is no
         // other backend path for a message — so a route of such an api that names no target
@@ -317,3 +335,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// `StringWithLengthBetween0And1024`, the shape `CreateDeployment$Description`
 /// targets.
 const MAX_DESCRIPTION_LEN: usize = 1024;
+
+/// The sentence a deployment of an api that holds no route is refused with.
+///
+/// The whole sentence is this error class's fixed text: it names neither the api nor
+/// anything else taken from the request or the store, because the condition it reports is
+/// the same one for every api — there is no route to deploy.
+const NO_VALID_ROUTES_MESSAGE: &str =
+    "Unable to deploy API because no valid routes exist in this API";

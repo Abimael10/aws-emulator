@@ -524,6 +524,18 @@ async fn reported_control_plane_documents(emulator: &MultiServiceRouter) -> Vec<
     // ---- The stage: `createdDate` and `lastUpdatedDate` on create, read, update and
     // list. The create carries `routeSettings`, the one map-of-structure member of the
     // shape, so the entries beside the timestamps are exercised too.
+    //
+    // The api is given the route those settings name first: a deployment freezes the api's
+    // routes, so an api holding none cannot be deployed at all and the release below would
+    // have no deployment to report an instant for.
+    let (status, route) = call(
+        emulator,
+        "POST",
+        &format!("{api_uri}/routes"),
+        Some(json!({ "routeKey": "GET /widgets" })),
+    )
+    .await;
+    assert_eq!(status, 201, "CreateRoute must answer 201, got {status} {route}");
     let stages_uri = format!("{api_uri}/stages");
     let (status, stage) = call(
         emulator,

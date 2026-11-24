@@ -15,8 +15,8 @@
 //!   deployment created nowhere.
 //!
 //! The rows vary what the rule generalises over: the api's protocol type, how the api
-//! got its routes (quick create's `$default`, explicit `CreateRoute` calls, none at
-//! all), whether the request carries a description, and the length of that description
+//! got its routes (quick create's `$default`, explicit `CreateRoute` calls), whether the
+//! request carries a description, and the length of that description
 //! at each bound of the shape it targets. The recorded case that filed the issue — a
 //! `CreateDeployment` call carrying only the api id — is one row.
 
@@ -74,9 +74,9 @@ fn rows() -> Vec<Row> {
             description: None,
         },
         Row {
-            case: "an HTTP api with no routes, deployed with a description",
-            api: http_api("empty-api"),
-            routes: &[],
+            case: "an HTTP api with one route, deployed with a description",
+            api: http_api("described-api"),
+            routes: &["GET /items"],
             request: Some(json!({ "description": "the first cut" })),
             description: Some("the first cut".to_string()),
         },

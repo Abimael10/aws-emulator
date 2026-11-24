@@ -127,10 +127,10 @@ fn rows() -> Vec<Row> {
             description: Some("an http api released to a stage"),
         },
         Row {
-            case: "an api with no routes at all, released to a stage named at its upper bound",
-            api: http_api("routeless-api"),
+            case: "an api with one route, released to a stage named at its upper bound",
+            api: http_api("one-route-api"),
             integration: None,
-            routes: &[],
+            routes: &["GET /items"],
             stage_name: "s".repeat(MAX_STAGE_NAME_LEN),
             description: None,
         },

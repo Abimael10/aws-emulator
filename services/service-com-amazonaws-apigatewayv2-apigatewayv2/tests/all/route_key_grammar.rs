@@ -592,17 +592,17 @@ async fn a_deployment_an_untargeted_route_does_not_block() {
 
     // The two apis the rule does NOT refuse: an HTTP api, whose route answers the request
     // that matches it at the data plane with no integration attached, and a WEBSOCKET api
-    // with no routes to capture at all.
+    // whose every route names a target.
     let rows = [
         (
             "an HTTP api whose route names no target",
             HTTP_PROTOCOL_TYPE,
-            Some("GET /items"),
+            "GET /items",
         ),
         (
-            "a WEBSOCKET api with no routes at all",
+            "a WEBSOCKET api whose only route names a target",
             WEBSOCKET_PROTOCOL_TYPE,
-            None,
+            "$connect",
         ),
     ];
 
@@ -614,14 +614,21 @@ async fn a_deployment_an_untargeted_route_does_not_block() {
             &format!("unblocked-host-{index}"),
         )
         .await;
-        if let Some(route_key) = route_key {
-            let (status, created) =
-                create_route(&emulator, &api_id, json!({ "routeKey": route_key })).await;
-            assert_eq!(
-                status, 201,
-                "case {case:?}: expected 201 from CreateRoute, got {status} {created}"
+        // A WEBSOCKET api serves a frame only through the target of the route that matched
+        // it, so its route is wired to one; an HTTP api's route is deployed without.
+        let mut request = json!({ "routeKey": route_key });
+        if protocol_type == WEBSOCKET_PROTOCOL_TYPE {
+            let target = format!(
+                "integrations/{}",
+                mock_integration(&emulator, case, &api_id).await
             );
+            request["target"] = json!(target);
         }
+        let (status, created) = create_route(&emulator, &api_id, request).await;
+        assert_eq!(
+            status, 201,
+            "case {case:?}: expected 201 from CreateRoute, got {status} {created}"
+        );
         let (status, deployed) = call(
             &emulator,
             "POST",

@@ -183,6 +183,46 @@ pub(crate) async fn deployable_target(
     ))
 }
 
+/// Give the api `api_id` ONE route it can be deployed with, and answer that route's
+/// `RouteKey`.
+///
+/// `CreateDeployment` refuses an api that holds no route at all — a deployment freezes the
+/// api's routes for a stage to serve, so an api with none has nothing to deploy — which is
+/// why every suite that deploys an api gives it a route first. The key is one of the api's
+/// own protocol (a method-and-path key for an HTTP api, the catch-all `$default` for a
+/// WEBSOCKET one), wired to a target where that protocol requires one
+/// ([`deployable_target`]).
+pub(crate) async fn deployable_route(
+    emulator: &MultiServiceRouter,
+    case: &str,
+    api_id: &str,
+) -> String {
+    // A target is needed exactly for a WEBSOCKET api, so its presence is also what selects
+    // the route key spelled in that api's protocol.
+    let target = deployable_target(emulator, case, api_id).await;
+    let route_key = if target.is_some() {
+        "$default"
+    } else {
+        "GET /probe"
+    };
+    let mut request = json!({ "routeKey": route_key });
+    if let Some(target) = target {
+        request["target"] = json!(target);
+    }
+    let (status, created) = call(
+        emulator,
+        "POST",
+        &format!("/v2/apis/{api_id}/routes"),
+        Some(request),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "case {case:?}: expected 201 from CreateRoute for {route_key:?}, got {status} {created}"
+    );
+    route_key.to_string()
+}
+
 /// Send one request, signed for [`REGION`], and return `(status, parsed body)`. An
 /// empty body parses to `Value::Null`, which is how a 204 is asserted.
 pub(crate) async fn call(

@@ -737,6 +737,35 @@ async fn deploy_connect(
             "CreateRoute",
         )
         .await;
+    } else {
+        // No `$connect` route — and an api holding NO route at all cannot be deployed
+        // (`CreateDeployment` freezes the api's routes, so one with none has nothing to
+        // deploy), so this api is given a `$default` route instead. The connection request
+        // is served by the `$connect` route alone, so the api still holds nothing that could
+        // refuse it.
+        let integration = created(
+            emulator,
+            case,
+            &format!("/v2/apis/{api_id}/integrations"),
+            json!({
+                "integrationType": "MOCK",
+                "requestTemplates": { "$default": "{\"statusCode\": 200}" }
+            }),
+            "CreateIntegration",
+        )
+        .await;
+        let integration_id = as_str(&integration, "integrationId");
+        created(
+            emulator,
+            case,
+            &format!("/v2/apis/{api_id}/routes"),
+            json!({
+                "routeKey": "$default",
+                "target": format!("integrations/{integration_id}")
+            }),
+            "CreateRoute",
+        )
+        .await;
     }
     created(
         emulator,
