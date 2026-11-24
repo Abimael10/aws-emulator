@@ -4314,12 +4314,18 @@ fn in_use_by_base_path_mapping(kind: &str, identifier: &str, domain_names: &[Str
 /// what `DeleteStage` refuses while the reference stands: the shared sentence
 /// ([`in_use_by_base_path_mapping`]) over the stage, which the recorded refusal names by
 /// the common noun.
-///
-/// The API ITSELF carries no such precondition: `DeleteRestApi` removes the API and leaves
-/// a mapping that named it behind (see that handler), so this sentence is the stage's
-/// alone.
 pub fn stage_in_use_by_base_path_mapping(stage_name: &str, domain_names: &[String]) -> String {
     in_use_by_base_path_mapping("stage", stage_name, domain_names)
+}
+
+/// The same sentence for the API ITSELF, which `DeleteRestApi` refuses on the same
+/// precondition: a mapping that routes to any stage of the API, or to the API with no stage
+/// of its own, references it. The recorded refusal names the record by its SHAPE name.
+pub fn rest_api_in_use_by_base_path_mapping(
+    rest_api_id: &str,
+    domain_names: &[String],
+) -> String {
+    in_use_by_base_path_mapping("RestApi", rest_api_id, domain_names)
 }
 
 /// The `BadRequestException` message for ANY caller-supplied value this service could

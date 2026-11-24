@@ -2,7 +2,9 @@
 
 //! @op DeleteRestApi
 //! IMPLEMENTED: removes the stored `RestApi` record and, with it, every resource and
-//! method under it; answers `NotFoundException` when no API has that id.
+//! method under it; answers `NotFoundException` when no API has that id, and
+//! `BadRequestException` while a custom domain name's base path mapping still routes to
+//! it.
 //!
 //! ## Shape of an operation
 //!
@@ -165,17 +167,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(crate::state::state_unavailable)?;
         let mut store = state.lock();
         // The API owns its resources and their methods, so removing the record removes
-        // the whole tree with it. What it does NOT own is the base path mapping of a
-        // custom domain name that ROUTES to it: that record is a domain name's, and it
-        // merely NAMES this API by id. A reference held by a record this API does not own
-        // is no precondition of its delete — API Gateway models none for `DeleteRestApi`
-        // and removes the API with the mapping left behind, pointing at an id that now
-        // resolves to nothing — so the mapping is neither refused on nor removed here; a
-        // caller that wants it gone makes `DeleteBasePathMapping`'s own call.
+        // the whole tree with it.
         if !store.rest_apis.contains_key(&input.rest_api_id) {
             return Err(DeleteRestApiErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
             })
+            .into());
+        }
+
+        // A `BasePathMapping` that names this API ROUTES to it: the calls arriving on its
+        // base path of a custom domain name are served by this API, so removing the API
+        // would leave that mapping pointing at an id that resolves to nothing. Such a
+        // delete is refused while the reference stands and the API survives, exactly as
+        // the delete of one STAGE of it is (`DeleteStage`); dropping the mapping is the
+        // mapping's own operations' call, not something this one does on the caller's
+        // behalf. What a caller RACING the two calls gets instead is the orphan the guard
+        // exists to prevent: a mapping written while the accepted removal is still in
+        // flight resolved the id against state that still held the API
+        // (`crate::state::rest_api_referenceable`).
+        let holding = store.domain_names_mapping_rest_api(&input.rest_api_id, None);
+        if !holding.is_empty() {
+            return Err(DeleteRestApiErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::rest_api_in_use_by_base_path_mapping(
+                        &input.rest_api_id,
+                        &holding,
+                    )),
+                },
+            )
             .into());
         }
         // The delete is ACCEPTED here rather than finished: this operation answers 202, so

@@ -11,15 +11,14 @@
 //! helpers are this crate's existing harness.
 //!
 //! The RULE under test: a base path mapping routes the calls arriving on its base path of
-//! a custom domain name to a STAGE of a REST API, so while it stands that stage may not be
-//! deleted — `DeleteStage` is refused with the modelled `BadRequestException`, naming the
-//! domain names whose mappings stand in the way, and every record survives. The API ITSELF
-//! carries no such precondition: `DeleteRestApi` removes the API while a mapping names it
-//! and the mapping is LEFT BEHIND, naming an id that now resolves to nothing. Deleting the
-//! mapping releases the stage. Nothing else is held: a stage no mapping points at deletes
-//! as it always did. The custom domain name that HOLDS the mapping is NOT one of those
-//! records — a mapping is a subordinate record of it and is deleted with it — which
-//! `domain_name_delete_cascade` is the suite for.
+//! a custom domain name to a STAGE of a REST API, so while it stands neither that stage nor
+//! the API it belongs to may be deleted — `DeleteStage` and `DeleteRestApi` are both refused
+//! with the modelled `BadRequestException`, naming the record the request addressed and the
+//! domain names whose mappings stand in the way, and every record survives. Deleting the
+//! mapping releases both. Nothing else is held: a stage no mapping points at, and an API no
+//! mapping points at, delete as they always did. The custom domain name that HOLDS the
+//! mapping is NOT one of those records — a mapping is a subordinate record of it and is
+//! deleted with it — which `domain_name_delete_cascade` is the suite for.
 //!
 //! The rows differ along what the rule generalises over: the spelling of the base path
 //! (a plain one and the `(none)` the member documents), whether the mapping names a stage
@@ -29,7 +28,7 @@
 use serde_json::json;
 use service_com_amazonaws_apigateway_backplanecontrolservice::state::NONE_BASE_PATH;
 
-use crate::base_path_mapping::{create_mapping, deployed_api, get_mapping};
+use crate::base_path_mapping::{create_mapping, deployed_api};
 use crate::domain_name_collection::created_domain;
 use crate::rest_api_lifecycle::{assert_failure, Answer, Gateway};
 use crate::stage_lifecycle::{create_deployed_stage, get_stage};
@@ -88,6 +87,17 @@ pub(crate) fn stage_refusal(stage_name: &str, domain_names: &[&str]) -> String {
     format!(
         "Deleting stage {stage_name} failed. Please remove all base path mappings related \
          to the stage in your domains: {}",
+        domain_names.join(", ")
+    )
+}
+
+/// The same refusal for the REST API the mapping names, which is the record
+/// `DeleteRestApi` addresses: one sentence for the class, with the record named by its
+/// SHAPE name where the stage's is named by the common noun.
+pub(crate) fn api_refusal(rest_api_id: &str, domain_names: &[&str]) -> String {
+    format!(
+        "Deleting RestApi {rest_api_id} failed. Please remove all base path mappings related \
+         to the RestApi in your domains: {}",
         domain_names.join(", ")
     )
 }
@@ -176,11 +186,11 @@ async fn a_stage_a_base_path_mapping_still_names_cannot_be_deleted() {
 }
 
 #[tokio::test]
-async fn a_rest_api_a_base_path_mapping_names_deletes_and_leaves_the_mapping_behind() {
+async fn a_rest_api_a_base_path_mapping_still_names_cannot_be_deleted() {
     let gateway = Gateway::new();
     // The rows differ along what the rule generalises over: whether the mapping names a
     // stage of the API at all, and the spelling of its base path. A mapping names its API
-    // either way, and either way it is no precondition of the API's delete.
+    // either way, and either way it holds the API's delete back.
     let rows = [
         MappingRow {
             case: "a mapping that names a stage",
@@ -201,6 +211,9 @@ async fn a_rest_api_a_base_path_mapping_names_deletes_and_leaves_the_mapping_beh
 
     for (index, row) in rows.iter().enumerate() {
         let (api, stage) = deployed_api(&gateway, &format!("mapped-api-{index}"), "prod").await;
+        // A second API no mapping names: it is held by nothing and deletes while this
+        // mapping stands.
+        let (free_api, _) = deployed_api(&gateway, &format!("free-api-{index}"), "prod").await;
         let domain_name = format!("mapped-api-{index}.example.com");
         created_domain(&gateway, &domain_name, json!({})).await;
         let mut request = json!({ "basePath": row.base_path, "restApiId": api });
@@ -209,10 +222,36 @@ async fn a_rest_api_a_base_path_mapping_names_deletes_and_leaves_the_mapping_beh
         }
         create_mapping(&gateway, &domain_name, request).await;
 
+        let refused = delete_api(&gateway, &api).await;
+        assert_bad_request(&refused, &api_refusal(&api, &[&domain_name]), row.case);
+
+        // The API survives the refusal.
+        let read = gateway.call("GET", &format!("/restapis/{api}"), None).await;
+        assert_eq!(
+            read.status, 200,
+            "case {}: the refused delete must leave the API, got {} with {:?}",
+            row.case, read.status, read.body
+        );
+
+        // Nothing else is held: an API no mapping names deletes while this one stands.
+        let deleted_free = delete_api(&gateway, &free_api).await;
+        assert_eq!(
+            deleted_free.status, 202,
+            "case {}: an API no mapping names must delete, got {} with {:?}",
+            row.case, deleted_free.status, deleted_free.body
+        );
+
+        // Releasing the mapping releases the API.
+        let released = delete_mapping(&gateway, &domain_name, row.base_path).await;
+        assert_eq!(
+            released.status, 202,
+            "case {}: expected 202 from DeleteBasePathMapping, got {} with {:?}",
+            row.case, released.status, released.body
+        );
         let deleted = delete_api(&gateway, &api).await;
         assert_eq!(
             deleted.status, 202,
-            "case {}: a mapping naming the API is no precondition of its delete, got {} \
+            "case {}: expected 202 from DeleteRestApi once the mapping is gone, got {} \
              with {:?}",
             row.case, deleted.status, deleted.body
         );
@@ -221,30 +260,6 @@ async fn a_rest_api_a_base_path_mapping_names_deletes_and_leaves_the_mapping_beh
             gone.status, 404,
             "case {}: expected the deleted API to be gone, got {} with {:?}",
             row.case, gone.status, gone.body
-        );
-
-        // And the mapping is LEFT BEHIND, still naming the id the delete took away: it is
-        // the domain name's record, not the API's, so nothing of it went with the API.
-        let orphaned = get_mapping(&gateway, &domain_name, row.base_path).await;
-        assert_eq!(
-            orphaned.status, 200,
-            "case {}: expected the mapping to outlive the API it named, got {} with {:?}",
-            row.case, orphaned.status, orphaned.body
-        );
-        assert_eq!(
-            orphaned.body["restApiId"].as_str(),
-            Some(api.as_str()),
-            "case {}: expected the orphaned mapping to still name {api}, got {:?}",
-            row.case,
-            orphaned.body
-        );
-
-        // Deleting the orphan is the caller's own call, and it goes through.
-        let released = delete_mapping(&gateway, &domain_name, row.base_path).await;
-        assert_eq!(
-            released.status, 202,
-            "case {}: expected 202 from DeleteBasePathMapping for the orphan, got {} with {:?}",
-            row.case, released.status, released.body
         );
     }
 }
@@ -412,6 +427,12 @@ async fn the_refusal_lists_the_domain_names_whose_mappings_hold_the_record() {
             row.case,
         );
 
+        // The API ITSELF is held by the same mappings and earns the same sentence over the
+        // record the request addressed: the same domain names, once each and in creation
+        // order.
+        let refused_api = delete_api(&gateway, &api).await;
+        assert_bad_request(&refused_api, &api_refusal(&api, &listed), row.case);
+
         // Releasing every mapping of the record releases it: a domain name whose last
         // mapping of it has gone drops out of the sentence, and the delete goes through
         // when the list is empty.
@@ -433,6 +454,14 @@ async fn the_refusal_lists_the_domain_names_whose_mappings_hold_the_record() {
             "case {}: expected 202 from DeleteStage once every mapping is gone, got {} \
              with {:?}",
             row.case, deleted.status, deleted.body
+        );
+        // And the API with it, now that no mapping of any domain name names it.
+        let deleted_api = delete_api(&gateway, &api).await;
+        assert_eq!(
+            deleted_api.status, 202,
+            "case {}: expected 202 from DeleteRestApi once every mapping is gone, got {} \
+             with {:?}",
+            row.case, deleted_api.status, deleted_api.body
         );
     }
 }

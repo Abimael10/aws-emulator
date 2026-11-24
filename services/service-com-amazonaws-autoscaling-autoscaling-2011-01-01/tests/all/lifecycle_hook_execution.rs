@@ -579,6 +579,9 @@ enum Addressed {
     /// The hook that WAS holding the instance, after its action was consumed and the
     /// instance is in service.
     ConsumedAction,
+    /// The hook that WAS holding the instance, after its action was consumed and the hook
+    /// itself was then deleted — the lookup comes up empty whichever of the two went first.
+    DeletedHook,
     /// An instance the group does not hold at all.
     AbsentInstance,
     /// A token no action of the group is held under.
@@ -604,6 +607,7 @@ async fn a_callback_naming_no_held_action_says_which_half_matched_nothing() {
     let rows: &[(&str, Addressed)] = &[
         ("a hook of the group holding nothing", Addressed::AnotherHook),
         ("an action already consumed", Addressed::ConsumedAction),
+        ("a hook deleted after its action was consumed", Addressed::DeletedHook),
         ("an instance the group does not hold", Addressed::AbsentInstance),
         ("a token no action is held under", Addressed::UnknownToken),
         ("a group the account does not hold", Addressed::AbsentGroup),
@@ -630,7 +634,7 @@ async fn a_callback_naming_no_held_action_says_which_half_matched_nothing() {
         // A token the service never minted, in the shape the member is modelled in.
         let unknown_token = "00000000-0000-4000-8000-000000000000";
         let absent_instance = "i-0123456789abcdef0";
-        if *addressed == Addressed::ConsumedAction {
+        if *addressed == Addressed::ConsumedAction || *addressed == Addressed::DeletedHook {
             complete(&router, case, &group, hook, &[
                 ("LifecycleActionToken", token.as_str()),
                 ("LifecycleActionResult", CONTINUE),
@@ -643,13 +647,24 @@ async fn a_callback_naming_no_held_action_says_which_half_matched_nothing() {
                 "case {case:?}: the consumed action must have released the instance, got {states:?}"
             );
         }
+        if *addressed == Addressed::DeletedHook {
+            let (status, body) = query(&router, "DeleteLifecycleHook", &[
+                ("AutoScalingGroupName", group.as_str()),
+                ("LifecycleHookName", hook),
+            ])
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the hook must be removable, got {status} with {body:?}"
+            );
+        }
 
         let (addressing, expected): (Vec<(&str, &str)>, String) = match addressed {
             Addressed::AnotherHook => (
                 vec![("InstanceId", instance_id.as_str())],
                 format!("No active Lifecycle Action found with instance ID {instance_id}"),
             ),
-            Addressed::ConsumedAction => (
+            Addressed::ConsumedAction | Addressed::DeletedHook => (
                 vec![("InstanceId", instance_id.as_str())],
                 format!("No active Lifecycle Action found with instance ID {instance_id}"),
             ),
