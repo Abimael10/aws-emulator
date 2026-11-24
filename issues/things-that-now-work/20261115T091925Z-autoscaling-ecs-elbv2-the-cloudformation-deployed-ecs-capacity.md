@@ -46,3 +46,30 @@ Smithy consulted (services/service-com-amazonaws-ecs-amazonec2containerservicev2
 3. Poll DescribeStacks(StackName=<name>)['Stacks'][0]['StackStatus'] every 5 s. Expected: it reaches a terminal status (CREATE_COMPLETE on AWS). Actual: no terminal status is observed before the harness cap.
 4. Then poll DescribeAutoScalingGroups(AutoScalingGroupNames=[<asg>]) and ListContainerInstances(cluster=<cluster>). Expected: DesiredCapacity > 0 and at least one containerInstanceArn. Actual: DesiredCapacity stays 0 and no container instance registers.
 5. Re-replay autoscaling__ecs__elbv2.deploy-ecs-capacity-provider-autoscaling-cfn to confirm the fix.
+
+## Resolution note
+
+The code base has drifted since the commit this report was written against, and the
+behaviour it asks for is now served: the recorded check replays green, and both halves of
+the scenario are served by existing components rather than by anything added here —
+CloudFormation drives a `CreateStack` to a terminal `StackStatus` for this template
+(`CREATE_COMPLETE`), and the Amazon ECS managed-scaling component
+(`services/service-com-amazonaws-ecs-amazonec2containerservicev20141113/src/state/managed_capacity_scaling.rs`)
+raises the Auto Scaling group's desired capacity for the tasks the cluster cannot place,
+whereupon Amazon EC2 Auto Scaling launches the instances and their agents register them as
+container instances of the cluster
+(`.../src/state/ec2_capacity.rs`), which is where the parked tasks are then placed.
+
+What was missing was the PROOF, so this change adds it:
+`core/router/tests/all/cfn_deployed_managed_scaling_provider_acquires_its_capacity.rs`
+deploys the declarative pattern of this report — a launch template, an Auto Scaling group
+with `MinSize`/`DesiredCapacity` 0, a capacity provider over it with managed scaling
+`ENABLED`, a cluster naming the provider, a `bridge` task definition and a service whose
+tasks cannot be placed — over the assembled emulator, and asserts the stack reaches a
+terminal `CREATE_COMPLETE`, the group's `DesiredCapacity` is raised to at least the
+shortfall taken under the provider's two scaling step sizes and never past the group's own
+`MaxSize`, `ListContainerInstances` reports the registered capacity as `ACTIVE`, and the
+service's `runningCount` reaches the declared `DesiredCount`. Its rows span what the rule
+generalises over: how many tasks are asked for, whether the capacity-provider strategy is
+the cluster's default or the service's own, and the two step sizes (a maximum that caps a
+two-task shortfall, and a minimum that is a floor under a one-task one).
