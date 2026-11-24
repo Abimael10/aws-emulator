@@ -63,6 +63,11 @@ emulator-core-build-support = { workspace = true }
 # Declares one module per `tests/all/<name>.rs`, so the single integration-test target
 # needs no hand-kept list of suites.
 automod = { workspace = true }
+# The AWS SDK's own implementation of the checksum algorithms, so the suite about the
+# integrity headers of a job's output object compares the stored checksum against a digest
+# of the served bytes computed by the algorithm rather than against another hand-written
+# copy of CRC32.
+aws-smithy-checksums = "0.65"
 hex = { workspace = true }
 # Generates the tag keys the modelled `TagKey` character class is asserted over
 # (`tests/all/tag_key_combining_mark_class.rs`), from a fixed seed so a failing case is
