@@ -84,7 +84,8 @@ fn rows() -> Vec<Row> {
             period: None,
             metric: None,
         },
-        // The same class of fact in BYTES rather than kilobytes.
+        // The same class of fact in BYTES rather than kilobytes, with its own published
+        // sentence.
         Row {
             service_code: "aoss",
             quota_code: "L-2005AF7E",
@@ -92,7 +93,7 @@ fn rows() -> Vec<Row> {
             value: 10240.0,
             unit: "Bytes",
             adjustable: false,
-            description: None,
+            description: Some("The maximum size of an encryption policy in bytes."),
             period: None,
             metric: None,
         },
@@ -445,8 +446,8 @@ const UNPUBLISHED_QUOTA_CODES: &[(&str, &str, &str)] = &[
     ),
     (
         "aoss",
-        "L-877395DB",
-        "an AWS code whose published policy-size limit this catalog carries no value for",
+        "L-1D4405ED",
+        "an AWS code whose published SAML-provider count this catalog carries no value for",
     ),
     (
         "application-signals",

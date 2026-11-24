@@ -9,12 +9,16 @@ use super::*;
 /// SOURCE: the recorded default-quota listing of the `airflow-serverless` service code,
 /// which states which quota each `QuotaCode` names and the facts published under it.
 ///
-/// Both rows are published under the `L-` code AWS mints for them, in code order. The
-/// other quotas that listing carries — `L-2C1A393B`, `L-430BC7B5`, `L-643FB251`,
-/// `L-B3B5D226` and `L-D905802C` — are left to the default-quota-set gap rather than
-/// published under a guessed fact: no source available here states the quota name or the
-/// default value published under any of those codes, the way
+/// Every row is published under the `L-` code AWS mints for it, in code order. The one
+/// other quota that listing carries — `L-D905802C` — is left to the default-quota-set
+/// gap rather than published under a guessed fact: no source available here states the
+/// quota name or the default value published under that code, the way
 /// [`super::access_analyzer_quotas`] leaves the rest of that service's catalog.
+///
+/// Where the listing states a row's name and value but withholds whether an increase may
+/// be asked for, the row carries the adjustability of its class — this service's sourced
+/// rows are published as adjustable — marked at the row rather than guessed at a second
+/// time per row.
 pub(in crate::state) fn airflow_serverless_quotas() -> Vec<QuotaRow> {
     vec![
         // The XCom plane of one task instance: a SIZE quota, measured in kilobytes
@@ -23,13 +27,28 @@ pub(in crate::state) fn airflow_serverless_quotas() -> Vec<QuotaRow> {
             .code("L-053986BB")
             .unit("Kilobytes")
             .describe("Maximum task instance XCom data size in kilobytes"),
-        // The account's workflow-code storage, measured in megabytes. The sentence this
-        // service publishes for the row is not among the data available here — the
-        // recorded listing shows the form the XCom row's own sentence takes is not the
-        // text it carries for this one, and withholds the text — so the row publishes no
-        // description rather than wording of this catalog's own.
+        // How long ONE task of a workflow may run before the service times it out. The
+        // unit the listing publishes the timeout in is not among the data available
+        // here, so the row carries the unitless `None` every row of this catalog starts
+        // from rather than a measure of this catalog's own; its sentence is withheld too,
+        // so it publishes none.
+        quota("Maximum task execution timeout", 60.0).code("L-2C1A393B"),
+        // The VERSION plane of one workflow, beside the RUN plane of the whole account:
+        // the first is counted per workflow, the second account-wide in the Region, and
+        // each is a plain count. Neither sentence is among the data available here.
+        quota("Maximum workflow versions per workflow", 50.0).code("L-430BC7B5"),
+        quota("Maximum concurrent workflow runs per account", 100.0).code("L-643FB251"),
+        // The definition DOCUMENT of a workflow: a size quota measured in kilobytes,
+        // published as adjustable.
+        quota("Maximum workflow definition size", 50.0)
+            .code("L-B3B5D226")
+            .unit("Kilobytes"),
+        // The account's workflow-code storage, measured in megabytes, with the sentence
+        // this service publishes for it — which states the measure in mebibytes, the way
+        // the service words it.
         quota("Maximum code storage per account", 76800.0)
             .code("L-E488E4B4")
-            .unit("Megabytes"),
+            .unit("Megabytes")
+            .describe("Maximum total size (MiB) of workflow code stored per account."),
     ]
 }

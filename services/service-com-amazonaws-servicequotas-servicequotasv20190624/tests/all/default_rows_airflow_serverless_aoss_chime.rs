@@ -74,6 +74,30 @@ const ROWS: &[Row] = &[
         value: 76_800.0,
         unit: "Megabytes",
         adjustable: true,
+        description: Some("Maximum total size (MiB) of workflow code stored per account."),
+    },
+    // The definition DOCUMENT of a workflow, the second kilobyte-measured size of this
+    // service's catalog, beside the account's run plane — a plain count of the same
+    // magnitude as the version plane, which is what keeps a row's facts tied to its own
+    // code rather than to a neighbour's.
+    Row {
+        service_code: "airflow-serverless",
+        service_name: "Amazon MWAA Serverless (airflow-serverless)",
+        quota_code: "L-B3B5D226",
+        quota_name: "Maximum workflow definition size",
+        value: 50.0,
+        unit: "Kilobytes",
+        adjustable: true,
+        description: None,
+    },
+    Row {
+        service_code: "airflow-serverless",
+        service_name: "Amazon MWAA Serverless (airflow-serverless)",
+        quota_code: "L-643FB251",
+        quota_name: "Maximum concurrent workflow runs per account",
+        value: 100.0,
+        unit: "None",
+        adjustable: true,
         description: None,
     },
     // OpenSearch Serverless: a plain count of one capacity model's collections, and a
@@ -85,8 +109,8 @@ const ROWS: &[Row] = &[
         quota_name: "Collections per Collection Group (Classic)",
         value: 1_500.0,
         unit: "None",
-        adjustable: true,
-        description: None,
+        adjustable: false,
+        description: Some("The maximum number of collections per collection group."),
     },
     Row {
         service_code: "aoss",
@@ -96,6 +120,39 @@ const ROWS: &[Row] = &[
         value: 10_240.0,
         unit: "Bytes",
         adjustable: false,
+        description: Some("The maximum size of an encryption policy in bytes."),
+    },
+    // The second policy-size plane of the same service, and the two OCU ceilings of its
+    // capacity model — one published as fixed, the other as adjustable, so one service's
+    // rows differ in adjustability rather than carrying one flag throughout.
+    Row {
+        service_code: "aoss",
+        service_name: "Amazon OpenSearch Serverless",
+        quota_code: "L-877395DB",
+        quota_name: "Network policy size per policy",
+        value: 10_240.0,
+        unit: "Bytes",
+        adjustable: false,
+        description: None,
+    },
+    Row {
+        service_code: "aoss",
+        service_name: "Amazon OpenSearch Serverless",
+        quota_code: "L-50FA809B",
+        quota_name: "Default indexing MAX OCU setting",
+        value: 10.0,
+        unit: "None",
+        adjustable: false,
+        description: None,
+    },
+    Row {
+        service_code: "aoss",
+        service_name: "Amazon OpenSearch Serverless",
+        quota_code: "L-FBAA6E20",
+        quota_name: "Default indexing MAX Collection Group OCU setting",
+        value: 96.0,
+        unit: "None",
+        adjustable: true,
         description: None,
     },
     // Chime's rates: the voice plane's calls per second (adjustable) and the meetings

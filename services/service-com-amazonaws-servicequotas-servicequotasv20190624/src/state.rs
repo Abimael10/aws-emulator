@@ -3126,6 +3126,13 @@ pub fn descriptive_quota_code(quota_name: &str) -> String {
 fn seed_quota_catalog() -> Vec<CatalogService> {
     vec![
         service(
+            // AWS's own code for Cloud Map, which is not its endpoint prefix: a code is
+            // published as AWS states it, letter case included.
+            "AWSCloudMap",
+            "AWS Cloud Map",
+            aws_cloud_map_quotas(),
+        ),
+        service(
             "access-analyzer",
             // The display name AWS's own integrated-service inventory reports for
             // this code, which is not the console's product name.
@@ -3227,6 +3234,13 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
         ),
         service("aws-marketplace", "AWS Marketplace", aws_marketplace_quotas()),
         service("aws-mcp", "AWS MCP", aws_mcp_quotas()),
+        service(
+            // The geospatial plane of SageMaker, whose display name the integrated-service
+            // inventory reports as another service's code (see [`SEED_SERVICE_CATALOG`]).
+            "axis",
+            "sagemaker-geospatial",
+            axis_quotas(),
+        ),
         // THE EXCEPTION [`descriptive_quota_code`] names, row by row. For each pair
         // below, the recorded default-quota listing of that service carries NO row
         // under the descriptive stand-in this catalog would publish it as — the
@@ -3405,7 +3419,16 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             ],
         ),
         service("cloudhsm", "AWS CloudHSM", cloudhsm_quotas()),
+        service("cloudshell", "AWS CloudShell", cloudshell_quotas()),
         service("cloudtrail", "AWS CloudTrail", cloudtrail_quotas()),
+        service(
+            // The CloudWatch Omni plane. Amazon CloudWatch itself is integrated under the
+            // `monitoring` code and publishes its own rows there, so neither code serves
+            // the other's quotas.
+            "cloudwatch",
+            "Amazon CloudWatch Omni",
+            cloudwatch_quotas(),
+        ),
         service("codeartifact", "AWS CodeArtifact", codeartifact_quotas()),
         service(
             "codebuild",
@@ -3415,6 +3438,7 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
                 quota("Concurrently running builds", 60.0),
             ],
         ),
+        service("codecatalyst", "Amazon CodeCatalyst", codecatalyst_quotas()),
         service(
             "codecommit",
             "AWS CodeCommit",
@@ -3440,7 +3464,17 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             "Amazon Cognito User Pools",
             cognito_idp_quotas(),
         ),
+        service(
+            "cognito-sync",
+            "Amazon Cognito Sync",
+            cognito_sync_quotas(),
+        ),
         service("comprehend", "Amazon Comprehend", comprehend_quotas()),
+        service(
+            "comprehendmedical",
+            "Amazon Comprehend Medical",
+            comprehendmedical_quotas(),
+        ),
         service(
             "config",
             "AWS Config",
@@ -3461,6 +3495,7 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             "Amazon Connect",
             vec![quota("Amazon Connect instances per account", 5.0)],
         ),
+        service("controltower", "AWS Control Tower", controltower_quotas()),
         service("dax", "Amazon DynamoDB Accelerator (DAX)", dax_quotas()),
         service(
             "directconnect",

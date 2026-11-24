@@ -307,6 +307,9 @@ const USAGE_METRIC_SERVICE_NAMES: &[(&str, &str)] = &[
     // under the names `AWS/Usage` publishes those services as.
     ("cloudhsm", "CloudHSM"),
     ("cloudtrail", "CloudTrail"),
+    // The CloudWatch Omni plane publishes its credit usage under the plane's own
+    // display name, which is NOT the one the `monitoring` code's metrics carry.
+    ("cloudwatch", "CloudWatch Omni"),
     ("ebs", "EBS"),
     ("ec2", "EC2"),
     ("ecr", "ECR"),
