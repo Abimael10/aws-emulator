@@ -22,6 +22,12 @@ use crate::ops::types::{
     EndpointResponse, EndpointUser,
 };
 
+/// Reading the account's origination identities, which another service owns, is its own
+/// concern and lives beside this store rather than in it.
+pub mod origination_identity;
+
+pub use origination_identity::{account_can_send_from, ORIGINATION_IDENTITY_NOT_USABLE_MESSAGE};
+
 /// The ARN namespace Pinpoint signs and builds ARNs with (`sigv4Name` /
 /// `awsService.arnNamespace` in the Smithy model), which is NOT its endpoint
 /// prefix (`pinpoint`).

@@ -11,16 +11,16 @@
 //! `AllowedAttempts` or `ValidityPeriod` — is a `BadRequestException`, and nothing is
 //! stored for it.
 //!
-//! The code goes out over the application's SMS channel, so the destination's
-//! `DeliveryStatus` is computed from that channel's stored state the same way a direct
-//! send to an SMS address is: an application with no SMS channel enabled has nothing to
-//! send the code over, so the send answers a permanent failure for the destination and
-//! mints no code at all — and a verification quoting a code for that reference finds no
-//! challenge to match. That channel's own `UpdateSmsChannel` is still a scaffold, so
-//! until it is implemented the enabled side of this gate is reachable only by a caller
-//! of this crate (a test) rather than over the wire; the refusal a caller sees until
-//! then is the same one a direct SMS send answers for an application that has not
-//! enabled the channel.
+//! The code goes out FROM the `OriginationIdentity` the request names, so that identity
+//! is what decides the destination's `DeliveryStatus` and `StatusCode`: an identity the
+//! calling account does not hold cannot send anything, so the destination is reported
+//! with this service's fixed origination-identity refusal and no code is minted for it —
+//! a verification quoting a code for that reference then finds no challenge to match.
+//! The identity itself belongs to the SMS and voice API, which leases the account's
+//! numbers, so it is resolved against THAT service's inventory
+//! ([`crate::state::account_can_send_from`]) and never against this application's own
+//! channel configuration. Either way the destination's result carries the `MessageId` of
+//! the message this send minted for it.
 //!
 //! ## Shape of an operation
 //!
@@ -93,7 +93,7 @@
 use super::types::*;
 // The `DeliveryStatus` and `StatusCode` vocabulary every send of this service answers
 // out of, defined once beside the store it is computed from.
-use crate::state::{DELIVERY_PERMANENT_FAILURE, DELIVERY_SUCCESSFUL, STATUS_NOT_FOUND, STATUS_OK};
+use crate::state::{DELIVERY_PERMANENT_FAILURE, DELIVERY_SUCCESSFUL, STATUS_OK, STATUS_REFUSED};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -256,44 +256,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let sent_at = crate::state::now_iso8601();
 
+        // The code is sent FROM the request's origination identity, so whether anything
+        // can be sent at all is decided by that identity and by nothing about this
+        // application: an identity the account does not hold has no number behind it. The
+        // account's identities are leased by the SMS and voice API, so they are read off
+        // that service's inventory — before this service's own store is locked, because
+        // the two stores are independent.
+        let Some(can_send_from) =
+            crate::state::account_can_send_from(&*self.engine, origination_identity.trim())
+        else {
+            return Err(origination_inventory_unavailable());
+        };
+
         let mut store = state.lock();
-        let Some(app) = store.apps.get(&application_id) else {
+        if !store.apps.contains_key(&application_id) {
             return Err(SendOTPMessageErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::APPLICATION_NOT_FOUND_MESSAGE.to_string()),
                 request_id: None,
             })
             .into());
-        };
+        }
 
-        // The OTP goes out over the SMS channel, and a channel the API configures as a
-        // channel of the application is delivered over only while that channel is
-        // enabled for it — the same rule a direct send to an SMS address is answered
-        // by. An application that never enabled the channel, or disabled it again, has
-        // no SMS to send the code over, so the destination's outcome is a permanent
-        // failure and no code is minted for it.
-        let outcome = match app.deliverable_channel(crate::state::CHANNEL_TYPE_SMS) {
-            Some(_) => Outcome {
+        // An identity the account cannot send from is a fault of the request, reported
+        // for the destination as the downstream refusal of the number it named; the
+        // message has no variable part, so it classifies the number and nothing else.
+        let outcome = if can_send_from {
+            Outcome {
                 delivery_status: DELIVERY_SUCCESSFUL,
                 status_code: STATUS_OK,
                 status_message: "Message accepted for delivery".to_string(),
-            },
-            None => Outcome {
+            }
+        } else {
+            Outcome {
                 delivery_status: DELIVERY_PERMANENT_FAILURE,
-                status_code: STATUS_NOT_FOUND,
-                status_message: crate::state::channel_not_found_message(
-                    crate::state::CHANNEL_TYPE_SMS,
-                    &app.id,
-                ),
-            },
+                status_code: STATUS_REFUSED,
+                status_message: crate::state::ORIGINATION_IDENTITY_NOT_USABLE_MESSAGE.to_string(),
+            }
         };
         let delivered = outcome.delivery_status == DELIVERY_SUCCESSFUL;
 
-        // A code and a message id are minted only for a destination the message was
-        // accepted for, so a code in the store always belongs to a message that went
-        // out and an id in a response always names an accepted delivery.
+        // A code is minted only for a destination the message was accepted for, so a code
+        // in the store always belongs to a message that went out. The message id is the
+        // handle the caller correlates THIS send by, so the destination carries one
+        // whatever became of the delivery — a refused destination is still a message this
+        // service answered for.
         let request_id = store.mint_id();
         let code = delivered.then(|| store.mint_otp_code(code_length));
-        let message_id = delivered.then(|| store.mint_id());
+        let message_id = store.mint_id();
         // The application was read above under this same guard, so it is still there.
         if let Some(app) = store.apps.get_mut(&application_id) {
             if let Some(code) = code {
@@ -317,7 +326,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     channel_type: Some(crate::state::CHANNEL_TYPE_SMS.to_string()),
                     delivery_status: outcome.delivery_status.to_string(),
                     status_code: outcome.status_code,
-                    message_id: message_id.clone(),
+                    message_id: Some(message_id.clone()),
                 }],
             });
         }
@@ -331,7 +340,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             destination_identity,
             MessageResult {
                 delivery_status: outcome.delivery_status.to_string(),
-                message_id,
+                message_id: Some(message_id),
                 status_code: outcome.status_code,
                 status_message: Some(outcome.status_message),
                 updated_token: None,
@@ -368,6 +377,17 @@ struct Outcome {
 fn bad_request(message: String) -> SendOTPMessageError {
     SendOTPMessageErrorModeled::BadRequestException(BadRequestException {
         message: Some(message),
+        request_id: None,
+    })
+    .into()
+}
+
+/// The `InternalServerErrorException` this operation answers with when the account's
+/// origination identities cannot be read: without them no verdict can be computed for
+/// the destination, and reporting one anyway would describe a send nothing decided.
+fn origination_inventory_unavailable() -> SendOTPMessageError {
+    SendOTPMessageErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some("the origination identity inventory is unavailable".to_string()),
         request_id: None,
     })
     .into()

@@ -24,6 +24,10 @@ tracing = { workspace = true }
 # Hashing + hex encoding for the server-generated ids and cohort assignment in `src/state.rs`.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The origination identities an OTP send is sent FROM are leased through the SMS and voice
+# (v2) API, which owns the account's inventory of them: this crate READS that inventory in
+# `src/state/origination_identity.rs` rather than keeping a second copy of it.
+service-com-amazonaws-pinpointsmsvoicev2-pinpointsmsvoicev2 = { path = "../service-com-amazonaws-pinpointsmsvoicev2-pinpointsmsvoicev2" }
 # `service-common` owns this tree's ONE statement of the request id a response names the
 # request it answers by, which this service reports in the `RequestID` member its
 # exception shapes declare (see `src/service.rs`).

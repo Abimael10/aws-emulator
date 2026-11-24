@@ -19071,6 +19071,7 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-com-amazonaws-pinpointsmsvoicev2-pinpointsmsvoicev2",
  "service-common",
  "sha2 0.10.9",
  "tokio",

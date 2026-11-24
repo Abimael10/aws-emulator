@@ -12,6 +12,11 @@
 //! * a send mints a code of the requested length, stores it as the challenge for the
 //!   request's `ReferenceId` and `DestinationIdentity`, and answers one result under
 //!   the destination it was sent to;
+//! * whether that destination took the code is decided by the request's
+//!   `OriginationIdentity` — an identity the account does not hold is reported for the
+//!   destination with a 400 and this service's fixed origination-identity sentence,
+//!   whichever channels the application has configured, and either way the destination
+//!   carries the `MessageId` of the message the send minted for it;
 //! * a verification is valid only for the exact code stored for that same pair, only
 //!   while the challenge is inside its validity period and still answers an attempt,
 //!   and only once — every other verification is a 200 reporting `Valid: false`;
@@ -27,11 +32,19 @@ use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
+use service_com_amazonaws_pinpointsmsvoicev2_pinpointsmsvoicev2 as sms_voice;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every case in this suite signs for; the suite asserts OTP behaviour,
 /// not ARNs.
 const REGION: &str = "us-east-1";
+
+/// The origination identity every send in this suite is sent from, leased to the
+/// account before the send so the message has a number behind it.
+const ORIGINATION_NUMBER: &str = "+15550000000";
+
+/// The identifier the lease of [`ORIGINATION_NUMBER`] is held under.
+const ORIGINATION_ID: &str = "phone-0000000000000000000000000000002a";
 
 /// A mounted emulator holding one shared engine, exactly as the router builds it.
 struct Emulator {
@@ -120,9 +133,59 @@ impl Emulator {
         .await
     }
 
+    /// Lease one phone number to the account, so an OTP send naming it as its
+    /// `OriginationIdentity` has a number behind it.
+    ///
+    /// The account's origination identities belong to the SMS and voice API, which
+    /// leases them through `RequestPhoneNumber`; this is the record that lease leaves
+    /// behind, written straight into that service's own store so this suite stays a
+    /// single-service suite. The cross-service wire path — lease there, send here — is
+    /// covered by the router suite `pinpoint_otp_origination_identity`.
+    fn lease_origination_identity(&self, id: &str, number: &str) -> String {
+        let arn = format!("arn:aws:sms-voice:{REGION}:000000000000:phone-number/{id}");
+        let store = sms_voice::state::service_state(&*self.engine)
+            .expect("the shared engine holds the SMS and voice store");
+        let mut guard = store.lock();
+        guard.phone_numbers.insert(
+            id.to_string(),
+            sms_voice::state::PhoneNumberRecord {
+                id: id.to_string(),
+                arn: arn.clone(),
+                phone_number: number.to_string(),
+                status: "ACTIVE".to_string(),
+                iso_country_code: "US".to_string(),
+                message_type: "TRANSACTIONAL".to_string(),
+                number_capabilities: vec!["SMS".to_string()],
+                number_type: "LONG_CODE".to_string(),
+                monthly_leasing_price: "0.00".to_string(),
+                two_way_enabled: false,
+                two_way_channel_arn: None,
+                two_way_channel_role: None,
+                self_managed_opt_outs_enabled: false,
+                opt_out_list_name: "Default".to_string(),
+                international_sending_enabled: false,
+                deletion_protection_enabled: false,
+                pool_id: None,
+                registration_id: None,
+                tags: Vec::new(),
+                created_timestamp: SystemTime::now(),
+            },
+        );
+        arn
+    }
+
+    /// Give one leased number back, the way `ReleasePhoneNumber` does.
+    fn release_origination_identity(&self, id: &str) {
+        let store = sms_voice::state::service_state(&*self.engine)
+            .expect("the shared engine holds the SMS and voice store");
+        let mut guard = store.lock();
+        guard.phone_numbers.remove(id);
+    }
+
     /// Enable or disable the application's SMS channel: the write `UpdateSmsChannel`
     /// will make once it is implemented, made here through the same state method every
-    /// channel update goes through, because an OTP send is gated on that channel.
+    /// channel update goes through. An OTP send is NOT gated on it, which is what the
+    /// channel-independence case uses this for.
     fn set_sms_channel(&self, app: &str, enabled: bool) {
         let store = service_com_amazonaws_pinpoint_pinpoint::state::service_state(&*self.engine)
             .expect("the shared engine holds this service's state");
@@ -233,7 +296,7 @@ fn base_send(destination: &str, reference_id: &str) -> serde_json::Map<String, V
     parameters.insert("BrandName".to_string(), json!("Example Corp"));
     parameters.insert("Channel".to_string(), json!("SMS"));
     parameters.insert("DestinationIdentity".to_string(), json!(destination));
-    parameters.insert("OriginationIdentity".to_string(), json!("+15550000000"));
+    parameters.insert("OriginationIdentity".to_string(), json!(ORIGINATION_NUMBER));
     parameters.insert("ReferenceId".to_string(), json!(reference_id));
     parameters
 }
@@ -255,7 +318,7 @@ struct SendCase {
 async fn a_sent_code_verifies_once_for_the_pair_it_was_sent_for() {
     let emulator = Emulator::new();
     let app = emulator.create_app("otp-round-trip").await;
-    emulator.set_sms_channel(&app, true);
+    emulator.lease_origination_identity(ORIGINATION_ID, ORIGINATION_NUMBER);
     let shortest = service_com_amazonaws_pinpoint_pinpoint::state::MIN_CODE_LENGTH;
     let longest = service_com_amazonaws_pinpoint_pinpoint::state::MAX_CODE_LENGTH;
     let shortest_asked = i64::try_from(shortest).expect("a code length fits an i64");
@@ -441,7 +504,7 @@ async fn a_sent_code_verifies_once_for_the_pair_it_was_sent_for() {
 async fn a_wrong_code_spends_one_of_the_allowed_attempts() {
     let emulator = Emulator::new();
     let app = emulator.create_app("otp-attempts").await;
-    emulator.set_sms_channel(&app, true);
+    emulator.lease_origination_identity(ORIGINATION_ID, ORIGINATION_NUMBER);
     let destination = "+15557654321";
 
     // Each row names an attempt budget and how many wrong codes are tried before the
@@ -504,7 +567,7 @@ async fn a_wrong_code_spends_one_of_the_allowed_attempts() {
 async fn a_verification_that_does_not_match_the_stored_challenge_is_not_valid() {
     let emulator = Emulator::new();
     let app = emulator.create_app("otp-rejections").await;
-    emulator.set_sms_channel(&app, true);
+    emulator.lease_origination_identity(ORIGINATION_ID, ORIGINATION_NUMBER);
     let destination = "+15550001111";
     let reference = "checkout-7";
     let mut parameters = base_send(destination, reference);
@@ -550,7 +613,7 @@ async fn a_verification_that_does_not_match_the_stored_challenge_is_not_valid() 
 async fn a_challenge_past_its_validity_period_is_not_valid_and_is_dropped() {
     let emulator = Emulator::new();
     let app = emulator.create_app("otp-expiry").await;
-    emulator.set_sms_channel(&app, true);
+    emulator.lease_origination_identity(ORIGINATION_ID, ORIGINATION_NUMBER);
     let destination = "+15552223333";
 
     for (case, validity) in [
@@ -590,7 +653,7 @@ async fn a_challenge_past_its_validity_period_is_not_valid_and_is_dropped() {
 async fn a_send_this_service_cannot_mint_a_code_for_is_refused_and_stores_nothing() {
     let emulator = Emulator::new();
     let app = emulator.create_app("otp-refusals").await;
-    emulator.set_sms_channel(&app, true);
+    emulator.lease_origination_identity(ORIGINATION_ID, ORIGINATION_NUMBER);
     let destination = "+15554445555";
     let shortest = i64::try_from(service_com_amazonaws_pinpoint_pinpoint::state::MIN_CODE_LENGTH)
         .expect("a code length fits an i64");
@@ -648,33 +711,245 @@ async fn a_send_this_service_cannot_mint_a_code_for_is_refused_and_stores_nothin
     );
 }
 
-#[tokio::test]
-async fn the_sms_channels_state_decides_whether_the_code_is_sent_at_all() {
-    let emulator = Emulator::new();
-    let app = emulator.create_app("otp-channel-gate").await;
-    let destination = "+15553334444";
+/// The sentence this service reports for a destination whose send names an origination
+/// identity the account cannot send from, written out in full so that changing the text
+/// has to be deliberate. It carries no variable part at all.
+const ORIGINATION_IDENTITY_NOT_USABLE: &str = "The provided number does not exist or does \
+     not belong to the account, or its resource policy does not allow Pinpoint to use it";
 
-    // The same send, before and after each write to the channel it goes out over: the
-    // outcome follows the application's stored channel state and nothing else.
-    for (case, channel, deliverable) in [
-        ("before the channel is configured at all", None, false),
-        ("once the channel is enabled", Some(true), true),
-        ("after the channel is disabled again", Some(false), false),
-        ("after it is enabled once more", Some(true), true),
+/// One row of the origination-identity table: the identity the send is sent FROM, and
+/// whether the account can send from it.
+struct OriginationCase {
+    case: &'static str,
+    identity: String,
+    sendable: bool,
+}
+
+#[tokio::test]
+async fn the_origination_identity_decides_whether_the_code_is_sent_at_all() {
+    let emulator = Emulator::new();
+    let app = emulator.create_app("otp-origination-gate").await;
+    let destination = "+15553334444";
+    let arn = emulator.lease_origination_identity(ORIGINATION_ID, ORIGINATION_NUMBER);
+    // A second lease, so a row can send from an identity of the account other than the
+    // one every other case in this suite uses.
+    let other_id = "phone-000000000000000000000000000000ff";
+    let other_number = "+15557770001";
+    emulator.lease_origination_identity(other_id, other_number);
+
+    // The rows differ along every form one of the account's identities is named by — the
+    // number, the same number without its leading `+`, the lease's identifier, the
+    // lease's ARN, a second leased number — and along forms that name no lease of this
+    // account at all: a number it never leased, a number one character short of a leased
+    // one, a pool identifier and a sender id.
+    let cases = [
+        OriginationCase {
+            case: "the leased number in E.164",
+            identity: ORIGINATION_NUMBER.to_string(),
+            sendable: true,
+        },
+        OriginationCase {
+            case: "the leased number without its leading plus",
+            identity: ORIGINATION_NUMBER.trim_start_matches('+').to_string(),
+            sendable: true,
+        },
+        OriginationCase {
+            case: "the identifier the lease is held under",
+            identity: ORIGINATION_ID.to_string(),
+            sendable: true,
+        },
+        OriginationCase {
+            case: "the ARN of the lease",
+            identity: arn.clone(),
+            sendable: true,
+        },
+        OriginationCase {
+            case: "a second number the account leases",
+            identity: other_number.to_string(),
+            sendable: true,
+        },
+        OriginationCase {
+            case: "a number the account never leased",
+            identity: "+15559990000".to_string(),
+            sendable: false,
+        },
+        OriginationCase {
+            case: "one digit short of a leased number",
+            identity: ORIGINATION_NUMBER[..ORIGINATION_NUMBER.len() - 1].to_string(),
+            sendable: false,
+        },
+        OriginationCase {
+            case: "a pool nothing created",
+            identity: "pool-0000000000000000000000000000000a".to_string(),
+            sendable: false,
+        },
+        OriginationCase {
+            case: "a sender id the account does not hold",
+            identity: "EXAMPLECORP".to_string(),
+            sendable: false,
+        },
+    ];
+
+    let mut message_ids: BTreeSet<String> = BTreeSet::new();
+    for (index, case) in cases.iter().enumerate() {
+        let reference = format!("origination-{index}");
+        let mut parameters = base_send(destination, &reference);
+        parameters.insert("OriginationIdentity".to_string(), json!(case.identity));
+        let (status, body) = emulator.send_otp(&app, Value::Object(parameters)).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: an OTP send is answered 200 whatever the destination's outcome, got {body:?}",
+            case.case
+        );
+        let outcome = &body["Result"][destination];
+        let expected = if case.sendable {
+            ("SUCCESSFUL", 200)
+        } else {
+            ("PERMANENT_FAILURE", 400)
+        };
+        assert_eq!(
+            (
+                outcome["DeliveryStatus"].as_str(),
+                outcome["StatusCode"].as_i64()
+            ),
+            (Some(expected.0), Some(i64::from(expected.1))),
+            "case {:?}: expected {expected:?}, got {outcome:?}",
+            case.case
+        );
+
+        // The destination carries the handle this send is correlated by whatever became
+        // of the delivery, and no two sends share one.
+        let message_id = outcome["MessageId"].as_str().unwrap_or_default().to_string();
+        assert!(
+            !message_id.is_empty(),
+            "case {:?}: the destination's result carries a MessageId, got {outcome:?}",
+            case.case
+        );
+        assert!(
+            message_ids.insert(message_id.clone()),
+            "case {:?}: every send mints its own MessageId, got {message_id:?}",
+            case.case
+        );
+
+        let stored = emulator.stored_code(&app, &reference, destination);
+        if case.sendable {
+            let code = stored.unwrap_or_else(|| {
+                panic!(
+                    "case {:?}: an accepted send stores the challenge it minted",
+                    case.case
+                )
+            });
+            let (status, body) = emulator
+                .verify_otp(&app, &reference, destination, &code)
+                .await;
+            assert!(
+                valid_flag(status, &body),
+                "case {:?}: the code that went out verifies, got {body:?}",
+                case.case
+            );
+        } else {
+            let status_message = outcome["StatusMessage"].as_str().unwrap_or_default();
+            assert_eq!(
+                status_message, ORIGINATION_IDENTITY_NOT_USABLE,
+                "case {:?}: the destination reports the origination-identity refusal, got {status_message:?}",
+                case.case
+            );
+            for interpolated in [app.as_str(), destination, case.identity.as_str()] {
+                assert!(
+                    !status_message.contains(interpolated),
+                    "case {:?}: the refusal interpolates nothing, yet it carries {interpolated:?}: {status_message:?}",
+                    case.case
+                );
+            }
+            assert_eq!(
+                stored, None,
+                "case {:?}: a send that delivered nothing mints no code",
+                case.case
+            );
+            // And with no challenge stored, no code can verify for that reference.
+            let (status, body) = emulator
+                .verify_otp(&app, &reference, destination, "123456")
+                .await;
+            assert!(
+                !valid_flag(status, &body),
+                "case {:?}: a reference nothing was sent for cannot verify, got {body:?}",
+                case.case
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_applications_channel_configuration_does_not_decide_an_otp_send() {
+    let emulator = Emulator::new();
+    let app = emulator.create_app("otp-channel-independence").await;
+    let destination = "+15552224444";
+    let unleased = "+15559990000";
+    emulator.lease_origination_identity(ORIGINATION_ID, ORIGINATION_NUMBER);
+
+    // The verdict follows the origination identity across every state the application's
+    // SMS channel can be in: never configured, enabled, disabled again.
+    for (case, channel) in [
+        ("with the SMS channel never configured", None),
+        ("with the SMS channel enabled", Some(true)),
+        ("with the SMS channel disabled again", Some(false)),
     ] {
         if let Some(enabled) = channel {
             emulator.set_sms_channel(&app, enabled);
         }
-        let reference = format!("gate-{case}");
+        for (identity, sendable) in [(ORIGINATION_NUMBER, true), (unleased, false)] {
+            let reference = format!("channel-{case}-{identity}");
+            let mut parameters = base_send(destination, &reference);
+            parameters.insert("OriginationIdentity".to_string(), json!(identity));
+            let (status, body) = emulator.send_otp(&app, Value::Object(parameters)).await;
+            assert_eq!(status, 200, "case {case:?}: expected 200, got {body:?}");
+            let outcome = &body["Result"][destination];
+            let expected = if sendable {
+                ("SUCCESSFUL", 200)
+            } else {
+                ("PERMANENT_FAILURE", 400)
+            };
+            assert_eq!(
+                (
+                    outcome["DeliveryStatus"].as_str(),
+                    outcome["StatusCode"].as_i64()
+                ),
+                (Some(expected.0), Some(i64::from(expected.1))),
+                "case {case:?}: sending from {identity:?} expected {expected:?}, got {outcome:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_released_origination_identity_stops_being_sendable_from() {
+    let emulator = Emulator::new();
+    let app = emulator.create_app("otp-origination-release").await;
+    let destination = "+15551112222";
+
+    // The identity is read off the inventory that owns it on every send, so giving the
+    // lease back — and taking it again — changes what the next send answers.
+    for (case, leased) in [
+        ("before the number is leased", false),
+        ("while the number is leased", true),
+        ("after the lease is given back", false),
+        ("once it is leased again", true),
+    ] {
+        if leased {
+            emulator.lease_origination_identity(ORIGINATION_ID, ORIGINATION_NUMBER);
+        } else {
+            emulator.release_origination_identity(ORIGINATION_ID);
+        }
+        let reference = format!("release-{case}");
         let (status, body) = emulator
             .send_otp(&app, Value::Object(base_send(destination, &reference)))
             .await;
         assert_eq!(status, 200, "case {case:?}: expected 200, got {body:?}");
         let outcome = &body["Result"][destination];
-        let expected = if deliverable {
+        let expected = if leased {
             ("SUCCESSFUL", 200)
         } else {
-            ("PERMANENT_FAILURE", 404)
+            ("PERMANENT_FAILURE", 400)
         };
         assert_eq!(
             (
@@ -684,46 +959,13 @@ async fn the_sms_channels_state_decides_whether_the_code_is_sent_at_all() {
             (Some(expected.0), Some(i64::from(expected.1))),
             "case {case:?}: expected {expected:?}, got {outcome:?}"
         );
-
-        let stored = emulator.stored_code(&app, &reference, destination);
-        if deliverable {
-            assert!(
-                outcome["MessageId"].as_str().is_some(),
-                "case {case:?}: an accepted delivery mints a MessageId, got {outcome:?}"
-            );
-            let code = stored
-                .unwrap_or_else(|| panic!("case {case:?}: an accepted send stores its challenge"));
-            let (status, body) = emulator
-                .verify_otp(&app, &reference, destination, &code)
-                .await;
-            assert!(
-                valid_flag(status, &body),
-                "case {case:?}: the code that went out verifies, got {body:?}"
-            );
-        } else {
-            assert_eq!(
-                outcome["MessageId"].as_str(),
-                None,
-                "case {case:?}: nothing was delivered, so no MessageId is minted, got {outcome:?}"
-            );
-            assert_eq!(
-                stored, None,
-                "case {case:?}: a send that delivered nothing mints no code"
-            );
-            let status_message = outcome["StatusMessage"].as_str().unwrap_or_default();
-            assert!(
-                status_message.contains("SMS") && status_message.contains(app.as_str()),
-                "case {case:?}: the status message names the channel to enable and the application, got {status_message:?}"
-            );
-            // And with no challenge stored, no code can verify for that reference.
-            let (status, body) = emulator
-                .verify_otp(&app, &reference, destination, "123456")
-                .await;
-            assert!(
-                !valid_flag(status, &body),
-                "case {case:?}: a reference nothing was sent for cannot verify, got {body:?}"
-            );
-        }
+        assert_eq!(
+            emulator
+                .stored_code(&app, &reference, destination)
+                .is_some(),
+            leased,
+            "case {case:?}: a code is minted only for a send that went out"
+        );
     }
 }
 
@@ -762,7 +1004,7 @@ async fn an_unknown_application_is_a_404_for_both_otp_operations() {
 async fn every_accepted_send_is_recorded_against_the_application() {
     let emulator = Emulator::new();
     let app = emulator.create_app("otp-send-log").await;
-    emulator.set_sms_channel(&app, true);
+    emulator.lease_origination_identity(ORIGINATION_ID, ORIGINATION_NUMBER);
     let destination = "+15558889999";
 
     let mut expected: Vec<(String, String, String, String)> = Vec::new();
@@ -799,7 +1041,7 @@ async fn every_accepted_send_is_recorded_against_the_application() {
 async fn the_challenge_store_is_bounded() {
     let emulator = Emulator::new();
     let app = emulator.create_app("otp-bound").await;
-    emulator.set_sms_channel(&app, true);
+    emulator.lease_origination_identity(ORIGINATION_ID, ORIGINATION_NUMBER);
     let destination = "+15551110000";
     let limit = service_com_amazonaws_pinpoint_pinpoint::state::MAX_OTPS_PER_APP;
 
