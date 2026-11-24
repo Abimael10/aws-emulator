@@ -3,11 +3,11 @@
 //! WHICH subject this service names when it refuses an identifier past the bound its
 //! operation states.
 //!
-//! The rule under test: ElastiCache states the length half of its identifier rule per MEMBER,
-//! and the sentence names the subject that member's refusals are worded with — for the
-//! members AWS names by its own parameter label, `The parameter <label> is not a valid
-//! identifier because it is longer than <n> characters.`, and for the members it names in
-//! prose, `<prose> cannot be longer than <n> characters.` The only variable parts are that
+//! The rule under test: ElastiCache states the length half of its identifier rule in the
+//! words the OPERATION that answers it uses for the identifier's subject — where that subject
+//! is AWS's own parameter label, `The parameter <label> is not a valid identifier because it
+//! is longer than <n> characters.`, and where it is the resource named in prose, `<prose>
+//! cannot be longer than <n> characters.` The only variable parts are that
 //! subject and the bound, both fixed by the rule: nothing of the value that broke it is
 //! echoed back, the refusal is 400 `InvalidParameterValue`, and it is answered BEFORE the
 //! identifier is resolved against anything — while an identifier the bound admits reaches
@@ -114,17 +114,17 @@ fn identifier_subjects() -> Vec<IdentifierSubject> {
             bound: state::REPLICATION_GROUP_ID_MAX_LEN,
             subject: Subject::Label("ReplicationGroupId"),
         },
+        // The contrast rows: the same resource on the operations whose own wording names it in
+        // prose, so the rule is shown to be per member and per operation rather than one
+        // subject for the whole service.
         IdentifierSubject {
             case: "a replication group delete",
             action: "DeleteReplicationGroup",
             member: "ReplicationGroupId",
             extra: &[],
             bound: state::REPLICATION_GROUP_ID_MAX_LEN,
-            subject: Subject::Label("ReplicationGroupId"),
+            subject: Subject::Prose("Replication Group ID"),
         },
-        // The contrast rows: the same resource on the operations whose own wording names it in
-        // prose, so the rule is shown to be per member and per operation rather than one
-        // subject for the whole service.
         IdentifierSubject {
             case: "a replication group lookup",
             action: "DescribeReplicationGroups",

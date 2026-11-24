@@ -178,10 +178,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The FORM of the identifier before it is resolved, as every lookup in
         // this service does it: a value no replication group could ever carry is
-        // a bad parameter value rather than a group that does not exist — see
-        // `crate::service::identifier_length_rules::replication_group_id_refusal`.
+        // a bad parameter value rather than a group that does not exist. This
+        // operation words BOTH halves of that rule over the resource named in
+        // prose — see
+        // `crate::service::identifier_length_rules::replication_group_id_prose_refusal`.
         if let Some(message) =
-            crate::service::identifier_length_rules::replication_group_id_refusal(
+            crate::service::identifier_length_rules::replication_group_id_prose_refusal(
                 &input.replication_group_id,
             )
         {
