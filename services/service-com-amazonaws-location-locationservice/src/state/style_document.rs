@@ -11,19 +11,22 @@
 //! 8): a source named after the data provider the map's tiles come from,
 //! carrying the map's own tile URL template and the zoom range it has tiles
 //! for; the sprite and glyph templates a renderer loads its icons and fonts
-//! from; the instants the style was created and last changed; and one layer per
-//! layer those tiles carry, in draw order, each bound to that source.
+//! from; the instants the published style reports; and the published layers of
+//! that style, in draw order, each bound to that source.
 //!
-//! Everything in it is derived from the map resource's stored record and the
-//! tile module beside it — the zoom range is [`super::MapStyle::max_zoom`],
-//! which `GetMapTile` enforces, the layers are
-//! [`super::map_tiles::tile_layers`], which `GetMapTile` encodes, and the
-//! instants are the resource's own `CreateTime`/`UpdateTime`, which a map read
-//! reports — so what this document DECLARES and what the rest of the plane
-//! serves cannot drift apart.
+//! The document's CONTENT is the published style asset of the style the map was
+//! created with ([`super::published_styles`]): its layers are that asset's
+//! layers, and its `created`/`modified` are the asset's own stamps rather than
+//! any instant of this service's clock or of the resource that was read. Only
+//! the addresses in it belong to the request — the templates are rooted at the
+//! endpoint the read arrived at and address the map resource it was read for —
+//! and the zoom range is the one [`super::MapStyle::max_zoom`] publishes and
+//! `GetMapTile` enforces, so what this document DECLARES and what the rest of
+//! the plane serves cannot drift apart.
 
-use super::map_tiles::{self, LayerGeometry, TileLayer};
-use super::{EpochMillis, MapStyle};
+use super::map_tiles::{self, LayerGeometry};
+use super::published_styles::{PublishedLayer, PublishedStyle, SYMBOL_ATTRIBUTE};
+use super::MapStyle;
 
 /// The media type a style descriptor is served with. The
 /// `GetMapStyleDescriptorResponse$ContentType` doc: "The style descriptor's
@@ -52,12 +55,9 @@ pub struct StyledMap<'a> {
     /// The data provider the map's tiles are sourced from, as the map resource
     /// stored it and every map read reports it.
     pub data_source: &'a str,
-    /// When the map resource was created, and so when the style it publishes
-    /// came into being: the resource's own `CreateTime`.
-    pub created: EpochMillis,
-    /// When the map resource was last written, and so when the style it
-    /// publishes last changed: the resource's own `UpdateTime`.
-    pub modified: EpochMillis,
+    /// The published style asset of the style the map was created with: the
+    /// layers the document paints and the instants it reports.
+    pub published: PublishedStyle,
 }
 
 /// The id the map's one source is declared under: the data provider the tiles
@@ -106,19 +106,6 @@ fn glyphs_template(endpoint: &str, map_name: &str) -> String {
     format!("{endpoint}/maps/v0/maps/{map_name}/glyphs/{{fontstack}}/{{range}}.pbf")
 }
 
-/// A stored instant as this document writes it: the ISO 8601 form every
-/// timestamp of this API is rendered in (see [`super::EpochMillis`]).
-///
-/// The rendering of an instant the service's own clock produced cannot fail, so
-/// the fallback is unreachable; it is here rather than an unwrap because a
-/// handler of this crate answers a modelled response for every input and
-/// panics for none.
-fn rendered_instant(millis: EpochMillis) -> String {
-    super::to_date_time(millis)
-        .fmt(::aws_smithy_types::date_time::Format::DateTime)
-        .unwrap_or_default()
-}
-
 /// The style descriptor of `map`, as the bytes the operation answers with.
 ///
 /// `endpoint` is the base URL this emulator is served at, so the templates in
@@ -144,10 +131,13 @@ pub fn style_descriptor(map: &StyledMap<'_>, endpoint: &str) -> Vec<u8> {
     );
     document.insert(
         "layers".to_string(),
-        ::serde_json::Value::Array(layers(&map.style, &source, &palette)),
+        ::serde_json::Value::Array(layers(map, &source, &palette)),
     );
-    document.insert("created".to_string(), rendered_instant(map.created).into());
-    document.insert("modified".to_string(), rendered_instant(map.modified).into());
+    // The stamps of the published asset, which are a property of the asset and
+    // not of this read: the same two values on every call, whatever the clock
+    // says and whenever the map resource was written.
+    document.insert("created".to_string(), map.published.created.into());
+    document.insert("modified".to_string(), map.published.modified.into());
     // Serialization of a document built in memory cannot fail: every value is a
     // string, a finite number or a nested object of those.
     ::serde_json::to_vec(&::serde_json::Value::Object(document)).unwrap_or_default()
@@ -191,45 +181,59 @@ fn attribution(data_source: &str) -> String {
     format!("\u{a9} {data_source}")
 }
 
-/// The layers a renderer draws, in draw order: one layer per layer the tiles
-/// carry, each bound to the source the document declares — the ground
-/// included, since the tiles carry it as a layer of their own.
+/// The layers a renderer draws, in draw order: the published layers of the
+/// map's style, each bound to the source the document declares — the ground
+/// included, since the published schema carries it as a layer of its own.
 ///
-/// A raster basemap's tiles are images, so there is nothing to paint per layer:
-/// the single `raster` layer draws the imagery itself, bound to that same
-/// source.
+/// A raster basemap's tiles are images, so there is nothing to paint per
+/// feature class: the published asset carries no source layers and the single
+/// `raster` layer draws the imagery itself, bound to that same source.
 fn layers(
-    style: &MapStyle,
+    map: &StyledMap<'_>,
     source: &str,
     palette: &map_tiles::TilePalette,
 ) -> Vec<::serde_json::Value> {
-    if map_tiles::tile_format(style.style) == map_tiles::TileFormat::Raster {
+    let published = map.published.layers();
+    if published.is_empty() {
         return vec![::serde_json::json!({
             "id": source,
             "type": "raster",
             "source": source,
+            "layout": {},
         })];
     }
 
-    map_tiles::tile_layers()
+    published
         .iter()
         .map(|layer| vector_layer(layer, source, palette))
         .collect()
 }
 
-/// One vector layer of the style: the source it reads, the source layer the
-/// tiles carry it in, the kind of geometry it holds, the lowest zoom the tiles
-/// draw it at, and the paint for it.
+/// One published layer of the style, as the document states it: its own id, the
+/// source it reads, the source layer the tiles carry it in, the kind of geometry
+/// it draws, the predicate that selects the class it paints, its layout, its
+/// paint and the lowest zoom it is drawn at.
 fn vector_layer(
-    layer: &TileLayer,
+    layer: &PublishedLayer,
     source: &str,
     palette: &map_tiles::TilePalette,
 ) -> ::serde_json::Value {
     let colour = map_tiles::hex(map_tiles::tint_colour(palette, layer.tint));
     let mut entry = ::serde_json::Map::new();
-    entry.insert("id".to_string(), layer.name.into());
+    entry.insert("id".to_string(), layer.id.into());
     entry.insert("source".to_string(), source.into());
-    entry.insert("source-layer".to_string(), layer.name.into());
+    entry.insert("source-layer".to_string(), layer.source_layer.into());
+    // The class of the source layer this layer paints, as the published filter
+    // spells it: the tiles tag every feature with the class it belongs to, so
+    // the layer draws that class and not the whole source layer.
+    entry.insert(
+        "filter".to_string(),
+        ::serde_json::json!(["==", SYMBOL_ATTRIBUTE, layer.symbol]),
+    );
+    entry.insert(
+        "layout".to_string(),
+        ::serde_json::Value::Object(::serde_json::Map::new()),
+    );
     match layer.geometry {
         LayerGeometry::Area => {
             entry.insert("type".to_string(), "fill".into());

@@ -3,14 +3,16 @@
 //! @op GetMapStyleDescriptor
 //! Serves the style descriptor a stored map resource publishes.
 //!
-//! The document is derived from the map resource's OWN stored record: the style
-//! it was created with decides the provider its tiles are credited to and the
-//! source they are declared under, the zoom range they exist for and the layers
-//! they carry, and the resource's own create and update instants are the
-//! instants the style reports. [`crate::state::style_document`] builds it from
-//! the same catalog entry and the same layer table `GetMapTile` serves tiles
-//! from, so what this document declares and what a tile read answers cannot
-//! drift apart.
+//! The document is the PUBLISHED style asset of the style the map resource was
+//! created with: this handler reads the map's own stored record, looks the style
+//! up in [`crate::state::published_styles`] and serves the asset stored there —
+//! its layers and its own `created`/`modified` stamps — with the addresses of
+//! this map's routes substituted into the document's templates. Nothing in the
+//! document is composed from the instant of the request, so two reads of one
+//! map, in any order and at any time, publish the same document.
+//! [`crate::state::style_document`] writes it from the same catalog and the same
+//! source-layer table `GetMapTile` encodes tiles from, so what this document
+//! declares and what a tile read answers cannot drift apart.
 //!
 //!
 //! ## Shape of an operation
@@ -171,12 +173,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // Read the map resource's own record — the style it was created with,
-        // the provider that style's tiles are sourced from, and the instants it
-        // was created and last written — and release the store: building the
-        // document reads nothing else, so a style read holds no lock while it
-        // renders and writes nothing at all.
-        let (style, data_source, created, modified) = {
+        // Read the map resource's own record — the style it was created with
+        // and the provider that style's tiles are sourced from — and release the
+        // store: building the document reads nothing else, so a style read holds
+        // no lock while it renders and writes nothing at all.
+        let (style, data_source) = {
             let store = state.lock();
             let map = store.maps.get(&input.map_name).ok_or_else(|| {
                 GetMapStyleDescriptorErrorModeled::ResourceNotFoundException(
@@ -188,19 +189,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     },
                 )
             })?;
-            (
-                map.configuration.style.clone(),
-                map.data_source.clone(),
-                map.create_time,
-                map.update_time,
-            )
+            (map.configuration.style.clone(), map.data_source.clone())
         };
 
         // The create resolved the style against this service's catalog, so a
         // stored map carrying one the catalog does not publish cannot be reached
         // through the API at all, and is a server fault rather than a bad
         // request.
-        let Some(entry) = crate::state::map_style(&style) else {
+        let (Some(entry), Some(published)) = (
+            crate::state::map_style(&style),
+            crate::state::published_styles::published_style(&style),
+        ) else {
             return Err(GetMapStyleDescriptorErrorModeled::InternalServerException(
                 InternalServerException {
                     message: "the map resource carries a style this service does not publish"
@@ -218,8 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name: &input.map_name,
             style: entry,
             data_source: &data_source,
-            created,
-            modified,
+            published,
         };
         Ok(GetMapStyleDescriptorOutput {
             blob: Some(crate::state::style_document::style_descriptor(

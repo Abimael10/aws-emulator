@@ -14,9 +14,9 @@
 //!   read for — it declares its tile source under the id of the data provider
 //!   the map's own style is sourced from, templates that source's tiles, its
 //!   sprite sheet and its glyph ranges onto this emulator's own routes for THIS
-//!   map resource, reports the instants the map resource was created and last
-//!   written, and binds every layer it paints to the source it declared (no
-//!   layer of the style's own invention);
+//!   map resource, reports the published style asset's own instants, and binds
+//!   every layer it paints to the source it declared (no layer of the style's
+//!   own invention);
 //! * a tile's `Content-Type` follows the OPERATION rather than the encoding of
 //!   the bytes inside it: every style's tile is labelled with the one media type
 //!   this plane serves binary assets as, while the body still decodes as the
@@ -35,8 +35,8 @@ use service_com_amazonaws_location_locationservice::state;
 // this one, so the published catalog, the tile media type and the create and
 // descriptor steps are stated once for the crate.
 use crate::harness::{
-    call, call_bytes, create_map, emulator, millis_of, published_styles, raster_basemap,
-    style_descriptor, TILE_CONTENT_TYPE,
+    call, call_bytes, create_map, emulator, published_styles, raster_basemap, style_descriptor,
+    TILE_CONTENT_TYPE,
 };
 
 /// The source id a style descriptor declares its tiles under, per data
@@ -66,6 +66,17 @@ const SOURCE_IDS: [(&str, &str); 4] = [
 /// fails if the catalog's depth for that family moves, rather than reading the
 /// depth back out of the catalog it is about.
 const ESRI_VECTOR_SOURCE_MAX_ZOOM: u64 = 15;
+
+/// The instant a published style asset reports as both its `created` and its
+/// `modified`.
+///
+/// Source: recorded behaviour of `GetMapStyleDescriptor` — the document AWS
+/// serves carries the zero-value timestamp in both members, a FIXED constant of
+/// the published asset rather than an instant of the serving clock or of the map
+/// resource that was read. Written here as the literal the recording carries, so
+/// this suite fails if the asset's stamp moves, rather than reading the stamp
+/// back out of the code it is about.
+const PUBLISHED_STYLE_INSTANT: &str = "0001-01-01T00:00:00Z";
 
 /// The source id the table above gives `provider`.
 fn expected_source_id(provider: &str) -> &'static str {
@@ -342,8 +353,21 @@ async fn a_vector_styles_layers_are_the_layers_its_tiles_carry() {
             .iter()
             .map(|layer| layer.name.to_string())
             .collect();
+        // A source layer is painted by one published layer per sub-class it
+        // carries, so the sequence of source layers the document paints is the
+        // tile schema expanded over those classes, in the order the tiles encode
+        // them.
+        let expected: Vec<String> = state::map_tiles::tile_layers()
+            .iter()
+            .flat_map(|layer| {
+                layer
+                    .classes
+                    .iter()
+                    .map(move |_| layer.name.to_string())
+            })
+            .collect();
         assert_eq!(
-            painted, carried,
+            painted, expected,
             "case {case:?}: the style must paint the layers its tiles carry, in the order the \
              tiles encode them, got {painted:?}"
         );
@@ -368,11 +392,11 @@ async fn a_vector_styles_layers_are_the_layers_its_tiles_carry() {
 }
 
 #[tokio::test]
-async fn a_descriptor_reports_the_instants_the_map_resource_carries() {
+async fn a_descriptor_reports_the_published_assets_own_instants() {
     let router = emulator();
     // Rows: a vector style and a raster one, under names of different shapes —
-    // the instants come from the RESOURCE, so neither the style nor the name
-    // changes where they are read from.
+    // the instants belong to the published ASSET, so neither the style, the
+    // provider nor the name changes them.
     for (map, style) in [
         ("instants.first_map", "VectorEsriNavigation"),
         ("INSTANTS-2", "RasterEsriImagery"),
@@ -388,19 +412,31 @@ async fn a_descriptor_reports_the_instants_the_map_resource_carries() {
         let described = described.json();
         let document = style_descriptor(&router, map).await;
 
-        for (member, resource_member) in [("created", "CreateTime"), ("modified", "UpdateTime")] {
+        for member in ["created", "modified"] {
             let rendered = string_member(map, &document, member);
-            let stored = millis_of(&described, resource_member);
             assert_eq!(
-                crate::harness::iso_millis(&rendered),
-                stored,
-                "case {map:?}: {member} must be the instant DescribeMap reports as \
-                 {resource_member} ({stored}), got {rendered:?}"
+                rendered, PUBLISHED_STYLE_INSTANT,
+                "case {map:?}: {member} must be the published asset's own instant \
+                 {PUBLISHED_STYLE_INSTANT:?}, got {rendered:?}"
             );
+            // The asset's stamp is not the instant the RESOURCE carries: the map
+            // was created by the call above, so its own instants are of this
+            // run.
+            for resource_member in ["CreateTime", "UpdateTime"] {
+                let stored = described
+                    .get(resource_member)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                assert_ne!(
+                    rendered, stored,
+                    "case {map:?}: {member} must be the published stamp rather than the \
+                     resource's {resource_member}, got {rendered:?}"
+                );
+            }
         }
 
-        // Read twice: a descriptor is a function of stored state, so the
-        // instants it reports do not move because it was read.
+        // Read twice: a descriptor is the stored published asset, so nothing in
+        // it moves because it was read.
         let again = style_descriptor(&router, map).await;
         assert_eq!(
             again, document,

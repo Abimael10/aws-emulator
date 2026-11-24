@@ -240,9 +240,10 @@ pub enum Tint {
     Detail,
 }
 
-/// One layer a vector tile carries: its name, what its features are drawn as,
-/// the ground they are drawn over, the colour a style paints them in, and the
-/// lowest zoom they are drawn at.
+/// One source layer a vector tile carries: its name as the published tile
+/// schema spells it, what its features are drawn as, the ground they are drawn
+/// over, the colour a style paints them in, the lowest zoom they are drawn at,
+/// and the sub-classes its features are tagged with.
 #[derive(Debug, Clone, Copy)]
 pub struct TileLayer {
     pub name: &'static str,
@@ -250,87 +251,20 @@ pub struct TileLayer {
     pub ground: Ground,
     pub tint: Tint,
     pub min_zoom: u32,
+    /// The classes the published style paints this layer's features in, one
+    /// published layer each: a tile tags every feature it encodes with the class
+    /// it belongs to, so the predicate a published layer filters with really
+    /// selects features out of this layer.
+    pub classes: &'static [super::published_styles::PublishedClass],
 }
 
-/// The layers a vector tile of this API carries.
+/// The layers a vector tile of this API carries: the source layers of the
+/// published tile schema, which is where their names, classes and zoom
+/// thresholds are written down (see [`super::published_styles`]).
 ///
-/// The names and what each one holds come from the `MapConfiguration$Style`
-/// doc's own account of what these basemaps include: "The map includes highways
-/// major roads, minor roads, railways, water features, cities, parks, landmarks,
-/// building footprints, and administrative boundaries." Which zoom each layer
-/// comes in at is this emulator's schema: a basemap draws its coarse features
-/// (water, boundaries, cities) at every zoom and its fine ones only once the
-/// tiles are small enough to hold them.
-///
-/// The ground comes FIRST because it is a layer of the tile data like any
-/// other: a renderer paints the land from the `land` polygon the tile carries,
-/// which is what lets every layer of the style document be bound to the source
-/// the document declares rather than to a background of the style's own.
-const TILE_LAYERS: [TileLayer; 9] = [
-    TileLayer {
-        name: "land",
-        geometry: LayerGeometry::Area,
-        ground: Ground::Land,
-        tint: Tint::Ground,
-        min_zoom: 0,
-    },
-    TileLayer {
-        name: "water",
-        geometry: LayerGeometry::Area,
-        ground: Ground::Water,
-        tint: Tint::Water,
-        min_zoom: 0,
-    },
-    TileLayer {
-        name: "boundaries",
-        geometry: LayerGeometry::Way,
-        ground: Ground::Any,
-        tint: Tint::Detail,
-        min_zoom: 0,
-    },
-    TileLayer {
-        name: "places",
-        geometry: LayerGeometry::Point,
-        ground: Ground::Land,
-        tint: Tint::Detail,
-        min_zoom: 0,
-    },
-    TileLayer {
-        name: "roads",
-        geometry: LayerGeometry::Way,
-        ground: Ground::Land,
-        tint: Tint::Detail,
-        min_zoom: 5,
-    },
-    TileLayer {
-        name: "railways",
-        geometry: LayerGeometry::Way,
-        ground: Ground::Land,
-        tint: Tint::Detail,
-        min_zoom: 7,
-    },
-    TileLayer {
-        name: "parks",
-        geometry: LayerGeometry::Area,
-        ground: Ground::Land,
-        tint: Tint::Detail,
-        min_zoom: 10,
-    },
-    TileLayer {
-        name: "landmarks",
-        geometry: LayerGeometry::Point,
-        ground: Ground::Land,
-        tint: Tint::Detail,
-        min_zoom: 12,
-    },
-    TileLayer {
-        name: "buildings",
-        geometry: LayerGeometry::Area,
-        ground: Ground::Land,
-        tint: Tint::Detail,
-        min_zoom: 14,
-    },
-];
+/// A tile is encoded from the same table the style descriptor is painted from,
+/// so a published layer's `source-layer` is a layer the tiles really carry.
+const TILE_LAYERS: &[TileLayer] = &super::published_styles::PUBLISHED_TILE_SCHEMA;
 
 /// The layers a vector tile at `zoom` over the given ground carries, in the
 /// order the tile encodes them: a layer comes in at its own zoom, and is drawn
@@ -351,7 +285,7 @@ fn carried_layers(zoom: u32, over_water: bool) -> impl Iterator<Item = &'static 
 /// `source-layer` a style names and the layer a tile carries are one list rather
 /// than two that can drift apart.
 pub fn tile_layers() -> &'static [TileLayer] {
-    &TILE_LAYERS
+    TILE_LAYERS
 }
 
 /// The names of the layers a vector tile of a map at `zoom` whose ground is land
@@ -399,60 +333,75 @@ fn ground_field(longitude: f64, latitude: f64) -> f64 {
 }
 
 /// A vector tile: one layer per entry of [`TILE_LAYERS`] the requested zoom and
-/// the tile's own ground admit, each carrying geometry on the tile's extent grid
-/// and the attributes a renderer filters and labels by.
+/// the tile's own ground admit, each carrying one feature per class of that
+/// layer — with the geometry on the tile's extent grid, the class the feature
+/// belongs to, and the attributes a renderer filters and labels by.
 fn vector_tile_bytes(style: &str, data_source: &str, address: TileAddress) -> Vec<u8> {
     let extent = i32::try_from(TILE_EXTENT).unwrap_or(4096);
     let (longitude, latitude) = address.centre();
     let water = over_water(longitude, latitude);
     let mut layers = Vec::with_capacity(TILE_LAYERS.len());
+    // Counts every feature the tile encodes, so each one is drawn inside its own
+    // inset and carries an id of its own.
+    let mut drawn = 0_usize;
 
-    for (index, layer) in carried_layers(address.z, water).enumerate() {
+    for layer in carried_layers(address.z, water) {
         let mut builder = LayerBuilder::new(layer.name, TILE_EXTENT);
-        let attributes = vec![
-            (
-                "name",
-                TagValue::Str(format!(
-                    "{} {}/{}/{}",
-                    layer.name, address.z, address.x, address.y
-                )),
-            ),
-            ("style", TagValue::Str(style.to_string())),
-            ("provider", TagValue::Str(data_source.to_string())),
-            ("z", TagValue::Int(i64::from(address.z))),
-            ("x", TagValue::Int(i64::from(address.x))),
-            ("y", TagValue::Int(i64::from(address.y))),
-            ("longitude", TagValue::Double(longitude)),
-            ("latitude", TagValue::Double(latitude)),
-        ];
-        // Each layer is drawn inside its own inset of the tile, so the layers of
-        // one tile are distinguishable to a client that decodes them.
-        let margin = (i32::try_from(index).unwrap_or(0) + 1) * 192;
-        let margin = margin.min(extent / 2 - 64);
-        let id = feature_id(address, index);
+        for class in layer.classes {
+            let attributes = vec![
+                (
+                    "name",
+                    TagValue::Str(format!(
+                        "{} {}/{}/{}",
+                        class.id, address.z, address.x, address.y
+                    )),
+                ),
+                // The class this feature belongs to, under the attribute the
+                // published style's own filter reads, so the layer the style
+                // paints for this class really selects it.
+                (
+                    super::published_styles::SYMBOL_ATTRIBUTE,
+                    TagValue::Int(class.symbol),
+                ),
+                ("style", TagValue::Str(style.to_string())),
+                ("provider", TagValue::Str(data_source.to_string())),
+                ("z", TagValue::Int(i64::from(address.z))),
+                ("x", TagValue::Int(i64::from(address.x))),
+                ("y", TagValue::Int(i64::from(address.y))),
+                ("longitude", TagValue::Double(longitude)),
+                ("latitude", TagValue::Double(latitude)),
+            ];
+            // Each feature is drawn inside its own inset of the tile, so the
+            // layers of one tile — and the classes of one layer — are
+            // distinguishable to a client that decodes them.
+            let margin = (i32::try_from(drawn).unwrap_or(0) + 1) * 192;
+            let margin = margin.min(extent / 2 - 64);
+            let id = feature_id(address, drawn);
+            drawn += 1;
 
-        match layer.geometry {
-            LayerGeometry::Area => {
-                let mut ring = GeometryWriter::new();
-                ring.move_to(margin, margin);
-                ring.line_to(&[
-                    (extent - margin, margin),
-                    (extent - margin, extent - margin),
-                    (margin, extent - margin),
-                ]);
-                ring.close_path();
-                builder.add_feature(id, GeomType::Polygon, ring.finish(), &attributes);
-            }
-            LayerGeometry::Way => {
-                let mut line = GeometryWriter::new();
-                line.move_to(0, margin);
-                line.line_to(&[(extent / 2, extent / 2), (extent, extent - margin)]);
-                builder.add_feature(id, GeomType::LineString, line.finish(), &attributes);
-            }
-            LayerGeometry::Point => {
-                let mut point = GeometryWriter::new();
-                point.move_to(extent / 2, extent / 2);
-                builder.add_feature(id, GeomType::Point, point.finish(), &attributes);
+            match layer.geometry {
+                LayerGeometry::Area => {
+                    let mut ring = GeometryWriter::new();
+                    ring.move_to(margin, margin);
+                    ring.line_to(&[
+                        (extent - margin, margin),
+                        (extent - margin, extent - margin),
+                        (margin, extent - margin),
+                    ]);
+                    ring.close_path();
+                    builder.add_feature(id, GeomType::Polygon, ring.finish(), &attributes);
+                }
+                LayerGeometry::Way => {
+                    let mut line = GeometryWriter::new();
+                    line.move_to(0, margin);
+                    line.line_to(&[(extent / 2, extent / 2), (extent, extent - margin)]);
+                    builder.add_feature(id, GeomType::LineString, line.finish(), &attributes);
+                }
+                LayerGeometry::Point => {
+                    let mut point = GeometryWriter::new();
+                    point.move_to(extent / 2, extent / 2);
+                    builder.add_feature(id, GeomType::Point, point.finish(), &attributes);
+                }
             }
         }
 
@@ -511,7 +460,12 @@ pub fn palette(data_source: &str) -> TilePalette {
     match data_source {
         super::PROVIDER_ESRI => TilePalette {
             water: [0x9f, 0xc4, 0xe0, 0xff],
-            land: [0xe8, 0xe3, 0xd6, 0xff],
+            // Recorded behaviour of `GetMapStyleDescriptor`: the published style
+            // of an Esri-backed vector basemap paints its `Land` layer
+            // `#f7f6d5`, so that is the colour this provider's ground is drawn
+            // in — by the published layer the descriptor carries and by the
+            // imagery a raster tile of the same provider is drawn from.
+            land: [0xf7, 0xf6, 0xd5, 0xff],
             relief: [0x8a, 0x7f, 0x63, 0xff],
         },
         super::PROVIDER_HERE => TilePalette {

@@ -34,7 +34,7 @@ use service_com_amazonaws_location_locationservice::state;
 // descriptor read — live in the harness, so this suite and the style-document
 // suite beside it cannot drift apart about any of them.
 use crate::harness::{
-    call, call_bytes, create_map, emulator, millis_of, published_styles, raster_basemap,
+    call, call_bytes, create_map, emulator, land_tile, millis_of, published_styles, raster_basemap,
     style_descriptor, RawAnswer, TILE_CONTENT_TYPE,
 };
 
@@ -372,25 +372,6 @@ async fn the_layers_a_style_paints_are_the_layers_its_tiles_carry() {
     }
 }
 
-/// The tile at `zoom` whose centre lies over land, found by walking the grid of
-/// that zoom with the same ground the service reads — so a row of the table
-/// below is about a tile whose land layers are drawn at all.
-fn land_tile(zoom: u32) -> state::map_tiles::TileAddress {
-    let axis = u32::try_from(state::map_tiles::TileAddress::axis_tiles(zoom)).unwrap_or(u32::MAX);
-    for step in 0..256 {
-        let address = state::map_tiles::TileAddress {
-            z: zoom,
-            x: (axis / 7).saturating_add(step) % axis,
-            y: (axis / 3).saturating_add(step) % axis,
-        };
-        let (longitude, latitude) = address.centre();
-        if !state::map_tiles::over_water(longitude, latitude) {
-            return address;
-        }
-    }
-    panic!("no tile of zoom {zoom} covers land, so the table below cannot be read");
-}
-
 /// What a tile carries follows its ADDRESS: the zoom decides which layers are
 /// drawn at all, and the ground the tile covers decides whether it carries the
 /// water layer or the land ones.
@@ -401,40 +382,49 @@ async fn a_tiles_content_follows_its_own_address() {
 
     /// The layers a tile over LAND carries at each zoom a layer comes in at.
     ///
-    /// Source: this crate's tile schema (`state::map_tiles::tile_layers`),
-    /// which names each layer and the lowest zoom it is drawn at; the rows are
-    /// those thresholds, so each one adds exactly the layer that zoom brings in.
+    /// Source: this crate's published tile schema
+    /// (`state::map_tiles::tile_layers`), which names each source layer as the
+    /// published schema spells it and the lowest zoom it is drawn at; the rows
+    /// are those thresholds, so each one adds exactly the layer that zoom brings
+    /// in.
     const LAND_LAYERS: [(u32, &[&str]); 6] = [
-        (0, &["land", "boundaries", "places"]),
-        (5, &["land", "boundaries", "places", "roads"]),
-        (7, &["land", "boundaries", "places", "roads", "railways"]),
+        (0, &["Land", "Boundary line", "City"]),
+        (5, &["Land", "Boundary line", "City", "Road"]),
+        (7, &["Land", "Boundary line", "City", "Road", "Railroad"]),
         (
             10,
-            &["land", "boundaries", "places", "roads", "railways", "parks"],
+            &[
+                "Land",
+                "Boundary line",
+                "City",
+                "Road",
+                "Railroad",
+                "Openspace or forest",
+            ],
         ),
         (
             12,
             &[
-                "land",
-                "boundaries",
-                "places",
-                "roads",
-                "railways",
-                "parks",
-                "landmarks",
+                "Land",
+                "Boundary line",
+                "City",
+                "Road",
+                "Railroad",
+                "Openspace or forest",
+                "Landmark",
             ],
         ),
         (
             14,
             &[
-                "land",
-                "boundaries",
-                "places",
-                "roads",
-                "railways",
-                "parks",
-                "landmarks",
-                "buildings",
+                "Land",
+                "Boundary line",
+                "City",
+                "Road",
+                "Railroad",
+                "Openspace or forest",
+                "Landmark",
+                "Building",
             ],
         ),
     ];
@@ -487,11 +477,11 @@ async fn a_tiles_content_follows_its_own_address() {
         .await;
         let carried = tile_layers(&case, &served.body);
         assert!(
-            carried.contains(&"water".to_string()),
+            carried.contains(&"Water area".to_string()),
             "case {case:?}: a tile over water must carry the water layer, got {carried:?}"
         );
         assert!(
-            !carried.contains(&"places".to_string()),
+            !carried.contains(&"City".to_string()),
             "case {case:?}: a tile over water must carry no land layer, got {carried:?}"
         );
     }

@@ -102,6 +102,12 @@ pub mod vector_tile;
 /// same layers.
 pub mod style_document;
 
+/// The published style asset each map style carries — the provider's own layer
+/// catalog and the instants that asset reports — kept beside this module because
+/// a style read serves the asset stored for the map's own style and a tile read
+/// encodes the source layers that same asset paints.
+pub mod published_styles;
+
 /// The place records the Places plane geocodes against, and the one statement of
 /// how a free-form query is matched against them, how a match is ranked and
 /// narrowed, and how a record is reported through the provider a place index was

@@ -315,6 +315,54 @@ pub async fn style_descriptor(router: &MultiServiceRouter, map: &str) -> Value {
     })
 }
 
+/// The tile at `zoom` whose centre lies over land, found by walking the grid of
+/// that zoom with the same ground the service reads — so a case read against it
+/// is about a tile whose land layers are drawn at all.
+///
+/// Here rather than in one suite because both map-plane suites that read a tile's
+/// own content need the same address.
+pub fn land_tile(
+    zoom: u32,
+) -> service_com_amazonaws_location_locationservice::state::map_tiles::TileAddress {
+    tile_over_ground(zoom, false)
+}
+
+/// The tile at `zoom` whose centre lies over WATER, found the same way: a case
+/// about the water layers a tile carries needs a tile that carries them.
+pub fn water_tile(
+    zoom: u32,
+) -> service_com_amazonaws_location_locationservice::state::map_tiles::TileAddress {
+    tile_over_ground(zoom, true)
+}
+
+/// The first tile of `zoom`'s grid whose centre lies over the asked-for ground,
+/// walked with the same ground field the service reads.
+fn tile_over_ground(
+    zoom: u32,
+    over_water: bool,
+) -> service_com_amazonaws_location_locationservice::state::map_tiles::TileAddress {
+    use service_com_amazonaws_location_locationservice::state::map_tiles;
+    let axis = u32::try_from(map_tiles::TileAddress::axis_tiles(zoom)).unwrap_or(u32::MAX);
+    // Walked with a stride rather than tile by tile: at a deep zoom neighbouring
+    // tiles cover almost the same ground, so a stride is what reaches both sides
+    // of a shoreline within a bounded number of probes.
+    for step in 0..4096_u32 {
+        let address = map_tiles::TileAddress {
+            z: zoom,
+            x: (axis / 7).saturating_add(step.saturating_mul(131)) % axis,
+            y: (axis / 3).saturating_add(step.saturating_mul(173)) % axis,
+        };
+        let (longitude, latitude) = address.centre();
+        if map_tiles::over_water(longitude, latitude) == over_water {
+            return address;
+        }
+    }
+    panic!(
+        "no tile of zoom {zoom} covers {}, so a case over it cannot be read",
+        if over_water { "water" } else { "land" }
+    );
+}
+
 /// The wire form of a timestamp inside a JSON body.
 ///
 /// Every timestamp member of this model targets one shape and that shape carries
