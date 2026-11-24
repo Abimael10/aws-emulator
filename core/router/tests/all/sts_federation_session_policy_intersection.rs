@@ -38,11 +38,15 @@ use crate::sts_session_credential_refusals::{
 /// The IAM action the account's own bucket listing is authorized under, as a refusal names it
 /// ("to use this operation, you must add the `s3:ListAllMyBuckets` policy action",
 /// `ListBuckets`).
-const LIST_ALL_MY_BUCKETS: &str = "s3:ListAllMyBuckets";
+pub(crate) const LIST_ALL_MY_BUCKETS: &str = "s3:ListAllMyBuckets";
 
 /// The Secrets Manager actions this suite drives: the account-wide listing, which addresses
 /// no secret, and the read of one secret.
-const LIST_SECRETS: &str = "secretsmanager:ListSecrets";
+///
+/// `pub(crate)`, like the harness below it: the suite that pins what CONCURRENTLY minted
+/// sessions may do ([`super::sts_concurrent_federation_sessions_keep_their_scopes`]) drives
+/// the same two gates through these rather than spelling a second harness for them.
+pub(crate) const LIST_SECRETS: &str = "secretsmanager:ListSecrets";
 const GET_SECRET_VALUE: &str = "secretsmanager:GetSecretValue";
 
 /// The name of the secret every row reads, created by the account's own credential.
@@ -61,7 +65,7 @@ const REGION: &str = "us-east-1";
 /// `core/router/src/lib.rs` mounts them: IAM holds the users and their documents, STS mints
 /// the federated session, and Amazon S3 and Secrets Manager each decide a request signed with
 /// it at their own gate.
-fn build_router() -> MultiServiceRouter {
+pub(crate) fn build_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -86,7 +90,7 @@ fn build_router() -> MultiServiceRouter {
 
 /// Call one Secrets Manager operation, presented as signed by `access_key_id`, over this
 /// service's awsJson1_1 wire form.
-async fn secrets_manager(
+pub(crate) async fn secrets_manager(
     router: &MultiServiceRouter,
     access_key_id: &str,
     operation: &str,
@@ -121,7 +125,7 @@ async fn secrets_manager(
 }
 
 /// The `__type` discriminator of an awsJson1_1 error body, without its namespace.
-fn json_error_code(parsed: &Value) -> String {
+pub(crate) fn json_error_code(parsed: &Value) -> String {
     parsed
         .get("__type")
         .and_then(Value::as_str)
@@ -133,7 +137,7 @@ fn json_error_code(parsed: &Value) -> String {
 }
 
 /// The `message` of an awsJson1_1 error body, whichever casing it carries.
-fn json_error_message(parsed: &Value) -> String {
+pub(crate) fn json_error_message(parsed: &Value) -> String {
     for member in ["message", "Message"] {
         if let Some(text) = parsed.get(member).and_then(Value::as_str) {
             return text.to_string();
@@ -144,7 +148,7 @@ fn json_error_message(parsed: &Value) -> String {
 
 /// The clause a refusal carries when the SESSION POLICIES are the boundary that withheld the
 /// grant.
-fn no_session_grant(action: &str) -> String {
+pub(crate) fn no_session_grant(action: &str) -> String {
     format!("because no session policy allows the {action} action")
 }
 
@@ -155,7 +159,7 @@ fn no_identity_grant(action: &str) -> String {
 
 /// The refusal sentence an action that addresses NO resource of its own is worded in: it
 /// names no resource, because no resource was addressed.
-fn not_authorized_account_wide(principal: &str, action: &str, reason: &str) -> String {
+pub(crate) fn not_authorized_account_wide(principal: &str, action: &str, reason: &str) -> String {
     format!("User: {principal} is not authorized to perform: {action} {reason}")
 }
 
@@ -530,7 +534,7 @@ async fn sibling_federation_sessions_keep_their_own_scopes() {
 ///
 /// Answers the session's access key id and the federated-user ARN a refusal of its requests
 /// names as the principal.
-async fn given_federation_session(
+pub(crate) async fn given_federation_session(
     router: &MultiServiceRouter,
     case: &str,
     minting_key: &str,
@@ -561,7 +565,7 @@ async fn given_federation_session(
 
 /// Create the secret every row reads with the account's own credential, and answer the ARN
 /// the account holds it under — which is the resource a read of it is decided over.
-async fn given_secret(router: &MultiServiceRouter, case: &str) -> String {
+pub(crate) async fn given_secret(router: &MultiServiceRouter, case: &str) -> String {
     let (status, answer) = secrets_manager(
         router,
         AMBIENT_KEY,
