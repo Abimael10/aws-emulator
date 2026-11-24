@@ -61,9 +61,10 @@ fn refusal_message(body: &Value) -> String {
 }
 
 /// The message the service reports for a rule the named group holds none of,
-/// WITHOUT the trace clause it closes with: that clause carries the trace of the
-/// request, a different value on every call, so what this suite compares is the
-/// sentence before it ([`stated_sentence`]).
+/// WITHOUT the trace clause an exception body closes with: that clause carries
+/// the trace of the request, a different value on every call, so the sentence a
+/// REFUSED call states is compared before its clause ([`stated_sentence`]) —
+/// while one row of a batch's served body states exactly this and stops.
 fn rule_not_found_message(group_id: &str, member: &str, match_source_id: &str) -> String {
     format!(
         r#"[{RSLVR_CODE_FIREWALL_RULE_NOT_FOUND}] Can’t locate the rule for the Firewall rule group ID: "{group_id}" and {member} "{match_source_id}"."#
@@ -71,8 +72,8 @@ fn rule_not_found_message(group_id: &str, member: &str, match_source_id: &str) -
 }
 
 /// The sentence `message` states, with the trace clause the service closes a DNS
-/// Firewall refusal with taken off it. A message that closes with no such clause
-/// fails here: the clause is part of the refusal.
+/// Firewall EXCEPTION BODY with taken off it. A message that closes with no such
+/// clause fails here: the clause is part of a refused call's answer.
 fn stated_sentence(case: &str, message: &str) -> String {
     let (stated, _) = traced_message(message).unwrap_or_else(|| {
         panic!("case {case:?}: the refusal must close with its trace clause, got {message:?}")
@@ -178,9 +179,10 @@ async fn every_operation_naming_a_rule_reports_the_same_not_found_sentence() {
             code, "ResourceNotFoundException",
             "case {case:?}: expected Code ResourceNotFoundException, got {body}"
         );
+        // The row is embedded in a body the call was SERVED with, so it states
+        // the sentence and nothing else: no clause of an exception body.
         assert_eq!(
-            stated_sentence(&case, &message),
-            expected,
+            message, expected,
             "case {case:?}: the entry's error must state the sentence the single delete \
              answers for it, got {body}"
         );
@@ -206,8 +208,7 @@ async fn every_operation_naming_a_rule_reports_the_same_not_found_sentence() {
             "case {case:?}: expected Code ResourceNotFoundException, got {body}"
         );
         assert_eq!(
-            stated_sentence(&case, &message),
-            expected,
+            message, expected,
             "case {case:?}: the entry's error must state the same sentence the deletes \
              answer for the same rule, got {body}"
         );

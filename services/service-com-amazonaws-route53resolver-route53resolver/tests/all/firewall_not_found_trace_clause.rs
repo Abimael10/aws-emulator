@@ -8,14 +8,18 @@
 //! REQUEST named in its `X-Amzn-Trace-Id` header and one the service minted for
 //! the request when the caller named none. So the clause is always there, it is
 //! read from the request and never from anything the caller asked ABOUT, and a
-//! chain the caller started is reported under that chain's own id.
+//! chain the caller started is reported under that chain's own id. The clause
+//! belongs to the EXCEPTION BODY a refused call answers with: a fault a SERVED
+//! call reports as one row of its response body states the coded sentence alone,
+//! because there is no exception for a trace to be attached to
+//! ([`a_batch_entry_error_states_the_sentence_alone`]).
 //!
 //! The table spans what the rule generalises over: the DNS Firewall resource the
 //! request could not address (a rule group, a domain list, a rule inside a
 //! group), how the request addressed it (by its own id and by the ARN the policy
 //! operations take), the operation that refused it (reads, writes, deletes and
-//! the entries of the batch operations) and the tracing header the request
-//! carried.
+//! the entries of the batch operations, which are served) and the tracing header
+//! the request carried.
 //!
 //! Every case goes over the wire the service actually speaks (awsJson1_1,
 //! `POST /` with `X-Amz-Target: Route53Resolver.<OperationName>`), through the
@@ -28,12 +32,14 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_route53resolver_route53resolver::state::{
     FIREWALL_RULE_DOMAIN_LIST_MEMBER, RESOURCE_TYPE_FIREWALL_DOMAIN_LIST, RESOURCE_TYPE_FIREWALL_RULE,
-    RESOURCE_TYPE_FIREWALL_RULE_GROUP, RSLVR_CODE_FIREWALL_RULE_NOT_FOUND,
-    RSLVR_CODE_RESOURCE_NOT_FOUND,
+    RESOURCE_TYPE_FIREWALL_RULE_GROUP, RSLVR_CODE_FIREWALL_RULE_BLOCK_OPTION_NOT_FOR_ACTION,
+    RSLVR_CODE_FIREWALL_RULE_NOT_FOUND, RSLVR_CODE_RESOURCE_NOT_FOUND,
+    RSLVR_CODE_RULE_PRIORITY_IN_USE,
 };
 
 use super::harness::{
-    call_tracing, emulator, error_type, ok, string_member, traced_message, ACCOUNT, REGION,
+    call_tracing, emulator, error_type, ok, string_member, traced_message, tracing_chain, ACCOUNT,
+    REGION,
 };
 
 /// A `FirewallRuleGroupId` no create ever minted, well formed for the modelled
@@ -42,6 +48,10 @@ const UNKNOWN_GROUP: &str = "rslvr-frg-0123456789abcdef0";
 
 /// A `FirewallDomainListId` no create ever minted.
 const UNKNOWN_DOMAIN_LIST: &str = "rslvr-fdl-0123456789abcdef0";
+
+/// A `FirewallThreatProtectionId` no create ever minted, used to name a SECOND
+/// match source beside a domain list so the request names no single rule.
+const UNKNOWN_THREAT_PROTECTION: &str = "rslvr-ftp-0123456789abcdef0";
 
 /// A VPC of the account the association row names, so its refusal is about the
 /// rule group it could not address and never about the VPC.
@@ -440,97 +450,438 @@ async fn every_firewall_not_found_refusal_closes_with_the_trace_clause_of_the_re
     );
 }
 
-/// One entry of a batch operation reports the refusal the single operation
-/// answers for that very entry, so the message it carries in the response body
-/// closes with the trace clause of the request too.
+/// What the EXCEPTION body of the single operation states, beside the sentence
+/// the per-entry row of the batch has to carry.
+enum Stated {
+    /// The service's coded sentence, closed with the trace clause of the
+    /// request: the exception body carries both, and the per-entry row carries
+    /// the sentence ALONE.
+    Clause(String),
+    /// A coded sentence the exception body carries with NO clause — not every
+    /// fault of this service is closed with one — so both surfaces state this
+    /// very text and the per-entry row has nothing to take off it.
+    Fixed(String),
+    /// A sentence this suite does not write out: whatever the exception body
+    /// stated, which carries no clause, is what the row has to state.
+    Bare,
+}
+
+/// One row of the batch table: the fault, the single operation refused for it,
+/// and the batch operation that reports it for one entry.
+struct Embedded {
+    case: &'static str,
+    code: &'static str,
+    stated: Stated,
+    /// The single operation and the request body it refuses.
+    single: (&'static str, Value),
+    /// The batch operation, the member its entries travel in, and the member its
+    /// per-entry errors travel back in.
+    batch: (&'static str, &'static str, &'static str),
+    /// The entry that causes the fault, as the batch carries it.
+    entry: Value,
+}
+
+/// The sentence the service states for a rule whose `Priority` another rule of
+/// its group already holds, written out here so the wording is what is pinned.
+fn priority_in_use(group_id: &str) -> String {
+    format!(
+        "[{RSLVR_CODE_RULE_PRIORITY_IN_USE}] The DNS Firewall rule group already has a rule \
+         associated with the same priority: \"{group_id}\". Provide another priority."
+    )
+}
+
+/// The sentence the service states for a block option stated with an action that
+/// lets the query through — a fault whose exception body closes with no clause,
+/// so the embedded row and the exception body state the same text.
+fn block_option_not_for_action() -> String {
+    format!(
+        "[{RSLVR_CODE_FIREWALL_RULE_BLOCK_OPTION_NOT_FOR_ACTION}] You can't provide a block \
+         option if the ACTION is ALLOW or ALERT."
+    )
+}
+
+/// Create one rule of `group` matching against `list` at `priority`, so the
+/// faults below are decided against a group that holds rules.
+async fn stored_rule(
+    router: &super::harness::Emulator,
+    group: &str,
+    list: &str,
+    name: &str,
+    priority: i64,
+) {
+    ok(
+        router,
+        "CreateFirewallRule",
+        json!({
+            "CreatorRequestId": format!("traced-{name}"),
+            "FirewallRuleGroupId": group,
+            "FirewallDomainListId": list,
+            "Priority": priority,
+            "Action": "ALLOW",
+            "Name": name,
+        }),
+    )
+    .await;
+}
+
+/// One entry of a batch operation reports the code and the sentence the single
+/// operation answers for that very entry — and nothing after it: the per-entry
+/// error is a member of a body the call is SERVED with, so it carries no trace
+/// clause, whether the caller named a trace or named none, while the single
+/// operation's exception body still closes with the clause where the service
+/// closes it with one.
+///
+/// The rows span the three batch operations and the faults their entries are
+/// refused for: a rule group the store holds nothing under, a domain list it
+/// holds nothing under, a rule the group holds none of, a priority a rule of the
+/// group already holds, a block option an action that lets the query through
+/// cannot carry, and a request naming no single rule — so both a fault whose
+/// exception body closes with the clause and faults whose body never carried
+/// one.
 #[tokio::test]
-async fn a_batch_entry_reports_the_refusal_with_the_trace_clause_of_the_request() {
+async fn a_batch_entry_error_states_the_sentence_alone() {
     let router = emulator();
     let held = held(&router).await;
-    let header = "Root=1-6b200003-9a8b7c6d5e4f3a2b1c0d9e8f;Sampled=0";
-    let root = "1-6b200003-9a8b7c6d5e4f3a2b1c0d9e8f";
+    let second_list = ok(
+        &router,
+        "CreateFirewallDomainList",
+        json!({ "CreatorRequestId": "traced-held-list-2", "Name": "traced-held-list-2" }),
+    )
+    .await;
+    let second_list = string_member(
+        second_list
+            .get("FirewallDomainList")
+            .expect("the create answers a FirewallDomainList"),
+        "Id",
+    );
+    stored_rule(&router, &held.group, &held.domain_list, "traced-held-rule", 500).await;
+    stored_rule(&router, &held.group, &second_list, "traced-other-rule", 600).await;
 
-    for (case, operation, body, member, sentence) in [
-        (
-            "a batch create naming a rule group the store holds nothing under",
-            "BatchCreateFirewallRule",
-            json!({
-                "CreateFirewallRuleEntries": [{
-                    "CreatorRequestId": "traced-batch-create",
+    let rows = [
+        Embedded {
+            case: "a batch create naming a rule group the store holds nothing under",
+            code: "ResourceNotFoundException",
+            stated: Stated::Clause(cannot_find(UNKNOWN_GROUP)),
+            single: (
+                "CreateFirewallRule",
+                json!({
+                    "CreatorRequestId": "embedded-single-unknown-group",
                     "FirewallRuleGroupId": UNKNOWN_GROUP,
                     "FirewallDomainListId": held.domain_list.clone(),
-                    "Priority": 130,
+                    "Priority": 701,
                     "Action": "ALLOW",
-                    "Name": "traced-batch-create",
-                }],
+                    "Name": "embedded-single-unknown-group",
+                }),
+            ),
+            batch: (
+                "BatchCreateFirewallRule",
+                "CreateFirewallRuleEntries",
+                "CreateErrors",
+            ),
+            entry: json!({
+                "CreatorRequestId": "embedded-batch-unknown-group",
+                "FirewallRuleGroupId": UNKNOWN_GROUP,
+                "FirewallDomainListId": held.domain_list.clone(),
+                "Priority": 702,
+                "Action": "ALLOW",
+                "Name": "embedded-batch-unknown-group",
             }),
-            "CreateErrors",
-            cannot_find(UNKNOWN_GROUP),
-        ),
-        (
-            "a batch update naming a rule the group holds none of",
-            "BatchUpdateFirewallRule",
-            json!({
-                "UpdateFirewallRuleEntries": [{
+        },
+        Embedded {
+            case: "a batch create naming a domain list the store holds nothing under",
+            code: "ResourceNotFoundException",
+            stated: Stated::Clause(cannot_find(UNKNOWN_DOMAIN_LIST)),
+            single: (
+                "CreateFirewallRule",
+                json!({
+                    "CreatorRequestId": "embedded-single-unknown-list",
                     "FirewallRuleGroupId": held.group.clone(),
                     "FirewallDomainListId": UNKNOWN_DOMAIN_LIST,
-                    "Priority": 140,
-                }],
+                    "Priority": 703,
+                    "Action": "ALLOW",
+                    "Name": "embedded-single-unknown-list",
+                }),
+            ),
+            batch: (
+                "BatchCreateFirewallRule",
+                "CreateFirewallRuleEntries",
+                "CreateErrors",
+            ),
+            entry: json!({
+                "CreatorRequestId": "embedded-batch-unknown-list",
+                "FirewallRuleGroupId": held.group.clone(),
+                "FirewallDomainListId": UNKNOWN_DOMAIN_LIST,
+                "Priority": 704,
+                "Action": "ALLOW",
+                "Name": "embedded-batch-unknown-list",
             }),
-            "UpdateErrors",
-            cannot_locate_rule(&held.group, UNKNOWN_DOMAIN_LIST),
-        ),
-        (
-            "a batch delete naming a rule the group holds none of",
-            "BatchDeleteFirewallRule",
-            json!({
-                "DeleteFirewallRuleEntries": [{
+        },
+        Embedded {
+            case: "a batch create asking for a priority a rule of the group holds",
+            code: "ValidationException",
+            stated: Stated::Clause(priority_in_use(&held.group)),
+            single: (
+                "CreateFirewallRule",
+                json!({
+                    "CreatorRequestId": "embedded-single-held-priority",
+                    "FirewallRuleGroupId": held.group.clone(),
+                    "FirewallDomainListId": held.domain_list.clone(),
+                    "Priority": 500,
+                    "Action": "ALLOW",
+                    "Name": "embedded-single-held-priority",
+                }),
+            ),
+            batch: (
+                "BatchCreateFirewallRule",
+                "CreateFirewallRuleEntries",
+                "CreateErrors",
+            ),
+            entry: json!({
+                "CreatorRequestId": "embedded-batch-held-priority",
+                "FirewallRuleGroupId": held.group.clone(),
+                "FirewallDomainListId": held.domain_list.clone(),
+                "Priority": 500,
+                "Action": "ALLOW",
+                "Name": "embedded-batch-held-priority",
+            }),
+        },
+        Embedded {
+            case: "a batch create stating a block option for an action that blocks nothing",
+            code: "ValidationException",
+            stated: Stated::Fixed(block_option_not_for_action()),
+            single: (
+                "CreateFirewallRule",
+                json!({
+                    "CreatorRequestId": "embedded-single-block-option",
+                    "FirewallRuleGroupId": held.group.clone(),
+                    "FirewallDomainListId": held.domain_list.clone(),
+                    "Priority": 705,
+                    "Action": "ALLOW",
+                    "BlockResponse": "NODATA",
+                    "Name": "embedded-single-block-option",
+                }),
+            ),
+            batch: (
+                "BatchCreateFirewallRule",
+                "CreateFirewallRuleEntries",
+                "CreateErrors",
+            ),
+            entry: json!({
+                "CreatorRequestId": "embedded-batch-block-option",
+                "FirewallRuleGroupId": held.group.clone(),
+                "FirewallDomainListId": held.domain_list.clone(),
+                "Priority": 706,
+                "Action": "ALLOW",
+                "BlockResponse": "NODATA",
+                "Name": "embedded-batch-block-option",
+            }),
+        },
+        Embedded {
+            case: "a batch update naming a rule the group holds none of",
+            code: "ResourceNotFoundException",
+            stated: Stated::Clause(cannot_locate_rule(&held.group, UNKNOWN_DOMAIN_LIST)),
+            single: (
+                "UpdateFirewallRule",
+                json!({
                     "FirewallRuleGroupId": held.group.clone(),
                     "FirewallDomainListId": UNKNOWN_DOMAIN_LIST,
-                }],
+                    "Priority": 707,
+                }),
+            ),
+            batch: (
+                "BatchUpdateFirewallRule",
+                "UpdateFirewallRuleEntries",
+                "UpdateErrors",
+            ),
+            entry: json!({
+                "FirewallRuleGroupId": held.group.clone(),
+                "FirewallDomainListId": UNKNOWN_DOMAIN_LIST,
+                "Priority": 708,
             }),
-            "DeleteErrors",
-            cannot_locate_rule(&held.group, UNKNOWN_DOMAIN_LIST),
-        ),
-    ] {
-        let (status, answered) = call_tracing(&router, operation, body, Some(header)).await;
+        },
+        Embedded {
+            case: "a batch update moving a rule onto a priority another rule holds",
+            code: "ValidationException",
+            stated: Stated::Clause(priority_in_use(&held.group)),
+            single: (
+                "UpdateFirewallRule",
+                json!({
+                    "FirewallRuleGroupId": held.group.clone(),
+                    "FirewallDomainListId": second_list.clone(),
+                    "Priority": 500,
+                }),
+            ),
+            batch: (
+                "BatchUpdateFirewallRule",
+                "UpdateFirewallRuleEntries",
+                "UpdateErrors",
+            ),
+            entry: json!({
+                "FirewallRuleGroupId": held.group.clone(),
+                "FirewallDomainListId": second_list.clone(),
+                "Priority": 500,
+            }),
+        },
+        Embedded {
+            case: "a batch delete naming a rule the group holds none of",
+            code: "ResourceNotFoundException",
+            stated: Stated::Clause(cannot_locate_rule(&held.group, UNKNOWN_DOMAIN_LIST)),
+            single: (
+                "DeleteFirewallRule",
+                json!({
+                    "FirewallRuleGroupId": held.group.clone(),
+                    "FirewallDomainListId": UNKNOWN_DOMAIN_LIST,
+                }),
+            ),
+            batch: (
+                "BatchDeleteFirewallRule",
+                "DeleteFirewallRuleEntries",
+                "DeleteErrors",
+            ),
+            entry: json!({
+                "FirewallRuleGroupId": held.group.clone(),
+                "FirewallDomainListId": UNKNOWN_DOMAIN_LIST,
+            }),
+        },
+        Embedded {
+            // A fault the service states with no clause of any kind: the row has
+            // to carry that message unchanged, so the projection cannot be
+            // trimming a message it was not asked to trim.
+            case: "a batch delete naming two match sources, so no single rule",
+            code: "ValidationException",
+            stated: Stated::Bare,
+            single: (
+                "DeleteFirewallRule",
+                json!({
+                    "FirewallRuleGroupId": held.group.clone(),
+                    "FirewallDomainListId": held.domain_list.clone(),
+                    "FirewallThreatProtectionId": UNKNOWN_THREAT_PROTECTION,
+                }),
+            ),
+            batch: (
+                "BatchDeleteFirewallRule",
+                "DeleteFirewallRuleEntries",
+                "DeleteErrors",
+            ),
+            entry: json!({
+                "FirewallRuleGroupId": held.group.clone(),
+                "FirewallDomainListId": held.domain_list.clone(),
+                "FirewallThreatProtectionId": UNKNOWN_THREAT_PROTECTION,
+            }),
+        },
+    ];
+
+    for (row, index) in rows.iter().zip(1u32..) {
+        let case = row.case;
+        let (chain, root) = tracing_chain(index);
+
+        // The SINGLE operation the entry's refusal is decided by: there the
+        // refusal IS the call's answer, as the exception body the operation
+        // models — and that body closes with the trace clause of the request
+        // wherever the service closes it with one.
+        let (single_operation, single_body) = &row.single;
+        let (status, refused) =
+            call_tracing(&router, single_operation, single_body.clone(), Some(&chain)).await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: {operation} must answer HTTP 200 and report the entry's error, got \
-             {status}: {answered}"
+            status, 400,
+            "case {case:?}: {single_operation} must answer HTTP 400, got {status}: {refused}"
         );
-        let errors = answered
-            .get(member)
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_else(|| {
-                panic!("case {case:?}: the response must carry {member} as a list, got {answered}")
-            });
-        assert_eq!(
-            errors.len(),
-            1,
-            "case {case:?}: the batch must report exactly one error for its one entry, got \
-             {answered}"
+        assert!(
+            error_type(&refused).contains(row.code),
+            "case {case:?}: {single_operation} must answer {}, got {refused}",
+            row.code
         );
-        assert_eq!(
-            string_member(&errors[0], "Code"),
-            "ResourceNotFoundException",
-            "case {case:?}: the entry's error must name the exception the single call answers, \
-             got {answered}"
-        );
-        let message = string_member(&errors[0], "Message");
-        let (stated, trace) = traced_message(&message).unwrap_or_else(|| {
-            panic!("case {case:?}: the entry's error must close with its trace clause, got {message:?}")
-        });
-        assert_eq!(
-            stated, sentence,
-            "case {case:?}: the entry's error must state the sentence the single call answers for \
-             it, got {message:?}"
-        );
-        assert_eq!(
-            trace, root,
-            "case {case:?}: the clause must carry the Root the request named, got {message:?}"
-        );
+        let refusal_message = string_member(&refused, "Message");
+        let expected_row = match &row.stated {
+            Stated::Clause(sentence) => {
+                assert_eq!(
+                    refusal_message,
+                    format!("{sentence} Trace Id: \"{root}\""),
+                    "case {case:?}: the exception body must state the sentence closed with the \
+                     trace clause of the request, got {refusal_message:?}"
+                );
+                sentence.clone()
+            }
+            Stated::Fixed(sentence) => {
+                assert_eq!(
+                    &refusal_message, sentence,
+                    "case {case:?}: the exception body must state this sentence and nothing \
+                     after it, got {refusal_message:?}"
+                );
+                sentence.clone()
+            }
+            Stated::Bare => {
+                assert!(
+                    !refusal_message.contains("Trace Id"),
+                    "case {case:?}: this fault's exception body carries no trace clause, got \
+                     {refusal_message:?}"
+                );
+                refusal_message.clone()
+            }
+        };
+
+        // The BATCH operation reporting the same fault for one entry, sent
+        // twice: once by a caller that named a trace and once by a caller that
+        // named none, because a clause read from the request is what would tell
+        // those two answers apart.
+        let (batch_operation, entries_member, errors_member) = &row.batch;
+        for (tracing_case, header) in [
+            ("a caller naming a chain", Some(chain.as_str())),
+            ("a caller naming none", None),
+        ] {
+            let case = format!("{case}, {tracing_case}");
+            let mut request = serde_json::Map::new();
+            request.insert(
+                (*entries_member).to_string(),
+                Value::Array(vec![row.entry.clone()]),
+            );
+            let (status, answered) =
+                call_tracing(&router, batch_operation, Value::Object(request), header).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: {batch_operation} must answer HTTP 200 and report the entry's \
+                 error, got {status}: {answered}"
+            );
+            let errors = answered
+                .get(errors_member)
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {case:?}: the response must carry {errors_member} as a list, got \
+                         {answered}"
+                    )
+                });
+            assert_eq!(
+                errors.len(),
+                1,
+                "case {case:?}: the batch must report exactly one error for its one entry, got \
+                 {answered}"
+            );
+            assert_eq!(
+                errors[0].get("FirewallRule"),
+                Some(&row.entry),
+                "case {case:?}: the error must echo the entry that caused it, got {answered}"
+            );
+            assert_eq!(
+                string_member(&errors[0], "Code"),
+                row.code,
+                "case {case:?}: the entry's error must name the exception the single call \
+                 answers, got {answered}"
+            );
+            let message = string_member(&errors[0], "Message");
+            assert_eq!(
+                message, expected_row,
+                "case {case:?}: the per-entry error must state the sentence the single call \
+                 answers for it and stop there, got {message:?}"
+            );
+            assert!(
+                !serde_json::to_string(&answered)
+                    .expect("the answer serializes")
+                    .contains("Trace Id"),
+                "case {case:?}: a served body carries no trace clause anywhere, got {answered}"
+            );
+        }
     }
 }
 

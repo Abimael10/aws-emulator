@@ -2106,7 +2106,36 @@ pub fn request_trace_root(headers: &::http::HeaderMap) -> String {
 /// REQUEST ([`request_trace_root`]) — so it is a different value on every call
 /// and is never derived from anything the caller asked about.
 pub fn traced_message(message: String, trace_root: &str) -> String {
-    format!("{message} Trace Id: \"{trace_root}\"")
+    format!("{message}{TRACE_CLAUSE_LEAD}{trace_root}\"")
+}
+
+/// What that clause opens with: a single space, the label, and the double quote
+/// the trace id is written inside. Named once so the clause is written and read
+/// back in one spelling ([`traced_message`], [`untraced_message`]).
+const TRACE_CLAUSE_LEAD: &str = " Trace Id: \"";
+
+/// The sentence `message` states, WITHOUT the trace clause of the request: the
+/// inverse of [`traced_message`], for the places the service reports a fault in
+/// a body it SERVES, where there is no exception for a trace to belong to.
+///
+/// What is taken off is a closing clause whose id is a trace in X-Ray's own form,
+/// read through the one reading of that form the services of this emulator share
+/// — which is exactly what the clause this service writes carries, because the id
+/// in it is the trace of the request ([`request_trace_root`]), continued or
+/// minted. So a message that closes with no such clause, and a sentence that
+/// merely echoes something shaped like one from the request, are each their own
+/// sentence and are returned unchanged.
+pub fn untraced_message(message: &str) -> &str {
+    match message.rsplit_once(TRACE_CLAUSE_LEAD) {
+        Some((stated, clause))
+            if clause
+                .strip_suffix('"')
+                .is_some_and(::service_common::xray_trace::is_trace_id) =>
+        {
+            stated
+        }
+        _ => message,
+    }
 }
 
 /// The `AccessDeniedException` an operation answers for a resource the caller

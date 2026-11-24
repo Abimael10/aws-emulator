@@ -154,7 +154,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); a rule is
         // not an ARN-bearing resource of its own, so what this operation takes
-        // from `ctx` is the trace the refusals of its entries are reported under.
+        // from `ctx` is the trace the WHOLE call would be refused under: an
+        // entry's refusal is the one the single update answers for it, and the
+        // row this operation reports it in carries the sentence alone
+        // (`FirewallRuleUpdateRefusal::embedded_message`).
         let trace_root = crate::state::request_trace_root(&ctx.parts().headers);
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
@@ -218,11 +221,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             match store.update_firewall_rule(request, now) {
                 Ok(rule) => updated_firewall_rules.push(rule),
                 // "The firewall rule entry that caused the error", as the
-                // request stated it.
+                // request stated it, beside the code and the sentence the single
+                // update answers for that entry — the sentence as an error
+                // EMBEDDED in a served body carries it, with no clause
+                // belonging to an exception body this call does not answer.
                 Err(refusal) => update_errors.push(BatchUpdateFirewallRuleError2 {
                     firewall_rule: Some(entry.clone()),
                     code: Some(refusal.code().to_string()),
-                    message: refusal.message(),
+                    message: refusal.embedded_message(),
                 }),
             }
         }

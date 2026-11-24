@@ -83,9 +83,9 @@ pub struct FirewallRuleCreate<'a> {
 /// A create that carries ONE rule reports it as the modelled exception it holds,
 /// and the whole call fails. A batch create decides each entry on its own, so it
 /// reports the same refusal in the response body instead: the exception's shape
-/// name as the error's `Code` ([`Self::code`]) and its sentence as the
-/// `Message`, which is the code and the sentence the single create answers with
-/// for that very entry.
+/// name as the error's `Code` ([`Self::code`]) and the sentence it states as the
+/// `Message` ([`Self::embedded_message`]), which is the code and the sentence
+/// the single create answers with for that very entry.
 #[derive(Debug, Clone)]
 pub enum FirewallRuleCreateRefusal {
     Validation(ValidationException),
@@ -104,13 +104,24 @@ impl FirewallRuleCreateRefusal {
         }
     }
 
-    /// The sentence this refusal states, as the exception's `Message`.
-    pub fn message(&self) -> Option<String> {
-        match self {
-            Self::Validation(error) => error.message.clone(),
-            Self::ResourceNotFound(error) => error.message.clone(),
-            Self::LimitExceeded(error) => error.message.clone(),
-        }
+    /// The sentence this refusal states as the `Message` of the per-entry error
+    /// a batch reports it in: the sentence ALONE, with no trace clause.
+    ///
+    /// A per-entry error is an ordinary member of the body a batch is SERVED
+    /// with and not an exception
+    /// (`smithy_query(query="shape",shape="BatchCreateFirewallRuleError")` —
+    /// `{FirewallRule, Code, Message}`, with no `@error`), so there is no
+    /// exception body for the trace of the request to belong to and the
+    /// embedded sentence ends where the sentence does ([`untraced_message`]).
+    /// The clause stays on the refusal of the SINGLE operation, which leaves as
+    /// an exception body ([`traced_message`]).
+    pub fn embedded_message(&self) -> Option<String> {
+        let stated = match self {
+            Self::Validation(error) => error.message.as_deref(),
+            Self::ResourceNotFound(error) => error.message.as_deref(),
+            Self::LimitExceeded(error) => error.message.as_deref(),
+        };
+        stated.map(|stated| untraced_message(stated).to_string())
     }
 }
 
@@ -604,8 +615,8 @@ pub struct FirewallRuleUpdate<'a> {
 /// create: an update that carries ONE rule reports it as the modelled exception
 /// it holds and the whole call fails, while a batch update decides each entry on
 /// its own and reports the same refusal in the response body — the exception's
-/// shape name as the error's `Code` ([`Self::code`]) and its sentence as the
-/// `Message`.
+/// shape name as the error's `Code` ([`Self::code`]) and the sentence it states
+/// as the `Message` ([`Self::embedded_message`]).
 #[derive(Debug, Clone)]
 pub enum FirewallRuleUpdateRefusal {
     Validation(ValidationException),
@@ -624,13 +635,18 @@ impl FirewallRuleUpdateRefusal {
         }
     }
 
-    /// The sentence this refusal states, as the exception's `Message`.
-    pub fn message(&self) -> Option<String> {
-        match self {
-            Self::Validation(error) => error.message.clone(),
-            Self::ResourceNotFound(error) => error.message.clone(),
-            Self::Conflict(error) => error.message.clone(),
-        }
+    /// The sentence this refusal states as the `Message` of the per-entry error
+    /// a batch reports it in: the sentence alone, with no trace clause, for the
+    /// reason [`FirewallRuleCreateRefusal::embedded_message`] states —
+    /// `BatchUpdateFirewallRuleError` is an ordinary output structure too, and
+    /// not an exception for a trace to belong to.
+    pub fn embedded_message(&self) -> Option<String> {
+        let stated = match self {
+            Self::Validation(error) => error.message.as_deref(),
+            Self::ResourceNotFound(error) => error.message.as_deref(),
+            Self::Conflict(error) => error.message.as_deref(),
+        };
+        stated.map(|stated| untraced_message(stated).to_string())
     }
 }
 
@@ -837,8 +853,8 @@ pub const FIREWALL_RULE_ACTION_WORD_DELETE: &str = "delete";
 /// create: a delete that carries ONE rule reports it as the modelled exception
 /// it holds and the whole call fails, while a batch delete decides each entry on
 /// its own and reports the same refusal in the response body — the exception's
-/// shape name as the error's `Code` ([`Self::code`]) and its sentence as the
-/// `Message`.
+/// shape name as the error's `Code` ([`Self::code`]) and the sentence it states
+/// as the `Message` ([`Self::embedded_message`]).
 #[derive(Debug, Clone)]
 pub enum FirewallRuleDeleteRefusal {
     Validation(ValidationException),
@@ -855,12 +871,17 @@ impl FirewallRuleDeleteRefusal {
         }
     }
 
-    /// The sentence this refusal states, as the exception's `Message`.
-    pub fn message(&self) -> Option<String> {
-        match self {
-            Self::Validation(error) => error.message.clone(),
-            Self::ResourceNotFound(error) => error.message.clone(),
-        }
+    /// The sentence this refusal states as the `Message` of the per-entry error
+    /// a batch reports it in: the sentence alone, with no trace clause, for the
+    /// reason [`FirewallRuleCreateRefusal::embedded_message`] states —
+    /// `BatchDeleteFirewallRuleError` is an ordinary output structure too, and
+    /// not an exception for a trace to belong to.
+    pub fn embedded_message(&self) -> Option<String> {
+        let stated = match self {
+            Self::Validation(error) => error.message.as_deref(),
+            Self::ResourceNotFound(error) => error.message.as_deref(),
+        };
+        stated.map(|stated| untraced_message(stated).to_string())
     }
 }
 

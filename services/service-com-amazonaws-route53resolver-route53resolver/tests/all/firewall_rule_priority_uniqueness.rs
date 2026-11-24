@@ -25,7 +25,9 @@
 //! refusal with the code, the fault sentence and the sentence that says what to
 //! send instead, and closes with the trace id of the request it refused — a
 //! different value on every call — so what is pinned is the fixed text plus the
-//! FORM of that clause ([`assert_refusal_message`]).
+//! FORM of that clause ([`assert_refusal_message`]). A batch entry's error is
+//! reported in a body the call is SERVED with and carries no such clause, so
+//! there the whole message is pinned.
 //!
 //! Every case goes over the wire the service actually speaks (awsJson1_1,
 //! `POST /` with `X-Amz-Target: Route53Resolver.<OperationName>`), through the
@@ -392,8 +394,9 @@ async fn a_priority_is_unique_within_one_group_and_not_across_groups() {
 
 /// A batch create decides each entry through the same rule, so an entry whose
 /// priority an earlier entry — or a rule already in the group — holds is
-/// reported with the code and the very message the single create answers for
-/// it, while the entries around it are created.
+/// reported with the code and the sentence the single create answers for it,
+/// while the entries around it are created. The row is embedded in a body the
+/// call is served with, so the sentence is the whole of its message.
 #[tokio::test]
 async fn a_batch_entry_with_a_held_priority_reports_the_same_message() {
     let router = emulator();
@@ -493,7 +496,14 @@ async fn a_batch_entry_with_a_held_priority_reports_the_same_message() {
          it: expected {want:?}, got {reported:?}"
     );
     for (name, _code, message) in &reported {
-        assert_refusal_message(name, message, &group);
+        // One row of a batch's response body is not an exception body, so it
+        // states the fixed sentence and nothing after it: no trace clause.
+        assert_eq!(
+            message,
+            &expected_message(&group),
+            "case {name:?}: the entry's error must state the sentence the single create answers \
+             for it and stop there, got {message:?}"
+        );
     }
 
     let held: Vec<i64> = listed_rules(&router, &group)
