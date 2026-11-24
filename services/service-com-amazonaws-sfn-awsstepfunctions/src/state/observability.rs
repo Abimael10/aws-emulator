@@ -1516,7 +1516,9 @@ pub(super) fn closes_task_work(event_type: &str) -> bool {
 /// whose work is a call this service makes on the caller's behalf — names neither
 /// resource, so it is counted in neither family and the dimensions never cross.
 fn work_on(definition: &::serde_json::Value, state_name: &str) -> Option<(WorkSeries, String)> {
-    let resource = state_named(definition, state_name)?
+    // The ONE reader of this crate that finds a state by name through the nested state
+    // lists a definition carries ([`super::asl::declared_state`]).
+    let resource = super::asl::declared_state(definition, state_name, super::asl::MAX_NESTING_DEPTH)?
         .get("Resource")?
         .as_str()?;
     if super::names_an_activity(resource) {
@@ -1524,44 +1526,6 @@ fn work_on(definition: &::serde_json::Value, state_name: &str) -> Option<(WorkSe
     }
     let invoked = super::integration::read(resource).ok()?.invokes?;
     Some((LAMBDA_FUNCTION_SERIES, invoked))
-}
-
-/// The state named `state_name` of the state machine `definition`, searched through the
-/// nested state lists a state declaring a machine of its own carries
-/// ([`super::asl::NESTED_MACHINE_MEMBERS`]).
-///
-/// "States names must be unique within the scope of the whole state machine", so one
-/// name names at most one state however deeply the definition nests it.
-///
-/// The definition is a caller's document, so how deep this descends is bounded by how
-/// deep the document is: the walk itself refuses one nested past
-/// [`super::asl::MAX_NESTING_DEPTH`], and the document is read by the maintained JSON
-/// parser, whose own nesting limit decides what a `Value` can be parsed to at all.
-fn state_named<'a>(
-    definition: &'a ::serde_json::Value,
-    state_name: &str,
-) -> Option<&'a ::serde_json::Map<String, ::serde_json::Value>> {
-    let states = definition.get("States")?.as_object()?;
-    if let Some(state) = states.get(state_name).and_then(::serde_json::Value::as_object) {
-        return Some(state);
-    }
-    for state in states.values() {
-        // A member naming ONE machine carries it as an object, and `Branches` carries a
-        // list of them: each is a state list of its own to look through.
-        let nested = super::asl::NESTED_MACHINE_MEMBERS
-            .iter()
-            .filter_map(|member| state.get(*member))
-            .flat_map(|value| match value.as_array() {
-                Some(machines) => machines.iter().collect::<Vec<_>>(),
-                None => vec![value],
-            });
-        for list in nested {
-            if let Some(found) = state_named(list, state_name) {
-                return Some(found);
-            }
-        }
-    }
-    None
 }
 
 /// What one attempt at a `Task` state's work has reported so far, for the spans the

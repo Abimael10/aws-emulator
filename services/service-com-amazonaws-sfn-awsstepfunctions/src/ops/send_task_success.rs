@@ -308,6 +308,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // What this state's retriers have already spent on the task, so the
             // continuation takes that budget up rather than restarting it.
             let retries_taken = task.retries_taken.clone();
+            // The concurrent states that state is nested inside, which the walk that
+            // continues the execution re-enters to reach it.
+            let frames = task.frames.clone();
             // The activity this task is queued under can be DELETED while the task is
             // outstanding, which leaves the task with no activity to be answered for:
             // the modelled `TaskDoesNotExist`, whose own documentation is "the
@@ -391,14 +394,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 match activity_arn {
                     Some(_) => Answered::Activity(crate::state::asl::ActivityReply {
                         // The event the PRESERVED history holds that state's entry at,
-                        // which this continuation does not record again.
-                        entered_event_id: execution.entered_event_id(&state_name),
+                        // which this continuation does not record again. The continuation
+                        // BEGINS at the outermost concurrent state the task is nested
+                        // inside, so that is the state whose entry it names
+                        // ([`crate::state::asl::job_entry_state`]).
+                        entered_event_id: execution.entered_event_id(
+                            crate::state::asl::job_entry_state(&state_name, &frames),
+                        ),
                         state_name,
                         state_input,
                         result,
+                        frames,
                     }),
                     None => Answered::Callback(crate::state::asl::CallbackReply {
-                        entered_event_id: execution.entered_event_id(&state_name),
+                        entered_event_id: execution.entered_event_id(
+                            crate::state::asl::job_entry_state(&state_name, &frames),
+                        ),
                         state_name,
                         state_input,
                         outcome: Ok(result),
@@ -407,6 +418,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         by_the_clock: false,
                         also_answers: &[],
                         retries_taken,
+                        frames,
                     }),
                 },
             )

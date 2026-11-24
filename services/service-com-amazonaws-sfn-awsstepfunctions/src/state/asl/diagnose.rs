@@ -2873,6 +2873,12 @@ pub(super) const ARGUMENTS_MEMBER: &str = "Arguments";
 /// The member a `Map` state projects each of its items through: "ItemSelector".
 pub(super) const ITEM_SELECTOR_MEMBER: &str = "ItemSelector";
 
+/// The member a `Task` state names the role its work is made under in: "Credentials",
+/// and the one field of it that names that role.
+pub(super) const CREDENTIALS_MEMBER: &str = "Credentials";
+/// See [`CREDENTIALS_MEMBER`].
+pub(super) const ROLE_ARN_FIELD: &str = "RoleArn";
+
 /// What was already in scope where a state machine is DECLARED, which its states
 /// inherit.
 ///

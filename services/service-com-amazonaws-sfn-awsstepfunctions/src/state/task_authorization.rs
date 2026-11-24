@@ -612,6 +612,11 @@ pub struct Acting {
     /// named by a value that carries no Region of its own
     /// ([`super::target_addressing::addressing`]).
     pub addressing: Option<Addressing>,
+    /// What serves a `Task` state that names a role of its OWN through `Credentials`
+    /// ([`TaskRoles`]); `None` for a walk with no execution role to assume from.
+    pub task_roles: Option<TaskRoles>,
+    /// What mints the credential such a call is signed with ([`TaskSigning`]).
+    pub task_signing: Option<TaskSigning>,
 }
 
 /// Debug without disclosing anything either closure reads: a connection holds
@@ -629,6 +634,8 @@ impl ::std::fmt::Debug for Acting {
             .field("express_machines", &self.express_machines.is_some())
             .field("addressing", &self.addressing.is_some())
             .field("signing", &self.signing.is_some())
+            .field("task_roles", &self.task_roles.is_some())
+            .field("task_signing", &self.task_signing.is_some())
             .finish()
     }
 }
@@ -698,7 +705,176 @@ pub fn acting<Eng: Send + Sync + 'static>(
         express_machines: super::express_machines::express_machines(engine),
         addressing: Some(super::target_addressing::addressing(engine, region)),
         signing,
+        // And what serves a `Task` state that names a role of its OWN, resolved per call
+        // because the role is one the state's own members produce as the walk runs.
+        task_roles: task_roles(engine, region, role_arn),
+        task_signing: task_signing(engine),
     }
+}
+
+/// What a `Task` state's own `Credentials` resolves to for ONE target role: whether the
+/// call may be made under that role at all, and what then decides the call.
+///
+/// "Credentials … Specify a target role that the state machine's execution role can
+/// assume": the ASSUME comes first, so a role the execution role may not take on is a task
+/// that FAILS rather than a call quietly made as the execution role instead. Where the
+/// assume is allowed, the call is made BY the target role, so it is that role's own
+/// policies the call is judged against and none of the execution role's.
+pub struct TaskRole {
+    /// Why the call may not be made under the role at all; `None` where the assume is
+    /// allowed, and wherever nothing of the kind can be shown (see the module docs).
+    pub refused: Option<Failed>,
+    /// What decides whether THAT role may make the call ([`role_gate`]).
+    pub gate: Option<RoleGate>,
+}
+
+/// What answers [`TaskRole`] for the role a `Task` state's `Credentials` named.
+///
+/// A closure for the reason [`RoleGate`] is one: the documents live in another service's
+/// store, reached through the engine the operation holds, and the walk knows only the ARN
+/// its state resolved.
+pub type TaskRoles = Arc<dyn Fn(&str) -> TaskRole + Send + Sync>;
+
+/// What mints the CREDENTIAL a call made under a task's own role is signed with: a session
+/// of that role ([`super::execution_role_session::role_session`]).
+///
+/// Asked where the call is served rather than where the walk is set up, because the role is
+/// one the walk resolves as it runs; the credential store a minted session is recorded in
+/// is the serving call's, so it is handed in per call.
+pub type TaskSigning = Arc<
+    dyn Fn(
+            &str,
+            Option<&::emulator_server::CredentialStore>,
+        ) -> Option<super::execution_role_session::RoleSession>
+        + Send
+        + Sync,
+>;
+
+/// What serves a `Task` state's `Credentials` for the execution role `role_arn`: see
+/// [`TaskRoles`]. `None` for a walk with no role to assume FROM, and for an engine
+/// carrying no IAM store to read.
+fn task_roles<Eng: Send + Sync + 'static>(
+    engine: &Arc<Eng>,
+    region: &str,
+    role_arn: &str,
+) -> Option<TaskRoles> {
+    if role_arn.is_empty() {
+        return None;
+    }
+    iam_state(&**engine)?;
+    let engine = Arc::clone(engine);
+    let region = region.to_string();
+    let execution_role = role_arn.to_string();
+    Some(Arc::new(move |target: &str| {
+        // One assume per call, under a session of its own, exactly as every other assume
+        // this service takes outside a walk ([`new_session_name`]).
+        let session_name = new_session_name();
+        TaskRole {
+            refused: assume_denied(&engine, &execution_role, target, &session_name),
+            // The call is made BY the target role, so it is judged as the invoked service
+            // judges a call from that role: the same gate over that role's documents.
+            gate: role_gate(
+                &engine,
+                &region,
+                target,
+                None,
+                &session_name,
+                Evidence::Documents,
+            ),
+        }
+    }))
+}
+
+/// See [`TaskSigning`]. Always answers one: the store a session is recorded in is handed
+/// in per call rather than captured here, so what is missing on an engine that holds no
+/// sessions store is answered by the mint itself ([`super::execution_role_session::role_session`]).
+fn task_signing<Eng: Send + Sync + 'static>(engine: &Arc<Eng>) -> Option<TaskSigning> {
+    let engine = Arc::clone(engine);
+    Some(Arc::new(move |role_arn: &str, store| {
+        super::execution_role_session::role_session(
+            &*engine,
+            store,
+            role_arn,
+            // The WALL clock: what makes a credential unusable is the instant the token
+            // service minted it to last until ([`acting`]).
+            ::std::time::SystemTime::now(),
+        )
+    }))
+}
+
+/// The ARN namespace and the operation of the call this service makes to act as the role a
+/// `Task` state's `Credentials` names, which is the call a refusal of that assume is
+/// reported as.
+const STS_NAMESPACE: &str = "sts";
+/// See [`STS_NAMESPACE`].
+const ASSUME_ROLE_OPERATION: &str = "AssumeRole";
+
+/// Why the execution role `execution_role` may NOT assume `target` to make a `Task`
+/// state's call under it, or `None` where it may and wherever nothing of the kind can be
+/// shown (see the module docs).
+///
+/// It is the same decision every other call of the walk gets, over the call this service
+/// really makes to take the role on: `sts:AssumeRole` on the target role, as the execution
+/// role's session, with the TARGET role's own trust policy as the resource-based document —
+/// "if an identity-based policy or a resource-based policy grants the request, then AWS
+/// allows the request", and a trust policy is the resource-based policy of a role. So a
+/// role whose trust policy names the execution role is assumable without the execution
+/// role carrying a grant of its own, and one neither document covers is not.
+///
+/// The failure is the task's own ([`TASK_FAILED_ERROR`]) carrying the token service's
+/// refusal as its SDK reports it, exactly as a refusal of the task's own work is.
+fn assume_denied<Eng: Send + Sync + 'static>(
+    engine: &Arc<Eng>,
+    execution_role: &str,
+    target: &str,
+    session_name: &str,
+) -> Option<Failed> {
+    let call = super::integration::own_call(STS_NAMESPACE, ASSUME_ROLE_OPERATION)?;
+    let iam = iam_state(&**engine)?;
+    let trust = role_trust_policy(&**engine, target);
+    let (code, status) = denied_answer(call.api, None);
+    let cause = refusal(
+        &iam.lock(),
+        Acts {
+            role_arn: execution_role,
+            session_name,
+        },
+        &call
+            .api
+            .refused_action(::service_common::iam_trust_policy::ASSUME_ROLE_ACTION),
+        target,
+        trust.as_deref(),
+        Answered {
+            api: call.api,
+            family: call.family,
+            code,
+            status,
+        },
+        // The assume is a call to the token service, which decides the same request
+        // itself: the documents are read as that service reads them.
+        Evidence::Documents,
+    )?;
+    Some(Failed {
+        error: TASK_FAILED_ERROR.to_string(),
+        cause,
+    })
+}
+
+/// The TRUST policy in force on the role `role_arn`, as this account's IAM holds it, or
+/// `None` where it holds no role under that ARN or the role carries no such document.
+///
+/// A role's trust policy is its resource-based policy — the document whose statements name
+/// the principals that may assume it — so it is read here for the one decision that needs
+/// it and handed to the SAME evaluator every other resource-based policy goes through
+/// ([`withheld`]).
+fn role_trust_policy<Eng: Send + Sync + 'static>(engine: &Eng, role_arn: &str) -> Option<String> {
+    let iam = iam_state(engine)?;
+    let held = iam.lock();
+    held.roles
+        .values()
+        .find(|role| role.arn == role_arn)?
+        .assume_role_policy_document
+        .clone()
 }
 
 /// The REFUSAL the call that reports a run-a-job (`.sync`) pattern's job answers with

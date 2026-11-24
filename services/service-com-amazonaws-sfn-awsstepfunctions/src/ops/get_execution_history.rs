@@ -586,7 +586,15 @@ fn projected(
                     parameters: stored.details.input.clone().unwrap_or_default(),
                     timeout_in_seconds: seconds(stored.details.timeout_seconds),
                     heartbeat_in_seconds: seconds(stored.details.heartbeat_seconds),
-                    task_credentials: None,
+                    // "The credentials that Step Functions uses for the task": the role
+                    // the scheduling state's `Credentials` named, for a task made under
+                    // one. A task made as the state machine's own execution role carries
+                    // no such member.
+                    task_credentials: stored.details.task_role_arn.clone().map(|role_arn| {
+                        TaskCredentials {
+                            role_arn: Some(role_arn),
+                        }
+                    }),
                 });
             }
         }

@@ -21,6 +21,19 @@ Issue-Commit: 7552cf7cb82a23878f689a33468aa3be5f606804
 > that the change which resolved the rest of that bundle did NOT fix. Nothing here is
 > claimed to work; each cause states what the next change has to build._
 
+> **STILL OPEN after the change that resolved causes 1 (for a `Parallel` branch), 2 and
+> 6.** Four causes of this report are NOT fixed and need a change of their own:
+> * cause 1 for a `Map` ITERATION, which still refuses to schedule a task whose answer
+>   comes from outside the execution (trace
+>   `stepfunctions.jsonata-task-error-two-levels-deep-propagates-through-map-and-parallel`);
+> * cause 3, a `Map` state's own concurrency for the work its items do besides an
+>   integration call;
+> * cause 4, the cause an out-of-range `MaxConcurrency` fails with;
+> * cause 5, the two causes an `Assign` past the variable space fails with.
+>
+> The three wordings of causes 4 and 5 are not disclosed by the replay and AWS publishes
+> no sentence for either class, so none of them was guessed at.
+
 ## Operation
 StartExecution
 

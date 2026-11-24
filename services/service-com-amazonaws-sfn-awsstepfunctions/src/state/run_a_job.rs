@@ -372,7 +372,7 @@ async fn resolve<Eng: Send + Sync + 'static>(
             // ([`super::execution_role_session::role_session`]).
             None,
         );
-        integration::interpret_through(callback, depth, &region, acting, move |tasks| {
+        integration::interpret_through(callback, depth, &region, None, acting, move |tasks| {
             super::plan_job_reply(
                 &definition,
                 &input,

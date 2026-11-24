@@ -197,7 +197,11 @@ impl Facts {
             machine_arn: machine.arn.clone(),
             context,
             previous_event_id: execution.last_event_id(),
-            entered_event_id: execution.entered_event_id(&task.state_name),
+            // The continuation BEGINS at the outermost concurrent state the task is
+            // nested inside, so that is the state whose preserved entry it names
+            // ([`asl::job_entry_state`]).
+            entered_event_id: execution
+                .entered_event_id(asl::job_entry_state(&task.state_name, &task.frames)),
         })
     }
 }
@@ -243,6 +247,9 @@ async fn continue_one<Eng: Send + Sync + 'static>(
         // What this state's retriers have already spent, so the continuation takes that
         // budget up rather than restarting it.
         retries_taken: task.retries_taken.clone(),
+        // The concurrent states that state is nested inside, which this continuation
+        // re-enters to reach it.
+        frames: task.frames.clone(),
         entered_event_id,
     };
 
@@ -278,7 +285,7 @@ async fn continue_one<Eng: Send + Sync + 'static>(
         // The continuation is work this service owes the clock rather than a step of
         // whatever call happened to drive it, so it opens a chain of in-process calls of
         // its own — bounded, as every chain is, by how deep the states it runs go.
-        integration::interpret_through(callback, 0, &region, acting, move |tasks| {
+        integration::interpret_through(callback, 0, &region, None, acting, move |tasks| {
             super::plan_callback_reply(
                 &definition,
                 &input,

@@ -3,8 +3,8 @@
 //! @op StartSyncExecution
 //! IMPLEMENTED: RUNS the Express state machine's Amazon States Language definition
 //! through [`crate::state::asl`] and answers the TERMINAL outcome that walk computed —
-//! this call is synchronous, so nothing about the outcome is owed to the clock — and
-//! stores the execution it ran.
+//! held until the instant the run's own spans make that outcome due, because this call
+//! is what reports it — and stores the execution it ran.
 //!
 //! A request this operation cannot serve is refused with one of the operation's own
 //! modelled errors; it never answers 501.
@@ -538,6 +538,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the definition's own `Wait` states declare, which the walk accumulates
         // instead of sleeping for them (`outcome.due_at`).
         let stopped = std::cmp::max(crate::state::now(), outcome.due_at);
+        // And THIS call answers that outcome, so it does not answer before the outcome is
+        // due: a synchronous execution "will return a 200 OK response" carrying the
+        // run's own terminal status, which is not known to a caller any sooner than the
+        // instant the run reached it. The walk sleeps for none of the spans the
+        // definition declares and reports the instant they add up to, so the span
+        // between now and that instant is waited out HERE — or until the longest a run of
+        // this workflow type can last, whichever comes first
+        // ([`crate::state::MAX_SYNCHRONOUS_RUN_DURATION`]), because a caller-chosen wait
+        // is bounded server-side. The call therefore occupies a request slot for as long
+        // as the run it answers, up to that ceiling. A definition whose own offsets add up
+        // PAST the ceiling is answered at the ceiling with the stop instant the walk
+        // computed, which is the one case where that instant is later than the answer;
+        // ending such a run at the workflow type's maximum duration instead belongs to the
+        // walk's own timeout handling. An asynchronous start needs none of this: its
+        // outcome is owed to the clock and read back later.
+        if let Ok(owed) = stopped.duration_since(crate::state::now()) {
+            ::tokio::time::sleep(owed.min(crate::state::MAX_SYNCHRONOUS_RUN_DURATION)).await;
+        }
         history.extend(outcome.events);
 
         let executed = crate::state::Execution {

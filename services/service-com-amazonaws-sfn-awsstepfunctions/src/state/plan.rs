@@ -831,6 +831,7 @@ fn plan_from_run(
             timeout_seconds: waiting.timeout_seconds,
             heartbeat_seconds: waiting.heartbeat_seconds,
             retries_taken: waiting.retries_taken,
+            frames: waiting.frames,
         };
         // The event that RECORDS the scheduling carries what was scheduled: the walk
         // computed the activity, the input and the bounds, so the event the history

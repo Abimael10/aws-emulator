@@ -730,17 +730,24 @@ async fn a_resource_no_call_is_made_for_fails_rather_than_being_faked() {
 }
 
 /// A `Task` state carrying a member whose semantics this emulator does not
-/// interpret is not run either — the rule the walk applies at every state — so
-/// another role to make the call as is reported rather than quietly ignored.
+/// interpret is not run either — the rule the walk applies at every state — so a member
+/// that decides what the state does is reported rather than quietly ignored.
+///
+/// The rows are members of the OTHER query language: a state written in JSONPath reads and
+/// writes its data through the `*Path` family and the payload templates, so a JSONata
+/// data-flow member written on one names a behaviour this emulator does not give it.
 #[tokio::test]
 async fn a_task_member_this_emulator_does_not_interpret_is_not_ignored() {
     let chain = Chain::new();
     chain.create_table("members").await;
     let parameters = json!({ "TableName": "members", "Item": { "pk": { "S": "m-1" } } });
-    let cases: [(&str, Value); 1] = [(
-        "Credentials",
-        json!({ "RoleArn": "arn:aws:iam::000000000000:role/Other" }),
-    )];
+    let cases: [(&str, Value); 2] = [
+        // The document a JSONata `Task` hands its work, which is `Parameters` in this
+        // state's own language.
+        ("Arguments", json!({ "TableName": "members" })),
+        // What a JSONata state puts out, which is the `Result*`/`OutputPath` family here.
+        ("Output", json!({ "done": true })),
+    ];
 
     for (index, (member, value)) in cases.iter().enumerate() {
         let mut definition = task("arn:aws:states:::dynamodb:putItem", parameters.clone());

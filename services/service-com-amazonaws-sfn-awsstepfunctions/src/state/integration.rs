@@ -1264,6 +1264,9 @@ pub fn dataset_call(operation: &str) -> Option<Call> {
         // dataset this writes is the text that writer built ([`super::result_writer`]),
         // not a value out of a state's document.
         payload_document: false,
+        // A dataset call is the `Map` state's own reading and writing rather than a
+        // `Task` state's work, so no `Credentials` names a role for it.
+        acting_as: None,
     })
 }
 
@@ -1364,6 +1367,17 @@ pub struct Call {
     /// endpoint this emulator does not serve is answered by the front door's own refusal
     /// ([`super::http_task`], "Where the request goes").
     pub endpoint: Option<EndpointTask>,
+    /// The ROLE this call is made under, for a `Task` state that declares `Credentials`:
+    /// "Specify a target role the state machine's execution role must be able to assume"
+    /// — Step Functions resolves that role's ARN, assumes it, and makes the integration
+    /// call with the credentials the assume vends.
+    ///
+    /// `None` for every call made as the state machine's own execution role, which is
+    /// every call a state declaring no `Credentials` makes and every call the service
+    /// makes for itself. It decides both halves of acting as the role: WHICH role's
+    /// policies the call is judged against ([`Tasks::authorize`]) and WHOSE session it is
+    /// signed with ([`super::task_authorization::Acting::task_signing`]).
+    pub acting_as: Option<String>,
 }
 
 /// The two `Resource` forms whose unit of work is one HTTP REQUEST to an endpoint the
@@ -2377,6 +2391,9 @@ pub fn read(resource: &str) -> Result<Call, String> {
         // The request IS the document this state built, so its payload member carries
         // the text of the value that document holds for it.
         payload_document: true,
+        // WHO the call is made as is the `Task` state's to say, not the `Resource`'s: a
+        // state declaring `Credentials` sets it on the call it asks for.
+        acting_as: None,
     })
 }
 
@@ -2526,6 +2543,8 @@ fn http_invoke(shown: &str, action: &str) -> Result<Call, String> {
         // No operation's input is built for this call at all ([`Call::endpoint`]), so
         // there is no payload member to put on the wire.
         payload_document: false,
+        // Set by the `Task` state that declares `Credentials`.
+        acting_as: None,
     })
 }
 
@@ -2585,6 +2604,8 @@ fn direct_invocation(function: &str, shown: &str) -> Result<Call, String> {
         // ([`Call::operation_input`]), and the payload member carries that document's
         // own text.
         payload_document: true,
+        // Set by the `Task` state that declares `Credentials`.
+        acting_as: None,
     })
 }
 
@@ -2783,6 +2804,9 @@ fn pattern_call(api: &'static Api, family: Family, operation: &str) -> Call {
         // Every such call is to an AWS JSON service, whose request body IS the
         // operation's input document: no payload member is bound for one.
         payload_document: false,
+        // The pattern's own calls, and the calls this service makes for itself, are made
+        // as the execution role: no `Task` state's `Credentials` names a role for them.
+        acting_as: None,
     }
 }
 
@@ -2986,6 +3010,10 @@ struct Dispatcher {
     /// EXPRESS workflow type ([`ExpressMachines`]); `None` for a walk with no store to
     /// ask.
     express_machines: Option<ExpressMachines>,
+    /// What decides a call a `Task` state asked to be made under a role of its OWN
+    /// ([`super::task_authorization::TaskRoles`]); `None` for a walk with no execution
+    /// role to assume such a role from.
+    task_roles: Option<super::task_authorization::TaskRoles>,
 }
 
 /// What decides whether the execution role a walk runs as may make one integration
@@ -3200,6 +3228,21 @@ impl Tasks for Dispatcher {
     }
 
     fn authorize(&self, call: &Call, request: &Value) -> Option<Failed> {
+        // A `Task` state that declares `Credentials` asks for the call to be made under
+        // the role it names, so WHO the call is judged as is that role and not the
+        // execution role: the assume this service has to take to act as it comes first,
+        // and only then does that role's own gate decide the call. A walk with no such
+        // seam at all — an empty execution role to assume FROM, or an engine carrying no
+        // IAM store — shows nothing about either, and leaves the call unjudged exactly as
+        // it leaves every other call of that walk unjudged (the module's "nothing is
+        // refused on evidence this emulator does not have" rule).
+        if let Some(target) = &call.acting_as {
+            let decided = self.task_roles.as_ref()?(target);
+            if let Some(refused) = decided.refused {
+                return Some(refused);
+            }
+            return decided.gate.as_ref()?(call, request);
+        }
         self.role.as_ref()?(call, request)
     }
 
@@ -3263,7 +3306,18 @@ where
     Work: FnOnce(&dyn Tasks) -> Outcome + Send + 'static,
     Outcome: Send + 'static,
 {
-    interpret_through(ctx.callback(), chain_depth(ctx), region, acting, work).await
+    interpret_through(
+        ctx.callback(),
+        chain_depth(ctx),
+        region,
+        // The credential store a session of a `Task` state's own `Credentials` role is
+        // recorded in, which is the serving request's
+        // ([`super::task_authorization::TaskSigning`]).
+        Some(ctx.credential_store()),
+        acting,
+        work,
+    )
+    .await
 }
 
 /// As [`interpret`], from a callback handle and a chain depth rather than from a
@@ -3274,10 +3328,15 @@ where
 /// clone of the callback ([`super::run_a_job`]) and interprets the continuation
 /// through this. Everything else is identical, including the bound on how deep a
 /// chain of in-process calls may still make one.
+///
+/// `store` is where a session of a role a `Task` state's own `Credentials` names is
+/// recorded; a caller with none — a continuation the clock runs rather than a request —
+/// makes such a call under a session only where one is already held.
 pub async fn interpret_through<Work, Outcome>(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     depth: u8,
     region: &str,
+    store: Option<&::emulator_server::CredentialStore>,
     acting: super::task_authorization::Acting,
     work: Work,
 ) -> Result<Outcome, ::tokio::task::JoinError>
@@ -3306,6 +3365,11 @@ where
     // execution role, which is the identity Step Functions does an execution's work as
     // ([`super::execution_role_session`]).
     let signing = acting.signing;
+    // And what serves a call a `Task` state asked to be made under a role of its OWN: the
+    // gate that decides it, taken by the walk, and the session it is signed with, taken
+    // here as each call is served ([`super::task_authorization::TaskRoles`]).
+    let task_roles = acting.task_roles;
+    let task_signing = acting.task_signing;
     let walk = ::tokio::task::spawn_blocking(move || {
         let dispatcher = Dispatcher {
             calls,
@@ -3316,6 +3380,7 @@ where
             map_runs: resumed_map_runs,
             activities: known_activities,
             express_machines,
+            task_roles,
         };
         work(&dispatcher)
     });
@@ -3333,7 +3398,19 @@ where
             while serving.try_join_next().is_some() {}
             let callback = callback.clone();
             let connections = connections.clone();
-            let signing = signing.clone();
+            // WHO this call is signed as: a session of the state machine's execution
+            // role, or — for a call a `Task` state asked to be made under a role of its
+            // own — a session of THAT role, minted here because the role is one the walk
+            // resolved as it ran. A call made under a task's own role is NEVER signed as
+            // the execution role instead: the gate judged it as the named role, so signing
+            // it as another identity would make a service resolve a caller the decision
+            // was not taken for. A role no session could be minted for leaves the call
+            // signed with this emulator's own credential, exactly as a walk with no
+            // session at all does.
+            let signing = match &handover.call.acting_as {
+                Some(target) => task_signing.as_ref().and_then(|mint| mint(target, store)),
+                None => signing.clone(),
+            };
             // WHERE this call goes: the Region the resource its request names is held in,
             // by the same reading the gate that judged the call formed its access request
             // in ([`super::target_addressing`]), so a call is made in the Region it was

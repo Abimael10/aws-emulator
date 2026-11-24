@@ -1405,6 +1405,15 @@ pub struct ScheduledActivity {
     /// retries nothing further. EMPTY for the first attempt of a task, which has
     /// spent none.
     pub retries_taken: Vec<u64>,
+    /// The concurrent states the suspended task is nested INSIDE, outermost first, and
+    /// empty for a task at the top level of the definition.
+    ///
+    /// It is the same record a parked job carries ([`ParkedJob::frames`]) and for the
+    /// same reason: a `Parallel` branch is walked inside its state's own turn, so a task
+    /// that suspends inside one suspends the whole execution, and the walk that continues
+    /// it has to re-enter that `Parallel` and carry on in the branch that suspended while
+    /// the branches that had finished keep what they produced.
+    pub frames: Vec<ParkedFrame>,
 }
 
 /// The job a `Task` state's run-a-job (`.sync`) integration STARTED, which parked the
@@ -1544,6 +1553,9 @@ pub struct ActivityReply {
     /// that scheduled the task recorded it, and this continuation does not record it a
     /// second time ([`ContinuedEntry`]).
     pub entered_event_id: Option<i64>,
+    /// The concurrent states that state is nested inside, as the stored task carries
+    /// them ([`ScheduledActivity::frames`]).
+    pub frames: Vec<ParkedFrame>,
 }
 
 /// What a `SendTaskSuccess`, a `SendTaskFailure` or the task's own CLOCK reported for
@@ -1586,6 +1598,9 @@ pub struct CallbackReply {
     /// whose integration handed out the token recorded it, and this continuation does
     /// not record it a second time ([`ContinuedEntry`]).
     pub entered_event_id: Option<i64>,
+    /// The concurrent states that state is nested inside, as the stored task carries
+    /// them ([`ScheduledActivity::frames`]).
+    pub frames: Vec<ParkedFrame>,
 }
 
 /// The step a redrive continues an execution from: the state the attempt stopped at,
@@ -2740,16 +2755,24 @@ fn interpret(
     // nothing.
     let (reply, job_reply, callback_reply, resume_frames, start_at, first_input, continued_entry) =
         match entry {
+            // A task of a `Parallel` BRANCH is answered one level in, exactly as a job
+            // started there is: the walk re-enters the concurrent states the stored task
+            // names, outermost first, and the frames are what it picks up at each of them
+            // ([`ParkedFrame`]).
             Entry::Reply(reply, state_input) => {
-                let state_name = reply.state_name.clone();
+                let frames = reply.frames.clone();
                 let entered = reply.entered_event_id.map(ContinuedEntry::replayed);
+                let (start_at, first_input) = match frames.first() {
+                    Some(frame) => (frame.state_name.clone(), frame.state_input.clone()),
+                    None => (reply.state_name.clone(), state_input),
+                };
                 (
                     Some(reply),
                     None,
                     None,
-                    Vec::new(),
-                    state_name,
-                    state_input,
+                    frames,
+                    start_at,
+                    first_input,
                     entered,
                 )
             }
@@ -2789,15 +2812,19 @@ fn interpret(
                 }
             }
             Entry::Callback(reply, state_input) => {
-                let state_name = reply.state_name.clone();
+                let frames = reply.frames.clone();
                 let entered = reply.entered_event_id.map(ContinuedEntry::replayed);
+                let (start_at, first_input) = match frames.first() {
+                    Some(frame) => (frame.state_name.clone(), frame.state_input.clone()),
+                    None => (reply.state_name.clone(), state_input),
+                };
                 (
                     None,
                     None,
                     Some(reply),
-                    Vec::new(),
-                    state_name,
-                    state_input,
+                    frames,
+                    start_at,
+                    first_input,
                     entered,
                 )
             }
@@ -3608,6 +3635,17 @@ struct MapTally {
 }
 
 impl Interpreter<'_> {
+    /// Whether this walk has SUSPENDED at work one of its states handed over: the job a
+    /// run-a-job task started, or the task a worker's reply or an answered token
+    /// finishes.
+    ///
+    /// The ONE statement of it, because a `Parallel` state answers for either the same
+    /// way: a branch that suspended leaves the state with no result, and the frame the
+    /// suspension records is what the continuation re-enters the state through.
+    fn suspended_in_a_branch(&self) -> bool {
+        self.parked.is_some() || self.waiting.is_some()
+    }
+
     // -----------------------------------------------------------------------
     // Parallel
     // -----------------------------------------------------------------------
@@ -3682,10 +3720,10 @@ impl Interpreter<'_> {
             me.push(super::EVENT_PARALLEL_STATE_STARTED, name, at);
             let (outcome, end) =
                 me.run_branches(&plan, name, &raw, &branch_input, at, resume.take());
-            // A branch that PARKED leaves the state with no outcome at all, so the
+            // A branch that SUSPENDED leaves the state with no outcome at all, so the
             // state records neither of the events an outcome is reported by: what
-            // happens next is the job finishing.
-            if me.parked.is_some() {
+            // happens next is the job finishing, or the task being answered.
+            if me.suspended_in_a_branch() {
                 return (outcome, end);
             }
             let event = if outcome.is_ok() {
@@ -3697,10 +3735,11 @@ impl Interpreter<'_> {
             (outcome, end)
         });
         match outcome {
-            // One of the branches is parked at the job its own run-a-job task
-            // started: the walk stops here and the execution waits for that job,
-            // exactly as it does for a task at the top level of the definition.
-            Ok(value) if self.parked.is_some() => Ok(StateStep {
+            // One of the branches is suspended at the work one of its own states handed
+            // over — the job a run-a-job task started, or the task a worker or a token
+            // answers: the walk stops here and the execution waits for it, exactly as it
+            // does for a task at the top level of the definition.
+            Ok(value) if self.suspended_in_a_branch() => Ok(StateStep {
                 value,
                 at: end,
                 next: Next::Suspended,
@@ -3881,30 +3920,36 @@ impl Interpreter<'_> {
         self.cancel_after = enclosing_cancel;
         if let Some((failure, when)) = failed {
             // A branch of this state failed, so the state has failed — and a sibling
-            // parked at a job is not waited for any longer: the job it started is
-            // ABANDONED, which is what stops it.
+            // suspended at work of its own is not waited for any longer: the job it
+            // started is ABANDONED, which is what stops it, and a task it had scheduled
+            // is one nothing waits at, so the suspension is dropped rather than reported
+            // beside a failure.
             if let Some(parked) = self.parked.take() {
                 self.abandoned.push(parked);
             }
+            self.waiting = None;
             self.abort_units(when, &units);
             return (Err(failure), when);
         }
         if let Some(branch) = suspended {
-            // The frame this state contributes to the parked record: which branch is
-            // parked, and what the others produced, so the continuation re-enters
-            // this state without re-running any of them.
+            // The frame this state contributes to the suspended record: which branch is
+            // waiting, and what the others produced, so the continuation re-enters
+            // this state without re-running any of them. One of the two records is set
+            // — a job the branch parked at, or a task it is waiting at — and the frame
+            // is the same either way.
+            let frame = ParkedFrame {
+                state_name: state_name.to_string(),
+                state_input: state_input.clone(),
+                branch,
+                done,
+            };
             if let Some(parked) = self.parked.as_mut() {
-                parked.frames.insert(
-                    0,
-                    ParkedFrame {
-                        state_name: state_name.to_string(),
-                        state_input: state_input.clone(),
-                        branch,
-                        done,
-                    },
-                );
+                parked.frames.insert(0, frame.clone());
             }
-            // The state has no result: `parallel_state` reads the parked record and
+            if let Some(waiting) = self.waiting.as_mut() {
+                waiting.frames.insert(0, frame);
+            }
+            // The state has no result: `parallel_state` reads the suspended record and
             // suspends there, so this value is never placed.
             return (Ok(Value::Null), end);
         }
@@ -4069,6 +4114,57 @@ fn jitter_draw() -> u64 {
     super::splitmix64(&mut seed)
 }
 
+/// The state named `state_name` ANYWHERE in `document`, as the Amazon States Language
+/// scopes a state name: "State names must be unique within the scope of the whole state
+/// machine", so one name names one state however deeply the state lists nest.
+///
+/// The search descends into the nested state machines a state declares, through the one
+/// statement of which members carry one ([`NESTED_MACHINE_MEMBERS`]) — a member naming ONE
+/// machine carries it as an object and `Branches` carries a list of them — so a reader
+/// asking what a state DECLARES finds the state a task of a `Parallel` branch belongs to
+/// exactly as it finds one at the top level. Without that, a task scheduled inside a
+/// branch would be judged against no `Retry` and no `Catch` at all.
+///
+/// `pub(in crate::state)`, not private to this module: it is the ONE such reader of this
+/// crate, which the series that names the work a state's event belongs to reads through
+/// too ([`super::observability`]).
+///
+/// `left` is how many levels further it may descend, which bounds the recursion by the
+/// nesting a definition may be RUN at ([`MAX_NESTING_DEPTH`]): the document is a caller's,
+/// so a definition nesting past what any walk of it would run is not descended into here
+/// either — no state past that depth is reachable at run time anyway.
+///
+/// The FIRST state of that name is the answer, which the uniqueness rule above is what
+/// makes unambiguous: within one state list the names are the keys of a JSON object, so
+/// they cannot repeat, and across nested lists it is the definition's own obligation. A
+/// definition that breaks it has one of its same-named states read here rather than both.
+pub(in crate::state) fn declared_state<'a>(
+    document: &'a Value,
+    state_name: &str,
+    left: usize,
+) -> Option<&'a Map<String, Value>> {
+    let states = document.get("States").and_then(Value::as_object)?;
+    if let Some(state) = states.get(state_name).and_then(Value::as_object) {
+        return Some(state);
+    }
+    let left = left.checked_sub(1)?;
+    for state in states.values() {
+        let nested = NESTED_MACHINE_MEMBERS
+            .iter()
+            .filter_map(|member| state.get(*member))
+            .flat_map(|value| match value.as_array() {
+                Some(machines) => machines.iter().collect::<Vec<_>>(),
+                None => vec![value],
+            });
+        for machine in nested {
+            if let Some(found) = declared_state(machine, state_name, left) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
 /// Which retrier of the `Task` state `state_name` of `definition` retries an activity
 /// task that failed, and how long after that failure its next attempt is due.
 ///
@@ -4091,11 +4187,7 @@ pub fn activity_retry_any(
     taken: &[u64],
 ) -> Option<(usize, Duration)> {
     let document = serde_json::from_str::<Value>(definition).ok()?;
-    let state = document
-        .get("States")
-        .and_then(Value::as_object)?
-        .get(state_name)
-        .and_then(Value::as_object)?;
+    let state = declared_state(&document, state_name, MAX_NESTING_DEPTH)?;
     let retriers = state.get("Retry").and_then(Value::as_array)?;
     for (index, retrier) in retriers.iter().enumerate() {
         let Some(retrier) = retrier.as_object() else {
@@ -4140,6 +4232,34 @@ pub fn activity_retry(
     activity_retry_any(definition, state_name, &[error], taken)
 }
 
+/// Whether any state on the path from `state_name` OUT to the top level of `definition`
+/// catches a failure answering to any of `errors`: the state itself, then each concurrent
+/// state it is nested inside, outermost last ([`ParkedFrame`]).
+///
+/// A failure no catcher of the state's own answers is the failure of the concurrent state
+/// that encloses it — "if any branch fails, the entire Parallel state is considered to have
+/// failed" — so a `Catch` on THAT state answers for it. The question a caller deciding
+/// whether a task's answer needs a WALK has to ask is therefore about the whole path and
+/// not about the state alone: a task inside a `Parallel` whose own `Catch` names the error
+/// is a task whose answer the execution carries on from.
+///
+/// `frames` is the path, as the suspended task carries it
+/// ([`ScheduledActivity::frames`]); empty for a task at the top level, where this is
+/// [`state_catches_error`] on the state itself.
+pub fn path_catches_error(
+    definition: &str,
+    state_name: &str,
+    frames: &[ParkedFrame],
+    errors: &[&str],
+) -> bool {
+    state_catches_error(definition, state_name, errors)
+        || frames.iter().any(|frame| {
+            // An enclosing state's own `Retry` re-runs its whole machine, which only a
+            // walk can do, so either half of its answer needs the continuation.
+            state_answers_error(definition, &frame.state_name, errors, &[])
+        })
+}
+
 /// Whether the state `state_name` of `definition` ANSWERS a failure ITSELF: a `Retry`
 /// whose retrier names it with an attempt left, or a `Catch` whose catcher names it.
 ///
@@ -4175,12 +4295,7 @@ pub fn state_catches_error(definition: &str, state_name: &str, errors: &[&str]) 
     let Ok(document) = serde_json::from_str::<Value>(definition) else {
         return false;
     };
-    let state = document
-        .get("States")
-        .and_then(Value::as_object)
-        .and_then(|states| states.get(state_name))
-        .and_then(Value::as_object);
-    let Some(state) = state else {
+    let Some(state) = declared_state(&document, state_name, MAX_NESTING_DEPTH) else {
         return false;
     };
     retry_entries(state, "Catch")

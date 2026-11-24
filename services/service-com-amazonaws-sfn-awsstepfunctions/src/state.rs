@@ -1307,6 +1307,11 @@ pub struct ActivityTask {
     /// by [`ComAmazonawsSfnAwsstepfunctionsState::schedule_activity_task`] exactly as
     /// [`StateMachine::retained_bytes`] is.
     pub retained_bytes: usize,
+    /// The concurrent states the state that scheduled this task is nested INSIDE,
+    /// outermost first, and empty for a task at the top level of the definition
+    /// ([`asl::ScheduledActivity::frames`]): what the walk continuing this execution
+    /// re-enters to reach that state.
+    pub frames: Vec<asl::ParkedFrame>,
 }
 
 impl ActivityTask {
@@ -1373,6 +1378,7 @@ impl ActivityTask {
             + self.input.len()
             + self.state_input.len()
             + self.retries_taken.len() * std::mem::size_of::<u64>()
+            + frames_bytes(&self.frames)
             + WORKER_NAME_RESERVE_BYTES
     }
 }
@@ -1466,6 +1472,8 @@ pub struct PlannedActivityTask {
     /// How many attempts each retrier of the scheduling state has already spent on
     /// this task; see [`ActivityTask::retries_taken`]. EMPTY for a first attempt.
     pub retries_taken: Vec<u64>,
+    /// The concurrent states the task is nested inside; see [`ActivityTask::frames`].
+    pub frames: Vec<asl::ParkedFrame>,
 }
 
 impl PlannedActivityTask {
@@ -1481,6 +1489,7 @@ impl PlannedActivityTask {
             + self.state_name.len()
             + self.input.len()
             + self.state_input.len()
+            + frames_bytes(&self.frames)
     }
 }
 
@@ -1680,6 +1689,15 @@ impl PlannedJob {
 /// a declared `TimeoutSeconds` too, for the same reason.
 pub const MAX_PARKED_JOB_DURATION: Duration = Duration::from_secs(300);
 
+/// The longest a SYNCHRONOUS Express start is held open waiting for the instant its own
+/// run's outcome falls due.
+///
+/// "Express Workflows […] have a maximum duration of five minutes", so five minutes is
+/// the longest a run of this workflow type can be owed to the clock and therefore the
+/// longest the call that answers one blocks. A walk whose logical offsets add up past it
+/// is answered at this ceiling rather than held open indefinitely.
+pub const MAX_SYNCHRONOUS_RUN_DURATION: Duration = Duration::from_secs(300);
+
 /// How often a parked job is asked whether it has finished.
 ///
 /// Emulator interval: the job is served in THIS process, so its own reporting call
@@ -1769,6 +1787,11 @@ pub struct EventDetails {
     /// The bounds the scheduling state declared for it.
     pub timeout_seconds: Option<u64>,
     pub heartbeat_seconds: Option<u64>,
+    /// "The ARN of an IAM role that Step Functions assumes for the task": the role the
+    /// scheduling state's `Credentials` named, for the event that reports a task being
+    /// scheduled. `None` for work made as the state machine's own execution role, which
+    /// the history states no role for.
+    pub task_role_arn: Option<String>,
     /// How many times the execution had been redriven when the event was written,
     /// which is what an `ExecutionRedriven` event reports. The record's own count
     /// moves again at the NEXT redrive, so the count belongs to the event rather
@@ -1810,6 +1833,7 @@ impl EventDetails {
             + text(&self.error)
             + text(&self.cause)
             + text(&self.location)
+            + text(&self.task_role_arn)
             + self
                 .assigned_variables
                 .iter()

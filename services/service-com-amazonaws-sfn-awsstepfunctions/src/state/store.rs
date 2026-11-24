@@ -320,6 +320,9 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             // that suspended at it had already used, so the answer's own walk takes
             // it up instead of restarting it.
             retries_taken: planned.retries_taken,
+            // The concurrent states the scheduling state is nested inside, as the walk
+            // recorded them ([`asl::ParkedFrame`]).
+            frames: planned.frames,
             retained_bytes: 0,
         };
         self.store_activity_task(task);
@@ -787,7 +790,7 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         let retried =
             asl::activity_retry_any(&definition, &task.state_name, errors, &task.retries_taken)
                 .is_some();
-        let caught = asl::state_catches_error(&definition, &task.state_name, errors);
+        let caught = asl::path_catches_error(&definition, &task.state_name, &task.frames, errors);
         match task.activity_arn.is_some() {
             true => !retried && caught,
             false => retried || caught,
@@ -1052,10 +1055,10 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         self.retry_activity_task(token, &[error], EVENT_ACTIVITY_FAILED, at)
     }
 
-    /// Whether the state the task `token` names belongs to CATCHES the failure `error` —
-    /// a `Catch` whose catcher names it, the `Retry` above having been offered it first —
-    /// so the reply CONTINUES the execution at that catcher instead of failing it
-    /// ([`asl::state_catches_error`]).
+    /// Whether the state the task `token` names belongs to — or any concurrent state it is
+    /// nested inside — CATCHES the failure `error`, the `Retry` above having been offered it
+    /// first, so the reply CONTINUES the execution at that catcher instead of failing it
+    /// ([`asl::path_catches_error`]).
     ///
     /// `false` for a token this store holds no task under, and for one whose execution
     /// runs a definition this store can no longer read.
@@ -1067,7 +1070,7 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         let Some(definition) = self.definition_of_execution(&task.execution_arn) else {
             return false;
         };
-        asl::state_catches_error(&definition, &task.state_name, &[error])
+        asl::path_catches_error(&definition, &task.state_name, &task.frames, &[error])
     }
 
     // -----------------------------------------------------------------------

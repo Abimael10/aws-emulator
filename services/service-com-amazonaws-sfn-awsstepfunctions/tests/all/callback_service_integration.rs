@@ -840,6 +840,199 @@ async fn a_bound_that_ran_out_reports_its_error_name_and_no_cause() {
 }
 
 // ---------------------------------------------------------------------------
+// A callback task inside a `Parallel` branch
+// ---------------------------------------------------------------------------
+
+/// The result the branch that does NOT wait for a token produces, so a row can show that
+/// what a finished branch produced survives the suspension.
+const FAST_RESULT: &str = "fast";
+
+/// The error a `SendTaskFailure` reports for the row whose failure the waiting state's own
+/// `Catch` takes over, and the name that catcher is written against.
+const CALLER_ERROR: &str = "CallerSaysNo";
+
+/// A `Parallel` branch WAITS for the token one of its states handed over: a branch reports
+/// nothing until it ends, so the execution suspends there exactly as it does for a task at
+/// the top level — the call really delivered the token, the execution stays `RUNNING`, and
+/// the answer resumes the execution inside that branch while the branch that had finished
+/// keeps what it produced.
+///
+/// The rows differ along what the rule generalises over: HOW the token is answered (a
+/// `SendTaskSuccess`, a `SendTaskFailure` the waiting state's own `Catch` takes over, and
+/// the state's own `TimeoutSeconds` running out, which the continuation the clock drives
+/// applies), and WHICH branch waits (the first of two and the second, so the record the
+/// suspension keeps names a branch other than zero).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_callback_task_in_a_parallel_branch_waits_for_its_token() {
+    // (case, which branch waits, how the token is answered, the output the run must end
+    //  with)
+    let rows: [(&str, usize, Answered, Value); 4] = [
+        (
+            "the first branch of two waits and a caller reports a result",
+            0,
+            Answered::Success,
+            json!([{ "approved": true, "by": "the worker outside" }, FAST_RESULT]),
+        ),
+        (
+            "the SECOND branch of two waits and a caller reports a result",
+            1,
+            Answered::Success,
+            json!([FAST_RESULT, { "approved": true, "by": "the worker outside" }]),
+        ),
+        (
+            "the waiting state's own Catch absorbs the failure a caller reported",
+            0,
+            Answered::Failure,
+            json!([{ "recovered": true }, FAST_RESULT]),
+        ),
+        (
+            "the waiting state's own TimeoutSeconds closes the token, and its Catch absorbs it",
+            1,
+            Answered::ItsOwnBound,
+            json!([FAST_RESULT, { "recovered": true }]),
+        ),
+    ];
+
+    let chain = Chain::new();
+    chain.create_table(TABLE).await;
+
+    for (index, (case, waiting_branch, answered, output)) in rows.into_iter().enumerate() {
+        let key = format!("branch-token-{index}");
+        // The waiting branch: a `.waitForTaskToken` task whose call writes the token into
+        // the table, with a `Catch` of its own for both the names a row can close it with.
+        let mut waits = json!({
+            "Type": "Task",
+            "Resource": "arn:aws:states:::dynamodb:putItem.waitForTaskToken",
+            "Parameters": {
+                "TableName": TABLE,
+                "Item": { "pk": { "S": key.clone() }, "token": { "S.$": "$$.Task.Token" } },
+            },
+            "Catch": [{
+                "ErrorEquals": [CALLER_ERROR, TIMEOUT_ERROR],
+                "ResultPath": "$.caught",
+                "Next": "Recovered",
+            }],
+            "End": true,
+        });
+        if answered == Answered::ItsOwnBound {
+            // The one bound a row needs: short enough that the clock closes the token
+            // without this test waiting for a span of its own.
+            waits
+                .as_object_mut()
+                .expect("the state is an object")
+                .insert("TimeoutSeconds".to_string(), json!(1));
+        }
+        let waiting_machine = json!({
+            "StartAt": "WaitForCallback",
+            "States": {
+                "WaitForCallback": waits,
+                "Recovered": { "Type": "Pass", "Result": { "recovered": true }, "End": true },
+            },
+        });
+        let fast_machine = json!({
+            "StartAt": "Fast",
+            "States": { "Fast": { "Type": "Pass", "Result": FAST_RESULT, "End": true } },
+        });
+        let branches: Vec<Value> = match waiting_branch {
+            0 => vec![waiting_machine, fast_machine],
+            _ => vec![fast_machine, waiting_machine],
+        };
+        // Neither the `Parallel` nor the definition declares a `Catch`, so a row that ends
+        // SUCCEEDED is the waiting state's own `Catch` doing the work.
+        let definition = json!({
+            "StartAt": "Both",
+            "States": {
+                "Both": { "Type": "Parallel", "Branches": branches, "End": true }
+            },
+        });
+        let machine = chain.create(&format!("branch-token-{index}"), &definition).await;
+        let execution = chain.start(&machine, "only", &json!({})).await;
+
+        // The call really was made from inside the branch, and it really delivered the
+        // token: the item it wrote is where the token is read back from, never built here.
+        let deadline = ::tokio::time::Instant::now() + SETTLE_DEADLINE;
+        let token = loop {
+            if let Some(item) = chain.item(TABLE, &key).await {
+                break item
+                    .get("token")
+                    .and_then(|attribute| attribute.get("S"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| {
+                        panic!("case {case:?}: expected a token in the item {item:?}")
+                    })
+                    .to_string();
+            }
+            assert!(
+                ::tokio::time::Instant::now() < deadline,
+                "case {case:?}: expected the branch's call to write the token into {TABLE}"
+            );
+            ::tokio::time::sleep(POLL_PAUSE).await;
+        };
+        assert!(
+            read_task_token(&token).is_some(),
+            "case {case:?}: expected a token this service minted, got {token:?}"
+        );
+
+        match answered {
+            Answered::Success => {
+                chain
+                    .sfn(
+                        "SendTaskSuccess",
+                        &json!({ "taskToken": token, "output": REPLY_OUTPUT }),
+                    )
+                    .await;
+            }
+            Answered::Failure => {
+                chain
+                    .sfn(
+                        "SendTaskFailure",
+                        &json!({ "taskToken": token, "error": CALLER_ERROR }),
+                    )
+                    .await;
+            }
+            // Nothing answers it: the state's own bound closes the token, and the
+            // continuation the clock drives applies the state's `Catch`.
+            Answered::ItsOwnBound => {}
+        }
+
+        let ended = reported_as(&chain, case, &execution, "SUCCEEDED").await;
+        let reported: Value =
+            serde_json::from_str(&string(&ended, "output")).unwrap_or_else(|why| {
+                panic!("case {case:?}: expected JSON output, got {why} for {ended:?}")
+            });
+        assert_eq!(
+            reported, output,
+            "case {case:?}: expected the Parallel to put out {output}, got {reported:?}"
+        );
+        assert!(
+            ended.get("error").is_none_or(Value::is_null),
+            "case {case:?}: a Parallel whose branch's Catch absorbed the failure reports no \
+             error, got {ended:?}"
+        );
+        // And the `Parallel` the continuation re-entered is entered ONCE: the walk that
+        // resumed the execution appends to the one history rather than beginning a second.
+        let types = event_types(&chain, &execution).await;
+        assert_eq!(
+            types.iter().filter(|kind| *kind == "ParallelStateEntered").count(),
+            1,
+            "case {case:?}: expected one ParallelStateEntered event, got {types:?}"
+        );
+    }
+}
+
+/// How one row of [`a_callback_task_in_a_parallel_branch_waits_for_its_token`] closes the
+/// token its branch handed over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Answered {
+    /// `SendTaskSuccess`: "the JSON output of the task" is the state's result.
+    Success,
+    /// `SendTaskFailure` naming [`CALLER_ERROR`], which the state's own `Catch` takes over.
+    Failure,
+    /// Nothing answers it, and the state's own `TimeoutSeconds` closes it.
+    ItsOwnBound,
+}
+
+// ---------------------------------------------------------------------------
 // Where the execution cannot wait for a token
 // ---------------------------------------------------------------------------
 
@@ -848,10 +1041,14 @@ async fn a_bound_that_ran_out_reports_its_error_name_and_no_cause() {
 /// for it — and where the WORKFLOW TYPE is what cannot wait, the definition is refused
 /// before any state machine is created at all.
 ///
-/// The rows are the places an execution has nowhere to wait: a `Map` iteration or a
-/// `Parallel` branch, each of which is walked to its own end inside the enclosing
-/// state's turn. An EXPRESS workflow, which waits for no answer from outside, is the
-/// create-time half of the same rule and is asserted on its own below.
+/// The rows are the places an execution has nowhere to wait: a `Map` iteration, which is
+/// walked to its own end inside the enclosing state's turn and whose Map Run counts an
+/// item only as its iteration finishes — at the top level of a definition, and nested
+/// inside a `Parallel` branch. A `Parallel` BRANCH does wait: a branch reports nothing
+/// until it ends, so the walk suspends and the continuation re-enters the state, which
+/// [`a_callback_task_in_a_parallel_branch_waits_for_its_token`] asserts. An EXPRESS
+/// workflow, which waits for no answer from outside, is the create-time half of the same
+/// rule and is asserted on its own below.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_callback_task_the_execution_cannot_wait_at_is_not_run() {
     let inner = json!({
@@ -884,14 +1081,27 @@ async fn a_callback_task_the_execution_cannot_wait_at_is_not_run() {
             "nothing was run for it",
         ),
         (
-            "a Parallel branch, which is walked to its own end",
+            "a Map iteration inside a Parallel branch, which is walked to its own end",
             "STANDARD",
             json!({
                 "StartAt": "Both",
                 "States": {
                     "Both": {
                         "Type": "Parallel",
-                        "Branches": [{ "StartAt": "Inner", "States": { "Inner": inner } }],
+                        "Branches": [{
+                            "StartAt": "Each",
+                            "States": {
+                                "Each": {
+                                    "Type": "Map",
+                                    "ItemsPath": "$.items",
+                                    "ItemProcessor": {
+                                        "StartAt": "Inner",
+                                        "States": { "Inner": inner },
+                                    },
+                                    "End": true,
+                                }
+                            },
+                        }],
                         "End": true,
                     }
                 }

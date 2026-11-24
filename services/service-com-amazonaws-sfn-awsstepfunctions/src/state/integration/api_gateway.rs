@@ -218,6 +218,8 @@ pub(super) fn read_invoke(
         // No operation's input is built for this call at all, so there is no payload
         // member to put on the wire.
         payload_document: false,
+        // Set by the `Task` state that declares `Credentials`.
+        acting_as: None,
     })
 }
 

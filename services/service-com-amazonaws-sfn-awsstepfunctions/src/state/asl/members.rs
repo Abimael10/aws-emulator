@@ -185,14 +185,15 @@ pub(super) fn can_retry(state_type: &str) -> bool {
 /// state's, whatever work its `Resource` names, and the window it declares closes at
 /// its own length for a task nothing heartbeats — which is every task whose work this
 /// emulator performs itself ([`Interpreter::task_state`] holds such a task to whichever
-/// of the two spans the state declared runs out first). `Credentials` is deliberately
-/// absent: it asks for the call to be made under another role, which this emulator does
-/// not assume.
+/// of the two spans the state declared runs out first). `Credentials` is among them too:
+/// it names the role the INVOCATION is made under, which is work this emulator does
+/// perform ([`Interpreter::task_role_arn`], [`super::super::task_authorization::TaskRoles`]).
 pub(super) const INTEGRATION_TASK_MEMBERS: &[&str] = &[
     "Type",
     "Comment",
     "QueryLanguage",
     "Assign",
+    "Credentials",
     "Resource",
     "InputPath",
     "Parameters",
@@ -222,6 +223,7 @@ pub(super) const CALLBACK_TASK_MEMBERS: &[&str] = &[
     "Comment",
     "QueryLanguage",
     "Assign",
+    "Credentials",
     "Resource",
     "InputPath",
     "Parameters",
@@ -245,6 +247,7 @@ pub(super) const JSONATA_CALLBACK_TASK_MEMBERS: &[&str] = &[
     "Comment",
     "QueryLanguage",
     "Assign",
+    "Credentials",
     "Output",
     "Resource",
     "Arguments",
@@ -348,6 +351,7 @@ pub(super) fn jsonata_members(state_type: &str, activity: bool) -> &'static [&'s
             "Comment",
             "QueryLanguage",
             "Assign",
+            "Credentials",
             "Output",
             "Resource",
             "Arguments",

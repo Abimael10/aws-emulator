@@ -719,7 +719,12 @@ impl Interpreter<'_> {
                 let waited = self
                     .wait_duration(state, language, &effective, &context, at)
                     .map_err(|failure| wait_failure(name, failure).at(at))?;
-                let at = at + waited;
+                // The span this state waits is the caller's definition's, which the model
+                // bounds only in BYTES, so a chain of them is accumulated WITHOUT the
+                // panic `Duration`'s own `Add` carries: an offset no duration can
+                // represent holds at the furthest one, which is an instant the run never
+                // reaches — exactly what an unreachable offset means.
+                let at = at.saturating_add(waited);
                 let value = self
                     .produced(state, language, &raw, &effective, None, &context, false)
                     .map_err(|failure| failure.at(at))?;
@@ -1256,6 +1261,64 @@ impl Interpreter<'_> {
         }
     }
 
+    /// The ROLE a `Task` state asks its work to be made under, from its `Credentials`
+    /// member; `None` for a state that declares none, whose work is made as the state
+    /// machine's own execution role.
+    ///
+    /// "Credentials … Specify a target role that the state machine's execution role can
+    /// assume" — the member carries one field, `RoleArn`, and that field is written in the
+    /// state's own query language: a literal ARN, a `RoleArn.$` reference path or
+    /// intrinsic in JSONPath, and a JSONata expression in the other. So the member is
+    /// resolved exactly as the document the work is handed is ([`Interpreter::task_request`]):
+    /// the whole object goes through that language's own template, and what comes out has
+    /// to be an object carrying a string `RoleArn` — anything else names no role the work
+    /// could be made under.
+    ///
+    /// Resolving it is the INTERPRETER's own step, taken before anything is handed over:
+    /// what the role then DECIDES — whether the execution role may assume it, and whether
+    /// that role may make the call — belongs to the task seam
+    /// ([`super::super::task_authorization::TaskRoles`]).
+    pub(super) fn task_role_arn(
+        &self,
+        state: &Map<String, Value>,
+        language: &'static str,
+        effective: &Value,
+        context: &Value,
+    ) -> Result<Option<String>, Failure> {
+        let Some(declared) = state.get(CREDENTIALS_MEMBER) else {
+            return Ok(None);
+        };
+        let resolved = match language {
+            JSONATA => {
+                let bindings = self.bindings(effective, context, None, None);
+                super::super::jsonata::render(
+                    declared,
+                    CREDENTIALS_MEMBER,
+                    &bindings,
+                    &mut self.jsonata_budget(),
+                )
+                .map_err(jsonata_failure)?
+            }
+            _ => payload_template(declared, effective, context)?,
+        };
+        let Some(role) = resolved.get(ROLE_ARN_FIELD) else {
+            return Err(runtime(format!(
+                "'{CREDENTIALS_MEMBER}' carries no '{ROLE_ARN_FIELD}', so it names no role the \
+                 work of this state could be made under"
+            )));
+        };
+        match role {
+            Value::String(arn) if !arn.is_empty() => Ok(Some(arn.clone())),
+            other => Err(self.invalid_field_value(
+                language,
+                declared.get(ROLE_ARN_FIELD),
+                &format!("{CREDENTIALS_MEMBER}.{ROLE_ARN_FIELD}"),
+                "the ARN of a role",
+                other,
+            )),
+        }
+    }
+
     /// A `Task` state whose `Resource` names an ACTIVITY: the state SCHEDULES a task
     /// for that activity and the walk suspends, because what happens next is a
     /// worker's reply.
@@ -1291,15 +1354,32 @@ impl Interpreter<'_> {
             ))
             .at(at));
         }
-        // A nested state list is walked to its own end inside the enclosing state's
-        // turn, so there is nowhere for one of its states to wait: a `Map` iteration
-        // or a `Parallel` branch that schedules a task is not run, rather than run as
-        // though the task had already answered.
-        if self.depth > 0 {
+        // A `Map` ITERATION is walked to its own end inside the enclosing state's turn,
+        // and what the Map Run around it reports — the items it has finished, the child
+        // execution each item ran as — is counted as those iterations finish, which an
+        // iteration waiting for a worker has not done. So a task scheduled inside one is
+        // not run, rather than run as though a worker had already answered; a `Parallel`
+        // BRANCH suspends, because a branch reports nothing until it ends, and the frames
+        // the suspension records are what the continuation re-enters it through
+        // ([`ParkedFrame`]).
+        if self.map_depth > 0 {
             return Err(runtime(format!(
-                "state '{name}' schedules an activity task inside a 'Map' iteration or a \
-                 'Parallel' branch, which this emulator does not wait at, so nothing was run \
-                 for it"
+                "state '{name}' schedules an activity task inside a 'Map' iteration, which this \
+                 emulator does not wait at, so nothing was run for it"
+            ))
+            .at(at));
+        }
+        // One execution waits at ONE unit of work whose answer comes from outside it:
+        // the record that holds it names the state it belongs to, and the answer that
+        // resolves it resumes that one state. So a second concurrent suspension — a
+        // sibling branch of the same `Parallel` reaching a task or a job of its own — is
+        // not scheduled either. The same question the run-a-job path and the callback
+        // path ask ([`Interpreter::suspended_in_a_branch`]).
+        if self.suspended_in_a_branch() {
+            return Err(runtime(format!(
+                "state '{name}' schedules a second activity task while this execution is \
+                 already waiting at one, which this emulator does not wait at, so nothing was \
+                 run for it"
             ))
             .at(at));
         }
@@ -1428,6 +1508,10 @@ impl Interpreter<'_> {
             // its retriers are spent by the store ([`ActivityTask::retries_taken`])
             // and this record starts the first attempt with none spent.
             retries_taken: Vec::new(),
+            // The concurrent states this task is nested inside are contributed by the
+            // states that enclose it, as the walk leaves each of them
+            // ([`Interpreter::run_branches`]).
+            frames: Vec::new(),
         });
         Ok(StateStep {
             value: input,
@@ -1627,7 +1711,11 @@ impl Interpreter<'_> {
             state.insert("Name".to_string(), serde_json::json!(name));
             state.insert(
                 "EnteredTime".to_string(),
-                serde_json::json!(iso(self.start + at)),
+                // Through the checked helper every other instant of this walk is built
+                // with ([`super::super::after`]): the offset is accumulated from a
+                // caller's own `Wait` states, so one no instant can represent holds at
+                // the furthest instant this clock carries instead of panicking.
+                serde_json::json!(iso(super::super::after(self.start, at))),
             );
             if can_retry(state_type) {
                 state.insert("RetryCount".to_string(), serde_json::json!(self.retry_count));
@@ -2509,17 +2597,19 @@ impl Interpreter<'_> {
                 at,
             ));
         }
-        // One execution parks at ONE job: the record that holds it names the state
-        // that started it, and the poll that resolves it resumes that one state. A
-        // second concurrent job is therefore not started either.
-        if call.job.is_some() && self.parked.is_some() {
+        // One execution waits at ONE unit of work whose answer comes from outside it, so
+        // a second concurrent suspension is not started: the record that holds it names
+        // the state it belongs to, and the frame a `Parallel` contributes names ONE of
+        // its branches ([`Interpreter::suspended_in_a_branch`], asked the same way by the
+        // activity and callback paths).
+        if call.job.is_some() && self.suspended_in_a_branch() {
             return Err(self.task_fault(
                 name,
                 &work,
                 runtime(format!(
-                    "state '{name}' starts a second run-a-job integration while this execution \
-                     is already parked at one, which this emulator does not park at, so nothing \
-                     was run for it"
+                    "state '{name}' starts a run-a-job integration while this execution is \
+                     already waiting at a task or a job, which this emulator does not park at, \
+                     so nothing was run for it"
                 )),
                 at,
             ));
@@ -2552,19 +2642,35 @@ impl Interpreter<'_> {
             ));
         }
         // A CALLBACK task is answered from outside the execution, which the walk can
-        // only wait for where it is the walk itself that suspends: a nested state
-        // list is walked to its own end inside the enclosing state's turn, so a `Map`
-        // iteration or a `Parallel` branch whose state would wait for a token is not
-        // run rather than run as though the token had already been answered. It is
+        // only wait for where it is the walk itself that suspends. A `Map` ITERATION
+        // cannot: the Map Run around it counts an item as its iteration finishes, and an
+        // iteration waiting for a token has not finished, so such a state is not run
+        // rather than run as though the token had been answered. A `Parallel` BRANCH can,
+        // because a branch reports nothing until it ends: the frames the suspension
+        // records are what the continuation re-enters it through ([`ParkedFrame`]). It is
         // the same bound an activity task is held to, for the same reason.
-        if call.callback && self.depth > 0 {
+        if call.callback && self.map_depth > 0 {
             return Err(self.task_fault(
                 name,
                 &work,
                 runtime(format!(
-                    "state '{name}' waits for a task token inside a 'Map' iteration or a \
-                     'Parallel' branch, which this emulator does not wait at, so nothing was \
-                     run for it"
+                    "state '{name}' waits for a task token inside a 'Map' iteration, which this \
+                     emulator does not wait at, so nothing was run for it"
+                )),
+                at,
+            ));
+        }
+        // And one execution waits at ONE such unit of work, so a second concurrent
+        // suspension — a sibling branch of the same `Parallel` reaching a task or a job of
+        // its own — hands out no token either.
+        if call.callback && self.suspended_in_a_branch() {
+            return Err(self.task_fault(
+                name,
+                &work,
+                runtime(format!(
+                    "state '{name}' waits for a second task token while this execution is \
+                     already waiting at one, which this emulator does not wait at, so nothing \
+                     was run for it"
                 )),
                 at,
             ));
@@ -2691,18 +2797,28 @@ impl Interpreter<'_> {
                 Ok(request) => request,
                 Err(failure) => return (Err(failure), at),
             };
+            // WHO this attempt's work is made as: the role the state's `Credentials`
+            // names, resolved against THIS attempt's own context exactly as the request
+            // above is, so a role the member computes from a variable or an intrinsic is
+            // the role this attempt's call is made under. A state declaring none makes
+            // its work as the state machine's execution role, as every state does.
+            let acting_as = match me.task_role_arn(state, language, &effective, &attempt_context) {
+                Ok(role) => role,
+                Err(failure) => return (Err(failure), at),
+            };
             // WHICH call this attempt makes, for a task that starts a nested execution:
             // an EXPRESS child is RUN by the call that starts it, because that workflow
             // type has no execution-scoped read for the pattern's own reporting call to
             // poll ([`super::super::integration::run_child_synchronously`]). Decided
             // from the child THIS attempt's request names, before anything is handed
             // over, so the events below name the work this attempt really did.
-            let call = match super::super::integration::nested_child(&call, &request)
+            let mut call = match super::super::integration::nested_child(&call, &request)
                 .filter(|child| me.tasks.express_child(child))
             {
                 Some(_) => super::super::integration::run_child_synchronously(&call),
                 None => call.clone(),
             };
+            call.acting_as = acting_as;
             // Each attempt hands the work over and starts it again, so each writes
             // its own pair of events, carrying the document THAT attempt built and
             // the bounds the state declared for it.
@@ -2714,6 +2830,9 @@ impl Interpreter<'_> {
                     input: Some(me.echo(&request)),
                     timeout_seconds: within.map(|within| within.as_secs()),
                     heartbeat_seconds: heartbeat,
+                    // The role this attempt's work is made under, which the event that
+                    // reports the task as scheduled states.
+                    task_role_arn: call.acting_as.clone(),
                     ..work.naming()
                 },
             );
@@ -3013,6 +3132,10 @@ impl Interpreter<'_> {
                                         // the answer takes up: the budget is the
                                         // state's, not this attempt's.
                                         retries_taken: me.attempts_spent.clone(),
+                                        // Contributed by the concurrent states that
+                                        // enclose this one, as the walk leaves each of
+                                        // them ([`Interpreter::run_branches`]).
+                                        frames: Vec::new(),
                                     });
                                 }
                             }
@@ -3859,17 +3982,24 @@ impl Interpreter<'_> {
         (0..items.len()).find_map(|position| Some((position, at(position)?)))
     }
 
-    /// Where the concurrent unit that PARKED carries on from, for a walk continuing
-    /// an execution whose job has ended: the next concurrent state down, else the
-    /// state that started the job itself.
+    /// Where the concurrent unit that SUSPENDED carries on from, for a walk continuing
+    /// an execution whose job has ended or whose task has been answered: the next
+    /// concurrent state down, else the state the work belonged to itself.
     pub(super) fn resume_entry(&self) -> Option<(String, Value)> {
         if let Some(frame) = self.resume_frames.first() {
             return Some((frame.state_name.clone(), frame.state_input.clone()));
         }
-        let reply = self.job_reply.as_ref()?;
+        // Exactly one of the three is set for a walk that continues an execution: the
+        // job that ended, the worker's reply, or the answer to a token.
+        let (state_name, state_input) = match (&self.job_reply, &self.reply, &self.callback_reply) {
+            (Some(reply), _, _) => (&reply.state_name, &reply.state_input),
+            (_, Some(reply), _) => (&reply.state_name, &reply.state_input),
+            (_, _, Some(reply)) => (&reply.state_name, &reply.state_input),
+            _ => return None,
+        };
         Some((
-            reply.state_name.clone(),
-            serde_json::from_str(&reply.state_input).unwrap_or(Value::Null),
+            state_name.clone(),
+            serde_json::from_str(state_input).unwrap_or(Value::Null),
         ))
     }
 
