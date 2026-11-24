@@ -46,7 +46,12 @@ const OTHER_REGION: &str = "us-east-1";
 
 /// The node every case writes about: an EC2 node id of the 17-character form the modelled
 /// `InstanceId` pattern admits (`^(^i-(\w{8}|\w{17})$)|(^mi-\w{17}$)$`).
-const NODE: &str = "i-0123456789abcdef0";
+///
+/// `pub(crate)` for the reason [`register`], [`item`], [`put`] and [`entries`] are: the
+/// sibling suite `inventory_item_context.rs` writes custom inventory about the same node the
+/// same way, and one spelling of "a registered node, and an item written about it" keeps the
+/// two from drifting.
+pub(crate) const NODE: &str = "i-0123456789abcdef0";
 
 /// A second registered node, so a case can pin that an item is about ONE node.
 const OTHER_NODE: &str = "i-0abc1234";
@@ -68,10 +73,10 @@ const VERSION: &str = "1.0";
 /// The type name every custom item is written under, in the caller's own namespace
 /// ("Custom inventory type names will start with Custom" —
 /// `smithy_query(query="doc", shape="InventoryItemSchema", member="TypeName")`).
-const CUSTOM_TYPE: &str = "Custom:RackInfo";
+pub(crate) const CUSTOM_TYPE: &str = "Custom:RackInfo";
 
 /// A second custom type, for the rows that write more than one.
-const SECOND_CUSTOM_TYPE: &str = "Custom:Compliance";
+pub(crate) const SECOND_CUSTOM_TYPE: &str = "Custom:Compliance";
 
 /// The one type this service publishes a schema of and holds the item of as the projection
 /// of the node record.
@@ -84,7 +89,7 @@ fn service() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 }
 
 /// Register a node in `region` the way its own registration would.
-fn register(engine: &Arc<engine::InMemoryEngine>, region: &str, node_id: &str) {
+pub(crate) fn register(engine: &Arc<engine::InMemoryEngine>, region: &str, node_id: &str) {
     let at = SystemTime::UNIX_EPOCH + LAST_PING;
     let mut node = ManagedNodeRecord::registering(node_id, RESOURCE_TYPE_EC2_INSTANCE, at);
     node.properties.platform_type = Some("Linux".to_string());
@@ -99,7 +104,7 @@ fn register(engine: &Arc<engine::InMemoryEngine>, region: &str, node_id: &str) {
 }
 
 /// One inventory item as a put carries it.
-fn item(type_name: &str, entries: Value) -> Value {
+pub(crate) fn item(type_name: &str, entries: Value) -> Value {
     json!({
         "TypeName": type_name,
         "SchemaVersion": VERSION,
@@ -109,7 +114,7 @@ fn item(type_name: &str, entries: Value) -> Value {
 }
 
 /// `PutInventory` of `items` about `node_id`, signed for `region`.
-async fn put(
+pub(crate) async fn put(
     router: &MultiServiceRouter,
     region: &str,
     node_id: &str,
@@ -125,7 +130,7 @@ async fn put(
 }
 
 /// The entries `ListInventoryEntries` reports of `type_name` about `node_id`.
-async fn entries(
+pub(crate) async fn entries(
     router: &MultiServiceRouter,
     node_id: &str,
     type_name: &str,

@@ -110,6 +110,24 @@ pub fn uncustomizable_type_name_message(type_name: &str) -> String {
     )
 }
 
+/// How this service refuses an item `Context` the inventory type it was stated for does not
+/// take.
+///
+/// `InventoryItem$Context` is "a map of associated properties for a specified inventory type.
+/// For example, with this attribute, you can specify the `ExecutionId`, `ExecutionType`,
+/// `ComplianceType` properties of the `AWS:ComplianceItem` type", so the properties a context
+/// states are the ones Systems Manager DEFINES for a type it gathers itself: a type of the
+/// caller's own namespace ([`is_custom_type`]), which is the only kind a write of custom
+/// inventory addresses, defines none and therefore takes no context.
+///
+/// The sentence is the one the modelled `UnsupportedInventoryItemContextException` states for
+/// that condition, with nothing of the request in it — the type name the caller submitted
+/// travels in that error's own `TypeName` member rather than in the message.
+pub const UNSUPPORTED_ITEM_CONTEXT: &str = "The Context attribute that you specified for the \
+                                            InventoryItem isn't allowed for this inventory \
+                                            type. You can only use the Context attribute with \
+                                            inventory types like AWS:ComplianceItem.";
+
 /// How this service refuses a type name a DELETE cannot address because it is not a custom
 /// type: "Delete a custom inventory type or the data associated with a custom Inventory
 /// type" (`DeleteInventory`), so a name outside the `Custom:` namespace names one of the

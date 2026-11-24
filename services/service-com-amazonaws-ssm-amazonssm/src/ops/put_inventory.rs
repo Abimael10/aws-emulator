@@ -20,7 +20,14 @@
 //!    Systems Manager publishes schemas for and gathers itself, and
 //!    `AWS:InstanceInformation` in particular is the projection of the node record
 //!    ([`crate::state::inventory`]) rather than anything a caller writes;
-//! 4. the emulator's own ceilings on how many custom types and items this store holds.
+//! 4. each item's `Context`, "a map of associated properties for a specified inventory type"
+//!    whose properties are the ones Systems Manager defines for the types it gathers itself
+//!    ("you can specify the `ExecutionId`, `ExecutionType`, `ComplianceType` properties of the
+//!    `AWS:ComplianceItem` type"), so a type of the caller's own namespace — the only kind a
+//!    put writes, by the decision above — defines none and a context stated for one is the
+//!    modelled `UnsupportedInventoryItemContextException`
+//!    ([`crate::state::custom_inventory::UNSUPPORTED_ITEM_CONTEXT`]);
+//! 5. the emulator's own ceilings on how many custom types and items this store holds.
 //!
 //! A refused put writes NOTHING: every item of the request is checked before the first one
 //! is persisted, so a request carrying one bad item leaves the node's inventory as it was.
@@ -263,6 +270,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     },
                 )
                 .into());
+            }
+        }
+
+        // A `Context` states properties OF an inventory type, and the properties a type has are
+        // the ones Systems Manager defines for the types it gathers itself — so the types a put
+        // writes, which are the caller's own by the decision above, define none and take no
+        // context. A context stated for such a type is not data this put can store, so it is
+        // refused rather than dropped. An EMPTY map states no property at all, which is nothing
+        // to refuse, and a context is judged for every item before the first one is written.
+        for item in &input.items {
+            if item
+                .context
+                .as_ref()
+                .is_some_and(|context| !context.is_empty())
+            {
+                return Err(
+                    PutInventoryErrorModeled::UnsupportedInventoryItemContextException(
+                        UnsupportedInventoryItemContextException {
+                            type_name: Some(item.type_name.clone()),
+                            message: Some(custom::UNSUPPORTED_ITEM_CONTEXT.to_string()),
+                        },
+                    )
+                    .into(),
+                );
             }
         }
 
