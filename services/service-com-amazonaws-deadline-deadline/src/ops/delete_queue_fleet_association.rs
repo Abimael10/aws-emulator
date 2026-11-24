@@ -224,7 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !association.stopped() {
             let status = association.status.clone();
             return Err(DeleteQueueFleetAssociationErrorModeled::ConflictException(
-                crate::state::queue_fleet_association_not_stopped(
+                crate::state::queue_fleet_association_not_deletable(
                     &input.farm_id,
                     &input.queue_id,
                     &input.fleet_id,

@@ -8,8 +8,9 @@
 //!   the fleet's scheduler holds no work on it — the worker never started, or has reported
 //!   itself stopped — so a later `GetWorker` of it is a 404 and the fleet's reported
 //!   `workerCount` falls by one, which makes room for another registration;
-//! * a worker that has started is still registered with that scheduler, so a delete of it
-//!   is refused with a 409 naming the worker and the status it is in, and removes nothing;
+//! * a worker in any other status is still registered with that scheduler, so a delete of
+//!   it is refused with a 409 naming the worker, the status it is in and the statuses the
+//!   deletion is valid in, and removes nothing;
 //! * a worker is reached only through its own fleet and a fleet only through its own farm,
 //!   so a delete naming an unheld farm, an unheld fleet, a fleet that is not the worker's
 //!   or an unheld worker removes nothing and answers a 404 naming the level that is
@@ -26,14 +27,18 @@ use crate::worker::{create_fleet_with_max, create_worker, fleet_worker_count, ge
 
 /// Every value of the modeled `WorkerStatus` enum
 /// (`smithy_query(query="shape", shape="WorkerStatus")`), paired with whether a worker in
-/// it can be deleted: a worker that never started, and one that has reported itself
-/// stopped, are the two the fleet's scheduler holds no work on.
-const WORKER_STATUSES: &[(&str, bool)] = &[
+/// it can be deleted: the statuses the service's own valid-status list for a worker's
+/// deletion names are `CREATED`, `DELETED`, `STOPPED` and `NOT_RESPONDING`, and `DELETED`
+/// is not a modelled `WorkerStatus` (a deleted worker is gone), so the modelled statuses a
+/// delete is valid in are the three left.
+///
+/// `pub(crate)` so every suite in this test target spans the one catalog.
+pub(crate) const WORKER_STATUSES: &[(&str, bool)] = &[
     ("CREATED", true),
     ("STARTED", false),
     ("STOPPING", false),
     ("STOPPED", true),
-    ("NOT_RESPONDING", false),
+    ("NOT_RESPONDING", true),
     ("NOT_COMPATIBLE", false),
     ("RUNNING", false),
     ("IDLE", false),
@@ -70,7 +75,9 @@ const REPORTED_STATUSES: &[&str] = &["STARTED", "STOPPING", "STOPPED"];
 /// are arranged in the very store the handlers read. Either way the arrangement is read back
 /// through `GetWorker` before anything is asserted about the delete, and the call under test
 /// goes over the wire.
-async fn worker_in_status(
+///
+/// `pub(crate)` so every suite in this test target arranges a worker's status the same way.
+pub(crate) async fn worker_in_status(
     emulator: &Emulator,
     farm_id: &str,
     fleet_id: &str,
@@ -120,7 +127,10 @@ async fn worker_in_status(
 }
 
 /// `DELETE` the worker `worker_id` under `farm_id`/`fleet_id`.
-async fn delete_worker(
+///
+/// `pub(crate)` so every suite in this test target drives the delete through the one request
+/// shape the model lays out.
+pub(crate) async fn delete_worker(
     emulator: &Emulator,
     farm_id: &str,
     fleet_id: &str,
@@ -143,8 +153,8 @@ async fn delete_worker_removes_a_worker_no_work_is_held_on() {
     let fleet_id = create_fleet_with_max(&emulator, &farm_id, "deregistering", 8).await;
 
     // The rule: a worker the fleet's scheduler holds no work on is removed from the fleet
-    // its path names. The rows are every status of the catalog above that the service lets
-    // a worker go in.
+    // its path names. The rows are every status of the catalog above that the service's
+    // valid-status list for a worker's deletion names.
     let cases: Vec<&str> = WORKER_STATUSES
         .iter()
         .filter(|(_, deletable)| *deletable)
@@ -220,10 +230,11 @@ async fn delete_worker_refuses_a_worker_that_has_started() {
     let farm_id = emulator.farm("started workers").await;
     let fleet_id = create_fleet_with_max(&emulator, &farm_id, "running", 8).await;
 
-    // The rule: a worker that has started is still registered with the fleet's scheduler,
-    // so the delete is refused and removes nothing. The rows are every status of the
-    // catalog above in which the worker has started — running the fleet's work, waiting for
-    // more of it, out of contact, or on its way down.
+    // The rule: a worker in a status the service's valid-status list for a worker's deletion
+    // does not name is still registered with the fleet's scheduler, so the delete is refused
+    // and removes nothing. The rows are every status of the catalog above that list leaves
+    // out — running the fleet's work, waiting for more of it, on its way down, or
+    // incompatible with it.
     let cases: Vec<&str> = WORKER_STATUSES
         .iter()
         .filter(|(_, deletable)| !*deletable)

@@ -32,6 +32,7 @@ use crate::limit::{create_limit, limit_path};
 use crate::queue_limit_association::{
     associate_ok, association_id, association_path, limit_body, read_association,
 };
+use crate::status_conflict_wording::status_conflict_message;
 // A stop is asked for and waited out exactly the way the update suite does it.
 use crate::update_queue_limit_association::{poll_until_status, update};
 
@@ -291,7 +292,11 @@ async fn delete_queue_limit_association_refuses_an_association_that_has_not_stop
             ),
             (
                 "ConflictException".to_string(),
-                format!("QueueLimitAssociation is in {case} status and cannot be deleted."),
+                status_conflict_message(
+                    case,
+                    &association_id(&farm_id, &queue_id, &limit_id),
+                    &[STOPPED],
+                ),
                 "STATUS_CONFLICT".to_string(),
                 RESOURCE_TYPE.to_string(),
                 association_id(&farm_id, &queue_id, &limit_id),

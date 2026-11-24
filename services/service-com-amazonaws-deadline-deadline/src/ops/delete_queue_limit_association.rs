@@ -16,7 +16,7 @@
 //! `GetQueueLimitAssociation` is polled for `STOPPED` before the delete. An association in
 //! any other status is still subjecting the queue's work to the limit, or still winding that
 //! usage down, so the delete is refused as a conflict over the status it is in
-//! ([`crate::state::queue_limit_association_not_stopped`]) and removes nothing.
+//! ([`crate::state::queue_limit_association_not_deletable`]) and removes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -227,7 +227,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !association.stopped() {
             let status = association.status.clone();
             return Err(DeleteQueueLimitAssociationErrorModeled::ConflictException(
-                crate::state::queue_limit_association_not_stopped(
+                crate::state::queue_limit_association_not_deletable(
                     &input.farm_id,
                     &input.queue_id,
                     &input.limit_id,

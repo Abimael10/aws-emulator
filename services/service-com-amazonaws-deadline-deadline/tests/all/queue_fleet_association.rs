@@ -26,6 +26,7 @@ use serde_json::{json, Value};
 
 use crate::farm_queue_job::{absent_id, error_code, string_at, Emulator};
 use crate::fleet::{create_fleet, get_fleet_path};
+use crate::status_conflict_wording::status_conflict_message;
 
 /// Long enough for the `STOP_SCHEDULING_AND_* -> STOPPED` move to have come due: the
 /// service owes it a few seconds after the update that asks for the stop, and nothing in
@@ -179,7 +180,11 @@ async fn delete_queue_fleet_association_refuses_an_association_that_has_not_stop
             ),
             (
                 "ConflictException".to_string(),
-                format!("QueueFleetAssociation is in {case} status and cannot be deleted."),
+                status_conflict_message(
+                    case,
+                    &association_id(&farm_id, &queue_id, &fleet_id),
+                    &["STOPPED"],
+                ),
                 "STATUS_CONFLICT".to_string(),
                 "queue-fleet-association".to_string(),
                 association_id(&farm_id, &queue_id, &fleet_id)

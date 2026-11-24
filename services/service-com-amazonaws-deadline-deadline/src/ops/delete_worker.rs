@@ -174,14 +174,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A worker that has started is still registered with the fleet's scheduler, so it is
-        // not taken out from under that work: the refusal names the status the worker is in,
-        // read from the store, and removes nothing. A worker that never started, and one
-        // that has reported itself stopped, hold none of it and are removed.
+        // A worker in a status the service's valid-status list for a deletion does not name
+        // is still registered with the fleet's scheduler, so it is not taken out from under
+        // that work: the refusal names the worker, the status it is in — read from the store
+        // — and the statuses the deletion is valid in, and removes nothing. A worker in one
+        // of those statuses holds none of that work and is removed.
         if !worker.deletable() {
             let status = worker.status.clone();
             return Err(DeleteWorkerErrorModeled::ConflictException(
-                crate::state::worker_not_stopped(&input.worker_id, &status),
+                crate::state::worker_not_deletable(&input.worker_id, &status),
             )
             .into());
         }

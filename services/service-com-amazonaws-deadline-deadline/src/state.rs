@@ -99,8 +99,39 @@ pub const WORKER_STATUS_CREATED: &str = "CREATED";
 /// is `STARTED` | `STOPPING` | `STOPPED` (`smithy_query(query="shape",
 /// shape="UpdatedWorkerStatus")`), and `STOPPING` is the worker on its way here. A worker in
 /// any other status is still registered as running the fleet's work, which is what makes this
-/// the one status its deletion is allowed in.
+/// one of the statuses its deletion is allowed in.
 pub const WORKER_STATUS_STOPPED: &str = "STOPPED";
+
+/// `WorkerStatus` a worker carries once the fleet's scheduler has lost contact with it.
+///
+/// One of the modelled values (`smithy_query(query="shape", shape="WorkerStatus")`), and
+/// the scheduler's own: `UpdatedWorkerStatus` does not carry it, so nothing a caller reports
+/// moves a worker here.
+pub const WORKER_STATUS_NOT_RESPONDING: &str = "NOT_RESPONDING";
+
+/// The status a worker this service has already let go of is in.
+///
+/// NOT one of the modelled `WorkerStatus` values, so no worker this emulator holds is ever
+/// read in it — a deleted worker is gone from its fleet, and reading it is a 404. It is
+/// listed among [`WORKER_DELETABLE_STATUSES`] because the service's own valid-status list
+/// for a worker's deletion names it: deleting a worker already in it changes nothing.
+pub const WORKER_STATUS_DELETED: &str = "DELETED";
+
+/// The statuses a worker's deletion is valid in, in the order the service's refusal lists
+/// them.
+///
+/// The statuses in which the fleet's scheduler holds no work on the worker: it has never
+/// started ([`WORKER_STATUS_CREATED`]), has already been let go of
+/// ([`WORKER_STATUS_DELETED`]), has reported itself stopped ([`WORKER_STATUS_STOPPED`]), or
+/// has dropped out of contact with the scheduler ([`WORKER_STATUS_NOT_RESPONDING`]). One
+/// source of truth: it is both what [`Worker::deletable`] decides on and the list the
+/// refusal of a worker in any other status states (see [`worker_not_deletable`]).
+pub const WORKER_DELETABLE_STATUSES: &[&str] = &[
+    WORKER_STATUS_CREATED,
+    WORKER_STATUS_DELETED,
+    WORKER_STATUS_STOPPED,
+    WORKER_STATUS_NOT_RESPONDING,
+];
 
 /// `JobLifecycleStatus` a job carries while the service is still assembling it.
 ///
@@ -725,16 +756,13 @@ impl Worker {
     ///
     /// `WorkerStatus` is `CREATED`, `STARTED`, `STOPPING`, `STOPPED`, `NOT_RESPONDING`,
     /// `NOT_COMPATIBLE`, `RUNNING`, `IDLE` (`smithy_query(query="shape",
-    /// shape="WorkerStatus")`). The two statuses here are the ones in which the worker is
-    /// not started: it has never started ([`WORKER_STATUS_CREATED`]) or has reported itself
-    /// stopped ([`WORKER_STATUS_STOPPED`]). In every other status the worker has started —
-    /// running the fleet's work, waiting for more of it, out of contact with the scheduler,
-    /// or on its way down — so the service does not take it out from under that work.
+    /// shape="WorkerStatus")`). The statuses a delete is valid in are
+    /// [`WORKER_DELETABLE_STATUSES`] — the same list the refusal states, so the service
+    /// never names a status it would not then delete in. In every other status the worker is
+    /// running the fleet's work, waiting for more of it, on its way down, or incompatible
+    /// with it, so the service does not take it out from under that work.
     pub fn deletable(&self) -> bool {
-        matches!(
-            self.status.as_str(),
-            WORKER_STATUS_CREATED | WORKER_STATUS_STOPPED
-        )
+        WORKER_DELETABLE_STATUSES.contains(&self.status.as_str())
     }
 
     /// The worker's host properties as a response reports them.
@@ -1866,21 +1894,28 @@ pub fn limit_in_use_by_queues(limit_id: &str) -> crate::ops::types::ConflictExce
     in_use_by_queues(RESOURCE_TYPE_LIMIT, limit_id, "Limit")
 }
 
-/// The 409 this service answers when a resource it only lets go of once that resource has
-/// stopped is deleted before it has.
+/// The 409 this service answers when the status the resource a call names is in does not
+/// permit that call.
 ///
-/// The resource whose delete was refused is the resource in conflict, and the status it is
-/// in is the one value the sentence varies on — read from the store, never from the request.
-/// `display_noun` is how this service names that resource in prose. One place to change: the
-/// fixed text is the wording of this error class, not of one operation.
-fn not_stopped(
-    display_noun: &str,
+/// The resource whose call was refused is the resource in conflict, and the sentence varies
+/// on two values only: the status it is in — read from the store, never from the request —
+/// and `valid_statuses`, the statuses the operation IS valid in, so a caller that parses
+/// them knows which transition to drive the resource through before retrying. That list is
+/// the same one the operation's own precondition decides on, never a second spelling of it.
+/// One place to change: the fixed text is the wording of this error class, not of one
+/// operation.
+fn status_does_not_permit(
     resource_type: &str,
     resource_id: &str,
     status: &str,
+    valid_statuses: &[&str],
 ) -> crate::ops::types::ConflictException {
     crate::ops::types::ConflictException {
-        message: format!("{display_noun} is in {status} status and cannot be deleted."),
+        message: format!(
+            "Request could not be completed. Status {status} of resource {resource_id} does \
+             not permit the operation. The valid statuses are [{}]",
+            valid_statuses.join(", ")
+        ),
         // From `smithy_query(query="shape", shape="ConflictExceptionReason")`:
         // CONFLICT_EXCEPTION, CONCURRENT_MODIFICATION, RESOURCE_ALREADY_EXISTS,
         // RESOURCE_IN_USE, STATUS_CONFLICT. What conflicts is the status the resource is
@@ -1898,18 +1933,19 @@ fn not_stopped(
 /// An association that is not [`QUEUE_FLEET_ASSOCIATION_STATUS_STOPPED`] is still holding
 /// the queue's work on the fleet — scheduling it (`ACTIVE`) or draining it (the two
 /// `STOP_SCHEDULING_AND_*` statuses) — so the association itself is the resource in
-/// conflict. See [`not_stopped`] for the class.
-pub fn queue_fleet_association_not_stopped(
+/// conflict and that one status is the whole of the valid-status list this refusal states.
+/// See [`status_does_not_permit`] for the class.
+pub fn queue_fleet_association_not_deletable(
     farm_id: &str,
     queue_id: &str,
     fleet_id: &str,
     status: &str,
 ) -> crate::ops::types::ConflictException {
-    not_stopped(
-        "QueueFleetAssociation",
+    status_does_not_permit(
         RESOURCE_TYPE_QUEUE_FLEET_ASSOCIATION,
         &queue_fleet_association_id(farm_id, queue_id, fleet_id),
         status,
+        &[QUEUE_FLEET_ASSOCIATION_STATUS_STOPPED],
     )
 }
 
@@ -1921,31 +1957,39 @@ pub fn queue_fleet_association_not_stopped(
 /// status does not change immediately, so an association that is not
 /// [`QUEUE_LIMIT_ASSOCIATION_STATUS_STOPPED`] is still subjecting the queue's work to the
 /// limit (`ACTIVE`) or winding that usage down (the two `STOP_LIMIT_USAGE_AND_*` statuses)
-/// and is the resource in conflict. The same class as for the queue's other association:
-/// see [`not_stopped`].
-pub fn queue_limit_association_not_stopped(
+/// and is the resource in conflict, that one status being the whole of the valid-status list
+/// this refusal states. The same class as for the queue's other association: see
+/// [`status_does_not_permit`].
+pub fn queue_limit_association_not_deletable(
     farm_id: &str,
     queue_id: &str,
     limit_id: &str,
     status: &str,
 ) -> crate::ops::types::ConflictException {
-    not_stopped(
-        "QueueLimitAssociation",
+    status_does_not_permit(
         RESOURCE_TYPE_QUEUE_LIMIT_ASSOCIATION,
         &queue_limit_association_id(farm_id, queue_id, limit_id),
         status,
+        &[QUEUE_LIMIT_ASSOCIATION_STATUS_STOPPED],
     )
 }
 
-/// The 409 this service answers when a worker that has started is deleted before it has
-/// stopped.
+/// The 409 this service answers when a worker is deleted in a status that does not permit
+/// it.
 ///
 /// A worker [`Worker::deletable`] is false for is still registered with the fleet's
-/// scheduler, so the worker itself is the resource in conflict. Worded the way this crate
-/// words the same refusal for every other resource this service only lets go of once it has
-/// stopped: see [`not_stopped`].
-pub fn worker_not_stopped(worker_id: &str, status: &str) -> crate::ops::types::ConflictException {
-    not_stopped("Worker", RESOURCE_TYPE_WORKER, worker_id, status)
+/// scheduler, so the worker itself is the resource in conflict, and the statuses its
+/// deletion IS valid in — [`WORKER_DELETABLE_STATUSES`], the very list that predicate
+/// decides on — are what the refusal states. Worded the way this crate words the same
+/// refusal for every other resource whose status is what refuses the call: see
+/// [`status_does_not_permit`].
+pub fn worker_not_deletable(worker_id: &str, status: &str) -> crate::ops::types::ConflictException {
+    status_does_not_permit(
+        RESOURCE_TYPE_WORKER,
+        worker_id,
+        status,
+        WORKER_DELETABLE_STATUSES,
+    )
 }
 
 /// The 409 this service answers when an update is asked for a job that has been archived.
@@ -1954,8 +1998,12 @@ pub fn worker_not_stopped(worker_id: &str, status: &str) -> crate::ops::types::C
 /// "can't be recovered", so [`JOB_LIFECYCLE_ARCHIVED`] is the end of the job's life and no
 /// later call changes it: the job itself is the resource in conflict and the status it is in
 /// is the one value the message varies on, read from the store and never from the request.
-/// Worded the way this crate words the same class of refusal for every other resource whose
-/// status is what refuses the call (see [`worker_not_stopped`]).
+/// Classified the way this crate classifies every refusal a resource's own status makes \u2014
+/// 409, `STATUS_CONFLICT`, the job as the resource in conflict \u2014 but worded on its own: the
+/// sentence [`status_does_not_permit`] builds states the statuses the operation IS valid in,
+/// and for an update of a job that is nothing this service decides (`UpdateJob` refuses only
+/// the archived job, and the remaining `JobLifecycleStatus` values are not a list this crate
+/// has the service's own spelling of).
 pub fn job_archived(job_id: &str) -> crate::ops::types::ConflictException {
     crate::ops::types::ConflictException {
         message: format!("Job is in {JOB_LIFECYCLE_ARCHIVED} status and cannot be updated."),
