@@ -47,8 +47,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AlarmConfiguration, Association, AssociationDescription, AssociationOverview,
-    AssociationStatus, InstanceAssociationOutputLocation, InstanceAssociationStatusInfo, Target,
-    TargetLocation, ASSOCIATION_FILTER_KEY_VALUES,
+    AssociationStatus, InstanceAssociation, InstanceAssociationOutputLocation,
+    InstanceAssociationStatusInfo, Target, TargetLocation, ASSOCIATION_FILTER_KEY_VALUES,
 };
 
 use super::ComAmazonawsSsmAmazonssmState;
@@ -313,6 +313,25 @@ pub fn association_page_size(max_results: Option<i32>) -> Result<usize, String> 
         max_results,
         MIN_ASSOCIATION_PAGE_SIZE,
         MAX_ASSOCIATION_PAGE_SIZE,
+    )
+}
+
+/// The lower bound the modelled `MaxResults` of the EFFECTIVE-association report carries
+/// (`DescribeEffectiveInstanceAssociationsRequest$MaxResults`, whose target
+/// `EffectiveInstanceAssociationMaxResults` ranges 1..5 — a tighter bound than the listing's
+/// own, which is why that report measures its page against these).
+pub const MIN_EFFECTIVE_ASSOCIATION_PAGE_SIZE: i32 = 1;
+
+/// The upper bound of the same member, and the page size a request naming no `MaxResults` is
+/// served up to (see [`super::page_size`]).
+pub const MAX_EFFECTIVE_ASSOCIATION_PAGE_SIZE: i32 = 5;
+
+/// The page size the effective-association report serves (see [`super::page_size`]).
+pub fn effective_association_page_size(max_results: Option<i32>) -> Result<usize, String> {
+    super::page_size(
+        max_results,
+        MIN_EFFECTIVE_ASSOCIATION_PAGE_SIZE,
+        MAX_EFFECTIVE_ASSOCIATION_PAGE_SIZE,
     )
 }
 
@@ -1222,6 +1241,59 @@ impl ComAmazonawsSsmAmazonssmState {
                 .association_run_nodes(record)
                 .iter()
                 .any(|node| node == instance_id)
+    }
+
+    /// The content of the association document `record` applies NOW: the document its
+    /// version in force names ([`AssociationVersionRecord::document_name`]), at the document
+    /// version that version selects, resolved through the same document lookup and version
+    /// selector every other reader of an association's document takes
+    /// ([`ComAmazonawsSsmAmazonssmState::resolve_document`] and
+    /// [`super::DocumentRecord::select`]).
+    ///
+    /// `None` when the endpoint the association belongs to holds no document of that name
+    /// any more: an association names its document by name, so a document deleted out from
+    /// under one leaves nothing to apply. The content is reported in the format a document
+    /// read that asks for none is served ([`super::DEFAULT_DOCUMENT_FORMAT`]), so one body is
+    /// never reported in two spellings by two readers.
+    pub fn association_document_content(&self, record: &AssociationRecord) -> Option<String> {
+        let version = record.latest()?;
+        let document = self.resolve_document(&record.region, &version.document_name)?;
+        // "The document version you want to associate with the targets … By default, the
+        // system uses the DEFAULT version of the document" (`CreateAssociationRequest$DocumentVersion`),
+        // so a version this association names none for applies the document's default one.
+        let selector = version
+            .document_version
+            .as_deref()
+            .filter(|selector| !selector.is_empty())
+            .unwrap_or(super::DOCUMENT_VERSION_DEFAULT);
+        let held = document.select(selector)?;
+        let (content, _) = super::document_format::rendered_content(
+            &held.content,
+            &held.document_format,
+            super::DEFAULT_DOCUMENT_FORMAT,
+        );
+        Some(content)
+    }
+
+    /// The modelled `InstanceAssociation` of `record` ON one managed node: the association a
+    /// node applies, and the document body it applies for it.
+    ///
+    /// The identity members are read where every other projection of an association reads
+    /// them — the association's own id and the version in force
+    /// ([`AssociationRecord::to_instance_association_status_info`]) — so the effective
+    /// associations of a node and the status it reports for them cannot disagree about which
+    /// version of which association is in effect there.
+    pub fn to_instance_association(
+        &self,
+        record: &AssociationRecord,
+        instance_id: &str,
+    ) -> InstanceAssociation {
+        InstanceAssociation {
+            association_id: Some(record.association_id.clone()),
+            instance_id: Some(instance_id.to_string()),
+            content: self.association_document_content(record),
+            association_version: Some(record.latest_version().to_string()),
+        }
     }
 }
 

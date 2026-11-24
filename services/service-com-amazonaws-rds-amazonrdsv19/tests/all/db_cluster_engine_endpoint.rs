@@ -428,9 +428,24 @@ async fn deleting_a_cluster_closes_the_port_it_published() {
         "the published endpoint must resolve to this machine's IPv4 loopback address, which \
          is the one the core binds on, got {resolved:?}"
     );
-    let connected = tokio::net::TcpStream::connect(("127.0.0.1", port)).await;
+    // The listener the record held is dropped with the record, and the socket it was
+    // accepting on closes as that drop is worked through — so what is waited for is the
+    // CONDITION (the port refusing a connection) rather than a span of time, with a deadline
+    // far longer than any teardown this emulator performs.
+    let closed = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                Err(_) => break true,
+                Ok(_) if std::time::Instant::now() >= deadline => break false,
+                Ok(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+            }
+        }
+    };
     assert!(
-        connected.is_err(),
+        closed,
         "the port a deleted cluster published must no longer accept a connection"
     );
     // Nothing else reports the cluster either: the endpoint is the resource's, and it left
