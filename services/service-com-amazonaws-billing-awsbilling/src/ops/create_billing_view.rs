@@ -246,6 +246,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The relation between the two bounds of the data filter's `timeRange`
+        // is a rule about the request alone — see
+        // `crate::state::check_data_filter_expression` — so it is decided
+        // before the store is locked, and a filter that selects no instant
+        // mints no view.
+        if let Some(expression) = &input.data_filter_expression {
+            crate::state::check_data_filter_expression(expression)
+                .map_err(|why| invalid_field("dataFilterExpression", why))?;
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateBillingViewErrorModeled::InternalServerException(InternalServerException {
                 message: "the billing view store is unavailable".to_string(),

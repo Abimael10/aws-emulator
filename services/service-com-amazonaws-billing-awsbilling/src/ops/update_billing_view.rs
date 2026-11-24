@@ -135,6 +135,20 @@ impl From<UpdateBillingViewErrorModeled> for UpdateBillingViewError {
     }
 }
 
+/// Refuse a request member as invalid, in the modeled `ValidationException`
+/// shape (HTTP 400) this operation declares.
+fn invalid_field(member: &str, why: &str) -> UpdateBillingViewError {
+    UpdateBillingViewErrorModeled::ValidationException(ValidationException {
+        message: why.to_string(),
+        reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: why.to_string(),
+        }]),
+    })
+    .into()
+}
+
 /// The `UpdateBillingView` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -186,6 +200,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
             .into());
+        }
+        // The relation between the two bounds of the data filter's `timeRange`
+        // is a rule about the request alone — see
+        // `crate::state::check_data_filter_expression` — so it is decided
+        // before the store is locked, and a filter that selects no instant is
+        // refused rather than written over the stored one.
+        if let Some(expression) = &input.data_filter_expression {
+            crate::state::check_data_filter_expression(expression)
+                .map_err(|why| invalid_field("dataFilterExpression", why))?;
         }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateBillingViewErrorModeled::InternalServerException(InternalServerException {

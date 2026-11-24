@@ -1641,6 +1641,43 @@ pub fn add_source_views(held: &mut Vec<String>, requested: impl IntoIterator<Ite
     }
 }
 
+/// Check the relations between the members of one request's data filter
+/// expression — or the message that refuses it.
+///
+/// `TimeRange` "specifies a time range with inclusive begin and end dates", so
+/// a range whose inclusive begin falls later than its inclusive end selects no
+/// instant at all: a period a caller cannot have meant, refused rather than
+/// stored and handed back on every later read. Neither bound carries a trait
+/// relating it to the other, so the boundary validator cannot see this and the
+/// rule is the service's to apply — the same relation every other two-bound
+/// date range a request to this service carries is refused on. A range that
+/// omits one bound is open on that side and still selects instants, so only a
+/// range carrying both bounds is related.
+///
+/// Every writer of [`BillingView::data_filter_expression`] checks through here,
+/// so the creator and the updater of a view's data filter answer identical
+/// input identically. The caller renders the `Err` as its own modeled
+/// `ValidationException` over the member that carried the expression, and
+/// writes nothing.
+pub fn check_data_filter_expression(expression: &Expression) -> Result<(), &'static str> {
+    let Some(range) = &expression.time_range else {
+        return Ok(());
+    };
+    let (Some(begin), Some(end)) = (&range.begin_date_inclusive, &range.end_date_inclusive) else {
+        return Ok(());
+    };
+    if date_time_secs(begin) > date_time_secs(end) {
+        return Err(INVERTED_TIME_RANGE);
+    }
+    Ok(())
+}
+
+/// The sentence [`check_data_filter_expression`] refuses an inverted period
+/// with, naming the two members whose relation fails — the wording this crate
+/// already uses for the other range it refuses whose two bounds are both
+/// inclusive (`activeTimeRange`), with this range's member names.
+const INVERTED_TIME_RANGE: &str = "beginDateInclusive must not be later than endDateInclusive";
+
 /// The message this service's ARN validation answers for a billing-view ARN
 /// that names no view of this account: the requested ARN, in brackets, reported
 /// as an invalid billing view ARN.
