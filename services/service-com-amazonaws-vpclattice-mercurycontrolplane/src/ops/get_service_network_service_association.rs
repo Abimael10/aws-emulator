@@ -224,7 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             service_network_arn: Some(association.service_network_arn.clone()),
             dns_entry: Some(crate::state::announced_dns_entry(
                 ctx,
-                association.announced_service(),
+                &association.dns_hosted_zone_id,
             )),
             custom_domain_name: association.custom_domain_name.clone(),
             // `failureCode`/`failureMessage` describe a failed association; nothing

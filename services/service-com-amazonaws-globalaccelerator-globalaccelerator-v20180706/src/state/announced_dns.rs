@@ -34,7 +34,7 @@
 //! The tree also carries the reading for a name a service MINTS of its own —
 //! [`addressing::announced_zone_of_authority`], "the DNS zone this emulator may ANNOUNCE a
 //! name of its own in", which a service with a per-resource name to publish builds its first
-//! label over (the VPC Lattice `DnsEntry` does). This member does not use it, for the reason
+//! label over. This member does not use it, for the reason
 //! the reading above gives and the same one the Device Advisor endpoint and the DynamoDB
 //! endpoint-discovery address state: nothing in this process answers for a SUB-NAME of the
 //! host it is reached at, so `<label>.<zone>` identifies the accelerator but resolves nowhere,

@@ -142,8 +142,8 @@ fn invalid(
 }
 
 /// The summary of one stored association, with the status the clock owes it at `now` and
-/// the DNS entry of the ASSOCIATED service, announcing that service's name in the zone
-/// this emulator answers in ([`crate::state::announced_dns_entry`]).
+/// the DNS entry of the ASSOCIATED service: that service's own hosted zone and the host
+/// this emulator is reached at ([`crate::state::announced_dns_entry`]).
 fn summary_of(
     association: &crate::state::ServiceNetworkServiceAssociation,
     now: std::time::SystemTime,
@@ -163,7 +163,7 @@ fn summary_of(
         service_network_arn: Some(association.service_network_arn.clone()),
         dns_entry: Some(crate::state::announced_dns_entry(
             ctx,
-            association.announced_service(),
+            &association.dns_hosted_zone_id,
         )),
         custom_domain_name: association.custom_domain_name.clone(),
     }

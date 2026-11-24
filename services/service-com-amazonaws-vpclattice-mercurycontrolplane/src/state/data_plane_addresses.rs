@@ -1,33 +1,35 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The ADDRESSES a service's listener answers at, published so a client INSIDE this emulator
-//! that reads the service's own DNS name out of the control plane reaches its data plane.
+//! that holds one of the service's own host-style names reaches its data plane.
 //!
-//! `CreateService`'s `dnsEntry` is "The public DNS name of the service" and a listener "is a
-//! process that checks for connection requests" on its port, so the pair — the announced name
-//! and a listener's port — is the address a client was told to call the service on. A client of
-//! this emulator that holds such an address has to be ROUTED to the service that answers
-//! there: nothing about a name in this emulator's own zone says which service answers it, so
-//! the service that opened the address records it, under the authority a client writes, in the
-//! one register such a reader looks in ([`::service_common::published_data_planes`]). A
-//! function this emulator runs then reaches a Lattice service by the very name the control
-//! plane published, instead of being answered as a client of an address nothing serves.
+//! A listener "is a process that checks for connection requests" on its port, so the pair — a
+//! name the service is reached by and a listener's port — is an address a client calls the
+//! service on. A client of this emulator that holds such an address has to be ROUTED to the
+//! service that answers there: nothing about a name in this emulator's own zone says which
+//! service answers it, so the service that opened the address records it, under the authority
+//! a client writes, in the one register such a reader looks in
+//! ([`::service_common::published_data_planes`]). A function this emulator runs then reaches a
+//! Lattice service by that name, instead of being answered as a client of an address nothing
+//! serves.
 //!
-//! WHICH authorities are published is what a client WRITES, and a client writes the name it
-//! was handed:
+//! WHICH authorities are published is what a client WRITES, and a client writes a name of the
+//! SERVICE — never the host the control plane announces in a `DnsEntry`, which is this
+//! emulator's OWN address (`super::announced_dns_host`) and says nothing about which service a
+//! request is for:
 //!
-//! * the announced name with the listener's port (`shop-0123….localhost:80`), which is what a
-//!   client that states the port writes;
-//! * the announced name ALONE, for a listener on the default port of its protocol — "for HTTP,
+//! * the service's own label ([`service_label`], the first label every host-style request this
+//!   plane claims is resolved from) under the zone a resolver answers with the loopback
+//!   interface — the interface the core binds its listeners on unless the operator names
+//!   another address ([`::service_common::data_plane_addressing::LOOPBACK_ZONE`]) — with the
+//!   listener's port (`shop-0123….localhost:80`), which is what a client that states the port
+//!   writes;
+//! * that same name ALONE, for a listener on the default port of its protocol — "for HTTP,
 //!   the default is 80. For HTTPS, the default is 443" (`Target$port`, the same two defaults
 //!   the `port` member of a listener documents) — because a URL on that port carries no port
 //!   at all;
 //! * the same two forms of the service's `customDomainName`, the other name a client reaches
-//!   it by, where the service has one;
-//! * the same two forms under the zone this emulator answers a client at an ADDRESS in
-//!   ([`::service_common::data_plane_addressing::LOOPBACK_ZONE`]), so a client that read the
-//!   name from a request that reached this emulator on a name still resolves it where names of
-//!   that zone are the ones a resolver answers.
+//!   it by, where the service has one.
 //!
 //! The record is held for exactly as long as the LISTENER: it is kept on the store under the
 //! listener's id, and dropping it withdraws every authority it published, so a listener that
@@ -45,7 +47,7 @@
 use ::service_common::data_plane_addressing::LOOPBACK_ZONE;
 use ::service_common::published_data_planes::PublishedPlanes;
 
-use super::{announced_dns_name, service_label, LatticeService, Listener};
+use super::{service_label, LatticeService, Listener};
 
 /// The authorities ONE listener answers at, and the register they are published in.
 ///
@@ -84,18 +86,17 @@ impl Drop for ListenerAddresses {
 /// Publish the addresses `listener` answers at for `service`, and answer the record that keeps
 /// them published.
 ///
-/// Called by the create that opened the listener, with the request's own context: the zone the
-/// announced name is minted in is the one this emulator answers the CALLER in
-/// ([`announced_dns_name`]), so the name published here is the name that create reported.
+/// Called by the create that opened the listener, with the request's own context, so a
+/// listener publishes its addresses exactly once — when the port is opened — and withdraws
+/// them when it is closed.
 #[must_use]
 pub fn published_listener_addresses<Eng: Send + Sync + 'static>(
     engine: &Eng,
-    ctx: &::smithy_server_runtime::OperationContext<'_>,
     service: &LatticeService,
     listener: &Listener,
 ) -> ListenerAddresses {
     let published = PublishedPlanes::of(engine);
-    let authorities = listener_authorities(ctx, service, listener);
+    let authorities = listener_authorities(service, listener);
     if let Some(published) = published.as_ref() {
         for authority in &authorities {
             published.publish(authority, super::ARN_SERVICE);
@@ -109,22 +110,13 @@ pub fn published_listener_addresses<Eng: Send + Sync + 'static>(
 
 /// Every authority a client writes for `listener` of `service` — the module header's list, in
 /// that order, with no authority repeated.
-fn listener_authorities(
-    ctx: &::smithy_server_runtime::OperationContext<'_>,
-    service: &LatticeService,
-    listener: &Listener,
-) -> Vec<String> {
-    let announced = announced_dns_name(ctx, service.announced());
+fn listener_authorities(service: &LatticeService, listener: &Listener) -> Vec<String> {
     let loopback = format!(
         "{}.{LOOPBACK_ZONE}",
         service_label(&service.name, &service.id)
     );
     let mut authorities: Vec<String> = Vec::new();
-    let names = [
-        Some(announced),
-        Some(loopback),
-        service.custom_domain_name.clone(),
-    ];
+    let names = [Some(loopback), service.custom_domain_name.clone()];
     for name in names.into_iter().flatten() {
         let name = name.trim().trim_end_matches('.').to_ascii_lowercase();
         if name.is_empty() {
@@ -225,10 +217,10 @@ mod tests {
         }
     }
 
-    /// RULE: a service's `customDomainName` is published beside its announced name, in the same
-    /// two forms, and a name is published once however many ways it is reached.
+    /// RULE: a service's `customDomainName` is published beside its own label name, in the
+    /// same two forms, and a name is published once however many ways it is reached.
     #[test]
-    fn a_custom_domain_name_is_published_beside_the_announced_one() {
+    fn a_custom_domain_name_is_published_beside_the_label_name() {
         let service = service("shop", Some("Shop.Example.Test"));
         let listener = listener("HTTP", 80);
         let loopback = format!("shop-0123456789abcdef0.{LOOPBACK_ZONE}");
@@ -236,7 +228,7 @@ mod tests {
         assert_eq!(
             forms,
             vec![format!("{loopback}:80"), loopback.clone()],
-            "expected the announced name in both forms, got {forms:?}"
+            "expected the service's own label name in both forms, got {forms:?}"
         );
         let custom = authority_forms("shop.example.test", &listener);
         assert_eq!(

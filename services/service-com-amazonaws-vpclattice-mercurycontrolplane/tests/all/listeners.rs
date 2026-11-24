@@ -32,7 +32,7 @@
 //!    `ResourceNotFoundException` — including a listener read through the wrong
 //!    service — and a name the modelled pattern forbids is a 400 `ValidationException`.
 //! 8. Deleting the service deletes its listeners, as `DeleteService` documents.
-//! 9. A listener SERVES the traffic a client sends to the name its service published: the
+//! 9. A listener SERVES the traffic a client sends to one of its service's own names: the
 //!    request is matched against the listener's rules in priority order, the default rule
 //!    answers what no other rule matches, and a `forward` to a `LAMBDA` target group invokes
 //!    the registered function and answers the client from what it returned. A service no VPC
@@ -1093,10 +1093,20 @@ async fn a_request_to_the_published_name_is_served_by_the_listeners_rules_and_it
         service.status, service.body
     );
     let service_id = service.str_field("id");
-    let published = service.body["dnsEntry"]["domainName"]
-        .as_str()
-        .unwrap_or_else(|| panic!("setup CreateService: no dnsEntry.domainName in {}", service.body))
-        .to_string();
+    // The name a client INSIDE the emulated network reaches this service by: the service's own
+    // label — the first label every host-style request this plane resolves a service from —
+    // under the zone a resolver answers with the loopback interface, which is the interface the
+    // core binds its listeners on. What the control plane ANNOUNCES in its `dnsEntry` is this
+    // emulator's own address instead, and the suite beside this one (`announced_dns_entry`)
+    // owns that rule.
+    let published = format!(
+        "{}.{}",
+        service_com_amazonaws_vpclattice_mercurycontrolplane::state::service_label(
+            "shop",
+            &service_id
+        ),
+        ::service_common::data_plane_addressing::LOOPBACK_ZONE
+    );
     let associated = lattice.associate(&service_id, &network_id).await;
     assert_eq!(
         associated.status, 200,
@@ -1200,7 +1210,7 @@ async fn a_request_to_the_published_name_is_served_by_the_listeners_rules_and_it
 
     // The address the listener answers at is published for a client INSIDE this emulator —
     // the one a Lambda function or another workload of the emulated network holds — under the
-    // very name the control plane announced.
+    // service's own host-style name.
     let answering = ::service_common::published_data_planes::PublishedPlanes::of(&*engine)
         .expect("the engine vends the published-plane records")
         .answering_service(&format!("{published}:80"));

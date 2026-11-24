@@ -41,7 +41,7 @@
 //! do not write it; editing the entry would let this file drift from the model.
 //!
 //! Beside the modelled operations this service serves ONE request no routing key names: a
-//! service's OWN TRAFFIC, sent to the name `CreateService` published for it. That is the
+//! service's OWN TRAFFIC, sent to one of the names a lattice service answers at. That is the
 //! DATA plane ([`data_plane`]), claimed in [`EmulatedService::can_handle`] and served from
 //! [`EmulatedService::override_operation`], which is what hands it the in-process transport a
 //! `forward` to a `LAMBDA` target group invokes the function over ([`lambda_target`]).
@@ -145,10 +145,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             Some(key) if key == self.entry.identity().signing_name() => true,
             // And a SERVICE's own traffic: a request addressed to a service this crate holds
             // a record for ([`data_plane::claims_parts`]). Such a request names no modelled
-            // operation and carries no credential scope naming this service — its host is the
-            // service's own published DNS name, whose first label names no service of AWS — so
+            // operation and carries no credential scope naming this service — its host is one
+            // of the service's own, whose first label names no service of AWS — so
             // the front door could resolve no target service for it and answered
-            // `404 UnknownService`, for the one address this service told the caller to use.
+            // `404 UnknownService`, for an address a client of the emulated network holds.
             //
             // The claim is narrowed to a service this crate HOLDS, read from the one shared
             // store, rather than to a host or a path shape alone, so one request keeps one

@@ -155,8 +155,8 @@ impl From<CreateServiceErrorModeled> for CreateServiceError {
 }
 
 /// The response for a stored service — every member read back out of state, with the
-/// status the clock owes it at `now` and the DNS entry announcing this service's name in
-/// the zone this emulator answers in ([`crate::state::announced_dns_entry`]).
+/// status the clock owes it at `now` and the DNS entry announcing the host this emulator
+/// is reached at ([`crate::state::announced_dns_entry`]).
 fn output_of(
     service: &crate::state::LatticeService,
     now: std::time::SystemTime,
@@ -171,7 +171,10 @@ fn output_of(
         status: Some(service.status(now).to_string()),
         auth_type: Some(service.auth_type.clone()),
         idle_timeout_seconds: Some(service.idle_timeout_seconds),
-        dns_entry: Some(crate::state::announced_dns_entry(ctx, service.announced())),
+        dns_entry: Some(crate::state::announced_dns_entry(
+            ctx,
+            &service.dns_hosted_zone_id,
+        )),
     }
 }
 

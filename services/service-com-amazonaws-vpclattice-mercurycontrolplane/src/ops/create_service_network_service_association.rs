@@ -156,8 +156,8 @@ fn not_found(
 }
 
 /// The response for a stored association — every member read back out of state, with
-/// the status the clock owes it at `now` and the DNS entry of the ASSOCIATED service,
-/// announcing that service's name in the zone this emulator answers in
+/// the status the clock owes it at `now` and the DNS entry of the ASSOCIATED service:
+/// that service's own hosted zone and the host this emulator is reached at
 /// ([`crate::state::announced_dns_entry`]).
 fn output_of(
     association: &crate::state::ServiceNetworkServiceAssociation,
@@ -172,7 +172,7 @@ fn output_of(
         custom_domain_name: association.custom_domain_name.clone(),
         dns_entry: Some(crate::state::announced_dns_entry(
             ctx,
-            association.announced_service(),
+            &association.dns_hosted_zone_id,
         )),
     }
 }

@@ -202,7 +202,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: Some(service.arn.clone()),
             created_at: Some(crate::state::timestamp(service.created_at)),
             last_updated_at: Some(crate::state::timestamp(service.last_updated_at)),
-            dns_entry: Some(crate::state::announced_dns_entry(ctx, service.announced())),
+            dns_entry: Some(crate::state::announced_dns_entry(
+                ctx,
+                &service.dns_hosted_zone_id,
+            )),
             custom_domain_name: service.custom_domain_name.clone(),
             certificate_arn: service.certificate_arn.clone(),
             status: Some(service.status(now).to_string()),

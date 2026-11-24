@@ -1,35 +1,36 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The VPC Lattice DATA plane: how a request a client sends to the name a service PUBLISHES
+//! The VPC Lattice DATA plane: how a request a client sends to a name a service ANSWERS AT
 //! is recognised, and how it is answered out of the listener, rule and target-group records
 //! the control plane holds.
 //!
-//! A service this control plane creates publishes a name for clients to call it on —
-//! `CreateService`'s `dnsEntry` is "The public DNS name of the service" — and a client in a
+//! A service this control plane creates is called by clients — `CreateService`'s `dnsEntry` is
+//! "The public DNS name of the service" — and a client in a
 //! VPC associated with the service network the service is associated with "can be clients and
 //! communicate with other services in the service network"
-//! (`CreateServiceNetworkVpcAssociation`). So the published name is an address something has
+//! (`CreateServiceNetworkVpcAssociation`). So a name of the service is an address something has
 //! to ANSWER at: a request to it is routed by the service's listener, matched against that
 //! listener's rules, and forwarded to the target group the matched rule's action names, whose
-//! target produces the response. Without that, the one address this service tells a caller to
-//! use is answered by the emulator's front door, which can resolve no service from a host
-//! whose first label names a lattice service, so every in-VPC consumer of a Lattice service
-//! waits for an answer that never comes.
+//! target produces the response. Without that, the addresses this service's control plane
+//! records for a client of this emulator are answered by the emulator's front door, which can
+//! resolve no service from a host whose first label names a lattice service, so every in-VPC
+//! consumer of a Lattice service waits for an answer that never comes.
 //!
 //! # What a request addresses, and how it is resolved
 //!
 //! Two addressings resolve, and each is checked against the records this service holds, so
 //! one request has one claimant:
 //!
-//! * HOST-STYLE, the addressing the published `dnsEntry` gives a client: the first label of
-//!   the host the request was sent to is a stored service's own label — the label its
-//!   announced name is minted from ([`crate::state::service_label`], which carries the
+//! * HOST-STYLE, the addressing a client holding one of the service's own names uses: the
+//!   first label of the host the request was sent to is a stored service's own label
+//!   ([`crate::state::service_label`], which carries the
 //!   service's id, so no two services share one) — or the host IS a stored service's
 //!   `customDomainName`. The whole request path is then the path the rules are matched
 //!   against;
-//! * PREFIXED PATH-STYLE: the plane is named by the reserved namespace segment
+//! * PREFIXED PATH-STYLE, the addressing a client holding nothing but the host the control
+//!   plane announced uses: the plane is named by the reserved namespace segment
 //!   ([`::service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE`]) and this
-//!   service's own ([`DATA_PLANE_SEGMENT`]), then the service's id, name or announced host,
+//!   service's own ([`DATA_PLANE_SEGMENT`]), then the service's id, name or own label,
 //!   then the request path — `/_aws/vpc-lattice/{service}/{path}`. The namespace segment
 //!   begins with `_`, which no modelled path of any service does, so the prefix collides
 //!   with no control-plane route.
@@ -290,12 +291,12 @@ fn prefixed_addressing(path: &str) -> Option<(&str, &str)> {
 }
 
 /// Whether `addressed` — the `host[:port]` a request was sent to — names `service`'s own
-/// published address.
+/// host-style address.
 ///
-/// The announced name is the service's own LABEL in whatever zone this emulator answers in
-/// ([`crate::state::announced_dns_name`]), and that label carries the service's id, so the
-/// first label of the host is what identifies the service whichever zone the client read the
-/// name in. A service's `customDomainName` — "the custom domain name of the service" — is the
+/// A host-style name of a service carries the service's own LABEL as its first label
+/// ([`crate::state::service_label`]), and that label carries the service's id, so the first
+/// label of the host is what identifies the service whichever zone the client holds the name
+/// in. A service's `customDomainName` — "the custom domain name of the service" — is the
 /// other name a client reaches it by, and is matched whole.
 fn addresses_published_name(service: &LatticeService, addressed: &str) -> bool {
     let host = host_only(addressed);
@@ -335,7 +336,7 @@ fn reachable(store: &LatticeState, service_id: &str) -> bool {
 }
 
 /// The service `named` names, under every form a client writes one in: the bare id, the
-/// service's name, or the first label of its announced host.
+/// service's name, or its own label.
 fn named_service<'s>(store: &'s LatticeState, named: &str) -> Option<&'s LatticeService> {
     store.services.values().find(|service| {
         named.eq_ignore_ascii_case(&service.id)

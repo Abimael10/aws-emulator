@@ -11,7 +11,7 @@
 //! the store through
 //! [`service_state`]; nothing in `src/ops/` keeps a second copy of a resource.
 //!
-//! The DNS NAME a response ANNOUNCES in a `DnsEntry` is read in the `announced_dns` child
+//! The HOST a response ANNOUNCES in a `DnsEntry` is read in the `announced_dns` child
 //! module, which every operation that serializes one builds its entry through
 //! ([`announced_dns_entry`]).
 //!
@@ -33,7 +33,7 @@
 //! ComAmazonawsVpclatticeMercurycontrolplaneState::auth_policy_state)).
 //!
 //! The ADDRESSES a listener of a service answers at, published so a client of this emulator
-//! that holds the service's own DNS name reaches its data plane, live in the
+//! that holds one of the service's own host-style names reaches its data plane, live in the
 //! `data_plane_addresses` child module ([`published_listener_addresses`], whose record the
 //! listener's own create keeps on this store).
 //!
@@ -58,9 +58,7 @@ pub use access_log_subscriptions::{
     AccessLogDestination, AccessLogSubscription, KIND_ACCESS_LOG_SUBSCRIPTION,
     MAX_ACCESS_LOG_SUBSCRIPTIONS, PREFIX_ACCESS_LOG_SUBSCRIPTION, UNRESOLVED_SUBSCRIBED_KIND,
 };
-pub use announced_dns::{
-    announced_dns_entry, announced_dns_name, service_label, AnnouncedService,
-};
+pub use announced_dns::{announced_dns_entry, announced_dns_host, service_label};
 pub use data_plane_addresses::{published_listener_addresses, ListenerAddresses};
 pub use auth_policies::{
     auth_policy_target, check_auth_policy_document, AuthPolicy, AUTH_POLICY_MEMBER,
@@ -621,8 +619,8 @@ pub struct LatticeService {
     pub idle_timeout_seconds: i32,
     /// The hosted zone of this service's DNS entry, minted once with the service and
     /// kept, so every read reports the same zone. The entry's DOMAIN NAME is not stored:
-    /// it is this service's own name in the zone this emulator answers in, built per
-    /// request by [`announced_dns_entry`].
+    /// it is the host this emulator is reached at, built per request by
+    /// [`announced_dns_entry`].
     pub dns_hosted_zone_id: String,
     pub tags: HashMap<String, String>,
     pub created_at: SystemTime,
@@ -663,8 +661,7 @@ pub struct ServiceNetworkServiceAssociation {
     pub service_network_name: String,
     /// The hosted zone of the associated service's DNS entry, copied from that service
     /// when the association is made — the association reports the service's own entry.
-    /// Its DOMAIN NAME is not stored; see [`ServiceNetworkServiceAssociation::announced_service`]
-    /// and [`announced_dns_entry`].
+    /// Its DOMAIN NAME is not stored; see [`announced_dns_entry`].
     pub dns_hosted_zone_id: String,
     pub custom_domain_name: Option<String>,
     pub tags: HashMap<String, String>,
@@ -1644,7 +1641,7 @@ pub struct ComAmazonawsVpclatticeMercurycontrolplaneState {
     /// resource, so the resource ceilings bound this map too.
     pub name_index: HashMap<String, String>,
     /// `<listener id>` -> the addresses that listener answers at, as published for a client
-    /// of this emulator that holds the service's own DNS name
+    /// of this emulator that holds one of the service's own host-style names
     /// ([`published_listener_addresses`]). One entry per stored listener, written by the
     /// create that opened the listener and dropped by [`Self::remove_listener`] — which is
     /// what withdraws the addresses — so the listener ceilings bound this map too.

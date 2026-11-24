@@ -270,10 +270,7 @@ pub const MAX_DNS_LABEL_LENGTH: usize = 63;
 /// value carrying a host or path delimiter from making the announced address name an
 /// authority the caller chose: a `:` would move the port and a `/` a path.
 ///
-/// Services still carrying their own copy of this reading, to be MIGRATED onto this function
-/// (it postdates them):
-/// `services/service-com-amazonaws-vpclattice-mercurycontrolplane/src/state/announced_dns.rs`.
-/// Nothing new inlines it again — call this module.
+/// Nothing inlines it again — call this module.
 #[must_use]
 pub fn dns_label(value: &str) -> String {
     let folded: String = value
@@ -306,10 +303,7 @@ pub fn dns_label(value: &str) -> String {
 /// process or, worse, to genuine AWS infrastructure, so announcing one sends the client out
 /// of the emulated environment carrying the credentials it is holding.
 ///
-/// Services still carrying their own copy of this reading, to be MIGRATED onto this function
-/// (it postdates them):
-/// `services/service-com-amazonaws-vpclattice-mercurycontrolplane/src/state/announced_dns.rs`.
-/// Nothing new inlines it again — call this module.
+/// Nothing inlines it again — call this module.
 #[must_use]
 pub fn announced_zone_of_authority(authority: &str) -> String {
     let host = host_only(authority)
