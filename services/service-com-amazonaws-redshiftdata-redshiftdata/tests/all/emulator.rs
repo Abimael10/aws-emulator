@@ -469,6 +469,9 @@ pub fn list(value: &Value, member: &str) -> Vec<Value> {
 /// one Region.
 pub const REGION: &str = "us-east-1";
 
+/// The node type a cluster this harness creates runs when the suite names none.
+pub const DEFAULT_NODE_TYPE: &str = "ra3.xlplus";
+
 /// One emulator carrying the Data API and BOTH Redshift control planes over ONE
 /// shared engine, the way the router mounts them in production — plus
 /// EventBridge and Amazon SQS, so a statement's published status change travels
@@ -634,12 +637,33 @@ impl Warehouses {
     /// Its wire protocol is awsQuery: the request is a form-encoded `Action`,
     /// and only its status is read here.
     pub async fn create_cluster_with_database(&self, identifier: &str, db_name: Option<&str>) {
+        self.create_cluster_of_shape(identifier, DEFAULT_NODE_TYPE, None, db_name)
+            .await;
+    }
+
+    /// Create a provisioned cluster of a node type and node count of the
+    /// caller's choosing, so a suite can drive a warehouse whose compute has a
+    /// published SHAPE of its own: how many slices a node type has, and how many
+    /// nodes the cluster runs, is what decides how a table is spread over them.
+    ///
+    /// `nodes` left as `None` creates a single-node cluster, which is what
+    /// Amazon Redshift creates for a request naming no node count.
+    pub async fn create_cluster_of_shape(
+        &self,
+        identifier: &str,
+        node_type: &str,
+        nodes: Option<i32>,
+        db_name: Option<&str>,
+    ) {
         let named_database = db_name
             .map(|name| format!("&DBName={name}"))
             .unwrap_or_default();
+        let shape = nodes
+            .map(|nodes| format!("&ClusterType=multi-node&NumberOfNodes={nodes}"))
+            .unwrap_or_default();
         let body = format!(
             "Action=CreateCluster&Version=2012-12-01&ClusterIdentifier={identifier}\
-             &NodeType=ra3.xlplus&MasterUsername=admin{named_database}"
+             &NodeType={node_type}&MasterUsername=admin{shape}{named_database}"
         );
         let request = http::Request::builder()
             .method("POST")

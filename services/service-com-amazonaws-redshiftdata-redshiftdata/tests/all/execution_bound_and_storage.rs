@@ -155,10 +155,11 @@ async fn a_statement_that_would_never_finish_is_still_stopped() {
     );
 }
 
-/// RULE 2: `STV_BLOCKLIST` reports one row per column of each table the
-/// database HOLDS ROWS IN, each carrying the number of values that column
-/// holds — read out of the engine's own catalogue, so a statement built from
-/// that table is built from the tables this database actually has.
+/// RULE 2: `STV_BLOCKLIST` reports one row per block of each column of each
+/// table the database holds, on every slice the warehouse spreads it over, each
+/// carrying the number of values that block holds — read out of the engine's own
+/// catalogue, so a statement built from that table is built from the tables this
+/// database actually has.
 ///
 /// The rows differ along what the rule generalises over: how many columns a
 /// table declares and how many rows it holds, including a table that holds none
@@ -172,6 +173,11 @@ async fn the_blocks_a_warehouse_reports_are_the_columns_of_the_tables_it_holds()
     // reference names as its hidden columns: they occupy blocks beside the
     // declared ones.
     const HIDDEN_COLUMNS: i64 = 3;
+    // The slices this warehouse spreads a table over. No control plane is
+    // mounted beside the Data API here, so the cluster's shape is the published
+    // floor: the smallest slices-per-node figure the Amazon Redshift Cluster
+    // Management Guide publishes, over one node.
+    const SLICES: i64 = 2;
     // (case, the table, how many columns it declares, how many rows it holds)
     let rows = [
         ("one column, three rows", "blocks_one", 1, 3),
@@ -179,7 +185,8 @@ async fn the_blocks_a_warehouse_reports_are_the_columns_of_the_tables_it_holds()
         ("three columns, five rows", "blocks_three", 3, 5),
     ];
     for (case, table, columns, held) in rows {
-        let expected_blocks = columns + HIDDEN_COLUMNS;
+        let carried = columns + HIDDEN_COLUMNS;
+        let expected_blocks = carried * SLICES;
         let declared = (0..columns)
             .map(|index| format!("c{index} INTEGER"))
             .collect::<Vec<String>>()
@@ -242,7 +249,7 @@ async fn the_blocks_a_warehouse_reports_are_the_columns_of_the_tables_it_holds()
         .await;
         assert_eq!(
             highest,
-            (expected_blocks - 1).to_string(),
+            (carried - 1).to_string(),
             "case {case}: expected the columns of {table} numbered from zero, got {highest}"
         );
     }

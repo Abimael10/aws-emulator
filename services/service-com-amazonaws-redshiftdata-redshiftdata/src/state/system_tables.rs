@@ -28,6 +28,8 @@
 use std::collections::VecDeque;
 use std::time::SystemTime;
 
+use super::storage_blocks;
+
 /// The system tables this engine serves, by the name a statement references
 /// them under.
 pub const SYSTEM_TABLES: &[&str] = &[
@@ -238,12 +240,17 @@ pub fn referenced(relations: &[String]) -> Vec<&'static str> {
 /// last statement read it: what a reader sees is the log as it stands when its
 /// own statement runs. The tables live in the temporary schema, so the
 /// database's own catalog keeps holding only the caller's tables.
+///
+/// `slices` is how many slices the warehouse this statement runs on spreads a
+/// table over, which is what the storage tables report a table's blocks per
+/// ([`super::storage_blocks`]).
 pub fn materialise(
     connection: &rusqlite::Connection,
     log: &mut SystemLog,
     database: &str,
     queues: &[super::session_settings::QueueConfig],
     encodings: &super::column_encodings::ColumnEncodings,
+    slices: i64,
     tables: &[&'static str],
 ) -> rusqlite::Result<()> {
     for table in tables {
@@ -254,8 +261,8 @@ pub fn materialise(
             "stv_wlm_service_class_config" => materialise_service_classes(connection, queues)?,
             "stv_recents" => materialise_recents(connection, log)?,
             "stl_load_errors" => materialise_load_errors(connection, log)?,
-            "stv_blocklist" => materialise_blocklist(connection, log)?,
-            "svv_table_info" => materialise_table_info(connection, log, database)?,
+            "stv_blocklist" => materialise_blocklist(connection, log, slices)?,
+            "svv_table_info" => materialise_table_info(connection, log, database, slices)?,
             "pg_table_def" => materialise_table_def(connection, encodings)?,
             _ => {}
         }
@@ -350,14 +357,19 @@ const NOT_SORTED: i64 = 0;
 /// The tables are the ones the DATABASE holds — "this view is visible only to
 /// superusers" and it reports a database's own tables, not the external ones a
 /// Spectrum schema serves out of Amazon S3 — so they are read from the engine's
-/// own catalog, and each table's row count from the table itself. The columns
-/// that describe how a cluster STORES a table (its blocks, its skew, its
-/// distribution style and sort keys) are not facts of this engine, which stores
-/// a table one way, so nothing is claimed for them.
+/// own catalog, and each table's row count from the table itself. Its `size` is
+/// "the size of the table, in 1 MB data blocks", which is the blocks its columns
+/// occupy on every slice of this warehouse — the same geometry `STV_BLOCKLIST`
+/// lists block by block ([`super::storage_blocks`]), so the two cannot disagree
+/// about what a table occupies. The columns that describe how a cluster SPREADS
+/// a table (its skew, its distribution style and sort keys) and how much of the
+/// cluster's own space it takes are not facts of this engine, which stores a
+/// table one way, so nothing is claimed for them.
 fn materialise_table_info(
     connection: &rusqlite::Connection,
     log: &mut SystemLog,
     database: &str,
+    slices: i64,
 ) -> rusqlite::Result<()> {
     create(
         connection,
@@ -395,6 +407,17 @@ fn materialise_table_info(
                 row.get(0)
             })
             .unwrap_or_default();
+        // The 1 MB blocks this relation occupies, over every slice it is spread
+        // across. A view stores none of its own, so it occupies none.
+        let size: i64 = storage_blocks::columns_of(connection, &name)
+            .map(|columns| {
+                columns
+                    .iter()
+                    .map(|column| column.blocks)
+                    .sum::<i64>()
+                    .saturating_mul(storage_blocks::spread_over(slices))
+            })
+            .unwrap_or_default();
         insert.execute(rusqlite::params![
             database,
             schema,
@@ -410,10 +433,12 @@ fn materialise_table_info(
             "",
             0_i64,
             0_i64,
-            // The blocks a table occupies, how much of the cluster's space it
-            // uses, how unsorted it is and how stale its statistics are are
-            // facts of a cluster's storage, which this engine does not model.
-            0_i64,
+            // The blocks this table occupies, counted the same way the block
+            // list lists them.
+            size,
+            // How much of the cluster's own space a table uses, how unsorted it
+            // is and how stale its statistics are are facts of a cluster's
+            // storage, which this engine does not model.
             0.0_f64,
             rows,
             0.0_f64,
@@ -688,16 +713,18 @@ const QUERY_TEXT_LENGTH: usize = 4_000;
 /// `STV_BLOCKLIST`: "the number of 1 MB disk blocks used by each slice, table,
 /// or column in a database".
 ///
-/// One row per block of one column of one table, as the table's grain is
-/// (`slice`, `tbl`, `col`, `blocknum`). What this engine really holds is what is
-/// reported: the tables its catalog holds, the columns each of them declares and
-/// the values each column holds (`num_values`), on the single slice this engine
-/// runs ([`SINGLE_SLICE`]). A table the catalog holds has a row for each of its
-/// columns whether or not it holds a row of data: the reference publishes the
-/// minimum size of a table as one block per column per slice, so a block is
-/// occupied from the moment the table exists and `num_values` is what counts the
-/// values in it. Beside the columns a table declares it carries the ones Amazon
-/// Redshift appends to every table ([`HIDDEN_COLUMNS`]).
+/// One row per block of one column of one table on one slice, which is the
+/// table's grain (`slice`, `tbl`, `col`, `blocknum`). What this engine really
+/// holds is what is reported: the tables its catalog holds, the columns each of
+/// them declares, the values each column holds (`num_values`) and the blocks
+/// those values occupy, over the slices the warehouse this statement runs on
+/// spreads a table across ([`super::storage_blocks`]). A table the catalog holds
+/// has a row for each of its columns on each slice whether or not it holds a row
+/// of data: the reference publishes the minimum size of a table as one block per
+/// column per slice, so a block is occupied from the moment the table exists,
+/// and a column whose values outgrow one block reports the further blocks they
+/// occupy. Beside the columns a table declares it carries the ones Amazon
+/// Redshift appends to every table ([`storage_blocks::HIDDEN_COLUMNS`]).
 ///
 /// The columns that describe how a CLUSTER lays a block out on disk — where its
 /// super block sits, which disk it prefers, whether it is pinned, on disk,
@@ -708,6 +735,7 @@ const QUERY_TEXT_LENGTH: usize = 4_000;
 fn materialise_blocklist(
     connection: &rusqlite::Connection,
     log: &mut SystemLog,
+    slices: i64,
 ) -> rusqlite::Result<()> {
     create(
         connection,
@@ -729,23 +757,13 @@ fn materialise_blocklist(
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<String>>>()?;
     drop(listing);
-    let mut blocks: Vec<(i64, usize, i64)> = Vec::new();
+    let mut blocks: Vec<(i64, Vec<storage_blocks::ColumnStorage>)> = Vec::new();
     for name in held {
-        let quoted = name.replace('"', "\"\"");
-        // The columns the table declares, read the way every other reader of a
-        // relation's columns here reads them: off the query that returns them.
-        let columns = match connection.prepare(&format!("SELECT * FROM \"{quoted}\" LIMIT 0")) {
-            Ok(probe) => probe.column_count(),
-            // A relation the engine cannot prepare a read of holds no block
-            // this reader can report.
-            Err(_unreadable) => continue,
-        };
-        let rows: i64 = connection
-            .query_row(&format!("SELECT count(*) FROM \"{quoted}\""), [], |row| {
-                row.get(0)
-            })
-            .unwrap_or_default();
-        blocks.push((log.table_id(&name), columns + HIDDEN_COLUMNS, rows));
+        // A relation the engine cannot prepare a read of holds no block this
+        // reader can report.
+        if let Some(columns) = storage_blocks::columns_of(connection, &name) {
+            blocks.push((log.table_id(&name), columns));
+        }
     }
     let mut insert = connection.prepare(
         "INSERT INTO temp.stv_blocklist (slice, col, tbl, blocknum, num_values, \
@@ -754,48 +772,49 @@ fn materialise_blocklist(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
          ?18)",
     )?;
-    for (table_id, columns, rows) in blocks {
-        for column in 0..columns {
-            insert.execute(rusqlite::params![
-                SINGLE_SLICE,
-                // "col: zero-based index for the column".
-                i64::try_from(column).unwrap_or(0),
-                table_id,
-                // The one block this engine holds a column's values in: it
-                // stores a table in one place rather than in 1 MB blocks
-                // across slices.
-                FIRST_BLOCK,
-                rows,
-                0_i64,
-                0_i64,
-                0_i64,
-                0_i64,
-                0_i64,
-                0_i64,
-                0_i64,
-                0_i64,
-                0_i64,
-                0_i64,
-                0_i64,
-                0_i64,
-                0_i64,
-            ])?;
+    let mut reported = 0_usize;
+    for slice in 0..storage_blocks::spread_over(slices) {
+        for (table_id, columns) in &blocks {
+            for (index, column) in columns.iter().enumerate() {
+                for block in 0..column.blocks {
+                    if reported >= MAX_REPORTED_BLOCKS {
+                        return Ok(());
+                    }
+                    reported += 1;
+                    insert.execute(rusqlite::params![
+                        slice,
+                        // "col: zero-based index for the column".
+                        i64::try_from(index).unwrap_or(0),
+                        table_id,
+                        // "blocknum: data block number", counted from zero.
+                        block,
+                        column.values_in(block),
+                        0_i64,
+                        0_i64,
+                        0_i64,
+                        0_i64,
+                        0_i64,
+                        0_i64,
+                        0_i64,
+                        0_i64,
+                        0_i64,
+                        0_i64,
+                        0_i64,
+                        0_i64,
+                        0_i64,
+                    ])?;
+                }
+            }
         }
     }
     Ok(())
 }
 
-/// The `blocknum` of a column's first block, which is the only one this engine
-/// reports: the reference numbers a block from zero.
-const FIRST_BLOCK: i64 = 0;
-
-/// How many columns a stored table carries BEYOND the ones it declares.
-///
-/// Source: the *System tables and views reference*, `STV_BLOCKLIST` — "every
-/// table you create has three hidden columns appended to it: INSERT_XID,
-/// DELETE_XID, ROW_ID (OID)". They occupy blocks of their own and are reported
-/// under the column indexes past the declared ones.
-const HIDDEN_COLUMNS: usize = 3;
+/// How many blocks ONE materialisation of the block list reports, bounded here
+/// as every other thing a caller can multiply in this module is: the list is
+/// rebuilt before each statement that reads it, so what it costs to build is
+/// bounded whatever the caller's tables declare.
+const MAX_REPORTED_BLOCKS: usize = 100_000;
 
 /// Create one system table EMPTY on the connection's temporary schema,
 /// replacing the one a previous statement left there.

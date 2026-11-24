@@ -62,7 +62,7 @@ use sqlparser::tokenizer::{Token, Tokenizer};
 
 use super::warehouse_statements::{self, WarehouseStatement};
 use super::warehouse_types;
-use super::{LockMode, LockRequest, TempRelations, TEMP_QUALIFIER};
+use super::{join_planning, LockMode, LockRequest, TempRelations, TEMP_QUALIFIER};
 
 /// The schemas one database holds, by name. Ordered, so a catalogue read of it
 /// is in name order whatever order the schemas were created in.
@@ -174,8 +174,15 @@ impl TransactionControl {
 /// `schemas` is the database's own catalogue of schemas, which is what decides
 /// whether a qualified name names a schema's table; `temp` is the temporary
 /// relations of the CONNECTION the statement runs on, which is what decides
-/// whether an unqualified name is one of those instead.
-pub fn translate(sql: &str, schemas: &SchemaSet, temp: &TempRelations<'_>) -> Translated {
+/// whether an unqualified name is one of those instead. `columns` is what the
+/// engine declares about the relations the statement reads, which is what its
+/// joins are planned against ([`super::join_planning`]).
+pub fn translate(
+    sql: &str,
+    schemas: &SchemaSet,
+    temp: &TempRelations<'_>,
+    columns: &dyn join_planning::DeclaredColumns,
+) -> Translated {
     if !within_readable_length(sql) {
         return Translated::Run(sql.to_string());
     }
@@ -226,10 +233,13 @@ pub fn translate(sql: &str, schemas: &SchemaSet, temp: &TempRelations<'_>) -> Tr
         changed: created.is_some() || named,
     };
     let _walked = statement.visit(&mut rewriter);
+    // The relations are named as the ENGINE holds them from here on, which is
+    // what the join planning below reads their declarations under.
+    let planned = join_planning::planned(statement, columns);
     // A statement is re-rendered only when a rewrite CHANGED it: the parser's
     // own rendering is not the caller's text, so a statement nothing applied to
     // is run exactly as it was submitted.
-    let text = if rewriter.changed {
+    let text = if rewriter.changed || planned {
         statement.to_string()
     } else {
         sql.to_string()

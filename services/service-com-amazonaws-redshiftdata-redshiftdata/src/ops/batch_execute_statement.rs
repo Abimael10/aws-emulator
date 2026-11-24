@@ -447,6 +447,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             database: connection.database.clone(),
             user: connection.db_user.clone().unwrap_or_default(),
             pid: 0,
+            // The shape of the warehouse's compute, as its own control plane
+            // reports it: how many slices a table it stores is spread over.
+            slices: warehouse.slices,
             settings: engine_settings,
         };
 

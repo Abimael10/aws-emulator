@@ -79,6 +79,13 @@ pub struct TargetFacts {
     /// from that owner and is none when the owner could not be asked and the
     /// request did not name the workgroup by ARN.
     pub arn: Option<String>,
+    /// How many SLICES the warehouse's compute has, which is what its storage
+    /// system tables report a table's blocks per
+    /// ([`super::storage_blocks::cluster_slices`]). A provisioned cluster's
+    /// shape is its node type and the number of nodes it runs, both of which its
+    /// owner reports; a target whose shape the owner did not report is at the
+    /// published floor.
+    pub slices: i64,
 }
 
 impl TargetFacts {
@@ -89,6 +96,7 @@ impl TargetFacts {
             resolution,
             provisioned_databases: Vec::new(),
             arn: None,
+            slices: super::storage_blocks::cluster_slices(None, 0),
         }
     }
 
@@ -434,7 +442,9 @@ pub async fn describe_target(
 /// question undecided.
 /// Its `DBName` — "the name of the initial database that was created when the
 /// cluster was created" — is the database the cluster holds from the moment it
-/// exists, so it is reported beside the resolution.
+/// exists, so it is reported beside the resolution, together with the SHAPE of
+/// its compute: its `NodeType` and `NumberOfNodes` are what decide how many
+/// slices it spreads a table over.
 async fn describe_cluster(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -458,6 +468,17 @@ async fn describe_cluster(
                 .map(str::to_string)
                 .collect(),
             arn,
+            slices: answer
+                .clusters()
+                .iter()
+                .map(|cluster| {
+                    super::storage_blocks::cluster_slices(
+                        cluster.node_type(),
+                        cluster.number_of_nodes().unwrap_or_default(),
+                    )
+                })
+                .max()
+                .unwrap_or_else(|| super::storage_blocks::cluster_slices(None, 0)),
         },
         Err(error) => {
             if error
@@ -512,6 +533,9 @@ async fn describe_workgroup(
         resolution: resolved.resolution,
         provisioned_databases,
         arn,
+        // Redshift Serverless publishes no node type for a workgroup's compute,
+        // so its slices are at the published floor.
+        slices: super::storage_blocks::cluster_slices(None, 0),
     }
 }
 

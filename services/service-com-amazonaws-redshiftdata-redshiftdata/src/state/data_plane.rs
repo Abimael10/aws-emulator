@@ -78,6 +78,13 @@ pub struct StatementFacts {
     /// The backend process id this submission's statements run under, which is
     /// what the query log reports for them.
     pub pid: i64,
+    /// How many SLICES the warehouse's compute spreads a table over, as the
+    /// control plane that owns the warehouse reports its shape
+    /// ([`super::warehouse::TargetFacts::slices`]). A table occupies at least
+    /// one block of each of its columns on each slice, so this is what the
+    /// storage system tables report a table's blocks per
+    /// ([`super::storage_blocks`]).
+    pub slices: i64,
     /// The parameter values the warehouse's ENGINE is running with — the values
     /// the control plane that owns the warehouse reports as applied to it, read
     /// by the operation that accepted this submission. A parameter the engine

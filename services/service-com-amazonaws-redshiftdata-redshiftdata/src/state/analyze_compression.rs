@@ -477,7 +477,11 @@ fn profile(
 /// for `DOUBLE PRECISION`, 8 or 16 for `DECIMAL` by its precision, 1 for
 /// `BOOLEAN`, 4 for `DATE` and 8 for the timestamp types. A character value is
 /// variable-width, so what it takes is its own length.
-fn stored_width(declared: &str, class: TypeClass) -> u64 {
+///
+/// What a column's values take is also what decides how many 1 MB blocks they
+/// occupy, so the warehouse's storage geometry reads the same widths
+/// ([`super::storage_blocks`]).
+pub(super) fn stored_width(declared: &str, class: TypeClass) -> u64 {
     match class {
         TypeClass::Integer => match copy_load::type_head(declared).as_str() {
             "smallint" | "int2" => 2,

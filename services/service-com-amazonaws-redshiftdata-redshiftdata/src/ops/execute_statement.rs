@@ -428,6 +428,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the backend process a statement runs under is the one the service
             // reports for it.
             pid: 0,
+            // The shape of the warehouse's compute, as its own control plane
+            // reports it: how many slices a table it stores is spread over.
+            slices: warehouse.slices,
             settings: engine_settings,
         };
 

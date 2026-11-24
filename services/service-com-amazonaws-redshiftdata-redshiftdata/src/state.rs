@@ -114,6 +114,14 @@ pub mod session_settings;
 /// of it, and the rows its loads rejected.
 pub mod system_tables;
 
+/// How a warehouse lays a table out on disk: the slices it spreads one over, and
+/// the 1 MB blocks each of its columns occupies on each of them.
+pub mod storage_blocks;
+
+/// Planning one statement's JOIN, so an equality that constrains two relations
+/// is resolved by a keyed lookup instead of by enumerating their cross product.
+pub mod join_planning;
+
 /// The Amazon Redshift SQL functions the engine does not carry, implemented and
 /// registered on every connection.
 pub mod functions;
@@ -2392,7 +2400,12 @@ fn carry_out(
     effects: &mut RunEffects<'_>,
     query: i64,
 ) -> Result<Produced, ExecutionFailure> {
-    let translated = redshift_sql::translate(sql, &database.schemas, &effects.temp());
+    let translated = redshift_sql::translate(
+        sql,
+        &database.schemas,
+        &effects.temp(),
+        &join_planning::EngineColumns::new(&database.connection),
+    );
     // Which statements CHANGE the database they run on: everything but a lock
     // and a transaction control, each of which acts on the connection rather
     // than on the data. A statement the engine answers with a result set read
@@ -2744,6 +2757,7 @@ fn prepare_references(
             &plane.facts.database,
             &queues,
             &database.encodings,
+            plane.facts.slices,
             &system,
         )?;
     }

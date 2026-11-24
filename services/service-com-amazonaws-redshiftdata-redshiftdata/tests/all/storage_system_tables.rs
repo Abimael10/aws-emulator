@@ -9,13 +9,15 @@
 //! RELATIONS, so a statement that reads one runs like any other statement and
 //! answers rows about this database. `STV_BLOCKLIST` is "the number of 1 MB
 //! disk blocks used by each slice, table, or column in a database", one row per
-//! block of one column of one table — so it reports the tables this database
-//! holds, the columns each of them carries and the values each column holds. A
-//! table occupies a block per column from the moment it exists, whether or not
-//! it holds a row (the published minimum size of a table is one block for each
-//! of its columns on each slice), and the columns it carries are the ones it
+//! block of one column of one table on one slice — so it reports the tables this
+//! database holds, the columns each of them carries, the values each column
+//! holds and the slices this warehouse spreads a table over. A table occupies a
+//! block per column on every slice from the moment it exists, whether or not it
+//! holds a row (the published minimum size of a table is one block for each of
+//! its columns on each slice), and the columns it carries are the ones it
 //! declares plus the three Amazon Redshift appends to every table it stores
-//! (`INSERT_XID`, `DELETE_XID`, `ROW_ID`).
+//! (`INSERT_XID`, `DELETE_XID`, `ROW_ID`). How the slices themselves follow the
+//! warehouse's shape is asserted in [`super::storage_block_geometry`].
 //!
 //! It is asserted over a TABLE of relations rather than one case: the rows
 //! differ in how many columns a table declares and in how many rows it holds,
@@ -83,9 +85,9 @@ struct Relation {
 
 impl Relation {
     /// How many blocks `STV_BLOCKLIST` reports for this table: one per column it
-    /// carries, on the single slice this engine runs.
+    /// carries, on each slice this warehouse spreads it over.
     fn blocks(&self) -> i64 {
-        self.columns + HIDDEN_COLUMNS
+        (self.columns + HIDDEN_COLUMNS) * SLICES
     }
 }
 
@@ -93,6 +95,14 @@ impl Relation {
 /// the table declares: `INSERT_XID`, `DELETE_XID` and `ROW_ID`, which the
 /// `STV_BLOCKLIST` reference names as the three hidden columns of every table.
 const HIDDEN_COLUMNS: i64 = 3;
+
+/// The slices the warehouse these statements run on spreads a table over.
+///
+/// This harness mounts the Data API alone, so no control plane answers for the
+/// cluster the statements name and its shape is the published floor: the
+/// smallest slices-per-node figure the Amazon Redshift Cluster Management Guide
+/// publishes, over one node.
+const SLICES: i64 = 2;
 
 const RELATIONS: &[Relation] = &[
     Relation {
@@ -126,8 +136,8 @@ const RELATIONS: &[Relation] = &[
 ];
 
 /// `STV_BLOCKLIST` reports one block per column of every table the database
-/// holds — the declared columns and the hidden ones — on the single slice this
-/// engine runs, including for a table that holds no row.
+/// holds — the declared columns and the hidden ones — on each slice this
+/// warehouse spreads a table over, including for a table that holds no row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_block_list_reports_a_block_per_column_of_every_table() {
     let case = "the block list";
@@ -162,18 +172,18 @@ async fn the_block_list_reports_a_block_per_column_of_every_table() {
         );
 
         // Each of them is a block of one of that table's columns, numbered from
-        // zero, on the one slice this engine runs, and carries the values that
-        // column holds.
+        // zero, on one of the slices this warehouse spreads it over, and carries
+        // the values that column holds.
         let described = number(
             &emulator,
             case,
             &format!(
                 "SELECT count(*) FROM stv_blocklist b JOIN svv_table_info t ON t.table_id = b.tbl \
-                 WHERE t.\"table\" = '{}' AND b.slice = 0 AND b.blocknum = 0 AND b.num_values = \
-                 {} AND b.col >= 0 AND b.col < {}",
+                 WHERE t.\"table\" = '{}' AND b.slice >= 0 AND b.slice < {SLICES} AND \
+                 b.blocknum = 0 AND b.num_values = {} AND b.col >= 0 AND b.col < {}",
                 relation.table,
                 relation.rows,
-                relation.blocks()
+                relation.columns + HIDDEN_COLUMNS
             ),
         )
         .await;
@@ -198,11 +208,11 @@ async fn the_block_list_reports_a_block_per_column_of_every_table() {
         .await;
         assert_eq!(
             columns,
-            relation.blocks(),
+            relation.columns + HIDDEN_COLUMNS,
             "case {case}: {} has one block per column, so its blocks name {} distinct columns, \
              got {columns}",
             relation.table,
-            relation.blocks()
+            relation.columns + HIDDEN_COLUMNS
         );
     }
 }

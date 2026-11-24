@@ -35,10 +35,13 @@
 //! * the `SQLSTATE` a refused statement is reported under, which for this
 //!   warehouse is not always the class a PostgreSQL server would use.
 
-use std::collections::BTreeSet;
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Mutex, PoisonError};
 
-use ::service_com_amazonaws_redshiftdata_redshiftdata::state::{redshift_sql, TempRelations};
+use ::service_com_amazonaws_redshiftdata_redshiftdata::state::{
+    join_planning, redshift_sql, TempRelations,
+};
 use ::service_common::sql_wire_planes::catalog_views;
 use ::service_common::sql_wire_planes::session::Answer;
 use ::service_common::sql_wire_planes::sql_engine::{
@@ -137,6 +140,85 @@ pub struct ClusterSql {
     catalogue: Mutex<Catalogue>,
 }
 
+/// What the engine behind ONE endpoint declares about its relations' columns,
+/// which is what the dialect plans a statement's joins against
+/// ([`redshift_sql::translate`]).
+///
+/// Read through the one reading of this engine's catalog
+/// ([`catalog_views::declared_columns`]), and read at most once per statement:
+/// the first column a planning asks about reads the whole catalog, and a
+/// statement whose joins need no planning reads none of it.
+struct EndpointColumns<'a> {
+    /// The engine whose catalog answers.
+    engine: &'a DatabaseEngine,
+    /// The session view the read runs under — a CLONE of the statement's own, so
+    /// a read made for planning changes nothing about the session.
+    view: RefCell<EngineView>,
+    /// The integer-typed columns of each relation, by the ENGINE name the
+    /// relation is held under, once the catalog has been read.
+    integer: RefCell<Option<HashMap<String, BTreeSet<String>>>>,
+}
+
+impl<'a> EndpointColumns<'a> {
+    /// Read the declarations of the relations behind this endpoint.
+    fn of(engine: &'a DatabaseEngine, view: &EngineView) -> Self {
+        Self {
+            engine,
+            view: RefCell::new(view.clone()),
+            integer: RefCell::new(None),
+        }
+    }
+
+    /// The integer-typed columns of every relation, read off the catalog unless
+    /// it has already been read.
+    fn read(&self) {
+        if self.integer.borrow().is_some() {
+            return;
+        }
+        let declared = {
+            let mut view = self.view.borrow_mut();
+            // A catalog this engine could not be read makes no claim about any
+            // column's type, so nothing is planned: a statement whose join the
+            // dialect cannot plan runs exactly as the client wrote it.
+            catalog_views::declared_columns(self.engine, &mut view).unwrap_or_default()
+        };
+        let mut held: HashMap<String, BTreeSet<String>> = HashMap::new();
+        for column in declared {
+            if !join_planning::declares_integer(&column.declared_type) {
+                continue;
+            }
+            // The name the ENGINE holds the relation under, which is what a
+            // statement's relations have been resolved to by the time its joins
+            // are planned: a table of a schema is held under its qualified name
+            // and one of the default schema under its own.
+            let relation = if column.table_schema == DEFAULT_SCHEMA {
+                column.table_name.clone()
+            } else {
+                format!("{}.{}", column.table_schema, column.table_name)
+            };
+            held.entry(relation.to_ascii_lowercase())
+                .or_default()
+                .insert(column.column_name.to_ascii_lowercase());
+        }
+        *self.integer.borrow_mut() = Some(held);
+    }
+}
+
+impl join_planning::DeclaredColumns for EndpointColumns<'_> {
+    fn is_integer(&self, table: &str, column: &str) -> bool {
+        self.read();
+        let (relation, column) = (table.to_ascii_lowercase(), column.to_ascii_lowercase());
+        self.integer.borrow().as_ref().is_some_and(|held| {
+            held.get(&relation)
+                .is_some_and(|columns| columns.contains(&column))
+        })
+    }
+}
+
+/// The schema a relation of no schema of its own is in, which the catalog
+/// reading reports for it.
+const DEFAULT_SCHEMA: &str = "public";
+
 impl ClusterSql {
     /// The dialect of a cluster whose database holds nothing yet.
     #[must_use]
@@ -158,7 +240,12 @@ impl SqlDialect for ClusterSql {
         let mut held = self.catalogue.lock().unwrap_or_else(PoisonError::into_inner);
         let translated = {
             let temporary = TempRelations::held_by(TEMPORARY_PREFIX, &held.temporary);
-            redshift_sql::translate(statement, &held.schemas, &temporary)
+            redshift_sql::translate(
+                statement,
+                &held.schemas,
+                &temporary,
+                &EndpointColumns::of(engine, view),
+            )
         };
         match translated {
             Translated::Run(sql) => DialectReading::Run(sql),
