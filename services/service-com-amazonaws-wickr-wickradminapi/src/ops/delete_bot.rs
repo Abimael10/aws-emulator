@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteBot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteBot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteBot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the one bot of a network the `botId` label names from the store, so the
+//! account is gone for every later caller: a read of it is refused as a bot that has
+//! been deleted, no listing and no group member tally counts it, and the `username` it
+//! held is available to a new account of the network again.
+//!
+//! A delete it cannot perform is refused at the resource the request named — a `botId`
+//! this store holds no bot for under that `networkId` is a gone BOT, whatever became of
+//! the network around it — in the same words a read of that bot states
+//! ([`crate::ops::get_bot`]).
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +166,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteBot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteBotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteBotErrorModeled::InternalServerError(InternalServerError {
+                message: "the Wickr network store is unavailable".to_string(),
+            })
+        })?;
+
+        let mut store = state.lock();
+        // The write the request asked for IS the removal: the operation "permanently
+        // removes the bot account and its associated data from the network", so the
+        // record leaves the store here and nothing of the bot is kept behind it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteBot"))
+        // The request names ONE bot, and that is the resource this delete reports on: a
+        // `botId` this store holds no bot for under the `networkId` the request named —
+        // because no bot of that network ever carried it, because it names a bot of a
+        // different network, because the network that held it has been deleted and its
+        // bots went with it, or because this very bot is already gone — is refused as
+        // the BOT that "doesn't exist or has been deleted", never as its parent network.
+        if store.remove_bot(&input.network_id, &input.bot_id).is_none() {
+            return Err(gone(crate::state::BOT_GONE_MESSAGE));
+        }
+
+        Ok(DeleteBotOutput {
+            message: Some(DELETED_MESSAGE.to_string()),
+        })
     }
+}
+
+/// The text this operation's success body states the result of the deletion in.
+///
+/// FIXED text, and this API's own: a bot operation of this service reports its result
+/// as this one word rather than as a sentence about the bot (the create of a bot reports
+/// it the same way), so it carries no id, no count and no timestamp — nothing a caller
+/// could read as a tally and nothing to parse. What identifies the bot that was deleted
+/// is the request the caller sent, and the deletion has HAPPENED when this is answered:
+/// the operation "permanently removes the bot account" and this handler drops the record
+/// before answering, so there is no later step for a caller to wait out.
+const DELETED_MESSAGE: &str = "success";
+
+/// The modelled `ResourceNotFoundError` (HTTP 404) for a resource the request named
+/// that "doesn't exist or has been deleted", stated in this API's fixed sentence for
+/// it — which names no id, so it says nothing about what else the store holds.
+fn gone(message: &str) -> DeleteBotError {
+    DeleteBotErrorModeled::ResourceNotFoundError(ResourceNotFoundError {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

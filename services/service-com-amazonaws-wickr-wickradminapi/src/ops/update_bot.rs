@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateBot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateBot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateBot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the properties a request carries to the one bot of a network the `botId`
+//! label names: a `PATCH`, so a member the request omits leaves that property of the
+//! bot as it stands, and every member it carries is written to the one record every
+//! operation that reports a bot answers from — so a read straight after an accepted
+//! update reports what the update set.
+//!
+//! Two of those properties are the same facts another operation decides, so they are
+//! decided the same way here: the security group a bot is assigned to has to be a group
+//! of the bot's own network, and a new password has to meet THAT group's password
+//! policy — checked before anything is written, so an update this service turns down
+//! leaves the bot exactly as it was.
+//!
+//! An update it cannot perform is refused at the resource the request named — a `botId`
+//! this store holds no bot for under that `networkId` is a gone BOT, whatever became of
+//! the network around it — in the same words a read of that bot states
+//! ([`crate::ops::get_bot`]).
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +179,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateBot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateBotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateBot"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let mut store = state.lock();
+
+        // The request names ONE bot, and that is the resource this update reports on: a
+        // `botId` this store holds no bot for under the `networkId` the request named —
+        // whatever became of the network around it — is refused as the BOT that "doesn't
+        // exist or has been deleted", never as its parent network.
+        let current_group_id = store
+            .bot_of(&input.network_id, &input.bot_id)
+            .ok_or_else(|| gone(crate::state::BOT_GONE_MESSAGE))?
+            .group_id
+            .clone();
+
+        // A request that assigns the bot to a group assigns it to one of the bot's OWN
+        // network's groups, so a `groupId` naming none of them names no group to assign
+        // it to. A request that assigns none leaves the bot where it is and asks nothing
+        // about any group, so no other member of it can be refused over one.
+        if let Some(group_id) = input.group_id.as_deref() {
+            if !store
+                .security_groups
+                .get(&input.network_id)
+                .is_some_and(|groups| groups.contains_key(group_id))
+            {
+                return Err(gone(crate::state::SECURITY_GROUP_GONE_MESSAGE));
+            }
+        }
+
+        // A new password is measured against the policy of the group the bot ends up in —
+        // the one this request assigns it to, or the one it is already a member of —
+        // exactly as the password a bot is created with is. A group whose stored settings
+        // state no policy, and a group this store can no longer resolve, are both held to
+        // the policy every group carries, so no password goes unchecked. The refusal names
+        // the policy and states the group's own numbers, so nothing of the submitted
+        // password is reported back.
+        if let Some(challenge) = input.challenge.as_deref() {
+            let group_id = input.group_id.as_deref().unwrap_or(&current_group_id);
+            let requirements = store
+                .security_groups
+                .get(&input.network_id)
+                .and_then(|groups| groups.get(group_id))
+                .and_then(|group| group.settings.password_requirements.clone())
+                .unwrap_or_else(crate::state::default_password_requirements);
+            if !crate::state::password_meets_requirements(challenge, &requirements) {
+                return Err(refused(
+                    crate::state::PASSWORD_POLICY_FIELD,
+                    crate::state::password_policy_reason(&requirements),
+                ));
+            }
+        }
+
+        // Nothing above wrote, so an update this service turned down left the bot as it
+        // was. From here every present member is applied to the stored record, and every
+        // absent one leaves that property alone.
+        let record = store
+            .bot_of_mut(&input.network_id, &input.bot_id)
+            .ok_or_else(store_unavailable)?;
+        if let Some(display_name) = input.display_name {
+            record.display_name = Some(display_name);
+        }
+        if let Some(group_id) = input.group_id {
+            record.group_id = group_id;
+        }
+        // The password itself is not kept — no operation reports it back — so what a new
+        // password changes about the bot is that it HAS one, which is what
+        // `Bot$hasChallenge` reports.
+        if input.challenge.is_some() {
+            record.has_challenge = true;
+        }
+        // "Set to true to suspend the bot or false to unsuspend it": the member carries
+        // the suspension status the bot is to end up in, so it is written as it stands.
+        if let Some(suspend) = input.suspend {
+            record.suspended = suspend;
+        }
+
+        Ok(UpdateBotOutput {
+            message: Some(UPDATED_MESSAGE.to_string()),
+        })
     }
+}
+
+/// The text this operation's success body states the result of the update in.
+///
+/// FIXED text, and this API's own: a bot operation of this service reports its result as
+/// this one word rather than as a sentence about the bot (the create of a bot reports it
+/// the same way), so it names neither the bot nor which of its properties changed. What
+/// the bot now holds is what a read of it reports.
+const UPDATED_MESSAGE: &str = "success";
+
+/// The modelled `ResourceNotFoundError` (HTTP 404) for a resource the request named
+/// that "doesn't exist or has been deleted", stated in this API's fixed sentence for
+/// it — which names no id, so it says nothing about what else the store holds.
+fn gone(message: &str) -> UpdateBotError {
+    UpdateBotErrorModeled::ResourceNotFoundError(ResourceNotFoundError {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// A `ValidationError` (HTTP 422) naming what was refused and why.
+fn refused(field: &str, reason: String) -> UpdateBotError {
+    UpdateBotErrorModeled::ValidationError(crate::state::field_validation_error(field, &reason))
+        .into()
+}
+
+/// The modelled server error for a store this service cannot reach — the one
+/// failure that is the emulator's own fault rather than the request's.
+fn store_unavailable() -> UpdateBotError {
+    UpdateBotErrorModeled::InternalServerError(InternalServerError {
+        message: "the Wickr network store is unavailable".to_string(),
+    })
+    .into()
 }

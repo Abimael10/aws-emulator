@@ -73,6 +73,35 @@ impl super::ComAmazonawsWickrWickradminapiState {
         self.bots.get(network_id)?.get(bot_id)
     }
 
+    /// The bot of `network_id` carrying `bot_id`, to CHANGE.
+    ///
+    /// The one way a stored bot is mutated, so an operation that changes a bot's
+    /// properties writes to the very record every reporting operation answers
+    /// from and cannot leave a second copy behind.
+    pub fn bot_of_mut(&mut self, network_id: &str, bot_id: &str) -> Option<&mut BotRecord> {
+        self.bots.get_mut(network_id)?.get_mut(bot_id)
+    }
+
+    /// Drop the bot of `network_id` carrying `bot_id`, answering the record that
+    /// was removed, or `None` when that network holds no such bot.
+    ///
+    /// The bot account goes entirely: nothing of it is kept, so afterwards a read
+    /// of it is a read of a bot that "has been deleted", it is counted in no
+    /// listing and in no group's member tally, and the `username` it held is
+    /// available to a new account of the network again. Only the minted-id
+    /// counter outlives it ([`Self::mint_bot_id`] is monotonic), so the id is
+    /// never handed out a second time.
+    pub fn remove_bot(&mut self, network_id: &str, bot_id: &str) -> Option<BotRecord> {
+        let bots = self.bots.get_mut(network_id)?;
+        let removed = bots.remove(bot_id)?;
+        // A network whose last bot is gone holds no bot map either, so the store
+        // carries nothing for it that a later reader could see.
+        if bots.is_empty() {
+            self.bots.remove(network_id);
+        }
+        Some(removed)
+    }
+
     /// The bot of `network_id` holding `username`, if one does.
     pub fn bot_by_username(&self, network_id: &str, username: &str) -> Option<&BotRecord> {
         self.bots
