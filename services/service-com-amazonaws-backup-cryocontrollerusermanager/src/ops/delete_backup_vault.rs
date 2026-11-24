@@ -2,10 +2,15 @@
 
 //! @op DeleteBackupVault
 //!
-//! Removes the vault from [`crate::state`]. AWS requires the vault be empty
-//! first, so a vault that still holds recovery points is refused with
-//! `InvalidRequestException`; so is a vault whose creation has not settled yet,
-//! with the `Code` AWS Backup words that refusal with.
+//! Removes the vault from [`crate::state`]. The vault the request names is
+//! resolved through
+//! [`crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::visible_vault`],
+//! the decision every vault-scoped call in this service shares, so a label that
+//! names no vault this account holds in this Region is refused with 403
+//! `AccessDeniedException` before any existence or state lookup. AWS requires the
+//! vault be empty first, so a vault that still holds recovery points is refused
+//! with `InvalidRequestException`; so is a vault whose creation has not settled
+//! yet, with the `Code` AWS Backup words that refusal with.
 //!
 //! ## Shape of an operation
 //!
@@ -176,34 +181,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut store = state.lock();
-        // This operation's `BackupVaultName` targets a plain `string`, so the
-        // framework does not apply the vault-name pattern for it; a name the
-        // service could never have stored is a bad parameter value, not an
-        // absent resource.
-        if !crate::state::is_modelled_vault_name(&input.backup_vault_name) {
-            return Err(
-                DeleteBackupVaultErrorModeled::InvalidParameterValueException(
-                    InvalidParameterValueException {
-                        message: Some(format!(
-                            "BackupVaultName {:?} must satisfy regular expression pattern: \
-                             ^[a-zA-Z0-9\\-\\_]{{2,50}}$",
-                            input.backup_vault_name
-                        )),
-                        ..Default::default()
-                    },
-                )
-                .into(),
-            );
-        }
-        // A vault is identified by its name within the region it was created
-        // in, so the delete resolves the name in the region this request
-        // resolves to: another region's vault of that name is not this one.
-        if store.vault(&region, &input.backup_vault_name).is_none() {
-            return Err(DeleteBackupVaultErrorModeled::ResourceNotFoundException(
-                crate::state::backup_vault_not_found(&input.backup_vault_name),
-            )
-            .into());
-        }
+        // A vault-scoped call decides ACCESS before EXISTENCE: AWS Backup
+        // authorizes the delete against the vault the request names as the
+        // resource, so a request whose label names no vault this account holds
+        // in this Region grants nothing and is refused for lack of privileges —
+        // the same answer, from the same decision, as every other vault-scoped
+        // call in this service
+        // ([`crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::visible_vault`]).
+        // `BackupVaultName` targets a plain `string` here (the model states no
+        // pattern for it), so the label's FORM changes nothing: a vault ARN, a
+        // name outside the vault-name alphabet and a name nothing was created
+        // under are one condition, and the refusal discloses nothing about which.
+        store.visible_vault(&region, &input.backup_vault_name, None)?;
         // A vault whose creation the clock has already settled is deletable, so
         // the transition owed at `settles_at` is materialised before the state
         // guard below reads the state.

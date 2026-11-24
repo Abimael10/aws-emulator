@@ -8,7 +8,10 @@
 //! the per-vault recovery-point index, never stored twice. The vault is resolved
 //! through [`crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::visible_vault`],
 //! so a vault outside the caller's visibility is refused with 403
-//! `AccessDeniedException` before any existence lookup.
+//! `AccessDeniedException` before any existence lookup. `BackupVaultName` is an
+//! `@httpLabel` targeting a plain `string` (the model states no pattern for it),
+//! so no form of that label is judged here: one that names no vault this caller
+//! may address is the authorization refusal above, whatever it looks like.
 //!
 //! ## Shape of an operation
 //!
@@ -218,25 +221,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut store = state.lock();
-        // This operation's `BackupVaultName` targets a plain `string`, so the
-        // framework does not apply the vault-name pattern for it; a name the
-        // service could never have stored is a bad parameter value, not an
-        // absent resource.
-        if !crate::state::is_modelled_vault_name(&input.backup_vault_name) {
-            return Err(
-                DescribeBackupVaultErrorModeled::InvalidParameterValueException(
-                    InvalidParameterValueException {
-                        message: Some(format!(
-                            "BackupVaultName {:?} must satisfy regular expression pattern: \
-                             ^[a-zA-Z0-9\\-\\_]{{2,50}}$",
-                            input.backup_vault_name
-                        )),
-                        ..Default::default()
-                    },
-                )
-                .into(),
-            );
-        }
+        // This operation's `BackupVaultName` targets a plain `string` — the model
+        // states no pattern for it — so there is no value of that label the
+        // service judges on its own: whatever form it takes, it either names a
+        // vault this caller may address or it does not, and the decision below is
+        // the one every vault-scoped call shares.
+        //
         // The ONE write this reporting operation performs: a vault whose
         // `CREATING` -> `AVAILABLE` transition the clock has already made due
         // was owed it at that instant whether or not anybody described it.

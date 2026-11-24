@@ -1003,10 +1003,12 @@ async fn an_unrecognised_cursor_is_refused() {
 /// `ResourceNotFoundException`; an absent required member is
 /// `MissingParameterValueException`.
 ///
-/// The vault-scoped READS are deliberately absent from this table: they decide
-/// access before existence and so answer 403 `AccessDeniedException` instead —
-/// `vault_read_visibility.rs` covers them. A mutation names the resource it could
-/// not act on, which is what the rows below assert.
+/// The calls that address a VAULT by the name in their URI are deliberately
+/// absent from this table: they decide access before existence and so answer 403
+/// `AccessDeniedException` instead — `vault_read_visibility.rs` covers the reads
+/// and `vault_label_identifier_forms.rs` the delete. A call that names a vault in
+/// its BODY names the resource it could not act on, which is what the rows below
+/// assert.
 #[tokio::test]
 async fn unknown_resources_and_absent_members_are_refused_by_their_own_code() {
     let router = router();
@@ -1017,12 +1019,6 @@ async fn unknown_resources_and_absent_members_are_refused_by_their_own_code() {
         r#"{{"BackupVaultName":"never-created","ResourceArn":"{resource}","IamRoleArn":"{role}"}}"#
     );
     let not_found: Vec<(&str, &str, &str, Option<&str>)> = vec![
-        (
-            "delete a vault that was never created",
-            "DELETE",
-            "/backup-vaults/never-created",
-            None,
-        ),
         (
             "describe a job id that was never issued",
             "GET",
@@ -1298,17 +1294,17 @@ async fn calculated_lifecycle_follows_the_stored_day_counts() {
     }
 }
 
-/// A vault name the service could never have stored is a bad parameter value,
-/// not an absent resource — including on the two operations whose model types
-/// the member as a plain string.
+/// The two operations whose model types `BackupVaultName` as a plain string
+/// judge no form of that label on its own: a label naming no vault the caller
+/// may address is the authorization refusal, whatever it looks like.
 #[tokio::test]
-async fn describe_and_delete_apply_the_vault_name_rule_too() {
+async fn describe_and_delete_deny_a_label_that_names_no_visible_vault() {
     let one_char = name_of_length(1);
     let fifty_one = name_of_length(51);
     let cases: Vec<(&str, &str)> = vec![
-        ("one character — under the published minimum of 2", one_char.as_str()),
-        ("51 characters — over the published maximum of 50", fifty_one.as_str()),
-        ("a dot, which the alphabet excludes", "has.dot"),
+        ("one character — under the vault-name minimum of 2", one_char.as_str()),
+        ("51 characters — over the vault-name maximum of 50", fifty_one.as_str()),
+        ("a dot, which the vault-name alphabet excludes", "has.dot"),
         ("a percent-encoded space, which the alphabet excludes", "has%20space"),
     ];
 
@@ -1318,8 +1314,8 @@ async fn describe_and_delete_apply_the_vault_name_rule_too() {
             let (status, body) = call(&router, method, &format!("/backup-vaults/{name}"), None).await;
             assert_eq!(
                 (status, error_code(&body).as_str()),
-                (400, "InvalidParameterValueException"),
-                "case {case:?} ({name:?}, {method}): expected 400 InvalidParameterValueException, got {status} {body:?}"
+                (403, "AccessDeniedException"),
+                "case {case:?} ({name:?}, {method}): expected 403 AccessDeniedException, got {status} {body:?}"
             );
         }
     }

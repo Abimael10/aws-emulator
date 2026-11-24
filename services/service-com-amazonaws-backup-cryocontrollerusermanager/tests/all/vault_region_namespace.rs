@@ -255,8 +255,16 @@ async fn a_vault_of_one_region_answers_no_call_made_in_another() {
 
         let (status, described) = describe_in(&router, region, SHARED_NAME).await;
         assert_eq!(
-            (status, error_code(&described).as_str()),
-            (403, "AccessDeniedException"),
+            (
+                status,
+                error_code(&described).as_str(),
+                string_at(&described, "Message").as_str()
+            ),
+            (
+                403,
+                "AccessDeniedException",
+                "Insufficient privileges to perform this action."
+            ),
             "case {case:?}: a vault-scoped read of a name this Region does not hold is \
              refused for lack of privileges, got {status} {described:?}"
         );
@@ -269,11 +277,12 @@ async fn a_vault_of_one_region_answers_no_call_made_in_another() {
                 string_at(&refused, "Message").as_str()
             ),
             (
-                400,
-                "ResourceNotFoundException",
-                format!("Backup vault {SHARED_NAME} not found").as_str()
+                403,
+                "AccessDeniedException",
+                "Insufficient privileges to perform this action."
             ),
-            "case {case:?}: the delete finds no vault of that name, got {status} {refused:?}"
+            "case {case:?}: a vault-scoped delete of a name this Region does not hold is \
+             refused for lack of privileges, got {status} {refused:?}"
         );
 
         let (status, refused) = start_job_in(&router, region, SHARED_NAME).await;
