@@ -2212,11 +2212,21 @@ fn parse_key_condition_expression(
 }
 
 /// This grammar's tokens as the redundant-parenthesis rule reads them: what opens a group,
-/// what closes one, and everything else ([`crate::state::GroupToken`]).
+/// what closes one, what carries this grammar's one CALL's arguments, and everything else
+/// ([`crate::state::GroupToken`]).
 fn grouping_of(tokens: &[Token]) -> Vec<crate::state::GroupToken> {
     tokens
         .iter()
-        .map(|token| match token {
+        .enumerate()
+        .map(|(at, token)| match token {
+            Token::Open
+                if matches!(
+                    at.checked_sub(1).and_then(|before| tokens.get(before)),
+                    Some(Token::BeginsWith)
+                ) =>
+            {
+                crate::state::GroupToken::Call
+            }
             Token::Open => crate::state::GroupToken::Open,
             Token::Close => crate::state::GroupToken::Close,
             _ => crate::state::GroupToken::Other,

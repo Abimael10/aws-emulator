@@ -3,14 +3,15 @@
 //! Where a filter's OPERANDS may be written, driven end to end.
 //!
 //! The rule pinned here: an operand of a condition is a `:placeholder`, a document path or
-//! a `size` call over one — the grammar reads nothing else there, so parentheses, which
-//! group CONDITIONS, cannot be written around an operand, while a path that reaches as deep
-//! into the item as the document-path grammar allows is read like any other.
+//! a `size` call over one, written on its own or inside the parentheses that GROUP what the
+//! grammar reads at that position, while a path that reaches as deep into the item as the
+//! document-path grammar allows is read like any other.
 //!
 //! The rows span both halves: the operand forms the grammar reads (a path into a map, into
-//! a list, into a map inside a list, a `size` over each of them) and the forms it does not
-//! (a parenthesised path, a parenthesised value, a parenthesised `size` call), each of the
-//! latter refused as the syntax error it is rather than evaluated.
+//! a list, into a map inside a list, a `size` over each of them, and each of those grouped)
+//! and the form it does not (a pair of parentheses around an operand's own pair, which
+//! groups what is already grouped), the latter refused for those parentheses rather than
+//! evaluated.
 
 use serde_json::{json, Value};
 
@@ -54,6 +55,11 @@ async fn an_operand_is_a_value_a_path_or_a_size_over_one() {
         ("attribute_type(mp.num, :tn)", json!({":tn": {"S": "N"}}), 1),
         ("begins_with(mp.deep, :b)", json!({":b": {"S": "be"}}), 1),
         ("size(mp) = :one", json!({":one": {"N": "1"}}), 0),
+        // The same operands with the parentheses that group them: a pair around an operand
+        // or around a call's argument states that operand itself.
+        ("attribute_exists((s))", json!({}), 1),
+        ("contains(s, (:c))", json!({":c": {"S": "bet"}}), 1),
+        ("size((s)) = (:four)", json!({":four": {"N": "4"}}), 1),
     ];
     for (filter, values, selected) in served {
         let mut request = json!({"TableName": TABLE, "FilterExpression": filter});
@@ -74,23 +80,16 @@ async fn an_operand_is_a_value_a_path_or_a_size_over_one() {
         );
     }
 
-    // The forms it does not read: a group around an OPERAND. Each is the syntax error the
-    // parse stopped at, quoted from the request's own text.
+    // The form it does not read: a pair of parentheses around an operand's own pair, which
+    // groups what is already grouped and says nothing about how the expression is read.
+    let redundant = "The expression has redundant parentheses;";
     let refused: Vec<(&str, Value, &str)> = vec![
+        ("attribute_exists(((s)))", json!({}), redundant),
+        ("contains(s, ((:c)))", json!({":c": {"S": "bet"}}), redundant),
         (
-            "attribute_exists((s))",
-            json!({}),
-            "Syntax error; token: \"(\", near: \"((s\"",
-        ),
-        (
-            "contains(s, (:c))",
-            json!({":c": {"S": "bet"}}),
-            "Syntax error; token: \"(\", near: \", (:c\"",
-        ),
-        (
-            "size((s)) = :four",
+            "size(((s))) = :four",
             json!({":four": {"N": "4"}}),
-            "Syntax error; token: \"(\", near: \"((s\"",
+            redundant,
         ),
     ];
     for (filter, values, detail) in refused {

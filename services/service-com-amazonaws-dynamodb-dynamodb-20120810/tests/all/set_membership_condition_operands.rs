@@ -470,11 +470,6 @@ async fn the_calls_whose_signature_declares_a_path_still_require_one() {
             needs_a_path("attribute_type"),
         ),
         (
-            "begins_with given a value in its path position",
-            "begins_with(:one, :one)",
-            needs_a_path("begins_with"),
-        ),
-        (
             "size given a value",
             "size(:one) = :tier",
             needs_a_path("size"),
@@ -505,6 +500,24 @@ async fn the_calls_whose_signature_declares_a_path_still_require_one() {
             "case {case:?} ({filter:?}): expected {expected:?}, got {status} with {answered}"
         );
     }
+
+    // `begins_with` is the OTHER call whose two operands are read the way `contains`'s are:
+    // the text a prefix is tested on may be a value the request carried, so the call is
+    // evaluated per item and answered as the page it selects rather than refused.
+    let (status, answered) = call(
+        &router,
+        "Scan",
+        json!({"TableName": TABLE, "FilterExpression": "begins_with(:one, #st)",
+               "ExpressionAttributeNames": {"#st": "status"},
+               "ExpressionAttributeValues": {":one": {"S": "active"}}}),
+    )
+    .await;
+    assert_eq!(
+        (status, &answered["Count"], &answered["ScannedCount"]),
+        (200, &json!(2), &json!(SCANNED)),
+        "case a prefix test whose tested text is a value the request carried: expected the 2 \
+         items of {SCANNED} whose status it begins with, got {status} with {answered}"
+    );
 }
 
 /// The whole message a value written where the signature declares a document path earns on

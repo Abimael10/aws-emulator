@@ -550,6 +550,11 @@ pub enum GroupToken {
     Open,
     Close,
     Other,
+    /// The `(` that carries a function CALL's arguments. It closes with a `)` like a group
+    /// does, so the walk pairs it with one, and it groups NOTHING — what stands inside it
+    /// are that call's arguments — so a pair written around one argument is not a pair
+    /// around a group.
+    Call,
 }
 
 /// Whether a token stream holds a pair of parentheses that groups what is already
@@ -561,9 +566,10 @@ pub enum GroupToken {
 /// which tokenize their own text and share no parser — are held to one reading of the rule
 /// rather than two.
 ///
-/// The parentheses of a function CALL carry its arguments and are never redundant, which
-/// the walk gets for free: a call's `(` follows the word that names it, so the group it
-/// opens does not begin where the group around it begins.
+/// The parentheses of a function CALL carry its arguments rather than grouping anything, so
+/// they are read as the call's own ([`GroupToken::Call`]): neither the pair a call opens nor
+/// a single pair written around one of its arguments states a group inside a group, while a
+/// pair around such an argument's own pair states exactly that.
 pub fn states_redundant_parentheses(tokens: &[GroupToken]) -> bool {
     // The index of the `(` each `)` closes, filled in as the walk closes each group, so
     // the group that ends just before a `)` is known when that `)` is reached.
@@ -571,7 +577,7 @@ pub fn states_redundant_parentheses(tokens: &[GroupToken]) -> bool {
     let mut open_groups: Vec<usize> = Vec::new();
     for (at, token) in tokens.iter().enumerate() {
         match token {
-            GroupToken::Open => open_groups.push(at),
+            GroupToken::Open | GroupToken::Call => open_groups.push(at),
             GroupToken::Close => {
                 // A `)` closing nothing is unbalanced, which the grammar states on its
                 // own: there is no group here to call redundant.
@@ -579,6 +585,11 @@ pub fn states_redundant_parentheses(tokens: &[GroupToken]) -> bool {
                     return false;
                 };
                 opened_by[at] = Some(open);
+                // A call's parentheses group nothing, so what they carry is never a group
+                // inside a group: `f((a))` states one pair around one argument.
+                if matches!(tokens.get(open), Some(GroupToken::Call)) {
+                    continue;
+                }
                 // This group's content is exactly one group of its own: it begins where
                 // that group begins and ends where it ends.
                 if at > 0
@@ -3538,7 +3549,9 @@ impl<'a> ExprParser<'a> {
         let grouping: Vec<GroupToken> = self
             .tokens
             .iter()
-            .map(|token| match token {
+            .enumerate()
+            .map(|(at, token)| match token {
+                ExprToken::Open if self.opens_a_call(at) => GroupToken::Call,
                 ExprToken::Open => GroupToken::Open,
                 ExprToken::Close => GroupToken::Close,
                 _ => GroupToken::Other,
@@ -3673,12 +3686,28 @@ impl<'a> ExprParser<'a> {
         }
     }
 
-    /// The name of the function call that starts here, if one does.
-    fn peek_call(&self) -> Option<String> {
-        match (self.peek(), self.tokens.get(self.at + 1)) {
-            (Some(ExprToken::Word(word)), Some(ExprToken::Open)) => Some(word.clone()),
+    /// The word a CALL starting at `at` names, if a call starts there: a word with this
+    /// grammar's `(` just after it. The one reading of what starts a call, so the cursor's
+    /// own call ([`Self::peek_call`]) and the `(` a call opens ([`Self::opens_a_call`])
+    /// cannot drift apart.
+    fn call_at(&self, at: usize) -> Option<&str> {
+        match (self.tokens.get(at), self.tokens.get(at + 1)) {
+            (Some(ExprToken::Word(word)), Some(ExprToken::Open)) => Some(word.as_str()),
             _ => None,
         }
+    }
+
+    /// Whether the `(` at `at` carries a CALL's arguments rather than opening a group: the
+    /// word before it names one of this language's functions ([`function_signature`]).
+    fn opens_a_call(&self, at: usize) -> bool {
+        at.checked_sub(1)
+            .and_then(|before| self.call_at(before))
+            .is_some_and(|word| function_signature(word).is_some())
+    }
+
+    /// The name of the function call that starts here, if one does.
+    fn peek_call(&self) -> Option<String> {
+        self.call_at(self.at).map(str::to_string)
     }
 
     fn descend(&mut self) -> Result<(), RequestError> {
@@ -3916,7 +3945,7 @@ impl<'a> ExprParser<'a> {
                 ConditionNode::AttributeType(path, wanted)
             }
             "begins_with" => {
-                let value = Operand::Path(self.function_path(name)?);
+                let value = self.function_operand(name, signature, 0)?;
                 self.expect(&ExprToken::Comma)?;
                 let prefix = self.function_operand(name, signature, 1)?;
                 check_begins_with_prefix(self.member, &prefix)?;
@@ -3991,13 +4020,42 @@ impl<'a> ExprParser<'a> {
         separators + 1
     }
 
+    /// One ARGUMENT of a call, read through the parentheses that group it.
+    ///
+    /// Parentheses group what the grammar reads at the position they stand in, and an
+    /// argument position reads an operand, so a pair written around an argument states that
+    /// argument. The pair the CALL itself opens is already behind the parse by the time an
+    /// argument is read, so every `(` standing here opens a group of its own; a pair that
+    /// groups what is already grouped is refused once the whole expression has parsed
+    /// ([`Self::check_no_redundant_parentheses`]), and the nesting one argument can state is
+    /// bounded like every other ([`Self::descend`]).
+    fn argument<T>(
+        &mut self,
+        read: impl FnOnce(&mut Self) -> Result<T, RequestError>,
+    ) -> Result<T, RequestError> {
+        let mut groups = 0usize;
+        while matches!(self.peek(), Some(ExprToken::Open)) {
+            self.at += 1;
+            self.descend()?;
+            groups += 1;
+        }
+        let read = read(self)?;
+        for _ in 0..groups {
+            self.depth -= 1;
+            self.expect(&ExprToken::Close)?;
+        }
+        Ok(read)
+    }
+
     /// One operand position the signature declares as a document PATH: a `:placeholder`
     /// written there names no location at all.
     fn function_path(&mut self, function: &str) -> Result<DocumentPath, RequestError> {
-        if matches!(self.peek(), Some(ExprToken::Placeholder(_))) {
-            return Err(requires_document_path(self.member, function));
-        }
-        self.path()
+        self.argument(|parser| {
+            if matches!(parser.peek(), Some(ExprToken::Placeholder(_))) {
+                return Err(requires_document_path(parser.member, function));
+            }
+            parser.path()
+        })
     }
 
     /// One operand of a call, held to the kind the signature declares for that position.
@@ -4007,7 +4065,7 @@ impl<'a> ExprParser<'a> {
         signature: &[OperandKind],
         at: usize,
     ) -> Result<Operand, RequestError> {
-        let operand = self.operand()?;
+        let operand = self.argument(|parser| parser.operand())?;
         if let Some(kind) = signature.get(at) {
             check_operand_kind(self.member, function, *kind, &operand)?;
         }
@@ -4051,10 +4109,9 @@ impl<'a> ExprParser<'a> {
     /// `comparison_operand := '(' comparison_operand ')' | operand`.
     ///
     /// A pair of parentheses around an operand groups what the comparison reads at that
-    /// position, so it states the operand it wraps. The parentheses of a FUNCTION CALL
-    /// carry that call's arguments instead, so an argument is read at the kind its
-    /// signature declares ([`Self::function_operand`]) and a group written there is the
-    /// syntax error it is.
+    /// position, so it states the operand it wraps. An ARGUMENT of a call is an operand
+    /// position too, read through whatever pairs group it ([`Self::argument`]) and then held
+    /// to the kind its signature declares ([`Self::function_operand`]).
     fn comparison_operand(&mut self) -> Result<Operand, RequestError> {
         if matches!(self.peek(), Some(ExprToken::Open)) {
             self.at += 1;

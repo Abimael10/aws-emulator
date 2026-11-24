@@ -59,6 +59,14 @@ pub(super) enum OperandKind {
 /// (`contains(:candidates, #attribute)`), and AWS is observed to evaluate that call per item
 /// instead of refusing it. Both positions are then read the same way, and what each holds is
 /// known only once an item is read.
+///
+/// `begins_with` is read the same way, and for the same reason: AWS is observed to evaluate
+/// `begins_with(:text, #attribute)` per item — the tested text may be one the REQUEST
+/// carried and the prefix one the item holds — and to answer the items that satisfy it
+/// rather than to refuse the call. Only `if_not_exists`, whose first operand is the location
+/// an update writes when it is absent, needs a path in that position, and the
+/// `attribute_exists`/`attribute_not_exists`/`size` and `attribute_type` positions above
+/// each state a location or a type NAME rather than a value to compare.
 pub(super) fn function_signature(name: &str) -> Option<&'static [OperandKind]> {
     const PATH: &[OperandKind] = &[OperandKind::Path];
     const PATH_VALUE: &[OperandKind] = &[OperandKind::Path, OperandKind::Value];
@@ -67,8 +75,8 @@ pub(super) fn function_signature(name: &str) -> Option<&'static [OperandKind]> {
     match name {
         "attribute_exists" | "attribute_not_exists" | "size" => Some(PATH),
         "attribute_type" => Some(PATH_VALUE),
-        "begins_with" | "if_not_exists" => Some(PATH_EITHER),
-        "contains" | "list_append" => Some(EITHER_EITHER),
+        "if_not_exists" => Some(PATH_EITHER),
+        "begins_with" | "contains" | "list_append" => Some(EITHER_EITHER),
         _ => None,
     }
 }
