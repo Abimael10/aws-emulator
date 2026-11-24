@@ -242,4 +242,30 @@ impl ComAmazonawsBillingAwsbillingState {
                 self.history_covers_billed_account(account_id, &spend.account_id)
             })
     }
+
+    /// The Support-eligible spend records of one billing month that the
+    /// Business Support charge report prices: the records of the accounts of
+    /// `account_id`'s consolidated billing family whose bill records a Support
+    /// plan that report can name, in ascending account order, each beside the
+    /// store key it is held under so a paginated read of them resumes after the
+    /// account its previous page ended on.
+    ///
+    /// The family traversal is [`Self::support_eligible_spend_for_month`]'s,
+    /// and the subscription is the record's own plan — the rule
+    /// [`Self::support_subscription_contracts`] and
+    /// [`Self::enterprise_support_spend_entries_for_month`] already read by.
+    /// The modeled `BusinessSupportAccountCharge$supportPlanName` documents its
+    /// valid values as the three [`SUPPORT_PLAN_NAMES`] holds, so a bill
+    /// recording another plan — such as the Enterprise Support plan an
+    /// Enterprise Support profile's accounts are billed under — is that plan's
+    /// charge to report, and belongs neither among this report's entries nor in
+    /// the month totals and account count summed over them.
+    pub fn business_support_spend_entries_for_month<'a>(
+        &'a self,
+        account_id: &'a str,
+        billing_month: &str,
+    ) -> impl Iterator<Item = (&'a String, &'a SupportEligibleSpend)> {
+        self.support_eligible_spend_for_month(account_id, billing_month)
+            .filter(|(_, spend)| SUPPORT_PLAN_NAMES.contains(&spend.support_plan_name.as_str()))
+    }
 }

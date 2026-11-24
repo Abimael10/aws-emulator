@@ -7,14 +7,17 @@
 //!
 //! It is a REPORTING operation (`@readonly`): it reads the store and writes
 //! nothing, so a caller cannot change another caller's answer by reading. For
-//! the requested billing month it walks the records of the caller's
-//! consolidated billing family, charges each account's Support-eligible spend
-//! by the published price schedule of the Support plan that account was
-//! subscribed to, and reports the per-account breakdown — filtered to one
-//! account when the request names one, ascending by account and paged by
-//! `maxResults`/`nextToken` — beside the month's own totals and account count,
-//! which the model documents as being "for all accounts in the billing month"
-//! and so are neither filtered nor paged.
+//! the requested billing month it walks the bills of the caller's consolidated
+//! billing family that record one of the Support plans this report's own
+//! `supportPlanName` documents, charges each such account's Support-eligible
+//! spend by the published price schedule of that plan, and reports the
+//! per-account breakdown — filtered to one account when the request names one,
+//! ascending by account and paged by `maxResults`/`nextToken` — beside the
+//! month's own totals and account count, which the model documents as being
+//! "for all accounts in the billing month" and so are neither filtered nor
+//! paged. A bill recording another plan, such as the Enterprise Support plan
+//! an Enterprise Support profile's accounts are billed under, is that plan's
+//! charge to report and is left out of both the entries and those totals.
 //!
 //! NOTE: nothing in this emulator writes that store yet — spend accrues from a
 //! billing run, and the emulator performs none. So on a running emulator this
@@ -213,8 +216,11 @@ struct PriceSchedule {
 /// 3% of that spend; Basic Support nothing. The plan names are the model's own
 /// (see [`crate::state::SUPPORT_PLAN_NAMES`]).
 ///
-/// A stored plan this service has no schedule for is reported with its spend
-/// and no charge, rather than priced by another plan's schedule.
+/// Basic Support is free, so it carries no minimum and no tier — and a stored
+/// plan this service has no schedule for (one the selection this report walks
+/// by, [`crate::state::ComAmazonawsBillingAwsbillingState::business_support_spend_entries_for_month`],
+/// does not admit) is reported with its spend and no charge, rather than priced
+/// by another plan's schedule.
 fn price_schedule(support_plan_name: &str) -> PriceSchedule {
     match support_plan_name {
         crate::state::SUPPORT_PLAN_BUSINESS => PriceSchedule {
@@ -244,6 +250,10 @@ fn price_schedule(support_plan_name: &str) -> PriceSchedule {
                 upper_bound_minor: None,
                 rate_basis_points: 300,
             }],
+        },
+        crate::state::SUPPORT_PLAN_BASIC => PriceSchedule {
+            minimum_charge_minor: 0,
+            tiers: &[],
         },
         _ => PriceSchedule {
             minimum_charge_minor: 0,
@@ -524,18 +534,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or(DEFAULT_MAX_RESULTS)
             .clamp(MIN_MAX_RESULTS, MAX_MAX_RESULTS);
 
-        // Every account the month holds a bill for is priced, whichever one the
-        // request asked about: the month's `totalSupportCharge`,
-        // `totalSupportEligibleSpend` and `accountCount` are documented as
-        // being for ALL accounts in the billing month, so they are the sum over
-        // the month and move with neither the `accountId` filter nor the page.
+        // Every account the month holds a Business/Developer/Basic Support bill
+        // for is priced, whichever one the request asked about: the month's
+        // `totalSupportCharge`, `totalSupportEligibleSpend` and `accountCount`
+        // are documented as being for ALL accounts in the billing month, so
+        // they are the sum over the month's bills this report covers and move
+        // with neither the `accountId` filter nor the page. An account billed
+        // under a plan this report's `supportPlanName` cannot name is not one
+        // of them: the selection leaves its bill to that plan's own report, so
+        // neither its spend nor its head-count reaches these totals.
         let mut total_support_charge_minor = 0_i64;
         let mut total_support_eligible_spend_minor = 0_i64;
         let mut account_count = 0_i32;
         let mut selected: Vec<(&String, BusinessSupportAccountCharge)> = Vec::new();
-        for (key, spend) in state
-            .support_eligible_spend_for_month(crate::state::caller_account_id(), &input.billing_month)
-        {
+        for (key, spend) in state.business_support_spend_entries_for_month(
+            crate::state::caller_account_id(),
+            &input.billing_month,
+        ) {
             let (charge, charge_minor, basis_minor) = account_charge(spend);
             total_support_charge_minor = total_support_charge_minor.saturating_add(charge_minor);
             total_support_eligible_spend_minor =
