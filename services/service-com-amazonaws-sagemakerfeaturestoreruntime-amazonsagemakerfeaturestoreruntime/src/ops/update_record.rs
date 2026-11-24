@@ -325,19 +325,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.ttl_duration.is_some() && posted_event_time.is_none() {
             return Err(validation(EVENT_TIME_REQUIRED_FOR_TTL));
         }
-        let ttl_secs = match input.ttl_duration.as_ref() {
-            None => None,
-            Some(ttl) => match crate::state::ttl_seconds(ttl) {
-                Some(secs) => Some(secs),
-                None => {
-                    return Err(validation(format!(
-                        "TtlDuration.Unit: '{}' is not a TtlDurationUnit; expected one of {}",
-                        ttl.unit,
-                        TTL_DURATION_UNIT_VALUES.join(", ")
-                    )))
-                }
-            },
-        };
+        // The TTL the update states, read through the data plane's one statement of this
+        // guard ([`crate::state::declared_ttl_seconds`]), so a unit outside the modelled
+        // enum is refused here exactly as a whole-record write refuses it.
+        let ttl_secs = input
+            .ttl_duration
+            .as_ref()
+            .map(crate::state::declared_ttl_seconds)
+            .transpose()
+            .map_err(validation)?;
 
         // An event time the request carries must be a timestamp: the update is ordered
         // against the stored record's, so a value in neither accepted format orders

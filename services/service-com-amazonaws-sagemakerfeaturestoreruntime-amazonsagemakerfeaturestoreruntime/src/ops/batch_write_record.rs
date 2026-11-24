@@ -192,15 +192,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The REQUEST-level `TtlDuration` "applies to all entries that do not specify
         // their own TtlDuration", so a unit outside the modelled enum would misread every
         // one of them: it is a defect of the request itself, not of one entry, and fails
-        // the call rather than being reported per entry.
+        // the call rather than being reported per entry. The guard is the data plane's one
+        // statement of it ([`crate::state::declared_ttl_seconds`]), the same one each
+        // entry's own `TtlDuration` is read through below.
         if let Some(ttl) = input.ttl_duration.as_ref() {
-            if crate::state::ttl_seconds(ttl).is_none() {
-                return Err(validation(format!(
-                    "TtlDuration.Unit: '{}' is not a TtlDurationUnit; expected one of {}",
-                    ttl.unit,
-                    TTL_DURATION_UNIT_VALUES.join(", ")
-                )));
-            }
+            crate::state::declared_ttl_seconds(ttl).map_err(validation)?;
         }
 
         let mut errors: Vec<BatchWriteRecordError2> = Vec::new();

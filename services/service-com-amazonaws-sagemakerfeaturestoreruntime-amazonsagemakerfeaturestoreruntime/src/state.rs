@@ -607,20 +607,9 @@ pub fn prepare_record(
 
     // The write's own TTL, in seconds: `ExpiresAt = EventTime + TtlDuration`, per the
     // `TtlDuration` shape's doc. The unit is a modelled enum, refused at the boundary,
-    // so a value outside it only reaches here if the walk let it through.
-    let record_ttl_secs = match ttl_duration {
-        None => None,
-        Some(ttl) => match ttl_seconds(ttl) {
-            Some(secs) => Some(secs),
-            None => {
-                return Err(format!(
-                    "TtlDuration.Unit: '{}' is not a TtlDurationUnit; expected one of {}",
-                    ttl.unit,
-                    crate::ops::types::TTL_DURATION_UNIT_VALUES.join(", ")
-                ))
-            }
-        },
-    };
+    // so a value outside it only reaches the one guard this plane states it in
+    // ([`declared_ttl_seconds`]) if the walk let it through.
+    let record_ttl_secs = ttl_duration.map(declared_ttl_seconds).transpose()?;
 
     // The TTL the record is stored under: its own when the write named one, and otherwise
     // the default the feature group configures ([`effective_ttl_seconds`]).
@@ -856,6 +845,28 @@ pub fn undeclared_target_store(target_stores: Option<&Vec<String>>) -> Option<St
         "TargetStores: '{unknown}' is not a TargetStore; expected one of {}",
         crate::ops::types::TARGET_STORE_VALUES.join(", ")
     ))
+}
+
+/// The span a `TtlDuration` member states, in seconds ([`ttl_seconds`]), or the refusal
+/// message for a `Unit` the model's `TtlDurationUnit` enum does not declare.
+///
+/// Every `TtlDuration` the wire carries is read through here — a whole-record write's own
+/// ([`prepare_record`], reached by `PutRecord` and by each `BatchWriteRecord` entry), the
+/// request-level one `BatchWriteRecord` applies "to all entries that do not specify their
+/// own TtlDuration", and the one a partial update states — because the unit arrives as a
+/// plain string and a value outside the enum has no span to add to an event time: it is
+/// refused with the modelled `ValidationError` rather than read as no TTL at all. The
+/// boundary validator refuses it first; this is the handlers' own guard, stated once so no
+/// two of them word it differently, beside [`undeclared_target_store`] and
+/// [`expiration_time_enabled`].
+pub fn declared_ttl_seconds(ttl: &crate::ops::types::TtlDuration) -> Result<f64, String> {
+    ttl_seconds(ttl).ok_or_else(|| {
+        format!(
+            "TtlDuration.Unit: '{}' is not a TtlDurationUnit; expected one of {}",
+            ttl.unit,
+            crate::ops::types::TTL_DURATION_UNIT_VALUES.join(", ")
+        )
+    })
 }
 
 /// The per-entry `ErrorCode` a batch operation of this data plane reports a refused

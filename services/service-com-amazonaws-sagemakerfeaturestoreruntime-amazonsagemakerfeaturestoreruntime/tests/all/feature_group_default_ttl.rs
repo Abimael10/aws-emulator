@@ -1164,3 +1164,300 @@ async fn a_soft_deleted_record_is_hard_deleted_once_its_re_derived_expiry_falls_
         );
     }
 }
+
+/// Whether `code` is the classification this data plane refuses a malformed request with:
+/// the modelled `ValidationError` a handler answers, or the `ValidationException` the
+/// protocol boundary answers for a value the model's own constraints already exclude.
+fn is_validation_code(code: &str) -> bool {
+    code == "ValidationError" || code == "ValidationException"
+}
+
+/// The `ErrorCode` of each entry `BatchWriteRecord` reports in `Errors`.
+fn entry_error_codes(body: &Value) -> Vec<String> {
+    body.get("Errors")
+        .and_then(Value::as_array)
+        .map(|errors| {
+            errors
+                .iter()
+                .map(|failed| failed["ErrorCode"].as_str().unwrap_or_default().to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One row of the TTL-unit table: the case name, the `Unit` a request states, the `Value`
+/// beside it, and the span in seconds the two denote — `None` for a unit the model's
+/// `TtlDurationUnit` enum does not declare, which denotes no span at all.
+type TtlUnitRow<'a> = (&'a str, &'a str, i32, Option<f64>);
+
+#[tokio::test]
+async fn one_ttl_duration_unit_rule_serves_every_member_that_carries_a_duration() {
+    // `ExpiresAt = EventTime + TtlDuration` for a unit the model's `TtlDurationUnit` enum
+    // declares, and a refusal for one it does not — the same reading wherever a
+    // `TtlDuration` reaches this data plane: a whole-record write's own duration
+    // (`PutRecord`, and each `BatchWriteRecord` entry), the request-level duration
+    // `BatchWriteRecord` applies "to all entries that do not specify their own
+    // TtlDuration", and the duration a partial update states.
+    //
+    // Rows: every unit the enum declares — Seconds, Minutes, Hours, Days, Weeks
+    // (`smithy_query(query="shape", shape="TtlDurationUnit")`, the list
+    // `TTL_DURATION_UNIT_VALUES` in `ops::types::shared_types` holds) — at the published
+    // lower bound of `TtlDurationValue` (range 1..) and above it, crossed with spellings
+    // the enum declares nowhere.
+    let rows: [TtlUnitRow<'_>; 9] = [
+        (
+            "Seconds, at the lower bound of TtlDurationValue",
+            "Seconds",
+            1,
+            Some(1.0),
+        ),
+        ("Minutes", "Minutes", 90, Some(5_400.0)),
+        ("Hours", "Hours", 36, Some(129_600.0)),
+        ("Days", "Days", 2, Some(172_800.0)),
+        ("Weeks", "Weeks", 52, Some(31_449_600.0)),
+        ("a unit the enum spells nowhere", "Fortnights", 2, None),
+        ("a declared unit in lower case", "days", 2, None),
+        ("a declared unit in upper case", "WEEKS", 1, None),
+        ("a declared unit with a trailing space", "Hours ", 1, None),
+    ];
+
+    for (case, unit, value, span) in rows {
+        let emulator = Emulator::new();
+        // No default TTL on the group, so an `ExpiresAt` a read reports can only come
+        // from the duration the request states.
+        emulator.create_feature_group("ttlunit", None);
+        let event_time = tomorrow_iso();
+        let ttl = json!({ "Unit": unit, "Value": value });
+
+        // The duration a WHOLE-RECORD write states for itself.
+        let (status, body) = emulator
+            .put_record(
+                "ttlunit",
+                json!({
+                    "Record": [
+                        feature(IDENTIFIER_FEATURE, "C-put"),
+                        feature(EVENT_TIME_FEATURE, &event_time),
+                        feature("city", "Seattle")
+                    ],
+                    "TtlDuration": ttl.clone()
+                }),
+            )
+            .await;
+        let code = error_code(&body);
+        match span {
+            Some(expected) => {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?} via PutRecord: expected 200 for a declared unit, got \
+                     {status} with body {body:?}"
+                );
+                let (_, served) = emulator.get_record("ttlunit", "C-put").await;
+                assert_expiry(
+                    &format!("{case} via PutRecord"),
+                    &served,
+                    &event_time,
+                    Some(expected),
+                );
+            }
+            None => {
+                assert!(
+                    status == 400 && is_validation_code(&code),
+                    "case {case:?} via PutRecord: expected HTTP 400 with a validation error \
+                     code for an undeclared unit, got {status} {code:?} with body {body:?}"
+                );
+                let (_, served) = emulator.get_record("ttlunit", "C-put").await;
+                let pairs = record_pairs(&served);
+                assert!(
+                    pairs.is_empty(),
+                    "case {case:?} via PutRecord: expected the refused write to store \
+                     nothing, got {pairs:?}"
+                );
+            }
+        }
+
+        // The same duration on ONE ENTRY of a batch, which is the same whole-record
+        // write.
+        let (status, body) = emulator
+            .batch_write_record(json!({ "Entries": [{
+                "FeatureGroupName": "ttlunit",
+                "Record": [
+                    feature(IDENTIFIER_FEATURE, "C-entry"),
+                    feature(EVENT_TIME_FEATURE, &event_time),
+                    feature("city", "Denver")
+                ],
+                "TtlDuration": ttl.clone()
+            }] }))
+            .await;
+        let code = error_code(&body);
+        let entry_codes = entry_error_codes(&body);
+        match span {
+            Some(expected) => {
+                assert_eq!(
+                    (status, entry_codes.clone()),
+                    (200, Vec::new()),
+                    "case {case:?} via a BatchWriteRecord entry: expected 200 with no entry \
+                     errors for a declared unit, got {status} {entry_codes:?} with body \
+                     {body:?}"
+                );
+                let (_, served) = emulator.get_record("ttlunit", "C-entry").await;
+                assert_expiry(
+                    &format!("{case} via a BatchWriteRecord entry"),
+                    &served,
+                    &event_time,
+                    Some(expected),
+                );
+            }
+            None => {
+                // Either layer may be the one that refuses it — the boundary validator
+                // for the modelled enum, refusing the whole request, or the handler's own
+                // guard, reporting the ONE entry it belongs to — and neither writes the
+                // entry's record.
+                let refused_whole = status == 400 && is_validation_code(&code);
+                let refused_entry = status == 200
+                    && entry_codes.len() == 1
+                    && is_validation_code(&entry_codes[0]);
+                assert!(
+                    refused_whole || refused_entry,
+                    "case {case:?} via a BatchWriteRecord entry: expected an undeclared unit \
+                     to be refused, as HTTP 400 or as that entry's own validation error, got \
+                     {status} {code:?} {entry_codes:?} with body {body:?}"
+                );
+                let (_, served) = emulator.get_record("ttlunit", "C-entry").await;
+                let pairs = record_pairs(&served);
+                assert!(
+                    pairs.is_empty(),
+                    "case {case:?} via a BatchWriteRecord entry: expected the refused entry \
+                     to store nothing, got {pairs:?}"
+                );
+            }
+        }
+
+        // The REQUEST-level duration, which "applies to all entries that do not specify
+        // their own TtlDuration": it would misread every entry, so it is the request's own
+        // failure rather than one entry's.
+        let (status, body) = emulator
+            .batch_write_record(json!({
+                "TtlDuration": ttl.clone(),
+                "Entries": [{
+                    "FeatureGroupName": "ttlunit",
+                    "Record": [
+                        feature(IDENTIFIER_FEATURE, "C-request"),
+                        feature(EVENT_TIME_FEATURE, &event_time),
+                        feature("city", "Austin")
+                    ]
+                }]
+            }))
+            .await;
+        let code = error_code(&body);
+        let entry_codes = entry_error_codes(&body);
+        match span {
+            Some(expected) => {
+                assert_eq!(
+                    (status, entry_codes.clone()),
+                    (200, Vec::new()),
+                    "case {case:?} via a request-level TtlDuration: expected 200 with no \
+                     entry errors for a declared unit, got {status} {entry_codes:?} with \
+                     body {body:?}"
+                );
+                let (_, served) = emulator.get_record("ttlunit", "C-request").await;
+                assert_expiry(
+                    &format!("{case} via a request-level TtlDuration"),
+                    &served,
+                    &event_time,
+                    Some(expected),
+                );
+            }
+            None => {
+                assert!(
+                    status == 400 && is_validation_code(&code),
+                    "case {case:?} via a request-level TtlDuration: expected HTTP 400 with a \
+                     validation error code for an undeclared unit, got {status} {code:?} \
+                     with body {body:?}"
+                );
+                let (_, served) = emulator.get_record("ttlunit", "C-request").await;
+                let pairs = record_pairs(&served);
+                assert!(
+                    pairs.is_empty(),
+                    "case {case:?} via a request-level TtlDuration: expected the refused \
+                     request to store nothing, got {pairs:?}"
+                );
+            }
+        }
+
+        // The duration a PARTIAL UPDATE states, beside the `EventTime` the same request
+        // has to carry. The record it updates is ingested under no duration at all, so the
+        // `ExpiresAt` it ends up with is the one this update derives.
+        let (status, body) = emulator
+            .put_record(
+                "ttlunit",
+                json!({ "Record": [
+                    feature(IDENTIFIER_FEATURE, "C-update"),
+                    feature(EVENT_TIME_FEATURE, &event_time),
+                    feature("city", "Boise")
+                ] }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the record the update is applied to to be ingested, got \
+             {status} with body {body:?}"
+        );
+        let (status, body) = emulator
+            .update_record(
+                "ttlunit",
+                json!({
+                    "RecordIdentifierValueAsString": "C-update",
+                    "Features": [
+                        feature(EVENT_TIME_FEATURE, &event_time),
+                        feature("city", "Reno")
+                    ],
+                    "TtlDuration": ttl.clone()
+                }),
+            )
+            .await;
+        let code = error_code(&body);
+        let (_, served) = emulator.get_record("ttlunit", "C-update").await;
+        let city = served_value(&served, "city");
+        match span {
+            Some(expected) => {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?} via UpdateRecord: expected 200 for a declared unit, got \
+                     {status} with body {body:?}"
+                );
+                assert_eq!(
+                    city.as_deref(),
+                    Some("Reno"),
+                    "case {case:?} via UpdateRecord: expected the update to be applied, got \
+                     {city:?}"
+                );
+                assert_expiry(
+                    &format!("{case} via UpdateRecord"),
+                    &served,
+                    &event_time,
+                    Some(expected),
+                );
+            }
+            None => {
+                assert!(
+                    status == 400 && is_validation_code(&code),
+                    "case {case:?} via UpdateRecord: expected HTTP 400 with a validation \
+                     error code for an undeclared unit, got {status} {code:?} with body \
+                     {body:?}"
+                );
+                assert_eq!(
+                    city.as_deref(),
+                    Some("Boise"),
+                    "case {case:?} via UpdateRecord: expected the refused update to change \
+                     nothing, got {city:?}"
+                );
+                let at = expires_at(&served);
+                assert!(
+                    at.is_none(),
+                    "case {case:?} via UpdateRecord: expected the refused update to derive \
+                     no ExpiresAt, got {at:?}"
+                );
+            }
+        }
+    }
+}
