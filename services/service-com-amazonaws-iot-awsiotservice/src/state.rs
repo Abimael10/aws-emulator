@@ -351,28 +351,40 @@ pub fn deprecated_thing_type_creation_message(thing_type_name: &str) -> String {
     format!("Can not create new thing with depreated thing type:{thing_type_name}")
 }
 
-/// How this service states that an `expectedVersion` does not match the registry.
+/// The sentence a VERSIONED registry family states an `expectedVersion` that does not
+/// match its record with: the fixed text, with the family's noun and the resource the
+/// request addressed interpolated into it.
 ///
 /// `VersionConflictException` is "An exception thrown when the version of an entity
 /// specified with the expectedVersion parameter does not match the latest version in
-/// the system", and `UpdateThing`/`DeleteThing` both check a thing's version against
-/// it, so the refusal is worded once here.
-///
-/// It is ONE fixed sentence whose only variable part is the thing the request addressed —
-/// the same shape this family's other version conflict takes
-/// ([`thing_group_version_conflict_message`]). Neither the version the request asked for
-/// nor the one the registry holds is part of it, so the refusal discloses nothing about the
-/// record beyond the fact that the caller has not seen it.
-pub fn thing_version_conflict_message(thing_name: &str) -> String {
-    format!("The version for thing {thing_name} does not match the expected version.")
+/// the system", and every family that takes an `expectedVersion` states it this one way, so
+/// the fixed text is written once here — the shape the registry families' shared not-found
+/// sentence takes in [`not_found`]. Neither the version the request
+/// asked for nor the one the registry holds is part of it, so the refusal discloses nothing
+/// about the record beyond the fact that the caller has not seen it.
+fn version_conflict(family: &str, name: &str) -> String {
+    format!("The version for {family} {name} does not match the expected version.")
 }
 
-/// How AWS IoT states that an `expectedVersion` does not match a THING GROUP's version:
-/// one fixed sentence whose only variable part is the group the request addressed, and
-/// which reports neither the version asked for nor the one the registry holds — the
-/// thing family's sentence ([`thing_version_conflict_message`]) with this family's noun.
+/// How this service states that an `expectedVersion` does not match a THING's version:
+/// [`version_conflict`] with this family's noun, which `UpdateThing` and `DeleteThing` both
+/// answer.
+pub fn thing_version_conflict_message(thing_name: &str) -> String {
+    version_conflict("thing", thing_name)
+}
+
+/// How this service states that an `expectedVersion` does not match a THING GROUP's
+/// version: [`version_conflict`] with this family's noun.
 pub fn thing_group_version_conflict_message(thing_group_name: &str) -> String {
-    format!("The version for thing group {thing_group_name} does not match the expected version.")
+    version_conflict("thing group", thing_group_name)
+}
+
+/// How this service states that an `expectedVersion` does not match a BILLING GROUP's
+/// version: [`version_conflict`] with this family's noun, read off the shared
+/// `VersionConflictException` template the other versioned families state rather than from a
+/// recording of this one.
+pub fn billing_group_version_conflict_message(billing_group_name: &str) -> String {
+    version_conflict("billing group", billing_group_name)
 }
 
 /// The configuration of a thing group: the members of a `CreateThingGroup` request
@@ -3445,8 +3457,9 @@ pub use scheduled_audits::{
 // are re-exported here so a handler reaches them as `crate::state::<name>`.
 pub mod billing_groups;
 pub use billing_groups::{
-    billing_group_arn, BillingGroupConfiguration, RegisteredBillingGroup,
-    FIRST_BILLING_GROUP_VERSION, MAX_BILLING_GROUPS, MAX_BILLING_GROUP_TAGS,
+    billing_group_arn, BillingGroupConfiguration, BillingGroupUpdate, BillingGroupUpdateRefusal,
+    RegisteredBillingGroup, FIRST_BILLING_GROUP_VERSION, MAX_BILLING_GROUPS,
+    MAX_BILLING_GROUP_TAGS,
 };
 
 // How a request that named a resource this service does not hold is REFUSED — the fixed

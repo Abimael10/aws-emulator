@@ -631,7 +631,7 @@ async fn a_name_the_store_does_not_hold_is_refused_by_the_reader() {
         );
         assert_eq!(
             refused.message(),
-            Some(format!("Billing group {name} does not exist")),
+            Some(format!("BillingGroup {ACCOUNT_ID}:{name} not found.")),
             "case {label:?}: expected this family's not-found sentence, got {refused:?}"
         );
     }
@@ -742,7 +742,7 @@ async fn a_thing_joins_a_billing_group_that_exists_and_no_other() {
     );
     assert_eq!(
         refused.message(),
-        Some("Billing group no-such-group does not exist".to_string()),
+        Some(format!("BillingGroup {ACCOUNT_ID}:no-such-group not found.")),
         "expected the billing-group family's not-found sentence, got {refused:?}"
     );
     assert_eq!(

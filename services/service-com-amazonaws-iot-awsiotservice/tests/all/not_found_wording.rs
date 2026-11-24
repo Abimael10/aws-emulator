@@ -14,7 +14,7 @@
 //!
 //! * the REGISTRY families qualify the name with the account the call was made for —
 //!   `<Family> <accountId>:<name> not found.` — with the family's own noun (`Thing`,
-//!   `ThingGroup`, `Thing Type`);
+//!   `ThingGroup`, `Thing Type`, `BillingGroup`);
 //! * the JOBS and COMMANDS planes word it `<Family> <id> cannot be found.`;
 //! * the AUTHORIZER family words it `Authorizer <name> not found`;
 //! * the BULK THING REGISTRATION task family words it with a sentence carrying NO part
@@ -356,6 +356,12 @@ fn cases() -> Vec<Case> {
                 format!("/thing-types/{name}/deprecate"),
                 "Thing Type",
             ),
+            (
+                "DescribeBillingGroup",
+                "GET",
+                format!("/billing-groups/{name}"),
+                "BillingGroup",
+            ),
         ] {
             rows.push(Case {
                 case: format!("{operation} on {noun} {name:?}"),
@@ -367,6 +373,20 @@ fn cases() -> Vec<Case> {
                 message: format!("{noun} {ACCOUNT_ID}:{name} not found."),
             });
         }
+
+        // The billing-group family's WRITE states the same sentence as its read.
+        // `UpdateBillingGroup$billingGroupProperties` is `@required`
+        // (`smithy_query(query="operation",operation="UpdateBillingGroup")`), so this row
+        // carries one — a miss is decided by the name, not by what the body asks for.
+        rows.push(Case {
+            case: format!("UpdateBillingGroup on BillingGroup {name:?}"),
+            method: "PATCH",
+            path: format!("/billing-groups/{name}"),
+            body: Some(json!({ "billingGroupProperties": {} })),
+            status: 404,
+            error_type: NOT_FOUND,
+            message: format!("BillingGroup {ACCOUNT_ID}:{name} not found."),
+        });
     }
 
     // The bulk-registration task family: one fixed sentence, whatever was asked for.

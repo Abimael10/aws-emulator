@@ -6,16 +6,14 @@
 //! text, and the variable parts of it come from the request and from this account's
 //! state — never from any one call's recording.
 //!
-//! * The REGISTRY families — a thing, a thing group, a thing type — qualify the name
-//!   with the ACCOUNT the call was made for: `<Family> <accountId>:<name> not found.`
-//!   ([`registry_not_found`]).
+//! * The REGISTRY families — a thing, a thing group, a thing type, a billing group —
+//!   qualify the name with the ACCOUNT the call was made for:
+//!   `<Family> <accountId>:<name> not found.` ([`registry_not_found`]).
 //! * The JOBS and COMMANDS planes word it `<Family> <id> cannot be found.`
 //!   ([`plane_not_found`]) — including a command EXECUTION, whose sentence is shared with
 //!   the device-facing half of the same plane
 //!   ([`missing_command_execution_message`]).
 //! * The AUTHORIZER family words it `Authorizer <name> not found`.
-//! * The BILLING GROUP family words it `Billing group <name> does not exist`
-//!   ([`missing_billing_group_message`]).
 //! * The DEVICE DEFENDER audit-task family words it
 //!   `Audit task with TaskId=<id> was not found` ([`missing_audit_task_message`]).
 //! * The BULK THING REGISTRATION task family words it with a sentence that carries no
@@ -150,12 +148,12 @@ pub fn fleet_metric_write_not_found_message(metric_name: &str) -> String {
 /// holds — for a reader of one, a writer of one, and for a thing whose `billingGroupName`
 /// named it.
 ///
-/// The family states the group the request named and this family's clause for a record that
-/// is not there, with the account NOT named — the form the fleet-metric family's write half
-/// takes ([`fleet_metric_write_not_found_message`]) rather than the thing-group family's
-/// account-qualified sentence.
+/// A billing group is a REGISTRY resource of this account like a thing or a thing group, so
+/// the miss is stated the way every registry family states one ([`registry_not_found`]): the
+/// family noun as ONE word, the account the record would belong to, the name the request
+/// asked about, and a terminating period.
 pub fn missing_billing_group_message(billing_group_name: &str) -> String {
-    format!("Billing group {billing_group_name} does not exist")
+    registry_not_found("BillingGroup", billing_group_name)
 }
 
 /// How this service states that a `thingTypeName` names no thing type this account holds

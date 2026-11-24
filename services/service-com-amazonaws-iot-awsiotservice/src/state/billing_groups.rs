@@ -17,11 +17,19 @@
 //! what the writer stored and the two cannot drift. `CreateThing` resolves its
 //! `billingGroupName` against the same records ([`super::ComAmazonawsIotAwsiotserviceState::register_thing`]),
 //! so a thing may only name a group this store holds.
+//!
+//! A LATER write of one record goes through the single registry write this module ends with
+//! ([`ComAmazonawsIotAwsiotserviceState::update_billing_group`]), which applies the
+//! properties the request carried and advances the record's `version` — so the reader
+//! reports what the last writer left, not the creation-time snapshot.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 
-use super::{fresh_uuid, ComAmazonawsIotAwsiotserviceState};
+use super::{
+    billing_group_version_conflict_message, fresh_uuid, missing_billing_group_message,
+    ComAmazonawsIotAwsiotserviceState,
+};
 use crate::ops::types::{BillingGroupMetadata, BillingGroupProperties};
 
 /// How many billing groups this emulator keeps for the account.
@@ -169,5 +177,106 @@ impl ComAmazonawsIotAwsiotserviceState {
                 return candidate;
             }
         }
+    }
+}
+
+/// What an update asks the registry to change about one billing group.
+///
+/// `UpdateBillingGroup$billingGroupProperties` is `@required`
+/// (`smithy_query(query="operation",operation="UpdateBillingGroup")`), so what the request
+/// carries IS the group's properties afterwards: properties carrying no description leave
+/// the group without one, the same reading [`super::ThingGroupUpdate`] makes of its own
+/// `@required` properties member.
+#[derive(Debug, Clone)]
+pub struct BillingGroupUpdate {
+    /// `BillingGroupProperties$billingGroupDescription`, as the request carried it.
+    pub description: Option<String>,
+    /// `UpdateBillingGroup$expectedVersion` — the version the caller believes the record is
+    /// at. "If the version of the billing group does not match the expected version
+    /// specified in the request, the UpdateBillingGroup request is rejected with a
+    /// VersionConflictException."
+    pub expected_version: Option<i64>,
+}
+
+/// Why a billing group record cannot take an update — what
+/// [`ComAmazonawsIotAwsiotserviceState::update_billing_group`] answers instead of the
+/// updated record.
+///
+/// It is the registry's reason, not a wire error: the handler maps it onto the error its
+/// own model declares, and the wording lives with the family's other sentences so every
+/// writer states one rule once — the shape [`super::ThingGroupUpdateRefusal`] takes.
+#[derive(Debug, Clone)]
+pub enum BillingGroupUpdateRefusal {
+    /// `billingGroupName` names no billing group in the registry.
+    MissingBillingGroup(String),
+    /// `expectedVersion` does not match the version the record holds, so the caller is
+    /// updating a record it has not seen.
+    ///
+    /// The two versions are carried for DIAGNOSTICS alone (a `Debug` rendering of why the
+    /// write was refused): this family's refusal sentence reports neither of them, only the
+    /// group the request addressed.
+    VersionConflict {
+        /// The group the request addressed.
+        billing_group_name: String,
+        /// The version the request expected.
+        expected: i64,
+        /// The version the registry holds.
+        registered: i64,
+    },
+}
+
+impl BillingGroupUpdateRefusal {
+    /// What the refusal reports, in the wording this service states each of these in.
+    pub fn message(&self) -> String {
+        match self {
+            Self::MissingBillingGroup(billing_group_name) => {
+                missing_billing_group_message(billing_group_name)
+            }
+            Self::VersionConflict {
+                billing_group_name, ..
+            } => billing_group_version_conflict_message(billing_group_name),
+        }
+    }
+}
+
+impl ComAmazonawsIotAwsiotserviceState {
+    /// Apply `update` to the billing group registered as `billing_group_name`: the ONE
+    /// registry write that changes a billing group record, answering the record as it
+    /// stands afterwards.
+    ///
+    /// Everything that can refuse the update is decided BEFORE the record is touched, so a
+    /// refused update leaves the group — and its version — exactly as it was, which is the
+    /// point of `expectedVersion`. A successful one advances the record's `version`, which
+    /// is what a later reader reports and a later `expectedVersion` has to match.
+    pub fn update_billing_group(
+        &mut self,
+        billing_group_name: &str,
+        update: BillingGroupUpdate,
+    ) -> Result<RegisteredBillingGroup, BillingGroupUpdateRefusal> {
+        let group = self
+            .billing_groups
+            .get_mut(billing_group_name)
+            .ok_or_else(|| {
+                BillingGroupUpdateRefusal::MissingBillingGroup(billing_group_name.to_string())
+            })?;
+        if let Some(expected) = update.expected_version {
+            if group.version != expected {
+                return Err(BillingGroupUpdateRefusal::VersionConflict {
+                    billing_group_name: group.billing_group_name.clone(),
+                    expected,
+                    registered: group.version,
+                });
+            }
+        }
+
+        // The group's identity — its name, the id and the ARN minted on the create — is not
+        // part of an update: `UpdateBillingGroup` carries none of them, so the record keeps
+        // what it was created with. Its tags are not either: they are managed by the tag
+        // plane ([`RegisteredBillingGroup::tags`]).
+        group.configuration.description = update.description;
+        // One update is one write of the record, so the registry version it carries advances
+        // by one — which is what a caller holding the old version then conflicts against.
+        group.version += 1;
+        Ok(group.clone())
     }
 }

@@ -3,9 +3,9 @@
 //! @op DescribeBillingGroup
 //!
 //! A PURE READ of the billing group the URI label names
-//! ([`crate::state::RegisteredBillingGroup`]): the record `CreateBillingGroup` persisted is
-//! reported as the response — its name, id and ARN, the `billingGroupProperties` the
-//! create stored, the `billingGroupMetadata` of the record and the version it carries — and
+//! ([`crate::state::RegisteredBillingGroup`]): the record the last writer left is
+//! reported as the response — its name, id and ARN, the `billingGroupProperties` that
+//! writer stored, the `billingGroupMetadata` of the record and the version it carries — and
 //! a name the account holds no group under is the modelled `ResourceNotFoundException`
 //! (404) in this family's wording ([`crate::state::missing_billing_group_message`]), never
 //! a hollow 200. The read writes nothing, so a later caller sees what this one saw.
@@ -173,8 +173,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
 
-        // Every member is read off the one record the create persisted, so this reader and
-        // that writer cannot drift: the properties the create stored
+        // Every member is read off the one record the writers persisted, so this reader and
+        // those writers cannot drift: the properties the last write stored
         // ([`crate::state::RegisteredBillingGroup::properties`]), the metadata of the
         // record ([`crate::state::RegisteredBillingGroup::metadata`]) and the version the
         // record carries.

@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateBillingGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateBillingGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateBillingGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies a change to the BILLING GROUP the URI label names
+//! ([`crate::state::RegisteredBillingGroup`]): `billingGroupProperties` is `@required`, so
+//! what the request carries IS the group's properties afterwards, and the one write
+//! advances the record's `version` — the value this call reports and the next
+//! `expectedVersion` has to match, so `DescribeBillingGroup` reads back the new properties
+//! at the new version.
+//!
+//! The write runs under OPTIMISTIC CONCURRENCY: an `expectedVersion` that does not match
+//! the stored version is the modelled `VersionConflictException` (409) in this family's
+//! wording ([`crate::state::billing_group_version_conflict_message`]) and changes nothing,
+//! and a name the account holds no group under is the modelled `ResourceNotFoundException`
+//! (404) in this family's wording ([`crate::state::missing_billing_group_message`]).
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +155,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateBillingGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateBillingGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateBillingGroup"))
+        // `ctx` carries request metadata only; an update addresses a group that is already
+        // registered, so nothing it changes is region-scoped.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateBillingGroupErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        // What the request asks the registry to change. `billingGroupProperties` is
+        // `@required` on this operation, so what it carries IS the group's properties
+        // afterwards: properties naming no description leave the group without one.
+        let update = crate::state::BillingGroupUpdate {
+            description: input.billing_group_properties.billing_group_description,
+            expected_version: input.expected_version,
+        };
+
+        let mut store = state.lock();
+        // The ONE registry write that changes a billing group record
+        // (`crate::state::ComAmazonawsIotAwsiotserviceState::update_billing_group`): it
+        // refuses before it writes, so a refused update leaves the record — and its version
+        // — exactly as it was, and a successful one advances that version for the next
+        // `expectedVersion` to match.
+        let updated = store
+            .update_billing_group(&input.billing_group_name, update)
+            .map_err(|refusal| {
+                let message = Some(refusal.message());
+                match refusal {
+                    // "The specified resource does not exist" (HTTP 404) is the modelled
+                    // error for a name the billing-group registry does not hold.
+                    crate::state::BillingGroupUpdateRefusal::MissingBillingGroup(_) => {
+                        UpdateBillingGroupErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException { message },
+                        )
+                    }
+                    // A record at another version is what `VersionConflictException`
+                    // (HTTP 409) is modelled for.
+                    crate::state::BillingGroupUpdateRefusal::VersionConflict { .. } => {
+                        UpdateBillingGroupErrorModeled::VersionConflictException(
+                            VersionConflictException { message },
+                        )
+                    }
+                }
+            })?;
+
+        // `version` is "The latest version of the billing group", so it is read off the
+        // record this write just left — the same value the next `DescribeBillingGroup`
+        // reports and the next `expectedVersion` has to match.
+        Ok(UpdateBillingGroupOutput {
+            version: updated.version,
+        })
     }
 }
