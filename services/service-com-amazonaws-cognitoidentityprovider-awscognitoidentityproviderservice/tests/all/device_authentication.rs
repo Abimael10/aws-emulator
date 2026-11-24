@@ -85,13 +85,13 @@ const INVALID_PARAMETER: &str = "InvalidParameterException";
 /// The instant a device stamps its claim with, in the form a client of this
 /// exchange writes one. Part of the signed message, so a response that signs one
 /// instant and sends another proves nothing.
-const CLAIM_TIMESTAMP: &str = "Mon Jan 1 00:00:00 UTC 2024";
+pub(crate) const CLAIM_TIMESTAMP: &str = "Mon Jan 1 00:00:00 UTC 2024";
 
 /// The label this exchange's key schedule expands its shared secret under.
 const DERIVED_KEY_LABEL: &[u8] = b"Caldera Derived Key";
 
 /// The size of the key the claim is signed under.
-const SESSION_KEY_BYTES: usize = 16;
+pub(crate) const SESSION_KEY_BYTES: usize = 16;
 
 /// The device configuration that asks a remembered device to authenticate
 /// itself, and leaves the remembering to the user's own prompt.
@@ -1049,9 +1049,13 @@ async fn device_exchange(
 
 /// One device's own credentials: the device the keys name, the device password
 /// its owner chose and the salt its verifier is derived with.
-struct DeviceCredentials {
+///
+/// `pub(crate)` because the exchange this computes is the ONE device half this
+/// crate has: a suite that needs a device to authenticate itself drives it from
+/// here rather than deriving the same verifier, key schedule and claim again.
+pub(crate) struct DeviceCredentials {
     device_group_key: String,
-    device_key: String,
+    pub(crate) device_key: String,
     password: String,
     salt: BigUint,
 }
@@ -1059,7 +1063,12 @@ struct DeviceCredentials {
 impl DeviceCredentials {
     /// The credentials of the device `device_key`, with the salt derived from
     /// `label` so each fixture registers its own.
-    fn new(device_group_key: String, device_key: String, password: String, label: &str) -> Self {
+    pub(crate) fn new(
+        device_group_key: String,
+        device_key: String,
+        password: String,
+        label: &str,
+    ) -> Self {
         Self {
             device_group_key,
             device_key,
@@ -1070,7 +1079,7 @@ impl DeviceCredentials {
 
     /// The `DeviceSecretVerifierConfig` this device registers: the verifier and
     /// the salt it was derived with, each base64 of its bytes.
-    fn verifier_config(&self) -> Value {
+    pub(crate) fn verifier_config(&self) -> Value {
         let standard = base64::engine::general_purpose::STANDARD;
         json!({
             "PasswordVerifier": standard.encode(padded(&self.verifier())),
@@ -1097,7 +1106,7 @@ impl DeviceCredentials {
 
     /// One exchange of this device: an ephemeral pair derived from `label`, so
     /// each exchange of a row runs its own.
-    fn exchange(&self, label: &str) -> ClientExchange {
+    pub(crate) fn exchange(&self, label: &str) -> ClientExchange {
         let private = BigUint::from_bytes_be(&pseudo_random(label, 32)) % prime();
         ClientExchange {
             public: generator().modpow(&private, prime()),
@@ -1107,14 +1116,14 @@ impl DeviceCredentials {
 }
 
 /// The device's half of one exchange.
-struct ClientExchange {
+pub(crate) struct ClientExchange {
     private: BigUint,
     public: BigUint,
 }
 
 impl ClientExchange {
     /// The public value as `SRP_A` carries it.
-    fn public_hex(&self) -> String {
+    pub(crate) fn public_hex(&self) -> String {
         hex::encode(padded(&self.public))
     }
 
@@ -1122,7 +1131,7 @@ impl ClientExchange {
     /// `S = (B - k·g^x)^(a + u·x) (mod N)` and the first [`SESSION_KEY_BYTES`] of
     /// the HKDF-SHA256 expansion of that secret, salted with `u` and labelled
     /// [`DERIVED_KEY_LABEL`].
-    fn session_key(
+    pub(crate) fn session_key(
         &self,
         credentials: &DeviceCredentials,
         password: &str,
@@ -1153,7 +1162,7 @@ impl ClientExchange {
 /// The claim a device signs: the HMAC of its session key over the device group
 /// key, the device key, the secret block the challenge served and the instant it
 /// signed at.
-fn claim_signature(
+pub(crate) fn claim_signature(
     session_key: &[u8],
     credentials: &DeviceCredentials,
     secret_block: &str,

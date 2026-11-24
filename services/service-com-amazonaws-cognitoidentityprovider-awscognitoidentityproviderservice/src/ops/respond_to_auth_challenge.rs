@@ -817,9 +817,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RespondToAuthChal
                 break 'answered Answered::Completed {
                     user_pool_id,
                     username,
-                    // "Called after user authentication flows have completed" is
-                    // this generation's own documented trigger source.
-                    generation: crate::state::lambda_triggers::TokenGeneration::Authentication,
+                    // "Called at the end of the authentication of a user device" is this
+                    // generation's own documented trigger source: the proof a DEVICE gave
+                    // is what completed this sign-in, which is a stage of its own and not
+                    // the one a user's own factor completes.
+                    generation:
+                        crate::state::lambda_triggers::TokenGeneration::AuthenticateDevice,
                     // The sign-in was completed BY this device, which is what its
                     // access token states.
                     device_key: Some(device_key),

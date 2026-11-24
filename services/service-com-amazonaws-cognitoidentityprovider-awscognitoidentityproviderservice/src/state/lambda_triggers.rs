@@ -227,6 +227,10 @@ pub enum TokenGeneration {
     /// The `NEW_PASSWORD_REQUIRED` challenge answered, which both completes the sign-in
     /// and sets the password the user chose.
     NewPasswordChallenge,
+    /// A DEVICE authenticating itself: the `DEVICE_PASSWORD_VERIFIER` claim answered, which
+    /// is the end of the exchange a remembered device runs over the credentials its
+    /// confirmation registered ([`crate::state::device_auth`]).
+    AuthenticateDevice,
 }
 
 impl TokenGeneration {
@@ -237,6 +241,7 @@ impl TokenGeneration {
             Self::Authentication => "TokenGeneration_Authentication",
             Self::RefreshTokens => "TokenGeneration_RefreshTokens",
             Self::NewPasswordChallenge => "TokenGeneration_NewPasswordChallenge",
+            Self::AuthenticateDevice => "TokenGeneration_AuthenticateDevice",
         }
     }
 }

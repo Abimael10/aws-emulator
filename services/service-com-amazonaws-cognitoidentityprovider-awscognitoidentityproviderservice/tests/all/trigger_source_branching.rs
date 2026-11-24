@@ -62,7 +62,7 @@ const HANDLER: &str = "lambda_function.lambda_handler";
 
 /// A password satisfying a default pool's password policy, which is the one every sign-in
 /// below presents.
-const GOOD_PASSWORD: &str = "Passw0rd!2024";
+pub(crate) const GOOD_PASSWORD: &str = "Passw0rd!2024";
 
 /// The password the new-password challenge chooses, distinct from the one above.
 const CHOSEN_PASSWORD: &str = "Ch0sen!Passw0rd";
@@ -88,14 +88,14 @@ const WITH_PASSWORD: &str = "with-password";
 const WITHOUT_PASSWORD: &str = "without-password";
 
 /// The claim the handler writes the token-generation source it was handed into.
-const SOURCE_CLAIM: &str = "trigger_source";
+pub(crate) const SOURCE_CLAIM: &str = "trigger_source";
 
 /// The claim it writes the event version into beside it.
-const VERSION_CLAIM: &str = "trigger_version";
+pub(crate) const VERSION_CLAIM: &str = "trigger_version";
 
 /// The event version the second trigger version asks for: the major number of `V2_0`
 /// (`PreTokenGenerationVersionConfigType$LambdaVersion`, this service's model).
-const SECOND_EVENT_VERSION: &str = "2";
+pub(crate) const SECOND_EVENT_VERSION: &str = "2";
 
 /// How long a wait for a function to report `Active`, or for the warm-up invocation to
 /// answer, is given before it is a failure. Generous: the span is the emulator's to choose
@@ -107,7 +107,12 @@ const LOOK_AGAIN: Duration = Duration::from_millis(50);
 
 /// Cognito and Lambda over ONE shared engine, as `core/router/src/lib.rs` mounts them, so
 /// the trigger dispatch's in-process invocation reaches this very Lambda.
-fn router() -> MultiServiceRouter {
+///
+/// `pub(crate)` — with [`cognito`], [`ok`] and [`trigger_function`] beside it — because a
+/// sibling suite asserting the same `triggerSource` rule over a stage this one does not
+/// drive mounts the same pair and runs the same function, rather than standing up a second
+/// copy of either.
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -128,7 +133,11 @@ fn authorization(service: &str) -> String {
 }
 
 /// One Cognito call: `awsJson1_1`, addressed by `X-Amz-Target`.
-async fn cognito(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn cognito(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -180,7 +189,7 @@ fn answer(response: http::Response<Bytes>) -> (u16, Value) {
 }
 
 /// A Cognito call that must succeed, with its response body.
-async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+pub(crate) async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
     let (status, payload) = cognito(router, operation, body).await;
     assert_eq!(
         status, 200,
@@ -247,7 +256,7 @@ def lambda_handler(event, context):
 /// profile this handler builds for a migrate-user source, so a suite that later reads a
 /// branch out of state or out of a token is reading the return value of code that had
 /// already run once.
-async fn trigger_function(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn trigger_function(router: &MultiServiceRouter, name: &str) -> String {
     let (status, created) = lambda(
         router,
         "POST",
@@ -457,7 +466,12 @@ fn claims(case: &str, kind: &str, token: &str) -> Value {
 }
 
 /// The `kind` token of an `AuthenticationResult`, which every generation below must mint.
-fn token<'payload>(case: &str, payload: &'payload Value, member: &str, kind: &str) -> &'payload str {
+pub(crate) fn token<'payload>(
+    case: &str,
+    payload: &'payload Value,
+    member: &str,
+    kind: &str,
+) -> &'payload str {
     payload["AuthenticationResult"][member]
         .as_str()
         .filter(|token| !token.is_empty())
