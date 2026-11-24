@@ -16,6 +16,16 @@
 //! so a transaction carrying both classes reports both — which is the only way a caller
 //! can attribute what failed to the action that failed.
 //!
+//! The order the two classes are found in is the service's own. An action is first BOUND to
+//! its table — the table it names, the policies in force, the values its map carries and
+//! the key that map states against the table's own key schema — and only then READ against
+//! the item its key holds: its condition, and the update it applies where that condition
+//! held. So a key the table's schema does not admit is found before any stored item has
+//! been read, and the transaction is cancelled there with every OTHER action reporting the
+//! null code, having never been evaluated; and an action whose condition was not met
+//! reports `ConditionalCheckFailed` alone, since its `UpdateExpression` is never applied to
+//! the item that would have failed it.
+//!
 //! The writes land through the same store write sites `PutItem`, `UpdateItem` and
 //! `DeleteItem` use, so numbers are canonicalized and capacity is accounted the same way
 //! on this path as on the single-item one, and an `Update` applies the same
@@ -28,11 +38,16 @@
 //! carries exactly one action: both are a `ValidationException`, as are an item a `Put`
 //! carries past the documented size, a VALUE an action carries that no item could hold —
 //! both are facts of the REQUEST, settled before any table is looked up — and a key that is
-//! not the table's. An `Update` whose resulting ITEM crosses that size once the change is
-//! applied to what the table holds is a failure the transaction's own change made — "an item
-//! size becomes too large [...] because of changes made by the transaction", one of the
-//! circumstances `TransactionCanceledException` documents — so it CANCELS the transaction,
-//! with that action's reason carrying the sentence the update path states for the quota. The documented ceiling of 100 action requests is the model's own `@length`
+//! not the table's. An `Update` that would leave the item past that size is answered by WHERE
+//! the bytes came from ([`crossed_the_item_ceiling`]): the item it ASKS for — the key it
+//! addresses plus what its clauses write — not fitting at all asks for something no table
+//! could hold whatever the store holds, so the call is refused in the class and the sentence
+//! the single-item `UpdateItem` of the same expression is refused with, while a payload that
+//! fits and a result that crosses only over what the stored item ALREADY held is a failure the
+//! transaction's own change made — "an item size becomes too large [...] because of changes
+//! made by the transaction", one of the circumstances `TransactionCanceledException`
+//! documents — so it CANCELS the transaction, with that action's reason carrying the same
+//! sentence. The documented ceiling of 100 action requests is the model's own `@length`
 //! on `TransactItems`, refused before this handler runs. An unknown — or not yet
 //! `ACTIVE` — table is `ResourceNotFoundException`, and
 //! a table whose resource-based policy denies the caller the action it performs
@@ -418,21 +433,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // Pass one resolves every action against the stored items and reads its
-        // condition, writing NOTHING: a transaction only lands once all of it is known
-        // to be applicable, and every condition speaks about the item as it stood
-        // before the transaction.
+        // Pass one BINDS every action to its table, writing NOTHING and reading no stored
+        // item: the table it names, the policies in force, the values its map carries and
+        // the key that map states against the table's own key schema
+        // ([`bind_element`]).
         //
-        // An action the transaction cannot apply does not stop the pass: "all of which
+        // An action the transaction cannot bind does not stop the pass: "all of which
         // must either succeed or fail", and the reasons report what EACH action's own
-        // outcome was in request order, so every action is resolved and the failures are
-        // collected ([`Outcome`]) rather than answered where they were found. Only a
-        // defect of the REQUEST refuses the call outright ([`ElementRefusal`]).
-        let mut outcomes: Vec<Outcome> = Vec::with_capacity(actions.len());
+        // outcome was in request order, so every action is bound and the failures are
+        // collected BESIDE the actions that bound — one entry per action, in request
+        // order, which is what keeps every reason aligned with the action it is about.
+        // Only a defect of the REQUEST refuses the call outright ([`ElementRefusal`]).
+        let mut bound: Vec<Result<Bound, String>> = Vec::with_capacity(actions.len());
         let mut keyed: std::collections::BTreeSet<(String, crate::state::ItemKey)> =
             std::collections::BTreeSet::new();
         for (at, action) in actions.iter().enumerate() {
-            match prepare_element(
+            match bind_element(
                 &*self.engine,
                 &store,
                 &caller,
@@ -442,6 +458,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &names[at],
                 &mut keyed,
             ) {
+                Ok(element) => bound.push(Ok(element)),
+                Err(ElementRefusal::Call(error)) => return Err(error),
+                Err(ElementRefusal::Element(message)) => bound.push(Err(message)),
+            }
+        }
+
+        // A defect an action is found to have while it is BOUND is found before any
+        // stored item has been read, so the transaction is cancelled there: that action
+        // reports its [`crate::state::CANCELLATION_CODE_VALIDATION_ERROR`] with the
+        // sentence the same defect earns on the single-item path, and every OTHER action
+        // reports the null code with no message — "if no error occurred for the
+        // associated item an error with a Null code and Null message will be present"
+        // (`CancellationReason`) — because nothing was ever read for it: no condition of
+        // its was evaluated and no update of its was applied. Nothing was attempted, so
+        // nothing is metered either.
+        if bound.iter().any(Result::is_err) {
+            let codes: Vec<&str> = bound
+                .iter()
+                .map(|element| match element {
+                    Ok(_) => crate::state::CANCELLATION_CODE_NONE,
+                    Err(_) => crate::state::CANCELLATION_CODE_VALIDATION_ERROR,
+                })
+                .collect();
+            let cancellation_reasons: Vec<CancellationReason> = bound
+                .iter()
+                .zip(&codes)
+                .map(|(element, code)| CancellationReason {
+                    code: Some((*code).to_string()),
+                    message: element.as_ref().err().cloned(),
+                    item: None,
+                })
+                .collect();
+            return Err(TransactWriteItemsErrorModeled::TransactionCanceledException(
+                TransactionCanceledException {
+                    message: Some(crate::state::transaction_cancelled_message(&codes)),
+                    cancellation_reasons: Some(cancellation_reasons),
+                },
+            )
+            .into());
+        }
+
+        // Pass two reads every action against the item its key holds: its condition
+        // first, and the update it states only where that condition held
+        // ([`resolve_element`]). A transaction only lands once all of it is known to be
+        // applicable, and every condition speaks about the item as it stood before the
+        // transaction.
+        let mut outcomes: Vec<Outcome> = Vec::with_capacity(actions.len());
+        for (action, element) in actions.iter().zip(bound) {
+            // One outcome per action, whichever pass decided it: the cancellation above
+            // already answered a transaction carrying an action that did not bind, and an
+            // action that did not bind still reports its own reason here, so `outcomes`
+            // cannot be shorter than `TransactItems` and no reason can slide onto another
+            // action.
+            let element = match element {
+                Ok(element) => element,
+                Err(message) => {
+                    outcomes.push(Outcome::Failed {
+                        code: crate::state::CANCELLATION_CODE_VALIDATION_ERROR,
+                        message,
+                    });
+                    continue;
+                }
+            };
+            match resolve_element(&store, &region, now, action, element) {
                 Ok(planned) => outcomes.push(Outcome::Applicable(Box::new(planned))),
                 Err(ElementRefusal::Call(error)) => return Err(error),
                 Err(ElementRefusal::Element(message)) => outcomes.push(Outcome::Failed {
@@ -1036,12 +1116,37 @@ fn canonicalized(item: &crate::state::Item) -> crate::state::Item {
     canonical
 }
 
+/// One action BOUND to its table: the key it addresses and what it would write, settled
+/// without reading the item that key holds ([`bind_element`]).
+struct Bound {
+    /// The resolved name of the table it addresses.
+    table: String,
+    /// Whether it reports its item when its condition is not met.
+    returns_old_on_failure: bool,
+    prepared: Prepared,
+}
+
 /// One action resolved against its table: the key it addresses and the write it would
 /// land, computed before any of the transaction is applied.
 struct Prepared {
     key: crate::state::ItemKey,
     addressed: crate::state::Item,
-    write: PlannedWrite,
+    write: BoundWrite,
+}
+
+/// What one action writes, as far as the REQUEST and the table's schema settle it: an
+/// `Update`'s own result is left to the pass that reads the item its key holds
+/// ([`resolve_element`]), because only that item can say what the update leaves.
+enum BoundWrite {
+    /// A `ConditionCheck`, which writes nothing.
+    Check,
+    /// The item a `Put` stores, replacing whatever its key held.
+    Put(crate::state::Item),
+    /// A `Delete`, which removes whatever its key held.
+    Delete,
+    /// An `Update`, parsed once here and applied to the stored item — which is what
+    /// decides its result — in the pass that reads it.
+    Update(crate::state::ParsedUpdate),
 }
 
 /// One action of the transaction, ready to apply.
@@ -1167,6 +1272,90 @@ fn refused_key(refusal: crate::state::KeyRefusal) -> ElementRefusal {
     refused_call(refusal.into_error())
 }
 
+/// A refusal of ONE ACTION, EXCEPT the documented item-size quota, whose answer follows
+/// WHERE the bytes that crossed it came from ([`crossed_the_item_ceiling`]).
+fn refused_element_unless_the_update_asks_too_much(
+    error: crate::state::RequestError,
+    table: &crate::state::Table,
+    key: &crate::state::Item,
+    applied: &crate::state::ParsedUpdate,
+) -> ElementRefusal {
+    match &error {
+        crate::state::RequestError::Validation(message)
+            if message == crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE =>
+        {
+            crossed_the_item_ceiling(table, key, applied)
+        }
+        _ => refused_element(error),
+    }
+}
+
+/// WHOSE failure a crossing of the documented item-size quota is, for an `Update`.
+///
+/// The documented cancel circumstance is "an item size becomes too large (larger than 400
+/// KB) [...] or a similar validation error occurs because of changes made by the
+/// transaction" (`TransactionCanceledException`), so what decides the answer is WHERE the
+/// bytes that crossed the ceiling came from:
+///
+/// * The bytes this update ASKS to store — the key it addresses plus what its clauses write
+///   — not fitting in an item at all is a request that cannot be served however the store
+///   looks ([`asks_for_an_item_past_the_ceiling`]), so the CALL is refused in the class and
+///   the sentence the single-item `UpdateItem` of this very expression is refused with: a
+///   caller is told to shrink the write rather than to retry the transaction.
+/// * Those bytes fitting, and the ceiling being crossed only over what the stored item
+///   ALREADY held, is the documented circumstance itself — the transaction's own change made
+///   the item too large — so it is THIS ACTION's failure: the transaction is cancelled and
+///   the reason list names this action with that sentence, every other action reporting its
+///   own outcome beside it.
+///
+/// The sentence is the same either way, because the quota is the same quota; what this
+/// decides is only who answers for it.
+fn crossed_the_item_ceiling(
+    table: &crate::state::Table,
+    key: &crate::state::Item,
+    applied: &crate::state::ParsedUpdate,
+) -> ElementRefusal {
+    if asks_for_an_item_past_the_ceiling(table, key, applied) {
+        return ElementRefusal::Call(crate::scaffolded::Scaffolded::validation(
+            crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE,
+        ));
+    }
+    ElementRefusal::Element(crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE.to_string())
+}
+
+/// Whether what this update asks to store is past the ceiling ON ITS OWN: the same update
+/// applied to the bare `Key` it addresses, as if that key held nothing, and the item that
+/// leaves charged exactly as every update surface charges one
+/// ([`crate::state::update_size_exceeded`]) — so an update that crosses the ceiling at a key
+/// holding nothing beyond what it writes crosses it at the same byte here as the single-item
+/// `UpdateItem` of the same expression does.
+///
+/// Reads the table and the maps it is handed and writes nothing: the bare key is a copy.
+///
+/// A clause the bare key cannot carry out — arithmetic over an attribute only the stored item
+/// holds, a document path only that item can offer — asks for nothing of its own: what it
+/// would store is what the stored item gave it, so the answer is no and the action answers
+/// for it. The one failure of that application that IS this question is the update language's
+/// own clamp on the item it builds, which is the very quota being decided.
+fn asks_for_an_item_past_the_ceiling(
+    table: &crate::state::Table,
+    key: &crate::state::Item,
+    applied: &crate::state::ParsedUpdate,
+) -> bool {
+    let mut asked = key.clone();
+    match applied.apply(&mut asked) {
+        Err(error) => error.message() == crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE,
+        Ok(_) => {
+            crate::state::canonicalize_item(&mut asked).is_ok()
+                && crate::state::update_size_exceeded(
+                    table,
+                    &asked,
+                    applied.request_shape_charge(),
+                )
+        }
+    }
+}
+
 /// What ONE action of the transaction turned out to be, in request order: the write it
 /// would land, or the failure it reported.
 ///
@@ -1244,18 +1433,24 @@ impl Outcome {
     }
 }
 
-/// Resolve ONE action against its table and read its condition, writing NOTHING.
+/// BIND ONE action to its table, writing NOTHING and reading no stored item.
 ///
 /// `name` is the resolved table name the element addresses, settled with the rest of the
 /// request ([`check_element_shape`]), and `keyed` carries the keys the actions before this
 /// one addressed, because "transaction requests cannot include multiple operations on one
 /// item".
 ///
+/// Everything an action can be found to be wrong about WITHOUT the item its key holds is
+/// decided here: the table it names, the policies in force, the values the map it carries
+/// holds, and the key that map states against the table's own KEY SCHEMA. What the item its
+/// key holds decides — its condition, and the update it applies — is read afterwards, over
+/// the actions that bound ([`resolve_element`]).
+///
 /// Which answer each refusal earns is [`ElementRefusal`]: a defect of the REQUEST refuses
-/// the call, and a failure the action is found to have against the stored item or the
-/// table's own schema cancels the transaction with this action named in the reason list.
+/// the call, and a failure the action is found to have against the table's own schema
+/// cancels the transaction with this action named in the reason list.
 #[allow(clippy::too_many_arguments)]
-fn prepare_element<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
+fn bind_element<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
     engine: &Eng,
     store: &Store,
     caller: &crate::state::authorization::Caller,
@@ -1264,7 +1459,7 @@ fn prepare_element<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
     action: &Requested<'_>,
     name: &str,
     keyed: &mut std::collections::BTreeSet<(String, crate::state::ItemKey)>,
-) -> Result<Planned, ElementRefusal> {
+) -> Result<Bound, ElementRefusal> {
     let name = name.to_string();
     let substitutions = crate::state::Substitutions::new(
         action.expression_attribute_names(),
@@ -1323,7 +1518,7 @@ fn prepare_element<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
             Prepared {
                 key: table.key_of_transact_item(&item).map_err(refused_key)?,
                 addressed: item.clone(),
-                write: PlannedWrite::Put(item),
+                write: BoundWrite::Put(item),
             }
         }
         Requested::Delete(delete) => {
@@ -1336,7 +1531,7 @@ fn prepare_element<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                     .key_of_transact_key_map(&delete.key)
                     .map_err(refused_key)?,
                 addressed: delete.key.clone(),
-                write: PlannedWrite::Delete,
+                write: BoundWrite::Delete,
             }
         }
         Requested::Check(check) => {
@@ -1349,14 +1544,15 @@ fn prepare_element<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                     .key_of_transact_key_map(&check.key)
                     .map_err(refused_key)?,
                 addressed: check.key.clone(),
-                write: PlannedWrite::Check,
+                write: BoundWrite::Check,
             }
         }
         Requested::Update(update) => {
             // Every refusal this element's own expressions earn is stated
             // outside the request envelope, like the refusals its substitution
             // tables earn above
-            // ([`crate::state::refused_in_element`]).
+            // ([`crate::state::refused_in_element`]). The grammar is the REQUEST's, so it
+            // is read here and carried to the pass that applies it.
             let applied = crate::state::ParsedUpdate::parse(
                 "UpdateExpression",
                 &update.update_expression,
@@ -1368,109 +1564,17 @@ fn prepare_element<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                 .active_table(region, &name, now)
                 .map_err(refused_call)?;
             deny(caller, table, action, now).map_err(ElementRefusal::Call)?;
-            let key = table
-                .key_of_transact_key_map(&update.key)
-                .map_err(refused_key)?;
-            let partition_key = table.partition_key_name().to_string();
-            let sort_key = table.sort_key_name().map(ToString::to_string);
-            // An update of a key that holds no item starts from the key itself,
-            // so the created item carries the primary key it was addressed by.
-            let mut item = table
-                .items
-                .get(&key)
-                .cloned()
-                .unwrap_or_else(|| update.key.clone());
-            // APPLYING the update is where the stored item decides: an operand the stored
-            // value has the wrong type for, a document path the stored item cannot hold,
-            // an attribute it does not carry, and the item the change would LEAVE being
-            // past the documented item-size quota. None of it can be settled from the
-            // request alone, so it is this ACTION that failed and the transaction is
-            // cancelled with that sentence against this action
-            // ([`ElementRefusal::Element`]).
-            let touched = applied
-                .apply(&mut item)
-                .map_err(crate::state::refused_in_element)
-                .map_err(refused_element)?;
-            for attribute in touched.attributes() {
-                if attribute.as_str() == partition_key.as_str()
-                    || Some(attribute.as_str()) == sort_key.as_deref()
-                {
-                    // What the update may change is decided against the TABLE's
-                    // own key schema, so it is this element the transaction
-                    // refuses and the answer is that element's cancellation,
-                    // carrying the sentence the single-item `UpdateItem` states
-                    // for the same defect.
-                    return Err(ElementRefusal::Element(format!(
-                        "{}: Cannot update attribute {attribute}. This attribute is \
-                         part of the key",
-                        crate::state::INVALID_PARAMETER_CLAUSE
-                    )));
-                }
-            }
-            // The item this update LEAVES is read against the stored one, so every rule
-            // about it is this action's outcome too — the documented item-SIZE quota
-            // included.
-            for (attribute, value) in &item {
-                crate::state::check_attribute_value(attribute, value)
-                    .map_err(crate::state::stated_for_an_update)
-                    .map_err(crate::state::unenveloped)
-                    .map_err(refused_element)?;
-            }
-            crate::state::canonicalize_item(&mut item)
-                .map_err(crate::state::unenveloped)
-                .map_err(refused_element)?;
-            // Sized over what this element ASKED FOR, exactly as the single-item
-            // `UpdateItem` of the same expression is: the item's non-key bytes plus
-            // what its key portion is charged, plus the entry a local secondary index of
-            // the table holds for it ([`crate::state::update_size_exceeded`]) plus the
-            // frame each clause of the update costs
-            // ([`crate::state::ParsedUpdate::request_shape_charge`]).
-            //
-            // Crossing it is a failure the transaction's own change made — "an item size
-            // becomes too large [...] because of changes made by the transaction", one of
-            // the circumstances `TransactionCanceledException` documents — so it is THIS
-            // ACTION's failure: the transaction is cancelled and the reason list names this
-            // action with the sentence the update path states for that quota, every other
-            // action reporting its own outcome beside it. The item a `Put` CARRIES is the
-            // request's own and is refused before any of the transaction is applied,
-            // worded for an item that was carried.
-            if crate::state::update_size_exceeded(table, &item, applied.request_shape_charge()) {
-                return Err(ElementRefusal::Element(
-                    crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE.to_string(),
-                ));
-            }
-            table
-                .check_index_key_types(&item)
-                .map_err(refused_element)?;
-            table
-                .check_index_key_values_of_update(&item)
-                .map_err(refused_call)?;
-            table
-                .check_vector_attributes(&item)
-                .map_err(refused_call)?;
-            // An update that wrote nothing into a key that holds no item adds no
-            // item, exactly as the single-item `UpdateItem` of the same
-            // expression does: what the key holds afterwards is what one of the
-            // update's clauses gave it a value for, and the key attributes it
-            // started from are not that.
-            let adds_nothing = !applied.states_no_action()
-                && !store
-                    .active_table(region, &name, now)
-                    .map_err(refused_call)?
-                    .items
-                    .contains_key(&key)
-                && item.keys().all(|attribute| {
-                    attribute.as_str() == partition_key.as_str()
-                        || Some(attribute.as_str()) == sort_key.as_deref()
-                });
             Prepared {
-                key,
-                addressed: item.clone(),
-                write: if adds_nothing {
-                    PlannedWrite::Nothing
-                } else {
-                    PlannedWrite::Update(item)
-                },
+                key: table
+                    .key_of_transact_key_map(&update.key)
+                    .map_err(refused_key)?,
+                // The item an `Update` LEAVES can only be computed from the one its key
+                // holds, so what it writes — and what the write is reported for — is
+                // settled in the pass that reads that item ([`resolve_element`]). Until
+                // then the action addresses the `Key` map it named, which is also where
+                // an update of a key that holds no item starts from.
+                addressed: update.key.clone(),
+                write: BoundWrite::Update(applied),
             }
         }
     };
@@ -1483,6 +1587,44 @@ fn prepare_element<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
             ),
         ));
     }
+    Ok(Bound {
+        table: name,
+        returns_old_on_failure,
+        prepared,
+    })
+}
+
+/// Read ONE bound action against the item its key holds: its CONDITION first, and the
+/// change it states only where that condition held.
+///
+/// That order is the service's own: an action's `ConditionExpression` "must be satisfied in
+/// order for the conditional operation to succeed" (`Update$ConditionExpression`), so an
+/// action whose condition the stored item does not satisfy has already failed and reports
+/// `ConditionalCheckFailed` alone — the runtime evaluation of its `UpdateExpression`, which
+/// only the stored item can fail, is never reached, exactly as it is never reached by a
+/// single-item `UpdateItem` whose condition is not met. Only where the condition holds is
+/// the update applied, and only then can it earn a failure of its own.
+///
+/// Which answer each refusal earns is [`ElementRefusal`], as it is while the action is
+/// bound: a defect of the REQUEST refuses the call, and a failure the action is found to
+/// have against the stored item cancels the transaction with this action named in the
+/// reason list.
+fn resolve_element(
+    store: &Store,
+    region: &str,
+    now: ::std::time::SystemTime,
+    action: &Requested<'_>,
+    bound: Bound,
+) -> Result<Planned, ElementRefusal> {
+    let Bound {
+        table: name,
+        returns_old_on_failure,
+        prepared,
+    } = bound;
+    let substitutions = crate::state::Substitutions::new(
+        action.expression_attribute_names(),
+        action.expression_attribute_values(),
+    );
     let before = store
         .active_table(region, &name, now)
         .map_err(refused_call)?
@@ -1504,11 +1646,138 @@ fn prepare_element<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
     )
     .map_err(crate::state::refused_in_element)
     .map_err(refused_call)?;
+    let (addressed, write) = match prepared.write {
+        BoundWrite::Check => (prepared.addressed, PlannedWrite::Check),
+        BoundWrite::Put(item) => (prepared.addressed, PlannedWrite::Put(item)),
+        BoundWrite::Delete => (prepared.addressed, PlannedWrite::Delete),
+        // An action whose condition was not met writes nothing: the transaction it is part
+        // of is cancelled for it, and its update is never applied — so the stored item
+        // decides nothing else about this action.
+        BoundWrite::Update(_) if !satisfied => (prepared.addressed, PlannedWrite::Nothing),
+        // The ONE thing the stored item decides besides the condition: what the update
+        // leaves at its key. It is read only where the condition held.
+        BoundWrite::Update(applied) => {
+            let table = store
+                .active_table(region, &name, now)
+                .map_err(refused_call)?;
+            let partition_key = table.partition_key_name().to_string();
+            let sort_key = table.sort_key_name().map(ToString::to_string);
+            // The `Key` map this action addresses, kept beside the item the update builds:
+            // it is what the update asks for ON ITS OWN, which is what decides who answers
+            // for a crossing of the item ceiling ([`crossed_the_item_ceiling`]).
+            let addressed_key = prepared.addressed;
+            // An update of a key that holds no item starts from the key itself,
+            // so the created item carries the primary key it was addressed by — which is
+            // the map the action was bound as addressing.
+            let mut item = before.clone().unwrap_or_else(|| addressed_key.clone());
+            // APPLYING the update is where the stored item decides: an operand the stored
+            // value has the wrong type for, a document path the stored item cannot hold,
+            // an attribute it does not carry. None of it can be settled from the request
+            // alone, so it is this ACTION that failed and the transaction is cancelled
+            // with that sentence against this action ([`ElementRefusal::Element`]) — except
+            // the documented item-SIZE quota, whose answer follows where the bytes that
+            // crossed it came from ([`crossed_the_item_ceiling`]).
+            let touched = applied
+                .apply(&mut item)
+                .map_err(crate::state::refused_in_element)
+                .map_err(|error| {
+                    refused_element_unless_the_update_asks_too_much(
+                        error,
+                        table,
+                        &addressed_key,
+                        &applied,
+                    )
+                })?;
+            for attribute in touched.attributes() {
+                if attribute.as_str() == partition_key.as_str()
+                    || Some(attribute.as_str()) == sort_key.as_deref()
+                {
+                    // What the update may change is decided against the TABLE's
+                    // own key schema, so it is this element the transaction
+                    // refuses and the answer is that element's cancellation,
+                    // carrying the sentence the single-item `UpdateItem` states
+                    // for the same defect.
+                    return Err(ElementRefusal::Element(format!(
+                        "{}: Cannot update attribute {attribute}. This attribute is \
+                         part of the key",
+                        crate::state::INVALID_PARAMETER_CLAUSE
+                    )));
+                }
+            }
+            // The item this update LEAVES is read against the stored one, so every rule
+            // about it is this action's outcome too — except the documented item-SIZE
+            // quota, whose answer follows where the bytes that crossed it came from
+            // ([`crossed_the_item_ceiling`]): a value the update COMPUTES, or one it
+            // carries, can be larger than any item may hold.
+            for (attribute, value) in &item {
+                crate::state::check_attribute_value(attribute, value)
+                    .map_err(crate::state::stated_for_an_update)
+                    .map_err(crate::state::unenveloped)
+                    .map_err(|error| {
+                        refused_element_unless_the_update_asks_too_much(
+                            error,
+                            table,
+                            &addressed_key,
+                            &applied,
+                        )
+                    })?;
+            }
+            crate::state::canonicalize_item(&mut item)
+                .map_err(crate::state::unenveloped)
+                .map_err(refused_element)?;
+            // Sized over what this element ASKED FOR, exactly as the single-item
+            // `UpdateItem` of the same expression is: the item's non-key bytes plus
+            // what its key portion is charged, plus the entry a local secondary index of
+            // the table holds for it ([`crate::state::update_size_exceeded`]) plus the
+            // frame each clause of the update costs
+            // ([`crate::state::ParsedUpdate::request_shape_charge`]).
+            //
+            // WHO answers for a crossing follows where the bytes came from
+            // ([`crossed_the_item_ceiling`]): an update whose own payload no item could hold
+            // refuses the CALL, as the single-item `UpdateItem` of this very expression is
+            // refused, while an update whose payload fits and whose result crosses the
+            // ceiling only over what the stored item ALREADY held is the documented cancel
+            // circumstance and is THIS ACTION's failure. The item a `Put` CARRIES is the
+            // request's own and is refused before any of the transaction is applied, worded
+            // for an item that was carried.
+            if crate::state::update_size_exceeded(table, &item, applied.request_shape_charge()) {
+                return Err(crossed_the_item_ceiling(table, &addressed_key, &applied));
+            }
+            table
+                .check_index_key_types(&item)
+                .map_err(refused_element)?;
+            table
+                .check_index_key_values_of_update(&item)
+                .map_err(refused_call)?;
+            table
+                .check_vector_attributes(&item)
+                .map_err(refused_call)?;
+            // An update that wrote nothing into a key that holds no item adds no
+            // item, exactly as the single-item `UpdateItem` of the same
+            // expression does: what the key holds afterwards is what one of the
+            // update's clauses gave it a value for, and the key attributes it
+            // started from are not that.
+            let adds_nothing = !applied.states_no_action()
+                && before.is_none()
+                && item.keys().all(|attribute| {
+                    attribute.as_str() == partition_key.as_str()
+                        || Some(attribute.as_str()) == sort_key.as_deref()
+                });
+            (
+                item.clone(),
+                if adds_nothing {
+                    PlannedWrite::Nothing
+                } else {
+                    PlannedWrite::Update(item)
+                },
+            )
+        }
+    };
     Ok(Planned {
         table: name,
         key: prepared.key,
-        addressed: prepared.addressed,
-        write: prepared.write,
+        addressed,
+        write,
         before,
         satisfied,
         returns_old_on_failure,

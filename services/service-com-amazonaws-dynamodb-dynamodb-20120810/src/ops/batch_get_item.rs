@@ -34,8 +34,11 @@
 //! projection — a `ProjectionExpression` with its `ExpressionAttributeNames` aliases, or
 //! the legacy `AttributesToGet` list, read into the one path list every read of this
 //! service reports through ([`crate::state::requested_projection`]) — and the whole item
-//! for an entry that names no projection, exactly as `GetItem` answers them. An entry
-//! that states the projection both ways is a `ValidationException`.
+//! for an entry that names no projection, exactly as `GetItem` answers them. WHICH
+//! generation those asks are stated in is read over the whole request: a batch that
+//! projects any table the legacy way and any table the expression way — in one entry or in
+//! two — is a `ValidationException`, and so is one that sends an `ExpressionAttributeNames`
+//! table while stating no `ProjectionExpression` anywhere.
 //!
 //! ## Shape of an operation
 //!
@@ -278,27 +281,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // members ([`crate::state::requested_projection`]).
         let mut projections: std::collections::HashMap<&String, Vec<crate::state::DocumentPath>> =
             std::collections::HashMap::new();
-        for (table_name, keys) in &addressed {
-            // An ask is stated through the expression member or through the legacy one it
-            // replaced, never through both. What states this batch's ask is ONE table's
-            // entry: "RequestItems — a map of one or more table names [...] and, for each
-            // table, a map that describes one or more items to retrieve from that table"
-            // (`BatchGetItem$RequestItems`), and the projection members sit INSIDE that
-            // per-table map, so each entry states its own projection and is held to the
-            // rule on its own ([`crate::state::check_expression_parameter_mix`]) — a batch
-            // that projects one table the legacy way and another the expression way states
-            // each of its asks exactly once and is served.
-            crate::state::check_expression_parameter_mix(
-                &[crate::state::stated_legacy(
-                    "AttributesToGet",
+        // Which GENERATION this batch states its asks in is read over the WHOLE request: the
+        // sentence a mixed one earns says the two may not be used "in the same request", and
+        // what a `RequestItems` entry carries is part of the request that carried it. So a
+        // batch that projects one table the legacy way and another the expression way has
+        // stated its projections in both generations and is refused, exactly as one entry
+        // carrying both members is ([`crate::state::check_expression_parameter_mix`]) — the
+        // entry-level case is this same rule, since an entry that carries both puts both on
+        // the request. Asked before anything any entry says is read, because it is decided
+        // about the call and not about one of its entries.
+        let projects_with_expression = addressed
+            .iter()
+            .any(|(_, keys)| keys.projection_expression.is_some());
+        crate::state::check_expression_parameter_mix(
+            &[crate::state::stated_legacy(
+                "AttributesToGet",
+                addressed.iter().any(|(_, keys)| {
                     keys.attributes_to_get
                         .as_ref()
-                        .is_some_and(|names| !names.is_empty()),
-                    PROJECTION_ASK,
-                )],
-                &[(PROJECTION_EXPRESSION, keys.projection_expression.is_some())],
-            )
-            .map_err(lift)?;
+                        .is_some_and(|names| !names.is_empty())
+                }),
+                PROJECTION_ASK,
+            )],
+            &[(PROJECTION_EXPRESSION, projects_with_expression)],
+        )
+        .map_err(lift)?;
+        // The projection any entry of this request states, for the rules below that are the
+        // REQUEST's rather than one entry's: only its PRESENCE is read, so the text is
+        // whichever entry states one.
+        let stated_projection: Option<&str> = addressed
+            .iter()
+            .find_map(|(_, keys)| keys.projection_expression.as_deref());
+        for (table_name, keys) in &addressed {
             // The projection first: a projection this service cannot apply is the defect
             // the entry is refused for, whatever else it also got wrong.
             let read = crate::state::requested_projection(
@@ -308,20 +322,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 keys.expression_attribute_names.as_ref(),
             )
             .map_err(lift)?;
+            // A substitution table exists to be substituted INTO, so a request that sends
+            // one and states no expression anywhere has sent a table nothing can use — the
+            // same rule, read in the same scope the generations above are read in: it is the
+            // REQUEST that must carry an expression, so a names table in one entry is
+            // admitted by a `ProjectionExpression` in any entry and refused when the batch
+            // states none at all, whichever generation its other entries projected in
+            // ([`crate::state::Substitutions::check_an_expression_was_sent`]).
+            crate::state::Substitutions::new(keys.expression_attribute_names.as_ref(), None)
+                .check_an_expression_was_sent(&[(PROJECTION_EXPRESSION, stated_projection)])
+                .map_err(lift)?;
             // Then this entry's substitution table against this entry's projection. A
             // `RequestItems` entry is one ELEMENT of the batch: the projection member, the
             // legacy list that states the same ask and the names table that resolves the
             // projection's aliases are all members of the ENTRY, so what each table SAYS is
             // held to the element's own scope — its keys are substitution tokens, it is not
             // empty, and every token its projection dereferences is defined
-            // ([`crate::state::Substitutions::check_all_referenced_in_element`]). The one
-            // rule that is the REQUEST's — that a substitution table was sent with an
-            // expression to be substituted into at all — is the request validator's over a
-            // call's OWN expression members, and this entry's members are not those, so an
-            // entry that carries a names table and states its projection another way, or
-            // none, is served. The refusal is that entry's, so it is stated on its own, and
-            // it is earned whichever generation the batch's OTHER entries stated their
-            // projection in — which is the scope the generation rule above is held in too.
+            // ([`crate::state::Substitutions::check_all_referenced_in_element`]). The entry
+            // resolves its OWN aliases, so an alias is referenced by the projection of the
+            // entry that defined it and by no other; the refusal is that entry's, so it is
+            // stated on its own.
             crate::state::Substitutions::new(keys.expression_attribute_names.as_ref(), None)
                 .check_all_referenced_in_element(&[(
                     PROJECTION_EXPRESSION,

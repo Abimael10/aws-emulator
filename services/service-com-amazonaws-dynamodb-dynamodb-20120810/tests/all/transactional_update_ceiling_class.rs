@@ -5,16 +5,20 @@
 //!
 //! The rule under test: the ceiling is the ITEM's and does not move with the surface the
 //! change arrived through, so the SENTENCE is the same wherever it was stated — but WHOSE
-//! failure the crossing is follows how the change was submitted. A SINGLE-ITEM update states
-//! a change on its own, so crossing the ceiling is refused as the request it is: HTTP 400,
-//! the validation class, and the sentence the update path words that quota with. Inside a
-//! TRANSACTION the crossing is a failure the transaction's own change made — "an item size
-//! becomes too large (larger than 400 KB) [...] or a similar validation error occurs because
-//! of changes made by the transaction", one of the circumstances
-//! `TransactionCanceledException` documents — so the transaction is CANCELLED: HTTP 400, the
-//! cancellation class, the top-level sentence over the per-slot codes in request order, and
-//! an ordered reason list naming the crossing action with that same sentence while every
-//! blameless action reports `None`. Nothing of a refused or a cancelled call is applied.
+//! failure the crossing is follows WHERE THE BYTES CAME FROM. A SINGLE-ITEM update states a
+//! change on its own, so crossing the ceiling is refused as the request it is: HTTP 400, the
+//! validation class, and the sentence the update path words that quota with. Inside a
+//! TRANSACTION the same answer is given to an update whose OWN payload — the key it addresses
+//! plus what its clauses write — does not fit in an item at all: that asks for something no
+//! table could hold whatever the store holds, so the call is refused and a caller is told to
+//! shrink the write. Where that payload fits and the ceiling is crossed only over bytes the
+//! STORED item already held, the crossing is "an item size becomes too large (larger than 400
+//! KB) [...] or a similar validation error occurs because of changes made by the
+//! transaction" — one of the circumstances `TransactionCanceledException` documents — so the
+//! transaction is CANCELLED: HTTP 400, the cancellation class, the top-level sentence over the
+//! per-slot codes in request order, and an ordered reason list naming the crossing action with
+//! that same sentence while every blameless action reports `None`. Nothing of a refused or a
+//! cancelled call is applied.
 //!
 //! The rows span what the rule generalises over: the surface a change is stated through
 //! (`UpdateItem` and a transaction's `Update` for an `UpdateExpression`, `ExecuteStatement`
@@ -183,6 +187,10 @@ struct Crossing {
     seeded: usize,
     expression: &'static str,
     values: fn() -> Value,
+    /// Whether the item this change ASKS for is past the ceiling on its own — the key it
+    /// addresses plus what its clauses write, with nothing of the stored item counted. That
+    /// is what decides who answers for the crossing inside a transaction.
+    asks_too_much: bool,
 }
 
 /// The ways an `UpdateExpression` can leave the item past the ceiling. They differ in WHAT
@@ -198,6 +206,7 @@ fn crossings() -> Vec<Crossing> {
             seeded: 0,
             expression: "SET big = :v",
             values: || json!({":v": {"S": "x".repeat(MAX_ITEM_BYTES)}}),
+            asks_too_much: true,
         },
         Crossing {
             case: "a value inside the ceiling over what the item already holds",
@@ -205,6 +214,7 @@ fn crossings() -> Vec<Crossing> {
             seeded: 300 * 1024,
             expression: "SET big = :v",
             values: || json!({":v": {"S": "x".repeat(150 * 1024)}}),
+            asks_too_much: false,
         },
         Crossing {
             case: "two clauses that cross the ceiling only together",
@@ -215,6 +225,7 @@ fn crossings() -> Vec<Crossing> {
                 json!({":a": {"S": "x".repeat(210 * 1024)},
                        ":b": {"S": "y".repeat(210 * 1024)}})
             },
+            asks_too_much: true,
         },
         Crossing {
             case: "a value the update computes past the ceiling",
@@ -225,6 +236,15 @@ fn crossings() -> Vec<Crossing> {
                 json!({":a": {"L": [{"S": "x".repeat(210 * 1024)}]},
                        ":b": {"L": [{"S": "y".repeat(210 * 1024)}]}})
             },
+            asks_too_much: true,
+        },
+        Crossing {
+            case: "a value the update computes from one the item already holds",
+            slot: "c5",
+            seeded: 210 * 1024,
+            expression: "SET joined = list_append(:a, :a)",
+            values: || json!({":a": {"L": [{"S": "x".repeat(100 * 1024)}]}}),
+            asks_too_much: false,
         },
     ]
 }
@@ -263,12 +283,14 @@ async fn an_update_expression_past_the_ceiling_is_refused_on_its_own() {
     }
 }
 
-/// RULE, the transactional half: the same crossing stated as an action of a transaction is a
-/// failure that transaction's own change made, so the transaction is cancelled and the reason
-/// list names that action with the same sentence — whether or not the key already holds an
-/// item — and nothing is applied.
+/// RULE, the transactional half: the same crossing stated as an action of a transaction is
+/// answered by WHERE the bytes came from — an update asking for an item no table could hold
+/// refuses the call, while one whose payload fits and whose result crosses the ceiling only
+/// over what the stored item already held is a failure the transaction's own change made, so
+/// the transaction is cancelled and the reason list names that action with the same sentence.
+/// Either way nothing is applied.
 #[tokio::test]
-async fn an_update_past_the_ceiling_cancels_the_transaction_that_states_it() {
+async fn an_update_past_the_ceiling_follows_where_its_bytes_came_from() {
     let router = seeded().await;
 
     for crossing in crossings() {
@@ -283,20 +305,24 @@ async fn an_update_past_the_ceiling_cancels_the_transaction_that_states_it() {
             json!({"TransactItems": [{"Update": update_of(&crossing, &key)}]}),
         )
         .await;
-        assert_cancelled(
-            &case,
-            status,
-            &body,
-            &[VALIDATION_ERROR_CODE],
-            &[Some(UPDATE_TOO_BIG)],
-        );
+        if crossing.asks_too_much {
+            assert_refused(&case, status, &body, UPDATE_TOO_BIG);
+        } else {
+            assert_cancelled(
+                &case,
+                status,
+                &body,
+                &[VALIDATION_ERROR_CODE],
+                &[Some(UPDATE_TOO_BIG)],
+            );
+        }
 
         let held = held_bytes(&router, &key).await;
         let expected = (crossing.seeded > 0).then_some(crossing.seeded);
         assert_eq!(
             held, expected,
-            "case {case:?}: a cancelled transaction leaves the stored item where it was, \
-             expected {expected:?} byte(s) of filler, got {held:?}"
+            "case {case:?}: a refused or cancelled transaction leaves the stored item where it \
+             was, expected {expected:?} byte(s) of filler, got {held:?}"
         );
     }
 }
@@ -382,17 +408,26 @@ async fn a_partiql_update_past_the_ceiling_follows_the_surface_that_states_it() 
 }
 
 /// RULE: the reason list is "ordered according to the ordering of the TransactItems request
-/// parameter", so WHERE the oversized action sits decides where its reason sits and nothing
+/// parameter", so WHERE the cancelling action sits decides where its reason sits and nothing
 /// else — every blameless action beside it reports `None`.
+///
+/// The crossing driven here is the one a transaction is CANCELLED for: each action asks to
+/// store a value any item has room for, and the ceiling is crossed only over the bytes the
+/// stored item already held.
 #[tokio::test]
 async fn where_the_oversized_action_sits_is_where_its_reason_sits() {
     let router = seeded().await;
 
-    let oversize = json!({":v": {"S": "x".repeat(MAX_ITEM_BYTES)}});
+    // Every key the rows update holds an item already near the ceiling, so what crosses it is
+    // what that item holds and not what the action asks for.
+    for slot in ["alone", "before", "after", "beside"] {
+        seed_item(&router, slot, 300 * 1024).await;
+    }
+    let grows = json!({":v": {"S": "x".repeat(150 * 1024)}});
     let update = |key: &str| {
         json!({"Update": {"TableName": TABLE, "Key": key_of(key),
                "UpdateExpression": "SET big = :v",
-               "ExpressionAttributeValues": oversize.clone()}})
+               "ExpressionAttributeValues": grows.clone()}})
     };
     let put = |key: &str| json!({"Put": {"TableName": TABLE, "Item": key_of(key)}});
     let failing_check = || {

@@ -796,10 +796,9 @@ async fn a_substitution_table_with_no_expression_is_told_to_add_one() {
     }
 
     // The BOUNDARY: this rule is held over the members ONE ASK is stated through. The
-    // substitution tables of an element of a TRANSACTIONAL call, and of one `RequestItems`
-    // entry of a BATCHED read, sit beside the expression members of that element, so they
-    // are held to the element's OWN expressions — and an element that states no expression
-    // has none to hold them to, so the call is SERVED.
+    // substitution tables of an element of a TRANSACTIONAL call sit beside the expression
+    // members of that element, so they are held to the element's OWN expressions — and an
+    // element that states no expression has none to hold them to, so the call is SERVED.
     for (case, operation, request) in [
         (
             "names, on one element of a transactional read",
@@ -816,13 +815,6 @@ async fn a_substitution_table_with_no_expression_is_told_to_add_one() {
                 "Key": {"pk": {"S": "item-3"}},
                 "ExpressionAttributeValues": {":v": {"S": "paused"}}}}]}),
         ),
-        (
-            "names, on one entry of a batched read",
-            "BatchGetItem",
-            json!({"RequestItems": {SUBSTITUTED: {
-                "Keys": [key.clone()],
-                "ExpressionAttributeNames": {"#s": "status"}}}}),
-        ),
     ] {
         let (status, body) = call(&router, operation, request).await;
         assert_eq!(
@@ -831,6 +823,42 @@ async fn a_substitution_table_with_no_expression_is_told_to_add_one() {
              expressions, so this is served, got {status} with {body}"
         );
     }
+
+    // A BATCHED read is the other side of that boundary: its parameter generations are read
+    // over the WHOLE call, so a names table one `RequestItems` entry carries is held to the
+    // expressions the REQUEST states — a batch stating no `ProjectionExpression` anywhere is
+    // told to add one, and the same table beside an entry that projects is served.
+    let (status, body) = call(
+        &router,
+        "BatchGetItem",
+        json!({"RequestItems": {SUBSTITUTED: {
+            "Keys": [key.clone()],
+            "ExpressionAttributeNames": {"#s": "status"}}}}),
+    )
+    .await;
+    assert_eq!(
+        (status, message(&body)),
+        (
+            400,
+            "ExpressionAttributeNames can only be specified when using expressions".to_string()
+        ),
+        "case names, on one entry of a batched read: expected the table told to add an \
+         expression, got {status} with {body}"
+    );
+    let (status, body) = call(
+        &router,
+        "BatchGetItem",
+        json!({"RequestItems": {SUBSTITUTED: {
+            "Keys": [key.clone()],
+            "ProjectionExpression": "#s",
+            "ExpressionAttributeNames": {"#s": "status"}}}}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case names used by a batched read's own projection: expected the batch served, got \
+         {status} with {body}"
+    );
 
     // The BOUNDARY: the OTHER defect class keeps its own sentence. A request that DOES
     // name an expression and offers an entry it never references is told to drop the

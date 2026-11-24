@@ -82,3 +82,47 @@ Cause 4: PutItem with v={'N':'1E9223372036854775807'} (overflow leg, passes) and
 Cause 5: BatchGetItem with one table entry carrying both ProjectionExpression and AttributesToGet.
 Cause 6: BatchGetItem with table A's entry using ProjectionExpression and table B's entry using AttributesToGet.
 Replay the eight check ids in trace_ids.
+
+## Resolution
+
+Causes 3 and 4 were already closed by drift when this fix started (the over-size `Update`
+refused the call, and the number parser classified an unparsable exponent). Cause 4 stayed
+closed. Cause 3 was REOPENED by a change that landed on mainline meanwhile — it made every
+over-size `Update` cancel the transaction, for the wire-corpus fixture
+`transact-write-items-update-over-size-limit-cancellation-reason` (open issues
+`20261121T173852Z-dynamodb-transactwriteitems-an-over-size-update-is-refused` and
+`20261122T202407Z-dynamodb-transaction-failures-take-the-wrong-error-class`), whose own text
+asks whoever touches it to "reconcile the two surfaces so that a size defect caused BY the
+transaction cancels [...] while a request-level defect still refuses". That reconciliation is
+what this fix implements, over the bytes rather than over the surface: the item an `Update`
+ASKS for — the key it addresses plus what its clauses write, with nothing of the stored item
+counted — not fitting in an item at all refuses the CALL (this issue's three behavioural
+units, including the byte-exact ceiling a short key shares with `UpdateItem`), while a payload
+that fits and a result that crosses the ceiling only over what the stored item ALREADY held
+cancels the transaction with that action's reason (the documented circumstance, and the wire
+fixture's near-ceiling leg).
+
+Causes 1 and 2 are one ordering: a transactional action is now BOUND to its table first (the
+table, the policies, the values it carries and the key its map states against the table's key
+schema) and only then READ against the item its key holds (its condition, and the update it
+applies where that condition held). So a key the schema does not admit cancels the transaction
+before any stored item is read — every sibling reporting the null code — and an action whose
+condition was not met reports `ConditionalCheckFailed` alone.
+
+Causes 5 and 6 are one scope: a `BatchGetItem`'s parameter GENERATIONS, and whether a
+substitution table has an expression to be substituted into, are read over the whole
+`RequestItems` map rather than entry by entry.
+
+TWO things left behind for whoever picks this up next:
+
+* The wire fixture's second leg (an `Update` on a key that holds NO item, carrying a payload
+  no item could hold) is recorded as a cancellation while this issue's behavioural units
+  record the same shape as a top-level `ValidationException`. The two corpora disagree there
+  and no rule can serve both; the behavioural units are what this issue owns, so the payload
+  case refuses. The seam is `crossed_the_item_ceiling` in
+  `services/service-com-amazonaws-dynamodb-dynamodb-20120810/src/ops/transact_write_items.rs`.
+* The unused-entry rule (`Value provided in ExpressionAttributeNames unused in expressions:
+  keys: {…}`) is still asked of each `RequestItems` entry against that entry's OWN projection,
+  which is the only scope in which an alias can be said to be dereferenced. If a recording
+  ever shows AWS reading that rule across entries too, it is the same seam
+  (`services/service-com-amazonaws-dynamodb-dynamodb-20120810/src/ops/batch_get_item.rs`).

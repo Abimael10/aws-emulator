@@ -30,9 +30,11 @@
 //! own slot. The rows span the term (a boolean function, a comparison that is not `=`, a
 //! range, a disjunction, no clause at all) against the clauses that DO address one item.
 //!
-//! RULE 5 — one `RequestItems` entry of a batched read states the projection of ITS table,
-//! so each entry is held to the projection rule on its own. The rows span which entry states
-//! which generation and which entry carries the substitution table.
+//! RULE 5 — a batched read states each of its asks in ONE generation, read over the whole
+//! `RequestItems` map: mixing the legacy projection with `ProjectionExpression`, in one
+//! entry or across two, is refused, and so is a substitution table the request has no
+//! expression for. The rows span which entry states which generation and which entry
+//! carries the substitution table.
 //!
 //! RULE 6 — TEXT that spells a boolean, standing where a boolean is MODELLED, is read as the
 //! boolean it spells; text that spells no boolean, and text standing where anything else is
@@ -190,12 +192,15 @@ fn update(expression: &str, values: Value) -> Value {
     }})
 }
 
-/// A `ConditionCheck` action whose condition the seeded item does not satisfy.
+/// A `ConditionCheck` action whose condition does not hold, addressing an item of its OWN:
+/// "transaction requests cannot include multiple operations on one item", so a check that
+/// stands beside an action on the seeded item has to address a different key — and the key
+/// it addresses holds no item, which is what makes `attribute_exists` fail on it.
 fn failing_check() -> Value {
     json!({"ConditionCheck": {
         "TableName": ITEMS,
-        "Key": {"pk": {"S": "one"}},
-        "ConditionExpression": "attribute_exists(absent)",
+        "Key": {"pk": {"S": "checked"}},
+        "ConditionExpression": "attribute_exists(pk)",
     }})
 }
 
@@ -352,37 +357,40 @@ async fn an_action_read_against_the_stored_item_reports_its_own_cancellation_rea
     );
 }
 
-/// RULE 1 at the item-size CEILING: an item the transaction's own changes would grow past
-/// the documented 400 KB ceiling is that action's own failure — "an item size becomes too
-/// large (larger than 400 KB) [...] because of changes made by the transaction" is one of the
-/// circumstances `TransactionCanceledException` documents — so the transaction is CANCELLED
-/// and the reason list names the crossing action with the sentence the update path words that
-/// quota with, every blameless action beside it reporting `None`.
+/// RULE 1 at the item-size CEILING: WHO answers for a change that would leave the item past
+/// the documented 400 KB ceiling follows WHERE the bytes came from. An `Update` whose own
+/// payload — the key it addresses plus what its clauses write — does not fit in an item asks
+/// for something no table could hold whatever the store holds, so the CALL is refused with the
+/// sentence the update path words that quota with, grading no action and reporting no reason
+/// list. An `Update` whose payload fits and whose result crosses the ceiling only over what the
+/// STORED item already held is "an item size becomes too large (larger than 400 KB) [...]
+/// because of changes made by the transaction", one of the circumstances
+/// `TransactionCanceledException` documents, so the transaction is CANCELLED and the reason
+/// list names that action with the same sentence, every blameless action beside it reporting
+/// `None`.
 ///
-/// The rows differ along what the rule generalises over: WHERE the oversized action sits
-/// (alone, before an action that would succeed, after one, beside an action whose condition
-/// does not hold), and HOW it crosses the ceiling (one oversized value, a value just past
-/// the ceiling spread over two clauses, and a value the update COMPUTES). What stands beside
-/// it changes only its own slot's reason, which is what the rows carrying siblings pin.
+/// The rows differ along what the rule generalises over: HOW the ceiling is crossed (one
+/// oversized value, two clauses that only cross together, a value the update COMPUTES from
+/// what the request carried, and a small value over an item already near the ceiling), and
+/// WHERE the crossing action sits (alone, before an action that would succeed, after one,
+/// beside an action whose condition does not hold).
 ///
 /// The other side of the rule is driven beside them: an item a `Put` CARRIES past the ceiling
-/// is too large as SUBMITTED, so it is the request's own defect — refused, grading no action
-/// and reporting no reason list, with the sentence for an item that was carried.
+/// is too large as SUBMITTED, so it earns the sentence for an item that was carried.
 #[tokio::test]
-async fn an_update_the_transaction_grows_past_the_item_ceiling_cancels_it() {
+async fn an_update_the_transaction_grows_past_the_item_ceiling_takes_its_bytes_class() {
     let router = seeded().await;
 
     // Past the documented 400 KB item ceiling in one value, and in two clauses that only
     // cross it together.
     let oversize = "x".repeat(400 * 1024);
     let half = "y".repeat(210 * 1024);
-    // Each row: the case, the actions the transaction carries, and the reason every action
-    // reports in request order.
-    let rows: Vec<CancellationRow> = vec![
+    // Each row: the case and the actions the transaction carries. Every one of them asks for
+    // an item no table could hold, so every one refuses the CALL.
+    let refused: Vec<(&str, Value)> = vec![
         (
             "the oversized action alone",
             json!([update("SET big = :v", json!({":v": {"S": oversize.clone()}}))]),
-            vec![("ValidationError", Some(UPDATE_TOO_BIG))],
         ),
         (
             "the oversized action before one that would succeed",
@@ -390,7 +398,6 @@ async fn an_update_the_transaction_grows_past_the_item_ceiling_cancels_it() {
                 update("SET big = :v", json!({":v": {"S": oversize.clone()}})),
                 put("after-the-ceiling")
             ]),
-            vec![("ValidationError", Some(UPDATE_TOO_BIG)), ("None", None)],
         ),
         (
             "the oversized action after one that would succeed",
@@ -398,7 +405,6 @@ async fn an_update_the_transaction_grows_past_the_item_ceiling_cancels_it() {
                 put("before-the-ceiling"),
                 update("SET big = :v", json!({":v": {"S": oversize.clone()}}))
             ]),
-            vec![("None", None), ("ValidationError", Some(UPDATE_TOO_BIG))],
         ),
         (
             "the oversized action beside a condition that does not hold",
@@ -406,10 +412,6 @@ async fn an_update_the_transaction_grows_past_the_item_ceiling_cancels_it() {
                 failing_check(),
                 update("SET big = :v", json!({":v": {"S": oversize.clone()}}))
             ]),
-            vec![
-                ("ConditionalCheckFailed", Some(CONDITION_FAILED)),
-                ("ValidationError", Some(UPDATE_TOO_BIG)),
-            ],
         ),
         (
             "two clauses that cross the ceiling together",
@@ -417,18 +419,79 @@ async fn an_update_the_transaction_grows_past_the_item_ceiling_cancels_it() {
                 "SET one = :a, two = :b",
                 json!({":a": {"S": half.clone()}, ":b": {"S": half.clone()}})
             )]),
-            vec![("ValidationError", Some(UPDATE_TOO_BIG))],
         ),
         (
-            // The value the update COMPUTES is what crosses the ceiling: neither operand
-            // does on its own, so this row is found while the change is applied rather
-            // than while the request is read.
-            "a value the update computes past the ceiling",
+            // The value the update COMPUTES crosses the ceiling, and both operands are the
+            // request's own: what it asks to store is past the ceiling all the same.
+            "a value the update computes past the ceiling from what it carried",
             json!([update(
                 "SET joined = list_append(:a, :b)",
                 json!({":a": {"L": [{"S": half.clone()}]}, ":b": {"L": [{"S": half.clone()}]}})
             )]),
+        ),
+    ];
+
+    for (case, actions) in refused {
+        let (status, answered) = call(
+            &router,
+            "TransactWriteItems",
+            json!({"TransactItems": actions}),
+        )
+        .await;
+        assert_eq!(
+            (
+                status,
+                error_code(&answered).as_str(),
+                message(&answered).as_str()
+            ),
+            (400, "ValidationException", UPDATE_TOO_BIG),
+            "case {case:?}: expected the call refused with the update path's ceiling sentence, \
+             got {status} with {answered}"
+        );
+        assert!(
+            answered.get("CancellationReasons").is_none(),
+            "case {case:?}: a refused call grades no action, so it reports no reason list, got \
+             {answered}"
+        );
+    }
+
+    // The other half of the rule: an item already near the ceiling, and a change asking for
+    // bytes any item has room for — so what crosses the ceiling is what the STORED item holds
+    // and the transaction is cancelled with that action named, every action beside it
+    // reporting its own outcome in request order.
+    ok(
+        &router,
+        "PutItem",
+        json!({"TableName": ITEMS, "Item": {
+            "pk": {"S": "near-the-ceiling"},
+            "held": {"S": "h".repeat(390 * 1024)},
+        }}),
+    )
+    .await;
+    let grows = json!({"Update": {
+        "TableName": ITEMS,
+        "Key": {"pk": {"S": "near-the-ceiling"}},
+        "UpdateExpression": "SET big = :v",
+        "ExpressionAttributeValues": {":v": {"S": "g".repeat(20 * 1024)}},
+    }});
+    let rows: Vec<CancellationRow> = vec![
+        (
+            "a change the stored item's own bytes push past the ceiling",
+            json!([grows.clone()]),
             vec![("ValidationError", Some(UPDATE_TOO_BIG))],
+        ),
+        (
+            "that change after an action that would succeed",
+            json!([put("before-the-stored-ceiling"), grows.clone()]),
+            vec![("None", None), ("ValidationError", Some(UPDATE_TOO_BIG))],
+        ),
+        (
+            "that change beside a condition that does not hold",
+            json!([grows.clone(), failing_check()]),
+            vec![
+                ("ValidationError", Some(UPDATE_TOO_BIG)),
+                ("ConditionalCheckFailed", Some(CONDITION_FAILED)),
+            ],
         ),
     ];
 
@@ -476,6 +539,7 @@ async fn an_update_the_transaction_grows_past_the_item_ceiling_cancels_it() {
     for key in [
         "after-the-ceiling",
         "before-the-ceiling",
+        "before-the-stored-ceiling",
         "carried-past-the-ceiling",
     ] {
         let read = ok(
@@ -886,7 +950,7 @@ async fn a_batch_select_states_equality_conditions_and_nothing_else() {
 }
 
 // ===========================================================================
-// RULE 5. One RequestItems entry states its own projection ask
+// RULE 5. A batched read states its projections in one generation
 // ===========================================================================
 
 #[tokio::test]
@@ -904,32 +968,32 @@ async fn each_batch_read_entry_is_held_to_its_own_projection() {
         .await;
     }
 
-    // Each row: the case and the two entries' options. They span which entry states which
-    // generation and which entry carries a substitution table its projection does not
-    // dereference — every arrangement states each entry's ask exactly once, so every one is
-    // served.
+    // Each row: the case and the two entries' options. Every one of them states each
+    // entry's ask exactly once, in ONE generation across the whole request, so every one is
+    // served. They span which generation the request uses, which entry carries a
+    // substitution table, and whose projection dereferences it.
     let rows: Vec<(&str, Value, Value)> = vec![
         (
-            "the legacy member in one entry and the expression member in the other",
+            "the legacy member in both entries",
             json!({"Keys": [{"pk": {"S": "one"}}], "AttributesToGet": ["pk"]}),
+            json!({"Keys": [{"pk": {"S": "one"}}], "AttributesToGet": ["pk"]}),
+        ),
+        (
+            "the expression member in both entries",
+            json!({"Keys": [{"pk": {"S": "one"}}], "ProjectionExpression": "pk"}),
             json!({"Keys": [{"pk": {"S": "one"}}], "ProjectionExpression": "pk"}),
         ),
         (
-            "the expression member in one entry and the legacy member in the other",
-            json!({"Keys": [{"pk": {"S": "one"}}], "ProjectionExpression": "pk"}),
-            json!({"Keys": [{"pk": {"S": "one"}}], "AttributesToGet": ["pk"]}),
+            "a names table used by its own entry's projection beside a plain entry",
+            json!({"Keys": [{"pk": {"S": "one"}}], "ProjectionExpression": "#n",
+                   "ExpressionAttributeNames": {"#n": "note"}}),
+            json!({"Keys": [{"pk": {"S": "one"}}]}),
         ),
         (
             "a names table with no projection beside an entry that projects",
             json!({"Keys": [{"pk": {"S": "one"}}],
                    "ExpressionAttributeNames": {"#n": "note"}}),
             json!({"Keys": [{"pk": {"S": "one"}}], "ProjectionExpression": "pk"}),
-        ),
-        (
-            "a names table beside the legacy projection of the same entry",
-            json!({"Keys": [{"pk": {"S": "one"}}], "AttributesToGet": ["pk"],
-                   "ExpressionAttributeNames": {"#n": "note"}}),
-            json!({"Keys": [{"pk": {"S": "one"}}]}),
         ),
         (
             "both entries projecting through their own names table",
@@ -966,23 +1030,57 @@ async fn each_batch_read_entry_is_held_to_its_own_projection() {
         );
     }
 
-    // The BOUNDARY: ONE ENTRY stating the same ask both ways is the mixing the rule is
-    // about, and is still refused.
-    let (status, answered) = call(
-        &router,
-        "BatchGetItem",
-        json!({"RequestItems": {ITEMS: {
-            "Keys": [{"pk": {"S": "one"}}],
-            "AttributesToGet": ["pk"],
-            "ProjectionExpression": "pk"}}}),
-    )
-    .await;
-    assert_eq!(
-        (status, error_code(&answered).as_str()),
-        (400, "ValidationException"),
-        "case one entry stating both generations: expected the mixing refused, got {status} \
-         with {answered}"
-    );
+    // The BOUNDARY: the generations are read over the WHOLE request, so a batch that states
+    // its projections in both — inside one entry or across two — is refused, and so is one
+    // whose names table has no projection anywhere to go into.
+    for (case, request, expected) in [
+        (
+            "one entry stating both generations",
+            json!({"RequestItems": {ITEMS: {
+                "Keys": [{"pk": {"S": "one"}}],
+                "AttributesToGet": ["pk"],
+                "ProjectionExpression": "pk"}}}),
+            "Can not use both expression and non-expression parameters in the same request: \
+             Non-expression parameters: {AttributesToGet} Expression parameters: \
+             {ProjectionExpression}",
+        ),
+        (
+            "one entry projecting the legacy way and the other the expression way",
+            json!({"RequestItems": {
+                ITEMS: {"Keys": [{"pk": {"S": "one"}}], "AttributesToGet": ["pk"]},
+                other: {"Keys": [{"pk": {"S": "one"}}], "ProjectionExpression": "pk"}}}),
+            "Can not use both expression and non-expression parameters in the same request: \
+             Non-expression parameters: {AttributesToGet} Expression parameters: \
+             {ProjectionExpression}",
+        ),
+        (
+            "a names table beside the legacy projection of the same entry",
+            json!({"RequestItems": {ITEMS: {
+                "Keys": [{"pk": {"S": "one"}}],
+                "AttributesToGet": ["pk"],
+                "ExpressionAttributeNames": {"#n": "note"}}}}),
+            "ExpressionAttributeNames can only be specified when using expressions",
+        ),
+        (
+            "a names table in a batch that projects nowhere",
+            json!({"RequestItems": {
+                ITEMS: {"Keys": [{"pk": {"S": "one"}}],
+                        "ExpressionAttributeNames": {"#n": "note"}},
+                other: {"Keys": [{"pk": {"S": "one"}}]}}}),
+            "ExpressionAttributeNames can only be specified when using expressions",
+        ),
+    ] {
+        let (status, answered) = call(&router, "BatchGetItem", request).await;
+        assert_eq!(
+            (
+                status,
+                error_code(&answered).as_str(),
+                message(&answered).as_str()
+            ),
+            (400, "ValidationException", expected),
+            "case {case:?}: expected {expected:?}, got {status} with {answered}"
+        );
+    }
 }
 
 // ===========================================================================

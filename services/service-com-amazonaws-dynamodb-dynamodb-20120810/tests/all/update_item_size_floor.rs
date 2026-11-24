@@ -352,10 +352,11 @@ fn assert_served(
 
 /// Assert the change one byte past the boundary did not go through, each surface stating it as
 /// that surface does: as the CALL's own refusal with the update path's sentence on the
-/// single-item and standalone PartiQL surfaces, as the crossing ACTION's cancellation reason —
-/// carrying that same sentence — on the TRANSACTIONAL surfaces, where an item the
-/// transaction's own change grows past the ceiling is one of the circumstances a cancellation
-/// documents, and as the slot's own error in a batch, which answers 200.
+/// single-item surfaces, on the standalone PartiQL one and on `TransactWriteItems` — where the
+/// item the action ASKS for (its key plus the one attribute it writes) is itself past the
+/// ceiling, so the request cannot be served however the store looks — as the crossing ACTION's
+/// cancellation reason carrying that same sentence on `ExecuteTransaction`, and as the slot's
+/// own error in a batch, which answers 200.
 fn assert_refused(case: &str, surface: Surface, answered: &(u16, Value)) {
     let (status, body) = answered;
     if surface == Surface::BatchExecuteStatement {
@@ -371,7 +372,7 @@ fn assert_refused(case: &str, surface: Surface, answered: &(u16, Value)) {
         );
         return;
     }
-    if surface == Surface::TransactWriteItems || surface == Surface::ExecuteTransaction {
+    if surface == Surface::ExecuteTransaction {
         assert_eq!(
             (*status, error_code(body).as_str(), message(body).as_str()),
             (

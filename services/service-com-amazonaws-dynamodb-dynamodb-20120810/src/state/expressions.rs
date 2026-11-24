@@ -1221,9 +1221,17 @@ impl<'a> Substitutions<'a> {
     /// them was sent. The NAMES table is reported first, which is the order the two tables
     /// are checked in throughout.
     ///
-    /// This rule is the REQUEST's own and is not asked of one ELEMENT of a multi-item
-    /// request ([`Substitutions::check_referenced_within_element`]).
-    fn check_an_expression_was_sent(
+    /// This rule is the REQUEST's own and is not asked of one ELEMENT of a TRANSACTIONAL
+    /// request, whose tables sit beside expression members stating only part of what that
+    /// element does ([`Substitutions::check_referenced_within_element`]).
+    ///
+    /// `expressions` is therefore read in the scope the CALL states its asks in. For an
+    /// operation whose expression members are its own, that is the request's own members. A
+    /// batched read states its projection inside each `RequestItems` entry while the
+    /// GENERATIONS of its parameters are read over the whole call — one entry's legacy list
+    /// collides with another entry's `ProjectionExpression` — so there it is what the call
+    /// states anywhere rather than what the entry carrying the table states.
+    pub(crate) fn check_an_expression_was_sent(
         &self,
         expressions: &[(&str, Option<&str>)],
     ) -> Result<(), RequestError> {

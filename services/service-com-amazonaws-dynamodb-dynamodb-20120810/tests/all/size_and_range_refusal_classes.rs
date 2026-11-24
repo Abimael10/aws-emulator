@@ -380,14 +380,25 @@ async fn a_change_that_would_grow_the_item_past_it_is_the_update_sentence() {
                    "Parameters": [oversized()]}),
         ),
         (
-            // A value the request CARRIED that no item could hold is the request's own
-            // defect — it is found reading the request, before any table is looked up — so
-            // inside a transaction too it refuses the call rather than cancelling it.
-            "one action of a transaction carrying an oversized value",
+            // What an action ASKS to store — the key it addresses plus the value its clause
+            // writes — not fitting in an item at all is the request's own defect, found
+            // whatever the store holds, so inside a transaction too it refuses the call
+            // rather than cancelling it. The case where the STORED item's own bytes are what
+            // cross the ceiling is driven below.
+            "one action of a transaction asking for an item no table could hold",
             "TransactWriteItems",
             json!({"TransactItems": [{"Update": {"TableName": TABLE, "Key": key(),
                    "UpdateExpression": "SET body = :b",
                    "ExpressionAttributeValues": {":b": oversized()}}}]}),
+        ),
+        (
+            // The same, with a value the ceiling admits ON ITS OWN: the item this action
+            // asks for still does not fit, which is the request's defect all the same.
+            "one action of a transaction asking for an item one byte past the ceiling",
+            "TransactWriteItems",
+            json!({"TransactItems": [{"Update": {"TableName": TABLE, "Key": key(),
+                   "UpdateExpression": "SET body = :b",
+                   "ExpressionAttributeValues": {":b": {"S": filler(MAX_ITEM_BYTES)}}}}]}),
         ),
     ] {
         let stated = refusal(&router, case, operation, request).await;
@@ -398,17 +409,27 @@ async fn a_change_that_would_grow_the_item_past_it_is_the_update_sentence() {
     }
 
     // The TRANSACTIONAL surface states the same sentence as the REASON the crossing action
-    // reports where the crossing is the transaction's own doing: the value here is INSIDE the
-    // ceiling, so nothing the request carried is too large on its own and it is only the item
-    // the change would LEAVE that cannot be stored — "an item size becomes too large [...]
+    // reports where the crossing is the transaction's own doing: what this action asks to
+    // store is a small value that any item has room for, and the ceiling is crossed only
+    // over the bytes the STORED item already held — "an item size becomes too large [...]
     // because of changes made by the transaction", one of the circumstances a cancellation
     // documents — so the transaction is cancelled with that action named.
+    let near_the_ceiling = json!({"pk": {"S": "near-the-ceiling"}, "sk": {"S": "a"}});
+    ok(
+        &router,
+        "PutItem",
+        json!({"TableName": TABLE, "Item": {"pk": {"S": "near-the-ceiling"},
+               "sk": {"S": "a"},
+               "held": {"S": filler(MAX_ITEM_BYTES - 1024)}}}),
+    )
+    .await;
     let (status, answered) = call(
         &router,
         "TransactWriteItems",
-        json!({"TransactItems": [{"Update": {"TableName": TABLE, "Key": key(),
+        json!({"TransactItems": [{"Update": {"TableName": TABLE,
+               "Key": near_the_ceiling.clone(),
                "UpdateExpression": "SET body = :b",
-               "ExpressionAttributeValues": {":b": {"S": filler(MAX_ITEM_BYTES)}}}}]}),
+               "ExpressionAttributeValues": {":b": {"S": filler(2048)}}}}]}),
     )
     .await;
     assert_eq!(

@@ -369,8 +369,10 @@ async fn a_substitution_table_with_no_expression_names_the_member_that_needs_one
 
     // Rows differ along the operation that accepts the member (an item read, a query and
     // a scan) and along which table was sent. The rule is the REQUEST's, so a call's own
-    // members are what it holds: the tables of ONE ELEMENT of a multi-item call are held
-    // to that element's own expressions instead, which the BOUNDARY below states.
+    // members are what it holds — and a BATCHED read's parameter generations are read over
+    // the whole call, so its entries' tables are held to it too; the tables of ONE ELEMENT
+    // of a TRANSACTIONAL call are held to that element's own expressions instead, which the
+    // BOUNDARY below states.
     let rows: Vec<(&str, Value, &str)> = vec![
         (
             "an item read",
@@ -409,9 +411,11 @@ async fn a_substitution_table_with_no_expression_names_the_member_that_needs_one
         );
     }
 
-    // A `RequestItems` entry of a BATCHED read is one ELEMENT of the batch: its projection
-    // members sit inside that entry rather than beside the call's own, so it is held to the
-    // element scope and an entry that states its projection another way, or none, is SERVED.
+    // A `RequestItems` entry sits inside a request whose parameter GENERATIONS are read
+    // over the whole call, so whether its names table has an expression to be substituted
+    // into is the REQUEST's fact too: a batch that sends one and states no
+    // `ProjectionExpression` anywhere is told to add the expression, exactly as the
+    // single-table readers above are.
     let (status, answered) = call(
         &router,
         "BatchGetItem",
@@ -421,10 +425,34 @@ async fn a_substitution_table_with_no_expression_names_the_member_that_needs_one
     )
     .await;
     assert_eq!(
-        (status, answered["Responses"][table][0]["label"].clone()),
-        (200, json!({"S": "first"})),
-        "case a batch read: an entry's tables are held to the entry's own projection, so the \
-         whole addressed item is served, got {status} with {answered}"
+        (
+            status,
+            error_code(&answered).as_str(),
+            message(&answered).as_str()
+        ),
+        (
+            400,
+            "ValidationException",
+            "ExpressionAttributeNames can only be specified when using expressions"
+        ),
+        "case a batch read: expected the names table told to add an expression, got {status} \
+         with {answered}"
+    );
+    // And the same table beside an entry that DOES state a projection is served: the
+    // request carries an expression for it, which is the scope the rule is read in.
+    let answered = ok(
+        &router,
+        "BatchGetItem",
+        json!({"RequestItems": {table: {
+            "Keys": [{"pk": {"S": "p1"}, "sk": {"N": "1"}}],
+            "ProjectionExpression": "#l",
+            "ExpressionAttributeNames": {"#l": "label"}}}}),
+    )
+    .await;
+    assert_eq!(
+        answered["Responses"][table][0]["label"],
+        json!({"S": "first"}),
+        "case a batch read that projects: expected the projected attribute, got {answered}"
     );
     assert_eq!(
         answered["UnprocessedKeys"],
