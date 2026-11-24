@@ -407,6 +407,11 @@ fn requested_account_id(
 /// The volumes this request asks about, by volume id, or `None` when it names none and so
 /// asks about the account's whole inventory in this Region.
 ///
+/// A request names none both by leaving `volumeArns` out and by sending it EMPTY, the crate's
+/// one rule for an identifier list ([`crate::state::named_identifiers`]) — which is also what
+/// keeps that case apart from the distinct one of a list that names only volumes this endpoint
+/// does not observe: THAT list names volumes, and selects nothing.
+///
 /// Every ARN has to be an Amazon EBS volume ARN — `volumeArns` is "the Amazon Resource
 /// Name (ARN) of the volumes for which to return recommendations" — so anything else is
 /// refused with [`INVALID_VOLUME_ARN_MESSAGE`], and one that names another account's
@@ -419,7 +424,7 @@ fn requested_volume_ids(
     account_id: &str,
     region: &str,
 ) -> Result<Option<Vec<String>>, GetEBSVolumeRecommendationsError> {
-    let Some(volume_arns) = volume_arns else {
+    let Some(volume_arns) = crate::state::named_identifiers(volume_arns) else {
         return Ok(None);
     };
     // The model bounds this list's length nowhere, so the service does: a request may name at

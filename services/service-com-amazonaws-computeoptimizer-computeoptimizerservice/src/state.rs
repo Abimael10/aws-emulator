@@ -205,6 +205,18 @@ pub fn too_many_identifiers(member: &str, named: usize) -> Option<String> {
     })
 }
 
+/// The identifiers an identifier list a request carries actually NAMES, or `None` when it
+/// names none and so asks about the account's whole inventory.
+///
+/// A member the request leaves out and one it sends EMPTY both name no resource, so both are
+/// the same request: a list narrows a reader's answer only once it holds an identifier. The
+/// same rule [`requested_account_id`] resolves an empty `accountIds` by, and the one every
+/// reader of this service applies to the identifier list it takes — so none of them can read
+/// an empty list as "no resource matches" while another reads it as "every resource".
+pub fn named_identifiers(identifiers: Option<&[String]>) -> Option<&[String]> {
+    identifiers.filter(|named| !named.is_empty())
+}
+
 /// The `ScopeName` enum values (`crate::ops::types::SCOPE_NAME_VALUES`), named so the
 /// precedence and validation rules below read as the model's own vocabulary.
 pub const SCOPE_ORGANIZATION: &str = "Organization";

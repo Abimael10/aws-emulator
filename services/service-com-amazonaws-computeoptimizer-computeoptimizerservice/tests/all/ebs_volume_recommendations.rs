@@ -16,7 +16,9 @@ use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::ANALYSIS_DELAY;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{call, call_in_region, emulator, error_code, opt_in, put_preference};
+use crate::harness::{
+    analysed_emulator, call, call_in_region, emulator, error_code, opt_in, put_preference,
+};
 
 /// Opt the account in and let the analysis its enrollment starts come due — the gate
 /// every recommendation reader of this service applies. The span is the service's own
@@ -912,6 +914,100 @@ async fn the_ebs_volume_summary_agrees_with_the_recommendations() {
         "the summary must total what the volume recommendations save ({expected_savings}), \
          got {summary}"
     );
+}
+
+/// A `volumeArns` that NAMES NO volume asks about the account's whole analysed inventory,
+/// and a request names none both by leaving the member out and by sending it empty — which
+/// is a shape clients send, and the shape this service already reads `accountIds` that way.
+/// A list that names volumes narrows to exactly those, even where none of them is a volume
+/// this endpoint observes.
+///
+/// Rows span the forms the list can take — absent, empty, one volume, several, a volume of
+/// another Region, and the empty list beside a `filters` narrowing it must not disable — each
+/// with the volumes it has to select.
+#[tokio::test]
+async fn a_volume_arns_list_that_names_no_volume_asks_about_the_whole_inventory() {
+    let router = analysed_emulator().await;
+
+    // The whole analysed inventory, which the rows that name no volume have to report.
+    let whole = [
+        GP2_WITH_HEADROOM,
+        GP3_OUTRUNNING_ITS_IOPS,
+        IO1_OVER_PROVISIONED,
+        GP3_ALREADY_RIGHT_SIZED,
+    ];
+    // A well-formed volume ARN of this account in ANOTHER Region: it NAMES a volume, one
+    // this endpoint does not observe, so it narrows the answer to nothing.
+    let other_region = format!(
+        "arn:aws:ec2:us-west-2:{}:volume/vol-0a1b2c3d4e5f6{GP2_WITH_HEADROOM}",
+        ::engine::emulator_account_id()
+    );
+    let optimized = json!([{"name": "Finding", "values": ["Optimized"]}]);
+
+    let cases: [(&str, Value, Vec<String>); 7] = [
+        (
+            "the member absent",
+            json!({"maxResults": 1000}),
+            whole.iter().map(|suffix| volume_arn(suffix)).collect(),
+        ),
+        (
+            "an explicitly empty list",
+            json!({"volumeArns": [], "maxResults": 1000}),
+            whole.iter().map(|suffix| volume_arn(suffix)).collect(),
+        ),
+        (
+            "one volume named",
+            json!({"volumeArns": [volume_arn(IO1_OVER_PROVISIONED)], "maxResults": 1000}),
+            vec![volume_arn(IO1_OVER_PROVISIONED)],
+        ),
+        (
+            "two volumes named",
+            json!({
+                "volumeArns": [
+                    volume_arn(GP2_WITH_HEADROOM),
+                    volume_arn(GP3_ALREADY_RIGHT_SIZED),
+                ],
+                "maxResults": 1000,
+            }),
+            vec![
+                volume_arn(GP2_WITH_HEADROOM),
+                volume_arn(GP3_ALREADY_RIGHT_SIZED),
+            ],
+        ),
+        (
+            "only a volume of another Region named",
+            json!({"volumeArns": [other_region.clone()], "maxResults": 1000}),
+            Vec::new(),
+        ),
+        (
+            "a filter, with the member absent",
+            json!({"filters": optimized.clone(), "maxResults": 1000}),
+            vec![volume_arn(GP3_ALREADY_RIGHT_SIZED)],
+        ),
+        (
+            "a filter, with an explicitly empty list",
+            json!({"volumeArns": [], "filters": optimized.clone(), "maxResults": 1000}),
+            vec![volume_arn(GP3_ALREADY_RIGHT_SIZED)],
+        ),
+    ];
+
+    for (case, request, expected) in cases {
+        let body = recommendations(&router, request.clone()).await;
+        let mut reported = reported_arns(&body);
+        reported.sort();
+        let mut expected = expected;
+        expected.sort();
+        assert_eq!(
+            reported, expected,
+            "case {case:?} ({request}): expected {expected:?}, got {reported:?}: {body}"
+        );
+        assert_eq!(
+            body["errors"],
+            json!([]),
+            "case {case:?}: a request naming no volume, or only volumes of this account, \
+             reports no per-volume error, got {body}"
+        );
+    }
 }
 
 #[tokio::test]

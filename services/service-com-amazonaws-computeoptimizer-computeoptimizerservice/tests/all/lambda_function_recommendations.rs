@@ -1489,3 +1489,122 @@ async fn the_summary_of_lambda_functions_counts_what_this_reader_reports() {
         );
     }
 }
+
+/// A `functionArns` that NAMES NO function asks about the account's whole analysed
+/// inventory, and a request names none both by leaving the member out and by sending it
+/// empty — the same shape this reader already answers an empty `accountIds` with. A list
+/// that names functions narrows to exactly those, even where none of them is a function this
+/// endpoint observes.
+///
+/// Rows span the forms the list can take — absent, empty, one function, several, a function
+/// of another Region, and the empty list beside a `filters` narrowing it must not disable —
+/// each with the functions it has to select.
+#[tokio::test]
+async fn a_function_arns_list_that_names_no_function_asks_about_the_whole_inventory() {
+    let (router, _engine) = analysed_emulator().await;
+
+    // The whole analysed population, unavailable findings included, so each row can be
+    // checked against the set it picks out of it.
+    let population = reported(&whole_population(&router).await);
+    let whole: Vec<String> = population
+        .iter()
+        .map(|recommendation| {
+            recommendation["functionArn"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        whole.len(),
+        5,
+        "the account must hold the analysed functions for this to prove anything, got {whole:?}"
+    );
+    // A well-formed function ARN of this account in ANOTHER Region: it NAMES a function, one
+    // this endpoint does not observe, so it narrows the answer to nothing.
+    let other_region = function_arn_in("us-west-2", OVER_PROVISIONED);
+    let every_finding = json!([{"name": "Finding", "values": FINDINGS}]);
+    let not_optimized = json!([{"name": "Finding", "values": ["NotOptimized"]}]);
+    let at_not_optimized: Vec<String> = population
+        .iter()
+        .filter(|recommendation| recommendation["finding"] == json!("NotOptimized"))
+        .map(|recommendation| {
+            recommendation["functionArn"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    assert!(
+        !at_not_optimized.is_empty() && at_not_optimized.len() < whole.len(),
+        "the filtered rows need a finding that narrows the population, got {at_not_optimized:?}"
+    );
+
+    let cases: [(&str, Value, Vec<String>); 7] = [
+        (
+            "the member absent",
+            json!({"filters": every_finding.clone(), "maxResults": 1000}),
+            whole.clone(),
+        ),
+        (
+            "an explicitly empty list",
+            json!({"functionArns": [], "filters": every_finding.clone(), "maxResults": 1000}),
+            whole.clone(),
+        ),
+        (
+            "one function named",
+            json!({
+                "functionArns": [function_arn(OVER_PROVISIONED)],
+                "filters": every_finding.clone(),
+                "maxResults": 1000,
+            }),
+            vec![function_arn(OVER_PROVISIONED)],
+        ),
+        (
+            "two functions named",
+            json!({
+                "functionArns": [
+                    function_arn(UNDER_PROVISIONED),
+                    function_arn(ALREADY_RIGHT_SIZED),
+                ],
+                "filters": every_finding.clone(),
+                "maxResults": 1000,
+            }),
+            vec![
+                function_arn(UNDER_PROVISIONED),
+                function_arn(ALREADY_RIGHT_SIZED),
+            ],
+        ),
+        (
+            "only a function of another Region named",
+            json!({
+                "functionArns": [other_region.clone()],
+                "filters": every_finding.clone(),
+                "maxResults": 1000,
+            }),
+            Vec::new(),
+        ),
+        (
+            "a filter, with the member absent",
+            json!({"filters": not_optimized.clone(), "maxResults": 1000}),
+            at_not_optimized.clone(),
+        ),
+        (
+            "a filter, with an explicitly empty list",
+            json!({"functionArns": [], "filters": not_optimized.clone(), "maxResults": 1000}),
+            at_not_optimized.clone(),
+        ),
+    ];
+
+    for (case, request, expected) in cases {
+        let body = recommendations(&router, request.clone()).await;
+        let mut reported = reported_arns(&body);
+        reported.sort();
+        let mut expected = expected;
+        expected.sort();
+        assert_eq!(
+            reported, expected,
+            "case {case:?} ({request}): expected {expected:?}, got {reported:?}: {body}"
+        );
+    }
+}

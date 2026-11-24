@@ -415,6 +415,11 @@ fn requested_account_id(
 /// The function VERSIONS this request asks about, by the resource part of their ARN, or
 /// `None` when it names none and so asks about the account's whole inventory in this Region.
 ///
+/// A request names none both by leaving `functionArns` out and by sending it EMPTY, the
+/// crate's one rule for an identifier list ([`crate::state::named_identifiers`]) — which is
+/// also what keeps that case apart from the distinct one of a list that names only functions
+/// this endpoint does not observe: THAT list names functions, and selects nothing.
+///
 /// Every entry has to be a Lambda function ARN — `functionArns` is "the Amazon Resource Name
 /// (ARN) of the functions for which to return recommendations" — so anything else is
 /// refused with [`INVALID_FUNCTION_ARN_MESSAGE`], and one that names another account's
@@ -431,7 +436,7 @@ fn requested_functions(
     account_id: &str,
     region: &str,
 ) -> Result<Option<Vec<String>>, GetLambdaFunctionRecommendationsError> {
-    let Some(function_arns) = function_arns else {
+    let Some(function_arns) = crate::state::named_identifiers(function_arns) else {
         return Ok(None);
     };
     // The model bounds this list's length nowhere, so the service does: a request may name at
