@@ -355,12 +355,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // IAM decides this call before the service looks at what it asks for: the action is
         // this operation's own name under this service's prefix, and the resource is the
         // function this create is ABOUT TO create, which is the resource such a call names
-        // (`crate::state::caller_authorization`). The request also publishes the condition key
-        // its own `CodeSigningConfigArn` member carries — the configuration this create asks
-        // for, and the key's ABSENCE when it asks for none, since the member is optional and
-        // that absence is a fact about the request (see
-        // [`crate::state::code_signing_conditions`]) — so a grant narrowed to an approved
-        // configuration covers only the creates that name it. A caller the documents in force
+        // (`crate::state::caller_authorization`). The request also publishes the condition keys
+        // the values ABOUT it carry: the configuration its own `CodeSigningConfigArn` member
+        // asks for, and the key's ABSENCE when it asks for none, since the member is optional
+        // and that absence is a fact about the request (see
+        // [`crate::state::code_signing_conditions`]); and the network placement its own
+        // `VpcConfig` asks for — the groups and subnets it names, and the VPC those subnets
+        // belong to (see [`crate::state::vpc_conditions`]). So a grant narrowed to an approved
+        // configuration, or to approved security groups, subnets or VPC, covers only the
+        // creates that ask for them. A caller the documents in force
         // do not allow is refused 403 `AccessDeniedException` here, so nothing is created.
         // Taken before this service's store is locked, which is the lock order the gate
         // documents, and before the name is resolved, which is the order AWS decides in: the
@@ -370,6 +373,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // addresses no function of this endpoint therefore has no ARN to be judged on and is
         // decided against the any-resource wildcard, exactly as IAM writes the resource of
         // such a request (`crate::state::invoke_authorization::ANY_RESOURCE`).
+        let mut request_conditions =
+            crate::state::code_signing_config_conditions(input.code_signing_config_arn.as_deref());
+        request_conditions.extend(crate::state::vpc_config_conditions(
+            &*self.engine,
+            input.vpc_config.as_ref(),
+        ));
+        let published_keys: Vec<&str> = crate::state::CODE_SIGNING_CONFIG_CONDITION_KEYS
+            .iter()
+            .chain(crate::state::VPC_CONFIG_CONDITION_KEYS)
+            .copied()
+            .collect();
         crate::state::authorize_caller_with_conditions(
             &*self.engine,
             ctx,
@@ -379,8 +393,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.function_name,
                 None,
             ),
-            &crate::state::code_signing_config_conditions(input.code_signing_config_arn.as_deref()),
-            crate::state::CODE_SIGNING_CONFIG_CONDITION_KEYS,
+            &request_conditions,
+            &published_keys,
         )?;
 
         let reference = crate::state::parse_function_reference(&input.function_name)

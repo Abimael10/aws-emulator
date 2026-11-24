@@ -197,6 +197,39 @@ pub fn reconcile_function_interfaces<Eng: Send + Sync + 'static>(
     }
 }
 
+/// Every VPC the subnets a configuration NAMES belong to, as EC2's own record of each subnet
+/// names it: the distinct ids, in the order the configuration first names a subnet of each.
+///
+/// The same resolution [`place_function_interfaces`] makes for the id it reports, asked on its
+/// own — because the VPC a request's configuration reaches is not a value the request carries
+/// but EC2's record of its subnets, and a caller that has to NAME that VPC without standing
+/// anything up needs exactly this reading ([`super::vpc_conditions`]).
+///
+/// A READ of the inventory, under a guard scoped to it: nothing is placed and nothing is
+/// changed. Empty for a configuration that attaches the function to nothing, for an engine
+/// carrying no EC2 inventory, and for subnets that inventory holds no record of — the same
+/// cases that report no id above, since no id is reported here that was not looked up.
+#[must_use]
+pub fn configured_vpc_ids<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    vpc_config: Option<&VpcConfig>,
+) -> Vec<String> {
+    let Some(subnet_ids) = attached_subnets(vpc_config) else {
+        return Vec::new();
+    };
+    let Some(state) = ec2::service_state(engine) else {
+        return Vec::new();
+    };
+    let store = state.lock();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    subnet_ids
+        .iter()
+        .filter_map(|subnet_id| store.subnets.get(subnet_id.as_str()))
+        .filter_map(|subnet| subnet.vpc_id.clone())
+        .filter(|vpc_id| seen.insert(vpc_id.clone()))
+        .collect()
+}
+
 /// Take the interfaces `network_interface_ids` names back out of the account's EC2 inventory —
 /// the exact reverse of [`place_function_interfaces`], so the addresses they held can be handed
 /// out again and the subnet and groups they held a place in can be deleted.
@@ -235,7 +268,7 @@ pub const MAX_ATTACHED_SECURITY_GROUPS: usize = 5;
 /// taken as the DISTINCT subnets it names, in the order it first names each, and no more of
 /// them than [`MAX_ATTACHED_SUBNETS`] — which is what keeps the placement below one bounded
 /// piece of work per request rather than one the caller sizes.
-fn attached_subnets(vpc_config: Option<&VpcConfig>) -> Option<Vec<String>> {
+pub(crate) fn attached_subnets(vpc_config: Option<&VpcConfig>) -> Option<Vec<String>> {
     let named = vpc_config.and_then(|vpc_config| vpc_config.subnet_ids.as_deref())?;
     let subnets = distinct(named, MAX_ATTACHED_SUBNETS);
     (!subnets.is_empty()).then_some(subnets)
@@ -244,7 +277,7 @@ fn attached_subnets(vpc_config: Option<&VpcConfig>) -> Option<Vec<String>> {
 /// "A list of VPC security group IDs" (`VpcConfig$SecurityGroupIds`) the configuration names,
 /// which are the groups of the interfaces the attachment stands up — the distinct groups it
 /// names, bounded by [`MAX_ATTACHED_SECURITY_GROUPS`], for the reasons above.
-fn security_group_ids(vpc_config: Option<&VpcConfig>) -> Vec<String> {
+pub(crate) fn security_group_ids(vpc_config: Option<&VpcConfig>) -> Vec<String> {
     vpc_config
         .and_then(|vpc_config| vpc_config.security_group_ids.as_deref())
         .map(|group_ids| distinct(group_ids, MAX_ATTACHED_SECURITY_GROUPS))

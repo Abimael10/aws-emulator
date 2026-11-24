@@ -374,6 +374,17 @@ pub use code_signing_conditions::{
     CODE_SIGNING_CONFIG_CONDITION_KEYS,
 };
 
+/// The CONDITION KEYS a call that names a VPC CONFIGURATION publishes into that decision —
+/// the placement the request asks for, which a policy writer narrows the grant to approved
+/// networks by — live in [`vpc_conditions`], beside the gate that carries them and the
+/// attachment reading they share their reading of the lists with. They are re-exported here
+/// for the same reason as [`capacity_provider`]: a handler names them as `crate::state::…`.
+pub mod vpc_conditions;
+pub use vpc_conditions::{
+    vpc_config_conditions, SECURITY_GROUP_IDS_CONDITION_KEY, SUBNET_IDS_CONDITION_KEY,
+    VPC_CONFIG_CONDITION_KEYS, VPC_IDS_CONDITION_KEY,
+};
+
 /// Whether a request may address a layer that belongs to ANOTHER account — the decision every
 /// operation on a layer takes before it resolves the name it was given — lives in
 /// [`layer_authorization`], beside the two gates above whose reading of the request's
