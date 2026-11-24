@@ -23,8 +23,9 @@
 //!   name for the KMS key") naming no key of this account, and a key KMS HOLDS but has
 //!   disabled, named both by its key id and by its ARN.
 //!
-//! Each row's `<Message>` is asserted in full: a create is refused about the key it
-//! SPECIFIED, and a copy — which also has the source snapshot's key — about its TARGET key.
+//! Each row's `<Message>` is asserted in full: a create is refused with the sentence that
+//! opens "The specified KMS key [", and a copy with the copy paths' own wording, which
+//! opens "Specified KMS key [".
 //!
 //! A control suite then pins the other side: under a key KMS holds ENABLED, not one of the
 //! same calls is refused with that fault, and an encrypted DB instance and an encrypted
@@ -73,11 +74,11 @@ fn key_not_accessible(key_id: &str) -> String {
     )
 }
 
-/// The same sentence on a COPY, whose named key is the key the COPY is encrypted under —
-/// the TARGET key, beside the source snapshot's own.
-fn target_key_not_accessible(key_id: &str) -> String {
+/// The sentence a snapshot COPY answers the same fault with: the copy paths' own wording,
+/// which drops the leading "The" the creates carry.
+fn copy_key_not_accessible(key_id: &str) -> String {
     format!(
-        "The target KMS key [{key_id}] does not exist, is not enabled or you do not have \
+        "Specified KMS key [{key_id}] does not exist, is not enabled or you do not have \
          permissions to access it."
     )
 }
@@ -229,9 +230,9 @@ struct OperationRow {
     /// `KmsKeyId` on the instance and snapshot paths, `KMSKeyId` on the custom engine
     /// version and the integration — the two spellings the model uses.
     key_member: &'static str,
-    /// Whether the key this operation names is the TARGET key of a copy, which Amazon RDS
-    /// words its refusal about, rather than the one key a create specifies.
-    target_key: bool,
+    /// Whether this operation is a snapshot COPY, which Amazon RDS answers the fault with
+    /// its own wording for, rather than a create.
+    copy: bool,
     /// The name the call would create its resource under, and the describe it would join:
     /// what the "nothing was created" assertion reads back.
     created: Created,
@@ -263,7 +264,7 @@ fn operation_rows(tag: &str) -> Vec<OperationRow> {
             case: "CreateDBInstance with storage encryption turned on",
             action: "CreateDBInstance",
             key_member: "KmsKeyId",
-            target_key: false,
+            copy: false,
             created: Created {
                 describe: "DescribeDBInstances",
                 member: "DBInstanceIdentifier",
@@ -281,7 +282,7 @@ fn operation_rows(tag: &str) -> Vec<OperationRow> {
             case: "CreateDBInstanceReadReplica of an encrypted replica",
             action: "CreateDBInstanceReadReplica",
             key_member: "KmsKeyId",
-            target_key: false,
+            copy: false,
             created: Created {
                 describe: "DescribeDBInstances",
                 member: "DBInstanceIdentifier",
@@ -296,7 +297,7 @@ fn operation_rows(tag: &str) -> Vec<OperationRow> {
             case: "CopyDBSnapshot under a key of the caller's",
             action: "CopyDBSnapshot",
             key_member: "KmsKeyId",
-            target_key: true,
+            copy: true,
             created: Created {
                 describe: "DescribeDBSnapshots",
                 member: "DBSnapshotIdentifier",
@@ -311,7 +312,7 @@ fn operation_rows(tag: &str) -> Vec<OperationRow> {
             case: "CopyDBClusterSnapshot under a key of the caller's",
             action: "CopyDBClusterSnapshot",
             key_member: "KmsKeyId",
-            target_key: true,
+            copy: true,
             created: Created {
                 describe: "DescribeDBClusterSnapshots",
                 member: "DBClusterSnapshotIdentifier",
@@ -332,7 +333,7 @@ fn operation_rows(tag: &str) -> Vec<OperationRow> {
             case: "CreateCustomDBEngineVersion, whose media the key encrypts",
             action: "CreateCustomDBEngineVersion",
             key_member: "KMSKeyId",
-            target_key: false,
+            copy: false,
             created: Created {
                 describe: "DescribeDBEngineVersions",
                 member: "EngineVersion",
@@ -347,7 +348,7 @@ fn operation_rows(tag: &str) -> Vec<OperationRow> {
             case: "CreateIntegration, whose data the key encrypts",
             action: "CreateIntegration",
             key_member: "KMSKeyId",
-            target_key: false,
+            copy: false,
             created: Created {
                 describe: "DescribeIntegrations",
                 member: "IntegrationName",
@@ -382,8 +383,8 @@ async fn a_kms_key_that_cannot_encrypt_refuses_every_create_that_names_it() {
             let case = format!("{} with {}", row.case, key_row.case);
             let mut params = row.params.clone();
             params.push((row.key_member, key_row.key_id.clone()));
-            let expected = if row.target_key {
-                target_key_not_accessible(&key_row.key_id)
+            let expected = if row.copy {
+                copy_key_not_accessible(&key_row.key_id)
             } else {
                 key_not_accessible(&key_row.key_id)
             };

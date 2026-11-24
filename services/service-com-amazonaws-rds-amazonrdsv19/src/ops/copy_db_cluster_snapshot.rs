@@ -270,7 +270,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     CopyDBClusterSnapshotErrorModeled::KMSKeyNotAccessibleFault(
                         KMSKeyNotAccessibleFault {
-                            message: Some(crate::state::target_kms_key_not_accessible_message(
+                            message: Some(crate::state::copy_kms_key_not_accessible_message(
                                 key_id,
                             )),
                         },

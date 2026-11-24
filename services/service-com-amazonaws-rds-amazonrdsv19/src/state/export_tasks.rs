@@ -198,13 +198,19 @@ pub fn kms_key_not_accessible_message(key_id: &str) -> String {
     )
 }
 
-/// The same fault on a COPY, where the key the request names is the key the COPY is
-/// encrypted under rather than the only key in the request: a copy also has the source's
-/// key, so Amazon RDS words this one about the TARGET key, and otherwise identically to
-/// [`kms_key_not_accessible_message`].
-pub fn target_kms_key_not_accessible_message(key_id: &str) -> String {
+/// The same fault on a snapshot COPY, where the key the request names is the key the COPY
+/// is encrypted under rather than the only key in the request.
+///
+/// Recorded behavior: the copy paths answer the fault in their own wording — the sentence
+/// opens `Specified KMS key [` rather than the create paths' `The specified KMS key [` and
+/// is otherwise identical to [`kms_key_not_accessible_message`]. It covers every condition
+/// the one fault reports on a copy (the account holds no such key, holds it disabled, or
+/// withholds its use), names neither the source key nor the reason, and its one variable
+/// part is the `KmsKeyId` echoed exactly as the request spelled it (key id, key ARN, alias
+/// name or alias ARN).
+pub fn copy_kms_key_not_accessible_message(key_id: &str) -> String {
     format!(
-        "The target KMS key [{key_id}] does not exist, is not enabled or you do not have \
+        "Specified KMS key [{key_id}] does not exist, is not enabled or you do not have \
          permissions to access it."
     )
 }
