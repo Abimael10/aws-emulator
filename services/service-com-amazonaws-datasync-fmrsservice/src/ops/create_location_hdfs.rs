@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLocationHdfs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLocationHdfs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLocationHdfs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Resolves the agents the request names against the agents this account has activated,
+//! then mints a `LocationArn` and stores the whole HDFS transfer location in
+//! [`crate::state`], so `DescribeLocationHdfs` and `CreateTask` can resolve it again. The
+//! Kerberos key table itself is neither stored nor reported: DataSync keeps it in a
+//! Secrets Manager secret, and the location record holds only that secret's ARN.
 //!
 //! ## Shape of an operation
 //!
@@ -204,18 +201,187 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLocationHdfs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLocationHdfsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLocationHdfs"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateLocationHdfsErrorModeled::InternalException(
+                InternalException {
+                    message: Some(
+                        "the DataSync emulator could not reach its state store".to_string(),
+                    ),
+                    error_code: None,
+                },
+            )
+            .into());
+        };
+
+        // Evaluated before the store is reached, so a request whose authentication type
+        // leaves out a parameter that type requires persists nothing at all.
+        if let Some(message) = authentication_refusal(&input) {
+            return Err(CreateLocationHdfsErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(message),
+                    error_code: None,
+                    datasync_error_code: None,
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let subdirectory = input
+            .subdirectory
+            .unwrap_or_else(|| crate::state::DEFAULT_HDFS_SUBDIRECTORY.to_string());
+        let location_uri = crate::state::LocationKind::Hdfs
+            .location_uri(&name_node_global_id(&input.name_nodes), Some(&subdirectory));
+        // The cluster's own settings, in force: the values the request asked for, or the
+        // defaults their members document.
+        let block_size = input
+            .block_size
+            .unwrap_or(crate::state::DEFAULT_HDFS_BLOCK_SIZE);
+        let replication_factor = input
+            .replication_factor
+            .unwrap_or(crate::state::DEFAULT_HDFS_REPLICATION_FACTOR);
+        let qop_configuration =
+            crate::state::resolved_qop_configuration(input.qop_configuration.as_ref());
+
+        let location_arn = {
+            let mut store = state.lock();
+            store.advance_clock(now);
+
+            // The pre-flight DataSync performs before it stores the location: the
+            // location reaches its cluster through the agents the request names, so an
+            // `AgentArn` this account holds no agent under is refused — in the words the
+            // agent surface refuses that same ARN with — before anything is stored.
+            if let Err(refusal) = store.resolve_agents(&input.agent_arns) {
+                return Err(
+                    CreateLocationHdfsErrorModeled::InvalidRequestException(refusal).into(),
+                );
+            }
+
+            if let Some(message) = store.at_capacity(crate::state::ResourceStore::Locations) {
+                return Err(CreateLocationHdfsErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(message),
+                        error_code: None,
+                        datasync_error_code: None,
+                    },
+                )
+                .into());
+            }
+
+            // Where this location's credential ends up — the key table a request
+            // authenticating with Kerberos supplies, or the secret a request names
+            // instead.
+            let secret = store.location_secret(
+                &region,
+                &crate::state::LocationSecret::None,
+                input
+                    .kerberos_keytab
+                    .as_ref()
+                    .is_some_and(|keytab| !keytab.is_empty()),
+                input.cmk_secret_config.as_ref(),
+                input.custom_secret_config.as_ref(),
+            );
+
+            let (location_arn, seq) = store.mint_location_arn(&region);
+            store.locations.insert(
+                location_arn.clone(),
+                crate::state::Location {
+                    arn: location_arn.clone(),
+                    seq,
+                    location_uri,
+                    subdirectory: Some(subdirectory),
+                    agent_arns: input.agent_arns,
+                    tags: input.tags.unwrap_or_default(),
+                    creation_time: now,
+                    config: crate::state::LocationConfig::Hdfs(crate::state::HdfsLocationConfig {
+                        name_nodes: input.name_nodes,
+                        block_size,
+                        replication_factor,
+                        kms_key_provider_uri: input.kms_key_provider_uri,
+                        qop_configuration,
+                        authentication_type: input.authentication_type,
+                        simple_user: input.simple_user,
+                        kerberos_principal: input.kerberos_principal,
+                        secret,
+                    }),
+                },
+            );
+            location_arn
+        };
+
+        Ok(CreateLocationHdfsOutput {
+            location_arn: Some(location_arn),
+        })
     }
 }
+
+/// The GLOBAL_ID of an HDFS cluster: the NameNode a client contacts, as a `LocationUri`
+/// spells one (`hdfs://<hostname>:<port>/`).
+///
+/// `HdfsNameNode` carries the hostname and the port "that the NameNode uses to listen to
+/// client requests", and `HdfsNameNodeList` is modelled `len 1..`, so the first NameNode
+/// of the list is the one the URI names.
+fn name_node_global_id(name_nodes: &[HdfsNameNode]) -> String {
+    name_nodes
+        .first()
+        .map(|name_node| {
+            format!(
+                "{hostname}:{port}",
+                hostname = name_node.hostname,
+                port = name_node.port
+            )
+        })
+        .unwrap_or_default()
+}
+
+/// The refusal a request earns by selecting an authentication type without the parameters
+/// that type requires, if any.
+///
+/// Each of those parameters documents its own half of the rule: `SimpleUser` is "required"
+/// "If SIMPLE is specified for AuthenticationType", and `KerberosPrincipal`,
+/// `KerberosKeytab` and `KerberosKrb5Conf` each say the same of `KERBEROS` — so a request
+/// selecting one type and leaving out a parameter that type needs describes a cluster
+/// DataSync could never authenticate to, and is refused before anything is stored.
+fn authentication_refusal(input: &CreateLocationHdfsInput) -> Option<String> {
+    let missing = |member: &str| {
+        Some(format!(
+            "If {authentication_type} is specified for AuthenticationType, {member} is \
+             required.",
+            authentication_type = input.authentication_type
+        ))
+    };
+    match input.authentication_type.as_str() {
+        KERBEROS_AUTHENTICATION_TYPE => {
+            if input.kerberos_principal.is_none() {
+                return missing("KerberosPrincipal");
+            }
+            if input.kerberos_keytab.is_none() {
+                return missing("KerberosKeytab");
+            }
+            if input.kerberos_krb5_conf.is_none() {
+                return missing("KerberosKrb5Conf");
+            }
+            None
+        }
+        SIMPLE_AUTHENTICATION_TYPE => {
+            if input.simple_user.is_none() {
+                return missing("SimpleUser");
+            }
+            None
+        }
+        // The modelled enum admits no third value, and that is enforced before this
+        // handler runs.
+        _ => None,
+    }
+}
+
+/// One of the two values the modelled `HdfsAuthenticationType` enum admits
+/// (`smithy_query(query="shape",shape="HdfsAuthenticationType")` -> `SIMPLE | KERBEROS`):
+/// the cluster identifies the client by the operating-system user name.
+const SIMPLE_AUTHENTICATION_TYPE: &str = "SIMPLE";
+
+/// The other value that enum admits: the cluster authenticates the client through
+/// Kerberos.
+const KERBEROS_AUTHENTICATION_TYPE: &str = "KERBEROS";

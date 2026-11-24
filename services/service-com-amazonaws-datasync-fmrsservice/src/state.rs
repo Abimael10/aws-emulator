@@ -50,8 +50,9 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    CmkSecretConfig, CustomSecretConfig, Ec2Config, FilterRule, InvalidRequestException,
-    ManifestConfig, Options, S3Config, TagListEntry, TaskReportConfig, TaskSchedule,
+    CmkSecretConfig, CustomSecretConfig, Ec2Config, FilterRule, HdfsNameNode,
+    InvalidRequestException, ManagedSecretConfig, ManifestConfig, NfsMountOptions, Options,
+    QopConfiguration, S3Config, SmbMountOptions, TagListEntry, TaskReportConfig, TaskSchedule,
 };
 
 /// How long each clock-owed transition takes.
@@ -149,6 +150,12 @@ pub enum LocationKind {
     ObjectStorage,
     /// An Amazon EFS file system.
     Efs,
+    /// A Network File System file server an agent mounts.
+    Nfs,
+    /// A Server Message Block file server an agent mounts.
+    Smb,
+    /// A Hadoop Distributed File System cluster an agent reaches.
+    Hdfs,
 }
 
 impl LocationKind {
@@ -159,6 +166,9 @@ impl LocationKind {
             Self::AzureBlob => "azure-blob",
             Self::ObjectStorage => "object-storage",
             Self::Efs => "efs",
+            Self::Nfs => "nfs",
+            Self::Smb => "smb",
+            Self::Hdfs => "hdfs",
         }
     }
 
@@ -197,6 +207,9 @@ impl LocationKind {
             Self::AzureBlob => "AZURE_BLOB",
             Self::ObjectStorage => "OBJECT_STORAGE",
             Self::Efs => "EFS",
+            Self::Nfs => "NFS",
+            Self::Smb => "SMB",
+            Self::Hdfs => "HDFS",
         }
     }
 
@@ -209,8 +222,11 @@ impl LocationKind {
     /// [`applied_options`] reads the POSIX metadata options against.
     pub fn is_file_system(self) -> bool {
         match self {
-            Self::S3 | Self::AzureBlob | Self::ObjectStorage => false,
-            Self::Efs => true,
+            // A Server Message Block file server keeps a security descriptor per file
+            // instead of a POSIX owner, group and mode, so it is the one agent-mounted
+            // kind whose files carry no POSIX metadata to read or to write.
+            Self::S3 | Self::AzureBlob | Self::ObjectStorage | Self::Smb => false,
+            Self::Efs | Self::Nfs | Self::Hdfs => true,
         }
     }
 
@@ -220,12 +236,14 @@ impl LocationKind {
     ///
     /// That member is documented for exactly two kinds of location: "This value is only
     /// used for transfers between SMB and Amazon FSx for Windows File Server locations or
-    /// between two FSx for Windows File Server locations". Neither kind is one an
-    /// implemented `CreateLocation*` can mint yet, so no pair of locations this service
-    /// holds carries one; each kind that does will answer `true` here.
+    /// between two FSx for Windows File Server locations". The first of them is a kind an
+    /// implemented `CreateLocation*` mints; the FSx for Windows File Server kind will
+    /// answer `true` here as well once its own create is implemented.
     pub fn carries_smb_security_descriptors(self) -> bool {
         match self {
-            Self::S3 | Self::AzureBlob | Self::ObjectStorage | Self::Efs => false,
+            Self::S3 | Self::AzureBlob | Self::ObjectStorage | Self::Efs | Self::Nfs
+            | Self::Hdfs => false,
+            Self::Smb => true,
         }
     }
 
@@ -236,6 +254,9 @@ impl LocationKind {
             Self::AzureBlob => "an Azure Blob Storage",
             Self::ObjectStorage => "an object storage",
             Self::Efs => "an Amazon EFS",
+            Self::Nfs => "an NFS",
+            Self::Smb => "an SMB",
+            Self::Hdfs => "an HDFS",
         }
     }
 }
@@ -275,6 +296,55 @@ impl LocationSecret {
                 Some(secret_arn)
             }
             Self::Customer { secret_arn, .. } => secret_arn.as_deref(),
+        }
+    }
+
+    /// This credential as the three mutually exclusive secret members a
+    /// `DescribeLocation*` reports it through: the DataSync-managed secret, the
+    /// DataSync-managed secret encrypted with the caller's KMS key, and the secret the
+    /// caller manages.
+    ///
+    /// One reading for every kind of location that keeps a credential, so each of them
+    /// reports where it is the same way; a location with no stored credential reports none
+    /// of the three.
+    pub fn reported(
+        &self,
+    ) -> (
+        Option<ManagedSecretConfig>,
+        Option<CmkSecretConfig>,
+        Option<CustomSecretConfig>,
+    ) {
+        match self {
+            Self::None => (None, None, None),
+            Self::Managed { secret_arn } => (
+                Some(ManagedSecretConfig {
+                    secret_arn: Some(secret_arn.clone()),
+                }),
+                None,
+                None,
+            ),
+            Self::ManagedWithCustomerKey {
+                secret_arn,
+                kms_key_arn,
+            } => (
+                None,
+                Some(CmkSecretConfig {
+                    secret_arn: Some(secret_arn.clone()),
+                    kms_key_arn: kms_key_arn.clone(),
+                }),
+                None,
+            ),
+            Self::Customer {
+                secret_arn,
+                secret_access_role_arn,
+            } => (
+                None,
+                None,
+                Some(CustomSecretConfig {
+                    secret_arn: secret_arn.clone(),
+                    secret_access_role_arn: secret_access_role_arn.clone(),
+                }),
+            ),
         }
     }
 }
@@ -324,6 +394,53 @@ pub struct EfsLocationConfig {
     pub in_transit_encryption: Option<String>,
 }
 
+/// The Network File System configuration of a transfer location.
+///
+/// `MountOptions` is optional in the create request and reported by the describe, so what
+/// the location holds is the version in force: the one the request asked for, or the
+/// default the member documents.
+#[derive(Debug, Clone)]
+pub struct NfsLocationConfig {
+    pub server_hostname: String,
+    pub mount_options: NfsMountOptions,
+}
+
+/// The Server Message Block configuration of a transfer location.
+///
+/// `User`, `Domain` and `KerberosPrincipal` are each optional in the create request and in
+/// the describe response, so a location holds exactly what its request named; the
+/// authentication type and the mount version are always in force, defaulted the way the
+/// members document them.
+#[derive(Debug, Clone)]
+pub struct SmbLocationConfig {
+    pub server_hostname: String,
+    pub user: Option<String>,
+    pub domain: Option<String>,
+    /// `NTLM` or `KERBEROS`, as the modelled `SmbAuthenticationType` enum spells them.
+    pub authentication_type: String,
+    pub mount_options: SmbMountOptions,
+    /// The DNS servers the agent resolves the file server's domain through; empty when the
+    /// request named none, which the modelled `DnsIpList` admits (`len 0..2`).
+    pub dns_ip_addresses: Vec<String>,
+    pub kerberos_principal: Option<String>,
+    pub secret: LocationSecret,
+}
+
+/// The Hadoop Distributed File System configuration of a transfer location.
+#[derive(Debug, Clone)]
+pub struct HdfsLocationConfig {
+    pub name_nodes: Vec<HdfsNameNode>,
+    pub block_size: i32,
+    pub replication_factor: i32,
+    pub kms_key_provider_uri: Option<String>,
+    pub qop_configuration: QopConfiguration,
+    /// `SIMPLE` or `KERBEROS`, as the modelled `HdfsAuthenticationType` enum spells them.
+    pub authentication_type: String,
+    pub simple_user: Option<String>,
+    pub kerberos_principal: Option<String>,
+    pub secret: LocationSecret,
+}
+
 /// The per-kind configuration of a transfer location: one variant per
 /// [`LocationKind`], so a location holds the members of its own kind and no others.
 #[derive(Debug, Clone)]
@@ -332,6 +449,9 @@ pub enum LocationConfig {
     AzureBlob(AzureBlobLocationConfig),
     ObjectStorage(ObjectStorageLocationConfig),
     Efs(EfsLocationConfig),
+    Nfs(NfsLocationConfig),
+    Smb(SmbLocationConfig),
+    Hdfs(HdfsLocationConfig),
 }
 
 impl LocationConfig {
@@ -342,6 +462,9 @@ impl LocationConfig {
             Self::AzureBlob(_) => LocationKind::AzureBlob,
             Self::ObjectStorage(_) => LocationKind::ObjectStorage,
             Self::Efs(_) => LocationKind::Efs,
+            Self::Nfs(_) => LocationKind::Nfs,
+            Self::Smb(_) => LocationKind::Smb,
+            Self::Hdfs(_) => LocationKind::Hdfs,
         }
     }
 
@@ -373,6 +496,31 @@ impl LocationConfig {
     pub fn as_efs(&self) -> Option<&EfsLocationConfig> {
         match self {
             Self::Efs(efs) => Some(efs),
+            _ => None,
+        }
+    }
+
+    /// The Network File System configuration, when that is this location's kind.
+    pub fn as_nfs(&self) -> Option<&NfsLocationConfig> {
+        match self {
+            Self::Nfs(nfs) => Some(nfs),
+            _ => None,
+        }
+    }
+
+    /// The Server Message Block configuration, when that is this location's kind.
+    pub fn as_smb(&self) -> Option<&SmbLocationConfig> {
+        match self {
+            Self::Smb(smb) => Some(smb),
+            _ => None,
+        }
+    }
+
+    /// The Hadoop Distributed File System configuration, when that is this location's
+    /// kind.
+    pub fn as_hdfs(&self) -> Option<&HdfsLocationConfig> {
+        match self {
+            Self::Hdfs(hdfs) => Some(hdfs),
             _ => None,
         }
     }
@@ -861,6 +1009,31 @@ impl ComAmazonawsDatasyncFmrsserviceState {
         self.located(arn, LocationKind::Efs, LocationConfig::as_efs)
     }
 
+    /// The Network File System location stored under `arn`, with its NFS configuration.
+    pub fn nfs_location(
+        &self,
+        arn: &str,
+    ) -> Result<(&Location, &NfsLocationConfig), LocationRefusal> {
+        self.located(arn, LocationKind::Nfs, LocationConfig::as_nfs)
+    }
+
+    /// The Server Message Block location stored under `arn`, with its SMB configuration.
+    pub fn smb_location(
+        &self,
+        arn: &str,
+    ) -> Result<(&Location, &SmbLocationConfig), LocationRefusal> {
+        self.located(arn, LocationKind::Smb, LocationConfig::as_smb)
+    }
+
+    /// The Hadoop Distributed File System location stored under `arn`, with its HDFS
+    /// configuration.
+    pub fn hdfs_location(
+        &self,
+        arn: &str,
+    ) -> Result<(&Location, &HdfsLocationConfig), LocationRefusal> {
+        self.located(arn, LocationKind::Hdfs, LocationConfig::as_hdfs)
+    }
+
     /// The object storage location stored under `arn`, with its object storage
     /// configuration.
     pub fn object_storage_location(
@@ -902,21 +1075,26 @@ impl ComAmazonawsDatasyncFmrsserviceState {
         })
     }
 
-    /// Where an object storage location's credential ends up, from the credential
-    /// members of a create or an update request and the secret it already has.
+    /// Where a location's credential ends up, from the credential members of a create or
+    /// an update request and the secret it already has.
     ///
     /// `CustomSecretConfig` points at a secret the caller manages. `CmkSecretConfig`
-    /// asks for a DataSync-managed secret encrypted with the caller's KMS key: with a
-    /// `SecretKey` DataSync creates that secret, and on its own it re-encrypts the
-    /// secret the location ALREADY has, which therefore stays where it is. A
-    /// `SecretKey` alone goes into a secret DataSync manages with the Amazon Web
+    /// asks for a DataSync-managed secret encrypted with the caller's KMS key: with the
+    /// credential itself in the request DataSync creates that secret, and on its own it
+    /// re-encrypts the secret the location ALREADY has, which therefore stays where it
+    /// is. A credential alone goes into a secret DataSync manages with the Amazon Web
     /// Services managed key. A request naming none of the three leaves a created
     /// location without a credential and an updated one with the credential it had.
-    pub fn object_storage_secret(
+    ///
+    /// `credential` is whether the request carried the token DataSync stores for this kind
+    /// of location — an object storage system's secret key, an SMB file server's password,
+    /// an HDFS cluster's Kerberos key table — since the rule is the same whichever member
+    /// of the request carries it.
+    pub fn location_secret(
         &mut self,
         region: &str,
         current: &LocationSecret,
-        secret_key: Option<&str>,
+        credential: bool,
         cmk_secret_config: Option<&CmkSecretConfig>,
         custom_secret_config: Option<&CustomSecretConfig>,
     ) -> LocationSecret {
@@ -927,7 +1105,7 @@ impl ComAmazonawsDatasyncFmrsserviceState {
             };
         }
         if let Some(cmk) = cmk_secret_config {
-            let held = current.secret_arn().filter(|_| secret_key.is_none());
+            let held = current.secret_arn().filter(|_| !credential);
             let secret_arn = match held {
                 Some(secret_arn) => secret_arn.to_string(),
                 None => self.mint_managed_secret_arn(region),
@@ -937,7 +1115,7 @@ impl ComAmazonawsDatasyncFmrsserviceState {
                 kms_key_arn: cmk.kms_key_arn.clone(),
             };
         }
-        if secret_key.is_some_and(|key| !key.is_empty()) {
+        if credential {
             return LocationSecret::Managed {
                 secret_arn: self.mint_managed_secret_arn(region),
             };
@@ -1066,6 +1244,15 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
+/// Whether a create or an update request carried the credential token DataSync stores for
+/// a location: a token that is present and not empty.
+///
+/// One reading for every kind of location that keeps one, so each of them resolves
+/// [`ComAmazonawsDatasyncFmrsserviceState::location_secret`] from the same question.
+pub fn carries_credential(token: Option<&str>) -> bool {
+    token.is_some_and(|token| !token.is_empty())
+}
+
 /// A `SystemTime` as the modelled `Time` timestamp.
 pub fn as_timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
     let since_epoch = at
@@ -1097,6 +1284,59 @@ pub fn default_server_port(server_protocol: &str) -> i32 {
         80
     } else {
         443
+    }
+}
+
+/// The mount version a request that named none ends up with, for both protocols a
+/// DataSync agent mounts a file server over.
+///
+/// `AUTOMATIC` is the value both mount-option members document as their default
+/// ("`AUTOMATIC` (default)" in `NfsMountOptions$Version` and
+/// `SmbMountOptions$Version`), and it is what it says: the agent and the file server
+/// negotiate the version between them.
+pub const DEFAULT_MOUNT_VERSION: &str = "AUTOMATIC";
+
+/// The authentication protocol an SMB location whose request named none ends up with:
+/// "DataSync supports `NTLM` (default) and `KERBEROS` authentication"
+/// (`CreateLocationSmb$AuthenticationType`).
+pub const DEFAULT_SMB_AUTHENTICATION_TYPE: &str = "NTLM";
+
+/// The subdirectory an HDFS location whose request named none ends up with: "If the
+/// subdirectory isn't specified, it will default to `/`"
+/// (`CreateLocationHdfs$Subdirectory`).
+pub const DEFAULT_HDFS_SUBDIRECTORY: &str = "/";
+
+/// The block size an HDFS location whose request named none writes with: "The default
+/// block size is 128 mebibytes (MiB)" (`CreateLocationHdfs$BlockSize`).
+pub const DEFAULT_HDFS_BLOCK_SIZE: i32 = 128 * 1024 * 1024;
+
+/// How many DataNodes an HDFS location whose request named none replicates to: "By
+/// default, data is replicated to three DataNodes"
+/// (`CreateLocationHdfs$ReplicationFactor`).
+pub const DEFAULT_HDFS_REPLICATION_FACTOR: i32 = 3;
+
+/// The Quality of Protection setting an HDFS request that named none ends up with:
+/// "If `QopConfiguration` isn't specified, `RpcProtection` and `DataTransferProtection`
+/// default to `PRIVACY`" (`CreateLocationHdfs$QopConfiguration`).
+pub const DEFAULT_QOP_PROTECTION: &str = "PRIVACY";
+
+/// The Quality of Protection settings in force for an HDFS location, from what its
+/// request named.
+///
+/// The member documents both halves of the rule: an unspecified configuration leaves both
+/// settings at [`DEFAULT_QOP_PROTECTION`], and "If you set `RpcProtection` or
+/// `DataTransferProtection`, the other parameter assumes the same value" — so a request
+/// naming one of the two settles both.
+pub fn resolved_qop_configuration(requested: Option<&QopConfiguration>) -> QopConfiguration {
+    let rpc = requested.and_then(|qop| qop.rpc_protection.clone());
+    let data = requested.and_then(|qop| qop.data_transfer_protection.clone());
+    let fallback = rpc
+        .clone()
+        .or_else(|| data.clone())
+        .unwrap_or_else(|| DEFAULT_QOP_PROTECTION.to_string());
+    QopConfiguration {
+        rpc_protection: Some(rpc.unwrap_or_else(|| fallback.clone())),
+        data_transfer_protection: Some(data.unwrap_or(fallback)),
     }
 }
 

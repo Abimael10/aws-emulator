@@ -194,38 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // credential lives, so the other two are absent; a location that needs no
         // stored credential reports none of them.
         let (managed_secret_config, cmk_secret_config, custom_secret_config) =
-            match &object_storage.secret {
-                crate::state::LocationSecret::None => (None, None, None),
-                crate::state::LocationSecret::Managed { secret_arn } => (
-                    Some(ManagedSecretConfig {
-                        secret_arn: Some(secret_arn.clone()),
-                    }),
-                    None,
-                    None,
-                ),
-                crate::state::LocationSecret::ManagedWithCustomerKey {
-                    secret_arn,
-                    kms_key_arn,
-                } => (
-                    None,
-                    Some(CmkSecretConfig {
-                        secret_arn: Some(secret_arn.clone()),
-                        kms_key_arn: kms_key_arn.clone(),
-                    }),
-                    None,
-                ),
-                crate::state::LocationSecret::Customer {
-                    secret_arn,
-                    secret_access_role_arn,
-                } => (
-                    None,
-                    None,
-                    Some(CustomSecretConfig {
-                        secret_arn: secret_arn.clone(),
-                        secret_access_role_arn: secret_access_role_arn.clone(),
-                    }),
-                ),
-            };
+            object_storage.secret.reported();
 
         Ok(DescribeLocationObjectStorageOutput {
             location_arn: Some(location.arn.clone()),

@@ -241,6 +241,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let location_arn = {
             let mut store = state.lock();
             store.advance_clock(now);
+
+            // The pre-flight DataSync performs before it stores the location: an
+            // `AgentArn` this account holds no agent under is refused — in the words the
+            // agent surface refuses that same ARN with — before anything is stored. A
+            // request naming no agent at all names none to resolve.
+            if let Err(refusal) = store.resolve_agents(input.agent_arns.as_deref().unwrap_or(&[])) {
+                return Err(
+                    CreateLocationObjectStorageErrorModeled::InvalidRequestException(refusal)
+                        .into(),
+                );
+            }
+
             if let Some(message) = store.at_capacity(crate::state::ResourceStore::Locations) {
                 return Err(CreateLocationObjectStorageErrorModeled::InvalidRequestException(
                     InvalidRequestException {
@@ -255,10 +267,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Where this location's credential ends up. The secret key itself is
             // neither stored nor reported: DataSync keeps it in a Secrets Manager
             // secret, and the location record holds only that secret's ARN.
-            let secret = store.object_storage_secret(
+            let secret = store.location_secret(
                 &region,
                 &crate::state::LocationSecret::None,
-                input.secret_key.as_deref(),
+                crate::state::carries_credential(input.secret_key.as_deref()),
                 input.cmk_secret_config.as_ref(),
                 input.custom_secret_config.as_ref(),
             );

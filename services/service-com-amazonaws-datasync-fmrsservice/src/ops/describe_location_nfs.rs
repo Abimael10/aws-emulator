@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeLocationNfs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeLocationNfs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeLocationNfs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the NFS transfer location stored under the `LocationArn` the request names:
+//! every member comes from what `CreateLocationNfs` persisted in [`crate::state`].
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +146,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeLocationNfs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeLocationNfsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeLocationNfs"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeLocationNfsErrorModeled::InternalException(
+                InternalException {
+                    message: Some(
+                        "the DataSync emulator could not reach its state store".to_string(),
+                    ),
+                    error_code: None,
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        store.advance_clock(::std::time::SystemTime::now());
+        // An ARN addresses one location of one kind: an unknown ARN and an ARN naming
+        // another kind of location are both refused, worded in `crate::state`.
+        let (location, nfs) = store.nfs_location(&input.location_arn).map_err(|refusal| {
+            DescribeLocationNfsErrorModeled::InvalidRequestException(refusal.into_invalid_request())
+        })?;
+
+        Ok(DescribeLocationNfsOutput {
+            location_arn: Some(location.arn.clone()),
+            location_uri: Some(location.location_uri.clone()),
+            // `AgentArnList` is modelled `len 1..8` and `OnPremConfig$AgentArns` is
+            // required, so this location was stored with the agents it reaches its file
+            // server through and reports exactly them.
+            on_prem_config: Some(OnPremConfig {
+                agent_arns: location.agent_arns.clone(),
+            }),
+            mount_options: Some(nfs.mount_options.clone()),
+            creation_time: Some(crate::state::as_timestamp(location.creation_time)),
+        })
     }
 }

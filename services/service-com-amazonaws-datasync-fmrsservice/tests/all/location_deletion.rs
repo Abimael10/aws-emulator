@@ -135,9 +135,38 @@ fn assert_location_not_found(refusal: &serde_json::Value, location_arn: &str, ca
     }
 }
 
-/// An agent ARN in the modelled `AgentArn` shape.
-fn agent_arn(tail: char) -> String {
-    format!("arn:aws:datasync:{SIGNED_REGION}:{ACCOUNT}:agent/agent-0123456789abcdef{tail}")
+/// One agent this account has really activated, by ARN.
+///
+/// A `CreateLocation*` resolves every `AgentArn` its request names against the agents the
+/// account has activated, so a location of a kind that reaches its storage through agents
+/// needs them activated first.
+async fn given_agent(router: &MultiServiceRouter, case: &str) -> String {
+    let created = ok(
+        router,
+        "CreateAgent",
+        serde_json::json!({ "ActivationKey": "AAAAA-11111-BBBBB-22222-CCCCC" }),
+        case,
+    )
+    .await;
+    string(&created, "AgentArn", case)
+}
+
+/// `kind`'s create request, with as many activated agents named in it as a location of
+/// that kind reaches its storage through.
+async fn request_for(
+    router: &MultiServiceRouter,
+    kind: &Kind,
+    case: &str,
+) -> serde_json::Value {
+    let mut request = (kind.request)();
+    if kind.agents > 0 {
+        let mut activated: Vec<String> = Vec::with_capacity(kind.agents);
+        for _ in 0..kind.agents {
+            activated.push(given_agent(router, case).await);
+        }
+        request["AgentArns"] = serde_json::json!(activated);
+    }
+    request
 }
 
 /// One kind of transfer location: the create that mints it, and the describe that
@@ -146,6 +175,9 @@ struct Kind {
     case: &'static str,
     create_operation: &'static str,
     describe_operation: &'static str,
+    /// How many agents a location of this kind reaches its storage through. Their ARNs
+    /// are filled in by [`request_for`], from agents this account really activated.
+    agents: usize,
     request: fn() -> serde_json::Value,
 }
 
@@ -159,6 +191,7 @@ fn kinds() -> Vec<Kind> {
             case: "an object storage location",
             create_operation: "CreateLocationObjectStorage",
             describe_operation: "DescribeLocationObjectStorage",
+            agents: 1,
             request: || {
                 serde_json::json!({
                     "ServerHostname": "store.example.com",
@@ -167,7 +200,6 @@ fn kinds() -> Vec<Kind> {
                     "Subdirectory": "/inbox",
                     "AccessKey": "transfer-user",
                     "SecretKey": "transfer-secret",
-                    "AgentArns": [agent_arn('0')],
                 })
             },
         },
@@ -175,6 +207,7 @@ fn kinds() -> Vec<Kind> {
             case: "an Amazon S3 location",
             create_operation: "CreateLocationS3",
             describe_operation: "DescribeLocationS3",
+            agents: 0,
             request: || {
                 serde_json::json!({
                     "S3BucketArn": "arn:aws:s3:::transfer-bucket",
@@ -188,12 +221,12 @@ fn kinds() -> Vec<Kind> {
             case: "an Azure Blob Storage location",
             create_operation: "CreateLocationAzureBlob",
             describe_operation: "DescribeLocationAzureBlob",
+            agents: 1,
             request: || {
                 serde_json::json!({
                     "ContainerUrl": "https://hotstore.blob.core.windows.net/transfer-in",
                     "AuthenticationType": "SAS",
                     "SasConfiguration": { "Token": "sv=2026-01-01&sig=abc" },
-                    "AgentArns": [agent_arn('1')],
                 })
             },
         },
@@ -201,6 +234,7 @@ fn kinds() -> Vec<Kind> {
             case: "an Amazon EFS location",
             create_operation: "CreateLocationEfs",
             describe_operation: "DescribeLocationEfs",
+            agents: 0,
             request: || {
                 serde_json::json!({
                     "EfsFilesystemArn": format!(
@@ -229,7 +263,13 @@ async fn deleting_a_location_of_any_kind_leaves_nothing_to_read() {
 
     for kind in kinds() {
         let case = kind.case;
-        let created = ok(&router, kind.create_operation, (kind.request)(), case).await;
+        let created = ok(
+            &router,
+            kind.create_operation,
+            request_for(&router, &kind, case).await,
+            case,
+        )
+        .await;
         let arn = string(&created, "LocationArn", case);
 
         // The location is readable while it is held, so the refusal below is the
@@ -292,7 +332,13 @@ async fn deleting_one_location_leaves_every_other_location_readable() {
     let kinds = kinds();
     let mut held: Vec<(usize, String)> = Vec::new();
     for (index, kind) in kinds.iter().enumerate() {
-        let created = ok(&router, kind.create_operation, (kind.request)(), case).await;
+        let created = ok(
+            &router,
+            kind.create_operation,
+            request_for(&router, kind, case).await,
+            case,
+        )
+        .await;
         held.push((index, string(&created, "LocationArn", case)));
     }
 
@@ -395,7 +441,13 @@ async fn create_task_refuses_a_deleted_location() {
 
     let mut arns: Vec<String> = Vec::new();
     for kind in kinds.iter().take(2) {
-        let created = ok(&router, kind.create_operation, (kind.request)(), case).await;
+        let created = ok(
+            &router,
+            kind.create_operation,
+            request_for(&router, kind, case).await,
+            case,
+        )
+        .await;
         arns.push(string(&created, "LocationArn", case));
     }
 
@@ -558,28 +610,22 @@ async fn a_location_a_task_references_cannot_be_deleted_until_the_task_is_gone()
         // One account per row, so each row's two locations are the only ones held.
         let router = service();
 
-        let source = string(
-            &ok(
-                &router,
-                source_kind.create_operation,
-                (source_kind.request)(),
-                &case,
-            )
-            .await,
-            "LocationArn",
+        let created = ok(
+            &router,
+            source_kind.create_operation,
+            request_for(&router, source_kind, &case).await,
             &case,
-        );
-        let destination = string(
-            &ok(
-                &router,
-                destination_kind.create_operation,
-                (destination_kind.request)(),
-                &case,
-            )
-            .await,
-            "LocationArn",
+        )
+        .await;
+        let source = string(&created, "LocationArn", &case);
+        let created = ok(
+            &router,
+            destination_kind.create_operation,
+            request_for(&router, destination_kind, &case).await,
             &case,
-        );
+        )
+        .await;
+        let destination = string(&created, "LocationArn", &case);
         let task = create_task(&router, &source, &destination, "in-use", &case).await;
 
         // Both endpoints are in use, and the refusal leaves each location readable.
@@ -662,7 +708,13 @@ async fn a_location_two_tasks_share_is_in_use_until_both_tasks_are_gone() {
 
     let mut arns: Vec<String> = Vec::new();
     for kind in kinds.iter().take(3) {
-        let created = ok(&router, kind.create_operation, (kind.request)(), case).await;
+        let created = ok(
+            &router,
+            kind.create_operation,
+            request_for(&router, kind, case).await,
+            case,
+        )
+        .await;
         arns.push(string(&created, "LocationArn", case));
     }
     // The middle location is the destination of one task and the source of the other.
@@ -877,28 +929,28 @@ async fn the_in_use_refusal_names_only_the_location_the_request_addressed() {
     for row in &rows {
         let case = row.case;
         let kind = &kinds[row.kind_index];
-        let held = string(
-            &ok(&router, kind.create_operation, (kind.request)(), case).await,
-            "LocationArn",
+        let created = ok(
+            &router,
+            kind.create_operation,
+            request_for(&router, kind, case).await,
             case,
-        );
+        )
+        .await;
+        let held = string(&created, "LocationArn", case);
 
         let mut holders: Vec<String> = Vec::new();
         for holder in 0..row.holders {
             // Each holding task needs a second endpoint of its own: a task copies one
             // location onto another, so the pair cannot be the same location.
             let other_kind = &kinds[(row.kind_index + 1 + holder) % kinds.len()];
-            let other = string(
-                &ok(
-                    &router,
-                    other_kind.create_operation,
-                    (other_kind.request)(),
-                    case,
-                )
-                .await,
-                "LocationArn",
+            let created = ok(
+                &router,
+                other_kind.create_operation,
+                request_for(&router, other_kind, case).await,
                 case,
-            );
+            )
+            .await;
+            let other = string(&created, "LocationArn", case);
             let held_as_source = match row.held_as {
                 HeldAs::Source => true,
                 HeldAs::Destination => false,

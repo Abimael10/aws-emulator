@@ -9,7 +9,11 @@
 //! resolves it through [`ComAmazonawsDatasyncFmrsserviceState::agent`] (or its writing
 //! and removing siblings) and refuses an ARN no agent of this account answers to with
 //! [`agent_not_found`], so the code and the wording of that refusal are the same wherever
-//! an agent is resolved rather than restated per operation.
+//! an agent is resolved rather than restated per operation. An operation that NAMES agents
+//! rather than addressing one — every `CreateLocation*` and `UpdateLocation*` carrying
+//! `AgentArns`, whose location reaches its storage through them — resolves the whole list
+//! through [`ComAmazonawsDatasyncFmrsserviceState::resolve_agents`] before it stores
+//! anything, and so refuses an unregistered ARN in exactly those words too.
 //!
 //! What the record holds is what an activation established: the name the caller asked
 //! for, how the agent reaches the service (its `EndpointType`, and the VPC service
@@ -114,6 +118,22 @@ impl ComAmazonawsDatasyncFmrsserviceState {
         self.agents
             .remove(agent_arn)
             .ok_or_else(|| agent_not_found(agent_arn))
+    }
+
+    /// Resolve every `AgentArn` a request NAMES — the agents a transfer location reaches
+    /// its storage through — refusing the first one no agent of this account answers to.
+    ///
+    /// The refusal is the one the agent surface gives for the same ARN
+    /// ([`agent_not_found`]), because the question is the same one `DescribeAgent`
+    /// answers: whether this account holds an agent under that ARN. A caller that named
+    /// several unresolvable ARNs is told about the first of them, in the order the request
+    /// listed them, since the refusal states the reason the request fails rather than
+    /// auditing the whole list.
+    pub fn resolve_agents(&self, agent_arns: &[String]) -> Result<(), InvalidRequestException> {
+        for agent_arn in agent_arns {
+            self.agent(agent_arn)?;
+        }
+        Ok(())
     }
 }
 

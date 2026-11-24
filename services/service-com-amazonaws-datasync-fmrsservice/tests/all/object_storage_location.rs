@@ -129,6 +129,26 @@ fn agent_arn(tail: char) -> String {
     format!("arn:aws:datasync:{SIGNED_REGION}:{ACCOUNT}:agent/agent-0123456789abcdef{tail}")
 }
 
+/// `count` agents this account has really activated, by ARN.
+///
+/// Every operation that NAMES an agent resolves the ARN against the agents the account
+/// has activated, so a location that reaches its server through agents needs them
+/// activated first.
+async fn given_agents(router: &MultiServiceRouter, count: usize, case: &str) -> Vec<String> {
+    let mut activated: Vec<String> = Vec::with_capacity(count);
+    for _ in 0..count {
+        let created = ok(
+            router,
+            "CreateAgent",
+            serde_json::json!({ "ActivationKey": "AAAAA-11111-BBBBB-22222-CCCCC" }),
+            case,
+        )
+        .await;
+        activated.push(string(&created, "AgentArn", case));
+    }
+    activated
+}
+
 /// A Secrets Manager secret ARN the caller manages themselves.
 fn customer_secret_arn() -> String {
     format!("arn:aws:secretsmanager:{SIGNED_REGION}:{ACCOUNT}:secret:object-storage-AbCdEf")
@@ -277,6 +297,11 @@ fn assert_location(described: &serde_json::Value, expected: &Expected, case: &st
 /// of the three ways the model gives a location to hold its credential.
 #[tokio::test]
 async fn created_object_storage_locations_are_reported_from_state() {
+    let router = service();
+    // The agents the rows below name: the modelled maximum of eight, activated through
+    // `CreateAgent`, because a create resolves every `AgentArn` its request names
+    // against the agents this account has activated.
+    let agents = given_agents(&router, 8, "activating the suite's agents").await;
     let rows = vec![
         Row {
             case: "defaults: no protocol, port, prefix or credential",
@@ -357,7 +382,7 @@ async fn created_object_storage_locations_are_reported_from_state() {
                 "ServerPort": 1,
                 "AccessKey": "reader",
                 "SecretKey": "s3cr3t",
-                "AgentArns": [agent_arn('0'), agent_arn('1')],
+                "AgentArns": [agents[0], agents[1]],
                 "Tags": [{ "Key": "team", "Value": "storage" }],
             }),
             expected: Expected {
@@ -365,7 +390,7 @@ async fn created_object_storage_locations_are_reported_from_state() {
                 port: 1,
                 protocol: "HTTPS",
                 access_key: Some("reader"),
-                agents: Some(vec![agent_arn('0'), agent_arn('1')]),
+                agents: Some(vec![agents[0].clone(), agents[1].clone()]),
                 secret: Secret::Managed,
                 certificate: None,
             },
@@ -414,27 +439,20 @@ async fn created_object_storage_locations_are_reported_from_state() {
                 "ServerHostname": "pki.example.com",
                 "BucketName": "pki-bucket",
                 "ServerCertificate": "cGVtLWNoYWluCg==",
-                "AgentArns": (0..8)
-                    .map(|index| agent_arn(char::from_digit(index, 10).expect("a digit")))
-                    .collect::<Vec<String>>(),
+                "AgentArns": agents.clone(),
             }),
             expected: Expected {
                 uri: "object-storage://pki.example.com/pki-bucket/".to_string(),
                 port: 443,
                 protocol: "HTTPS",
                 access_key: None,
-                agents: Some(
-                    (0..8)
-                        .map(|index| agent_arn(char::from_digit(index, 10).expect("a digit")))
-                        .collect(),
-                ),
+                agents: Some(agents.clone()),
                 secret: Secret::Absent,
                 certificate: Some("cGVtLWNoYWluCg=="),
             },
         },
     ];
 
-    let router = service();
     let mut minted: Vec<String> = Vec::new();
 
     for row in &rows {
@@ -508,6 +526,9 @@ async fn created_object_storage_locations_are_reported_from_state() {
 async fn object_storage_updates_write_only_the_members_the_request_names() {
     let case = "update one member at a time";
     let router = service();
+    // Three activated agents: the one the location is created with, and the two a later
+    // step replaces it by.
+    let agents = given_agents(&router, 3, case).await;
     let created = ok(
         &router,
         "CreateLocationObjectStorage",
@@ -519,7 +540,7 @@ async fn object_storage_updates_write_only_the_members_the_request_names() {
             "Subdirectory": "/first",
             "AccessKey": "first-user",
             "SecretKey": "first-secret",
-            "AgentArns": [agent_arn('0')],
+            "AgentArns": [agents[0]],
         }),
         case,
     )
@@ -535,7 +556,7 @@ async fn object_storage_updates_write_only_the_members_the_request_names() {
                 port: 443,
                 protocol: "HTTPS",
                 access_key: Some("first-user"),
-                agents: Some(vec![agent_arn('0')]),
+                agents: Some(vec![agents[0].clone()]),
                 secret: Secret::Managed,
                 certificate: None,
             },
@@ -548,7 +569,7 @@ async fn object_storage_updates_write_only_the_members_the_request_names() {
                 port: 9000,
                 protocol: "HTTPS",
                 access_key: Some("first-user"),
-                agents: Some(vec![agent_arn('0')]),
+                agents: Some(vec![agents[0].clone()]),
                 secret: Secret::Managed,
                 certificate: None,
             },
@@ -561,7 +582,7 @@ async fn object_storage_updates_write_only_the_members_the_request_names() {
                 port: 80,
                 protocol: "HTTP",
                 access_key: Some("first-user"),
-                agents: Some(vec![agent_arn('0')]),
+                agents: Some(vec![agents[0].clone()]),
                 secret: Secret::Managed,
                 certificate: None,
             },
@@ -578,7 +599,7 @@ async fn object_storage_updates_write_only_the_members_the_request_names() {
                 port: 80,
                 protocol: "HTTP",
                 access_key: Some("first-user"),
-                agents: Some(vec![agent_arn('0')]),
+                agents: Some(vec![agents[0].clone()]),
                 secret: Secret::Managed,
                 certificate: None,
             },
@@ -593,27 +614,27 @@ async fn object_storage_updates_write_only_the_members_the_request_names() {
                     "SecretAccessRoleArn": secret_access_role_arn(),
                 },
                 "ServerCertificate": "cGVtLWNoYWluCg==",
-                "AgentArns": [agent_arn('0')],
+                "AgentArns": [agents[0]],
             }),
             Expected {
                 uri: "object-storage://after.example.com/update-bucket/second/level/".to_string(),
                 port: 80,
                 protocol: "HTTP",
                 access_key: Some("second-user"),
-                agents: Some(vec![agent_arn('0')]),
+                agents: Some(vec![agents[0].clone()]),
                 secret: Secret::Custom,
                 certificate: Some("cGVtLWNoYWluCg=="),
             },
         ),
         (
             "another agent replaces the one an agent-based location had",
-            serde_json::json!({ "LocationArn": arn, "AgentArns": [agent_arn('1'), agent_arn('2')] }),
+            serde_json::json!({ "LocationArn": arn, "AgentArns": [agents[1], agents[2]] }),
             Expected {
                 uri: "object-storage://after.example.com/update-bucket/second/level/".to_string(),
                 port: 80,
                 protocol: "HTTP",
                 access_key: Some("second-user"),
-                agents: Some(vec![agent_arn('1'), agent_arn('2')]),
+                agents: Some(vec![agents[1].clone(), agents[2].clone()]),
                 secret: Secret::Custom,
                 certificate: Some("cGVtLWNoYWluCg=="),
             },

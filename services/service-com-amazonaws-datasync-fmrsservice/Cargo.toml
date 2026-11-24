@@ -47,6 +47,9 @@ aws-sdk-efs = { version = "1", default-features = false }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Compiles every `tests/all/<name>.rs` as a suite of the one integration-test target
+# rooted at `tests/all/main.rs`.
+automod = { workspace = true }
 sha2 = { workspace = true }
 # Both sides of a transfer between Amazon S3 locations are buckets of this emulator's own
 # object store, and the role a location names is a record of its own IAM, so the suite

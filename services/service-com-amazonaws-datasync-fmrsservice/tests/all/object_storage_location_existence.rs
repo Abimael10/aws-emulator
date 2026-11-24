@@ -26,9 +26,6 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The region every request in this suite signs for.
 const SIGNED_REGION: &str = "us-west-2";
 
-/// The canonical account id every emulator ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = "000000000000";
-
 /// The discriminator DataSync reports, in both `errorCode` and `datasyncErrorCode`, for a
 /// request naming a location the account does not hold.
 const LOCATION_NOT_FOUND: &str = "LocationNotFound";
@@ -143,13 +140,25 @@ async fn assert_refused_as_absent(
     );
 }
 
-/// An agent ARN in the modelled `AgentArn` shape.
-fn agent_arn(tail: char) -> String {
-    format!("arn:aws:datasync:{SIGNED_REGION}:{ACCOUNT}:agent/agent-0123456789abcdef{tail}")
+/// One agent this account has really activated, by ARN.
+///
+/// A `CreateLocationObjectStorage` resolves every `AgentArn` its request names against
+/// the agents the account has activated, so a location that reaches its server through
+/// an agent needs that agent activated first.
+async fn given_agent(router: &MultiServiceRouter, case: &str) -> String {
+    let created = ok(
+        router,
+        "CreateAgent",
+        serde_json::json!({ "ActivationKey": "AAAAA-11111-BBBBB-22222-CCCCC" }),
+        case,
+    )
+    .await;
+    string(&created, "AgentArn", case)
 }
 
-/// A create request for an object storage location, distinct per `bucket`.
-fn create_request(bucket: &str) -> serde_json::Value {
+/// A create request for an object storage location, distinct per `bucket`, reaching its
+/// server through `agent_arn`.
+fn create_request(bucket: &str, agent_arn: &str) -> serde_json::Value {
     serde_json::json!({
         "ServerHostname": format!("{bucket}.example.com"),
         "BucketName": bucket,
@@ -157,7 +166,7 @@ fn create_request(bucket: &str) -> serde_json::Value {
         "Subdirectory": "/inbox",
         "AccessKey": "transfer-user",
         "SecretKey": "transfer-secret",
-        "AgentArns": [agent_arn('0')],
+        "AgentArns": [agent_arn],
     })
 }
 
@@ -302,10 +311,11 @@ async fn an_object_storage_read_resolves_only_the_exact_arn_the_create_stored() 
     let router = service();
     let case = "a held object storage location";
 
+    let agent_arn = given_agent(&router, case).await;
     let created = ok(
         &router,
         "CreateLocationObjectStorage",
-        create_request("near-miss-bucket"),
+        create_request("near-miss-bucket", &agent_arn),
         case,
     )
     .await;
@@ -363,11 +373,12 @@ async fn each_object_storage_location_resolves_only_under_its_own_arn() {
     let case = "three object storage locations";
 
     let mut held: Vec<(String, String)> = Vec::new();
+    let agent_arn = given_agent(&router, case).await;
     for bucket in ["first-bucket", "second-bucket", "third-bucket"] {
         let created = ok(
             &router,
             "CreateLocationObjectStorage",
-            create_request(bucket),
+            create_request(bucket, &agent_arn),
             case,
         )
         .await;
@@ -426,7 +437,7 @@ async fn each_object_storage_location_resolves_only_under_its_own_arn() {
     let created = ok(
         &router,
         "CreateLocationObjectStorage",
-        create_request("fourth-bucket"),
+        create_request("fourth-bucket", &agent_arn),
         case,
     )
     .await;

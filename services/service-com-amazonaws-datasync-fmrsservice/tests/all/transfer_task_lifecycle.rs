@@ -545,11 +545,23 @@ async fn created_s3_locations_are_reported_from_state() {
     let router = service();
     let mut minted: Vec<String> = Vec::new();
 
+    // The agent an Amazon S3 location on Outposts reaches its bucket through, activated
+    // through `CreateAgent` because a create resolves every `AgentArn` its request names
+    // against the agents this account has activated.
+    let created = ok(
+        &router,
+        "CreateAgent",
+        serde_json::json!({ "ActivationKey": "AAAAA-11111-BBBBB-22222-CCCCC" }),
+        "activating the suite's agent",
+    )
+    .await;
+    let agent_arn = string(&created, "AgentArn", "activating the suite's agent");
+
     for row in &rows {
         let mut request = serde_json::json!({
             "S3BucketArn": row.bucket_arn,
             "S3Config": { "BucketAccessRoleArn": "arn:aws:iam::000000000000:role/datasync" },
-            "AgentArns": [format!("arn:aws:datasync:{SIGNED_REGION}:{ACCOUNT}:agent/agent-0123456789abcdefg")],
+            "AgentArns": [agent_arn],
             "Tags": [{ "Key": "team", "Value": "storage" }],
         });
         if let Some(subdirectory) = row.subdirectory {

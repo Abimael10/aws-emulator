@@ -231,13 +231,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // The agents this update names, resolved against the agents this account has
+        // activated: an `AgentArn` this account holds no agent under is refused — in the
+        // words the agent surface refuses that same ARN with — before anything changes.
+        if let Err(refusal) = store.resolve_agents(input.agent_arns.as_deref().unwrap_or(&[])) {
+            return Err(
+                UpdateLocationObjectStorageErrorModeled::InvalidRequestException(refusal).into(),
+            );
+        }
+
         // Resolved before the location is borrowed for writing, because minting a
         // DataSync-managed secret draws on the same store. An update that names none
         // of the credential members leaves the secret the location already has.
-        let secret = store.object_storage_secret(
+        let secret = store.location_secret(
             &region,
             &current_secret,
-            input.secret_key.as_deref(),
+            crate::state::carries_credential(input.secret_key.as_deref()),
             input.cmk_secret_config.as_ref(),
             input.custom_secret_config.as_ref(),
         );

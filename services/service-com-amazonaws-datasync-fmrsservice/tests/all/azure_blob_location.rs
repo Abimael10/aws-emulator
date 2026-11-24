@@ -33,11 +33,10 @@ const CUSTOMER_SECRET_ARN: &str =
 /// The IAM role that grants DataSync access to [`CUSTOMER_SECRET_ARN`].
 const SECRET_ACCESS_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/datasync-secret-reader";
 
-/// Two DataSync agents, as the modelled `AgentArn` spells them.
-const AGENT_ARNS: [&str; 2] = [
-    "arn:aws:datasync:us-west-2:000000000000:agent/agent-01234567890abcdef",
-    "arn:aws:datasync:us-west-2:000000000000:agent/agent-abcdef01234567890",
-];
+/// An activation key in the modelled `ActivationKey` shape
+/// (`^[A-Z0-9]{5}(-[A-Z0-9]{5}){4}$`), which every agent this suite activates is created
+/// with.
+const ACTIVATION_KEY: &str = "AAAAA-11111-BBBBB-22222-CCCCC";
 
 /// A router with just this service mounted on a fresh engine.
 fn service() -> MultiServiceRouter {
@@ -263,15 +262,35 @@ struct Row {
     subdirectory: Option<&'static str>,
     blob_type: Option<&'static str>,
     access_tier: Option<&'static str>,
-    agent_arns: &'static [&'static str],
+    /// How many agents this location reaches its container through. The ARNs are the
+    /// ones [`given_agents`] activated, since a create resolves every `AgentArn` its
+    /// request names.
+    agents: usize,
     credential: Credential,
     expected_uri: &'static str,
     expected_blob_type: &'static str,
     expected_access_tier: &'static str,
 }
 
-/// The request body a row asks for.
-fn request_of(row: &Row) -> serde_json::Value {
+/// `count` agents this account has really activated, by ARN.
+async fn given_agents(router: &MultiServiceRouter, count: usize, case: &str) -> Vec<String> {
+    let mut activated: Vec<String> = Vec::with_capacity(count);
+    for _ in 0..count {
+        let created = ok(
+            router,
+            "CreateAgent",
+            serde_json::json!({ "ActivationKey": ACTIVATION_KEY }),
+            case,
+        )
+        .await;
+        activated.push(string(&created, "AgentArn", case));
+    }
+    activated
+}
+
+/// The request body a row asks for, naming `agents` as the agents it reaches its
+/// container through.
+fn request_of(row: &Row, agents: &[String]) -> serde_json::Value {
     let mut request = serde_json::json!({
         "ContainerUrl": row.container_url,
         "AuthenticationType": row.authentication_type,
@@ -285,8 +304,8 @@ fn request_of(row: &Row) -> serde_json::Value {
     if let Some(access_tier) = row.access_tier {
         request["AccessTier"] = serde_json::json!(access_tier);
     }
-    if !row.agent_arns.is_empty() {
-        request["AgentArns"] = serde_json::json!(row.agent_arns);
+    if !agents.is_empty() {
+        request["AgentArns"] = serde_json::json!(agents);
     }
     row.credential.apply(&mut request);
     request
@@ -310,7 +329,7 @@ async fn created_azure_blob_locations_are_reported_from_state() {
             subdirectory: None,
             blob_type: None,
             access_tier: None,
-            agent_arns: &[],
+            agents: 0,
             credential: Credential::SasToken,
             expected_uri: "azure-blob://hotstore.blob.core.windows.net/transfer-in/",
             expected_blob_type: "BLOCK",
@@ -323,7 +342,7 @@ async fn created_azure_blob_locations_are_reported_from_state() {
             subdirectory: Some("/images/raw"),
             blob_type: Some("BLOCK"),
             access_tier: Some("COOL"),
-            agent_arns: &[AGENT_ARNS[0]],
+            agents: 1,
             credential: Credential::SasToken,
             expected_uri: "azure-blob://coolstore.blob.core.windows.net/transfer-out/images/raw/",
             expected_blob_type: "BLOCK",
@@ -336,7 +355,7 @@ async fn created_azure_blob_locations_are_reported_from_state() {
             subdirectory: Some("images/raw/"),
             blob_type: None,
             access_tier: Some("ARCHIVE"),
-            agent_arns: &AGENT_ARNS,
+            agents: 2,
             credential: Credential::SasToken,
             expected_uri: "azure-blob://coolstore.blob.core.windows.net/transfer-out/images/raw/",
             expected_blob_type: "BLOCK",
@@ -349,7 +368,7 @@ async fn created_azure_blob_locations_are_reported_from_state() {
             subdirectory: Some("/nested/deeper/still"),
             blob_type: Some("BLOCK"),
             access_tier: Some("HOT"),
-            agent_arns: &[],
+            agents: 0,
             credential: Credential::SasTokenWithCustomerKey,
             expected_uri:
                 "azure-blob://cmkstore.blob.core.windows.net/encrypted-data/nested/deeper/still/",
@@ -363,7 +382,7 @@ async fn created_azure_blob_locations_are_reported_from_state() {
             subdirectory: None,
             blob_type: None,
             access_tier: Some("COOL"),
-            agent_arns: &[AGENT_ARNS[1]],
+            agents: 1,
             credential: Credential::CustomerSecret,
             expected_uri: "azure-blob://ownsecret.blob.core.windows.net/byo-secret/",
             expected_blob_type: "BLOCK",
@@ -376,7 +395,7 @@ async fn created_azure_blob_locations_are_reported_from_state() {
             subdirectory: Some("/"),
             blob_type: None,
             access_tier: None,
-            agent_arns: &[],
+            agents: 0,
             credential: Credential::None,
             expected_uri: "azure-blob://openstore.blob.core.windows.net/public-container/",
             expected_blob_type: "BLOCK",
@@ -389,7 +408,14 @@ async fn created_azure_blob_locations_are_reported_from_state() {
     let mut managed_secrets: Vec<String> = Vec::new();
 
     for row in &rows {
-        let created = ok(&router, "CreateLocationAzureBlob", request_of(row), row.case).await;
+        let agents = given_agents(&router, row.agents, row.case).await;
+        let created = ok(
+            &router,
+            "CreateLocationAzureBlob",
+            request_of(row, &agents),
+            row.case,
+        )
+        .await;
         let arn = string(&created, "LocationArn", row.case);
         assert_location_arn(&arn, row.case);
         assert!(
@@ -442,7 +468,7 @@ async fn created_azure_blob_locations_are_reported_from_state() {
         );
 
         let reported_agents = described["AgentArns"].clone();
-        if row.agent_arns.is_empty() {
+        if agents.is_empty() {
             assert!(
                 reported_agents.is_null(),
                 "case {:?}: `AgentArns` is modelled len 1..8, so a location with no agents \
@@ -452,7 +478,7 @@ async fn created_azure_blob_locations_are_reported_from_state() {
         } else {
             assert_eq!(
                 reported_agents,
-                serde_json::json!(row.agent_arns),
+                serde_json::json!(agents),
                 "case {:?}: expected the agents the request named, got {described}",
                 row.case
             );
@@ -526,16 +552,23 @@ async fn duplicate_azure_blob_configurations_are_independent_locations() {
             subdirectory: Some("/same/prefix"),
             blob_type: Some("BLOCK"),
             access_tier: Some("HOT"),
-            agent_arns: &AGENT_ARNS,
+            agents: 2,
             credential,
             expected_uri: "",
             expected_blob_type: "BLOCK",
             expected_access_tier: "HOT",
         };
 
+        let agents = given_agents(&router, row.agents, case).await;
         let mut described_bodies: Vec<serde_json::Value> = Vec::new();
         for attempt in 0..3 {
-            let created = ok(&router, "CreateLocationAzureBlob", request_of(&row), case).await;
+            let created = ok(
+                &router,
+                "CreateLocationAzureBlob",
+                request_of(&row, &agents),
+                case,
+            )
+            .await;
             let arn = string(&created, "LocationArn", case);
             assert_location_arn(&arn, case);
             assert!(

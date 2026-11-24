@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeLocationSmb
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeLocationSmb`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeLocationSmb::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the SMB transfer location stored under the `LocationArn` the request names:
+//! every member comes from what `CreateLocationSmb` persisted in [`crate::state`].
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +171,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeLocationSmb` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeLocationSmbErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeLocationSmb"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeLocationSmbErrorModeled::InternalException(
+                InternalException {
+                    message: Some(
+                        "the DataSync emulator could not reach its state store".to_string(),
+                    ),
+                    error_code: None,
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        store.advance_clock(::std::time::SystemTime::now());
+        // An ARN addresses one location of one kind: an unknown ARN and an ARN naming
+        // another kind of location are both refused, worded in `crate::state`.
+        let (location, smb) = store.smb_location(&input.location_arn).map_err(|refusal| {
+            DescribeLocationSmbErrorModeled::InvalidRequestException(refusal.into_invalid_request())
+        })?;
+
+        // Where this location's credential is kept, as the three mutually exclusive
+        // secret members report it; a location whose request named no credential at all
+        // reports none of them.
+        let (managed_secret_config, cmk_secret_config, custom_secret_config) =
+            smb.secret.reported();
+
+        Ok(DescribeLocationSmbOutput {
+            location_arn: Some(location.arn.clone()),
+            location_uri: Some(location.location_uri.clone()),
+            // `AgentArns` is required on the create and modelled `len 1..8`, so this
+            // location reports exactly the agents it was stored with.
+            agent_arns: Some(location.agent_arns.clone()),
+            // Each of these three is optional in the create request, so a location
+            // reports one only when its own request named it.
+            user: smb.user.clone(),
+            domain: smb.domain.clone(),
+            kerberos_principal: smb.kerberos_principal.clone(),
+            mount_options: Some(smb.mount_options.clone()),
+            creation_time: Some(crate::state::as_timestamp(location.creation_time)),
+            // `DnsIpList` is modelled `len 0..2`, so a location that named no DNS server
+            // reports the empty list it was stored with.
+            dns_ip_addresses: Some(smb.dns_ip_addresses.clone()),
+            authentication_type: Some(smb.authentication_type.clone()),
+            managed_secret_config,
+            cmk_secret_config,
+            custom_secret_config,
+        })
     }
 }

@@ -230,6 +230,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let location_arn = {
             let mut store = state.lock();
             store.advance_clock(now);
+
+            // The pre-flight DataSync performs before it stores the location: an
+            // `AgentArn` this account holds no agent under is refused — in the words the
+            // agent surface refuses that same ARN with — before anything is stored. A
+            // request naming no agent at all names none to resolve.
+            if let Err(refusal) = store.resolve_agents(input.agent_arns.as_deref().unwrap_or(&[])) {
+                return Err(
+                    CreateLocationAzureBlobErrorModeled::InvalidRequestException(refusal).into(),
+                );
+            }
+
             if let Some(message) = store.at_capacity(crate::state::ResourceStore::Locations) {
                 return Err(CreateLocationAzureBlobErrorModeled::InvalidRequestException(
                     InvalidRequestException {
