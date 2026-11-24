@@ -21,9 +21,10 @@
 //!    the service would not accept is answered about the RESOURCE.
 //! 3. The tagging operations take the ARN of a resource of a kind this service
 //!    TAGS; a `ResourceArn` naming any other kind is the caller's own input to
-//!    fix — HTTP 400 `BadRequestException` in one fixed sentence — whether or not
-//!    that resource exists, while a well-formed ARN of a taggable kind that names
-//!    nothing stays the modelled 404.
+//!    fix — HTTP 400 `BadRequestException` in a fixed sentence — whether or not
+//!    that resource exists, and a value that is not an ARN at all is refused on
+//!    its syntax in that sentence's own form, while a well-formed ARN of a
+//!    taggable kind that names nothing stays the modelled 404.
 //! 4. The list of Kafka clusters a replicator spans is a SET, so a list naming one
 //!    cluster twice is refused on that member in the service's fixed sentence for
 //!    it.
@@ -43,9 +44,13 @@ use crate::kafka_harness::{pct, ClusterRequest, Emulator, Reply, ACCOUNT, REGION
 /// sentence, which is why every row below asserts it EQUAL rather than contained.
 const RESOURCE_NOT_FOUND: &str = "The requested resource doesn\u{2019}t exist.";
 
-/// The whole message the tagging operations answer a `ResourceArn` they cannot
+/// The whole message the tagging operations answer a well-formed `ResourceArn` they cannot
 /// accept as the ARN of a taggable MSK resource with. Also fixed end to end.
 const INVALID_TAG_RESOURCE_ARN: &str = "Invalid input resource arn";
+
+/// And the whole message they answer a `ResourceArn` that is not an ARN AT ALL with: the same
+/// sentence plus the reason such a value could not be read. Fixed end to end too.
+const INVALID_TAG_RESOURCE_ARN_SYNTAX: &str = "Invalid input resource arn: bad syntax";
 
 /// The whole message `CreateReplicator` answers a cluster list that names one
 /// cluster twice with.
@@ -513,24 +518,35 @@ async fn the_tagging_operations_refuse_an_arn_of_a_kind_they_do_not_tag() {
 
     // Rows: the live configuration's own ARN, a cluster-operation ARN, an ARN of
     // another vendor's service, and a value that is no ARN at all — every one of
-    // them a `ResourceArn` this surface cannot act on.
-    let refused: Vec<(&str, String)> = vec![
-        ("a live configuration", configuration.clone()),
+    // them a `ResourceArn` this surface cannot act on, each with the sentence its class
+    // earns: the one that is no ARN at all is refused on its syntax.
+    let refused: Vec<(&str, String, &str)> = vec![
+        (
+            "a live configuration",
+            configuration.clone(),
+            INVALID_TAG_RESOURCE_ARN,
+        ),
         (
             "a cluster operation",
             format!(
                 "arn:aws:kafka:{REGION}:{ACCOUNT}:cluster-operation/resolution/\
                  00000000-0000-0000-0000-000000000000-1"
             ),
+            INVALID_TAG_RESOURCE_ARN,
         ),
         (
             "another service's ARN",
             format!("arn:aws:sqs:{REGION}:{ACCOUNT}:queue/resolution"),
+            INVALID_TAG_RESOURCE_ARN,
         ),
-        ("not an ARN at all", "resolution-not-an-arn".to_string()),
+        (
+            "not an ARN at all",
+            "resolution-not-an-arn".to_string(),
+            INVALID_TAG_RESOURCE_ARN_SYNTAX,
+        ),
     ];
 
-    for (case, arn) in &refused {
+    for (case, arn, expected) in &refused {
         for (operation, method, uri, body) in [
             (
                 "TagResource",
@@ -555,7 +571,7 @@ async fn the_tagging_operations_refuse_an_arn_of_a_kind_they_do_not_tag() {
             let reply = emulator.call(method, &uri, body).await;
             assert_eq!(
                 (reply.status, reply.error_code(), reply.error_message()),
-                (400, "BadRequestException", INVALID_TAG_RESOURCE_ARN),
+                (400, "BadRequestException", *expected),
                 "case {case}: expected the fixed input refusal, got {} {}",
                 reply.status,
                 reply.body

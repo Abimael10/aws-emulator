@@ -288,10 +288,10 @@ async fn describe_v2_reports_the_state_the_clock_owes() {
     }
 }
 
-/// RULE: a `ClusterArn` that is not shaped like an MSK cluster ARN is refused with
-/// `BadRequestException` (400); a well-formed ARN this endpoint's region holds no
-/// cluster for is `NotFoundException` (404) — the two gates the model declares,
-/// in that order.
+/// RULE: a `ClusterArn` that is no MSK resource ARN at all is refused with
+/// `BadRequestException` (400); a reference this reader resolves to no cluster of its
+/// endpoint's region — including an ARN of this service naming another resource type — is
+/// `NotFoundException` (404). The two gates the model declares, in that order.
 #[tokio::test]
 async fn describe_v2_refuses_an_unknown_or_malformed_cluster_arn() {
     let emulator = Emulator::new();
@@ -306,7 +306,8 @@ async fn describe_v2_refuses_an_unknown_or_malformed_cluster_arn() {
     // reaches no grant — a cluster reference with a missing or extra segment, and a
     // value that is no ARN at all, are each the authorization refusal, taken before
     // anything resolves. An ARN naming a resource of another KIND is no cluster
-    // reference at all, so this reader answers it itself.
+    // reference at all, so this reader answers it itself: another vendor's as the
+    // parameter it cannot read, and one of this service's as a cluster it does not hold.
     let rows: Vec<(String, u16, &str)> = vec![
         (
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/absent/00000000-0000-4000-8000-000000000000-1"),
@@ -325,10 +326,13 @@ async fn describe_v2_refuses_an_unknown_or_malformed_cluster_arn() {
             400,
             "BadRequestException",
         ),
+        // An ARN naming a resource of another KIND is no cluster reference the gate decides
+        // over, and this reader RESOLVES the reference it is handed, so it answers such an
+        // ARN of this service as the cluster it holds nothing for.
         (
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/not-a-cluster/1"),
-            400,
-            "BadRequestException",
+            404,
+            "NotFoundException",
         ),
         (
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/missing-id"),

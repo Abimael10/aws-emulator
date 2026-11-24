@@ -241,12 +241,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = crate::state::request_region(ctx.parts());
 
-        // This operation models no `NotFoundException`, so both ways a
-        // `ClusterArn` can fail to resolve are the same bad request — but the
-        // message distinguishes them, so the three readers say the same thing
-        // about the same input. The shape check depends on the request alone, so
-        // it runs before the state lock is taken.
-        if !crate::state::is_cluster_arn(&input.cluster_arn) {
+        // This operation models no `NotFoundException` of its own, so the shape
+        // gate and the lookup both answer through the channels below — but a
+        // reader RESOLVES the cluster reference it is handed: every MSK resource
+        // ARN is such a reference, so one naming another resource type is a
+        // cluster this endpoint holds nothing for (the 404 below) rather than a
+        // parameter the caller mistyped. Only a value that is no MSK resource ARN
+        // at all is the bad request. The shape check depends on the request alone,
+        // so it runs before the state lock is taken.
+        if !crate::state::is_kafka_resource_arn(&input.cluster_arn) {
             return Err(GetBootstrapBrokersErrorModeled::BadRequestException(
                 crate::state::malformed_arn(crate::state::CLUSTER_ARN_MEMBER),
             )

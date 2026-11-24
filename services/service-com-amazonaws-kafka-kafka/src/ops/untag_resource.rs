@@ -179,9 +179,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         // Resolved exactly as `TagResource` resolves it, through the one shared
-        // lookup, and refused in the same two ways: a `ResourceArn` this service
+        // lookup, and refused in the same ways: a `ResourceArn` that is not an
+        // ARN at all is refused on its syntax, a well-formed ARN this service
         // cannot accept as the ARN of a resource it TAGS is the caller's own
-        // input to fix, while a well-formed ARN of a taggable kind that names
+        // input to fix, and a well-formed ARN of a taggable kind that names
         // nothing this region holds is the modelled miss.
         let tags = match state.resource_tags_mut_in(
             &region,
@@ -190,6 +191,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             Ok(tags) => tags,
             Err(crate::state::TagTargetRejected::NotAnArn) => {
+                return Err(UntagResourceErrorModeled::BadRequestException(
+                    crate::state::invalid_tag_resource_arn_syntax(),
+                )
+                .into());
+            }
+            Err(crate::state::TagTargetRejected::NotATaggableResource) => {
                 return Err(UntagResourceErrorModeled::BadRequestException(
                     crate::state::invalid_tag_resource_arn(),
                 )

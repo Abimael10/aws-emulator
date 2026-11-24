@@ -5,7 +5,7 @@
 //! RULE under test: a refusal a service takes on the request BODY as a whole — here the
 //! cluster-type selection, which the API admits only one valid form of, the model declaring
 //! `provisioned` and `serverless` as two separate optional structures rather than a union —
-//! is answered with the service's ONE fixed sentence for a body it will not accept, naming no
+//! is answered with the service's ONE fixed sentence for that selection, naming no
 //! member and interpolating nothing of the request. So the answer is the identical string for
 //! every such body: no value the caller submitted and nothing the account already holds
 //! reaches it.
@@ -18,7 +18,7 @@
 //! its modelled range, the broker type, what the tags say, whether the serverless block names
 //! client authentication, whether the name is one the account already holds and which region
 //! the call is signed for — and each row asserts the answer echoes none of the values it
-//! submitted and names neither cluster-type member. One name PAST the model's length bound is
+//! submitted. One name PAST the model's length bound is
 //! driven too, because that request never reaches the decision: the input-constraint layer
 //! answers it in this service's own sentence for a parameter it will not accept.
 
@@ -42,18 +42,22 @@ const CLUSTER_NAME_MAX_LENGTH: usize = 64;
 const BROKER_NODES_MIN: i64 = 1;
 const BROKER_NODES_MAX: i64 = 15;
 
-/// The wire names of the two cluster-type members and of the parameter MSK blames when a
-/// create names NEITHER of them: a refusal taken on the BODY names no member, so none of
-/// these tokens may appear in its sentence.
-const MEMBER_TOKENS: &[&str] = &["provisioned", "serverless", "clusterType"];
+/// The wire name of the parameter MSK blames when a create names NEITHER cluster type, which
+/// a refusal taken on the BODY never names: the selection refusal carries no
+/// `invalidParameter` at all, and its sentence states the two kinds as part of its own fixed
+/// text rather than as a report of what the request sent.
+const CLUSTER_TYPE_PARAMETER: &str = "clusterType";
 
 /// A region OTHER than the harness default, so one row shows the sentence is the service's own
 /// rather than something composed per region.
 const OTHER_REGION: &str = "eu-west-1";
 
 /// The broker software and the broker type the shared `provisioned` block names, which a row
-/// lists among the values its answer must not echo.
-const BLOCK_VERSION: &str = "3.6.0";
+/// lists among the values its answer must not echo. The version is one this service OFFERS a
+/// new cluster (from
+/// `service_com_amazonaws_kafka_kafka::state::new_cluster_kafka_versions("kafka.m5.large")`),
+/// so a row carrying it names a provisioned block the service would build.
+const BLOCK_VERSION: &str = "3.8.x";
 const BLOCK_INSTANCE_TYPE: &str = "kafka.m5.large";
 
 /// The same `provisioned` block on the broker type the caller names, so a row can name one the
@@ -169,7 +173,7 @@ fn rows(held: &str) -> Vec<Row> {
 }
 
 /// RULE: the sentence MSK refuses an unacceptable body with is FIXED, so every body naming
-/// both cluster types reads the identical string — one that names neither cluster-type member
+/// both cluster types reads the identical string — one that names no member
 /// and carries no value the request submitted — whatever the name is, however long it is,
 /// whatever the two blocks say, whatever tags the body carries, whether the name is one the
 /// account already holds and whichever region the call is signed for.
@@ -196,13 +200,13 @@ async fn the_body_refusal_sentence_is_fixed_whatever_the_request_says() {
             .call_in(row.region, "POST", "/api/v2/clusters", Some(row.body.clone()))
             .await;
         assert_one_cluster_type(&reply, case);
+        assert!(
+            !reply.error_message().contains(CLUSTER_TYPE_PARAMETER),
+            "case {case}: the selection sentence states the two kinds, not the parameter name, \
+             got {:?}",
+            reply.error_message()
+        );
         let message = reply.error_message();
-        for token in MEMBER_TOKENS {
-            assert!(
-                !message.contains(token),
-                "case {case}: the body refusal must not name {token:?}, got {message:?}"
-            );
-        }
         for value in &row.submitted {
             assert!(
                 !message.contains(value.as_str()),

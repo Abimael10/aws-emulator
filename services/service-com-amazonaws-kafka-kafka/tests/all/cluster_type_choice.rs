@@ -6,8 +6,9 @@
 //! The rule under test: a create carries EXACTLY ONE of the two alternative cluster-type
 //! bodies, and each way of failing that has its own fixed answer — a create naming NEITHER is
 //! refused about the `clusterType` parameter the request left unset, a create naming BOTH is
-//! refused on the BODY it sent, with no member named, because a body describing two clusters
-//! is no body this API accepts. Neither registers anything.
+//! refused on the BODY it sent, with no member named, in the sentence stating that only one of
+//! the two may be given, because either member would have fixed the request. Neither registers
+//! anything.
 //!
 //! Where [`super::create_and_update_input_gates`] pins the WORDING, this suite pins that each
 //! answer is INVARIANT over a table of bodies that differ in everything the choice does not
@@ -28,9 +29,10 @@ use crate::kafka_harness::{Emulator, Reply};
 const NO_CLUSTER_TYPE_MESSAGE: &str =
     "You must specify a cluster type, either provisioned or serverless.";
 
-/// What MSK answers a create whose body names BOTH cluster types: its sentence for a request
-/// body it will not accept, the two members being alternatives rather than a pair.
-const ONE_CLUSTER_TYPE_MESSAGE: &str = "Invalid request body";
+/// What MSK answers a create whose body names BOTH cluster types: the sentence stating that
+/// only one of the two may be given, the two members being alternatives rather than a pair.
+const ONE_CLUSTER_TYPE_MESSAGE: &str =
+    "You can specify only one cluster type, either provisioned or serverless.";
 
 /// A `provisioned` block asking for `brokers` brokers.
 fn provisioned(brokers: u64) -> Value {
@@ -75,7 +77,9 @@ fn no_cluster_type_rows() -> Vec<(&'static str, Value)> {
     ]
 }
 
-/// Bodies that name BOTH cluster types, differing in what each block says.
+/// Bodies that name BOTH cluster types, differing in what each block says — including whether
+/// a named block would itself have been refused, which the selection refusal is taken ahead
+/// of.
 fn both_cluster_types_rows() -> Vec<(&'static str, Value)> {
     vec![
         (
@@ -108,6 +112,14 @@ fn both_cluster_types_rows() -> Vec<(&'static str, Value)> {
                     },
                 },
                 "serverless": serverless(1),
+            }),
+        ),
+        (
+            "a serverless block that would itself have been refused",
+            json!({
+                "clusterName": "choice-both-unauthenticated",
+                "provisioned": provisioned(2),
+                "serverless": { "vpcConfigs": [{ "subnetIds": ["subnet-aaaaaaaaaaaaaaaaa"] }] },
             }),
         ),
     ]

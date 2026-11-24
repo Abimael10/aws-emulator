@@ -3234,16 +3234,22 @@ impl VpcConnection {
 /// Why a tagging operation could not resolve its `ResourceArn` to a resource it
 /// can act on.
 ///
-/// The two variants are the two failures the real service distinguishes: a value
-/// it cannot accept as the ARN of a resource it TAGS, and a well-formed one of a
-/// taggable kind that names nothing.
+/// The three variants are the failures the real service distinguishes: a value
+/// that is not an ARN at all, a well-formed ARN it cannot accept as the ARN of a
+/// resource it TAGS, and a well-formed one of a taggable kind that names nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TagTargetRejected {
-    /// Not the ARN of a taggable MSK resource: not an ARN of this service at
-    /// all, not shaped like the kind it names, or naming a kind the tagging
-    /// surface does not serve ([`TAGGABLE_RESOURCE_TYPES`]). A client
-    /// `BadRequestException`.
+    /// Not an ARN at all: the value does not carry the fields every AWS ARN has
+    /// ([`is_arn`]), so nothing about it can be read as a resource reference. A
+    /// client `BadRequestException` whose sentence says the syntax is what failed
+    /// ([`INVALID_TAG_RESOURCE_ARN_SYNTAX_MESSAGE`]).
     NotAnArn,
+    /// A well-formed ARN this service cannot accept as the ARN of a resource it
+    /// tags: another vendor's, not shaped like the MSK kind it names, or naming a
+    /// kind the tagging surface does not serve ([`TAGGABLE_RESOURCE_TYPES`]). A
+    /// client `BadRequestException` about the reference rather than about the
+    /// syntax ([`INVALID_TAG_RESOURCE_ARN_MESSAGE`]).
+    NotATaggableResource,
     /// A well-formed ARN of a TAGGABLE kind this endpoint's region holds no
     /// resource for: absent, deleted, or belonging to another region. A
     /// `NotFoundException`.
@@ -3290,11 +3296,26 @@ pub const TAGGING_NOT_FOUND_MESSAGE: &str = "Resource was not found";
 /// reaches it, so two calls carrying different unusable ARNs are told the same
 /// thing. RECORDED behaviour, not modelled: the tagging operations have to turn
 /// `ResourceArn` into one of the service's own taggable resources before they
-/// can act, and a value they cannot — unparseable, not shaped like the kind it
-/// names, or naming a kind no API of this service gives a `Tags` member
-/// ([`TAGGABLE_RESOURCE_TYPES`]) — is reported as the caller's own input to fix
-/// rather than as a resource that may appear later.
+/// can act, and a well-formed ARN they cannot — another vendor's, not shaped like
+/// the kind it names, or naming a kind no API of this service gives a `Tags`
+/// member ([`TAGGABLE_RESOURCE_TYPES`]) — is reported as the caller's own input
+/// to fix rather than as a resource that may appear later.
+///
+/// The sentence for a value that is not an ARN AT ALL says so
+/// ([`INVALID_TAG_RESOURCE_ARN_SYNTAX_MESSAGE`]): the two input classes are told
+/// apart by what the message adds after this text, and by nothing taken from the
+/// request.
 pub const INVALID_TAG_RESOURCE_ARN_MESSAGE: &str = "Invalid input resource arn";
+
+/// The message Amazon MSK answers a tagging call whose `ResourceArn` is not an
+/// ARN at all with: [`INVALID_TAG_RESOURCE_ARN_MESSAGE`] and the reason the
+/// reference could not be read, which for such a value is its syntax.
+///
+/// Fixed text end to end too — the offending value is NOT echoed into it — and
+/// RECORDED behaviour: a `ResourceArn` carrying no ARN is refused on the syntax
+/// before any resource of this service is looked for, which is what separates it
+/// from a well-formed ARN the surface cannot act on.
+pub const INVALID_TAG_RESOURCE_ARN_SYNTAX_MESSAGE: &str = "Invalid input resource arn: bad syntax";
 
 /// The refusal the tagging operations answer such a `ResourceArn` with: the
 /// modelled `BadRequestException` (HTTP 400, the status the model gives the
@@ -3305,9 +3326,23 @@ pub const INVALID_TAG_RESOURCE_ARN_MESSAGE: &str = "Invalid input resource arn";
 /// apart on how an ARN they cannot act on is reported: one condition, one
 /// envelope, whichever of them met it.
 pub fn invalid_tag_resource_arn() -> BadRequestException {
+    tag_resource_arn_refusal(INVALID_TAG_RESOURCE_ARN_MESSAGE)
+}
+
+/// The same refusal for a `ResourceArn` that is not an ARN at all, carrying
+/// [`INVALID_TAG_RESOURCE_ARN_SYNTAX_MESSAGE`]: same status, same code, same
+/// absence of a named parameter — only the reason differs.
+pub fn invalid_tag_resource_arn_syntax() -> BadRequestException {
+    tag_resource_arn_refusal(INVALID_TAG_RESOURCE_ARN_SYNTAX_MESSAGE)
+}
+
+/// One `BadRequestException` about a `ResourceArn` the tagging surface cannot
+/// act on, so the two refusals above cannot drift apart on anything but their
+/// sentence.
+fn tag_resource_arn_refusal(message: &str) -> BadRequestException {
     BadRequestException {
         invalid_parameter: None,
-        message: Some(INVALID_TAG_RESOURCE_ARN_MESSAGE.to_string()),
+        message: Some(message.to_string()),
     }
 }
 

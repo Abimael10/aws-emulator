@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! WHEN `CreateClusterV2` refuses the BODY rather than a member: the body-level refusal and
+//! WHEN `CreateClusterV2` refuses the BODY rather than a member: the selection refusal and
 //! its place in the order of decisions.
 //!
-//! The rule under test: a `CreateClusterV2` body that names BOTH cluster types describes two
-//! different clusters, so it is no body this API accepts — it is refused on the
-//! BODY, with HTTP 400 `BadRequestException`, MSK's one sentence for a request body it will
-//! not accept and NO
-//! `invalidParameter`, because no single member is at fault. That decision is taken on the
-//! body alone, so it comes BEFORE every decision taken on a member's value or on the
-//! registry: a body naming both kinds reads the same sentence whether one of the blocks
-//! would itself have been refused and whether the cluster name is one the account already
-//! holds.
+//! The rule under test: the two cluster-type members are ALTERNATIVES, so a `CreateClusterV2`
+//! body naming BOTH selects two clusters at once and is refused on the BODY — HTTP 400
+//! `BadRequestException` stating the rule that only one of the two may be given, with NO
+//! `invalidParameter`, because either member would have fixed the request and no single one is
+//! at fault. That decision is taken on the SELECTION alone, so it comes BEFORE every decision
+//! taken on a member's value or on the registry: a body naming both kinds reads the same
+//! sentence whether one of the blocks would itself have been refused and whether the cluster
+//! name is one the account already holds.
 //!
 //! The two neighbouring classes are driven alongside it, so what the rows pin is the class
 //! and not the operation: a body naming NEITHER kind names no cluster type and is refused
@@ -23,8 +22,8 @@
 //!
 //! The rows differ along what the two blocks say (broker count, how many VPC configurations),
 //! what else the body carries (tags), whether a named block would itself have been refused (an
-//! unsupported `KafkaVersion`, a serverless block naming no VPC configuration) and whether the
-//! name is free or already taken.
+//! unsupported `KafkaVersion`, a broker type the service does not offer, a serverless block
+//! naming no VPC configuration) and whether the name is free or already taken.
 //!
 //! The other half of the rule — that the sentence is FIXED TEXT, identical for every such
 //! body and carrying no part of the request — is driven by
@@ -36,12 +35,12 @@ use serde_json::{json, Value};
 use crate::kafka_harness::{assert_name_already_exists, Emulator, Reply};
 use crate::refusal_wording::PARAMETERS_NOT_VALID;
 
-/// MSK's sentence for a create whose body names both cluster types, written out
-/// here rather than read from the service's own constant, so the wording is pinned by this
-/// suite instead of by the code under test: the two members are ALTERNATIVES, so a body
-/// carrying both is no body this API accepts, and the refusal is about that body rather than
-/// about any member of it.
-const INVALID_REQUEST_BODY_MESSAGE: &str = "Invalid request body";
+/// MSK's sentence for a create whose body names both cluster types, written out here rather
+/// than read from the service's own constant, so the wording is pinned by this suite instead
+/// of by the code under test: the two members are ALTERNATIVES, so such a body selects two
+/// clusters at once and the refusal states that rule, naming neither member.
+const ONE_CLUSTER_TYPE_MESSAGE: &str =
+    "You can specify only one cluster type, either provisioned or serverless.";
 
 /// MSK's fixed sentence for a create that names NO cluster type, and the parameter it blames.
 const NO_CLUSTER_TYPE_MESSAGE: &str =
@@ -74,14 +73,16 @@ pub(crate) fn serverless(configurations: usize) -> Value {
 }
 
 /// The bodies that name both cluster types: how the case is named and the body itself, under
-/// the cluster name the caller supplies.
-fn both_cluster_type_rows(name: &str) -> Vec<(&'static str, Value)> {
+/// the cluster name the caller supplies. The rows vary what the two blocks say — including
+/// whether a named block would itself have been refused, which the selection refusal is taken
+/// ahead of.
+pub(crate) fn both_cluster_type_rows(name: &str) -> Vec<(&'static str, Value)> {
     vec![
         (
             "a minimal block of each kind",
             json!({
                 "clusterName": name,
-                "provisioned": provisioned("3.6.0", 1),
+                "provisioned": provisioned(OFFERED_VERSION, 1),
                 "serverless": serverless(1),
             }),
         ),
@@ -106,31 +107,50 @@ fn both_cluster_type_rows(name: &str) -> Vec<(&'static str, Value)> {
             "a serverless block naming no VPC configuration",
             json!({
                 "clusterName": name,
-                "provisioned": provisioned("3.6.0", 2),
+                "provisioned": provisioned(OFFERED_VERSION, 2),
                 "serverless": { "vpcConfigs": [] },
+            }),
+        ),
+        (
+            "a provisioned block naming a broker type the service does not offer",
+            json!({
+                "clusterName": name,
+                "provisioned": {
+                    "kafkaVersion": OFFERED_VERSION,
+                    "numberOfBrokerNodes": 2,
+                    "brokerNodeGroupInfo": {
+                        "instanceType": "kafka.not-a-broker-type",
+                        "clientSubnets": ["subnet-aaaaaaaaaaaaaaaaa", "subnet-bbbbbbbbbbbbbbbbb"],
+                    },
+                },
+                "serverless": serverless(1),
             }),
         ),
     ]
 }
+
+/// A broker software version this service offers a NEW cluster, from
+/// `service_com_amazonaws_kafka_kafka::state::new_cluster_kafka_versions("kafka.m5.large")` —
+/// so a row carrying it is a row whose provisioned block the service would build.
+const OFFERED_VERSION: &str = "3.8.x";
 
 /// A body naming both kinds whose `numberOfBrokerNodes` is outside the range the model
 /// declares for it, which is refused by the input-constraint layer before any handler runs.
 fn both_kinds_outside_a_modelled_bound(name: &str) -> Value {
     json!({
         "clusterName": name,
-        "provisioned": provisioned("3.6.0", 0),
+        "provisioned": provisioned(OFFERED_VERSION, 0),
         "serverless": serverless(1),
     })
 }
 
-/// Assert `reply` is the body-level refusal: MSK's sentence for a body it will not accept,
-/// and no member named.
+/// Assert `reply` is the SELECTION refusal: MSK's sentence for a body that names two cluster
+/// types, HTTP 400 `BadRequestException`, and no member named.
 pub(crate) fn assert_one_cluster_type(reply: &Reply, case: &str) {
     assert_eq!(
         (reply.status, reply.error_code(), reply.error_message()),
-        (400, "BadRequestException", INVALID_REQUEST_BODY_MESSAGE),
-        "case {case}: expected a 400 BadRequestException {INVALID_REQUEST_BODY_MESSAGE:?}, got \
-         {} {}",
+        (400, "BadRequestException", ONE_CLUSTER_TYPE_MESSAGE),
+        "case {case}: expected a 400 BadRequestException {ONE_CLUSTER_TYPE_MESSAGE:?}, got {} {}",
         reply.status,
         reply.body
     );
@@ -198,7 +218,7 @@ async fn a_body_naming_both_cluster_types_is_refused_on_the_selection() {
         reply.body
     );
     assert_ne!(
-        NO_CLUSTER_TYPE_MESSAGE, INVALID_REQUEST_BODY_MESSAGE,
+        NO_CLUSTER_TYPE_MESSAGE, ONE_CLUSTER_TYPE_MESSAGE,
         "the two ways of getting the cluster type wrong must read different sentences"
     );
 

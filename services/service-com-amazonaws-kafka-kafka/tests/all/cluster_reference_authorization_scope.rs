@@ -415,26 +415,32 @@ async fn a_value_that_is_no_arn_is_decided_over_itself_or_left_to_the_operation(
 
 /// The ARNs of ANOTHER resource kind the readings below are driven over, built around
 /// the live configuration `configuration` this endpoint really holds: other kinds of
-/// this service's own resources, and another vendor's.
-fn arns_of_another_kind(configuration: &str) -> Vec<(&'static str, String)> {
+/// this service's own resources, and another vendor's. Each row says whether the value is
+/// an ARN of THIS service, which is what decides which of the operation's own refusals a
+/// cluster READER answers it with.
+fn arns_of_another_kind(configuration: &str) -> Vec<(&'static str, String, bool)> {
     vec![
         (
             "a configuration this endpoint holds",
             configuration.to_string(),
+            true,
         ),
         (
             "a configuration never minted",
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/never-minted/{GHOST_ID}"),
+            true,
         ),
         (
             "a replicator of this service",
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:replicator/a-replicator/{GHOST_ID}"),
+            true,
         ),
         (
             "a VPC connection of this service",
             format!(
                 "arn:aws:kafka:{REGION}:{ACCOUNT}:vpc-connection/{ACCOUNT}/a-cluster/{GHOST_ID}"
             ),
+            true,
         ),
         (
             "a cluster-operation of this service",
@@ -442,13 +448,22 @@ fn arns_of_another_kind(configuration: &str) -> Vec<(&'static str, String)> {
                 "arn:aws:kafka:{REGION}:{ACCOUNT}:cluster-operation/a-cluster/{GHOST_ID}/\
                  99999999-8888-4777-8666-555555555555"
             ),
+            true,
         ),
         (
             "another vendor's resource",
             format!("arn:aws:ec2:{REGION}:{ACCOUNT}:instance/i-0a1b2c3d"),
+            false,
         ),
     ]
 }
+
+/// The operations that READ one cluster — the two describes and the bootstrap-broker reader.
+/// They RESOLVE the cluster reference they are handed rather than parsing it as the one kind
+/// they report, so an ARN of this service naming another resource type is a cluster they hold
+/// nothing for (404 `NotFoundException`) where every other cluster-scoped call answers the
+/// parameter refusal (400 `BadRequestException`).
+const CLUSTER_READERS: [&str; 3] = ["DescribeCluster", "DescribeClusterV2", "GetBootstrapBrokers"];
 
 /// RULE (reading 3): an ARN naming a resource of another KIND is no cluster
 /// reference, so the gate decides nothing about it and the operation answers —
@@ -465,15 +480,23 @@ async fn an_arn_of_another_resource_kind_is_never_the_gates_answer() {
         )
         .await;
 
-    for (value_case, value) in arns_of_another_kind(&configuration) {
+    for (value_case, value, is_an_arn_of_this_service) in arns_of_another_kind(&configuration) {
         for call in calls() {
             let case = format!("{} / {value_case}", call.case);
             let reply = call.make(&emulator, &value).await;
+            // The operation's OWN refusal: a cluster reader resolves any ARN of this
+            // service, so one naming another resource type is a cluster it holds nothing
+            // for; every other call parses the value as the cluster ARN it reports.
+            let expected = if CLUSTER_READERS.contains(&call.case) && is_an_arn_of_this_service {
+                (404, "NotFoundException")
+            } else {
+                (400, "BadRequestException")
+            };
             assert_eq!(
                 (reply.status, reply.error_code()),
-                (400, "BadRequestException"),
+                expected,
                 "case {case:?}: an ARN of another resource kind is no reference the gate decides \
-                 over, so the operation answers the parameter, got {} {}",
+                 over, so the operation answers it itself, got {} {}",
                 reply.status,
                 reply.body
             );
@@ -531,7 +554,7 @@ async fn the_cluster_delete_refuses_an_arn_of_another_kind_as_a_parameter() {
         (Some("not-a-version"), "currentVersion"),
     ];
 
-    for (value_case, value) in arns_of_another_kind(&configuration) {
+    for (value_case, value, _) in arns_of_another_kind(&configuration) {
         for (version, blamed) in probes {
             let case = format!("{value_case} / currentVersion={version:?}");
             let uri = match version {

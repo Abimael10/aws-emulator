@@ -180,11 +180,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // A `ResourceArn` this service cannot accept as the ARN of a resource it
         // TAGS is the caller's own input to fix, in the service's fixed sentence
-        // for one ([`crate::state::invalid_tag_resource_arn`]): unparseable, not
-        // shaped like the kind it names, or naming a kind no API of this service
-        // gives a `Tags` member. A well-formed ARN of a taggable kind that names
-        // nothing this region holds is the different, modelled miss — a resource
-        // that may yet appear.
+        // for one ([`crate::state::invalid_tag_resource_arn`]), which says WHY
+        // the reference could not be read: a value that is not an ARN at all
+        // failed on its syntax
+        // ([`crate::state::invalid_tag_resource_arn_syntax`]), while a well-formed
+        // ARN that is not shaped like the kind it names, or that names a kind no
+        // API of this service gives a `Tags` member, is refused as the reference
+        // it is. A well-formed ARN of a taggable kind that names nothing this
+        // region holds is the different, modelled miss — a resource that may yet
+        // appear.
         let tags = match state.resource_tags_mut_in(
             &region,
             &input.resource_arn,
@@ -192,6 +196,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             Ok(tags) => tags,
             Err(crate::state::TagTargetRejected::NotAnArn) => {
+                return Err(TagResourceErrorModeled::BadRequestException(
+                    crate::state::invalid_tag_resource_arn_syntax(),
+                )
+                .into());
+            }
+            Err(crate::state::TagTargetRejected::NotATaggableResource) => {
                 return Err(TagResourceErrorModeled::BadRequestException(
                     crate::state::invalid_tag_resource_arn(),
                 )

@@ -39,6 +39,13 @@
 //! value that is no ARN — over the value AS SUBMITTED, there being nothing else it
 //! stands for — which is the third suite below.
 //!
+//! Nor does Rule 2 hold for the three cluster READERS (`DescribeCluster`,
+//! `DescribeClusterV2`, `GetBootstrapBrokers`) handed a well-formed ARN of THIS service
+//! naming another resource type: a reader resolves the reference it is given, so such a
+//! value is a cluster this endpoint holds nothing for — HTTP 404 `NotFoundException` —
+//! while the surfaces that CHANGE a cluster, the delete among them, keep the parameter
+//! refusal.
+//!
 //! Neither does the resolution BEHIND Rule 1 hold for an operation that changes how
 //! clients reach the cluster (`UpdateConnectivity`, `RejectClientVpcConnection`):
 //! that surface is what a cluster's own resource-based policy is attached for, so a
@@ -492,7 +499,10 @@ fn references_naming_no_resource(member: &str) -> Vec<(&'static str, String)> {
 /// than `member` carries: another vendor's resource, another kind of this service's,
 /// and the OTHER kind this suite's two members carry. None of them is a reference of
 /// the operation's own kind, so the authorization gate decides nothing about them.
-fn arns_of_another_kind(member: &str) -> Vec<(&'static str, String)> {
+/// Each row says whether the value is an ARN of THIS service, which is what decides
+/// which of its own refusals a cluster READER answers it with
+/// ([`CLUSTER_READERS`]).
+fn arns_of_another_kind(member: &str) -> Vec<(&'static str, String, bool)> {
     let other_kind = if member == CLUSTER_OPERATION_ARN_MEMBER {
         format!(
             "arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/a-cluster/\
@@ -508,6 +518,7 @@ fn arns_of_another_kind(member: &str) -> Vec<(&'static str, String)> {
         (
             "another-service-namespace",
             format!("arn:aws:ec2:{REGION}:{ACCOUNT}:instance/i-0a1b2c3d"),
+            false,
         ),
         (
             "another-resource-kind-of-this-service",
@@ -515,9 +526,46 @@ fn arns_of_another_kind(member: &str) -> Vec<(&'static str, String)> {
                 "arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/a-configuration/\
                  11111111-2222-4333-8444-555555555555-1"
             ),
+            true,
         ),
-        ("the-other-kind-this-suite-drives", other_kind),
+        ("the-other-kind-this-suite-drives", other_kind, true),
     ]
+}
+
+/// The operations that READ one cluster. They RESOLVE the cluster reference they are handed
+/// rather than parsing it as the one kind they report, so an ARN of this service naming
+/// another resource type is a cluster this endpoint holds nothing for — HTTP 404
+/// `NotFoundException` with the service's fixed not-found sentence — where every other
+/// cluster-scoped call answers the parameter refusal of Rule 2. Which of the two a surface
+/// answers is the operation's own: the cluster DELETE keeps the parameter refusal.
+const CLUSTER_READERS: [&str; 3] = ["DescribeCluster", "DescribeClusterV2", "GetBootstrapBrokers"];
+
+/// The service's one not-found sentence (the apostrophe is U+2019, as it writes it), written
+/// out here rather than imported so this suite pins the wording.
+const RESOURCE_NOT_FOUND_MESSAGE: &str = "The requested resource doesn\u{2019}t exist.";
+
+/// Assert `reply` is a cluster reader's not-found refusal: HTTP 404 `NotFoundException`, that
+/// fixed sentence as the WHOLE message, `member` as the parameter at fault, and nothing of the
+/// submitted value in the text.
+fn assert_cluster_not_found(reply: &Reply, case: &str, member: &str, submitted: &str) {
+    assert_eq!(
+        (reply.status, reply.error_code(), reply.error_message()),
+        (404, "NotFoundException", RESOURCE_NOT_FOUND_MESSAGE),
+        "case {case}: expected the not-found refusal, got {} {}",
+        reply.status,
+        reply.body
+    );
+    assert_eq!(
+        reply.at("/invalidParameter").as_str(),
+        Some(member),
+        "case {case}: expected the refusal to name {member}, got {}",
+        reply.body
+    );
+    assert!(
+        !reply.error_message().contains(submitted),
+        "case {case}: the refusal must not echo the submitted value, got {:?}",
+        reply.error_message()
+    );
 }
 
 /// The sentence a request that reaches no grant is refused with: fixed connectives
@@ -740,7 +788,10 @@ async fn an_arn_that_names_no_cluster_is_refused_by_authorization_not_as_a_param
 /// KIND than the operation's target is no reference of that kind at all, so no
 /// permission scoped to it is ever matched against the value and the gate decides
 /// nothing — the operation answers the reference it cannot use, never with the
-/// authorization refusal. Driven over every operation this suite carries, crossed
+/// authorization refusal. WHICH of its own refusals it answers is the operation's: a
+/// cluster READER resolves any ARN of this service, so one of another resource type is a
+/// cluster it holds nothing for, while every other call parses the value as the kind its
+/// member carries. Driven over every operation this suite carries, crossed
 /// with every kind of ARN that is not its own.
 #[tokio::test]
 async fn an_arn_of_another_resource_kind_is_left_to_the_operation() {
@@ -752,21 +803,26 @@ async fn an_arn_of_another_resource_kind_is_left_to_the_operation() {
     sleep_past_activation();
 
     for operation in operations() {
-        for (case, value) in arns_of_another_kind(operation.member) {
+        for (case, value, is_an_arn_of_this_service) in arns_of_another_kind(operation.member) {
             let reply = emulator
                 .call(operation.method, &operation.uri(&value), operation.body())
                 .await;
             let case = format!("{case}/{}", operation.name);
-            // The operation's own refusal for a reference it cannot read — the same
-            // one Rule 2 gives a value that is no ARN, since neither names a
-            // resource of the kind the member carries.
-            assert_unparsable_arn(
-                &reply,
-                &case,
-                operation.member,
-                operation.message,
-                &value,
-            );
+            // The operation's own refusal for a reference it cannot use — for most of them
+            // the same one Rule 2 gives a value that is no ARN, since neither names a
+            // resource of the kind the member carries, and for a cluster reader handed an
+            // ARN of this service the cluster it resolves nothing for.
+            if CLUSTER_READERS.contains(&operation.name) && is_an_arn_of_this_service {
+                assert_cluster_not_found(&reply, &case, operation.member, &value);
+            } else {
+                assert_unparsable_arn(
+                    &reply,
+                    &case,
+                    operation.member,
+                    operation.message,
+                    &value,
+                );
+            }
             assert!(
                 !reply.error_message().contains("is not authorized to perform"),
                 "case {case}: the operation's own refusal carries no authorization sentence, got \

@@ -158,13 +158,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             std::time::SystemTime::now(),
         ) {
             Ok(tags) => tags,
-            // A value this service cannot accept as the ARN of a resource it
-            // TAGS — unparseable, not shaped like the kind it names, or naming a
-            // kind no API of this service gives a `Tags` member — is the
-            // caller's own input to fix, in the service's one fixed sentence for
-            // it, which the tag writes answer too: none of the three composes a
-            // sentence of its own around the value it was handed.
+            // A `ResourceArn` this service cannot act on is the caller's own input
+            // to fix, in the service's fixed sentence for it — the same one the
+            // tag writes answer, so none of the three composes a sentence of its
+            // own around the value it was handed. The sentence says WHY the
+            // reference could not be read: a value that is not an ARN at all
+            // failed on its syntax, while a well-formed ARN of a kind no API of
+            // this service gives a `Tags` member is refused as the reference it is.
             Err(crate::state::TagTargetRejected::NotAnArn) => {
+                return Err(ListTagsForResourceErrorModeled::BadRequestException(
+                    crate::state::invalid_tag_resource_arn_syntax(),
+                )
+                .into());
+            }
+            Err(crate::state::TagTargetRejected::NotATaggableResource) => {
                 return Err(ListTagsForResourceErrorModeled::BadRequestException(
                     crate::state::invalid_tag_resource_arn(),
                 )

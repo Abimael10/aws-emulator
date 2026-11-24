@@ -175,10 +175,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let region = crate::state::request_region(ctx.parts());
-        // A value that is not an MSK cluster ARN at all is a request this service
-        // cannot parse (400) — a different answer from a well-formed ARN that no
-        // cluster of this region holds (404 below).
-        if !crate::state::is_cluster_arn(&input.cluster_arn) {
+        // A reader RESOLVES the cluster reference it is handed, so every MSK
+        // resource ARN is one: an ARN naming another resource type names no
+        // cluster of this region (404 below), and only a value that is no MSK
+        // resource ARN at all is a request this service cannot parse (400).
+        if !crate::state::is_kafka_resource_arn(&input.cluster_arn) {
             return Err(DescribeClusterV2ErrorModeled::BadRequestException(
                 crate::state::malformed_arn(crate::state::CLUSTER_ARN_MEMBER),
             )

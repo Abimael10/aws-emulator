@@ -63,13 +63,18 @@ use crate::kafka_harness::{
 /// asserted so the three operations cannot drift apart from each other.
 const NOT_FOUND_MESSAGE: &str = "Resource was not found";
 
-/// The text the tagging operations answer a `ResourceArn` they cannot accept as
-/// the ARN of a taggable MSK resource with. RECORDED behaviour, mirroring
+/// The text the tagging operations answer a well-formed `ResourceArn` they cannot
+/// accept as the ARN of a taggable MSK resource with. RECORDED behaviour, mirroring
 /// `state::INVALID_TAG_RESOURCE_ARN_MESSAGE`: fixed end to end, so no part of
 /// the refused value is echoed back into it. Written out here rather than
 /// imported, so the form is pinned by the suite instead of by the code under
 /// test.
 const INVALID_RESOURCE_ARN_MESSAGE: &str = "Invalid input resource arn";
+
+/// And the text they answer a `ResourceArn` that is not an ARN AT ALL with: the same sentence
+/// plus the reason such a value could not be read, which is its syntax. RECORDED behaviour
+/// too, and fixed end to end — the refused value is not echoed into it either.
+const INVALID_RESOURCE_ARN_SYNTAX_MESSAGE: &str = "Invalid input resource arn: bad syntax";
 
 /// The shared harness plus the calls this suite's rule needs: the three tagging
 /// operations and the creates that seed a resource to tag. Everything else —
@@ -769,8 +774,11 @@ async fn an_arn_naming_no_resource_is_not_found() {
 }
 
 /// RULE: a `ResourceArn` this service cannot accept as the ARN of a resource it
-/// TAGS is a 400 `BadRequestException` carrying one fixed sentence — the request
-/// the caller has to fix, as distinct from the resource it cannot find.
+/// TAGS is a 400 `BadRequestException` carrying a fixed sentence — the request
+/// the caller has to fix, as distinct from the resource it cannot find — and that
+/// sentence says WHY the reference could not be read: a value that is not an ARN
+/// at all failed on its syntax, while a well-formed ARN of a kind the surface
+/// cannot act on is refused as the reference it is.
 #[tokio::test]
 async fn a_value_that_is_not_a_taggable_msk_resource_arn_is_a_bad_request() {
     // The rows differ along HOW the value fails to be the ARN of a taggable MSK
@@ -780,16 +788,27 @@ async fn a_value_that_is_not_a_taggable_msk_resource_arn_is_a_bad_request() {
     // well-formed ARN of a kind no API of this service gives a `Tags` member
     // (`Configuration` and `ClusterOperationInfo` model none:
     // `smithy_query(query="shape",shape="Configuration")`), which is the same
-    // refusal whether or not that resource exists.
-    let rows: Vec<(&str, String)> = vec![
-        ("not-an-arn", "not-an-arn-at-all".to_string()),
-        ("bare-word", "cluster".to_string()),
+    // refusal whether or not that resource exists. Each row carries the sentence
+    // its class earns: a value carrying no ARN at all is the one refused on its
+    // syntax.
+    let rows: Vec<(&str, String, &str)> = vec![
+        (
+            "not-an-arn",
+            "not-an-arn-at-all".to_string(),
+            INVALID_RESOURCE_ARN_SYNTAX_MESSAGE,
+        ),
+        (
+            "bare-word",
+            "cluster".to_string(),
+            INVALID_RESOURCE_ARN_SYNTAX_MESSAGE,
+        ),
         (
             "configuration",
             format!(
                 "arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/absent/\
                  22222222-2222-2222-2222-222222222222-2"
             ),
+            INVALID_RESOURCE_ARN_MESSAGE,
         ),
         (
             "cluster-operation",
@@ -797,55 +816,66 @@ async fn a_value_that_is_not_a_taggable_msk_resource_arn_is_a_bad_request() {
                 "arn:aws:kafka:{REGION}:{ACCOUNT}:cluster-operation/absent/\
                  55555555-5555-5555-5555-555555555555-5"
             ),
+            INVALID_RESOURCE_ARN_MESSAGE,
         ),
         (
             "too-few-fields",
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}"),
+            INVALID_RESOURCE_ARN_SYNTAX_MESSAGE,
         ),
         (
             "another-service",
             format!("arn:aws:sqs:{REGION}:{ACCOUNT}:queue/absent/1"),
+            INVALID_RESOURCE_ARN_MESSAGE,
         ),
         (
             "empty-partition",
             format!("arn::kafka:{REGION}:{ACCOUNT}:cluster/absent/1"),
+            INVALID_RESOURCE_ARN_SYNTAX_MESSAGE,
         ),
         (
             "empty-region",
             format!("arn:aws:kafka::{ACCOUNT}:cluster/absent/1"),
+            INVALID_RESOURCE_ARN_MESSAGE,
         ),
         (
             "empty-account",
             format!("arn:aws:kafka:{REGION}::cluster/absent/1"),
+            INVALID_RESOURCE_ARN_MESSAGE,
         ),
         (
             "no-resource-type",
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:/absent/1"),
+            INVALID_RESOURCE_ARN_MESSAGE,
         ),
         (
             "no-resource-id",
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster"),
+            INVALID_RESOURCE_ARN_MESSAGE,
         ),
         (
             "empty-resource-id",
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/"),
+            INVALID_RESOURCE_ARN_MESSAGE,
         ),
         (
             "cluster-without-id-segment",
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/only-a-name"),
+            INVALID_RESOURCE_ARN_MESSAGE,
         ),
         (
             "cluster-with-extra-segment",
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/name/id/extra"),
+            INVALID_RESOURCE_ARN_MESSAGE,
         ),
     ];
 
     let emulator = Tagging::new();
-    for (case, arn) in &rows {
+    for (case, arn, expected) in &rows {
         let tagged = emulator.tag(arn, &[("env", "prod")]).await;
         assert_eq!(
             (tagged.status, tagged.error_code(), message(&tagged)),
-            (400, "BadRequestException", INVALID_RESOURCE_ARN_MESSAGE),
+            (400, "BadRequestException", *expected),
             "case {case} ({arn:?}): expected TagResource to answer 400 BadRequestException, got {} {}",
             tagged.status,
             tagged.body
@@ -858,7 +888,7 @@ async fn a_value_that_is_not_a_taggable_msk_resource_arn_is_a_bad_request() {
         let removed = emulator.untag(arn, &["env"]).await;
         assert_eq!(
             (removed.status, removed.error_code(), message(&removed)),
-            (400, "BadRequestException", INVALID_RESOURCE_ARN_MESSAGE),
+            (400, "BadRequestException", *expected),
             "case {case} ({arn:?}): expected UntagResource to answer 400 BadRequestException, got {} {}",
             removed.status,
             removed.body
@@ -866,7 +896,7 @@ async fn a_value_that_is_not_a_taggable_msk_resource_arn_is_a_bad_request() {
         let listed = emulator.list_tags(arn).await;
         assert_eq!(
             (listed.status, listed.error_code(), message(&listed)),
-            (400, "BadRequestException", INVALID_RESOURCE_ARN_MESSAGE),
+            (400, "BadRequestException", *expected),
             "case {case} ({arn:?}): expected ListTagsForResource to answer 400 BadRequestException, got {} {}",
             listed.status,
             listed.body

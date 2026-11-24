@@ -517,8 +517,8 @@ impl ComAmazonawsKafkaKafkaState {
             // Unreachable: `resource_type_of_arn` admits only the kinds this
             // service tags, each of which has an arm above. A kind it does not
             // tag never reaches here — it is the input refusal
-            // ([`TagTargetRejected::NotAnArn`]) — so this arm is a backstop
-            // rather than an answer anybody can be given.
+            // ([`TagTargetRejected::NotATaggableResource`]) — so this arm is a
+            // backstop rather than an answer anybody can be given.
             _ => Err(TagTargetRejected::NoSuchResource),
         }
     }

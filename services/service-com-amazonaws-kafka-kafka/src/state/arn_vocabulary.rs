@@ -29,19 +29,24 @@ pub fn kafka_resource_arn_parts(value: &str) -> Option<(&str, &str)> {
 /// The resource type `value` names, for an operation that takes any MSK resource
 /// ARN — provided it is a type this service TAGS.
 ///
-/// Three things are one answer here ([`TagTargetRejected::NotAnArn`]): a value
-/// that is not an ARN of this service, one whose type this service mints in a
-/// shape `value` does not have, and one naming a kind of resource the tagging
-/// surface does not serve. The last is the rule's point: a resource of this
-/// service carries tags only where the API gives it a `Tags` member
-/// ([`TAGGABLE_RESOURCE_TYPES`]), and a configuration or a cluster operation has
-/// none — so such an ARN is a `ResourceArn` the service cannot act on rather
-/// than a resource that might appear later. The shape check goes through the
-/// same `is_*_arn` predicate the readers of that resource type use, so one value
-/// is never a bad request to one operation and a miss to another.
+/// Three things fail here, and they are told apart by WHY: a value that is not an
+/// ARN at all ([`TagTargetRejected::NotAnArn`]), and — as one answer
+/// ([`TagTargetRejected::NotATaggableResource`]) — a well-formed ARN that is not
+/// one of this service's, one whose type this service mints in a shape `value`
+/// does not have, and one naming a kind of resource the tagging surface does not
+/// serve. The last is the rule's point: a resource of this service carries tags
+/// only where the API gives it a `Tags` member ([`TAGGABLE_RESOURCE_TYPES`]), and
+/// a configuration or a cluster operation has none — so such an ARN is a
+/// `ResourceArn` the service cannot act on rather than a resource that might
+/// appear later. The shape check goes through the same `is_*_arn` predicate the
+/// readers of that resource type use, so one value is never a bad request to one
+/// operation and a miss to another.
 pub(super) fn resource_type_of_arn(value: &str) -> Result<&str, TagTargetRejected> {
-    let Some((resource_type, _)) = kafka_resource_arn_parts(value) else {
+    if !is_arn(value) {
         return Err(TagTargetRejected::NotAnArn);
+    }
+    let Some((resource_type, _)) = kafka_resource_arn_parts(value) else {
+        return Err(TagTargetRejected::NotATaggableResource);
     };
     let shaped = match resource_type {
         CLUSTER_RESOURCE_TYPE => is_cluster_arn(value),
@@ -50,13 +55,31 @@ pub(super) fn resource_type_of_arn(value: &str) -> Result<&str, TagTargetRejecte
         VPC_CONNECTION_RESOURCE_TYPE => is_vpc_connection_arn(value),
         // Every other resource type this service mints, taggable by no API of
         // it.
-        _ => return Err(TagTargetRejected::NotAnArn),
+        _ => return Err(TagTargetRejected::NotATaggableResource),
     };
     if shaped {
         Ok(resource_type)
     } else {
-        Err(TagTargetRejected::NotAnArn)
+        Err(TagTargetRejected::NotATaggableResource)
     }
+}
+
+/// Whether `value` is an ARN AT ALL — the six colon-separated fields every AWS
+/// ARN carries, `arn:<partition>:<service>:<region>:<account>:<resource>`, with a
+/// partition, a service namespace and a resource named.
+///
+/// The region and the account fields may be EMPTY, because AWS publishes ARNs
+/// that leave them so (a global service's resource, a bucket), while a value
+/// naming no partition, no service or no resource references nothing at all. Says
+/// nothing about WHOSE resource the ARN is or whether it exists: that is what the
+/// predicates over this service's own ARNs are for, and [`arn_resource_of`] is
+/// stricter for exactly that reason — every ARN THIS service mints names a region
+/// and an account. Both read the fields through [`arn_fields`], so the two cannot
+/// disagree about where an ARN's fields are.
+pub fn is_arn(value: &str) -> bool {
+    arn_fields(value).is_some_and(|arn| {
+        !arn.partition.is_empty() && !arn.vendor.is_empty() && !arn.resource.is_empty()
+    })
 }
 
 /// The resource types of this service that carry tags — the ones whose API gives
@@ -70,6 +93,22 @@ pub const TAGGABLE_RESOURCE_TYPES: [&str; 4] = [
     REPLICATOR_RESOURCE_TYPE,
     VPC_CONNECTION_RESOURCE_TYPE,
 ];
+
+/// Whether `value` is an ARN of a resource of THIS service at all — any resource
+/// type it names, in any partition, region and account.
+///
+/// The gate of the cluster READ surface, which resolves the reference it is handed
+/// rather than parsing it as the one kind it reports: an operation that answers
+/// `NotFoundException` for a cluster reference that resolves to nothing treats
+/// every MSK resource ARN as such a reference, so an ARN of another resource type
+/// is a cluster that does not exist rather than a parameter the caller mistyped,
+/// and only a value that is no MSK resource ARN at all earns [`malformed_arn`].
+/// The surfaces that CHANGE a cluster keep the stricter [`is_cluster_arn`]: what
+/// each answers for an ARN of another type is the operation's own, and the two
+/// classes are recorded separately.
+pub fn is_kafka_resource_arn(value: &str) -> bool {
+    kafka_resource_arn_parts(value).is_some()
+}
 
 /// Whether `value` is shaped like an MSK cluster ARN —
 /// `arn:<partition>:kafka:<region>:<account>:cluster/<name>/<id>`.
@@ -449,17 +488,36 @@ pub(super) fn kafka_arn_resource(value: &str) -> Option<&str> {
 /// The resource part of `value` when it is an ARN of `vendor` in some partition,
 /// region and account, and `None` otherwise.
 ///
-/// The ONE ARN split of this module, shared by the predicates over this
-/// service's own ARNs and by the one over the Secrets Manager secret ARNs a
-/// member of this API carries, so they cannot disagree about the five fields in
-/// front of the resource. `splitn` with the field count leaves the whole
-/// resource — colons included — as the last field, so an ARN of the
-/// `<type>:<id>` form splits exactly like one of the `<type>/<id>` form, and the
-/// vendor comparison is exact because an ARN namespace is a fixed lowercase
-/// token.
+/// The ONE reading of an ARN's fields for the predicates over this service's own
+/// ARNs and for the one over the Secrets Manager secret ARNs a member of this API
+/// carries ([`arn_fields`]), so they cannot disagree about the five fields in
+/// front of the resource. Stricter than [`is_arn`]: a resource of a REGIONAL
+/// service belongs to one region of one account, and every ARN this service mints
+/// or reads as its own names both, so a value leaving either empty names no
+/// resource here. The vendor comparison is exact because an ARN namespace is a
+/// fixed lowercase token.
 pub(super) fn arn_resource_of<'a>(value: &'a str, vendor: &str) -> Option<&'a str> {
+    let arn = arn_fields(value)?;
+    (arn.vendor == vendor
+        && !arn.partition.is_empty()
+        && !arn.region.is_empty()
+        && !arn.account.is_empty())
+    .then_some(arn.resource)
+}
+
+/// The six fields of `value` read as an ARN — `arn`, then the partition, the
+/// service namespace, the region, the account and the whole resource — or `None`
+/// when `value` does not have them.
+///
+/// The one ARN split of this module, borrowed from `value` so a predicate on the
+/// hot path of every reader allocates nothing. `splitn` with the field count
+/// leaves the whole resource — colons included — as the last field, so an ARN of
+/// the `<type>:<id>` form splits exactly like one of the `<type>/<id>` form. What
+/// a field is allowed to SAY is the caller's: this reports the fields and judges
+/// none of them.
+fn arn_fields(value: &str) -> Option<ArnFields<'_>> {
     let mut fields = value.splitn(6, ':');
-    let (Some("arn"), Some(partition), Some(found), Some(region), Some(account), Some(resource)) = (
+    let (Some("arn"), Some(partition), Some(vendor), Some(region), Some(account), Some(resource)) = (
         fields.next(),
         fields.next(),
         fields.next(),
@@ -469,8 +527,20 @@ pub(super) fn arn_resource_of<'a>(value: &'a str, vendor: &str) -> Option<&'a st
     ) else {
         return None;
     };
-    if found != vendor || partition.is_empty() || region.is_empty() || account.is_empty() {
-        return None;
-    }
-    Some(resource)
+    Some(ArnFields {
+        partition,
+        vendor,
+        region,
+        account,
+        resource,
+    })
+}
+
+/// The fields [`arn_fields`] reads out of an ARN, borrowed from it.
+struct ArnFields<'a> {
+    partition: &'a str,
+    vendor: &'a str,
+    region: &'a str,
+    account: &'a str,
+    resource: &'a str,
 }

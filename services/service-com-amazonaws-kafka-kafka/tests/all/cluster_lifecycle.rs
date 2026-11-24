@@ -1087,66 +1087,77 @@ async fn a_cluster_is_only_visible_in_its_own_region() {
     );
 }
 
-/// RULE: a reader that models both errors separates a well-formed `ClusterArn` no
-/// live cluster holds (`NotFoundException`, 404) from a cluster REFERENCE that
+/// RULE: a reader that models both errors separates a reference it resolves to no
+/// live cluster (`NotFoundException`, 404) from a cluster REFERENCE that
 /// identifies no cluster, which is refused earlier still, by authorization
 /// (`AccessDeniedException`, 403), since it resolves to no resource a permission
 /// could be scoped to. `GetBootstrapBrokers`, which models no
 /// `NotFoundException`, answers the same code and status as the readers for the
 /// same reference; the DELETE, whose action no cluster policy governs, keeps the
-/// parameter refusal for a value that is no ARN at all.
+/// parameter refusal for a value that is no ARN at all — and for an ARN of this
+/// service naming another resource type, which the readers resolve to no cluster
+/// instead.
 #[tokio::test]
 async fn an_unknown_or_malformed_cluster_arn_is_refused() {
     let emulator = Emulator::new();
     emulator.create_ok(&ClusterRequest::named("present")).await;
 
-    // `(arn, expected status, expected error code)` for DescribeCluster and
-    // DeleteCluster. Rows: well-formed but absent (two regions), then an ARN naming
-    // a resource of another KIND — wrong service, wrong resource type — which is no
-    // cluster reference at all and so keeps each operation's own parameter refusal,
-    // and two cluster REFERENCES that identify no cluster — an extra resource
-    // segment, and an empty region — which authorization refuses. A value that is
-    // not an ARN at all is answered differently by the two operations and is
-    // asserted after the table.
-    let rows: Vec<(String, u16, &str)> = vec![
-        (
-            format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/absent/11111111-2222-4333-8444-555555555555-1"),
-            404,
-            "NotFoundException",
-        ),
-        (
-            format!("arn:aws:kafka:us-east-1:{ACCOUNT}:cluster/present/11111111-2222-4333-8444-555555555555-1"),
-            404,
-            "NotFoundException",
-        ),
-        (
-            format!("arn:aws:s3:{REGION}:{ACCOUNT}:cluster/present/abc-1"),
-            400,
-            "BadRequestException",
-        ),
-        (
-            format!("arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/present/abc"),
-            400,
-            "BadRequestException",
-        ),
-        (
-            format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/present/abc/extra"),
-            403,
-            "AccessDeniedException",
-        ),
-        (
-            format!("arn:aws:kafka::{ACCOUNT}:cluster/present/abc-1"),
-            403,
-            "AccessDeniedException",
-        ),
+    // `(arn, what the two READERS answer, what the DELETE answers)`. Rows:
+    // well-formed but absent (two regions), then an ARN naming a resource of another
+    // KIND — wrong service, wrong resource type — which is no cluster reference at
+    // all, so the delete keeps its parameter refusal while a reader resolves any ARN
+    // of THIS service to the cluster it holds nothing for, and two cluster
+    // REFERENCES that identify no cluster — an extra resource segment, and an empty
+    // region — which authorization refuses. A value that is not an ARN at all is
+    // answered differently by the two operations and is asserted after the table.
+    let not_found = (404u16, "NotFoundException");
+    let bad_request = (400u16, "BadRequestException");
+    let denied = (403u16, "AccessDeniedException");
+    /// One row: the reference, what the two READERS answer it, and what the DELETE does.
+    struct Row {
+        arn: String,
+        read: (u16, &'static str),
+        delete: (u16, &'static str),
+    }
+    let rows: Vec<Row> = vec![
+        Row {
+            arn: format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/absent/11111111-2222-4333-8444-555555555555-1"),
+            read: not_found,
+            delete: not_found,
+        },
+        Row {
+            arn: format!("arn:aws:kafka:us-east-1:{ACCOUNT}:cluster/present/11111111-2222-4333-8444-555555555555-1"),
+            read: not_found,
+            delete: not_found,
+        },
+        Row {
+            arn: format!("arn:aws:s3:{REGION}:{ACCOUNT}:cluster/present/abc-1"),
+            read: bad_request,
+            delete: bad_request,
+        },
+        Row {
+            arn: format!("arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/present/abc"),
+            read: not_found,
+            delete: bad_request,
+        },
+        Row {
+            arn: format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/present/abc/extra"),
+            read: denied,
+            delete: denied,
+        },
+        Row {
+            arn: format!("arn:aws:kafka::{ACCOUNT}:cluster/present/abc-1"),
+            read: denied,
+            delete: denied,
+        },
     ];
 
-    for (arn, status, code) in &rows {
+    for Row { arn, read, delete } in &rows {
         let described = emulator.describe(arn).await;
         assert_eq!(
             (described.status, described.error_code()),
-            (*status, *code),
-            "case arn={arn:?}: expected {status} {code} from DescribeCluster, got {} {}",
+            *read,
+            "case arn={arn:?}: expected {read:?} from DescribeCluster, got {} {}",
             described.status,
             described.body
         );
@@ -1155,20 +1166,20 @@ async fn an_unknown_or_malformed_cluster_arn_is_refused() {
             .await;
         assert_eq!(
             (deleted.status, deleted.error_code()),
-            (*status, *code),
-            "case arn={arn:?}: expected {status} {code} from DeleteCluster, got {} {}",
+            *delete,
+            "case arn={arn:?}: expected {delete:?} from DeleteCluster, got {} {}",
             deleted.status,
             deleted.body
         );
         // `GetBootstrapBrokers` models no `NotFoundException`, yet the service
-        // answers the same code and status for the same reference: an absent
-        // cluster is the not-found, and an ARN naming no cluster the authorization
-        // refusal.
+        // answers the same code and status as the other reader for the same
+        // reference: one it resolves to nothing is the not-found, and an ARN naming
+        // no cluster at all the authorization refusal.
         let brokers = emulator.bootstrap_brokers(arn).await;
         assert_eq!(
             (brokers.status, brokers.error_code()),
-            (*status, *code),
-            "case arn={arn:?}: expected {status} {code} from GetBootstrapBrokers, got {} {}",
+            *read,
+            "case arn={arn:?}: expected {read:?} from GetBootstrapBrokers, got {} {}",
             brokers.status,
             brokers.body
         );
