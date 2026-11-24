@@ -207,6 +207,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut guard = state.lock();
 
+        // The NAME the request states, judged against the form of the kind of domain it is
+        // about before the pair is resolved: a request carrying a `CustomDomainConfig` is
+        // about a custom domain, whose name is "the fully-qualified domain name, such as
+        // auth.example.com" (`UpdateUserPoolDomain.Domain`), and one carrying none is about a
+        // prefix domain, whose name is the prefix alone. The model's pattern states the prefix
+        // form alone, so this member is not decided by the constraint walk for this operation
+        // (`crate::service`'s `served_despite`).
+        if let Some(defect) = crate::state::domain_name_form_defect(
+            &input.domain,
+            input.custom_domain_config.is_some(),
+        ) {
+            return Err(invalid_parameter(defect));
+        }
+
         // This operation addresses the domain by the PAIR `UserPoolId` +
         // `Domain` (`UserPoolId` is **required** here), and the pair is
         // resolved as a unit: a pool that is not stored holds no domain,

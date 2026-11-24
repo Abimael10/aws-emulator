@@ -634,7 +634,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RespondToAuthChal
             {
                 let presented = responses
                     .get(code_entry)
-                    .ok_or_else(|| missing_challenge_response(code_entry, &session.challenge_name))?
+                    .ok_or_else(|| missing_parameter(code_entry))?
                     .clone();
                 // The user the session names may have been disabled, reset or deleted since
                 // the challenge was started, so the sign-in is refused on the stored user's
@@ -698,12 +698,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RespondToAuthChal
             if session.challenge_name == crate::state::SELECT_MFA_TYPE_CHALLENGE {
                 let answer = responses
                     .get(crate::state::ANSWER_RESPONSE)
-                    .ok_or_else(|| {
-                        missing_challenge_response(
-                            crate::state::ANSWER_RESPONSE,
-                            &session.challenge_name,
-                        )
-                    })?;
+                    .ok_or_else(|| missing_parameter(crate::state::ANSWER_RESPONSE))?;
                 let chosen = crate::state::mfa_setting_chosen(answer).ok_or_else(|| {
                     invalid_parameter(crate::state::chosen_factor_refusal_message())
                 })?;
@@ -773,7 +768,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RespondToAuthChal
                 let username = usable_session_user(guard, &session)?;
                 let served = guard
                     .answer_device_srp_auth(&session, &responses)
-                    .map_err(|refusal| device_auth_refused(refusal, &session.challenge_name))?;
+                    .map_err(device_auth_refused)?;
                 let validity = guard
                     .pool(&user_pool_id)
                     .and_then(|pool| pool.clients.get(&input.client_id))
@@ -825,7 +820,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RespondToAuthChal
                 let username = usable_session_user(guard, &session)?;
                 let device_key = guard
                     .answer_device_password_verifier(&session_token, &session, &responses, now)
-                    .map_err(|refusal| device_auth_refused(refusal, &session.challenge_name))?;
+                    .map_err(device_auth_refused)?;
                 // The device proved it holds its device password, so the
                 // challenge is answered and its session is spent: the same claim
                 // cannot complete a second sign-in.
@@ -1278,12 +1273,9 @@ fn not_authorized(message: &str) -> RespondToAuthChallengeError {
 /// — and it carries no `AuthenticationResult`, since nothing was authenticated.
 fn device_auth_refused(
     refusal: crate::state::DeviceAuthRefusal,
-    challenge_name: &str,
 ) -> RespondToAuthChallengeError {
     match refusal {
-        crate::state::DeviceAuthRefusal::MissingResponse(entry) => {
-            missing_challenge_response(entry, challenge_name)
-        }
+        crate::state::DeviceAuthRefusal::MissingResponse(entry) => missing_parameter(entry),
         crate::state::DeviceAuthRefusal::UnknownDevice => device_not_found(),
         crate::state::DeviceAuthRefusal::ClaimNotVerified => {
             not_authorized(crate::state::INCORRECT_CREDENTIALS_MESSAGE)
@@ -1303,22 +1295,15 @@ fn device_not_found() -> RespondToAuthChallengeError {
     .into()
 }
 
-/// The refusal for an input member this challenge response requires and the request
-/// did not carry.
+/// The refusal for an input member or a `ChallengeResponses` entry this challenge
+/// response requires and the request did not carry.
+///
+/// One sentence for both, because they are one refusal to a caller: fixed text whose
+/// only variable part is the NAME of the parameter the request has to add
+/// ([`crate::state::missing_required_parameter_message`]) — the same sentence
+/// `AdminRespondToAuthChallenge` answers the same absent entry with.
 fn missing_parameter(parameter: &str) -> RespondToAuthChallengeError {
-    invalid_parameter(format!("Missing required parameter {parameter}"))
-}
-
-/// The refusal for a `ChallengeResponses` entry the challenge requires and the
-/// request did not carry.
-fn missing_challenge_response(
-    parameter: &str,
-    challenge_name: &str,
-) -> RespondToAuthChallengeError {
-    invalid_parameter(format!(
-        "Missing required parameter {parameter} in ChallengeResponses for ChallengeName \
-         {challenge_name}"
-    ))
+    invalid_parameter(crate::state::missing_required_parameter_message(parameter))
 }
 
 /// This operation's `InvalidParameterException`, carrying `message`.

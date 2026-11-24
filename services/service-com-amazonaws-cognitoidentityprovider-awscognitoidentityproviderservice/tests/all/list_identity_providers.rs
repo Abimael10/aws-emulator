@@ -420,7 +420,8 @@ async fn a_listing_reports_every_stored_provider_rendered_from_the_stored_provid
             )
             .await;
             assert_eq!(
-                &read["IdentityProvider"], created,
+                read["IdentityProvider"],
+                super::identity_provider_lifecycle::as_read(created),
                 "case {label:?}: the listing changed nothing a later reader of \
                  {provider_name:?} sees, got {read}"
             );

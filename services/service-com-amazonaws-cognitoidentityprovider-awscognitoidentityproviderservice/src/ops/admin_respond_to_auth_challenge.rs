@@ -1137,7 +1137,7 @@ fn not_authorized(message: &str) -> AdminRespondToAuthChallengeError {
 /// The refusal for an input member this challenge response requires and the
 /// request did not carry.
 fn missing_parameter(parameter: &str) -> AdminRespondToAuthChallengeError {
-    invalid_parameter(format!("Missing required parameter {parameter}"))
+    invalid_parameter(crate::state::missing_required_parameter_message(parameter))
 }
 
 /// What a response that does not answer a device-authentication challenge is

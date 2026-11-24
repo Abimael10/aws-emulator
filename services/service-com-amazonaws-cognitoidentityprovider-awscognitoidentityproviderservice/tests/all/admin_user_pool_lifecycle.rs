@@ -1303,11 +1303,7 @@ async fn an_unmodelled_or_unimplemented_value_is_answered_by_its_own_refusal() {
             (
                 400,
                 "InvalidParameterException",
-                format!(
-                    "Missing required parameter REFRESH_TOKEN in AuthParameters for AuthFlow \
-                     {auth_flow}"
-                )
-                .as_str()
+                "Missing required parameter REFRESH_TOKEN"
             ),
             "case {auth_flow:?}: the refresh flow is served, so its own refusal answers a \
              request missing the token, got {payload}"

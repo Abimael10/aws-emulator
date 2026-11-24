@@ -461,6 +461,11 @@ pub(super) fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // `@length(min: 1, max: 32)` (that same model) — the tightest of the three, and one a
         // generated name would otherwise break.
         COGNITO_USER_POOL_IDENTITY_PROVIDER => rules(32, Characters::AsGenerated),
+        // The same service's `CreateUserPoolDomain.Domain`: `DomainType`,
+        // `@length(min: 1, max: 63)` with pattern `^[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?$`
+        // (that same model) — a DNS label, so a generated name has to be reduced to the
+        // lowercase alphanumerics and hyphens it admits as well as fitted to its length.
+        COGNITO_USER_POOL_DOMAIN => rules(63, Characters::LowercaseAlphanumeric),
         // The same service's `CreateResourceServer.Identifier`:
         // `ResourceServerIdentifierType`, `@length(min: 1, max: 256)` with pattern
         // `^[\x21\x23-\x5B\x5D-\x7E]+$` (that same model), which a generated name is already
@@ -1100,6 +1105,13 @@ pub(super) fn declared_name_property(resource_type: &str) -> Option<&'static str
         // the provider is CREATED under and the identifier every cognito-idp call on one
         // takes beside its pool, so it is the physical id.
         COGNITO_USER_POOL_IDENTITY_PROVIDER => Some("ProviderName"),
+        // The same service's `CreateUserPoolDomain` takes a `Domain` — the domain string
+        // `DescribeUserPoolDomain` resolves a pool's domain by, and what "Ref returns" for
+        // the type — so the type publishes `Domain`; the type's last segment is
+        // `UserPoolDomain`, so neither `UserPoolDomainName` nor `Name` finds it. That string
+        // is what the domain is CREATED under and the identifier every call on one takes
+        // beside its pool, so it is the physical id.
+        COGNITO_USER_POOL_DOMAIN => Some("Domain"),
         // The same service's `CreateResourceServer` takes an `Identifier` — "a unique
         // resource server identifier" — beside the resource server's `Name`, and that
         // identifier is what every call on one takes and what a custom scope of it is spelled

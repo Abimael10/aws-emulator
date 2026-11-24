@@ -121,6 +121,18 @@ mod error_wire;
 /// before the operation serves them ([`BehindWebAcl`]).
 mod web_acl;
 
+/// The PATH a request addresses, read the one way the seams below read it
+/// ([`request_path::of`]).
+mod request_path;
+
+/// The CORS PREFLIGHT this endpoint answers a browser with, which is the request that
+/// precedes every call a web page makes to this API ([`cors_preflight::answer`]).
+mod cors_preflight;
+
+/// The OAuth2 endpoints a pool's DOMAIN serves — its token, user-info and revocation
+/// endpoints — which the pool's own discovery document announces ([`oauth2::answer`]).
+mod oauth2;
+
 /// Whether IAM lets a request perform the action it names, which is decided in front of
 /// every operation the model requires a SigV4 signature for
 /// ([`iam_authorization::IamAuthorized`]).
@@ -171,16 +183,21 @@ const MAX_QUOTED_VALUE: usize = 2 * LARGEST_DECLARED_LENGTH;
 /// as the framework spells a member path.
 const DOMAIN_MEMBER_PATH: &str = "domain";
 
-/// The operations that ask a user pool FOR a hosted domain name, as against the ones that
-/// address a domain already asked for: a create of the pool's domain, and the update that
-/// re-points it. Their request carries a name the pool is to TAKE, which is the name Amazon
-/// Cognito validates with its own prose ([`domain_name_prose`]).
-const DOMAIN_NAMING_OPERATIONS: [&str; 2] = ["CreateUserPoolDomain", "UpdateUserPoolDomain"];
-
-/// The operation that reports the domain a name holds, which Amazon Cognito answers for ANY
-/// name (`smithy_query(query="operation",operation="DescribeUserPoolDomain")`): see
-/// [`served_despite`].
-const DESCRIBE_USER_POOL_DOMAIN: &str = "DescribeUserPoolDomain";
+/// The operations that address a user pool's hosted domain BY ITS NAME: the create that asks
+/// for one, the update that re-points it, the delete that gives it up and the read that
+/// reports it. Each binds the `Domain` member, and each may be given the fully-qualified name
+/// of a CUSTOM domain — "for custom domains, this is the fully-qualified domain name, such as
+/// auth.example.com" (`CreateUserPoolDomain.Domain` in this service's model) — which the
+/// PREFIX form the model's pattern states admits nowhere, so the pattern is not what decides
+/// such a request ([`served_despite`]): the handler judges the name against the form of the
+/// kind of domain the request asks for
+/// ([`crate::state::domain_name_form_defect`]).
+const DOMAIN_ADDRESSING_OPERATIONS: [&str; 4] = [
+    "CreateUserPoolDomain",
+    "UpdateUserPoolDomain",
+    "DeleteUserPoolDomain",
+    "DescribeUserPoolDomain",
+];
 
 /// The machine-to-machine grant, whose request PRESENTS a credential to be verified
 /// (`smithy_query(query="operation",operation="GetClientToken")`): see [`served_despite`].
@@ -657,16 +674,16 @@ fn withheld_value_quoted(violation: Violation, echo: &SubmittedEcho) -> Violatio
 /// quoted as the MODEL writes it, anchors included, because the prose states the expression a
 /// WHOLE name must match rather than the one a clause quotes.
 ///
-/// Only an `operation` that asks for a name answers it ([`DOMAIN_NAMING_OPERATIONS`]): one
-/// that merely ADDRESSES a domain is asking about a name rather than for one, so it keeps the
-/// modelled constraint report. And only for a request refused for the FORM of its domain name
-/// and nothing else: a
+/// Only an `operation` that asks for a name answered it before; now the operations that
+/// address a domain BY ITS NAME never reach it, because the pattern is not what decides their
+/// request ([`DOMAIN_ADDRESSING_OPERATIONS`], [`served_despite`]) and each of their handlers
+/// judges the name against the form of the kind of domain asked for, answering this same
+/// sentence ([`crate::state::domain_name_form_message`]). It stands for any other operation
+/// the model binds the member on, and only for a request refused for the FORM of its domain
+/// name and nothing else: a
 /// request that breaks another member's constraint too is a refusal of more than this
 /// sentence reports, so the framework's envelope stands.
-fn domain_name_prose(operation: &str, violations: &[(Violation, SubmittedEcho)]) -> Option<String> {
-    if !DOMAIN_NAMING_OPERATIONS.contains(&operation) {
-        return None;
-    }
+fn domain_name_prose(violations: &[(Violation, SubmittedEcho)]) -> Option<String> {
     if violations
         .iter()
         .any(|(violation, _)| violation.path != DOMAIN_MEMBER_PATH)
@@ -676,11 +693,9 @@ fn domain_name_prose(operation: &str, violations: &[(Violation, SubmittedEcho)])
     violations
         .iter()
         .find_map(|(violation, _)| match &violation.kind {
-            ViolationKind::Pattern(pattern) => Some(format!(
-                "The domain name contains an invalid character. Domain names can only contain \
-                 lower-case letters, numbers, and hyphens. Please enter a different name that \
-                 follows this format: {pattern}"
-            )),
+            ViolationKind::Pattern(pattern) => {
+                Some(crate::state::domain_name_form_message(pattern))
+            }
             _ => None,
         })
 }
@@ -766,7 +781,7 @@ fn absent_user_pool_id_sentence<'v>(
 /// service carries — and a request that omits the member carries no value to read at all.
 fn served_despite(operation: &str, violation: &Violation) -> bool {
     let presented_value = !matches!(violation.kind, ViolationKind::MissingRequiredMember);
-    (operation == DESCRIBE_USER_POOL_DOMAIN
+    (DOMAIN_ADDRESSING_OPERATIONS.contains(&operation)
         && violation.path == DOMAIN_MEMBER_PATH
         && matches!(violation.kind, ViolationKind::Pattern(_)))
         || (operation == GET_CLIENT_TOKEN
@@ -886,28 +901,32 @@ where
                 MAX_ECHO_POSITIONS,
                 MAX_QUOTED_VALUE,
             );
-            // Read off the violations as the MODEL stated them, before the clause
-            // renderings below requote the expression: the prose quotes the pattern a
-            // whole domain name must match, anchors included. A request that names no
-            // pool to work on is answered by the null check that pool resolution opens
-            // with, which is ahead of every clause about a member of the request.
-            let prose = absent_user_pool_id_sentence(
-                collected.iter().map(|(violation, _)| violation),
-            )
-            .or_else(|| domain_name_prose(O::NAME, &collected));
             // A violation this service does not refuse on is left out of the refusal and
             // noted, because the framework's own sequence WOULD refuse it.
             let served = collected
                 .iter()
                 .any(|(violation, _)| served_despite(O::NAME, violation));
+            let refusing: Vec<(Violation, SubmittedEcho)> = collected
+                .into_iter()
+                .filter(|(violation, _)| !served_despite(O::NAME, violation))
+                .collect();
+            // Read off the violations this service REFUSES on, as the MODEL stated them and
+            // before the clause renderings below requote the expression: the prose quotes the
+            // pattern a whole domain name must match, anchors included. A violation the
+            // service serves is no part of the refusal, so it states none of it. A request
+            // that names no pool to work on is answered by the null check that pool
+            // resolution opens with, which is ahead of every clause about a member.
+            let prose = absent_user_pool_id_sentence(
+                refusing.iter().map(|(violation, _)| violation),
+            )
+            .or_else(|| domain_name_prose(&refusing));
             // Stated in the order this endpoint states its clauses
             // ([`in_stated_clause_order`]), which is the order the refusal below reports
             // them in as well, so one request's clauses cannot be ordered one way here and
             // another there.
             let refused: Vec<Violation> = in_stated_clause_order(
-                &collected
+                &refusing
                     .into_iter()
-                    .filter(|(violation, _)| !served_despite(O::NAME, violation))
                     .map(|(violation, echo)| quoting_the_submitted_value(violation, echo))
                     .collect::<Vec<Violation>>(),
             );
@@ -1023,6 +1042,27 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             // reported.
             || (parts.method == http::Method::PUT
                 && user_import_csv_route(&parts.uri.to_string()).is_some())
+            // A CORS PREFLIGHT of this API is sent by a browser before it makes any
+            // call to the endpoint: unsigned, with no `X-Amz-Target` to name this
+            // service by (it is asking whether that very header may be SENT), and
+            // addressed to the path the call it precedes is posted to. Nothing in it
+            // names a service, so the framework resolves no routing key for it and no
+            // service would claim it; a preflight that reaches this emulator on no
+            // routing key at all is this endpoint's, because the answer is this
+            // endpoint's own standing statement about the API it shares and consults
+            // no state ([`cors_preflight`]). A preflight whose routing key DOES name a
+            // service is claimed by the clause above when that service is this one,
+            // and is left to that service when it is another.
+            || (cors_preflight::asks_a_cors_question(parts)
+                && smithy_server_runtime::resolve_route_key(parts).is_none())
+            // The OAuth2 endpoints of a pool's hosted authorization server — its token,
+            // user-info and revocation endpoints — are called by whatever client holds a
+            // token or a credential of an app client of that pool: anonymously as far as
+            // SigV4 is concerned, with no `X-Amz-Target`, at the paths the pool's own
+            // discovery document announces ([`oauth2`]). A request to exactly one of
+            // those paths is therefore claimed here, so each endpoint answers where the
+            // document said it would.
+            || oauth2::is_endpoint(parts)
     }
 
     fn override_operation(
@@ -1114,6 +1154,23 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // `UICustomizationType.ImageUrl` locates for an anonymous browser to
         // fetch. Every other unrouted request keeps the framework's
         // protocol-correct refusal.
+        //
+        // The CORS PREFLIGHT a browser sends before any call to this API is answered
+        // FIRST: it names no modelled operation (it is asking whether the very header
+        // that names one may be sent), it is unsigned, and its answer is this
+        // endpoint's own standing statement about the API it shares — so it is decided
+        // from the request alone, before any route of a stored resource is resolved,
+        // and it reads no state.
+        if let Some(answered) = cors_preflight::answer(req) {
+            return Some(answered);
+        }
+        // The OAuth2 endpoints of a pool's domain, which the pool's discovery document
+        // announces and no routing key of this model names: the token endpoint's grants,
+        // the claims of the user whose access token a request presents, and the
+        // revocation of a sign-in ([`oauth2`]).
+        if let Some(answered) = oauth2::answer(&*self.engine, req) {
+            return Some(answered);
+        }
         // The CSV upload target of a user import job is written with PUT, so it
         // is answered before the GET routes below: the locator this service
         // published describes an upload, and the job records the file that

@@ -8,8 +8,9 @@
 //!
 //! The rule under test: a created identity provider is keyed by (`UserPoolId`,
 //! `ProviderName`), it renders `UserPoolId`, `ProviderName`, `ProviderType`,
-//! `ProviderDetails`, `AttributeMapping` and `IdpIdentifiers` as submitted (empty
-//! when the request set none), completed by the configuration the submitted
+//! `ProviderDetails`, `AttributeMapping` and `IdpIdentifiers` as submitted (the create's own
+//! answer leaving the identifier list out altogether where the request set none, while a read
+//! renders the empty list the provider holds), completed by the configuration the submitted
 //! `ProviderType` resolves ([`super::identity_provider_type_defaults`]), beside
 //! the `AcrMapping` only an IdP created with one carries and the instant it was
 //! created, a second provider under a name the pool already holds is refused and
@@ -162,13 +163,14 @@ impl ProviderCase {
         )
     }
 
-    /// What the stored provider must render for `IdpIdentifiers`: the submitted
-    /// list, in order, and an empty list when the request set none.
-    fn expected_idp_identifiers(&self) -> Value {
-        match &self.idp_identifiers {
-            Some(identifiers) => json!(identifiers),
-            None => json!([]),
-        }
+    /// What the CREATE's own answer must render for `IdpIdentifiers`: the submitted list, in
+    /// order, and NOTHING AT ALL when the request set none — the create answers the
+    /// identifiers it was given, which for such a request is none.
+    fn expected_created_idp_identifiers(&self) -> Option<Value> {
+        self.idp_identifiers
+            .as_ref()
+            .filter(|identifiers| !identifiers.is_empty())
+            .map(|identifiers| json!(identifiers))
     }
 
     /// What the stored provider must render for `AcrMapping`: the submitted map,
@@ -177,6 +179,24 @@ impl ProviderCase {
     fn expected_acr_mapping(&self) -> Option<Value> {
         self.acr_mapping.as_ref().map(|mapping| object(mapping))
     }
+}
+
+/// What a CREATE's own answer looks like once a READ of the same provider renders it: the
+/// identifier list the create leaves out where the provider holds an empty one.
+///
+/// `CreateIdentityProvider` answers the identifiers it was GIVEN, so a provider nothing gave
+/// any carries no `IdpIdentifiers` member in that answer, while every read of the provider
+/// renders the empty list it holds. `pub(crate)`: the sibling suites that compare a create's
+/// answer with a read of the same provider read THIS normalisation rather than carrying a
+/// second copy of it.
+pub(crate) fn as_read(created: &Value) -> Value {
+    let mut expected = created.clone();
+    if let Some(members) = expected.as_object_mut() {
+        members
+            .entry("IdpIdentifiers".to_string())
+            .or_insert_with(|| json!([]));
+    }
+    expected
 }
 
 /// Owned key/value pairs from borrowed ones, so a row can be written inline.
@@ -330,9 +350,9 @@ async fn a_created_identity_provider_round_trips_through_stored_state() {
             "case {label:?}: the stored attribute mapping must be the submitted one completed by the type's subject claim, got {provider}"
         );
         assert_eq!(
-            provider["IdpIdentifiers"],
-            case.expected_idp_identifiers(),
-            "case {label:?}: the stored identifiers must be the submitted ones, in order, got {provider}"
+            provider.get("IdpIdentifiers").cloned(),
+            case.expected_created_idp_identifiers(),
+            "case {label:?}: the create must answer the submitted identifiers, in order, and no member at all when none was submitted, got {provider}"
         );
         assert_eq!(
             provider.get("AcrMapping").cloned(),
@@ -353,7 +373,8 @@ async fn a_created_identity_provider_round_trips_through_stored_state() {
         );
 
         // The round trip: the reader renders the STORED provider, member for
-        // member.
+        // member, with the identifier list the create left out where the provider holds an
+        // empty one ([`as_read`]).
         let read = ok(
             &router,
             "DescribeIdentityProvider",
@@ -361,7 +382,8 @@ async fn a_created_identity_provider_round_trips_through_stored_state() {
         )
         .await;
         assert_eq!(
-            read["IdentityProvider"], created["IdentityProvider"],
+            read["IdentityProvider"],
+            as_read(&created["IdentityProvider"]),
             "case {label:?}: DescribeIdentityProvider must render the stored provider, got {read}"
         );
 
@@ -414,7 +436,8 @@ async fn a_provider_name_the_pool_already_holds_is_refused_and_the_stored_provid
         )
         .await;
         assert_eq!(
-            read["IdentityProvider"], created["IdentityProvider"],
+            read["IdentityProvider"],
+            as_read(&created["IdentityProvider"]),
             "case {label:?}: a refused create must not have touched the stored provider, got {read}"
         );
     }

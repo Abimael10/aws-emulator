@@ -1941,6 +1941,16 @@ pub const COGNITO_USER_POOL: &str = "AWS::Cognito::UserPool";
 /// publishes is what a confidential client signs its token requests with.
 pub const COGNITO_USER_POOL_CLIENT: &str = "AWS::Cognito::UserPoolClient";
 
+/// The type of a DOMAIN of a user pool: the host the pool's managed login pages, its OAuth2
+/// endpoints and its OpenID Connect discovery document are served on. Its identity is the
+/// `Domain` its declaration states — the string `DescribeUserPoolDomain` resolves a domain by,
+/// and what "Ref returns" for the type — which is what [`declared_name_property`] names the
+/// property it is stated in. The one attribute it publishes,
+/// `CloudFrontDistribution`, is read off the domain itself by the provisioner
+/// ([`crate::state::provisioning::cognito_user_pool`]), since a prefix domain's create answers
+/// none.
+pub const COGNITO_USER_POOL_DOMAIN: &str = "AWS::Cognito::UserPoolDomain";
+
 /// The type of a third-party IDENTITY PROVIDER of a user pool. Its identity is the
 /// `ProviderName` its declaration states — the name that service addresses a provider by,
 /// beside the pool that holds it — which is what [`declared_name_property`] names the

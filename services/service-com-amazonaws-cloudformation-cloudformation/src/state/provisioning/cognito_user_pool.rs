@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! `AWS::Cognito::UserPool`, `AWS::Cognito::UserPoolClient`,
-//! `AWS::Cognito::UserPoolIdentityProvider` and `AWS::Cognito::UserPoolResourceServer`: the
-//! user pool a stack declares, the app client that signs in against it, the third-party
-//! identity provider it federates with and the resource server whose scopes that client is
-//! permitted, created in Amazon Cognito user pools itself.
+//! `AWS::Cognito::UserPoolDomain`, `AWS::Cognito::UserPoolIdentityProvider` and
+//! `AWS::Cognito::UserPoolResourceServer`: the user pool a stack declares, the app client
+//! that signs in against it, the domain its managed login and OAuth2 endpoints are served
+//! on, the third-party identity provider it federates with and the resource server whose
+//! scopes that client is permitted, created in Amazon Cognito user pools itself.
 //!
-//! This is the per-type half of provisioning for four resource types, the half
+//! This is the per-type half of provisioning for five resource types, the half
 //! [`super::super::provisioner`] holds for every other type this emulator creates; it lives
 //! in its own module beside [`super::cognito_identity_pool`] for the reason that module
 //! records — that file is far past the length a change to this repository may touch — and is
@@ -26,11 +27,20 @@
 //! answered). The pool's NAME and the client's NAME stay CloudFormation's own: that is what
 //! each create is made under.
 //!
-//! An IDENTITY PROVIDER and a RESOURCE SERVER are the other case: a pool holds at most one
-//! provider per `ProviderName` and at most one resource server per `Identifier`, which is
-//! what each declaration states and what "Ref returns" for it, so the physical id is that
-//! value ([`super::super::template::declared_name_property`] names the property it is stated
-//! in) and nothing is adopted from the create. A resource server is created for the same
+//! A DOMAIN, an IDENTITY PROVIDER and a RESOURCE SERVER are the other case: a domain string
+//! resolves to one pool, a pool holds at most one provider per `ProviderName` and at most one
+//! resource server per `Identifier`, which is what each declaration states and what "Ref
+//! returns" for it, so the physical id is that value
+//! ([`super::super::template::declared_name_property`] names the property it is stated in)
+//! and nothing is adopted from the create.
+//!
+//! A domain is created for the reason the others are: the managed login pages, the OAuth2
+//! endpoints and the OpenID Connect discovery document of a pool are served only once the
+//! pool really HAS a domain, so a stack that declares one and reports it created must leave
+//! `DescribeUserPoolDomain` resolving it. The `CloudFrontDistribution` the type publishes as
+//! an attribute is read off that read, since a PREFIX domain's create answers no
+//! `CloudFrontDomain` at all ("Amazon Cognito returns this value if you set a custom domain
+//! with `CustomDomainConfig`"). A resource server is created for the same
 //! reason the pool is: the custom scopes it defines are the only scopes an app client of the
 //! pool may be permitted, so a client declaring one cannot be created unless the resource
 //! server really exists there.
@@ -69,8 +79,8 @@ use crate::state::StoredResource;
 /// The resource types this module provisions live in [`crate::state::template`]'s catalogue,
 /// beside the return values each of them publishes.
 use crate::state::template::{
-    COGNITO_USER_POOL, COGNITO_USER_POOL_CLIENT, COGNITO_USER_POOL_IDENTITY_PROVIDER,
-    COGNITO_USER_POOL_RESOURCE_SERVER,
+    COGNITO_USER_POOL, COGNITO_USER_POOL_CLIENT, COGNITO_USER_POOL_DOMAIN,
+    COGNITO_USER_POOL_IDENTITY_PROVIDER, COGNITO_USER_POOL_RESOURCE_SERVER,
 };
 
 /// Amazon Cognito user pools' signing name, which is what routes the in-process call to its
@@ -104,6 +114,8 @@ pub(in crate::state) enum Kind {
     UserPool,
     /// `AWS::Cognito::UserPoolClient`.
     Client,
+    /// `AWS::Cognito::UserPoolDomain`.
+    Domain,
     /// `AWS::Cognito::UserPoolIdentityProvider`.
     IdentityProvider,
     /// `AWS::Cognito::UserPoolResourceServer`.
@@ -115,6 +127,7 @@ pub(super) fn kind_of(resource_type: &str) -> Option<Kind> {
     match resource_type {
         COGNITO_USER_POOL => Some(Kind::UserPool),
         COGNITO_USER_POOL_CLIENT => Some(Kind::Client),
+        COGNITO_USER_POOL_DOMAIN => Some(Kind::Domain),
         COGNITO_USER_POOL_IDENTITY_PROVIDER => Some(Kind::IdentityProvider),
         COGNITO_USER_POOL_RESOURCE_SERVER => Some(Kind::ResourceServer),
         _ => None,
@@ -140,6 +153,18 @@ const CLIENT_NAME: &str = "ClientName";
 
 /// The property an identity provider's own name is stated in, which is its physical id.
 const PROVIDER_NAME: &str = "ProviderName";
+
+/// The property a domain's own name is stated in, which is its physical id and the member
+/// every call on a domain addresses it by. The same name on both sides.
+const DOMAIN: &str = "Domain";
+
+/// The member `DomainDescriptionType` reports the CloudFront endpoint a domain is served
+/// through under, and the attribute the type publishes it as ("the Amazon CloudFront endpoint
+/// that you use as the target of the alias that you set up with your DNS provider").
+const CLOUD_FRONT_DISTRIBUTION: &str = "CloudFrontDistribution";
+
+/// The member a read of a domain carries the domain's own configuration in.
+const DOMAIN_DESCRIPTION: &str = "DomainDescription";
 
 /// The property a resource server's own identifier is stated in, which is its physical id
 /// and the member every call on one addresses it by beside its pool.
@@ -310,6 +335,19 @@ const IDENTITY_PROVIDER_UPDATE_MEMBERS: &[&str] = &[
 /// the same name.
 const RESOURCE_SERVER_MEMBERS: &[&str] = &["Identifier", "Name", "Scopes", "UserPoolId"];
 
+/// The properties of `AWS::Cognito::UserPoolDomain`, every one of them a member of
+/// `CreateUserPoolDomain` — and of `UpdateUserPoolDomain`, which takes the same set — under
+/// the same name
+/// (`smithy_query(query="operation",operation="CreateUserPoolDomain")`), which is why one
+/// request shape serves the create and the update ([`domain_request`]).
+const DOMAIN_MEMBERS: &[&str] = &[
+    "CustomDomainConfig",
+    "Domain",
+    "ManagedLoginVersion",
+    "Routing",
+    "UserPoolId",
+];
+
 /// The members these APIs model as BOOLEANS, which a template may write as a quoted scalar or
 /// feed through a `Ref` to a `String` parameter — every value of one arrives as text.
 const FLAG_MEMBERS: &[&str] = &[
@@ -324,6 +362,7 @@ const NUMBER_MEMBERS: &[&str] = &[
     "AccessTokenValidity",
     "AuthSessionValidity",
     "IdTokenValidity",
+    "ManagedLoginVersion",
     "RefreshTokenValidity",
 ];
 
@@ -343,6 +382,7 @@ pub(super) async fn create(
         // the owning service addresses a POOL, so there is no call that could carry a tag to
         // one.
         Kind::Client => create_client(ctx, region, resource).await,
+        Kind::Domain => create_domain(ctx, region, resource).await,
         Kind::IdentityProvider => create_identity_provider(ctx, region, resource).await,
         Kind::ResourceServer => create_resource_server(ctx, region, resource).await,
     }
@@ -519,6 +559,100 @@ fn resource_server_request(
     Ok(Value::Object(request))
 }
 
+/// Create the domain an `AWS::Cognito::UserPoolDomain` declares, in the pool its declaration
+/// names — so the managed login pages, the OAuth2 endpoints and the OpenID Connect discovery
+/// document of that pool are really served, and `DescribeUserPoolDomain` resolves the domain
+/// the stack reports.
+///
+/// Its identity is the domain string it is created under, which the resource already carries
+/// as its physical id, so nothing is adopted from the answer. The one attribute the type
+/// publishes is read back off the domain ([`domain_attributes`]): a PREFIX domain's create
+/// answers no `CloudFrontDomain` at all, while a read of either kind reports the endpoint it
+/// is served through.
+async fn create_domain(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    refuse_unapplied_properties(&resource.properties, resource, Kind::Domain)?;
+    let request = domain_request(resource, &resource.properties)?;
+    call_cognito_idp(ctx, region, "CreateUserPoolDomain", &request)
+        .await
+        .map_err(|refusal| naming_the_domain(refusal, resource))?;
+    Ok(Created::attributes(
+        domain_attributes(ctx, region, &resource.physical_resource_id).await,
+    ))
+}
+
+/// `refusal` with the DECLARATION it was made for named beside it: the call that was refused
+/// and the domain it was made under.
+///
+/// A create the owning service refuses is what the resource fails with, and the reason lands
+/// on that resource's own event — so it has to say which call was refused and for which
+/// value, not only how that service worded it. The owning service's code and message are kept
+/// verbatim; nothing of the declaration beside the domain name, which is the resource's own
+/// identity, is added.
+fn naming_the_domain(refusal: Refusal, resource: &StoredResource) -> Refusal {
+    Refusal {
+        code: refusal.code,
+        message: format!(
+            "CreateUserPoolDomain for domain {} was refused: {}",
+            resource.physical_resource_id, refusal.message
+        ),
+    }
+}
+
+/// The `CreateUserPoolDomain`/`UpdateUserPoolDomain` request one declaration states: the
+/// members the call takes, with the pool the declaration names and the domain string the
+/// resource carries.
+///
+/// The domain string is the resource's identity, so it is the physical id rather than the
+/// declared property — which is the same value whenever the declaration states one
+/// ([`super::super::template::declared_name_property`]).
+fn domain_request(resource: &StoredResource, declared: &Value) -> Result<Value, Refusal> {
+    let mut request = declared_members(declared, DOMAIN_MEMBERS);
+    request.insert(
+        USER_POOL_ID.to_string(),
+        Value::String(declared_pool(resource)?),
+    );
+    request.insert(
+        DOMAIN.to_string(),
+        Value::String(resource.physical_resource_id.clone()),
+    );
+    Ok(Value::Object(request))
+}
+
+/// The attributes `AWS::Cognito::UserPoolDomain` publishes, read off the domain itself: the
+/// CloudFront endpoint it is served through, which `DescribeUserPoolDomain` reports for a
+/// prefix domain and for a custom one alike.
+///
+/// The create that precedes this ANSWERED, so the domain exists whatever this read says: a
+/// read the owning service refuses publishes no attribute rather than failing a resource that
+/// was created, since what a published attribute reports is a second question about a resource
+/// that is already there.
+async fn domain_attributes(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    domain: &str,
+) -> BTreeMap<String, String> {
+    let mut attributes = BTreeMap::new();
+    let answered = call_cognito_idp(
+        ctx,
+        region,
+        "DescribeUserPoolDomain",
+        &serde_json::json!({DOMAIN: domain}),
+    )
+    .await;
+    let Ok(answered) = answered else {
+        return attributes;
+    };
+    let described = answered.get(DOMAIN_DESCRIPTION).unwrap_or(&Value::Null);
+    if let Some(distribution) = answered_text(described, CLOUD_FRONT_DISTRIBUTION) {
+        attributes.insert(CLOUD_FRONT_DISTRIBUTION.to_string(), distribution);
+    }
+    attributes
+}
+
 /// Whether the owning service reports the resource ready.
 ///
 /// Nothing is asked, and nothing waits: a pool EXISTS from the moment `CreateUserPool`
@@ -623,6 +757,15 @@ pub(super) async fn update(
             created.physical_resource_id = None;
             Ok(Some(created))
         }
+        Kind::Domain => {
+            let request = domain_request(resource, declared)?;
+            call_cognito_idp(ctx, region, "UpdateUserPoolDomain", &request).await?;
+            // The domain keeps the string it was created under, so only its attributes are
+            // re-read — off the domain itself, where a changed certificate is reflected.
+            Ok(Some(Created::attributes(
+                domain_attributes(ctx, region, &resource.physical_resource_id).await,
+            )))
+        }
         Kind::IdentityProvider => {
             let mut request = declared_members(declared, IDENTITY_PROVIDER_UPDATE_MEMBERS);
             request.insert(
@@ -677,6 +820,13 @@ pub(super) async fn delete(
                 CLIENT_ID_MEMBER: resource.physical_resource_id.clone(),
             }),
         ),
+        Kind::Domain => (
+            "DeleteUserPoolDomain",
+            serde_json::json!({
+                USER_POOL_ID: declared_pool(resource)?,
+                DOMAIN: resource.physical_resource_id.clone(),
+            }),
+        ),
         Kind::IdentityProvider => (
             "DeleteIdentityProvider",
             serde_json::json!({
@@ -728,6 +878,12 @@ pub(super) async fn actual_configuration(
             REPORTED_CLIENT_MEMBERS,
             "UserPoolClient",
         ),
+        Kind::Domain => (
+            "DescribeUserPoolDomain",
+            serde_json::json!({DOMAIN: resource.physical_resource_id.clone()}),
+            REPORTED_DOMAIN_MEMBERS,
+            DOMAIN_DESCRIPTION,
+        ),
         Kind::IdentityProvider => (
             "DescribeIdentityProvider",
             serde_json::json!({
@@ -752,6 +908,18 @@ pub(super) async fn actual_configuration(
             let Some(detail) = answer.get(held) else {
                 return Ok(None);
             };
+            // A read of a DOMAIN the owning service no longer holds is not a refusal: that
+            // operation "reports the absence by answering a 200 carrying an empty
+            // `DomainDescription`", so a description naming no domain is the resource being
+            // gone, exactly as the `ResourceNotFoundException` of the other reads is.
+            if detail
+                .get(DOMAIN)
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+                && held == DOMAIN_DESCRIPTION
+            {
+                return Ok(None);
+            }
             let mut configuration = Map::new();
             for (member, property) in reported {
                 if let Some(value) = detail.get(*member) {
@@ -832,6 +1000,16 @@ const REPORTED_PROVIDER_MEMBERS: &[(&str, &str)] = &[
     ("ProviderDetails", "ProviderDetails"),
     ("ProviderName", "ProviderName"),
     ("ProviderType", "ProviderType"),
+    ("UserPoolId", "UserPoolId"),
+];
+
+/// The members `DomainDescriptionType` reports a domain's declared configuration under, each
+/// spelled identically to the property it is the value of.
+const REPORTED_DOMAIN_MEMBERS: &[(&str, &str)] = &[
+    ("CustomDomainConfig", "CustomDomainConfig"),
+    ("Domain", "Domain"),
+    ("ManagedLoginVersion", "ManagedLoginVersion"),
+    ("Routing", "Routing"),
     ("UserPoolId", "UserPoolId"),
 ];
 
@@ -970,6 +1148,7 @@ fn create_only_properties(kind: Kind) -> &'static [&'static str] {
     match kind {
         Kind::UserPool => &["AliasAttributes", "UsernameAttributes", "UsernameConfiguration"],
         Kind::Client => &["GenerateSecret", "UserPoolId"],
+        Kind::Domain => &["UserPoolId"],
         Kind::IdentityProvider => &["ProviderType", "UserPoolId"],
         Kind::ResourceServer => &["UserPoolId"],
     }
@@ -1214,6 +1393,7 @@ fn applied_properties(kind: Kind) -> Vec<&'static str> {
             .chain([USER_POOL_NAME, USER_POOL_TAGS])
             .collect(),
         Kind::Client => CLIENT_MEMBERS.to_vec(),
+        Kind::Domain => DOMAIN_MEMBERS.to_vec(),
         Kind::IdentityProvider => IDENTITY_PROVIDER_MEMBERS.to_vec(),
         Kind::ResourceServer => RESOURCE_SERVER_MEMBERS.to_vec(),
     }

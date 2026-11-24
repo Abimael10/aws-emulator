@@ -465,7 +465,8 @@ async fn a_deleted_identity_provider_is_gone_and_every_app_client_reference_is_s
         )
         .await;
         assert_eq!(
-            survivor_read["IdentityProvider"], survivor_created["IdentityProvider"],
+            survivor_read["IdentityProvider"],
+            super::identity_provider_lifecycle::as_read(&survivor_created["IdentityProvider"]),
             "case {label:?}: the surviving IdP is exactly as it was created, got {survivor_read}"
         );
 
@@ -590,7 +591,8 @@ async fn a_delete_that_resolves_no_provider_or_no_pool_is_a_400_and_persists_not
     )
     .await;
     assert_eq!(
-        read["IdentityProvider"], created["IdentityProvider"],
+        read["IdentityProvider"],
+        super::identity_provider_lifecycle::as_read(&created["IdentityProvider"]),
         "a refused delete leaves the stored IdP exactly as it was, got {read}"
     );
     let other_listed = listed_provider_names(&router, &other_pool).await;

@@ -387,7 +387,7 @@ const PREVIOUS_PASSWORD_PARAMETER: &str = "OldPassword";
 /// The refusal for a parameter this request required and did not carry.
 fn missing_parameter(parameter: &str) -> ChangePasswordError {
     ChangePasswordErrorModeled::InvalidParameterException(InvalidParameterException {
-        message: Some(format!("Missing required parameter {parameter}")),
+        message: Some(crate::state::missing_required_parameter_message(parameter)),
         // `reasonCode` is AWS's own classification of the bad parameter and this
         // service's model documents no value for it, so nothing is invented here.
         reason_code: None,

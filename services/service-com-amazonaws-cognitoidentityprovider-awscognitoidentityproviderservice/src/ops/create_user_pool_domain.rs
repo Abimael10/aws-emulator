@@ -263,6 +263,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // The NAME the request asks the pool to take, judged against the form of the kind
+        // of domain it asks for: a prefix is one label, while a custom domain is "the
+        // fully-qualified domain name, such as auth.example.com"
+        // (`CreateUserPoolDomain.Domain`), which the prefix form admits nowhere. The model's
+        // pattern states the prefix form alone, so the framework's constraint walk does not
+        // decide this member for this operation (`crate::service`'s `served_despite`) and the
+        // name is judged here, where the request's `CustomDomainConfig` says which kind it is
+        // ([`crate::state::domain_name_form_defect`]).
+        if let Some(defect) = crate::state::domain_name_form_defect(
+            &input.domain,
+            input.custom_domain_config.is_some(),
+        ) {
+            return Err(invalid_parameter(defect));
+        }
+
         // An Amazon Cognito PREFIX domain is a label in a namespace Amazon Web
         // Services owns, so a prefix carrying one of the words reserved there is
         // one no pool can be granted

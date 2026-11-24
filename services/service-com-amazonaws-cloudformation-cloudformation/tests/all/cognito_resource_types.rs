@@ -30,10 +30,11 @@
 //! Most of these types have no provisioner, so each is declared-only
 //! (`unprovisioned_resources.rs` pins that: nothing is called in the owning service and the
 //! stack completes). The ones that DO are created through the owning service's own API, which
-//! this crate's harness mounts beside CloudFormation. Six of them cannot be created from a
+//! this crate's harness mounts beside CloudFormation. Seven of them cannot be created from a
 //! declaration that states none of their properties, because the pool the resource belongs to
 //! is one of them — `AWS::Cognito::UserPoolGroup`, `AWS::Cognito::UserPoolClient`,
-//! `AWS::Cognito::UserPoolIdentityProvider` and `AWS::Cognito::UserPoolResourceServer`, whose
+//! `AWS::Cognito::UserPoolDomain`, `AWS::Cognito::UserPoolIdentityProvider` and
+//! `AWS::Cognito::UserPoolResourceServer`, whose
 //! rows' stacks FAIL naming the property the type requires, and the two types that configure
 //! an identity pool rather than being one — while `AWS::Cognito::IdentityPool` and `AWS::Cognito::UserPool` need no
 //! property of the declaration and have their identity ASSIGNED by that service, so their rows
@@ -110,8 +111,9 @@ const PUBLISHED: &[&str] = &[
 /// A group is identified by the pair `(UserPoolId, GroupName)`, so a declaration naming no
 /// pool describes no group `CreateGroup` could make: the provisioner refuses it, naming
 /// that property, rather than sending a request the owning service would reject. An app
-/// client, an identity provider and a resource server are in the same position — each belongs
-/// to ONE user pool, which `CreateUserPoolClient`, `CreateIdentityProvider` and
+/// client, a domain, an identity provider and a resource server are in the same position — each
+/// belongs to ONE user pool, which `CreateUserPoolClient`, `CreateUserPoolDomain`,
+/// `CreateIdentityProvider` and
 /// `CreateResourceServer` all require — and a role attachment too: it configures ONE identity
 /// pool, which its `IdentityPoolId` names. A principal-tag attribute map is the same case
 /// twice over: it is the mapping of ONE provider of ONE pool, and
@@ -119,6 +121,7 @@ const PUBLISHED: &[&str] = &[
 const REQUIRES_A_PROPERTY: &[(&str, &str)] = &[
     ("AWS::Cognito::UserPoolGroup", "UserPoolId"),
     ("AWS::Cognito::UserPoolClient", "UserPoolId"),
+    ("AWS::Cognito::UserPoolDomain", "UserPoolId"),
     ("AWS::Cognito::UserPoolIdentityProvider", "UserPoolId"),
     ("AWS::Cognito::UserPoolResourceServer", "UserPoolId"),
     (

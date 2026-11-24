@@ -260,9 +260,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // provider is a configuration a client can federate with.
                 provider.seed_provider_type_defaults();
                 let stored = slot.insert(provider);
-                Ok(CreateIdentityProviderOutput {
-                    identity_provider: stored.to_identity_provider_type(),
-                })
+                // The provider as it was STORED, which is what this create answers with — and
+                // an `IdpIdentifiers` nothing gave it is left OUT of that answer rather than
+                // reported as an empty list: the member is optional
+                // (`IdpIdentifiersListType`, `@length(min: 0, max: 50)`), and the create
+                // answers the identifiers it was given, which for such a request is none at
+                // all. A later READ of the provider renders the stored list, which is the
+                // empty one it holds ([`crate::state::IdentityProvider::to_identity_provider_type`]).
+                let mut identity_provider = stored.to_identity_provider_type();
+                if stored.idp_identifiers.is_empty() {
+                    identity_provider.idp_identifiers = None;
+                }
+                Ok(CreateIdentityProviderOutput { identity_provider })
             }
         }
     }

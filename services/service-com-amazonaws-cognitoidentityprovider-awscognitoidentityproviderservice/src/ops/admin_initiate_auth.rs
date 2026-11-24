@@ -486,11 +486,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminInitiateAuth
         let caller = crate::state::lambda_triggers::Caller::of(ctx.parts(), None);
         let username = auth_parameters
             .get("USERNAME")
-            .ok_or_else(|| missing_auth_parameter("USERNAME", &input.auth_flow))?
+            .ok_or_else(|| missing_auth_parameter("USERNAME"))?
             .clone();
         let password = auth_parameters
             .get("PASSWORD")
-            .ok_or_else(|| missing_auth_parameter("PASSWORD", &input.auth_flow))?
+            .ok_or_else(|| missing_auth_parameter("PASSWORD"))?
             .clone();
 
         // The stored state decides this sign-in under ONE lock, which the block RELEASES
@@ -893,7 +893,7 @@ async fn refresh_sign_in(
     let auth_parameters = input.auth_parameters.clone().unwrap_or_default();
     let refresh_token = auth_parameters
         .get(REFRESH_TOKEN)
-        .ok_or_else(|| missing_auth_parameter(REFRESH_TOKEN, &input.auth_flow))?
+        .ok_or_else(|| missing_auth_parameter(REFRESH_TOKEN))?
         .clone();
     // An `Admin*` operation is authorized by IAM credentials rather than by an app
     // client, so the event a trigger receives names no caller client id.
@@ -1170,10 +1170,13 @@ fn user_not_confirmed() -> AdminInitiateAuthError {
 
 /// The refusal for an `AuthParameters` entry this flow requires and the request
 /// did not carry.
-fn missing_auth_parameter(parameter: &str, auth_flow: &str) -> AdminInitiateAuthError {
-    invalid_parameter(format!(
-        "Missing required parameter {parameter} in AuthParameters for AuthFlow {auth_flow}"
-    ))
+///
+/// The sentence is fixed text whose only variable part is the ENTRY the request has
+/// to carry ([`crate::state::missing_required_parameter_message`]) — the same one
+/// `InitiateAuth` answers with, so one absent entry is not worded two ways by the
+/// two sign-in operations.
+fn missing_auth_parameter(parameter: &str) -> AdminInitiateAuthError {
+    invalid_parameter(crate::state::missing_required_parameter_message(parameter))
 }
 
 /// This operation's `InvalidParameterException`, carrying `message`.

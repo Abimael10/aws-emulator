@@ -265,7 +265,7 @@ fn account_not_linked() -> AdminDisableProviderForUserError {
 /// This operation's `InvalidParameterException` for a member of the submitted
 /// `ProviderUserIdentifierType` the request left out.
 fn missing_parameter(parameter: &str) -> AdminDisableProviderForUserError {
-    invalid_parameter(format!("Missing required parameter {parameter}"))
+    invalid_parameter(crate::state::missing_required_parameter_message(parameter))
 }
 
 /// This operation's `InvalidParameterException`, carrying `message`.

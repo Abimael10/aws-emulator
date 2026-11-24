@@ -93,8 +93,15 @@ mod feature_plan;
 /// refused: whether its signature fails to check out against the key set the pool it
 /// names publishes, or it is no signed token of this service at all.
 mod access_token_signature;
+/// The one sentence this service refuses an absent required parameter with,
+/// read by every operation that reports one.
+mod missing_parameter;
+/// The NAME a user pool's hosted domain may take: the two forms a `Domain` value has, and
+/// which of them each request is held to.
+mod domain_name;
 pub use access_token_signature::*;
 pub use device_auth::*;
+pub use domain_name::*;
 pub use feature_plan::*;
 pub use attributes::*;
 pub use client_preconditions::*;
@@ -104,6 +111,7 @@ pub use csv_header::*;
 pub use presented_tokens::*;
 pub use identity_providers::*;
 pub use mfa_challenge::*;
+pub use missing_parameter::*;
 pub use openid_discovery::*;
 pub use pool_preconditions::*;
 pub use pool_region_role::*;

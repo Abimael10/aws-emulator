@@ -267,7 +267,9 @@ impl UpdateCase {
         )
     }
 
-    /// Likewise `IdpIdentifiers`, whose order is the submitted one.
+    /// Likewise `IdpIdentifiers`, whose order is the submitted one. An UPDATE answers the
+    /// provider as a read of it does, so a provider left with no identifiers renders the empty
+    /// list it holds.
     fn expected_idp_identifiers(&self) -> Value {
         json!(self
             .idp_identifiers

@@ -380,7 +380,8 @@ async fn a_created_provider_carries_the_configuration_its_type_resolves() {
         )
         .await;
         assert_eq!(
-            read["IdentityProvider"], *provider,
+            read["IdentityProvider"],
+            super::identity_provider_lifecycle::as_read(provider),
             "case {case:?}: DescribeIdentityProvider must render what the create stored, got {read}"
         );
         let again = ok(
@@ -439,7 +440,8 @@ async fn an_update_that_replaces_the_detail_map_keeps_the_configuration_its_type
         )
         .await;
         assert_eq!(
-            read["IdentityProvider"], *provider,
+            read["IdentityProvider"],
+            super::identity_provider_lifecycle::as_read(provider),
             "case {case:?}: DescribeIdentityProvider must render what the update stored, got {read}"
         );
     }

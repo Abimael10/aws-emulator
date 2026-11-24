@@ -60,7 +60,7 @@ impl NewPasswordChallengeRefusal {
             Self::NewPasswordMissing => format!(
                 "Invalid attributes given, new password should be given with key {NEW_PASSWORD}"
             ),
-            Self::UsernameMissing => format!("Missing required parameter {CHALLENGE_USERNAME}"),
+            Self::UsernameMissing => missing_required_parameter_message(CHALLENGE_USERNAME),
             Self::SessionNotApplicable => CHALLENGE_SESSION_MISMATCH_MESSAGE.to_string(),
             Self::PasswordRejected(message) => message.clone(),
             Self::UnknownAttribute(name) => format!(

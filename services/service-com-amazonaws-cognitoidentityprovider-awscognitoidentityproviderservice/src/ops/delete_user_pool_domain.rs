@@ -154,6 +154,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut guard = state.lock();
 
+        // The NAME this request addresses a domain by, judged before the pair is resolved.
+        // It says nothing about which KIND of domain it means, so either form is a name it
+        // may address — the prefix the model's pattern states, and the fully-qualified name a
+        // custom domain carries — and a value that is neither names no domain of any pool
+        // ([`crate::state::domain_name_addressed_defect`]). The model's pattern states the
+        // prefix form alone, so this member is not decided by the constraint walk for this
+        // operation (`crate::service`'s `served_despite`).
+        if let Some(defect) = crate::state::domain_name_addressed_defect(&input.domain) {
+            return Err(invalid_parameter(defect));
+        }
+
         // This operation addresses the domain by the PAIR `UserPoolId` +
         // `Domain` (`UserPoolId` is **required** here, unlike on
         // `DescribeUserPoolDomain`), and the pair is resolved as a unit: a pool
@@ -217,6 +228,17 @@ fn no_such_domain() -> DeleteUserPoolDomainError {
 fn domain_of_other_pool() -> DeleteUserPoolDomainError {
     DeleteUserPoolDomainErrorModeled::InvalidParameterException(InvalidParameterException {
         message: Some(crate::state::DOMAIN_OF_OTHER_POOL_MESSAGE.to_string()),
+        reason_code: None,
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException` for a `Domain` that is no name a domain may
+/// be addressed by, carrying the sentence this endpoint words a bad domain name with
+/// ([`crate::state::domain_name_form_message`]).
+fn invalid_parameter(message: String) -> DeleteUserPoolDomainError {
+    DeleteUserPoolDomainErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
         reason_code: None,
     })
     .into()

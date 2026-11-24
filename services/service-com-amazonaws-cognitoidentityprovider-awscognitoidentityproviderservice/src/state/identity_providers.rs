@@ -62,6 +62,13 @@ impl IdentityProvider {
     }
 
     /// The modelled view of this provider, rendered from what is stored.
+    ///
+    /// `IdpIdentifiers` is the list this provider HOLDS, which is the empty list for a
+    /// provider nothing ever gave identifiers: a READ of a provider renders the stored
+    /// configuration in full. The CREATE's own answer is the one that leaves an empty list out
+    /// altogether ([`crate::ops::create_identity_provider`]), which is where that difference
+    /// belongs — the create answers the provider as it stored it, and only a read reconstructs
+    /// one.
     pub fn to_identity_provider_type(&self) -> IdentityProviderType {
         IdentityProviderType {
             user_pool_id: Some(self.user_pool_id.clone()),

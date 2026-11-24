@@ -682,10 +682,10 @@ async fn password_sign_in(
 ) -> Result<InitiateAuthOutput, InitiateAuthError> {
     let username = auth_parameters
         .get("USERNAME")
-        .ok_or_else(|| missing_auth_parameter("USERNAME", USER_PASSWORD_AUTH))?;
+        .ok_or_else(|| missing_auth_parameter("USERNAME"))?;
     let password = auth_parameters
         .get("PASSWORD")
-        .ok_or_else(|| missing_auth_parameter("PASSWORD", USER_PASSWORD_AUTH))?;
+        .ok_or_else(|| missing_auth_parameter("PASSWORD"))?;
 
     let outcome = {
         let mut decided = decide_password_sign_in(
@@ -1071,7 +1071,7 @@ fn email_otp_sign_in(
 ) -> Result<(InitiateAuthOutput, Option<IssuedCode>), InitiateAuthError> {
     let username = auth_parameters
         .get("USERNAME")
-        .ok_or_else(|| missing_auth_parameter("USERNAME", USER_AUTH))?;
+        .ok_or_else(|| missing_auth_parameter("USERNAME"))?;
     let preferred = auth_parameters
         .get(PREFERRED_CHALLENGE)
         .map(String::as_str)
@@ -1241,7 +1241,7 @@ async fn refresh_sign_in(
 ) -> Result<InitiateAuthOutput, InitiateAuthError> {
     let refresh_token = auth_parameters
         .get("REFRESH_TOKEN")
-        .ok_or_else(|| missing_auth_parameter("REFRESH_TOKEN", auth_flow))?;
+        .ok_or_else(|| missing_auth_parameter("REFRESH_TOKEN"))?;
 
     let (user_pool_id, username) = {
         let state = &*store.lock();
@@ -1467,10 +1467,15 @@ fn user_not_confirmed() -> InitiateAuthError {
 
 /// The refusal for an `AuthParameters` entry this flow requires and the request did not
 /// carry.
-fn missing_auth_parameter(parameter: &str, auth_flow: &str) -> InitiateAuthError {
-    invalid_parameter(format!(
-        "Missing required parameter {parameter} in AuthParameters for AuthFlow {auth_flow}"
-    ))
+///
+/// The sentence is fixed text whose only variable part is the ENTRY the request has to
+/// carry, which is the one thing the caller has to add — the flow it is missing from is
+/// the `AuthFlow` the request itself named, so it is not quoted back. It is the sentence
+/// every refusal of an absent parameter of this service carries
+/// ([`crate::state::missing_required_parameter_message`]), so one absent entry is not
+/// worded two ways by two sign-in operations.
+fn missing_auth_parameter(parameter: &str) -> InitiateAuthError {
+    invalid_parameter(crate::state::missing_required_parameter_message(parameter))
 }
 
 /// This operation's `InvalidParameterException`, carrying `message`.

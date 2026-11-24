@@ -345,7 +345,7 @@ fn branding_not_found() -> UpdateManagedLoginBrandingError {
 /// This operation's `InvalidParameterException` for a request that leaves out a
 /// parameter it needs to name the style to update.
 fn missing_parameter(parameter: &str) -> UpdateManagedLoginBrandingError {
-    invalid_parameter(format!("Missing required parameter {parameter}"))
+    invalid_parameter(crate::state::missing_required_parameter_message(parameter))
 }
 
 /// This operation's `InvalidParameterException` for a request that reverts the
