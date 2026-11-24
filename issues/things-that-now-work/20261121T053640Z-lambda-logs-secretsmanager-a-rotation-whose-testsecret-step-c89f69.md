@@ -35,3 +35,63 @@ Expected: with a rotation function that raises in testSecret, AWSCURRENT stays o
 4. RotateSecret with the passing function as the positive control and poll for promotion to AWSCURRENT.
 Observed: neither arm settles and the check is killed at its budget. Expected: the failing arm keeps AWSCURRENT on the original version with the candidate at AWSPENDING; the control arm promotes.
 5. Replay lambda__logs__secretsmanager.rotation-with-a-failing-testsecret-step-rejected-and-awscurrent-never-moves.
+
+## Resolution
+
+What this record claims, and what it does not, is decided by a MEASUREMENT of the recorded check
+against this emulator rather than by an argument: every call it makes was traced, with the instant
+it arrived, while it ran.
+
+The reported cause could not be reproduced: the rotation reaches its terminal outcome, and the
+check's own reading paths report that outcome, 2.4 seconds after `RotateSecret` answers. The traced
+run, in seconds from the check's first call:
+
+- 0.0 `CreateSecret`.
+- 0.0 `CreateFunction` (the failing twin); the check polls `GetFunctionConfiguration` at 0.1
+  (`Pending`) and 2.1 (`Active`).
+- 2.1 `CreateFunction` (the passing twin); polled at 2.1 (`Pending`) and 4.1 (`Active`).
+- 4.1 `AddPermission` and `GetPolicy` on both functions, then `RotateSecret` — answered 200 with
+  the candidate's id, `AWSPENDING` staked on it, after reading the function's own policy.
+- 4.4 the first invocation (`createSecret`), whose handler reads the staged version and writes the
+  candidate with `PutSecretValue` at 6.4; 6.5 the second (`setSecret`) and the third
+  (`testSecret`), which raises.
+- 7.2 the check's poll of the function's default log group reports exactly the three records its
+  handler printed — `createSecret`, `setSecret`, `testSecret` — beside the `[ERROR] RuntimeError`,
+  `END` and `REPORT` of the invocation that raised, and nothing past the step it stopped at.
+
+From 7.2 seconds on, the check is inside a loop of its own that reads the SAME two things every
+5.0 seconds — one `FilterLogEvents` page of that group selected by the term its handler prints
+(three records, plus the continuation page that correctly reports no further record), and one
+`GetSecretValue` naming no version (the original version, the original string) — and it is still
+in that loop, having read that unchanged and correct state eleven times, when the runner's 60-second
+cap kills it at its `time.sleep(5.0)`. It never reaches its positive control: the check makes no
+second `RotateSecret` and no `CancelRotateSecret` at all, which was confirmed by refusing each of
+those two operations in turn and seeing the verdict unchanged. So the check's own fixed watch
+window, on top of a setup whose spans are its own poll intervals, exceeds the cap whatever this
+emulator answers, and no state this emulator could reach ends that loop.
+
+Two halves of the report are therefore declined as not defects, each against evidence:
+
+- "no stage movement is ever observable for the failing arm" — `AWSPENDING` is staked on the
+  candidate by `RotateSecret` itself and the candidate is created by the function's own
+  `createSecret` step, both inside 2.4 s; `DescribeSecret` reports
+  `{original: [AWSCURRENT], candidate: [AWSPENDING]}` with no `LastRotatedDate`, and
+  `GetSecretValue` keeps serving the original.
+- "the in-progress rotation is cleared so a later `RotateSecret` is accepted rather than refused" —
+  the sibling recording
+  `lambda__logs__secretsmanager.deep-secrets-and-params-failed-finishsecret-leaves-candidate-awspending-and-rejects-new-rotation`
+  shows AWS REFUSING a later rotation carrying a new token in exactly this state, which is what the
+  model states ("If the AWSPENDING staging label is present but not attached to the same version as
+  AWSCURRENT, then any later invocation of RotateSecret assumes that a previous rotation request is
+  still in progress and returns an error") and what this emulator answers. Serving that call instead
+  was tried against the recorded check and changed nothing, because the check never makes it.
+
+What landed is the pin for the rule the report is about, taken through the paths the recorded check
+itself reads it by, which no suite covered:
+`core/router/tests/all/secretsmanager_failed_rotation_read_through_a_clients_own_paths.rs` — a
+table over the FORM a client spells the `filterPattern` selecting its handler's records in (a bare
+term, a quoted string, a `?` alternative, a `%…%` expression, no pattern at all, and a term no
+record carries), the pagination of that read, the staging map, the plain `GetSecretValue` held over
+a window of looks, and the twin with its failure flag cleared completing the protocol and promoting
+the candidate.
+
