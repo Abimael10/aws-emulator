@@ -11,18 +11,25 @@
 //! (`PutTargets`: "for Lambda functions, Amazon SNS topics and Amazon SQS queues,
 //! EventBridge relies on resource-based policies"), and the dead letter's
 //! `ERROR_CODE` is EventBridge's classification OF THE ANSWER the target's service
-//! gave — never a verdict this service reaches on its own. A queue that is THERE and
-//! did not authorize the send answers a refusal of the CALL (`AccessDenied` at HTTP
-//! 403, the code and status AWS answers an unauthorized call with), so every form of
-//! withholding lands in the permission class (`NO_PERMISSIONS`); a target that is not
-//! there at all answers that service's own not-found code and lands in the resource
-//! class (`NO_RESOURCE`).
+//! gave — never a verdict this service reaches on its own. Amazon SQS does not
+//! disclose a queue it will not let the caller write to: it models no authorization
+//! failure on `SendMessage` at all (`smithy_query(query="operation",
+//! operation="SendMessage",
+//! model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`)
+//! and answers a send no document in force over the queue permits under its own
+//! not-found code, so every form of withholding lands in the resource class
+//! (`NO_RESOURCE`) — the class a target that is not there lands in too, under that
+//! service's OTHER sentence for the same code. Each row therefore states the
+//! SENTENCE its answer must carry beside the class, so the two kinds of answer stay
+//! told apart by what that service said.
 //!
-//! The table spans both classes rather than one case: the rows differ along the FORM
-//! the withholding takes (no document at all, an explicit `Deny`, a grant scoped by
-//! `aws:SourceArn` to another rule, a grant of another action, of another resource,
-//! to another principal) and along the form a target that is not there takes (an ARN
-//! no queue was created for, and a queue deleted after the target was written). Each
+//! The table spans both kinds rather than one case: the rows differ along the FORM
+//! the withholding takes (no document at all, a document with no statement, an
+//! explicit `Deny`, a grant scoped by `aws:SourceArn` to another rule, one scoped by
+//! `aws:SourceAccount` to another account, a grant of another action, of another
+//! resource, to another principal) and along the form a
+//! target that is not there takes (an ARN no queue was created for, and a queue
+//! deleted after the target was written). Each
 //! row is a FRESH emulator, so one row's document never decides another row's
 //! delivery.
 //!
@@ -33,20 +40,20 @@
 //! The last test closes the loop the class leaves open: the very queue a withheld
 //! delivery was dead-lettered for receives the NEXT event once its policy grants the
 //! send, with nothing else changed — so the queue was there all along and only the
-//! authorization had failed, which is what the permission class says and what an
-//! operator reading the letter has to repair.
+//! authorization had failed, which is exactly what that service's answer declines to
+//! disclose and what an operator reading the letter has to repair.
 //!
 //! The harness (the router with EventBridge, Amazon SQS, Step Functions, IAM and
 //! CloudWatch on one engine) is `tests/all/target_dispatch.rs`'s.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state::{
-    rule_arn, DEFAULT_EVENT_BUS_NAME, NO_PERMISSIONS, NO_RESOURCE, SERVICE_PRINCIPAL,
+    rule_arn, DEFAULT_EVENT_BUS_NAME, NO_RESOURCE, SERVICE_PRINCIPAL,
 };
 
 use crate::target_dispatch::{
     drain, emulator, given_queue, given_queue_with_policy, given_rule, granting_events, publish,
-    sqs, Emulator, REGION,
+    sqs, Emulator, QUEUE_ABSENT_SENTENCE, QUEUE_NOT_DISCLOSED_SENTENCE, REGION,
 };
 
 /// The rule every row publishes through.
@@ -106,12 +113,18 @@ enum Setup {
     Deleted,
 }
 
-/// One row: the case, how its target queue is brought about and the class the dead
-/// letter is to report.
+/// One row: the case, how its target queue is brought about, the class the dead
+/// letter is to report and the sentence the answer beside it is to carry.
 struct Row {
     case: &'static str,
     setup: Setup,
     class: &'static str,
+    sentence: &'static str,
+}
+
+/// A document carrying no statement at all, which grants nothing.
+fn no_statements(_queue_arn: &str) -> String {
+    document(json!([]))
 }
 
 /// A document stating nothing about this service: the send is granted to another
@@ -151,6 +164,17 @@ fn granting_another_rule(queue_arn: &str) -> String {
         SEND_MESSAGE,
         queue_arn,
         Some(json!({"ArnEquals": {"aws:SourceArn": another_rule_arn()}})),
+    )]))
+}
+
+/// A document granting this service the send, scoped by `aws:SourceAccount` to the
+/// rules of an account other than the one this delivery is made for.
+fn granting_another_account(queue_arn: &str) -> String {
+    document(json!([grant(
+        SERVICE_PRINCIPAL,
+        SEND_MESSAGE,
+        queue_arn,
+        Some(json!({"StringEquals": {"aws:SourceAccount": "111122223333"}})),
     )]))
 }
 
@@ -209,49 +233,70 @@ fn attribute(message: &Value, name: &str) -> String {
 }
 
 /// The dead-letter `ERROR_CODE` is the class the target service's OWN answer puts
-/// the failure in, over every form a withheld delivery and an absent target take.
+/// the failure in, over every form a withheld delivery and an absent target take —
+/// and the sentence beside it is the one that service worded for its own answer.
 #[tokio::test]
 async fn a_queue_targets_failure_class_is_the_one_its_own_state_puts_it_in() {
     let rows = [
         Row {
             case: "a queue carrying no policy at all",
             setup: Setup::Queue(None),
-            class: NO_PERMISSIONS,
+            class: NO_RESOURCE,
+            sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
+        },
+        Row {
+            case: "a queue whose document states no statement",
+            setup: Setup::Queue(Some(no_statements)),
+            class: NO_RESOURCE,
+            sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
         },
         Row {
             case: "a queue whose policy denies the send beside granting it",
             setup: Setup::Queue(Some(granting_then_denying)),
-            class: NO_PERMISSIONS,
+            class: NO_RESOURCE,
+            sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
         },
         Row {
             case: "a queue whose grant is scoped by aws:SourceArn to another rule",
             setup: Setup::Queue(Some(granting_another_rule)),
-            class: NO_PERMISSIONS,
+            class: NO_RESOURCE,
+            sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
+        },
+        Row {
+            case: "a queue whose grant is scoped by aws:SourceAccount to another account",
+            setup: Setup::Queue(Some(granting_another_account)),
+            class: NO_RESOURCE,
+            sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
         },
         Row {
             case: "a queue granting this service another action",
             setup: Setup::Queue(Some(granting_another_action)),
-            class: NO_PERMISSIONS,
+            class: NO_RESOURCE,
+            sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
         },
         Row {
             case: "a queue whose grant names another queue as its resource",
             setup: Setup::Queue(Some(granting_another_resource)),
-            class: NO_PERMISSIONS,
+            class: NO_RESOURCE,
+            sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
         },
         Row {
             case: "a queue granting the send to another service principal",
             setup: Setup::Queue(Some(granting_another_principal)),
-            class: NO_PERMISSIONS,
+            class: NO_RESOURCE,
+            sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
         },
         Row {
             case: "a queue ARN no queue was created for",
             setup: Setup::NeverCreated,
             class: NO_RESOURCE,
+            sentence: QUEUE_ABSENT_SENTENCE,
         },
         Row {
             case: "a queue deleted after the target was written",
             setup: Setup::Deleted,
             class: NO_RESOURCE,
+            sentence: QUEUE_ABSENT_SENTENCE,
         },
     ];
 
@@ -310,18 +355,21 @@ async fn a_queue_targets_failure_class_is_the_one_its_own_state_puts_it_in() {
             target_arn,
             "case {case:?}: expected the dead letter to name the target, got {message:?}"
         );
+        // The answer beside the class is the one that service worded for what it
+        // answered, which is how the two kinds of answer under one code stay apart.
+        let reported = attribute(message, ERROR_MESSAGE_ATTRIBUTE);
         assert!(
-            !attribute(message, ERROR_MESSAGE_ATTRIBUTE).is_empty(),
-            "case {case:?}: expected the target's own answer as the \
-             {ERROR_MESSAGE_ATTRIBUTE}, got {message:?}"
+            reported.contains(row.sentence),
+            "case {case:?}: expected the answer to state {:?}, got {reported:?}",
+            row.sentence
         );
     }
 }
 
 /// The queue a withheld delivery was dead-lettered for IS there: the same queue,
-/// with nothing changed but its policy, receives the next event — so the class the
-/// letter carries is about the authorization, and that is what an operator reading it
-/// has to repair.
+/// with nothing changed but its policy, receives the next event — so the answer the
+/// letter carries is the one that service gives without disclosing the queue, and the
+/// policy is what an operator reading it has to repair.
 #[tokio::test]
 async fn the_queue_a_withheld_delivery_names_receives_once_its_policy_grants_the_send() {
     let case = "a target queue granted the send after a withheld delivery";
@@ -351,8 +399,8 @@ async fn the_queue_a_withheld_delivery_names_receives_once_its_policy_grants_the
     );
     let code = attribute(&dead_lettered[0], ERROR_CODE_ATTRIBUTE);
     assert_eq!(
-        code, NO_PERMISSIONS,
-        "case {case:?}: expected the dead-letter {ERROR_CODE_ATTRIBUTE} {NO_PERMISSIONS:?}, got \
+        code, NO_RESOURCE,
+        "case {case:?}: expected the dead-letter {ERROR_CODE_ATTRIBUTE} {NO_RESOURCE:?}, got \
          {code:?} in {:?}",
         dead_lettered[0]
     );

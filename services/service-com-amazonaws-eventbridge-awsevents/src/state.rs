@@ -908,16 +908,18 @@ pub const FAILED_TO_ASSUME_ROLE: &str = "FAILED_TO_ASSUME_ROLE";
 /// The condition EventBridge reports for an event whose target invocation that
 /// target's service answered with an AUTHORIZATION refusal: the resource is there
 /// and it would not let the call be made. That is the role's policies where the
-/// target names a role, and the TARGET's own resource policy where it names none —
-/// a queue, a topic, a function or a log group this service may not call — plus the
-/// key an encrypted target's payload is encrypted under.
+/// target names a role, and the TARGET's own resource policy where it names none
+/// and the service holding it answers such a refusal — a topic, a function or a
+/// log group this service may not call — plus the key an encrypted target's
+/// payload is encrypted under.
 ///
-/// Which class a refusal lands in follows the ANSWER the target's service gave
-/// ([`queue_access_refusal`] for a queue whose own document withheld the send), and
-/// a service that ANSWERED a refusal of the call answered about a target that IS
-/// there: the refusal of a document in force over an existing target is this class
-/// whichever service that target lives in, while [`NO_RESOURCE`] is the class of a
-/// target the delivery could not address at all.
+/// Which class a refusal lands in follows the ANSWER the target's service gave,
+/// not a verdict this service reaches: a service that answered its AUTHORIZATION
+/// code refused the call on a target that is there, which is this class, while
+/// [`NO_RESOURCE`] is the class of every answer given under a service's NOT-FOUND
+/// code — including Amazon SQS's refusal of a send the queue's own document
+/// withheld, which that service answers without disclosing the queue
+/// ([`queue_access_refusal`]).
 pub const NO_PERMISSIONS: &str = "NO_PERMISSIONS";
 
 /// The condition EventBridge reports for a delivery that failed for a reason its
@@ -3149,8 +3151,8 @@ fn target_invocation_condition_context(rule_arn: &str) -> Vec<(String, String)> 
 /// WHICH of the two refusals it was is deliberately not reported to the caller of
 /// a delivery: the target's service does not tell EventBridge either, and what
 /// EventBridge reports for a delivery it could not make is the answer that
-/// service gave it, which is one authorization refusal however the document
-/// withheld the call (see [`queue_access_refusal`]).
+/// service gave it, which is one refusal however the document withheld the call
+/// (see [`queue_access_refusal`]).
 pub fn target_policy_decision(
     policy: &str,
     attempt: &DeliveryAttempt<'_>,
@@ -3169,16 +3171,18 @@ pub fn target_policy_decision(
 /// event because it could not be addressed: the target is not THERE.
 ///
 /// Distinct from [`NO_PERMISSIONS`], which is about the call a target that IS
-/// there refused: this one is about the RESOURCE, and it is what a target service
-/// answering "no such resource" earns — the answer the delivery read from that
-/// service's own API, rather than a verdict this service reaches about a target it
-/// never addressed. So it covers the failures that answer is given for and no
-/// others: a send the queue's OWN document withheld is a send that queue answered,
-/// so it is the authorization class ([`queue_access_refusal`]). The two conditions
-/// are this service's OWN classification of a failed delivery and never the target
-/// service's error code, which the dead letter reports in its `ERROR_MESSAGE`
-/// beside the condition: one answer fills both, so the class and the sentence
-/// beside it can never name two different failures.
+/// there refused under its own authorization code: this one is the class of every
+/// answer a target service gives under its NOT-FOUND code, whether that service
+/// answers it for a resource that is really gone or for one it declines to
+/// disclose to the caller. It is read off the answer the delivery got from that
+/// service's own API rather than from a verdict this service reaches about the
+/// target: Amazon SQS answers a `sqs:SendMessage` no document in force over the
+/// queue permits under that same not-found code
+/// ([`queue_access_refusal`]), so such a delivery is this class. The two
+/// conditions are this service's OWN classification of a failed delivery and
+/// never the target service's error code, which the dead letter reports in its
+/// `ERROR_MESSAGE` beside the condition: one answer fills both, so the class and
+/// the sentence beside it can never name two different failures.
 pub const NO_RESOURCE: &str = "NO_RESOURCE";
 
 /// The service name Amazon SQS's own error metadata carries. `pub(crate)`
@@ -3188,71 +3192,75 @@ pub const NO_RESOURCE: &str = "NO_RESOURCE";
 pub(crate) const SQS_SERVICE_NAME: &str = "AmazonSQS";
 
 /// The error code and the status Amazon SQS answers a caller whose send the
-/// documents in force over the queue do not permit.
+/// documents in force over the queue do not permit: its own not-found class.
 ///
-/// NOT from that service's model: `SendMessage` declares no authorization failure
-/// at all (`smithy_query(query="operation", operation="SendMessage",
-/// model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`),
-/// because an authorization refusal is answered AHEAD of the operation, under the
-/// code and the status AWS answers every unauthorized call with — the same reason
-/// a function target's refusal is in no model either
-/// (`crate::ops::put_events`'s Lambda branch). That is what a caller of the send
-/// reads, and so what a delivery this service could not make reports.
-const SQS_ACCESS_DENIED_CODE: &str = "AccessDenied";
-const SQS_ACCESS_DENIED_STATUS: u16 = 403;
+/// `SendMessage` models no authorization failure at all — its errors are
+/// `InvalidAddress`, `InvalidMessageContents`, `InvalidSecurity`, the `Kms*`
+/// family, `QueueDoesNotExist`, `RequestThrottled` and `UnsupportedOperation`
+/// (`smithy_query(query="operation", operation="SendMessage",
+/// model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`)
+/// — because that service does not disclose a queue it will not let the caller
+/// write to: it answers `QueueDoesNotExist` instead, HTTP 400 under the
+/// `awsQueryError` code below (`smithy_query(query="shape",
+/// shape="QueueDoesNotExist", model_path="...")`). That is what a caller of the
+/// send reads, and so what a delivery this service could not make reports.
+const SQS_QUEUE_UNDISCLOSED_CODE: &str = "AWS.SimpleQueueService.NonExistentQueue";
+const SQS_QUEUE_UNDISCLOSED_STATUS: u16 = 400;
 
-/// The answer a delivery READS from Amazon SQS when the queue target's own
-/// `Policy` grants this service nothing: that service's authorization refusal,
+/// The sentence that answer carries for the class where the queue is there and
+/// the caller may not write to it: it states both facts without saying which
+/// holds, and it is fixed text in its entirety — nothing of the request, of the
+/// queue or of the account is interpolated into it.
+///
+/// Distinct from the sentence that service answers for a queue that is simply
+/// absent (`service_com_amazonaws_sqs_amazonsqs::state::QUEUE_DOES_NOT_EXIST_MESSAGE`,
+/// which a delivery to an absent queue reads from that service itself): the two
+/// classes of the one code word differently, so neither is used for the other.
+const SQS_QUEUE_UNDISCLOSED_MESSAGE: &str =
+    "The specified queue does not exist or you do not have access to it.";
+
+/// The answer a delivery READS from Amazon SQS when the documents in force over
+/// the queue target grant this service nothing: that service's not-found refusal,
 /// inside the metadata block an AWS error carries.
 ///
 /// The queue's own policy is what governs the delivery
 /// ([`target_policy_decision`]) — the only document in force over a queue target
 /// that names no role, and the one whose explicit deny refuses the send even for
 /// a target that names one — and what the delivery SEES when it grants nothing is
-/// the refusal that service answers a sender it has not authorized: the sentence
-/// naming the principal the call was made as, the action it asked for and the
-/// queue it asked for, under [`SQS_ACCESS_DENIED_CODE`].
+/// what that service answers a sender it has not authorized: it does not disclose
+/// the queue at all, so the answer is [`SQS_QUEUE_UNDISCLOSED_CODE`] carrying
+/// [`SQS_QUEUE_UNDISCLOSED_MESSAGE`], which names neither the principal, nor the
+/// action, nor the queue.
 ///
 /// The CONDITION reported beside it is whatever this service's own classifier
 /// makes of that code (`crate::ops::put_events`), as it is for every other
 /// delivery, so the class a dead letter carries and the answer beside it cannot
-/// disagree: a code refusing the CALL on a target that answered it is
-/// [`NO_PERMISSIONS`] — the class every other target kind's own-document refusal
-/// earns, a topic's, a function's, a log group's and the key an encrypted queue's
-/// messages are encrypted under — while [`NO_RESOURCE`] stays the class of a
-/// target that is not there, which that service answers under its own not-found
-/// code.
-///
-/// `queue_arn` and `action` are the resource and the fully qualified action of the
-/// REFUSED call, as the delivery attempted them: an authorization refusal names
-/// what was asked for, and nothing else of the delivery reaches the sentence.
+/// disagree: this code is the not-found class, so the delivery is
+/// [`NO_RESOURCE`], while [`NO_PERMISSIONS`] stays the class of the services that
+/// DO answer an authorization refusal — a topic's `AuthorizationError`, a
+/// function's and a log group's `AccessDeniedException`, the role a target names,
+/// and the key an encrypted queue's messages are encrypted under.
 ///
 /// The request id is MINTED here and nowhere else: it identifies the one refused
 /// call, so it is drawn fresh rather than derived from the event or the target,
 /// which is what makes two refused deliveries distinguishable in a dead-letter
 /// queue. It comes from the tree's one mint of an AWS request id
-/// (`::service_common::query_error_envelope::new_request_id`), the sentence from
-/// the tree's one wording of a refusal no resource policy allowed
-/// (`::service_common::iam_authorization::not_authorized_by_resource_policy`), and
-/// the block around it from the tree's one rendering of a caught service exception
+/// (`::service_common::query_error_envelope::new_request_id`), and the block
+/// around the sentence from the tree's one rendering of a caught service exception
 /// (`::service_common::relayed_refusal::caught_exception_message`), so this service
-/// reports none of the three in a form no other service reports.
-pub fn queue_access_refusal(queue_arn: &str, action: &str) -> (&'static str, String) {
+/// reports neither in a form no other service reports.
+pub fn queue_access_refusal() -> (&'static str, String) {
     let request_id = ::service_common::query_error_envelope::new_request_id();
     (
-        SQS_ACCESS_DENIED_CODE,
+        SQS_QUEUE_UNDISCLOSED_CODE,
         ::service_common::relayed_refusal::caught_exception_message(
             "",
             "",
-            &::service_common::iam_authorization::not_authorized_by_resource_policy(
-                SERVICE_PRINCIPAL,
-                action,
-                queue_arn,
-            ),
+            SQS_QUEUE_UNDISCLOSED_MESSAGE,
             ::service_common::relayed_refusal::CaughtCall {
                 service: SQS_SERVICE_NAME,
-                status: SQS_ACCESS_DENIED_STATUS,
-                code: SQS_ACCESS_DENIED_CODE,
+                status: SQS_QUEUE_UNDISCLOSED_STATUS,
+                code: SQS_QUEUE_UNDISCLOSED_CODE,
                 request_id: &request_id,
             },
         ),

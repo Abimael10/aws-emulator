@@ -9,11 +9,14 @@
 //! The rule pinned here: EventBridge invokes an Amazon SQS target by calling
 //! `sqs:SendMessage` as the service principal `events.amazonaws.com`, so the TARGET queue's
 //! own resource policy is what admits the send; a send no statement admits is refused by that
-//! service with the code and status AWS answers an unauthorized call with, nothing is
+//! service without disclosing the queue — it models no authorization failure on
+//! `SendMessage` at all, and answers `QueueDoesNotExist` (HTTP 400, `awsQueryError` code
+//! `AWS.SimpleQueueService.NonExistentQueue`) under the fixed sentence that states the absence
+//! and the want of access without saying which holds — nothing is
 //! enqueued on the target, and — because the target carries a `DeadLetterConfig` — the
 //! envelope is written to that queue instead with the message attributes `RULE_ARN`,
-//! `TARGET_ARN`, `ERROR_CODE` and `ERROR_MESSAGE`, under the authorization class
-//! (`NO_PERMISSIONS`) that answer belongs to and with no retries. None of that depends on how
+//! `TARGET_ARN`, `ERROR_CODE` and `ERROR_MESSAGE`, under the resource class
+//! (`NO_RESOURCE`) that answer belongs to and with no retries. None of that depends on how
 //! the rule, its target or the queue policy came to exist: a stack's `AWS::Events::Rule` and
 //! `AWS::SQS::QueuePolicy` leave behind the same rule, target and document a client's own
 //! `PutRule`/`PutTargets`/`SetQueueAttributes` do, and a stack UPDATE that adds the missing
@@ -26,9 +29,9 @@
 //! wildcard, spelling the action in the console's casing), the FORM the stack update takes to
 //! restore delivery (a new `AWS::SQS::QueuePolicy` resource for the target queue, or the
 //! resource the stack already has with its `Queues` extended to name it), WHO names the
-//! deployed resources (the template, or CloudFormation when the declaration names none) and
-//! how the bus is ADDRESSED on the calls that take one (`EventBusNameOrArn` admits the bus's
-//! name or its ARN).
+//! deployed resources (the template, CloudFormation when the declaration names none, or the
+//! two together where only the queues are left unnamed) and how the bus is ADDRESSED on the
+//! calls that take one (`EventBusNameOrArn` admits the bus's name or its ARN).
 //!
 //! Three crates have to agree for that to hold — CloudFormation provisions the bus, the two
 //! queues, the policy and the rule with its per-target `RetryPolicy`/`DeadLetterConfig`;
@@ -104,17 +107,27 @@ const RETRY_ATTEMPTS_ATTRIBUTE: &str = "RETRY_ATTEMPTS";
 const EXHAUSTED_RETRY_CONDITION_ATTRIBUTE: &str = "EXHAUSTED_RETRY_CONDITION";
 
 /// The class EventBridge records for a delivery the target's own document refused, which is
-/// the class Amazon SQS's answer to an unauthorized send belongs to.
-const NO_PERMISSIONS: &str = "NO_PERMISSIONS";
+/// the class Amazon SQS's answer to such a send belongs to: that service answers it under its
+/// own not-found code rather than disclosing a queue it will not let the caller write to.
+const NO_RESOURCE: &str = "NO_RESOURCE";
+
+/// The error code and status that answer carries
+/// (`smithy_query(query="shape", shape="QueueDoesNotExist",
+/// model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`),
+/// and the fixed sentence beside it — stated here rather than read from any implementation,
+/// so a wrong answer cannot make this suite pass.
+const QUEUE_NOT_DISCLOSED_CODE: &str = "AWS.SimpleQueueService.NonExistentQueue";
+const QUEUE_NOT_DISCLOSED_STATUS: u16 = 400;
+const QUEUE_NOT_DISCLOSED_SENTENCE: &str =
+    "The specified queue does not exist or you do not have access to it.";
 
 /// The answer Amazon SQS gives a sender its documents did not permit, up to the id of the
-/// refused call: the refusal of that CALL, naming the principal it was made as, the action it
-/// asked for and the queue it asked for — so the head is built from the target queue's ARN.
-fn withheld_answer_head(queue_arn: &str) -> String {
+/// refused call: its fixed text inside the metadata block naming that service, the status and
+/// the code — so nothing of the refused send appears in it.
+fn withheld_answer_head() -> String {
     format!(
-        "User: {EVENTS_PRINCIPAL} is not authorized to perform: {SEND_MESSAGE} on resource: \
-         {queue_arn} because no resource-based policy allows the {SEND_MESSAGE} action \
-         (Service: AmazonSQS; Status Code: 403; Error Code: AccessDenied; Request ID: "
+        "{QUEUE_NOT_DISCLOSED_SENTENCE} (Service: AmazonSQS; Status Code: \
+         {QUEUE_NOT_DISCLOSED_STATUS}; Error Code: {QUEUE_NOT_DISCLOSED_CODE}; Request ID: "
     )
 }
 
@@ -391,6 +404,9 @@ enum Naming {
     Declared,
     /// The two queues and the rule carry none, so CloudFormation generates them.
     Generated,
+    /// The bus and the rule carry declared names and the two QUEUES carry none, which is the
+    /// shape a template takes when only the resources a client addresses by name are named.
+    QueuesGenerated,
 }
 
 /// One row of the table.
@@ -446,6 +462,15 @@ fn rows() -> Vec<Row> {
             dead_letter_scope: Scope::Unscoped,
             restore: Restore::NewResource(Scope::Unscoped),
             naming: Naming::Generated,
+            form: Form::QueueArn,
+            bus_address: BusAddress::Name,
+        },
+        Row {
+            case: "the bus and the rule are named by the template while the queues are not",
+            stack: "cfn-queue-target-dlq-queues-generated",
+            dead_letter_scope: Scope::ItsRule,
+            restore: Restore::NewResource(Scope::Unscoped),
+            naming: Naming::QueuesGenerated,
             form: Form::QueueArn,
             bus_address: BusAddress::Name,
         },
@@ -548,6 +573,8 @@ fn template(row: &Row, rule_arn: &str, account: &str, restored: bool) -> String 
         resources["TargetQueue"]["Properties"] =
             json!({ "QueueName": format!("{stack}-target") });
         resources["Dlq"]["Properties"] = json!({ "QueueName": format!("{stack}-dlq") });
+    }
+    if row.naming != Naming::Generated {
         resources["Rule"]["Properties"]["Name"] = json!(format!("{stack}-rule"));
     }
     if restored {
@@ -635,7 +662,7 @@ async fn a_deployed_queue_target_without_a_policy_dead_letters_until_an_update_g
         // template does not name its rule cannot spell that ARN out, so its grants name no
         // rule and the ARN is read off the stack's own output below.
         let declared_rule_arn = match row.naming {
-            Naming::Declared => format!(
+            Naming::Declared | Naming::QueuesGenerated => format!(
                 "arn:aws:events:{REGION}:{account}:rule/{}-bus/{}-rule",
                 row.stack, row.stack
             ),
@@ -743,7 +770,7 @@ async fn a_deployed_queue_target_without_a_policy_dead_letters_until_an_update_g
         for (name, expected) in [
             (RULE_ARN_ATTRIBUTE, rule_arn.clone()),
             (TARGET_ARN_ATTRIBUTE, target_arn.clone()),
-            (ERROR_CODE_ATTRIBUTE, NO_PERMISSIONS.to_string()),
+            (ERROR_CODE_ATTRIBUTE, NO_RESOURCE.to_string()),
         ] {
             let actual = attribute(parked, name);
             assert_eq!(
@@ -753,11 +780,11 @@ async fn a_deployed_queue_target_without_a_policy_dead_letters_until_an_update_g
             );
         }
         let reported = attribute(parked, ERROR_MESSAGE_ATTRIBUTE);
-        let head = withheld_answer_head(&target_arn);
+        let head = withheld_answer_head();
         assert!(
             reported.starts_with(head.as_str()) && reported.ends_with(ANSWER_TAIL),
-            "case {case:?}: expected the answer that service gives an unauthorized send, got \
-             {reported:?}"
+            "case {case:?}: expected the answer that service gives a send it will not disclose \
+             the queue of, got {reported:?}"
         );
         // What varies in that answer is the id of the ONE refused call, and nothing else: an
         // AWS request id is a UUID in the canonical 8-4-4-4-12 form.
@@ -772,7 +799,16 @@ async fn a_deployed_queue_target_without_a_policy_dead_letters_until_an_update_g
             "case {case:?}: expected the refused call's own request id between the fixed text, \
              got {request_id:?}"
         );
-        // An authorization refusal is not retryable, so the target's `RetryPolicy` adds no
+        // That answer discloses nothing of the send it refused, so neither the queue nor the
+        // principal is named in it.
+        for withheld in [target_arn.as_str(), EVENTS_PRINCIPAL] {
+            assert!(
+                !reported.contains(withheld),
+                "case {case:?}: expected {withheld:?} NOT to be disclosed by that answer, got \
+                 {reported:?}"
+            );
+        }
+        // A refusal of the send is not retryable, so the target's `RetryPolicy` adds no
         // attempts and the dead letter names no retry count and no exhausted bound.
         for name in [RETRY_ATTEMPTS_ATTRIBUTE, EXHAUSTED_RETRY_CONDITION_ATTRIBUTE] {
             assert!(
@@ -819,6 +855,17 @@ async fn a_deployed_queue_target_without_a_policy_dead_letters_until_an_update_g
             "case {case:?}: expected the update to leave the target queue in place, got \
              {described}"
         );
+        // The queues the UPDATED stack reports are the queues it reported before: a client
+        // that re-reads the outputs after an update addresses the same two queues, so the
+        // urls it reads now are the ones the create left behind.
+        for (name, url) in [("TargetUrl", &target_url), ("DlqUrl", &dead_letter_url)] {
+            assert_eq!(
+                outputs.get(name).cloned().unwrap_or_default(),
+                *url,
+                "case {case:?}: expected the update to leave the {name} output naming the same \
+                 queue, got {described}"
+            );
+        }
 
         let restored = publish(&router, case, &addressed, SOURCE, "restored").await;
         let delivered = wait_for_messages(&router, case, &target_url).await;

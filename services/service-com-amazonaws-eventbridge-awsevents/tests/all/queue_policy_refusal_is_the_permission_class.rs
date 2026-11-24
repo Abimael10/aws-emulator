@@ -1,165 +1,98 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! WHICH class a dead letter carries when the destination queue's own resource policy
-//! withheld the delivery, end to end over the wire (`awsJson1_1`, `POST /` with
+//! WHICH refusals of a delivery are the PERMISSION class (`NO_PERMISSIONS`) and which
+//! are not, end to end over the wire (`awsJson1_1`, `POST /` with
 //! `X-Amz-Target: AWSEvents.<Operation>`) through the real `MultiServiceRouter` with
-//! Amazon SQS on the same engine — so each row is read where a consumer of a
-//! dead-letter queue reads it: off the message attributes of the dead letter the
-//! target's `DeadLetterConfig` queue received.
+//! Amazon SQS, Amazon SNS, Step Functions and IAM on the same engine — so each row is
+//! read where a consumer of a dead-letter queue reads it: off the message attributes of
+//! the dead letter the target's `DeadLetterConfig` queue received.
 //!
-//! The RULE asserted here: EventBridge classifies a failed delivery by what the
-//! target service's refusal is ABOUT, so a target that IS there and refused the CALL
-//! is the PERMISSION class (`NO_PERMISSIONS`) and only a target that was not there to
-//! be called is the RESOURCE class (`NO_RESOURCE`). A
-//! queue target is reached with `sqs:SendMessage` as the service principal and no role
-//! ("for Lambda functions, Amazon SNS topics and Amazon SQS queues, EventBridge relies
-//! on resource-based policies", `PutTargets`), so a queue whose `Policy` does not allow
-//! that principal that action on that queue answers a refusal of that call — the code
-//! and status AWS answers an unauthorized call with, `AccessDenied` at HTTP 403, which
-//! `SendMessage` declares no more than any other operation does because such a refusal
-//! is answered ahead of the operation (`smithy_query(query="operation",
-//! operation="SendMessage",
+//! The question this path used to answer the other way — whether a queue whose own
+//! `Policy` withheld the send is in that class — is answered below, and by the rows
+//! around it: it is not.
+//!
+//! The RULE asserted here bounds that class: a dead letter's `ERROR_CODE` is
+//! EventBridge's classification of the ANSWER the target's own service gave, so the
+//! permission class is the class of the services that answer an AUTHORIZATION refusal
+//! — Amazon SNS refusing a publish its topic's document does not permit
+//! (`AuthorizationErrorException`, `awsQueryError` code `AuthorizationError`,
+//! `smithy_query(query="shape", shape="AuthorizationErrorException",
+//! model_path="services/service-com-amazonaws-sns-amazonsimplenotificationservice/smithy-model/com-amazonaws-sns-amazonsimplenotificationservice.json")`),
+//! and the identity policies in force on a role EventBridge invokes a target AS. It is
+//! NOT the class of a queue whose own `Policy` withheld the send: Amazon SQS models no
+//! authorization failure on `SendMessage` at all
+//! (`smithy_query(query="operation", operation="SendMessage",
 //! model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`)
-//! — and the dead letter carries the permission class with
-//! that answer beside it. A queue ARN nothing was created for is the other class, under
-//! that service's `QueueDoesNotExist`.
+//! because it does not disclose a queue it will not let the caller write to, so that
+//! answer comes back under its own not-found code and is the RESOURCE class
+//! (`NO_RESOURCE`) — which is `tests/all/queue_policy_refusal_is_not_disclosed.rs`'s
+//! rule, asserted here only as the contrast that keeps this class from swallowing it.
 //!
-//! The table spans the class rather than the one case the defect was found on: its rows
-//! differ along the FORM the withholding takes (no document at all, a document with no
-//! statement, an explicit `Deny` beside the grant, a grant scoped by `aws:SourceArn` to
-//! another rule, a grant of another action, a grant to another service principal) and
-//! along whether the queue was there at all. Every row installs a SECOND queue target
-//! on the same rule that DOES grant the send, and asserts it received the event — so a
-//! row cannot pass by failing every delivery, and the two classes are told apart on one
-//! publication.
+//! The rows therefore differ along the SERVICE that answered and along WHAT it was
+//! asked (a publish its topic's document withholds, an execution the invoking role's
+//! policies withhold, a trust policy that does not let this service assume the role at
+//! all, and the queue-policy send that is the other class), so a classifier that
+//! answered one class for every failed delivery fails here whichever way it leant. The
+//! key an ENCRYPTED queue's messages are encrypted under is a second refusal Amazon SQS
+//! relays as an authorization failure (`KMS.AccessDeniedException`); that is
+//! `tests/all/encrypted_queue_target_key_policy.rs`'s rule and is not re-asserted here.
 //!
-//! The condition operators and keys the rows use are IAM's own, because a queue's
-//! `Policy` is an IAM policy document
-//! (`smithy_query(query="doc",shape="com.amazonaws.sqs#QueueAttributeName")`).
-//!
-//! The harness (the router with EventBridge, Amazon SQS, Step Functions, IAM and
-//! CloudWatch on one engine) is `tests/all/target_dispatch.rs`'s.
+//! The harness (the router with EventBridge, Amazon SQS, Amazon SNS, Step Functions,
+//! IAM and CloudWatch on one engine) is `tests/all/target_dispatch.rs`'s.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state::{
-    rule_arn, DEFAULT_EVENT_BUS_NAME, NO_PERMISSIONS, NO_RESOURCE, SERVICE_PRINCIPAL,
+    FAILED_TO_ASSUME_ROLE, NO_PERMISSIONS, NO_RESOURCE, SERVICE_PRINCIPAL,
 };
 
 use crate::target_dispatch::{
-    drain, emulator, given_queue, given_queue_with_policy, given_rule, granting_events, publish,
-    Emulator, REGION,
+    drain, emulator, given_queue, given_queue_with_policy, given_role, given_rule,
+    given_state_machine, publish, sns, xml_text, Emulator, QUEUE_NOT_DISCLOSED_CODE,
 };
 
 /// The rule every row below publishes through.
-const RULE: &str = "classified-by-permission";
+const RULE: &str = "class-bounded";
 
-/// The ids the two queue targets of that rule carry.
-const WITHHELD_TARGET_ID: &str = "withheld";
-const GRANTED_TARGET_ID: &str = "granted";
-
-/// The IAM action a delivery to a queue target performs on that queue.
-const SEND_MESSAGE: &str = "sqs:SendMessage";
+/// The id the one failing target of that rule carries.
+const TARGET_ID: &str = "refused";
 
 /// The dead-letter message attributes this suite reads.
 const ERROR_CODE_ATTRIBUTE: &str = "ERROR_CODE";
 const ERROR_MESSAGE_ATTRIBUTE: &str = "ERROR_MESSAGE";
-const RULE_ARN_ATTRIBUTE: &str = "RULE_ARN";
-const TARGET_ARN_ATTRIBUTE: &str = "TARGET_ARN";
 
-/// The error code and status Amazon SQS answers a send the documents in force over the
-/// queue do not permit, and the code it answers for a queue that is not there — stated
-/// here rather than read from the implementation, so a wrong answer there cannot make
-/// this suite pass.
-const ACCESS_DENIED: &str = "AccessDenied";
-const ACCESS_DENIED_STATUS: u16 = 403;
-const QUEUE_DOES_NOT_EXIST: &str = "AWS.SimpleQueueService.NonExistentQueue";
+/// The action a state-machine target's invocation performs, which a role that may make
+/// it is allowed.
+const START_EXECUTION: &str = "states:StartExecution";
 
-/// A statement list wrapped as a policy document.
-fn document(statements: Value) -> String {
-    json!({ "Version": "2012-10-17", "Statement": statements }).to_string()
+/// The error code Amazon SNS answers a publish its topic's document does not permit
+/// (`AuthorizationErrorException`'s `awsQueryError` code) — stated here rather than read
+/// from any implementation, so a wrong answer cannot make this suite pass.
+const AUTHORIZATION_ERROR: &str = "AuthorizationError";
+
+/// Which target refuses the row's handover, and by what.
+enum Refused {
+    /// An Amazon SNS topic on the document that service generates for its owner, which
+    /// grants this service nothing: a publish that service answers as an authorization
+    /// refusal.
+    TopicGrantingNothing,
+    /// A state machine named by a target whose role this service may assume but whose
+    /// policies allow the invocation's own call nowhere.
+    RoleWithholdingTheCall,
+    /// A state machine named by a target whose role does not trust this service at all,
+    /// so the delivery failed before any call was made.
+    RoleThisServiceCannotAssume,
+    /// An Amazon SQS queue carrying no policy, which that service answers without
+    /// disclosing the queue — the other class.
+    QueueGrantingNothing,
 }
 
-/// An `Allow` of `action` to the service principal `principal` on `resource`, scoped by
-/// `condition` when the row states one.
-fn grant(principal: &str, action: &str, resource: &str, condition: Option<Value>) -> Value {
-    let mut statement = json!({
-        "Effect": "Allow",
-        "Principal": {"Service": principal},
-        "Action": action,
-        "Resource": resource,
-    });
-    if let Some(condition) = condition {
-        statement["Condition"] = condition;
-    }
-    statement
-}
-
-/// A document carrying no statement at all, which grants nothing.
-fn no_statements(_queue_arn: &str) -> String {
-    document(json!([]))
-}
-
-/// A grant of the send with an explicit `Deny` of it beside the grant.
-fn granting_then_denying(queue_arn: &str) -> String {
-    document(json!([
-        grant(SERVICE_PRINCIPAL, SEND_MESSAGE, queue_arn, None),
-        {
-            "Effect": "Deny",
-            "Principal": {"Service": SERVICE_PRINCIPAL},
-            "Action": SEND_MESSAGE,
-            "Resource": queue_arn,
-        },
-    ]))
-}
-
-/// A grant of the send scoped by `aws:SourceArn` to the deliveries of a rule other than
-/// the one publishing here.
-fn granting_another_rule(queue_arn: &str) -> String {
-    let other = rule_arn(REGION, DEFAULT_EVENT_BUS_NAME, "somebody-elses-rule");
-    document(json!([grant(
-        SERVICE_PRINCIPAL,
-        SEND_MESSAGE,
-        queue_arn,
-        Some(json!({"ArnEquals": {"aws:SourceArn": other}})),
-    )]))
-}
-
-/// A grant of another action of the same service on the queue.
-fn granting_another_action(queue_arn: &str) -> String {
-    document(json!([grant(
-        SERVICE_PRINCIPAL,
-        "sqs:ReceiveMessage",
-        queue_arn,
-        None
-    )]))
-}
-
-/// A grant of the send to a different service principal.
-fn granting_another_principal(queue_arn: &str) -> String {
-    document(json!([grant(
-        "s3.amazonaws.com",
-        SEND_MESSAGE,
-        queue_arn,
-        None
-    )]))
-}
-
-/// How a row brings the queue its withheld target names about.
-enum Setup {
-    /// A queue carrying the document the row's function builds from its own ARN, or none
-    /// at all when the function is `None`.
-    Queue(Option<fn(&str) -> String>),
-    /// A queue ARN of this account and Region that no queue was ever created for.
-    NeverCreated,
-}
-
-/// One row: the case, how its withheld target is brought about, the class the dead
-/// letter is to carry and the error code the answer beside it must name.
+/// One row: the case, what refused the handover, the class the dead letter is to carry
+/// and what the answer beside it must state.
 struct Row {
     case: &'static str,
-    setup: Setup,
+    refused: Refused,
     class: &'static str,
-    code: &'static str,
+    states: Option<&'static str>,
 }
 
 /// The string value of the dead letter's message attribute `name`.
@@ -170,80 +103,100 @@ fn attribute(message: &Value, name: &str) -> String {
         .to_string()
 }
 
-/// The ARN the row's withheld target names, and the url of its queue when the row has
-/// one.
-async fn given_withheld_target(
+/// A topic called `name` on the document Amazon SNS generates for its owner; answers its
+/// ARN. Nothing is subscribed to it: what the row reads is the answer the PUBLISH earned,
+/// which that topic's own document decides whether or not anybody is listening.
+async fn given_topic(emulator: &Emulator, case: &str, name: &str) -> String {
+    let (status, created) = sns(emulator, "CreateTopic", &[("Name", name)]).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: CreateTopic answered {status}: {created}"
+    );
+    xml_text(&created, "TopicArn").unwrap_or_else(|| panic!("case {case:?}: no TopicArn in {created}"))
+}
+
+/// The ARN the row's failing target names, the role it names where the row's refusal is
+/// a role's, and the url of its queue where the row's target is one.
+async fn given_refused_target(
     emulator: &Emulator,
+    case: &str,
     index: usize,
-    setup: &Setup,
-) -> (String, Option<String>) {
-    match setup {
-        Setup::Queue(policy) => {
-            let policy: Option<&dyn Fn(&str) -> String> = policy
-                .as_ref()
-                .map(|written| written as &dyn Fn(&str) -> String);
-            let (url, arn) =
-                given_queue_with_policy(emulator, &format!("permission-target-{index}"), policy)
-                    .await;
-            (arn, Some(url))
-        }
-        Setup::NeverCreated => (
-            format!(
-                "arn:aws:sqs:{REGION}:{}:never-created-{index}",
-                engine::emulator_account_id()
-            ),
+    refused: &Refused,
+) -> (String, Option<String>, Option<String>) {
+    match refused {
+        Refused::TopicGrantingNothing => (
+            given_topic(emulator, case, &format!("bounded-topic-{index}")).await,
+            None,
             None,
         ),
+        Refused::RoleWithholdingTheCall => {
+            let role = given_role(
+                emulator,
+                &format!("bounded-role-{index}"),
+                SERVICE_PRINCIPAL,
+                None,
+            )
+            .await;
+            (
+                given_state_machine(emulator, &format!("bounded-machine-{index}")).await,
+                Some(role),
+                None,
+            )
+        }
+        Refused::RoleThisServiceCannotAssume => {
+            // The role allows the call but trusts another service, so this service
+            // cannot act as it at all.
+            let role = given_role(
+                emulator,
+                &format!("bounded-untrusting-role-{index}"),
+                "lambda.amazonaws.com",
+                Some(START_EXECUTION),
+            )
+            .await;
+            (
+                given_state_machine(emulator, &format!("bounded-untrusted-machine-{index}")).await,
+                Some(role),
+                None,
+            )
+        }
+        Refused::QueueGrantingNothing => {
+            let (url, arn) =
+                given_queue_with_policy(emulator, &format!("bounded-queue-{index}"), None).await;
+            (arn, None, Some(url))
+        }
     }
 }
 
-/// The class of a delivery the destination queue's own documents withheld is the
-/// permission one, over every form the withholding takes — and only a queue that was
-/// not there earns the resource one.
+/// The permission class is the class of the services that ANSWER an authorization
+/// refusal, and of a role whose own policies withhold the call — while the send a
+/// queue's own document withheld is the other class, because that service answers it
+/// without disclosing the queue.
 #[tokio::test]
-async fn a_queue_policy_refusal_is_dead_lettered_as_a_permission_failure() {
+async fn the_permission_class_is_the_class_of_an_answered_authorization_refusal() {
     let rows = [
         Row {
+            case: "a topic on the document Amazon SNS generates for its owner",
+            refused: Refused::TopicGrantingNothing,
+            class: NO_PERMISSIONS,
+            states: Some(AUTHORIZATION_ERROR),
+        },
+        Row {
+            case: "a target whose role may be assumed but allows the call nowhere",
+            refused: Refused::RoleWithholdingTheCall,
+            class: NO_PERMISSIONS,
+            states: Some(START_EXECUTION),
+        },
+        Row {
+            case: "a target whose role does not trust this service",
+            refused: Refused::RoleThisServiceCannotAssume,
+            class: FAILED_TO_ASSUME_ROLE,
+            states: None,
+        },
+        Row {
             case: "a queue carrying no policy at all",
-            setup: Setup::Queue(None),
-            class: NO_PERMISSIONS,
-            code: ACCESS_DENIED,
-        },
-        Row {
-            case: "a queue whose document states no statement",
-            setup: Setup::Queue(Some(no_statements)),
-            class: NO_PERMISSIONS,
-            code: ACCESS_DENIED,
-        },
-        Row {
-            case: "a queue whose policy denies the send beside granting it",
-            setup: Setup::Queue(Some(granting_then_denying)),
-            class: NO_PERMISSIONS,
-            code: ACCESS_DENIED,
-        },
-        Row {
-            case: "a queue whose grant is scoped by aws:SourceArn to another rule",
-            setup: Setup::Queue(Some(granting_another_rule)),
-            class: NO_PERMISSIONS,
-            code: ACCESS_DENIED,
-        },
-        Row {
-            case: "a queue granting this service another action",
-            setup: Setup::Queue(Some(granting_another_action)),
-            class: NO_PERMISSIONS,
-            code: ACCESS_DENIED,
-        },
-        Row {
-            case: "a queue granting the send to another service principal",
-            setup: Setup::Queue(Some(granting_another_principal)),
-            class: NO_PERMISSIONS,
-            code: ACCESS_DENIED,
-        },
-        Row {
-            case: "a queue ARN no queue was created for",
-            setup: Setup::NeverCreated,
+            refused: Refused::QueueGrantingNothing,
             class: NO_RESOURCE,
-            code: QUEUE_DOES_NOT_EXIST,
+            states: Some(QUEUE_NOT_DISCLOSED_CODE),
         },
     ];
 
@@ -251,55 +204,29 @@ async fn a_queue_policy_refusal_is_dead_lettered_as_a_permission_failure() {
         let emulator = emulator();
         let case = row.case;
         let (dead_letter_url, dead_letter_arn) =
-            given_queue(&emulator, &format!("permission-dlq-{index}")).await;
-        let (withheld_arn, withheld_url) =
-            given_withheld_target(&emulator, index, &row.setup).await;
-        // The sibling target of the same rule, whose own policy DOES grant the send:
-        // one publication, two queues, and only the one that granted it receives the
-        // event.
-        let (granted_url, granted_arn) = given_queue_with_policy(
-            &emulator,
-            &format!("permission-sibling-{index}"),
-            Some(&granting_events),
-        )
-        .await;
-        given_rule(
-            &emulator,
-            RULE,
-            json!([
-                {
-                    "Id": WITHHELD_TARGET_ID,
-                    "Arn": withheld_arn,
-                    "DeadLetterConfig": { "Arn": dead_letter_arn },
-                    "RetryPolicy": { "MaximumRetryAttempts": 0, "MaximumEventAgeInSeconds": 60 },
-                },
-                {
-                    "Id": GRANTED_TARGET_ID,
-                    "Arn": granted_arn,
-                },
-            ]),
-        )
-        .await;
+            given_queue(&emulator, &format!("bounded-dlq-{index}")).await;
+        let (target_arn, role_arn, target_url) =
+            given_refused_target(&emulator, case, index, &row.refused).await;
+        let mut target = json!({
+            "Id": TARGET_ID,
+            "Arn": target_arn,
+            "DeadLetterConfig": { "Arn": dead_letter_arn },
+            "RetryPolicy": { "MaximumRetryAttempts": 0, "MaximumEventAgeInSeconds": 60 },
+        });
+        if let Some(role_arn) = &role_arn {
+            target["RoleArn"] = json!(role_arn);
+        }
+        given_rule(&emulator, RULE, json!([target])).await;
 
         publish(&emulator).await;
 
-        // The sibling that granted the send received the whole envelope: the rule
-        // matched and the delivery path ran.
-        let delivered = drain(&emulator, &granted_url).await;
-        assert_eq!(
-            delivered.len(),
-            1,
-            "case {case:?}: expected the granting queue to receive the event, got {delivered:?}"
-        );
-        if let Some(url) = &withheld_url {
-            let leaked = drain(&emulator, url).await;
+        if let Some(url) = &target_url {
+            let delivered = drain(&emulator, url).await;
             assert!(
-                leaked.is_empty(),
-                "case {case:?}: a queue that did not authorize the send receives nothing, got \
-                 {leaked:?}"
+                delivered.is_empty(),
+                "case {case:?}: a refused delivery leaves the target empty, got {delivered:?}"
             );
         }
-
         let parked = drain(&emulator, &dead_letter_url).await;
         assert_eq!(
             parked.len(),
@@ -314,105 +241,14 @@ async fn a_queue_policy_refusal_is_dead_lettered_as_a_permission_failure() {
              in {message:?}",
             row.class
         );
-        // The answer beside the class is the one the refused send read, and the class is
-        // the class of the code INSIDE it, so the two cannot name two failures.
-        let reported = attribute(message, ERROR_MESSAGE_ATTRIBUTE);
-        assert!(
-            reported.contains(row.code),
-            "case {case:?}: expected the answering service's code {:?} in {reported:?}",
-            row.code
-        );
-        if row.class == NO_PERMISSIONS {
-            // An authorization refusal names what was refused: the principal the call
-            // was made as, the action it asked for and the queue it asked for.
-            let expected = format!(
-                "User: {SERVICE_PRINCIPAL} is not authorized to perform: {SEND_MESSAGE} on \
-                 resource: {withheld_arn} because no resource-based policy allows the \
-                 {SEND_MESSAGE} action (Service: AmazonSQS; Status Code: \
-                 {ACCESS_DENIED_STATUS}; Error Code: {ACCESS_DENIED}; Request ID: "
-            );
+        // The class is the class of what the answer beside it states, so the two can
+        // never name two different failures.
+        if let Some(states) = row.states {
+            let reported = attribute(message, ERROR_MESSAGE_ATTRIBUTE);
             assert!(
-                reported.starts_with(expected.as_str()) && reported.ends_with("; Proxy: null)"),
-                "case {case:?}: expected {expected:?} then the id of the refused call, got \
-                 {reported:?}"
+                reported.contains(states),
+                "case {case:?}: expected the reported answer to state {states:?}, got {reported:?}"
             );
         }
-        // The class names neither the rule nor the target, so the letter names both.
-        assert_eq!(
-            attribute(message, RULE_ARN_ATTRIBUTE),
-            rule_arn(REGION, DEFAULT_EVENT_BUS_NAME, RULE),
-            "case {case:?}: expected the dead letter to name the rule, got {message:?}"
-        );
-        assert_eq!(
-            attribute(message, TARGET_ARN_ATTRIBUTE),
-            withheld_arn,
-            "case {case:?}: expected the dead letter to name the target, got {message:?}"
-        );
     }
-}
-
-/// The class follows the DOCUMENT in force at the instant of the delivery: the very
-/// queue a withheld delivery was dead-lettered for receives the next event once its
-/// policy grants the send, with nothing else changed — which is what makes the
-/// permission class the one an operator acts on.
-#[tokio::test]
-async fn the_permission_class_clears_when_the_queues_policy_grants_the_send() {
-    let case = "a target queue granted the send after a withheld delivery";
-    let emulator = emulator();
-    let (dead_letter_url, dead_letter_arn) = given_queue(&emulator, "regranted-dlq").await;
-    let (target_url, target_arn) =
-        given_queue_with_policy(&emulator, "regranted-target", None).await;
-    given_rule(
-        &emulator,
-        RULE,
-        json!([{
-            "Id": WITHHELD_TARGET_ID,
-            "Arn": target_arn,
-            "DeadLetterConfig": { "Arn": dead_letter_arn },
-            "RetryPolicy": { "MaximumRetryAttempts": 0, "MaximumEventAgeInSeconds": 60 },
-        }]),
-    )
-    .await;
-
-    publish(&emulator).await;
-
-    let parked = drain(&emulator, &dead_letter_url).await;
-    assert_eq!(
-        parked.len(),
-        1,
-        "case {case:?}: expected one dead letter before the grant, got {parked:?}"
-    );
-    let class = attribute(&parked[0], ERROR_CODE_ATTRIBUTE);
-    assert_eq!(
-        class, NO_PERMISSIONS,
-        "case {case:?}: expected the dead-letter {ERROR_CODE_ATTRIBUTE} {NO_PERMISSIONS:?}, got \
-         {class:?} in {:?}",
-        parked[0]
-    );
-
-    // Nothing but the queue's own document changes.
-    let (status, body) = crate::target_dispatch::sqs(
-        &emulator,
-        "SetQueueAttributes",
-        &json!({ "QueueUrl": target_url, "Attributes": { "Policy": granting_events(&target_arn) } }),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: SetQueueAttributes answered {status} {body}"
-    );
-
-    publish(&emulator).await;
-
-    let delivered = drain(&emulator, &target_url).await;
-    assert_eq!(
-        delivered.len(),
-        1,
-        "case {case:?}: expected the regranted queue to receive the next event, got {delivered:?}"
-    );
-    let parked = drain(&emulator, &dead_letter_url).await;
-    assert!(
-        parked.is_empty(),
-        "case {case:?}: a delivery the policy now grants parks nothing, got {parked:?}"
-    );
 }

@@ -7,19 +7,24 @@
 //! read where a client reads one: off the message attributes of the dead letter the
 //! target's `DeadLetterConfig` queue received.
 //!
-//! The RULE asserted here: a delivery a target's service refused because the
-//! documents in force over that target do not authorize the call is reported in the
-//! AUTHORIZATION class (`NO_PERMISSIONS`), carrying that service's own refusal of the
-//! call — the code and status AWS answers an unauthorized call with, naming the
-//! principal the call was made as, the action it asked for and the resource it asked
-//! for; the RESOURCE class (`NO_RESOURCE`) is reserved for a target the delivery
-//! could not address at all, which that service answers under its own not-found code.
+//! The RULE asserted here: a delivery fails when the documents in force over the
+//! target do not authorize the call, and the class EventBridge reports for it is the
+//! class of the ANSWER that target's service gave — not of what really went wrong.
 //! For a queue target the authorizing document is the queue's own `Policy` alone
 //! ("for Lambda functions, Amazon SNS topics and Amazon SQS queues, EventBridge
 //! relies on resource-based policies", `PutTargets`), and a grant scoped by
-//! `aws:SourceArn` authorizes the deliveries of the rule it names and no other. The
-//! class and the sentence come from the ONE refusal, so they can never name two
-//! different failures.
+//! `aws:SourceArn` authorizes the deliveries of the rule it names and no other; but
+//! Amazon SQS models no authorization failure on `SendMessage` at all
+//! (`smithy_query(query="operation", operation="SendMessage",
+//! model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`)
+//! because it does not disclose a queue it will not let the caller write to: it
+//! answers `QueueDoesNotExist` (HTTP 400, `awsQueryError` code
+//! `AWS.SimpleQueueService.NonExistentQueue`) under the fixed sentence that states the
+//! absence and the want of access without saying which holds. So the class of a
+//! queue-target authorization failure is the RESOURCE one (`NO_RESOURCE`), the same
+//! one a target the delivery could not address at all earns, and what tells the two
+//! apart is the SENTENCE that service worded. The class and the sentence come from the
+//! ONE refusal, so they can never name two different failures.
 //!
 //! `ERROR_CODE`/`ERROR_MESSAGE` are message attributes EventBridge adds to a
 //! dead-letter message and no shape models (`Target$DeadLetterConfig` is documented
@@ -32,28 +37,31 @@
 //! rules matching the same event, and two queues — one whose policy names its own
 //! rule's `aws:SourceArn`, one whose policy names only the OTHER rule's. The
 //! correctly scoped pair receives the event while the mis-scoped delivery is
-//! dead-lettered in the permission class, so a class flipped for every failed
-//! delivery, or one reached without reading the grant's scope, fails here.
+//! dead-lettered under the answer that service gave, so a class reached without
+//! reading the grant's scope, or a delivery refused for every rule alike, fails here.
 //!
 //! The second test spans the class over a TABLE whose rows differ along the FORM the
 //! withholding takes (no document at all, a grant scoped to another rule, a grant to
 //! another service principal, a grant of another action of the same service) and
-//! includes a target queue that is NOT there, which is the other class. Every
-//! repairable row then has the grant written and the SAME queue receives the next
-//! event, with nothing else changed — which is what makes the class the right one: the
-//! queue existed throughout and only the authorization had failed.
+//! includes a target queue that is NOT there, whose answer carries that service's
+//! other sentence. Every repairable row then has the grant written and the SAME queue
+//! receives the next event, with nothing else changed — which is what that service's
+//! answer declines to disclose: the queue existed throughout and only the
+//! authorization had failed.
 //!
 //! The harness (the router with EventBridge, Amazon SQS, Step Functions, IAM and
 //! CloudWatch on one engine) is `tests/all/target_dispatch.rs`'s.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state::{
-    rule_arn, DEFAULT_EVENT_BUS_NAME, NO_PERMISSIONS, NO_RESOURCE, SERVICE_PRINCIPAL,
+    rule_arn, DEFAULT_EVENT_BUS_NAME, NO_RESOURCE, SERVICE_PRINCIPAL,
 };
 
 use crate::target_dispatch::{
-    drain, emulator, given_queue, given_queue_with_policy, given_rule, granting_events, publish,
-    sqs, Emulator, REGION,
+    answered_request_id, drain, emulator, given_queue, given_queue_with_policy, given_rule,
+    granting_events, is_request_id, not_disclosed_answer_head, publish, sqs, Emulator,
+    QUEUE_ABSENT_SENTENCE, QUEUE_NOT_DISCLOSED_CODE, QUEUE_NOT_DISCLOSED_SENTENCE,
+    QUEUE_NOT_DISCLOSED_STATUS, REGION,
 };
 
 /// The id the one target of every rule below carries.
@@ -68,32 +76,13 @@ const ERROR_MESSAGE_ATTRIBUTE: &str = "ERROR_MESSAGE";
 const RULE_ARN_ATTRIBUTE: &str = "RULE_ARN";
 const TARGET_ARN_ATTRIBUTE: &str = "TARGET_ARN";
 
-/// The error code and status AWS answers a call no document in force over the
-/// resource permits, which is what a withheld send reads back.
-const ACCESS_DENIED: &str = "AccessDenied";
-const ACCESS_DENIED_STATUS: u16 = 403;
-
-/// Amazon SQS's own code, status and sentence for a send on a queue that is not
-/// there: `QueueDoesNotExist`'s `awsQueryError` code
-/// (`smithy_query(query="shape", shape="QueueDoesNotExist",
-/// model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`).
-const QUEUE_DOES_NOT_EXIST: &str = "AWS.SimpleQueueService.NonExistentQueue";
-const QUEUE_DOES_NOT_EXIST_STATUS: u16 = 400;
-
-/// What closes the metadata block of a relayed answer, after the id of the one
-/// refused call.
-const ANSWER_TAIL: &str = "; Proxy: null)";
-
 /// The answer a send the queue's own documents withheld reads back, up to the id of
-/// that one refused call: the refusal of the CALL, naming the principal, the action
-/// and the queue — built here rather than read from the implementation's own helper,
-/// so a wrong answer there cannot make this suite pass.
-fn withheld_answer_head(queue_arn: &str) -> String {
-    format!(
-        "User: {SERVICE_PRINCIPAL} is not authorized to perform: {SEND_MESSAGE} on resource: \
-         {queue_arn} because no resource-based policy allows the {SEND_MESSAGE} action (Service: \
-         AmazonSQS; Status Code: {ACCESS_DENIED_STATUS}; Error Code: {ACCESS_DENIED}; Request ID: "
-    )
+/// that one refused call: the fixed sentence that service words for a queue it will not
+/// disclose, inside the metadata block naming the service, the status and the code —
+/// built from this suite's own literals rather than read from the implementation's
+/// helper, so a wrong answer there cannot make this suite pass.
+fn withheld_answer_head() -> String {
+    not_disclosed_answer_head()
 }
 
 /// A statement list wrapped as a policy document.
@@ -149,33 +138,33 @@ fn attribute(message: &Value, name: &str) -> String {
 }
 
 /// Assert the dead letter `message` reports the withheld send on `queue_arn` by the
-/// rule `rule`: the permission class, and beside it that service's refusal of the one
-/// call, whose id is the only part of the sentence the delivery did not state.
+/// rule `rule`: the resource class, and beside it that service's answer for a queue it
+/// will not disclose, whose id is the only part of the sentence that varies at all.
 fn assert_withheld(case: &str, message: &Value, queue_arn: &str, rule: &str) {
     let class = attribute(message, ERROR_CODE_ATTRIBUTE);
     assert_eq!(
-        class, NO_PERMISSIONS,
-        "case {case:?}: expected the dead-letter {ERROR_CODE_ATTRIBUTE} {NO_PERMISSIONS:?}, got \
+        class, NO_RESOURCE,
+        "case {case:?}: expected the dead-letter {ERROR_CODE_ATTRIBUTE} {NO_RESOURCE:?}, got \
          {class:?} in {message:?}"
     );
-    let head = withheld_answer_head(queue_arn);
+    let head = withheld_answer_head();
     let reported = attribute(message, ERROR_MESSAGE_ATTRIBUTE);
+    let request_id = answered_request_id(&reported, &head).unwrap_or_else(|| {
+        panic!("case {case:?}: expected {head:?} then the id of the refused call, got {reported:?}")
+    });
     assert!(
-        reported.starts_with(head.as_str()) && reported.ends_with(ANSWER_TAIL),
-        "case {case:?}: expected {head:?} then the id of the refused call and {ANSWER_TAIL:?}, \
-         got {reported:?}"
-    );
-    let request_id = reported
-        .strip_prefix(head.as_str())
-        .and_then(|rest| rest.strip_suffix(ANSWER_TAIL))
-        .unwrap_or_default();
-    // An AWS request id is a UUID in the canonical 8-4-4-4-12 form.
-    let widths: Vec<usize> = request_id.split('-').map(str::len).collect();
-    assert_eq!(
-        widths,
-        vec![8, 4, 4, 4, 12],
+        is_request_id(&request_id),
         "case {case:?}: expected a request id in the 8-4-4-4-12 form, got {request_id:?}"
     );
+    // That answer discloses nothing of the queue it was asked about, and is not the
+    // sentence that service keeps for a queue which is simply gone.
+    for withheld in [queue_arn, SERVICE_PRINCIPAL, SEND_MESSAGE, QUEUE_ABSENT_SENTENCE] {
+        assert!(
+            !reported.contains(withheld),
+            "case {case:?}: that service discloses nothing of the refused send, so {withheld:?} \
+             must not appear in {reported:?}"
+        );
+    }
     // The class names neither the delivery nor the failure's own words, so the letter
     // names the rule and the target beside it.
     assert_eq!(
@@ -206,9 +195,9 @@ async fn write_policy(emulator: &Emulator, case: &str, url: &str, policy: &str) 
 
 /// A grant is read FOR THE RULE being invoked: of two rules matching one event, the
 /// one its target queue's `aws:SourceArn` names is delivered, and the one whose queue
-/// names only the other rule is dead-lettered in the permission class.
+/// names only the other rule is dead-lettered under the answer that service gave.
 #[tokio::test]
-async fn a_grant_scoped_to_another_rule_dead_letters_in_the_permission_class() {
+async fn a_grant_scoped_to_another_rule_dead_letters_under_that_services_answer() {
     let case = "two rules matching one event, one queue scoped to the other rule";
     let emulator = emulator();
     let (dead_letter_url, dead_letter_arn) = given_queue(&emulator, "scoped-dlq").await;
@@ -323,47 +312,50 @@ fn granting_another_rule(queue_arn: &str) -> String {
 struct Row {
     case: &'static str,
     setup: Setup,
-    class: &'static str,
+    /// Whether the row's queue is THERE and only withheld the send, which is what the
+    /// answer declines to disclose and the repair leg then proves.
+    withheld: bool,
     repairable: bool,
 }
 
 /// The rule the table below publishes through.
 const TABLE_RULE: &str = "withheld-then-granted";
 
-/// Every form of withholding earns the permission class with that service's refusal
-/// of the call, and the queue it refused receives the next event once the grant is
-/// written — while a queue that is not THERE earns the resource class instead.
+/// Every form of withholding earns that service's own answer for a queue it will not
+/// disclose, in the resource class, and the queue it refused receives the next event
+/// once the grant is written — while a queue that is not THERE carries that service's
+/// other sentence under the same class.
 #[tokio::test]
-async fn the_withholding_class_is_the_permission_one_and_the_queue_is_still_there() {
+async fn the_withholding_class_is_the_answered_one_and_the_queue_is_still_there() {
     let rows = [
         Row {
             case: "a queue carrying no policy at all",
             setup: Setup::Queue(None),
-            class: NO_PERMISSIONS,
+            withheld: true,
             repairable: true,
         },
         Row {
             case: "a queue whose grant is scoped by aws:SourceArn to another rule",
             setup: Setup::Queue(Some(granting_another_rule)),
-            class: NO_PERMISSIONS,
+            withheld: true,
             repairable: true,
         },
         Row {
             case: "a queue granting the send to another service principal",
             setup: Setup::Queue(Some(granting_another_principal)),
-            class: NO_PERMISSIONS,
+            withheld: true,
             repairable: true,
         },
         Row {
             case: "a queue granting this service another action",
             setup: Setup::Queue(Some(granting_another_action)),
-            class: NO_PERMISSIONS,
+            withheld: true,
             repairable: true,
         },
         Row {
             case: "a queue ARN no queue was created for",
             setup: Setup::NeverCreated,
-            class: NO_RESOURCE,
+            withheld: false,
             repairable: false,
         },
     ];
@@ -423,7 +415,7 @@ async fn the_withholding_class_is_the_permission_one_and_the_queue_is_still_ther
             "case {case:?}: expected exactly one dead letter, got {parked:?}"
         );
         let message = &parked[0];
-        if row.class == NO_PERMISSIONS {
+        if row.withheld {
             assert_withheld(case, message, &target_arn, TABLE_RULE);
         } else {
             let class = attribute(message, ERROR_CODE_ATTRIBUTE);
@@ -432,12 +424,13 @@ async fn the_withholding_class_is_the_permission_one_and_the_queue_is_still_ther
                 "case {case:?}: expected the dead-letter {ERROR_CODE_ATTRIBUTE} \
                  {NO_RESOURCE:?}, got {class:?} in {message:?}"
             );
-            // The sentence agrees with the class: that service's own not-found answer,
-            // under its own code and status.
+            // The sentence agrees with what that service answered: its own not-found
+            // wording for a queue that is simply gone, under its own code and status.
             let reported = attribute(message, ERROR_MESSAGE_ATTRIBUTE);
             for stated in [
-                QUEUE_DOES_NOT_EXIST,
-                &QUEUE_DOES_NOT_EXIST_STATUS.to_string(),
+                QUEUE_NOT_DISCLOSED_CODE,
+                &QUEUE_NOT_DISCLOSED_STATUS.to_string(),
+                QUEUE_ABSENT_SENTENCE,
             ] {
                 assert!(
                     reported.contains(stated),
@@ -446,9 +439,9 @@ async fn the_withholding_class_is_the_permission_one_and_the_queue_is_still_ther
                 );
             }
             assert!(
-                !reported.contains(ACCESS_DENIED),
-                "case {case:?}: a target that is not there reports no authorization refusal, got \
-                 {reported:?}"
+                !reported.contains(QUEUE_NOT_DISCLOSED_SENTENCE),
+                "case {case:?}: a queue that is not there reads the absence sentence rather than \
+                 the undisclosed one, got {reported:?}"
             );
         }
 

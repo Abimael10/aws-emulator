@@ -9,11 +9,13 @@
 //! The RULE asserted here: the `ERROR_CODE` EventBridge stamps on a dead-lettered
 //! event is the service's OWN classification of why the delivery failed, never the
 //! target service's error code — but it is the classification OF THAT ANSWER, so
-//! which class a failure falls in follows what the target's service answered. A
-//! target the delivery could not address is `NO_RESOURCE`, the class of that
-//! service's own not-found answer; a target that IS there and refused the CALL is
-//! `NO_PERMISSIONS` — a queue whose own document withheld the send, and a role whose
-//! policies withhold the call (the class `tests/all/dead_letter_error_code.rs` spans
+//! which class a failure falls in follows what the target's service answered. An
+//! answer given under that service's not-found code is `NO_RESOURCE` — a target the
+//! delivery could not address, and a queue whose own document withheld the send,
+//! which Amazon SQS answers under that same code because it does not disclose a
+//! queue it will not let the caller write to; an answer refusing the IDENTITY the
+//! call was made as is `NO_PERMISSIONS`, which is what a role whose policies
+//! withhold the call earns (the class `tests/all/dead_letter_error_code.rs` spans
 //! over the two steps of a role-governed handover); a failure of any other kind is
 //! `UNKNOWN`. The
 //! target service's own answer is what the `ERROR_MESSAGE` beside it carries, in
@@ -27,11 +29,11 @@
 //! The table spans the class rather than one case: the rows differ along WHICH
 //! classification the failure falls in, along the target's SERVICE (a queue, a
 //! state machine), and along the FORM the failure takes within one class — a queue
-//! granting nothing and one refused by a policy scoped to another rule both being a
-//! call an existing target refused, a queue that was never created and one deleted
-//! after the target was written both being a resource the delivery could not address,
-//! while a queue refusing one parameter of the send is a third class on the same
-//! service.
+//! granting nothing, one refused by a policy scoped to another rule, one that was
+//! never created and one deleted after the target was written all being answers
+//! that service gives under its not-found code, while a queue refusing one parameter
+//! of the send is a third class on the same service and a state machine whose role
+//! withholds the call is the permission one.
 //!
 //! The harness (the router with EventBridge, Amazon SQS, Step Functions, IAM and
 //! CloudWatch on one engine, and the queue, role and rule fixtures) is
@@ -44,8 +46,9 @@ use service_com_amazonaws_eventbridge_awsevents::state::{
 };
 
 use crate::target_dispatch::{
-    drain, emulator, given_queue, given_queue_with_policy, given_role, given_rule,
-    given_state_machine, granting_events, invocations, publish, sqs, Emulator, REGION,
+    answered_request_id, drain, emulator, given_queue, given_queue_with_policy, given_role,
+    given_rule, given_state_machine, granting_events, invocations, is_request_id,
+    not_disclosed_answer_head, publish, sqs, Emulator, QUEUE_ABSENT_SENTENCE, REGION,
 };
 
 /// The rule every row publishes through.
@@ -267,12 +270,12 @@ async fn the_dead_letter_condition_classifies_the_targets_own_answer() {
         Row {
             case: "a queue whose policy grants this service nothing",
             target: Target::QueueGrantingNothing,
-            condition: Some(NO_PERMISSIONS),
+            condition: Some(NO_RESOURCE),
         },
         Row {
             case: "a queue whose policy is scoped by aws:SourceArn to another rule",
             target: Target::QueueGrantingAnotherRule,
-            condition: Some(NO_PERMISSIONS),
+            condition: Some(NO_RESOURCE),
         },
         Row {
             case: "a queue ARN no queue was created for",
@@ -387,12 +390,14 @@ async fn the_dead_letter_condition_classifies_the_targets_own_answer() {
 
 /// A queue target refused by its own policy reports the answer Amazon SQS gives a
 /// caller whose send the documents in force over the queue do not permit: that
-/// service's refusal of the CALL, at HTTP 403 under `AccessDenied`, whose sentence
-/// names the principal the send was made as, the action and the queue — which is the
-/// answer an operator and a replay tool read, and why the condition beside it is the
-/// permission one rather than the resource one.
+/// service does not disclose the queue, so the answer is its not-found code at HTTP
+/// 400 under the fixed sentence that states the absence and the want of access
+/// without saying which holds — which names neither the principal, nor the action,
+/// nor the queue, and is why the condition beside it is the resource one. The
+/// sentence a queue that is simply not there earns is that service's OTHER sentence
+/// for the same code, so the two are told apart by the answer and not by the class.
 #[tokio::test]
-async fn a_queue_refusing_the_send_reports_its_own_authorization_answer() {
+async fn a_queue_refusing_the_send_reports_the_answer_that_service_gives() {
     let case = "a queue granting this service nothing";
     let emulator = emulator();
     let (dead_letter_url, dead_letter_arn) = given_queue(&emulator, "worded-dlq").await;
@@ -420,18 +425,22 @@ async fn a_queue_refusing_the_send_reports_its_own_authorization_answer() {
     let reported = dead_lettered[0]["MessageAttributes"]["ERROR_MESSAGE"]["StringValue"]
         .as_str()
         .unwrap_or_default();
-    let expected = format!(
-        "User: {SERVICE_PRINCIPAL} is not authorized to perform: sqs:SendMessage on resource: \
-         {target_arn} because no resource-based policy allows the sqs:SendMessage action \
-         (Service: AmazonSQS; Status Code: 403; Error Code: AccessDenied; Request ID: "
-    );
+    let expected = not_disclosed_answer_head();
+    let request_id = answered_request_id(reported, &expected).unwrap_or_else(|| {
+        panic!("case {case:?}: expected {expected:?} and the id of the refused request, got {reported:?}")
+    });
     assert!(
-        reported.starts_with(expected.as_str()) && reported.ends_with("; Proxy: null)"),
-        "case {case:?}: expected {expected:?} and the id of the refused request, got {reported:?}"
+        is_request_id(&request_id),
+        "case {case:?}: expected a request id in the 8-4-4-4-12 form, got {request_id:?}"
     );
+    // That answer discloses nothing of the queue it was asked about: neither the
+    // principal the send was made as, nor the queue, nor the sentence that service
+    // keeps for a queue that is simply not there.
     assert!(
-        reported.contains(target_arn.as_str()) && reported.contains(SERVICE_PRINCIPAL),
-        "case {case:?}: expected the answer to name the refused call's queue and principal, got \
-         {reported:?}"
+        !reported.contains(target_arn.as_str())
+            && !reported.contains(SERVICE_PRINCIPAL)
+            && !reported.contains(QUEUE_ABSENT_SENTENCE),
+        "case {case:?}: expected an answer naming neither the queue nor the principal nor the \
+         absence, got {reported:?}"
     );
 }

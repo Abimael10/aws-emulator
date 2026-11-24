@@ -11,15 +11,16 @@
 //! destination queue's own resource policy alone authorizes the send (`PutTargets`:
 //! "for Lambda functions, Amazon SNS topics and Amazon SQS queues, EventBridge relies
 //! on resource-based policies"); what the delivery reads back from a queue whose
-//! documents do not permit the send is that service's refusal of the CALL — the code
-//! and status AWS answers an unauthorized call with (`AccessDenied`, HTTP 403), which
-//! `SendMessage` models no more than any other operation does because such a refusal
-//! is answered ahead of the operation (`smithy_query(query="operation",
+//! documents do not permit the send is that service's own answer for a queue it will
+//! not disclose to the caller — its not-found code at HTTP 400, which is why
+//! `SendMessage` models no authorization failure at all
+//! (`smithy_query(query="operation",
 //! operation="SendMessage",
 //! model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`)
-//! — and EventBridge classifies that answer, so the class is the permission one
-//! (`NO_PERMISSIONS`) and the sentence beside it is that service's own, naming the
-//! principal, the action and the queue of the refused send. Such an answer is the
+//! — and EventBridge classifies that answer, so the class is the resource one
+//! (`NO_RESOURCE`) and the sentence beside it is that service's own fixed text, which
+//! states the absence and the want of access without saying which holds. Such an
+//! answer is the
 //! same however often it is asked for, so nothing retries the handover: ONE attempt
 //! is counted, ONE dead letter is parked, and the letter accounts for no retry
 //! whatever the target's `RetryPolicy` allows.
@@ -49,13 +50,14 @@ use service_com_amazonaws_eventbridge_awsevents::state::retry_bounds::{
 };
 use service_com_amazonaws_eventbridge_awsevents::state::{
     rule_arn, DEFAULT_EVENT_BUS_NAME, FAILED_INVOCATIONS_METRIC, INVOCATIONS_SENT_TO_DLQ_METRIC,
-    INVOCATION_ATTEMPTS_METRIC, NO_PERMISSIONS, SERVICE_PRINCIPAL,
+    INVOCATION_ATTEMPTS_METRIC, NO_RESOURCE, SERVICE_PRINCIPAL,
     SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC,
 };
 
 use crate::target_dispatch::{
-    drain, emulator, given_queue, given_queue_with_policy, given_rule, granting_events, metric_sum,
-    publish, Emulator, REGION,
+    answered_request_id, drain, emulator, given_queue, given_queue_with_policy, given_rule,
+    granting_events, is_request_id, metric_sum, not_disclosed_answer_head, publish, Emulator,
+    REGION,
 };
 
 /// The rule every row below publishes through.
@@ -72,20 +74,6 @@ const ERROR_CODE_ATTRIBUTE: &str = "ERROR_CODE";
 const ERROR_MESSAGE_ATTRIBUTE: &str = "ERROR_MESSAGE";
 const RULE_ARN_ATTRIBUTE: &str = "RULE_ARN";
 const TARGET_ARN_ATTRIBUTE: &str = "TARGET_ARN";
-
-/// The error code AWS answers a call no document in force over the resource permits,
-/// the status it answers under, and the sentence it carries — stated here rather than
-/// read from the implementation's own constants, so a wrong answer there cannot make
-/// this suite pass. The sentence names the principal the send was made as, the action
-/// and the queue, which is what an authorization refusal is about.
-const QUEUE_ACCESS_DENIED: &str = "AccessDenied";
-const QUEUE_ACCESS_DENIED_STATUS: u16 = 403;
-fn queue_access_denied_message(queue_arn: &str) -> String {
-    format!(
-        "User: {SERVICE_PRINCIPAL} is not authorized to perform: {SEND_MESSAGE} on resource: \
-         {queue_arn} because no resource-based policy allows the {SEND_MESSAGE} action"
-    )
-}
 
 /// A statement list wrapped as a policy document.
 fn document(statements: Value) -> String {
@@ -305,33 +293,24 @@ async fn a_withheld_queue_delivery_is_attempted_once_under_every_retry_policy() 
             "case {case:?}: expected exactly one dead letter, got {parked:?}"
         );
         let message = &parked[0];
-        // The class is the one the ANSWER belongs to: that service answered a refusal
-        // of the call on a queue that is there, which is the permission class.
+        // The class is the one the ANSWER belongs to: that service answered under its
+        // own not-found code, which is the resource class.
         let class = attribute(message, ERROR_CODE_ATTRIBUTE);
         assert_eq!(
-            class, NO_PERMISSIONS,
-            "case {case:?}: expected the dead-letter {ERROR_CODE_ATTRIBUTE} {NO_PERMISSIONS:?}, \
+            class, NO_RESOURCE,
+            "case {case:?}: expected the dead-letter {ERROR_CODE_ATTRIBUTE} {NO_RESOURCE:?}, \
              got {class:?} in {message:?}"
         );
-        // The sentence beside it is that service's own answer, in full: the refusal of
-        // the call the delivery made, with the metadata block of the one refused call,
-        // whose id is the only part that varies.
-        let head = format!(
-            "{} (Service: AmazonSQS; Status Code: \
-             {QUEUE_ACCESS_DENIED_STATUS}; Error Code: {QUEUE_ACCESS_DENIED}; Request ID: ",
-            queue_access_denied_message(&target_arn)
-        );
+        // The sentence beside it is that service's own answer, in full: its fixed text
+        // inside the metadata block of the one refused call, whose id is the only part
+        // that varies.
+        let head = not_disclosed_answer_head();
         let reported = attribute(message, ERROR_MESSAGE_ATTRIBUTE);
+        let id = answered_request_id(&reported, &head).unwrap_or_else(|| {
+            panic!("case {case:?}: expected {head:?} then the id of the refused call, got {reported:?}")
+        });
         assert!(
-            reported.starts_with(head.as_str()) && reported.ends_with("; Proxy: null)"),
-            "case {case:?}: expected {head:?} then the id of the refused call, got {reported:?}"
-        );
-        let id = reported
-            .strip_prefix(head.as_str())
-            .and_then(|rest| rest.strip_suffix("; Proxy: null)"))
-            .unwrap_or_default();
-        assert!(
-            !id.is_empty(),
+            is_request_id(&id),
             "case {case:?}: expected the refused call's own id in that answer, got {reported:?}"
         );
         // Nothing retried the handover, so the letter accounts for no retry and names

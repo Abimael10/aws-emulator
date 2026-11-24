@@ -481,6 +481,64 @@ pub(crate) async fn given_queue_with_policy(
     (url, arn)
 }
 
+/// The error code and the status Amazon SQS answers a `SendMessage` it will not let the
+/// caller make: its own not-found class, under the `awsQueryError` code of
+/// `QueueDoesNotExist` (`smithy_query(query="shape", shape="QueueDoesNotExist",
+/// model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`,
+/// `httpError` 400). That service models no authorization failure on `SendMessage` at
+/// all (`smithy_query(query="operation", operation="SendMessage", model_path=...)`): a
+/// queue it will not let the caller write to is not disclosed to that caller.
+///
+/// Stated HERE rather than read from the implementation's own constants, so a wrong
+/// answer there cannot make a suite that asserts this pass.
+pub(crate) const QUEUE_NOT_DISCLOSED_CODE: &str = "AWS.SimpleQueueService.NonExistentQueue";
+pub(crate) const QUEUE_NOT_DISCLOSED_STATUS: u16 = 400;
+
+/// The sentence that answer carries, which states both the absence and the want of
+/// access without saying which holds. RECORDED behavior, fixed text in its entirety:
+/// nothing of the request, of the queue or of the account appears in it.
+pub(crate) const QUEUE_NOT_DISCLOSED_SENTENCE: &str =
+    "The specified queue does not exist or you do not have access to it.";
+
+/// The sentence Amazon SQS answers for the OTHER class of that one code — a queue that
+/// is simply not there — which no withheld send may read.
+pub(crate) const QUEUE_ABSENT_SENTENCE: &str = "The specified queue does not exist.";
+
+/// The name Amazon SQS's own error metadata carries.
+pub(crate) const SQS_SERVICE_NAME: &str = "AmazonSQS";
+
+/// What closes the metadata block of a relayed answer, after the id of the ONE refused
+/// call.
+pub(crate) const ANSWER_TAIL: &str = "; Proxy: null)";
+
+/// The whole answer a send no document in force over the queue permitted reads back, up
+/// to the id of that one refused call: the sentence above inside the metadata block an
+/// AWS error carries. Built from this suite's own literals for the same reason they are
+/// stated here.
+pub(crate) fn not_disclosed_answer_head() -> String {
+    format!(
+        "{QUEUE_NOT_DISCLOSED_SENTENCE} (Service: {SQS_SERVICE_NAME}; Status Code: \
+         {QUEUE_NOT_DISCLOSED_STATUS}; Error Code: {QUEUE_NOT_DISCLOSED_CODE}; Request ID: "
+    )
+}
+
+/// The request id `reported` states, where it is that answer with an id in place of the
+/// call it names — `None` for anything else.
+pub(crate) fn answered_request_id(reported: &str, head: &str) -> Option<String> {
+    reported
+        .strip_prefix(head)
+        .and_then(|rest| rest.strip_suffix(ANSWER_TAIL))
+        .map(str::to_string)
+}
+
+/// Whether `request_id` is an AWS request id: a UUID in the canonical 8-4-4-4-12 form.
+pub(crate) fn is_request_id(request_id: &str) -> bool {
+    request_id
+        .split('-')
+        .map(str::len)
+        .eq([8, 4, 4, 4, 12])
+}
+
 /// Every message waiting on the queue at `url`, with its attributes.
 pub(crate) async fn drain(emulator: &Emulator, url: &str) -> Vec<Value> {
     let (status, body) = sqs(

@@ -28,12 +28,12 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state::{
-    DEFAULT_RULE_STATE, NO_PERMISSIONS, RULE_STATE_DISABLED, RULE_STATE_ENABLED,
-    SERVICE_PRINCIPAL,
+    DEFAULT_RULE_STATE, NO_RESOURCE, RULE_STATE_DISABLED, RULE_STATE_ENABLED,
 };
 
 use crate::target_dispatch::{
-    drain, emulator, events, given_queue, given_queue_with_policy, Emulator, DETAIL_TYPE, SOURCE,
+    answered_request_id, drain, emulator, events, given_queue, given_queue_with_policy,
+    not_disclosed_answer_head, Emulator, DETAIL_TYPE, SOURCE,
 };
 
 /// The dead-letter attributes naming the delivery that failed and why.
@@ -51,15 +51,11 @@ const EXHAUSTED_RETRY_CONDITION_ATTRIBUTE: &str =
     service_com_amazonaws_eventbridge_awsevents::state::retry_bounds::EXHAUSTED_RETRY_CONDITION;
 
 /// What a dead letter of a send the target queue's own `Policy` withheld opens
-/// with: Amazon SQS's refusal of the CALL on a queue that is there — the code and
-/// status AWS answers an unauthorized call with (`AccessDenied`, HTTP 403) — naming
-/// the principal the send was made as, the action and the queue `queue_arn`.
-fn withheld_send_answer(queue_arn: &str) -> String {
-    format!(
-        "User: {SERVICE_PRINCIPAL} is not authorized to perform: sqs:SendMessage on resource: \
-         {queue_arn} because no resource-based policy allows the sqs:SendMessage action (Service: \
-         AmazonSQS; Status Code: 403; Error Code: AccessDenied; Request ID: "
-    )
+/// with: the answer Amazon SQS gives a caller it will not disclose the queue to — its
+/// not-found code at HTTP 400 under the fixed sentence that states the absence and
+/// the want of access without saying which holds.
+fn withheld_send_answer() -> String {
+    not_disclosed_answer_head()
 }
 
 /// The rule every row below publishes through.
@@ -326,14 +322,14 @@ async fn a_rule_that_is_not_enabled_neither_delivers_nor_dead_letters() {
                 );
                 assert_eq!(
                     attribute(message, ERROR_CODE_ATTRIBUTE),
-                    NO_PERMISSIONS,
+                    NO_RESOURCE,
                     "case {case:?} (granted {granted}): expected the class of the answer Amazon \
                      SQS gave the withheld send, got {message:?}"
                 );
                 let reported = attribute(message, ERROR_MESSAGE_ATTRIBUTE);
-                let head = withheld_send_answer(&target_arn);
+                let head = withheld_send_answer();
                 assert!(
-                    reported.starts_with(head.as_str()) && reported.ends_with("; Proxy: null)"),
+                    answered_request_id(&reported, &head).is_some(),
                     "case {case:?} (granted {granted}): expected {head:?} then \
                      the id of the refused call, got {reported:?}"
                 );

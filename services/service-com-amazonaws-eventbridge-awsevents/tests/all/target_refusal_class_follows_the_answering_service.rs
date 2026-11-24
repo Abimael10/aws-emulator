@@ -14,14 +14,14 @@
 //! service really answers, and is NOT one verdict this service reaches for every
 //! failed delivery:
 //!
-//! * Amazon SQS answers a send the queue's own document does not permit with the code
-//!   and status AWS answers an unauthorized call with (HTTP 403, `AccessDenied`),
-//!   naming the principal, the action and the queue — a refusal of the CALL on a queue
-//!   that answered it, so the PERMISSION class — and keeps `QueueDoesNotExist` (HTTP
-//!   400, `awsQueryError` code `AWS.SimpleQueueService.NonExistentQueue`,
-//!   `smithy_query(query="operation", operation="SendMessage",
-//!   model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`)
-//!   for a queue that is not THERE, which is the RESOURCE class;
+//! * Amazon SQS models no authorization failure on `SendMessage` at all
+//!   (`smithy_query(query="operation", operation="SendMessage",
+//!   model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`):
+//!   it does not disclose a queue it will not let the caller write to, so a send the
+//!   queue's own document does not permit is answered `QueueDoesNotExist` (HTTP 400,
+//!   `awsQueryError` code `AWS.SimpleQueueService.NonExistentQueue`) — the same code
+//!   that service answers for a queue that is not THERE, under its own sentence for
+//!   each of the two — so both land in the RESOURCE class;
 //! * Amazon SNS answers a publish its topic's policy does not permit with
 //!   `AuthorizationErrorException` (HTTP 403, `awsQueryError` code
 //!   `AuthorizationError`,
@@ -33,9 +33,9 @@
 //! The table's rows therefore differ along the target's SERVICE, along the FORM the
 //! withholding takes (no document at all, an explicit `Deny` beside a grant, the
 //! document that service generates for the resource's owner) and along whether the
-//! target is there at all, each row stating both the class and the error code the
-//! message must name — so a class read off anything but the answer, or one collapsed
-//! for every failed delivery, fails here. A control row whose queue DOES grant the
+//! target is there at all, each row stating both the class and what the message must
+//! name of that service's answer — so a class read off anything but the answer, or one
+//! collapsed for every failed delivery, fails here. A control row whose queue DOES grant the
 //! send receives the event and parks no dead letter, so no row passes because nothing
 //! was delivered anywhere.
 //!
@@ -49,7 +49,7 @@ use service_com_amazonaws_eventbridge_awsevents::state::{
 
 use crate::target_dispatch::{
     drain, emulator, given_queue, given_queue_with_policy, given_rule, granting_events, publish,
-    sns, xml_text, Emulator, REGION,
+    sns, xml_text, Emulator, QUEUE_ABSENT_SENTENCE, QUEUE_NOT_DISCLOSED_SENTENCE, REGION,
 };
 
 /// The rule every row below publishes through.
@@ -67,9 +67,8 @@ const TARGET_ARN_ATTRIBUTE: &str = "TARGET_ARN";
 const SEND_MESSAGE: &str = "sqs:SendMessage";
 const PUBLISH: &str = "sns:Publish";
 
-/// The error code each answering service reports its refusal under.
-const QUEUE_DOES_NOT_EXIST: &str = "AWS.SimpleQueueService.NonExistentQueue";
-const QUEUE_ACCESS_DENIED: &str = "AccessDenied";
+/// The error code Amazon SNS reports its refusal of a publish under
+/// (`AuthorizationErrorException`'s `awsQueryError` code).
 const AUTHORIZATION_ERROR: &str = "AuthorizationError";
 
 /// A statement list wrapped as a policy document.
@@ -110,8 +109,10 @@ enum Setup {
 }
 
 /// One row: the case, how its target is brought about, and the answer the dead letter
-/// is to carry — the error code the answering service reported under, and the class
-/// this service puts that code in. `None` for a row whose delivery goes through.
+/// is to carry — what the answering service's own answer states, and the class this
+/// service puts that answer in. What it states is that service's error code, or, where
+/// one code covers two classes of answer, the sentence that tells them apart. `None`
+/// for a row whose delivery goes through.
 struct Row {
     case: &'static str,
     setup: Setup,
@@ -213,17 +214,17 @@ async fn a_withheld_deliverys_class_is_the_class_of_the_answering_services_code(
         Row {
             case: "a queue carrying no policy at all",
             setup: Setup::Queue(None),
-            expected: Some((QUEUE_ACCESS_DENIED, NO_PERMISSIONS)),
+            expected: Some((QUEUE_NOT_DISCLOSED_SENTENCE, NO_RESOURCE)),
         },
         Row {
             case: "a queue whose policy denies the send beside granting it",
             setup: Setup::Queue(Some(queue_denying)),
-            expected: Some((QUEUE_ACCESS_DENIED, NO_PERMISSIONS)),
+            expected: Some((QUEUE_NOT_DISCLOSED_SENTENCE, NO_RESOURCE)),
         },
         Row {
             case: "a queue ARN no queue was created for",
             setup: Setup::NeverCreated,
-            expected: Some((QUEUE_DOES_NOT_EXIST, NO_RESOURCE)),
+            expected: Some((QUEUE_ABSENT_SENTENCE, NO_RESOURCE)),
         },
         Row {
             case: "a topic on the document Amazon SNS generates for its owner",
@@ -263,7 +264,7 @@ async fn a_withheld_deliverys_class_is_the_class_of_the_answering_services_code(
         publish(&emulator).await;
 
         let dead_lettered = drain(&emulator, &dead_letter_url).await;
-        let Some((code, class)) = row.expected else {
+        let Some((states, class)) = row.expected else {
             assert!(
                 dead_lettered.is_empty(),
                 "case {case:?}: a delivery that went through is not dead-lettered, got \
@@ -297,9 +298,9 @@ async fn a_withheld_deliverys_class_is_the_class_of_the_answering_services_code(
         let message = &dead_lettered[0];
         let reported = attribute(message, ERROR_MESSAGE_ATTRIBUTE);
         assert!(
-            reported.contains(code),
-            "case {case:?}: expected the answering service's code {code:?} in the reported \
-             answer, got {reported:?}"
+            reported.contains(states),
+            "case {case:?}: expected the answering service's own answer to state {states:?}, got \
+             {reported:?}"
         );
         let reported_class = attribute(message, ERROR_CODE_ATTRIBUTE);
         assert_eq!(

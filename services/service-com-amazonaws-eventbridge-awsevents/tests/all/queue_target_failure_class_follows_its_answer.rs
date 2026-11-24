@@ -12,19 +12,21 @@
 //! message, and the two can never name two different failures. For a queue target the
 //! send is authorized by the queue's own resource policy alone ("for Lambda functions,
 //! Amazon SNS topics and Amazon SQS queues, EventBridge relies on resource-based
-//! policies", `PutTargets`), and which refusal that service answers depends on which
-//! of the two reasons it was: a queue that is THERE and did not permit the sender
-//! answers a refusal of the CALL, under the code and status AWS answers an
-//! unauthorized call with (`AccessDenied`, HTTP 403 — a refusal answered ahead of the
-//! operation, which is why `SendMessage` declares none:
-//! `smithy_query(query="operation", operation="SendMessage",
-//! model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`),
-//! and that code's class is the permission one; a queue that is NOT there answers
+//! policies", `PutTargets`), and Amazon SQS models no authorization failure on
+//! `SendMessage` at all (`smithy_query(query="operation", operation="SendMessage",
+//! model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`)
+//! because it does not disclose a queue it will not let the caller write to: both a
+//! queue whose documents withheld the send and a queue that is not THERE are answered
 //! `QueueDoesNotExist`, HTTP 400 under `AWS.SimpleQueueService.NonExistentQueue`
 //! (`smithy_query(query="shape", shape="QueueDoesNotExist",
 //! model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`),
-//! whose class is the resource one. Both codes are in the table below, so a row whose
-//! two attributes named different classes would fail.
+//! each under its own sentence — so the class of both is the resource one. The one
+//! refusal that service DOES answer as an authorization failure is the key an
+//! encrypted queue's messages are encrypted under, which it relays as
+//! `KMS.AccessDeniedException` and which is the permission class; that code is in the
+//! table below, so a message naming it where the row expects the resource class fails
+//! here (the encrypted-queue rule itself is
+//! `tests/all/encrypted_queue_target_key_policy.rs`'s).
 //!
 //! The table spans that rule rather than one case: its rows differ along the FORM a
 //! refusal takes (no document at all, an explicit `Deny`, a grant scoped by
@@ -34,7 +36,8 @@
 //! after the target was written). The expected class of each row is DERIVED from the
 //! error code the row's message carries, through the one table below, so a row whose
 //! two attributes disagreed would fail whichever of them was wrong — and the row also
-//! states the class it expects, so the derivation cannot pass vacuously.
+//! states the class and the sentence it expects, so the derivation cannot pass
+//! vacuously.
 //!
 //! The condition operators and keys the rows use are IAM's own, because a queue's
 //! `Policy` is an IAM policy document
@@ -49,8 +52,9 @@ use service_com_amazonaws_eventbridge_awsevents::state::{
 };
 
 use crate::target_dispatch::{
-    drain, emulator, given_queue, given_queue_with_policy, given_rule, publish, sqs, Emulator,
-    REGION,
+    answered_request_id, drain, emulator, given_queue, given_queue_with_policy, given_rule,
+    is_request_id, not_disclosed_answer_head, publish, sqs, Emulator, QUEUE_ABSENT_SENTENCE,
+    QUEUE_NOT_DISCLOSED_CODE, QUEUE_NOT_DISCLOSED_SENTENCE, REGION,
 };
 
 /// The rule every row below publishes through.
@@ -68,40 +72,20 @@ const ERROR_MESSAGE_ATTRIBUTE: &str = "ERROR_MESSAGE";
 const RULE_ARN_ATTRIBUTE: &str = "RULE_ARN";
 const TARGET_ARN_ATTRIBUTE: &str = "TARGET_ARN";
 
-/// The error code a target service answers under when it refuses the CALL on a
-/// resource that is there — for a queue target the queue's own document withholding
-/// the send, and the key an encrypted queue's messages are encrypted under
-/// (`KMS.AccessDeniedException` names it).
-const ACCESS_DENIED: &str = "AccessDenied";
-
-/// The status that refusal is answered with, which the reported answer states beside
-/// the code.
-const ACCESS_DENIED_STATUS: u16 = 403;
-
-/// The sentence it carries — built here rather than read from the implementation's own
-/// helper, so a wrong sentence there cannot make this suite pass. An authorization
-/// refusal names the call it refused: the principal, the action and the resource.
-fn access_denied_message(queue_arn: &str) -> String {
-    format!(
-        "User: {SERVICE_PRINCIPAL} is not authorized to perform: {SEND_MESSAGE} on resource: \
-         {queue_arn} because no resource-based policy allows the {SEND_MESSAGE} action"
-    )
-}
-
-/// Amazon SQS's own error code for a send on a queue that is not there:
-/// `QueueDoesNotExist`'s `awsQueryError` code.
-const QUEUE_DOES_NOT_EXIST: &str = "AWS.SimpleQueueService.NonExistentQueue";
-
-/// The fixed sentence that answer carries — stated here rather than read from the
-/// implementation's own constant, so a wrong sentence there cannot make this suite
-/// pass.
-const QUEUE_DOES_NOT_EXIST_MESSAGE: &str = "The specified queue does not exist.";
+/// The error code a queue target's service answers when the key an ENCRYPTED queue's
+/// messages are encrypted under withholds the data key — the one refusal of a send
+/// that service really does answer as an authorization failure, which it relays under
+/// its own code (`KmsAccessDenied`'s `awsQueryError` code,
+/// `smithy_query(query="shape", shape="KmsAccessDenied",
+/// model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`).
+/// No row here encrypts its queue, so no row may read it.
+const KEY_ACCESS_DENIED: &str = "KMS.AccessDeniedException";
 
 /// Which class each error code a queue target's service answers belongs to. Source:
 /// the two refusals above, as the services that answer them publish them.
 const CLASS_OF_CODE: [(&str, &str); 2] = [
-    (ACCESS_DENIED, NO_PERMISSIONS),
-    (QUEUE_DOES_NOT_EXIST, NO_RESOURCE),
+    (QUEUE_NOT_DISCLOSED_CODE, NO_RESOURCE),
+    (KEY_ACCESS_DENIED, NO_PERMISSIONS),
 ];
 
 /// The account every resource below belongs to.
@@ -197,12 +181,13 @@ enum Setup {
 }
 
 /// One row: the case, how its target queue is brought about, and the answer that
-/// state earns — the error code the target's service gives, and the class this
-/// service puts that code in.
+/// state earns — the error code the target's service gives, the sentence it words that
+/// answer with, and the class this service puts that code in.
 struct Row {
     case: &'static str,
     setup: Setup,
     code: &'static str,
+    sentence: &'static str,
     class: &'static str,
 }
 
@@ -268,49 +253,57 @@ async fn a_dead_letters_class_and_message_come_from_one_answer() {
         Row {
             case: "a queue carrying no policy at all",
             setup: Setup::Queue(None),
-            code: ACCESS_DENIED,
-            class: NO_PERMISSIONS,
+            code: QUEUE_NOT_DISCLOSED_CODE,
+            sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
+            class: NO_RESOURCE,
         },
         Row {
             case: "a queue whose policy denies the send beside granting it",
             setup: Setup::Queue(Some(denying)),
-            code: ACCESS_DENIED,
-            class: NO_PERMISSIONS,
+            code: QUEUE_NOT_DISCLOSED_CODE,
+            sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
+            class: NO_RESOURCE,
         },
         Row {
             case: "a queue whose grant is scoped by aws:SourceArn to another rule",
             setup: Setup::Queue(Some(granting_another_rule)),
-            code: ACCESS_DENIED,
-            class: NO_PERMISSIONS,
+            code: QUEUE_NOT_DISCLOSED_CODE,
+            sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
+            class: NO_RESOURCE,
         },
         Row {
             case: "a queue whose grant is scoped by aws:SourceAccount to another account",
             setup: Setup::Queue(Some(granting_another_account)),
-            code: ACCESS_DENIED,
-            class: NO_PERMISSIONS,
+            code: QUEUE_NOT_DISCLOSED_CODE,
+            sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
+            class: NO_RESOURCE,
         },
         Row {
             case: "a queue granting this service another action",
             setup: Setup::Queue(Some(granting_another_action)),
-            code: ACCESS_DENIED,
-            class: NO_PERMISSIONS,
+            code: QUEUE_NOT_DISCLOSED_CODE,
+            sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
+            class: NO_RESOURCE,
         },
         Row {
             case: "a queue granting the send to another service principal",
             setup: Setup::Queue(Some(granting_another_principal)),
-            code: ACCESS_DENIED,
-            class: NO_PERMISSIONS,
+            code: QUEUE_NOT_DISCLOSED_CODE,
+            sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
+            class: NO_RESOURCE,
         },
         Row {
             case: "a queue ARN no queue was created for",
             setup: Setup::NeverCreated,
-            code: QUEUE_DOES_NOT_EXIST,
+            code: QUEUE_NOT_DISCLOSED_CODE,
+            sentence: QUEUE_ABSENT_SENTENCE,
             class: NO_RESOURCE,
         },
         Row {
             case: "a queue deleted after the target was written",
             setup: Setup::Deleted,
-            code: QUEUE_DOES_NOT_EXIST,
+            code: QUEUE_NOT_DISCLOSED_CODE,
+            sentence: QUEUE_ABSENT_SENTENCE,
             class: NO_RESOURCE,
         },
     ];
@@ -351,12 +344,15 @@ async fn a_dead_letters_class_and_message_come_from_one_answer() {
         let message = &parked[0];
         let reported = attribute(message, ERROR_MESSAGE_ATTRIBUTE);
         // The answer is the target service's own: the code that service answered
-        // under, as the delivery read it.
-        assert!(
-            reported.contains(row.code),
-            "case {case:?}: expected the answer that service gave to name {:?}, got {reported:?}",
-            row.code
-        );
+        // under and the sentence it worded for what it answered, as the delivery read
+        // them.
+        for stated in [row.code, row.sentence] {
+            assert!(
+                reported.contains(stated),
+                "case {case:?}: expected the answer that service gave to state {stated:?}, got \
+                 {reported:?}"
+            );
+        }
         // The class is the class of the code inside that very answer, so the pair
         // cannot name two failures.
         let derived = class_of(&reported);
@@ -392,10 +388,12 @@ async fn a_dead_letters_class_and_message_come_from_one_answer() {
 
 /// The answer a withheld send earns states the ONE call it refused: a second delivery
 /// to the same queue reports the same refusal with a fresh id for its own refused
-/// call, and each names the queue, the principal and the action that call asked for,
-/// which is what an authorization refusal is about.
+/// call, and the rest of it is the fixed text that service words for a queue it will
+/// not disclose — so it names neither the queue, nor the principal, nor the action
+/// that call asked for, and it is not the sentence that service keeps for a queue
+/// which is simply gone.
 #[tokio::test]
-async fn the_withheld_send_answer_states_one_call_and_names_what_it_refused() {
+async fn the_withheld_send_answer_states_one_call_and_discloses_nothing_of_it() {
     let case = "a queue granting this service nothing";
     let emulator = emulator();
     let (dead_letter_url, dead_letter_arn) = given_queue(&emulator, "named-dlq").await;
@@ -422,43 +420,29 @@ async fn the_withheld_send_answer_states_one_call_and_names_what_it_refused() {
         2,
         "case {case:?}: expected one dead letter per refused delivery, got {parked:?}"
     );
-    let head = format!(
-        "{} (Service: AmazonSQS; Status Code: \
-         {ACCESS_DENIED_STATUS}; Error Code: {ACCESS_DENIED}; Request ID: ",
-        access_denied_message(&target_arn)
-    );
+    let head = not_disclosed_answer_head();
     let mut ids = Vec::new();
     for message in &parked {
         let reported = attribute(message, ERROR_MESSAGE_ATTRIBUTE);
+        let id = answered_request_id(&reported, &head).unwrap_or_else(|| {
+            panic!("case {case:?}: expected {head:?} then the id of the refused call, got {reported:?}")
+        });
         assert!(
-            reported.starts_with(head.as_str()) && reported.ends_with("; Proxy: null)"),
-            "case {case:?}: expected {head:?} then the id of the refused call, got {reported:?}"
-        );
-        let id = reported
-            .strip_prefix(head.as_str())
-            .and_then(|rest| rest.strip_suffix("; Proxy: null)"))
-            .unwrap_or_default()
-            .to_string();
-        // An AWS request id is a UUID in the canonical 8-4-4-4-12 form.
-        let widths: Vec<usize> = id.split('-').map(str::len).collect();
-        assert_eq!(
-            widths,
-            vec![8, 4, 4, 4, 12],
+            is_request_id(&id),
             "case {case:?}: expected a request id in the 8-4-4-4-12 form, got {id:?}"
         );
-        // That answer is about the CALL, so it names what the call asked for — and
-        // not the absence of a queue that answered it.
-        for named in [target_arn.as_str(), SERVICE_PRINCIPAL, SEND_MESSAGE] {
+        // That answer discloses nothing of the call it was asked about, and is not
+        // the sentence a queue that is simply gone earns.
+        for withheld in [target_arn.as_str(), SERVICE_PRINCIPAL, SEND_MESSAGE] {
             assert!(
-                reported.contains(named),
-                "case {case:?}: expected the refused send's {named:?} in that answer, got \
+                !reported.contains(withheld),
+                "case {case:?}: expected the refused send's {withheld:?} NOT to be disclosed, got \
                  {reported:?}"
             );
         }
         assert!(
-            !reported.contains(QUEUE_DOES_NOT_EXIST)
-                && !reported.contains(QUEUE_DOES_NOT_EXIST_MESSAGE),
-            "case {case:?}: a queue that answered the send does not report an absence, got \
+            !reported.contains(QUEUE_ABSENT_SENTENCE),
+            "case {case:?}: a queue that is there does not read the absence sentence, got \
              {reported:?}"
         );
         ids.push(id);

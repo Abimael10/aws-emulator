@@ -34,7 +34,7 @@ use service_com_amazonaws_eventbridge_awsevents::state::bus_logs::{
     INVOCATION_FAILURE, LOG_LEVEL_ERROR, LOG_LEVEL_INFO, LOG_LEVEL_OFF, LOG_LEVEL_TRACE,
 };
 use service_com_amazonaws_eventbridge_awsevents::state::{
-    rule_arn, NO_PERMISSIONS, SERVICE_PRINCIPAL,
+    rule_arn, NO_PERMISSIONS, NO_RESOURCE, SERVICE_PRINCIPAL,
 };
 use service_com_amazonaws_eventbridge_awsevents::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -641,11 +641,11 @@ async fn every_withheld_handover_is_reported_through_a_delivery_that_carries_thi
             case: "a queue granting nothing",
             target: Target::Queue { granted: false },
             log_type: Some(ERROR_LOGS_LOG_TYPE),
-            // A queue that is there and whose policy does not authorize the send
-            // answers a refusal of the CALL, as a log group's own answer does, so
-            // the condition the record reports for a withheld send is the
-            // permission one.
-            reports: Some(NO_PERMISSIONS),
+            // Amazon SQS does not disclose a queue it will not let the caller write
+            // to: it answers under its own not-found code rather than refusing the
+            // identity the way a log group's own answer does, so the condition the
+            // record reports for a withheld send is the resource one.
+            reports: Some(NO_RESOURCE),
         },
         Row {
             case: "a queue granting the send",
