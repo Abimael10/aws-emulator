@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResourceGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetResourceGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetResourceGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -142,6 +133,20 @@ impl From<GetResourceGatewayErrorModeled> for GetResourceGatewayError {
     }
 }
 
+/// HTTP 404 for an identifier that names no persisted resource gateway, built by the
+/// slice's shared error construction ([`crate::state::resource_access_not_found`]): AWS's
+/// not-found wording for a resource gateway over the submitted identifier, and the kind's
+/// resource-type token.
+fn not_found(identifier: &str) -> GetResourceGatewayError {
+    GetResourceGatewayErrorModeled::ResourceNotFoundException(
+        crate::state::resource_access_not_found(
+            crate::state::ResourceKind::ResourceGateway,
+            identifier,
+        ),
+    )
+    .into()
+}
+
 /// The `GetResourceGateway` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -178,18 +183,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetResourceGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetResourceGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetResourceGateway"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetResourceGatewayErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the vpc-lattice state store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        // `resourceGatewayIdentifier` is "the ID or ARN of the resource gateway", so it
+        // resolves in either modelled form.
+        let identifier = &input.resource_gateway_identifier;
+        let Some(id) = crate::state::id_from_identifier(
+            identifier,
+            crate::state::PREFIX_RESOURCE_GATEWAY,
+        ) else {
+            return Err(not_found(identifier));
+        };
+        let now = std::time::SystemTime::now();
+        let store = state.lock();
+        let Some(gateway) = store.resource_gateways.get(&id) else {
+            return Err(not_found(identifier));
+        };
+        Ok(GetResourceGatewayOutput {
+            name: Some(gateway.name.clone()),
+            id: Some(gateway.id.clone()),
+            arn: Some(gateway.arn.clone()),
+            status: Some(gateway.status(now).to_string()),
+            vpc_id: gateway.vpc_id.clone(),
+            subnet_ids: gateway.subnet_ids.clone(),
+            // A gateway a CALLER created is the caller's: `serviceManaged` and `managedBy`
+            // report a gateway Amazon Web Services created on the account's behalf, and
+            // nothing here creates one of those.
+            service_managed: Some(false),
+            managed_by: None,
+            security_group_ids: gateway.security_group_ids.clone(),
+            ip_address_type: gateway.ip_address_type.clone(),
+            ipv4_addresses_per_eni: gateway.ipv4_addresses_per_eni,
+            resource_config_dns_resolution: gateway.resource_config_dns_resolution.clone(),
+            created_at: Some(crate::state::timestamp(gateway.created_at)),
+            last_updated_at: Some(crate::state::timestamp(gateway.last_updated_at)),
+        })
     }
 }

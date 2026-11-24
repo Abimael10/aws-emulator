@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResourceConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResourceConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResourceConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -122,6 +113,41 @@ impl From<ListResourceConfigurationsErrorModeled> for ListResourceConfigurations
     }
 }
 
+/// HTTP 400 for a request this operation refuses, naming the member at fault.
+fn invalid(message: String, member: &str, detail: String) -> ListResourceConfigurationsError {
+    ListResourceConfigurationsErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: detail,
+        }]),
+    })
+    .into()
+}
+
+/// The summary of one stored configuration, with the status the clock owes it at `now`.
+fn summary_of(
+    configuration: &crate::state::ResourceConfiguration,
+    now: std::time::SystemTime,
+) -> ResourceConfigurationSummary {
+    ResourceConfigurationSummary {
+        id: Some(configuration.id.clone()),
+        name: Some(configuration.name.clone()),
+        arn: Some(configuration.arn.clone()),
+        resource_gateway_id: configuration.resource_gateway_id.clone(),
+        resource_configuration_group_id: configuration.resource_configuration_group_id.clone(),
+        r#type: Some(configuration.configuration_type.clone()),
+        status: Some(configuration.status(now).to_string()),
+        amazon_managed: Some(false),
+        created_at: Some(crate::state::timestamp(configuration.created_at)),
+        last_updated_at: Some(crate::state::timestamp(configuration.last_updated_at)),
+        custom_domain_name: configuration.custom_domain_name.clone(),
+        domain_verification_id: None,
+        group_domain: configuration.group_domain.clone(),
+    }
+}
+
 /// The `ListResourceConfigurations` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -158,18 +184,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResourceConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResourceConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResourceConfigurations"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListResourceConfigurationsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the vpc-lattice state store is unavailable".to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+        let Ok(after) = crate::state::decode_cursor(input.next_token.as_deref()) else {
+            return Err(invalid(
+                "nextToken is not a token this service issued".to_string(),
+                "nextToken",
+                "the token does not name a page of this result set".to_string(),
+            ));
+        };
+        // Each filter accepts either modelled form of its identifier. One that resolves to
+        // no id of its kind matches nothing: this operation models no
+        // `ResourceNotFoundException`, so an empty page is the answer.
+        let gateway_filter = input.resource_gateway_identifier.as_deref().map(|identifier| {
+            crate::state::id_from_identifier(identifier, crate::state::PREFIX_RESOURCE_GATEWAY)
+        });
+        let group_filter = input
+            .resource_configuration_group_identifier
+            .as_deref()
+            .map(|identifier| {
+                crate::state::id_from_identifier(
+                    identifier,
+                    crate::state::PREFIX_RESOURCE_CONFIGURATION,
+                )
+            });
+        // A domain verification is a resource of its own that nothing here creates yet —
+        // `StartDomainVerification` and its siblings keep their own stub issues — so a
+        // request narrowed by one matches no stored configuration. When those operations
+        // land, this filter narrows by the verification each configuration carries.
+        let verification_filtered = input.domain_verification_identifier.is_some();
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(crate::state::MAX_PAGE_SIZE)
+            .clamp(1, crate::state::MAX_PAGE_SIZE);
+        let now = std::time::SystemTime::now();
+        let store = state.lock();
+
+        let mut ordered: Vec<&crate::state::ResourceConfiguration> = store
+            .resource_configurations
+            .values()
+            .filter(|configuration| {
+                !verification_filtered
+                    && gateway_filter.as_ref().is_none_or(|wanted| {
+                        wanted.as_deref() == configuration.resource_gateway_id.as_deref()
+                    })
+                    && group_filter.as_ref().is_none_or(|wanted| {
+                        wanted.as_deref()
+                            == configuration.resource_configuration_group_id.as_deref()
+                    })
+            })
+            .collect();
+        ordered.sort_by_key(|configuration| configuration.sequence);
+
+        let mut items: Vec<ResourceConfigurationSummary> = Vec::new();
+        let mut page_ends_at = after;
+        let mut more_follow = false;
+        for configuration in ordered
+            .iter()
+            .filter(|configuration| configuration.sequence > after)
+        {
+            if items.len() == page_size {
+                more_follow = true;
+                break;
+            }
+            page_ends_at = configuration.sequence;
+            items.push(summary_of(configuration, now));
+        }
+
+        Ok(ListResourceConfigurationsOutput {
+            items: Some(items),
+            next_token: more_follow.then(|| crate::state::encode_cursor(page_ends_at)),
+        })
     }
 }

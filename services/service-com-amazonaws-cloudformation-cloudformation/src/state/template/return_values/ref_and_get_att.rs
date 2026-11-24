@@ -2258,6 +2258,47 @@ pub(crate) fn return_values(
             attributes.insert("ResiliencyGroupId".to_string(), group_id);
             (arn, attributes)
         }
+        // Amazon VPC Lattice's own control plane: the resource gateway, the resource
+        // configuration and the two associations a template declares beside the service
+        // network above. Each type's `Ref` returns the resource's ARN (its primary
+        // identifier) and `Fn::GetAtt` reads that ARN and the `Id` inside it. That service
+        // MINTS both — every one of those creates answers an id it drew (`rgw-`, `rcfg-`,
+        // `snra-`, `snva-`, each 17 characters) with the ARN built around it — so the values
+        // here are STAND-INS of those forms, which `super::provisioning` re-points at what
+        // each create really answered
+        // ([`super::provisioner::vpc_lattice_resources`]).
+        VPCLATTICE_RESOURCE_GATEWAY
+        | VPCLATTICE_RESOURCE_CONFIGURATION
+        | VPCLATTICE_SERVICE_NETWORK_RESOURCE_ASSOCIATION
+        | VPCLATTICE_SERVICE_NETWORK_VPC_ASSOCIATION => {
+            let (path, prefix) = match resource_type {
+                VPCLATTICE_RESOURCE_GATEWAY => (
+                    VPCLATTICE_RESOURCE_GATEWAY_PATH,
+                    VPCLATTICE_RESOURCE_GATEWAY_ID_PREFIX,
+                ),
+                VPCLATTICE_RESOURCE_CONFIGURATION => (
+                    VPCLATTICE_RESOURCE_CONFIGURATION_PATH,
+                    VPCLATTICE_RESOURCE_CONFIGURATION_ID_PREFIX,
+                ),
+                VPCLATTICE_SERVICE_NETWORK_RESOURCE_ASSOCIATION => (
+                    VPCLATTICE_RESOURCE_ASSOCIATION_PATH,
+                    VPCLATTICE_RESOURCE_ASSOCIATION_ID_PREFIX,
+                ),
+                _ => (
+                    VPCLATTICE_VPC_ASSOCIATION_PATH,
+                    VPCLATTICE_VPC_ASSOCIATION_ID_PREFIX,
+                ),
+            };
+            let id = generated_service_id(prefix, name, VPCLATTICE_ID_CHARACTERS);
+            let arn = ::emulator_server::emulator_arn(
+                VPCLATTICE_ARN_NAMESPACE,
+                region,
+                &format!("{path}/{id}"),
+            );
+            attributes.insert(VPCLATTICE_ARN_ATTRIBUTE.to_string(), arn.clone());
+            attributes.insert(VPCLATTICE_ID_ATTRIBUTE.to_string(), id);
+            (arn, attributes)
+        }
         // CloudWatch Application Signals' own control plane: the service level objective an
         // `AWS::ApplicationSignals::ServiceLevelObjective` declares. "Ref returns the ARN",
         // which that service builds from its own namespace, the Region and the objective's

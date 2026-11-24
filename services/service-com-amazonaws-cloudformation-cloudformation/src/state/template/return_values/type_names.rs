@@ -2179,3 +2179,55 @@ pub const MEMORYDB_ARN_NAMESPACE: &str = "memorydb";
 /// `DescribeSubnetGroups` report in each group's `ARN` member.
 pub const MEMORYDB_PARAMETER_GROUP_SEGMENT: &str = "parametergroup";
 pub const MEMORYDB_SUBNET_GROUP_SEGMENT: &str = "subnetgroup";
+
+/// The `AWS::<cloudFormationName>::<Resource>` types of the Amazon VPC Lattice
+/// RESOURCE-ACCESS estate a template declares, beside the service network and the access log
+/// subscription above. The middle segment is that model's own
+/// `awsService.cloudFormationName` (`VpcLattice`).
+///
+/// * a RESOURCE GATEWAY — "a point of ingress into the VPC where a resource resides"
+///   (`CreateResourceGateway`'s own documentation), opened in a declared VPC's subnets;
+/// * a RESOURCE CONFIGURATION — what one resource reached through such a gateway IS, as a
+///   client of the service network addresses it;
+/// * a SERVICE-NETWORK/RESOURCE ASSOCIATION — the binding that shares one configuration
+///   into one service network;
+/// * a SERVICE-NETWORK/VPC ASSOCIATION — the binding that lets a VPC's resources reach the
+///   services in a service network.
+///
+/// Each type's `Ref` returns the resource's ARN (its primary identifier) and `Fn::GetAtt`
+/// reads that ARN and the `Id` inside it. Amazon VPC Lattice MINTS both, exactly as it does
+/// for the two types above: every one of those creates takes a name or a pair of identifiers
+/// and answers the `rgw-`/`rcfg-`/`snra-`/`snva-` id it drew with the ARN built around it, so
+/// no naming rule could compute either and [`identity_is_service_assigned`] names all four.
+pub const VPCLATTICE_RESOURCE_GATEWAY: &str = "AWS::VpcLattice::ResourceGateway";
+pub const VPCLATTICE_RESOURCE_CONFIGURATION: &str = "AWS::VpcLattice::ResourceConfiguration";
+pub const VPCLATTICE_SERVICE_NETWORK_RESOURCE_ASSOCIATION: &str =
+    "AWS::VpcLattice::ServiceNetworkResourceAssociation";
+pub const VPCLATTICE_SERVICE_NETWORK_VPC_ASSOCIATION: &str =
+    "AWS::VpcLattice::ServiceNetworkVpcAssociation";
+
+/// The resource path each of those ARNs carries before the id that service minted, and the
+/// prefix of that id — both from the modelled ARN and id patterns of each resource
+/// (`resourcegateway/rgw-…`, `resourceconfiguration/rcfg-…`,
+/// `servicenetworkresourceassociation/snra-…`, `servicenetworkvpcassociation/snva-…`). The
+/// namespace they sit in and the width of the id are that service's own
+/// ([`VPCLATTICE_ARN_NAMESPACE`], [`VPCLATTICE_ID_CHARACTERS`]).
+pub(super) const VPCLATTICE_RESOURCE_GATEWAY_PATH: &str = "resourcegateway";
+pub(super) const VPCLATTICE_RESOURCE_CONFIGURATION_PATH: &str = "resourceconfiguration";
+pub(super) const VPCLATTICE_RESOURCE_ASSOCIATION_PATH: &str =
+    "servicenetworkresourceassociation";
+pub(super) const VPCLATTICE_VPC_ASSOCIATION_PATH: &str = "servicenetworkvpcassociation";
+pub(super) const VPCLATTICE_RESOURCE_GATEWAY_ID_PREFIX: &str = "rgw";
+pub(super) const VPCLATTICE_RESOURCE_CONFIGURATION_ID_PREFIX: &str = "rcfg";
+pub(super) const VPCLATTICE_RESOURCE_ASSOCIATION_ID_PREFIX: &str = "snra";
+pub(super) const VPCLATTICE_VPC_ASSOCIATION_ID_PREFIX: &str = "snva";
+
+/// Every `Fn::GetAtt` attribute each of those four types publishes, in the sorted order a
+/// resource's own attribute map holds them in: the ARN that service minted and the id inside
+/// it, which are the two read-only values each create answers the resource's identity in.
+pub(super) const VPCLATTICE_RESOURCE_ACCESS_ATTRIBUTES: &[&str] = &["Arn", "Id"];
+
+/// The two attributes by name, so the arms that compute them and the provisioner that
+/// re-points them at what the create really answered cannot spell them differently.
+pub const VPCLATTICE_ARN_ATTRIBUTE: &str = "Arn";
+pub const VPCLATTICE_ID_ATTRIBUTE: &str = "Id";

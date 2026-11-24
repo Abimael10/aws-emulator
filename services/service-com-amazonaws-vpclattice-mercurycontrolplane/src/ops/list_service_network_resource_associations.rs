@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListServiceNetworkResourceAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListServiceNetworkResourceAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListServiceNetworkResourceAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -123,6 +114,52 @@ impl From<ListServiceNetworkResourceAssociationsErrorModeled> for ListServiceNet
     }
 }
 
+/// HTTP 400 for a request this operation refuses, naming the member at fault.
+fn invalid(
+    message: String,
+    member: &str,
+    detail: String,
+) -> ListServiceNetworkResourceAssociationsError {
+    ListServiceNetworkResourceAssociationsErrorModeled::ValidationException(
+        ValidationException {
+            message,
+            reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
+            field_list: Some(vec![ValidationExceptionField {
+                name: member.to_string(),
+                message: detail,
+            }]),
+        },
+    )
+    .into()
+}
+
+/// The summary of one stored association, with the status the clock owes it at `now`.
+fn summary_of(
+    association: &crate::state::ServiceNetworkResourceAssociation,
+    now: std::time::SystemTime,
+) -> ServiceNetworkResourceAssociationSummary {
+    ServiceNetworkResourceAssociationSummary {
+        id: Some(association.id.clone()),
+        arn: Some(association.arn.clone()),
+        status: Some(association.status(now).to_string()),
+        created_by: Some(association.created_by.clone()),
+        created_at: Some(crate::state::timestamp(association.created_at)),
+        resource_configuration_id: Some(association.resource_configuration_id.clone()),
+        resource_configuration_arn: Some(association.resource_configuration_arn.clone()),
+        resource_configuration_name: Some(association.resource_configuration_name.clone()),
+        service_network_id: Some(association.service_network_id.clone()),
+        service_network_arn: Some(association.service_network_arn.clone()),
+        service_network_name: Some(association.service_network_name.clone()),
+        // A DNS entry is announced for a domain the shared resource answers under, and
+        // nothing here announces one for a resource configuration.
+        dns_entry: None,
+        private_dns_entry: None,
+        is_managed_association: Some(false),
+        failure_code: None,
+        private_dns_enabled: association.private_dns_enabled,
+    }
+}
+
 /// The `ListServiceNetworkResourceAssociations` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -159,18 +196,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListServiceNetworkResourceAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListServiceNetworkResourceAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListServiceNetworkResourceAssociations"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListServiceNetworkResourceAssociationsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the vpc-lattice state store is unavailable".to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+        let Ok(after) = crate::state::decode_cursor(input.next_token.as_deref()) else {
+            return Err(invalid(
+                "nextToken is not a token this service issued".to_string(),
+                "nextToken",
+                "the token does not name a page of this result set".to_string(),
+            ));
+        };
+        // Both filters accept either modelled form of their identifier. One that resolves
+        // to no id of its kind matches nothing: this operation models no
+        // `ResourceNotFoundException`, so an empty page is the answer.
+        let network_filter = input.service_network_identifier.as_deref().map(|identifier| {
+            crate::state::id_from_identifier(identifier, crate::state::PREFIX_SERVICE_NETWORK)
+        });
+        let configuration_filter = input
+            .resource_configuration_identifier
+            .as_deref()
+            .map(|identifier| {
+                crate::state::id_from_identifier(
+                    identifier,
+                    crate::state::PREFIX_RESOURCE_CONFIGURATION,
+                )
+            });
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(crate::state::MAX_PAGE_SIZE)
+            .clamp(1, crate::state::MAX_PAGE_SIZE);
+        let now = std::time::SystemTime::now();
+        let store = state.lock();
+
+        // `includeChildren` widens a filter on a GROUP configuration to the associations of
+        // its children, which are the configurations that name it as their group.
+        let children: Vec<String> = match (input.include_children, configuration_filter.as_ref())
+        {
+            (Some(true), Some(Some(parent))) => store
+                .resource_configurations
+                .values()
+                .filter(|configuration| {
+                    configuration.resource_configuration_group_id.as_deref()
+                        == Some(parent.as_str())
+                })
+                .map(|configuration| configuration.id.clone())
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        let mut ordered: Vec<&crate::state::ServiceNetworkResourceAssociation> = store
+            .resource_associations
+            .values()
+            .filter(|association| {
+                network_filter.as_ref().is_none_or(|wanted| {
+                    wanted.as_deref() == Some(association.service_network_id.as_str())
+                }) && configuration_filter.as_ref().is_none_or(|wanted| {
+                    wanted.as_deref() == Some(association.resource_configuration_id.as_str())
+                        || children.contains(&association.resource_configuration_id)
+                })
+            })
+            .collect();
+        ordered.sort_by_key(|association| association.sequence);
+
+        let mut items: Vec<ServiceNetworkResourceAssociationSummary> = Vec::new();
+        let mut page_ends_at = after;
+        let mut more_follow = false;
+        for association in ordered
+            .iter()
+            .filter(|association| association.sequence > after)
+        {
+            if items.len() == page_size {
+                more_follow = true;
+                break;
+            }
+            page_ends_at = association.sequence;
+            items.push(summary_of(association, now));
+        }
+
+        Ok(ListServiceNetworkResourceAssociationsOutput {
+            items,
+            next_token: more_follow.then(|| crate::state::encode_cursor(page_ends_at)),
+        })
     }
 }

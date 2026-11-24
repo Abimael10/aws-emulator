@@ -48,6 +48,7 @@ mod access_log_subscriptions;
 mod announced_dns;
 mod auth_policies;
 mod data_plane_addresses;
+mod resource_access;
 mod tags;
 mod targets;
 mod vpc_associations;
@@ -72,6 +73,16 @@ pub use targets::{
     HEALTH_CHECK_MEMBER, TARGET_DRAINING_TIME, TARGET_FAILURE_INVALID_TARGET,
     TARGET_FAILURE_TARGET_NOT_FOUND, TARGET_REASON_HEALTH_CHECK_DISABLED,
     TARGET_REASON_HEALTH_CHECK_NOT_SUPPORTED, TARGET_STATUS_DRAINING,
+};
+pub use resource_access::{
+    check_port_ranges, invalid_port_range_message, resource_access_not_found,
+    ResourceConfiguration, ResourceGateway, ServiceNetworkResourceAssociation,
+    DEFAULT_ALLOW_SHAREABLE_ASSOCIATION, DEFAULT_RESOURCE_CONFIGURATION_PROTOCOL,
+    KIND_RESOURCE_ASSOCIATION, KIND_RESOURCE_GATEWAY, MAX_PORT, MAX_RESOURCE_ASSOCIATIONS,
+    MAX_RESOURCE_CONFIGURATIONS, MAX_RESOURCE_GATEWAYS, MIN_PORT, PORT_RANGES_MEMBER,
+    PREFIX_RESOURCE_ASSOCIATION, PREFIX_RESOURCE_GATEWAY, PROTOCOL_TYPES,
+    RESOURCE_GATEWAY_NAME_PATTERN, SHAREABLE_ASSOCIATION_TYPES, STATUS_ACTIVE,
+    STATUS_CREATE_IN_PROGRESS, STATUS_DELETE_IN_PROGRESS,
 };
 pub use vpc_associations::ServiceNetworkVpcAssociation;
 
@@ -167,11 +178,15 @@ pub enum ResourceKind {
     ResourceConfiguration,
     /// An access log subscription (`als-…`).
     AccessLogSubscription,
+    /// A resource gateway (`rgw-…`).
+    ResourceGateway,
+    /// A service-network/resource association (`snra-…`).
+    ResourceAssociation,
 }
 
 impl ResourceKind {
     /// How many kinds there are, so a per-kind cache can hold one slot each.
-    pub const COUNT: usize = 9;
+    pub const COUNT: usize = 11;
 
     /// This kind's slot in a per-kind array ([`Self::COUNT`] wide).
     pub const fn slot(self) -> usize {
@@ -185,6 +200,8 @@ impl ResourceKind {
             Self::ResourceConfiguration => 6,
             Self::VpcAssociation => 7,
             Self::AccessLogSubscription => 8,
+            Self::ResourceGateway => 9,
+            Self::ResourceAssociation => 10,
         }
     }
 
@@ -201,6 +218,8 @@ impl ResourceKind {
             Self::TargetGroup => KIND_TARGET_GROUP,
             Self::ResourceConfiguration => KIND_RESOURCE_CONFIGURATION,
             Self::AccessLogSubscription => KIND_ACCESS_LOG_SUBSCRIPTION,
+            Self::ResourceGateway => KIND_RESOURCE_GATEWAY,
+            Self::ResourceAssociation => KIND_RESOURCE_ASSOCIATION,
         }
     }
 
@@ -216,6 +235,8 @@ impl ResourceKind {
             Self::TargetGroup => PREFIX_TARGET_GROUP,
             Self::ResourceConfiguration => PREFIX_RESOURCE_CONFIGURATION,
             Self::AccessLogSubscription => PREFIX_ACCESS_LOG_SUBSCRIPTION,
+            Self::ResourceGateway => PREFIX_RESOURCE_GATEWAY,
+            Self::ResourceAssociation => PREFIX_RESOURCE_ASSOCIATION,
         }
     }
 
@@ -240,6 +261,8 @@ impl ResourceKind {
             Self::TargetGroup => "TARGET_GROUP",
             Self::ResourceConfiguration => "RESOURCE_CONFIGURATION",
             Self::AccessLogSubscription => "ACCESS_LOG_SUBSCRIPTION",
+            Self::ResourceGateway => "RESOURCE_GATEWAY",
+            Self::ResourceAssociation => "SERVICE_NETWORK_RESOURCE_ASSOCIATION",
         }
     }
 
@@ -264,6 +287,8 @@ impl ResourceKind {
             Self::TargetGroup => "TargetGroup",
             Self::ResourceConfiguration => "ResourceConfiguration",
             Self::AccessLogSubscription => "AccessLogSubscription",
+            Self::ResourceGateway => "ResourceGateway",
+            Self::ResourceAssociation => "ServiceNetworkResourceAssociation",
         }
     }
 
@@ -281,6 +306,8 @@ impl ResourceKind {
             Self::TargetGroup => "target group",
             Self::ResourceConfiguration => "resource configuration",
             Self::AccessLogSubscription => "access log subscription",
+            Self::ResourceGateway => "resource gateway",
+            Self::ResourceAssociation => "service network resource association",
         }
     }
 
@@ -329,9 +356,13 @@ impl ResourceKind {
             Self::Rule => Some(RULE_NAME_PATTERN),
             Self::TargetGroup => Some(TARGET_GROUP_NAME_PATTERN),
             Self::ResourceConfiguration => Some(RESOURCE_CONFIGURATION_NAME_PATTERN),
+            Self::ResourceGateway => Some(RESOURCE_GATEWAY_NAME_PATTERN),
             // Neither an association nor an access log subscription has a name: each is
             // named by what it binds.
-            Self::ServiceAssociation | Self::VpcAssociation | Self::AccessLogSubscription => None,
+            Self::ServiceAssociation
+            | Self::VpcAssociation
+            | Self::AccessLogSubscription
+            | Self::ResourceAssociation => None,
         }
     }
 }
@@ -1588,6 +1619,12 @@ pub struct ComAmazonawsVpclatticeMercurycontrolplaneState {
     /// that reads it
     /// ([`ComAmazonawsVpclatticeMercurycontrolplaneState::expire_deleted_target_groups`]).
     pub target_groups: HashMap<String, TargetGroup>,
+    /// Keyed by `rgw-…` id. At most [`MAX_RESOURCE_GATEWAYS`] entries.
+    pub resource_gateways: HashMap<String, ResourceGateway>,
+    /// Keyed by `rcfg-…` id. At most [`MAX_RESOURCE_CONFIGURATIONS`] entries.
+    pub resource_configurations: HashMap<String, ResourceConfiguration>,
+    /// Keyed by `snra-…` id. At most [`MAX_RESOURCE_ASSOCIATIONS`] entries.
+    pub resource_associations: HashMap<String, ServiceNetworkResourceAssociation>,
     /// `<resource id>` -> the resource-based permission policy document
     /// `PutResourcePolicy` attached to that resource, for the kinds whose ARN the
     /// operation accepts ([`policy_target`]). One entry per resource that has a policy,
@@ -2053,12 +2090,12 @@ impl ComAmazonawsVpclatticeMercurycontrolplaneState {
             ResourceKind::Listener => self.listeners.contains_key(id),
             ResourceKind::Rule => self.rules.contains_key(id),
             ResourceKind::TargetGroup => self.target_groups.contains_key(id),
-            // `CreateResourceConfiguration` is still a 501, so no resource
-            // configuration can be stored for one to be found.
-            ResourceKind::ResourceConfiguration => false,
+            ResourceKind::ResourceConfiguration => self.resource_configurations.contains_key(id),
             ResourceKind::AccessLogSubscription => {
                 self.access_log_subscriptions.contains_key(id)
             }
+            ResourceKind::ResourceGateway => self.resource_gateways.contains_key(id),
+            ResourceKind::ResourceAssociation => self.resource_associations.contains_key(id),
         }
     }
 
@@ -2471,6 +2508,8 @@ pub fn check_resource_name(
 /// one slot per kind.
 fn compiled_pattern(kind: ResourceKind) -> Option<&'static ::fancy_regex::Regex> {
     static COMPILED: [::std::sync::OnceLock<::fancy_regex::Regex>; ResourceKind::COUNT] = [
+        ::std::sync::OnceLock::new(),
+        ::std::sync::OnceLock::new(),
         ::std::sync::OnceLock::new(),
         ::std::sync::OnceLock::new(),
         ::std::sync::OnceLock::new(),

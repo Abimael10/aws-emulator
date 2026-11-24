@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListServiceNetworkVpcAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListServiceNetworkVpcAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListServiceNetworkVpcAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -119,6 +110,44 @@ impl From<ListServiceNetworkVpcAssociationsErrorModeled> for ListServiceNetworkV
     }
 }
 
+/// HTTP 400 for a request this operation refuses, naming the member at fault.
+fn invalid(
+    message: String,
+    member: &str,
+    detail: String,
+) -> ListServiceNetworkVpcAssociationsError {
+    ListServiceNetworkVpcAssociationsErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: detail,
+        }]),
+    })
+    .into()
+}
+
+/// The summary of one stored association, with the status the clock owes it at `now`.
+fn summary_of(
+    association: &crate::state::ServiceNetworkVpcAssociation,
+    now: std::time::SystemTime,
+) -> ServiceNetworkVpcAssociationSummary {
+    ServiceNetworkVpcAssociationSummary {
+        id: Some(association.id.clone()),
+        arn: Some(association.arn.clone()),
+        status: Some(association.status(now).to_string()),
+        created_by: Some(association.created_by.clone()),
+        created_at: Some(crate::state::timestamp(association.created_at)),
+        service_network_id: Some(association.service_network_id.clone()),
+        service_network_name: Some(association.service_network_name.clone()),
+        service_network_arn: Some(association.service_network_arn.clone()),
+        private_dns_enabled: association.private_dns_enabled,
+        dns_options: association.dns_options.clone(),
+        vpc_id: Some(association.vpc_id.clone()),
+        last_updated_at: Some(crate::state::timestamp(association.last_updated_at)),
+    }
+}
+
 /// The `ListServiceNetworkVpcAssociations` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -155,18 +184,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListServiceNetworkVpcAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListServiceNetworkVpcAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListServiceNetworkVpcAssociations"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListServiceNetworkVpcAssociationsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the vpc-lattice state store is unavailable".to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+        // "You must provide either the service network identifier or the VPC identifier"
+        // (this operation's own documentation), so a request that filters by neither is
+        // refused rather than answered with the whole store.
+        if input.service_network_identifier.is_none() && input.vpc_identifier.is_none() {
+            return Err(invalid(
+                "either serviceNetworkIdentifier or vpcIdentifier must be provided".to_string(),
+                "serviceNetworkIdentifier",
+                "provide this or vpcIdentifier".to_string(),
+            ));
+        }
+        let Ok(after) = crate::state::decode_cursor(input.next_token.as_deref()) else {
+            return Err(invalid(
+                "nextToken is not a token this service issued".to_string(),
+                "nextToken",
+                "the token does not name a page of this result set".to_string(),
+            ));
+        };
+        // The service-network filter accepts either modelled form of its identifier; the
+        // VPC filter is modelled as a bare VPC id. One that resolves to nothing matches
+        // nothing: this operation models no `ResourceNotFoundException`, so an empty page is
+        // the answer.
+        let network_filter = input.service_network_identifier.as_deref().map(|identifier| {
+            crate::state::id_from_identifier(identifier, crate::state::PREFIX_SERVICE_NETWORK)
+        });
+        let vpc_filter = input.vpc_identifier.as_deref();
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(crate::state::MAX_PAGE_SIZE)
+            .clamp(1, crate::state::MAX_PAGE_SIZE);
+        let now = std::time::SystemTime::now();
+        let store = state.lock();
+
+        let mut ordered: Vec<&crate::state::ServiceNetworkVpcAssociation> = store
+            .vpc_associations
+            .values()
+            .filter(|association| {
+                network_filter.as_ref().is_none_or(|wanted| {
+                    wanted.as_deref() == Some(association.service_network_id.as_str())
+                }) && vpc_filter.is_none_or(|wanted| wanted == association.vpc_id)
+            })
+            .collect();
+        ordered.sort_by_key(|association| association.sequence);
+
+        let mut items: Vec<ServiceNetworkVpcAssociationSummary> = Vec::new();
+        let mut page_ends_at = after;
+        let mut more_follow = false;
+        for association in ordered
+            .iter()
+            .filter(|association| association.sequence > after)
+        {
+            if items.len() == page_size {
+                more_follow = true;
+                break;
+            }
+            page_ends_at = association.sequence;
+            items.push(summary_of(association, now));
+        }
+
+        Ok(ListServiceNetworkVpcAssociationsOutput {
+            items,
+            next_token: more_follow.then(|| crate::state::encode_cursor(page_ends_at)),
+        })
     }
 }

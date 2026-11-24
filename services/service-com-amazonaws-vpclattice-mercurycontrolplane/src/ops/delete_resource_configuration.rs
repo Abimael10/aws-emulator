@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteResourceConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteResourceConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteResourceConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -113,6 +104,18 @@ impl From<DeleteResourceConfigurationErrorModeled> for DeleteResourceConfigurati
     }
 }
 
+/// HTTP 404 for an identifier that names no persisted resource configuration; see
+/// [`crate::state::resource_access_not_found`].
+fn not_found(identifier: &str) -> DeleteResourceConfigurationError {
+    DeleteResourceConfigurationErrorModeled::ResourceNotFoundException(
+        crate::state::resource_access_not_found(
+            crate::state::ResourceKind::ResourceConfiguration,
+            identifier,
+        ),
+    )
+    .into()
+}
+
 /// The `DeleteResourceConfiguration` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -149,18 +152,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteResourceConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteResourceConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteResourceConfiguration"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteResourceConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the vpc-lattice state store is unavailable".to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+        let identifier = &input.resource_configuration_identifier;
+        let Some(id) = crate::state::id_from_identifier(
+            identifier,
+            crate::state::PREFIX_RESOURCE_CONFIGURATION,
+        ) else {
+            return Err(not_found(identifier));
+        };
+        let mut store = state.lock();
+        if !store.resource_configurations.contains_key(&id) {
+            return Err(not_found(identifier));
+        }
+        // A configuration shared into a service network cannot go while that sharing
+        // stands: the association would name a configuration that no longer exists.
+        if store
+            .resource_associations
+            .values()
+            .any(|association| association.resource_configuration_id == id)
+        {
+            return Err(DeleteResourceConfigurationErrorModeled::ConflictException(
+                crate::state::conflict(
+                    crate::state::ResourceKind::ResourceConfiguration,
+                    &id,
+                    format!("ResourceConfiguration {id} has service network(s) associated"),
+                ),
+            )
+            .into());
+        }
+        // A CHILD configuration belongs to its GROUP, so the group cannot go first.
+        if store
+            .resource_configurations
+            .values()
+            .any(|configuration| {
+                configuration.resource_configuration_group_id.as_deref() == Some(id.as_str())
+            })
+        {
+            return Err(DeleteResourceConfigurationErrorModeled::ConflictException(
+                crate::state::conflict(
+                    crate::state::ResourceKind::ResourceConfiguration,
+                    &id,
+                    format!(
+                        "ResourceConfiguration {id} has child resource configuration(s)"
+                    ),
+                ),
+            )
+            .into());
+        }
+        let Some(_removed) = store.remove_resource_configuration(&id) else {
+            return Err(not_found(identifier));
+        };
+        // The model gives this response no members; the 204 is the whole answer.
+        Ok(DeleteResourceConfigurationOutput {})
     }
 }

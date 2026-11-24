@@ -3226,6 +3226,12 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     // subscription, the monitored resource that service resolved.
     VPCLATTICE_SERVICE_NETWORK,
     VPCLATTICE_ACCESS_LOG_SUBSCRIPTION,
+    // The four RESOURCE-ACCESS types of that service a stack really creates, each publishing
+    // the ARN that service minted for the resource and the id inside it.
+    VPCLATTICE_RESOURCE_GATEWAY,
+    VPCLATTICE_RESOURCE_CONFIGURATION,
+    VPCLATTICE_SERVICE_NETWORK_RESOURCE_ASSOCIATION,
+    VPCLATTICE_SERVICE_NETWORK_VPC_ASSOCIATION,
 ];
 
 /// Evaluate one intrinsic function.

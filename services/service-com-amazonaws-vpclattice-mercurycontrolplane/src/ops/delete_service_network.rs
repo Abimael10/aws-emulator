@@ -205,6 +205,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // A resource configuration shared into the service network is a dependent of the
+        // same kind as a service or a VPC: the association names the network, so the
+        // network cannot go while one stands.
+        if store
+            .resource_associations
+            .values()
+            .any(|association| association.service_network_id == id)
+        {
+            return Err(DeleteServiceNetworkErrorModeled::ConflictException(
+                crate::state::conflict(
+                    crate::state::ResourceKind::ServiceNetwork,
+                    &id,
+                    format!("ServiceNetwork {id} has resource configuration(s) associated"),
+                ),
+            )
+            .into());
+        }
         if let Some(removed) = store.service_networks.remove(&id) {
             let name_key =
                 crate::state::name_key(crate::state::KIND_SERVICE_NETWORK, &removed.name);

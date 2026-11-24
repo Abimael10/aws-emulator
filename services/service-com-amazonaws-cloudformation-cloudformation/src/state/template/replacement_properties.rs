@@ -153,6 +153,28 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         // the limit's amount and its period and no device at all, so a declaration naming
         // another device asks for a different limit.
         BRAKET_SPENDING_LIMIT => &["DeviceArn"],
+        // Amazon VPC Lattice publishes an update for a resource gateway's SECURITY GROUPS
+        // (`UpdateResourceGateway` takes `securityGroupIds` and nothing else) and for a
+        // configuration's port ranges and allowed sharing (`UpdateResourceConfiguration`), so
+        // every OTHER property of either type is one its create alone takes: a declaration
+        // restating one asks for a different resource, which CloudFormation replaces. An
+        // ASSOCIATION is the binding between two resources, so every side of it is
+        // create-only; the VPC association's security groups are `UpdateServiceNetworkVpc\
+        // Association`'s own member and so reach it in place. (Each type's `Name`, where it
+        // has one, is in that position through [`name_is_create_only`].)
+        VPCLATTICE_RESOURCE_GATEWAY => &["IpAddressType", "SubnetIds", "VpcIdentifier"],
+        VPCLATTICE_RESOURCE_CONFIGURATION => &[
+            "ResourceConfigurationDefinition",
+            "ResourceConfigurationGroupId",
+            "ResourceConfigurationType",
+            "ResourceGatewayId",
+        ],
+        VPCLATTICE_SERVICE_NETWORK_RESOURCE_ASSOCIATION => {
+            &["ResourceConfigurationId", "ServiceNetworkId"]
+        }
+        VPCLATTICE_SERVICE_NETWORK_VPC_ASSOCIATION => {
+            &["ServiceNetworkIdentifier", "VpcIdentifier"]
+        }
         // An AWS HealthLake FHIR data store keeps what its create made it with: the FHIR
         // release version it hosts, the Synthea data it was preloaded with and the key it is
         // encrypted under are members of `CreateFHIRDatastore` and of no member of

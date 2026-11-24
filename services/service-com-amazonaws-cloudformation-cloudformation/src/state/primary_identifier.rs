@@ -96,6 +96,15 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         // the Arn") — the handle every call on either takes; the type's own `Name` is only
         // what the resource is called, and two accounts' reports may share one.
         BCM_DASHBOARD | BCM_SCHEDULED_REPORT => "Arn",
+        // Each Amazon VPC Lattice RESOURCE-ACCESS resource is identified by the ARN that
+        // service minted for it ("Ref returns the Arn"), which is the handle every VPC Lattice
+        // call on one takes; a gateway's or a configuration's own `Name` is only what it is
+        // called, and an association has no name at all. (The service network and the access
+        // log subscription are in the same position, under their own arm above.)
+        VPCLATTICE_RESOURCE_GATEWAY
+        | VPCLATTICE_RESOURCE_CONFIGURATION
+        | VPCLATTICE_SERVICE_NETWORK_RESOURCE_ASSOCIATION
+        | VPCLATTICE_SERVICE_NETWORK_VPC_ASSOCIATION => VPCLATTICE_ARN_ATTRIBUTE,
         // An Amazon Bedrock SESSION, identified by the ARN the Bedrock Agent runtime built
         // around the uuid it minted ("Ref returns the session ARN") — one of the two forms
         // every call on a session takes as its `sessionIdentifier`; the type declares no name a

@@ -1684,6 +1684,15 @@ pub(super) enum Provisioner {
     /// the owning service does not hold is ITS refusal — a 404 `ResourceNotFoundException`,
     /// which the resource reports in the provider envelope under the `NotFound` handler class.
     VpcLatticeAccessLogSubscription,
+    /// `AWS::VpcLattice::ResourceGateway`, `::ResourceConfiguration`,
+    /// `::ServiceNetworkResourceAssociation` and `::ServiceNetworkVpcAssociation`: the
+    /// RESOURCE-ACCESS estate of that same control plane, beside the two types above. Each is
+    /// made by that service's own `Create…` and removed by its own `Delete…`, and each create
+    /// MINTS the resource's identity — the id it drew and the ARN built around it — so the ARN
+    /// it answered is the resource's physical id and the handle every later call takes
+    /// ([`vpc_lattice_resources`]). Which of the four the declaration is travels with the
+    /// variant, the four sharing one set of arms ([`vpc_lattice_resources::Resource`]).
+    VpcLatticeResource(vpc_lattice_resources::Resource),
 }
 
 /// The provisioner that owns a template resource type, or `None` for a type this emulator
@@ -2007,8 +2016,12 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         }
         // The Amazon Bedrock AgentCore family's entries are catalogued beside that family's
         // own type names and arms ([`type_registry`]), so adding one of its types is a change
-        // to that file alone; every other type answers `None` and is left declared-only.
-        _ => agentcore_provisioner_for(resource_type),
+        // to that file alone; the Amazon VPC Lattice family's are catalogued beside its own
+        // arms the same way ([`vpc_lattice_resources`]); every other type answers `None` and
+        // is left declared-only.
+        _ => agentcore_provisioner_for(resource_type).or_else(|| {
+            vpc_lattice_provisioner_for(resource_type).map(Provisioner::VpcLatticeResource)
+        }),
     }
 }
 impl Provisioner {
@@ -3165,6 +3178,13 @@ impl Provisioner {
             Self::VpcLatticeAccessLogSubscription => {
                 create_vpc_lattice_access_log_subscription(ctx, region, resource, propagated)
                     .await
+            }
+            // Every one of the four RESOURCE-ACCESS types publishes `Tags` too, and every one
+            // of their creates takes a `tags` MAP of its own, so a resource a stack creates
+            // there carries the tags CloudFormation gives it beside the ones its declaration
+            // asks for.
+            Self::VpcLatticeResource(kind) => {
+                create_vpc_lattice_resource(ctx, region, kind, resource, propagated).await
             }
         }
     }
@@ -4495,6 +4515,12 @@ impl Provisioner {
                 delete_vpc_lattice_access_log_subscription(ctx, region, physical_resource_id)
                     .await
             }
+            // Each of the four RESOURCE-ACCESS deletes addresses its resource by that same
+            // ARN, which is one of the two forms every identifier member of that service
+            // accepts.
+            Self::VpcLatticeResource(kind) => {
+                delete_vpc_lattice_resource(ctx, region, kind, physical_resource_id).await
+            }
         }
     }
 
@@ -4921,6 +4947,15 @@ use client_vpn::*;
 /// their entries for them by those names.
 pub(in crate::state) mod rekognition_resources;
 use rekognition_resources::*;
+
+/// The Amazon VPC Lattice RESOURCE-ACCESS family — the resource gateway, the resource
+/// configuration and the two associations — whose arms are [`vpc_lattice_resources`]'s,
+/// beside the service-network and subscription arms of [`vpc_lattice`]. Visible to the rest
+/// of this service's state because that module names the four types it serves.
+pub(in crate::state) mod vpc_lattice_resources;
+use vpc_lattice_resources::{
+    create_vpc_lattice_resource, delete_vpc_lattice_resource, vpc_lattice_provisioner_for,
+};
 
 /// What the owning service says about a resource's LIFECYCLE PROGRESS — whether a created
 /// resource has come up, what it publishes once it has, and whether a deleted one is gone —

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateResourceConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateResourceConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateResourceConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -227,6 +218,38 @@ impl From<CreateResourceConfigurationErrorModeled> for CreateResourceConfigurati
     }
 }
 
+/// The response for a stored configuration — every member this operation models, read back
+/// out of state, with the status the clock owes the record at `now`.
+fn output_of(
+    configuration: &crate::state::ResourceConfiguration,
+    now: std::time::SystemTime,
+) -> CreateResourceConfigurationOutput {
+    CreateResourceConfigurationOutput {
+        id: Some(configuration.id.clone()),
+        name: Some(configuration.name.clone()),
+        arn: Some(configuration.arn.clone()),
+        resource_gateway_id: configuration.resource_gateway_id.clone(),
+        resource_configuration_group_id: configuration.resource_configuration_group_id.clone(),
+        r#type: Some(configuration.configuration_type.clone()),
+        port_ranges: configuration.port_ranges.clone(),
+        protocol: configuration.protocol.clone(),
+        status: Some(configuration.status(now).to_string()),
+        resource_configuration_definition: configuration.definition.clone(),
+        allow_association_to_shareable_service_network: configuration
+            .allow_association_to_shareable_service_network,
+        created_at: Some(crate::state::timestamp(configuration.created_at)),
+        // `failureReason` reports why a configuration FAILED, and nothing fails one here:
+        // no create of this emulator answers one of the `*_FAILED` statuses.
+        failure_reason: None,
+        custom_domain_name: configuration.custom_domain_name.clone(),
+        // A domain verification is a resource of its own, which nothing here creates, so a
+        // configuration carries no verification id or ARN.
+        domain_verification_id: None,
+        group_domain: configuration.group_domain.clone(),
+        domain_verification_arn: None,
+    }
+}
+
 /// The `CreateResourceConfiguration` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -263,18 +286,213 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateResourceConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateResourceConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateResourceConfiguration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateResourceConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the vpc-lattice state store is unavailable".to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::region_of(ctx.parts());
+        let now = std::time::SystemTime::now();
+
+        // The modelled `TagMap` ceiling and the `name` `@pattern`, neither of which the
+        // request boundary refuses here.
+        if let Err(violation) = crate::state::check_tag_count(input.tags.as_ref()) {
+            return Err(CreateResourceConfigurationErrorModeled::ValidationException(
+                crate::state::validation_exception(&[violation]),
+            )
+            .into());
+        }
+        if let Err(violation) = crate::state::check_resource_name(
+            crate::state::ResourceKind::ResourceConfiguration,
+            "name",
+            &input.name,
+        ) {
+            return Err(CreateResourceConfigurationErrorModeled::ValidationException(
+                crate::state::validation_exception(&[violation]),
+            )
+            .into());
+        }
+        // A port range has to denote a non-empty range of real ports, which the modelled
+        // `@pattern` on `PortRange` does not decide ([`crate::state::check_port_ranges`]).
+        if let Err(violation) = crate::state::check_port_ranges(input.port_ranges.as_ref()) {
+            return Err(CreateResourceConfigurationErrorModeled::ValidationException(
+                crate::state::service_rule_exception(&violation),
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // `clientToken` is an @idempotencyToken: a retry carrying the token of a completed
+        // create answers with that same configuration — and "If the parameters aren't
+        // identical, the retry fails."
+        let token = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::token_key(Self::NAME, token));
+        if let Some(existing) = token
+            .as_ref()
+            .and_then(|key| store.idempotency_tokens.get(key))
+            .and_then(|id| store.resource_configurations.get(id))
+        {
+            if existing.name != input.name || existing.configuration_type != input.r#type {
+                return Err(CreateResourceConfigurationErrorModeled::ConflictException(
+                    crate::state::conflict(
+                        crate::state::ResourceKind::ResourceConfiguration,
+                        &existing.id,
+                        format!(
+                            "Resource configuration {} was already created with this clientToken.",
+                            existing.id
+                        ),
+                    ),
+                )
+                .into());
+            }
+            return Ok(output_of(existing, now));
+        }
+
+        // The gateway a configuration is reached through, and the GROUP a child belongs to,
+        // each have to name something actually persisted: a configuration whose ingress
+        // point or parent is not there would be reachable through nothing.
+        let resource_gateway_id = match input.resource_gateway_identifier.as_deref() {
+            Some(identifier) => {
+                let held = crate::state::id_from_identifier(
+                    identifier,
+                    crate::state::PREFIX_RESOURCE_GATEWAY,
+                )
+                .filter(|id| store.resource_gateways.contains_key(id));
+                let Some(id) = held else {
+                    return Err(
+                        CreateResourceConfigurationErrorModeled::ResourceNotFoundException(
+                            crate::state::resource_access_not_found(
+                                crate::state::ResourceKind::ResourceGateway,
+                                identifier,
+                            ),
+                        )
+                        .into(),
+                    );
+                };
+                Some(id)
+            }
+            None => None,
+        };
+        let group_id = match input.resource_configuration_group_identifier.as_deref() {
+            Some(identifier) => {
+                let held = crate::state::id_from_identifier(
+                    identifier,
+                    crate::state::PREFIX_RESOURCE_CONFIGURATION,
+                )
+                .filter(|id| store.resource_configurations.contains_key(id));
+                let Some(id) = held else {
+                    return Err(
+                        CreateResourceConfigurationErrorModeled::ResourceNotFoundException(
+                            crate::state::resource_access_not_found(
+                                crate::state::ResourceKind::ResourceConfiguration,
+                                identifier,
+                            ),
+                        )
+                        .into(),
+                    );
+                };
+                Some(id)
+            }
+            None => None,
+        };
+
+        // "The name must be unique within the account" (the `name` member's own
+        // documentation).
+        let name_key =
+            crate::state::name_key(crate::state::KIND_RESOURCE_CONFIGURATION, &input.name);
+        if let Some(taken) = store.name_index.get(&name_key).cloned() {
+            return Err(CreateResourceConfigurationErrorModeled::ConflictException(
+                crate::state::conflict(
+                    crate::state::ResourceKind::ResourceConfiguration,
+                    &taken,
+                    crate::state::duplicate_name_in_account_message(&input.name),
+                ),
+            )
+            .into());
+        }
+
+        // The emulator's own ceiling on stored configurations, answered with the modelled
+        // 402 so a caller looping on create cannot grow this process without bound.
+        if store.resource_configurations.len() >= crate::state::MAX_RESOURCE_CONFIGURATIONS {
+            return Err(
+                CreateResourceConfigurationErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "this account already holds the maximum of {} resource configurations",
+                            crate::state::MAX_RESOURCE_CONFIGURATIONS
+                        ),
+                        resource_id: None,
+                        resource_type: crate::state::ResourceKind::ResourceConfiguration
+                            .wire_type()
+                            .to_string(),
+                        service_code: crate::state::ARN_SERVICE.to_string(),
+                        quota_code: "resource-configurations-per-account".to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = crate::state::mint_id(crate::state::PREFIX_RESOURCE_CONFIGURATION);
+        let sequence = store.next_sequence();
+        let configuration_type = input.r#type.clone();
+        let record = crate::state::ResourceConfiguration {
+            arn: crate::state::arn_for(
+                &region,
+                crate::state::KIND_RESOURCE_CONFIGURATION,
+                &id,
+            ),
+            id: id.clone(),
+            name: input.name.clone(),
+            port_ranges: input.port_ranges.clone().filter(|ranges| !ranges.is_empty()),
+            // The protocol and the shareable-association setting each carry the default
+            // their own documentation states, for the types that documentation scopes them
+            // to; a type the member does not apply to carries neither.
+            protocol: input.protocol.clone().or_else(|| {
+                crate::state::PROTOCOL_TYPES
+                    .contains(&configuration_type.as_str())
+                    .then(|| {
+                        crate::state::DEFAULT_RESOURCE_CONFIGURATION_PROTOCOL.to_string()
+                    })
+            }),
+            allow_association_to_shareable_service_network: input
+                .allow_association_to_shareable_service_network
+                .or_else(|| {
+                    crate::state::SHAREABLE_ASSOCIATION_TYPES
+                        .contains(&configuration_type.as_str())
+                        .then_some(crate::state::DEFAULT_ALLOW_SHAREABLE_ASSOCIATION)
+                }),
+            configuration_type,
+            resource_gateway_id,
+            resource_configuration_group_id: group_id,
+            definition: input.resource_configuration_definition.clone(),
+            custom_domain_name: input.custom_domain_name.clone(),
+            group_domain: input.group_domain.clone(),
+            tags: input.tags.clone().unwrap_or_default(),
+            created_at: now,
+            last_updated_at: now,
+            // Creating a configuration is asynchronous: CREATE_IN_PROGRESS until this
+            // stored due instant passes, then ACTIVE.
+            active_at: now + crate::state::CREATE_TRANSITION,
+            sequence,
+        };
+
+        store.name_index.insert(name_key, id.clone());
+        if let Some(key) = token {
+            store.idempotency_tokens.record(key, id.clone());
+        }
+        // Read back out of the store it was just written to, so the response is the
+        // persisted record and not a second copy of it.
+        let stored = store.resource_configurations.entry(id).or_insert(record);
+        Ok(output_of(stored, now))
     }
 }

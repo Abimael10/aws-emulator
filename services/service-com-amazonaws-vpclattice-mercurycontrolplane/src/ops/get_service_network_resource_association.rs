@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetServiceNetworkResourceAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetServiceNetworkResourceAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetServiceNetworkResourceAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -156,6 +147,18 @@ impl From<GetServiceNetworkResourceAssociationErrorModeled> for GetServiceNetwor
     }
 }
 
+/// HTTP 404 for an identifier that names no persisted service-network/resource
+/// association; see [`crate::state::resource_access_not_found`].
+fn not_found(identifier: &str) -> GetServiceNetworkResourceAssociationError {
+    GetServiceNetworkResourceAssociationErrorModeled::ResourceNotFoundException(
+        crate::state::resource_access_not_found(
+            crate::state::ResourceKind::ResourceAssociation,
+            identifier,
+        ),
+    )
+    .into()
+}
+
 /// The `GetServiceNetworkResourceAssociation` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -192,18 +195,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetServiceNetworkResourceAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetServiceNetworkResourceAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetServiceNetworkResourceAssociation"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetServiceNetworkResourceAssociationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the vpc-lattice state store is unavailable".to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+        let identifier = &input.service_network_resource_association_identifier;
+        let Some(id) = crate::state::id_from_identifier(
+            identifier,
+            crate::state::PREFIX_RESOURCE_ASSOCIATION,
+        ) else {
+            return Err(not_found(identifier));
+        };
+        let now = std::time::SystemTime::now();
+        let store = state.lock();
+        let Some(association) = store.resource_associations.get(&id) else {
+            return Err(not_found(identifier));
+        };
+        Ok(GetServiceNetworkResourceAssociationOutput {
+            id: Some(association.id.clone()),
+            arn: Some(association.arn.clone()),
+            status: Some(association.status(now).to_string()),
+            created_by: Some(association.created_by.clone()),
+            created_at: Some(crate::state::timestamp(association.created_at)),
+            resource_configuration_id: Some(association.resource_configuration_id.clone()),
+            resource_configuration_arn: Some(association.resource_configuration_arn.clone()),
+            resource_configuration_name: Some(association.resource_configuration_name.clone()),
+            service_network_id: Some(association.service_network_id.clone()),
+            service_network_arn: Some(association.service_network_arn.clone()),
+            service_network_name: Some(association.service_network_name.clone()),
+            // `failureReason` and `failureCode` report why an association FAILED, and
+            // nothing fails one here: no create of this emulator answers one of the
+            // `*_FAILED` statuses.
+            failure_reason: None,
+            failure_code: None,
+            last_updated_at: Some(crate::state::timestamp(association.last_updated_at)),
+            // A DNS entry is announced for a domain the shared resource answers under, and
+            // nothing here announces one for a resource configuration.
+            private_dns_entry: None,
+            private_dns_enabled: association.private_dns_enabled,
+            dns_entry: None,
+            // An association a CALLER made is the caller's: `isManagedAssociation` reports
+            // one Amazon Web Services made on the account's behalf.
+            is_managed_association: Some(false),
+            // A domain verification is a resource of its own, which nothing here creates.
+            domain_verification_status: None,
+        })
     }
 }

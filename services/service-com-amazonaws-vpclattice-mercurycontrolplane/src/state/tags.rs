@@ -27,8 +27,9 @@ use super::{
 ///
 /// Each one models a `tags` member on its create (`CreateServiceNetwork`,
 /// `CreateService`, both association creates, `CreateListener`, `CreateRule`,
-/// `CreateTargetGroup`, `CreateResourceConfiguration`, `CreateAccessLogSubscription`), so
-/// each one carries tags and an ARN of any of them is a tag operation's target.
+/// `CreateTargetGroup`, `CreateResourceConfiguration`, `CreateAccessLogSubscription`,
+/// `CreateResourceGateway`, `CreateServiceNetworkResourceAssociation`), so each one carries
+/// tags and an ARN of any of them is a tag operation's target.
 pub const TAGGABLE_KINDS: [ResourceKind; ResourceKind::COUNT] = [
     ResourceKind::ServiceNetwork,
     ResourceKind::Service,
@@ -39,6 +40,8 @@ pub const TAGGABLE_KINDS: [ResourceKind; ResourceKind::COUNT] = [
     ResourceKind::TargetGroup,
     ResourceKind::ResourceConfiguration,
     ResourceKind::AccessLogSubscription,
+    ResourceKind::ResourceGateway,
+    ResourceKind::ResourceAssociation,
 ];
 
 /// How a tag operation refuses a `resourceArn` that names no resource it can tag.
@@ -98,9 +101,15 @@ impl ComAmazonawsVpclatticeMercurycontrolplaneState {
             ResourceKind::AccessLogSubscription => {
                 self.access_log_subscriptions.get(id).map(|held| &held.tags)
             }
-            // `CreateResourceConfiguration` is still a 501, so no resource configuration
-            // can be stored for one to carry tags.
-            ResourceKind::ResourceConfiguration => None,
+            ResourceKind::ResourceConfiguration => {
+                self.resource_configurations.get(id).map(|held| &held.tags)
+            }
+            ResourceKind::ResourceGateway => {
+                self.resource_gateways.get(id).map(|held| &held.tags)
+            }
+            ResourceKind::ResourceAssociation => {
+                self.resource_associations.get(id).map(|held| &held.tags)
+            }
         }
     }
 
@@ -129,7 +138,17 @@ impl ComAmazonawsVpclatticeMercurycontrolplaneState {
                 .access_log_subscriptions
                 .get_mut(id)
                 .map(|held| &mut held.tags),
-            ResourceKind::ResourceConfiguration => None,
+            ResourceKind::ResourceConfiguration => self
+                .resource_configurations
+                .get_mut(id)
+                .map(|held| &mut held.tags),
+            ResourceKind::ResourceGateway => {
+                self.resource_gateways.get_mut(id).map(|held| &mut held.tags)
+            }
+            ResourceKind::ResourceAssociation => self
+                .resource_associations
+                .get_mut(id)
+                .map(|held| &mut held.tags),
         }
     }
 

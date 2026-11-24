@@ -439,8 +439,14 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
     // vpclattice-access-log-subscription-missing-log-group-rejected`, whose reason reads
     // `Resource handler returned message: "<the service's sentence> (Service: VpcLattice,
     // Status Code: 404, Request ID: …) (SDK Attempt Count: …)" (RequestToken: …,
-    // HandlerErrorCode: NotFound)`). The two resource types this emulator provisions over this
-    // signing name are both that service's ([`provisioner::vpc_lattice`]).
+    // HandlerErrorCode: NotFound)`). That is also the shape the recorded reason of an
+    // `AWS::VpcLattice::ResourceConfiguration` whose declared `PortRanges` entry names a range
+    // that service refuses carries (check `cloudformation__ec2__vpc-lattice.deploy-\
+    // vpclattice-resource-configuration-invalid-port-range-rejected-and-rolled-back`, whose
+    // reason closes `(SDK Attempt Count: …)" (RequestToken: …, HandlerErrorCode:
+    // InvalidRequest)`). Every resource type this emulator provisions over this signing name
+    // is that service's ([`provisioner::vpc_lattice`] and
+    // [`provisioner::vpc_lattice_resources`]).
     (
         crate::state::provisioner::vpc_lattice::VPC_LATTICE_SIGNING_NAME,
         "VpcLattice",

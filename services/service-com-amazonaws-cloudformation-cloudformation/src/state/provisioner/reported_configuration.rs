@@ -971,6 +971,17 @@ impl Provisioner {
                 describe_vpc_lattice_access_log_subscription(ctx, region, physical_resource_id)
                     .await
             }
+            // Its own read of one of the four RESOURCE-ACCESS resources, by that same ARN,
+            // which is one of the two forms every identifier member of that service accepts.
+            Self::VpcLatticeResource(kind) => {
+                vpc_lattice_resources::describe_vpc_lattice_resource(
+                    ctx,
+                    region,
+                    kind,
+                    physical_resource_id,
+                )
+                .await
+            }
         }
     }
 }

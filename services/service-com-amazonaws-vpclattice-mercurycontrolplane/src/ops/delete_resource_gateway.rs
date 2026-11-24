@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteResourceGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteResourceGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteResourceGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -125,6 +116,18 @@ impl From<DeleteResourceGatewayErrorModeled> for DeleteResourceGatewayError {
     }
 }
 
+/// HTTP 404 for an identifier that names no persisted resource gateway; see
+/// [`crate::state::resource_access_not_found`].
+fn not_found(identifier: &str) -> DeleteResourceGatewayError {
+    DeleteResourceGatewayErrorModeled::ResourceNotFoundException(
+        crate::state::resource_access_not_found(
+            crate::state::ResourceKind::ResourceGateway,
+            identifier,
+        ),
+    )
+    .into()
+}
+
 /// The `DeleteResourceGateway` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -161,18 +164,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteResourceGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteResourceGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteResourceGateway"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteResourceGatewayErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the vpc-lattice state store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let identifier = &input.resource_gateway_identifier;
+        let Some(id) = crate::state::id_from_identifier(
+            identifier,
+            crate::state::PREFIX_RESOURCE_GATEWAY,
+        ) else {
+            return Err(not_found(identifier));
+        };
+        let mut store = state.lock();
+        if !store.resource_gateways.contains_key(&id) {
+            return Err(not_found(identifier));
+        }
+        // A resource configuration is reached THROUGH its gateway, so a gateway that still
+        // has one cannot go: the configurations would name an ingress point that no longer
+        // exists. Reported the way this service reports every referential-integrity
+        // refusal — a `ConflictException` naming the resource that still has dependents and
+        // which kind they are, never how many.
+        if store
+            .resource_configurations
+            .values()
+            .any(|configuration| configuration.resource_gateway_id.as_deref() == Some(id.as_str()))
+        {
+            return Err(DeleteResourceGatewayErrorModeled::ConflictException(
+                crate::state::conflict(
+                    crate::state::ResourceKind::ResourceGateway,
+                    &id,
+                    format!("ResourceGateway {id} has resource configuration(s) associated"),
+                ),
+            )
+            .into());
+        }
+        let Some(removed) = store.remove_resource_gateway(&id) else {
+            return Err(not_found(identifier));
+        };
+        Ok(DeleteResourceGatewayOutput {
+            id: Some(removed.id.clone()),
+            arn: Some(removed.arn.clone()),
+            name: Some(removed.name.clone()),
+            // The status of the deletion this call started.
+            status: Some(crate::state::STATUS_DELETE_IN_PROGRESS.to_string()),
+        })
     }
 }

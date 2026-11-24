@@ -366,6 +366,13 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         // service's own report of the limit rather than from here, exactly as a knowledge
         // base's instants do.
         BRAKET_SPENDING_LIMIT => &["SpendingLimitArn"],
+        // Each Amazon VPC Lattice RESOURCE-ACCESS type publishes the ARN that service minted
+        // and the id inside it, which are the two return values these naming rules compute a
+        // stand-in for before the resource exists.
+        VPCLATTICE_RESOURCE_GATEWAY
+        | VPCLATTICE_RESOURCE_CONFIGURATION
+        | VPCLATTICE_SERVICE_NETWORK_RESOURCE_ASSOCIATION
+        | VPCLATTICE_SERVICE_NETWORK_VPC_ASSOCIATION => VPCLATTICE_RESOURCE_ACCESS_ATTRIBUTES,
         // An AWS HealthLake FHIR data store publishes the four read-only values its own
         // "Return values" section names, and a data transformation profile the five its own
         // does; only each resource's ARN and the id inside it, and the version and target
@@ -1123,6 +1130,15 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // decides is either and the identity in force is the one that service answered.
         || resource_type == VPCLATTICE_SERVICE_NETWORK
         || resource_type == VPCLATTICE_ACCESS_LOG_SUBSCRIPTION
+        // The four RESOURCE-ACCESS types of that service are four more, for the same reason:
+        // a template declares a gateway's name, a configuration's definition and an
+        // association's two sides, and each create answers the id it drew (`rgw-`, `rcfg-`,
+        // `snra-`, `snva-`) with the ARN built around it, which is what that type's `Ref`
+        // returns and the handle every later call on the resource takes.
+        || resource_type == VPCLATTICE_RESOURCE_GATEWAY
+        || resource_type == VPCLATTICE_RESOURCE_CONFIGURATION
+        || resource_type == VPCLATTICE_SERVICE_NETWORK_RESOURCE_ASSOCIATION
+        || resource_type == VPCLATTICE_SERVICE_NETWORK_VPC_ASSOCIATION
         // The two AWS DIRECT CONNECT types are two more: neither create takes an identifier
         // for the resource — a template declares a gateway's name and Amazon-side ASN, and a
         // group's name and intended resiliency model — and each answers the identifier that

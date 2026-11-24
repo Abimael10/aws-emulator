@@ -119,14 +119,16 @@ impl ComAmazonawsVpclatticeMercurycontrolplaneState {
                 .map(|service| service.auth_type.as_str()),
             // No other kind models an `authType`, so no auth policy attached to one can
             // be active. A resource configuration is the only other kind an auth-policy
-            // identifier names, and nothing holds one of those either.
+            // identifier names, and a configuration carries no auth type of its own.
             ResourceKind::ServiceAssociation
             | ResourceKind::VpcAssociation
             | ResourceKind::Listener
             | ResourceKind::Rule
             | ResourceKind::TargetGroup
             | ResourceKind::ResourceConfiguration
-            | ResourceKind::AccessLogSubscription => None,
+            | ResourceKind::AccessLogSubscription
+            | ResourceKind::ResourceGateway
+            | ResourceKind::ResourceAssociation => None,
         }
     }
 

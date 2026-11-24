@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResourceGateways
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResourceGateways`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResourceGateways::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -112,6 +103,40 @@ impl From<ListResourceGatewaysErrorModeled> for ListResourceGatewaysError {
     }
 }
 
+/// HTTP 400 for a request this operation refuses, naming the member at fault.
+fn invalid(message: String, member: &str, detail: String) -> ListResourceGatewaysError {
+    ListResourceGatewaysErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: detail,
+        }]),
+    })
+    .into()
+}
+
+/// The summary of one stored gateway, with the status the clock owes it at `now`.
+fn summary_of(
+    gateway: &crate::state::ResourceGateway,
+    now: std::time::SystemTime,
+) -> ResourceGatewaySummary {
+    ResourceGatewaySummary {
+        name: Some(gateway.name.clone()),
+        id: Some(gateway.id.clone()),
+        arn: Some(gateway.arn.clone()),
+        status: Some(gateway.status(now).to_string()),
+        vpc_identifier: gateway.vpc_id.clone(),
+        subnet_ids: gateway.subnet_ids.clone(),
+        security_group_ids: gateway.security_group_ids.clone(),
+        ip_address_type: gateway.ip_address_type.clone(),
+        ipv4_addresses_per_eni: gateway.ipv4_addresses_per_eni,
+        resource_config_dns_resolution: gateway.resource_config_dns_resolution.clone(),
+        created_at: Some(crate::state::timestamp(gateway.created_at)),
+        last_updated_at: Some(crate::state::timestamp(gateway.last_updated_at)),
+    }
+}
+
 /// The `ListResourceGateways` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -148,18 +173,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResourceGateways` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResourceGatewaysErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResourceGateways"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListResourceGatewaysErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the vpc-lattice state store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let Ok(after) = crate::state::decode_cursor(input.next_token.as_deref()) else {
+            return Err(invalid(
+                "nextToken is not a token this service issued".to_string(),
+                "nextToken",
+                "the token does not name a page of this result set".to_string(),
+            ));
+        };
+        // `maxResults` caps one page; absent, the page carries at most the maximum the
+        // model allows that member, so one GET can never be made to serialise the whole
+        // store and `nextToken` pages the rest.
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(crate::state::MAX_PAGE_SIZE)
+            .clamp(1, crate::state::MAX_PAGE_SIZE);
+        let now = std::time::SystemTime::now();
+        let store = state.lock();
+
+        // One stable order for every page: creation order, from the monotonic sequence
+        // number each gateway was stored with.
+        let mut ordered: Vec<&crate::state::ResourceGateway> =
+            store.resource_gateways.values().collect();
+        ordered.sort_by_key(|gateway| gateway.sequence);
+
+        let mut items: Vec<ResourceGatewaySummary> = Vec::new();
+        let mut page_ends_at = after;
+        let mut more_follow = false;
+        for gateway in ordered.iter().filter(|gateway| gateway.sequence > after) {
+            if items.len() == page_size {
+                more_follow = true;
+                break;
+            }
+            page_ends_at = gateway.sequence;
+            items.push(summary_of(gateway, now));
+        }
+
+        Ok(ListResourceGatewaysOutput {
+            items: Some(items),
+            next_token: more_follow.then(|| crate::state::encode_cursor(page_ends_at)),
+        })
     }
 }

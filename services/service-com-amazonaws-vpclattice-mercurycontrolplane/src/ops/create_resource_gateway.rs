@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateResourceGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateResourceGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateResourceGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -177,6 +168,26 @@ impl From<CreateResourceGatewayErrorModeled> for CreateResourceGatewayError {
     }
 }
 
+/// The response for a stored gateway — every member this operation models, read back out
+/// of state, with the status the clock owes the record at `now`.
+fn output_of(
+    gateway: &crate::state::ResourceGateway,
+    now: std::time::SystemTime,
+) -> CreateResourceGatewayOutput {
+    CreateResourceGatewayOutput {
+        name: Some(gateway.name.clone()),
+        id: Some(gateway.id.clone()),
+        arn: Some(gateway.arn.clone()),
+        status: Some(gateway.status(now).to_string()),
+        vpc_identifier: gateway.vpc_id.clone(),
+        subnet_ids: gateway.subnet_ids.clone(),
+        security_group_ids: gateway.security_group_ids.clone(),
+        ip_address_type: gateway.ip_address_type.clone(),
+        ipv4_addresses_per_eni: gateway.ipv4_addresses_per_eni,
+        resource_config_dns_resolution: gateway.resource_config_dns_resolution.clone(),
+    }
+}
+
 /// The `CreateResourceGateway` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -213,18 +224,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateResourceGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateResourceGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateResourceGateway"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateResourceGatewayErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the vpc-lattice state store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let region = crate::state::region_of(ctx.parts());
+        let now = std::time::SystemTime::now();
+
+        // The modelled `TagMap` ceiling and the `name` `@pattern`, neither of which the
+        // request boundary refuses here (the pattern uses look-around).
+        if let Err(violation) = crate::state::check_tag_count(input.tags.as_ref()) {
+            return Err(CreateResourceGatewayErrorModeled::ValidationException(
+                crate::state::validation_exception(&[violation]),
+            )
+            .into());
+        }
+        if let Err(violation) = crate::state::check_resource_name(
+            crate::state::ResourceKind::ResourceGateway,
+            "name",
+            &input.name,
+        ) {
+            return Err(CreateResourceGatewayErrorModeled::ValidationException(
+                crate::state::validation_exception(&[violation]),
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // `clientToken` is an @idempotencyToken: a retry carrying the token of a completed
+        // create answers with that same gateway — and, as that member's documentation says,
+        // "If the parameters aren't identical, the retry fails."
+        let token = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::token_key(Self::NAME, token));
+        if let Some(existing) = token
+            .as_ref()
+            .and_then(|key| store.idempotency_tokens.get(key))
+            .and_then(|id| store.resource_gateways.get(id))
+        {
+            if existing.name != input.name || existing.vpc_id != input.vpc_identifier {
+                return Err(CreateResourceGatewayErrorModeled::ConflictException(
+                    crate::state::conflict(
+                        crate::state::ResourceKind::ResourceGateway,
+                        &existing.id,
+                        format!(
+                            "Resource gateway {} was already created with this clientToken.",
+                            existing.id
+                        ),
+                    ),
+                )
+                .into());
+            }
+            return Ok(output_of(existing, now));
+        }
+
+        // "The name must be unique within the account" (the `name` member's own
+        // documentation), so a second create under a taken name is a conflict.
+        let name_key = crate::state::name_key(crate::state::KIND_RESOURCE_GATEWAY, &input.name);
+        if let Some(taken) = store.name_index.get(&name_key).cloned() {
+            return Err(CreateResourceGatewayErrorModeled::ConflictException(
+                crate::state::conflict(
+                    crate::state::ResourceKind::ResourceGateway,
+                    &taken,
+                    crate::state::duplicate_name_in_account_message(&input.name),
+                ),
+            )
+            .into());
+        }
+
+        // The emulator's own ceiling on stored gateways, answered with the modelled 402 so
+        // a caller looping on create cannot grow this process without bound.
+        if store.resource_gateways.len() >= crate::state::MAX_RESOURCE_GATEWAYS {
+            return Err(
+                CreateResourceGatewayErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "this account already holds the maximum of {} resource gateways",
+                            crate::state::MAX_RESOURCE_GATEWAYS
+                        ),
+                        resource_id: None,
+                        resource_type: crate::state::ResourceKind::ResourceGateway
+                            .wire_type()
+                            .to_string(),
+                        service_code: crate::state::ARN_SERVICE.to_string(),
+                        quota_code: "resource-gateways-per-account".to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = crate::state::mint_id(crate::state::PREFIX_RESOURCE_GATEWAY);
+        let sequence = store.next_sequence();
+        let record = crate::state::ResourceGateway {
+            arn: crate::state::arn_for(&region, crate::state::KIND_RESOURCE_GATEWAY, &id),
+            id: id.clone(),
+            name: input.name.clone(),
+            vpc_id: input.vpc_identifier.clone(),
+            subnet_ids: input.subnet_ids.clone().filter(|ids| !ids.is_empty()),
+            security_group_ids: input
+                .security_group_ids
+                .clone()
+                .filter(|ids| !ids.is_empty()),
+            ip_address_type: input.ip_address_type.clone(),
+            ipv4_addresses_per_eni: input.ipv4_addresses_per_eni,
+            resource_config_dns_resolution: input.resource_config_dns_resolution.clone(),
+            tags: input.tags.clone().unwrap_or_default(),
+            created_at: now,
+            last_updated_at: now,
+            // Creating a gateway is asynchronous: CREATE_IN_PROGRESS until this stored due
+            // instant passes, then ACTIVE.
+            active_at: now + crate::state::CREATE_TRANSITION,
+            sequence,
+        };
+
+        store.name_index.insert(name_key, id.clone());
+        if let Some(key) = token {
+            store.idempotency_tokens.record(key, id.clone());
+        }
+        // Read back out of the store it was just written to, so the response is the
+        // persisted record and not a second copy of it.
+        let stored = store.resource_gateways.entry(id).or_insert(record);
+        Ok(output_of(stored, now))
     }
 }
