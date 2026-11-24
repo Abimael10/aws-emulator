@@ -3183,19 +3183,51 @@ pub fn asset_bucket_arn(region: &str) -> String {
     format!("arn:aws:s3:::assets-{}-{region}", asset_bucket_account(region))
 }
 
+/// The accounts the service's own asset buckets live in, keyed by Region.
+///
+/// Each entry is a FIXED property of its Region, published by the service itself: the
+/// bucket name in the `s3BucketArn` every domain of that Region reports (and the same
+/// bucket an Amazon S3 gateway endpoint policy has to allow for a VPC to fetch package
+/// assets) carries it, identically for every account, every domain and every call. So
+/// these are looked up, not computed: nothing about a request can change which bucket a
+/// Region's assets are in.
+///
+/// Keyed by the Region of the endpoint the request was addressed to. A Region this table
+/// carries no published account for falls back to [`placeholder_asset_bucket_account`].
+const ASSET_BUCKET_ACCOUNTS: &[(&str, &str)] = &[
+    // us-west-2 stores package assets in `assets-787052242323-us-west-2`.
+    ("us-west-2", "787052242323"),
+];
+
 /// The 12-digit account the service's asset bucket of one Region lives in — a property of
 /// the REGION alone, never of the caller or of a domain.
 ///
 /// The bucket that stores package assets belongs to the service itself, so its account is
-/// not the one the caller holds: it is derived from the Region (and from this service's own
-/// name, so two services deriving a Region-scoped account do not land on one value), which
-/// keeps it stable across reads and across restarts while giving each Region its own.
+/// never the one the caller holds: it is the service's published account for the Region
+/// ([`ASSET_BUCKET_ACCOUNTS`]) where one is known, and a Region-stable placeholder
+/// otherwise. Either way the value depends on nothing but the Region, which keeps it
+/// stable across reads, across domains and across restarts.
+pub fn asset_bucket_account(region: &str) -> String {
+    ASSET_BUCKET_ACCOUNTS
+        .iter()
+        .find(|(published_region, _)| *published_region == region)
+        .map_or_else(
+            || placeholder_asset_bucket_account(region),
+            |(_, account)| (*account).to_string(),
+        )
+}
+
+/// The asset-bucket account reported for a Region whose published one is not known here.
+///
+/// Derived from the Region (and from this service's own name, so two services deriving a
+/// Region-scoped account do not land on one value), so each Region still reports one
+/// stable bucket of its own rather than a per-call or per-boot value.
 ///
 /// The derivation is kept inside the leading-zero, non-routable family the account id this
 /// emulator presents as the caller's belongs to (`engine::EMULATOR_ACCOUNT_ID`), so the
 /// value discloses no account that could be anyone's, and it is never zero, so it is never
 /// that account id itself.
-pub fn asset_bucket_account(region: &str) -> String {
+fn placeholder_asset_bucket_account(region: &str) -> String {
     /// How many distinct asset-bucket accounts the derivation can land on. Four significant
     /// digits keep the value inside the placeholder family (eight leading zeros) while
     /// leaving room for every Region to get its own.

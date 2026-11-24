@@ -257,6 +257,83 @@ pub async fn create_domain(
     .await
 }
 
+/// [`create_domain`], signed for (and addressed to) an arbitrary `region` — for a suite
+/// about a value that is a property of the Region the domain was created against.
+pub async fn create_domain_in(router: &MultiServiceRouter, region: &str, domain: &str) -> Answer {
+    call_in_region(
+        router,
+        region,
+        "POST",
+        &format!("/v1/domain?domain={domain}"),
+        Some(json!({})),
+    )
+    .await
+}
+
+/// `DescribeDomain` on `domain`, signed for `region`.
+pub async fn describe_domain_in(router: &MultiServiceRouter, region: &str, domain: &str) -> Answer {
+    call_in_region(
+        router,
+        region,
+        "GET",
+        &format!("/v1/domain?domain={domain}"),
+        None,
+    )
+    .await
+}
+
+/// `DeleteDomain` on `domain`, signed for `region`.
+pub async fn delete_domain_in(router: &MultiServiceRouter, region: &str, domain: &str) -> Answer {
+    call_in_region(
+        router,
+        region,
+        "DELETE",
+        &format!("/v1/domain?domain={domain}"),
+        None,
+    )
+    .await
+}
+
+/// The `s3BucketArn` of a `DomainDescription`-bearing answer — the member `CreateDomain`,
+/// `DescribeDomain` and `DeleteDomain` all answer with.
+pub fn domain_bucket(answer: &Answer, case: &str) -> String {
+    answer.body["domain"]["s3BucketArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: no domain.s3BucketArn in {answer:?}"))
+        .to_string()
+}
+
+/// The account component of an asset-bucket ARN of `region`, after checking the ARN's
+/// fixed text: an S3 ARN (no region and no account segment of its own) whose bucket name
+/// is `assets-<account>-<region>`.
+pub fn asset_bucket_account(arn: &str, region: &str, case: &str) -> String {
+    let account = arn
+        .strip_prefix("arn:aws:s3:::assets-")
+        .and_then(|suffix| suffix.strip_suffix(&format!("-{region}")))
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: expected an asset bucket ARN of the form \
+                 arn:aws:s3:::assets-<account>-{region}, got {arn:?}"
+            )
+        });
+    assert!(
+        account.len() == 12 && account.chars().all(|digit| digit.is_ascii_digit()),
+        "case {case:?}: expected a 12-digit account in {arn:?}, got {account:?}"
+    );
+    account.to_string()
+}
+
+/// Domain names a Region-scoped rule is repeated over: the modelled extremes of
+/// `DomainName` (`@length 2..50`) and a hyphenated middle, so a value carrying anything
+/// per-domain shows up as two domains of one Region disagreeing.
+pub fn domain_name_rows() -> Vec<(&'static str, String)> {
+    vec![
+        ("the shortest legal name", "ab".to_string()),
+        ("a hyphenated name", "my-domain-7".to_string()),
+        ("the longest legal name", format!("d{}e", "x".repeat(48))),
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // The caller a request speaks for
 //

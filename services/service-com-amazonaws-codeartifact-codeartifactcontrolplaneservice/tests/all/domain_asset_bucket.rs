@@ -21,78 +21,15 @@
 //! its stability — across reads, across domains of a Region, and across emulator
 //! instances.
 
-use smithy_server_runtime::MultiServiceRouter;
-
-use crate::harness::{call_in_region, emulator, Answer, ACCOUNT};
+use crate::harness::{
+    asset_bucket_account, create_domain_in, delete_domain_in, describe_domain_in, domain_bucket,
+    domain_name_rows, emulator, ACCOUNT,
+};
 
 /// The Regions the table spans: the default partition's four corners, so a bucket name
 /// that ignored the Region (or that carried a per-call value) shows up as two Regions
 /// agreeing where they must not.
 const REGIONS: [&str; 4] = ["us-east-1", "us-west-2", "eu-central-1", "ap-southeast-2"];
-
-/// `POST /v1/domain?domain=`, signed for `region`.
-async fn create_domain_in(router: &MultiServiceRouter, region: &str, domain: &str) -> Answer {
-    call_in_region(
-        router,
-        region,
-        "POST",
-        &format!("/v1/domain?domain={domain}"),
-        Some(serde_json::json!({})),
-    )
-    .await
-}
-
-/// `GET /v1/domain?domain=`, signed for `region`.
-async fn describe_domain_in(router: &MultiServiceRouter, region: &str, domain: &str) -> Answer {
-    call_in_region(
-        router,
-        region,
-        "GET",
-        &format!("/v1/domain?domain={domain}"),
-        None,
-    )
-    .await
-}
-
-/// `DELETE /v1/domain?domain=`, signed for `region`.
-async fn delete_domain_in(router: &MultiServiceRouter, region: &str, domain: &str) -> Answer {
-    call_in_region(
-        router,
-        region,
-        "DELETE",
-        &format!("/v1/domain?domain={domain}"),
-        None,
-    )
-    .await
-}
-
-/// The `s3BucketArn` of a `DomainDescription`-bearing answer.
-fn bucket(answer: &Answer, case: &str) -> String {
-    answer.body["domain"]["s3BucketArn"]
-        .as_str()
-        .unwrap_or_else(|| panic!("case {case:?}: no domain.s3BucketArn in {answer:?}"))
-        .to_string()
-}
-
-/// The account component of an asset-bucket ARN of `region`, after checking the ARN's
-/// fixed text: an S3 ARN (no region and no account segment of its own) whose bucket name
-/// is `assets-<account>-<region>`.
-fn asset_bucket_account(arn: &str, region: &str, case: &str) -> String {
-    let account = arn
-        .strip_prefix("arn:aws:s3:::assets-")
-        .and_then(|suffix| suffix.strip_suffix(&format!("-{region}")))
-        .unwrap_or_else(|| {
-            panic!(
-                "case {case:?}: expected an asset bucket ARN of the form \
-                 arn:aws:s3:::assets-<account>-{region}, got {arn:?}"
-            )
-        });
-    assert!(
-        account.len() == 12 && account.chars().all(|digit| digit.is_ascii_digit()),
-        "case {case:?}: expected a 12-digit account in {arn:?}, got {account:?}"
-    );
-    account.to_string()
-}
 
 /// The account segment of a CodeArtifact ARN — `arn:aws:codeartifact:<region>:<account>:…`.
 fn arn_account(arn: &str) -> String {
@@ -111,15 +48,8 @@ async fn the_asset_bucket_is_the_services_own_for_the_region() {
         // Rows differ along what a per-domain or per-call derivation would have varied
         // over: the name's length (the modelled extremes of `DomainName`, len 2..50), its
         // character classes, and how many domains the account already holds.
-        let longest = format!("d{}e", "x".repeat(48));
-        let domains = [
-            ("the shortest legal name", "ab".to_string()),
-            ("a hyphenated name", "my-domain-7".to_string()),
-            ("the longest legal name", longest),
-        ];
-
         let mut buckets: Vec<String> = Vec::new();
-        for (label, domain) in &domains {
+        for (label, domain) in &domain_name_rows() {
             let case = format!("{region} / {label}");
 
             let created = create_domain_in(&router, region, domain).await;
@@ -127,7 +57,7 @@ async fn the_asset_bucket_is_the_services_own_for_the_region() {
                 created.status, 200,
                 "case {case:?}: expected CreateDomain 200, got {created:?}"
             );
-            let reported = bucket(&created, &case);
+            let reported = domain_bucket(&created, &case);
             let bucket_account = asset_bucket_account(&reported, region, &case);
 
             // The bucket belongs to the service, so its account is neither the account
@@ -162,13 +92,13 @@ async fn the_asset_bucket_is_the_services_own_for_the_region() {
             // for the removed one.
             let described = describe_domain_in(&router, region, domain).await;
             assert_eq!(
-                (described.status, bucket(&described, &case).as_str()),
+                (described.status, domain_bucket(&described, &case).as_str()),
                 (200, reported.as_str()),
                 "case {case:?}: DescribeDomain must report the same bucket, got {described:?}"
             );
             let deleted = delete_domain_in(&router, region, domain).await;
             assert_eq!(
-                (deleted.status, bucket(&deleted, &case).as_str()),
+                (deleted.status, domain_bucket(&deleted, &case).as_str()),
                 (200, reported.as_str()),
                 "case {case:?}: DeleteDomain must report the same bucket, got {deleted:?}"
             );
@@ -177,7 +107,7 @@ async fn the_asset_bucket_is_the_services_own_for_the_region() {
             // nothing about it is per-call.
             let recreated = create_domain_in(&router, region, domain).await;
             assert_eq!(
-                (recreated.status, bucket(&recreated, &case).as_str()),
+                (recreated.status, domain_bucket(&recreated, &case).as_str()),
                 (200, reported.as_str()),
                 "case {case:?}: a re-created domain must report the same bucket, \
                  got {recreated:?}"
@@ -227,12 +157,12 @@ async fn the_asset_bucket_of_a_region_is_the_same_on_a_fresh_emulator() {
             "case {case:?}: expected CreateDomain 200 on both, got {left:?} and {right:?}"
         );
         assert_eq!(
-            bucket(&left, &case),
-            bucket(&right, &case),
+            domain_bucket(&left, &case),
+            domain_bucket(&right, &case),
             "case {case:?}: the Region's asset bucket must not depend on the instance"
         );
         // And the value is not an echo of the request: nothing in it names the domain.
-        let reported = bucket(&left, &case);
+        let reported = domain_bucket(&left, &case);
         assert!(
             !reported.contains("stable-bucket"),
             "case {case:?}: the asset bucket name carries nothing per-domain, \
