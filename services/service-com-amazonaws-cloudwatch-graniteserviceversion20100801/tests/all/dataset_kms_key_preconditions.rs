@@ -18,10 +18,11 @@
 //! client branches on — one wire error code for EVERY failure of the dry run, in the request's
 //! own status class, rather than one of the three modelled 400 faults whose sentences describe
 //! those conditions — and that the association did NOT take effect, so `GetDataset` still
-//! reports what it reported before the call. The dry run does not report WHICH of its checks
-//! failed, so every outcome but the key's own state carries one sentence naming the key
-//! (`crate::state::dataset_kms_key::unable_to_validate_message`) and a key KMS holds in a state
-//! that admits no cryptographic operation carries the other one.
+//! reports what it reported before the call. The SERVICE-principal half of the dry run does not
+//! report WHICH of its checks failed, so every outcome of it but the key's own state carries one
+//! sentence naming the key (`crate::state::dataset_kms_key::unable_to_validate_message`) and a key
+//! KMS holds in a state that admits no cryptographic operation carries the next one; the half run
+//! with the CALLER's credentials carries its own, which `dataset_kms_key_caller_refusal` tables.
 //!
 //! The emulator and the KMS wire calls come from the suite that drives this service's OTHER
 //! decision over a customer managed key (`sns_action_publish_grant`), so KMS is mounted and asked
@@ -155,21 +156,35 @@ enum Sentence {
 }
 
 impl Sentence {
-    /// The whole message this sentence states about `key_arn`, as the service words it.
-    fn message(self, key_arn: &str) -> String {
+    /// The message this sentence states about `key_arn`, up to the id of the internal KMS call the
+    /// caller's own refusal closes with (the whole message for the two that carry none).
+    fn text_before_the_id(self, key_arn: &str) -> String {
         match self {
             Self::NotValidated => format!(
                 "Unable to validate KMS key {key_arn}. Verify the key exists and the key policy \
                  grants kms:DescribeKey to the CloudWatch service principal."
             ),
             Self::Disabled => format!("KMS key {key_arn} is disabled."),
-            Self::TheCallersOwn => format!(
-                "User: {} is not authorized to perform: kms:Decrypt on resource: {key_arn} \
-                 with an explicit deny in a resource-based policy",
-                service_common::caller_principal::ambient_user_arn()
-            ),
+            Self::TheCallersOwn => crate::dataset_kms_key_caller_refusal::stated_refusal(key_arn),
         }
     }
+}
+
+/// Assert that the refusal `message` states `sentence` about `key_arn`.
+///
+/// The caller's own refusal closes with the id of the internal KMS call it came out of, which is
+/// per request and so compared as a FORM rather than as a value
+/// (`dataset_kms_key_caller_refusal`); every other sentence is the whole message.
+fn assert_sentence(case: &str, sentence: Sentence, message: &str, key_arn: &str) {
+    if sentence == Sentence::TheCallersOwn {
+        crate::dataset_kms_key_caller_refusal::assert_caller_refusal(case, message, key_arn);
+        return;
+    }
+    assert_eq!(
+        message,
+        sentence.text_before_the_id(key_arn),
+        "case {case:?}: expected the {sentence:?} sentence naming the key, got {message:?}"
+    );
 }
 
 /// How a row sets its key up.
@@ -362,12 +377,7 @@ async fn an_association_takes_effect_only_for_a_key_this_service_can_use() {
                     "case {case:?}: expected the {DENIED_CODE} code, got {answered}"
                 );
                 let message = error_message(&answered);
-                assert_eq!(
-                    message,
-                    sentence.message(&key_arn),
-                    "case {case:?}: expected the {sentence:?} sentence naming the key, got \
-                     {message:?}"
-                );
+                assert_sentence(case, sentence, &message, &key_arn);
                 assert_eq!(
                     reported_key(&emulator, case).await,
                     None,
@@ -384,15 +394,11 @@ async fn an_association_takes_effect_only_for_a_key_this_service_can_use() {
                     DENIED_CODE,
                     "case {case:?}: expected the {DENIED_CODE} code, got {answered}"
                 );
-                // The authorization refusal over the calling principal and the key, which is
-                // what the dry run run with the caller's credentials answers.
+                // This service's own sentence about the dry run run with the caller's
+                // credentials: the key the request named, the permission the caller's policy has
+                // to grant on it, and the id of the internal KMS call.
                 let message = error_message(&answered);
-                assert_eq!(
-                    message,
-                    Sentence::TheCallersOwn.message(&key_arn),
-                    "case {case:?}: expected the refusal of the caller's own dry run, got \
-                     {message:?}"
-                );
+                assert_sentence(case, Sentence::TheCallersOwn, &message, &key_arn);
                 assert_eq!(
                     reported_key(&emulator, case).await,
                     None,
@@ -460,11 +466,7 @@ async fn the_same_call_succeeds_once_the_key_is_repaired() {
             "case {case:?}: expected the {DENIED_CODE} code, got {answered}"
         );
         let message = error_message(&answered);
-        assert_eq!(
-            message,
-            sentence.message(&key_arn),
-            "case {case:?}: expected the {sentence:?} sentence naming the key, got {message:?}"
-        );
+        assert_sentence(case, sentence, &message, &key_arn);
 
         match repair {
             Repair::GrantTheServicePrincipal => {

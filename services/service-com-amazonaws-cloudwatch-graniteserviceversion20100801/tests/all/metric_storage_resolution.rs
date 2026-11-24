@@ -15,13 +15,16 @@
 //! cannot differ: a high-resolution series is folded up into the window the read asked for, and a
 //! regular-resolution one is read at the minute it is stored in.**
 //!
-//! A read cannot report detail finer than the resolution the data is stored at, but it is not
-//! refused and not answered with nothing either: the datapoint is served at the start of the span
-//! it IS stored in. The one period that asks for detail a regular-resolution span holds none of is
-//! the one-second period, which is answered from such a span only once the clock has LEFT it and
-//! its aggregate is complete (`metric_open_span_reads` holds that half of the rule, over spans the
-//! clock is still inside). `StorageResolution` is optional and "if you omit this, the default of
-//! 60 is used", so an omitted member reads exactly like 60.
+//! A read cannot report detail finer than the resolution the data is stored at, but at the
+//! divisions of a minute its own windows are laid on it is not refused and not answered with
+//! nothing either: the datapoint is served at the start of the span it IS stored in. The ONE
+//! period below those divisions — the one-second period — resolves the per-second detail only
+//! high-resolution storage keeps, so it selects the data stored AT that resolution and nothing
+//! else: "High-resolution metrics are those metrics stored by a PutMetricData call that includes a
+//! StorageResolution of 1 second."
+//! (`smithy_query(query="doc",shape="GetMetricStatisticsInput",member="Period")`), and
+//! `per_second_period_selection` tables that half of the rule. `StorageResolution` is optional and
+//! "if you omit this, the default of 60 is used", so an omitted member reads exactly like 60.
 //!
 //! The rows differ along what the rule generalises over: the resolution the series was published
 //! at (1, 60, and omitted), the period the read asks for (1, 5, 10, 20 and 30 seconds — every
@@ -83,6 +86,9 @@ struct Row {
 /// detail than the minute it is stored at.
 const BY_THE_MINUTE: &[(f64, f64)] = &[(0.0, 2.0), (60.0, 1.0)];
 
+/// The buckets a read answers with over a series that holds nothing at the granularity it asked
+/// for: none at all.
+const NOTHING: &[(f64, f64)] = &[];
 /// The table: one row per shape the rule generalises over.
 const ROWS: &[Row] = &[
     Row {
@@ -110,16 +116,27 @@ const ROWS: &[Row] = &[
         buckets: BY_THE_MINUTE,
     },
     Row {
+        // The one period below those divisions resolves per-second detail, which a
+        // regular-resolution series holds none of: such a read selects only the data stored at
+        // that resolution, so this series has no datapoint there.
         case: "regular resolution read at one second",
         storage_resolution: Some(60),
         period: 1,
-        buckets: BY_THE_MINUTE,
+        buckets: NOTHING,
     },
     Row {
         case: "high resolution read at one second",
         storage_resolution: Some(1),
         period: 1,
         buckets: &[(0.0, 1.0), (10.0, 1.0), (70.0, 1.0)],
+    },
+    Row {
+        // "If you omit this, the default of 60 is used" — the omitted member is regular
+        // resolution at the one-second period too.
+        case: "an omitted StorageResolution read at one second",
+        storage_resolution: None,
+        period: 1,
+        buckets: NOTHING,
     },
     Row {
         case: "regular resolution read at five seconds",

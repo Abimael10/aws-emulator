@@ -11,12 +11,18 @@
 //! (`smithy_query(query="doc",shape="MetricDatum",member="StorageResolution")`) — so a period
 //! FINER than a datapoint's storage granularity is answered FROM that datapoint, bucketed by
 //! the span it is stored in (the whole minute for a regular-resolution one, its own second for
-//! a high-resolution one), and never dropped for want of detail the series does not hold.**
+//! a high-resolution one), and never dropped for want of detail the series does not hold. The one
+//! period that holds NO coarser-stored datapoint at all is the one-second period, which resolves
+//! the per-second detail only high-resolution storage keeps — "High-resolution metrics are those
+//! metrics stored by a PutMetricData call that includes a StorageResolution of 1 second."
+//! (`GetMetricStatisticsInput$Period`) — so there only the high-resolution half of the series is
+//! answered.**
 //!
 //! The series under test carries one datapoint of each resolution inside the same minute, which
-//! is what tells the two apart: at a sub-minute period the high-resolution datapoint stands at
-//! its own second while the regular-resolution one stands at the minute, and at a period of a
-//! minute or more the two fold together. A read that dropped either datapoint, or reported the
+//! is what tells the two apart: at a division of a minute the high-resolution datapoint stands at
+//! its own second while the regular-resolution one stands at the minute, at the one-second period
+//! the regular-resolution one is not reported at all, and at a period of a minute or more the two
+//! fold together. A read that dropped either datapoint where the rule reports it, or reported the
 //! regular-resolution one at the second it was published at, fails every row.
 //!
 //! The rows differ along the period the read asks for: every sub-minute value `MetricStat$Period`
@@ -187,50 +193,58 @@ async fn metric_data_buckets(
     buckets
 }
 
-/// One row: what it is, the period it reads at, and the `(offset from the base, SampleCount)`
-/// buckets the rule requires.
-type Row = (&'static str, i64, Vec<(f64, f64)>);
+/// One row: what it is, the period it reads at, the `(offset from the base, SampleCount)` buckets
+/// the rule requires, and how many of the series' two observations that period reports.
+type Row = (&'static str, i64, Vec<(f64, f64)>, f64);
 
-/// The period each row reads at, and the buckets the rule requires: the sub-minute rows report
-/// the regular-resolution datapoint at the minute and the high-resolution one in the window of
-/// its own second, and the one-minute row folds both into the minute.
+/// The period each row reads at, and the buckets the rule requires: the divisions of a minute
+/// report the regular-resolution datapoint at the minute and the high-resolution one in the window
+/// of its own second, the one-second period reports only the high-resolution one, and the
+/// one-minute row folds both into the minute.
 fn rows() -> Vec<Row> {
     let window = |period: f64, offset: f64| (offset / period).floor() * period;
     vec![
         (
             "one second, the finest granularity a read may ask for",
             1,
-            vec![(0.0, 1.0), (HIGH_RESOLUTION_OFFSET, 1.0)],
+            vec![(HIGH_RESOLUTION_OFFSET, 1.0)],
+            1.0,
         ),
         (
             "five seconds",
             5,
             vec![(0.0, 1.0), (window(5.0, HIGH_RESOLUTION_OFFSET), 1.0)],
+            2.0,
         ),
         (
             "ten seconds",
             10,
             vec![(0.0, 1.0), (window(10.0, HIGH_RESOLUTION_OFFSET), 1.0)],
+            2.0,
         ),
         (
             "twenty seconds",
             20,
             vec![(0.0, 1.0), (window(20.0, HIGH_RESOLUTION_OFFSET), 1.0)],
+            2.0,
         ),
         (
             "thirty seconds",
             30,
             vec![(0.0, 1.0), (window(30.0, HIGH_RESOLUTION_OFFSET), 1.0)],
+            2.0,
         ),
         (
             "one minute, where the two resolutions cannot differ",
             60,
             vec![(0.0, 2.0)],
+            2.0,
         ),
         (
             "five minutes, a multiple of the minute",
             300,
             vec![(0.0, 2.0)],
+            2.0,
         ),
     ]
 }
@@ -243,7 +257,7 @@ async fn a_read_places_each_datapoint_at_the_span_its_resolution_stores_it_in() 
     let base = base_minute();
     publish(&router, base).await;
 
-    for (case, period, expected) in rows() {
+    for (case, period, expected, reported) in rows() {
         for (reader, got) in [
             (
                 "GetMetricStatistics",
@@ -259,21 +273,22 @@ async fn a_read_places_each_datapoint_at_the_span_its_resolution_stores_it_in() 
                 "case {case:?}: expected {reader} at Period {period} to answer {expected:?}, got \
                  {got:?}"
             );
-            // Whatever the period, every observation of the series is reported: the two
-            // datapoints are one sample each, so the counts over the window sum to two.
+            // The observations the period reports: both of them wherever the series holds data at
+            // that granularity, and only the high-resolution one at the per-second period, which
+            // the regular-resolution half stores none of.
             let counted: f64 = got.iter().map(|(_, count)| *count).sum();
             assert_eq!(
-                counted, 2.0,
-                "case {case:?}: {reader} at Period {period} must report both observations, got \
-                 {got:?}"
+                counted, reported,
+                "case {case:?}: {reader} at Period {period} must report {reported} of the \
+                 series' observations, got {got:?}"
             );
         }
     }
 }
 
-/// The REGULAR-resolution datapoint stands on a whole minute at every period, which is what
-/// says the read reports no detail the series does not hold — asserted over the instants
-/// themselves rather than over a bucket list.
+/// The REGULAR-resolution datapoint stands on a whole minute at every period that reports it,
+/// which is what says the read reports no detail the series does not hold — asserted over the
+/// instants themselves rather than over a bucket list. The one-second period reports none of it.
 #[tokio::test]
 async fn the_regular_resolution_datapoint_is_reported_on_a_whole_minute() {
     let router = build_router();
@@ -319,6 +334,15 @@ async fn the_regular_resolution_datapoint_is_reported_on_a_whole_minute() {
             .iter()
             .filter_map(|point| point["Timestamp"].as_f64())
             .collect();
+        // The one-second period resolves per-second detail, which this series holds none of.
+        if period == 1 {
+            assert!(
+                stamps.is_empty(),
+                "case {period}: a regular-resolution datapoint is not reported at the per-second \
+                 period, got {body}"
+            );
+            continue;
+        }
         assert_eq!(
             stamps.len(),
             1,

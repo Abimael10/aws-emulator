@@ -33,12 +33,14 @@
 //! it was before any of this was asked, and nothing is invented for a question that went
 //! unanswered.
 //!
-//! WHAT A FAILED DRY RUN SAYS is one sentence for every outcome but the key's own state
-//! ([`Unusable`]): the dry run does not report which of its checks failed, so a key that resolves
-//! to nothing, one whose policy admits this service nothing, one that is not a symmetric
-//! encryption key and one the caller may not use are all stated as a key this service could not
-//! validate. Only a key KMS holds in a state that admits no cryptographic operation is named on
-//! its own.
+//! WHAT A FAILED DRY RUN SAYS is one sentence for every outcome of the SERVICE-principal half of
+//! it ([`Unusable`]): that half does not report which of its checks failed, so a key that resolves
+//! to nothing, one whose policy admits this service nothing and one that is not a symmetric
+//! encryption key are all stated as a key this service could not validate, while a key KMS holds
+//! in a state that admits no cryptographic operation is named on its own. The dry run run with the
+//! CALLER's credentials is a different finding and carries its own sentence
+//! ([`caller_denied_message`]): it names the key and the permission the CALLER's own policy has to
+//! grant on it, because what repairs it is that policy rather than anything about the key.
 
 /// What KMS states about the key a dataset association names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,15 +56,15 @@ pub enum KeyCondition {
     Unknown,
 }
 
-/// Why the dry run did not pass — the two refusals this service words differently.
+/// Why the dry run did not pass — the three refusals this service words differently.
 ///
-/// Everything a dry run can find about a key other than its STATE is answered with one
-/// sentence, because the dry run does not report which of its checks failed: a key that
-/// resolves to nothing, one whose key policy grants this service nothing, one that is not the
-/// kind data can be sealed under and one the caller may not use are a key this service could
-/// not validate ([`unable_to_validate_message`]). A key KMS holds in a state that admits no
-/// cryptographic operation is the one condition the refusal names on its own
-/// ([`key_disabled_message`]).
+/// Everything the SERVICE-principal half of the dry run can find about a key other than its
+/// STATE is answered with one sentence, because that half does not report which of its checks
+/// failed: a key that resolves to nothing, one whose key policy grants this service nothing and
+/// one that is not the kind data can be sealed under are a key this service could not validate
+/// ([`unable_to_validate_message`]). A key KMS holds in a state that admits no cryptographic
+/// operation is a condition the refusal names on its own ([`key_disabled_message`]), and the dry
+/// run run with the CALLER's credentials is the third ([`caller_denied_message`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unusable {
     /// The key could not be validated for this association.
@@ -72,19 +74,23 @@ pub enum Unusable {
     /// The key's own policy denies the CALLING principal the operation the association needs.
     ///
     /// Not a judgement of the key but of the caller's authority over it, which is why it is the
-    /// one outcome of the dry run answered in the class an authorization failure carries.
+    /// one outcome of the dry run answered in the class an authorization failure carries, and
+    /// why its sentence names the permission the caller's own policy has to grant
+    /// ([`caller_denied_message`]).
     CallerDenied,
 }
 
 impl Unusable {
-    /// The sentence this refusal carries about the key `key_arn` the request named, for the
-    /// `caller` the dry run was run with.
+    /// The sentence this refusal carries about the key `key_arn` the request named.
+    ///
+    /// Every sentence names the key and nothing of the calling identity: what a caller repairs is
+    /// the key, or its own policy's grant ON that key, and the key is how either is found.
     #[must_use]
-    pub fn message(self, key_arn: &str, caller: &str) -> String {
+    pub fn message(self, key_arn: &str) -> String {
         match self {
             Self::NotValidated => unable_to_validate_message(key_arn),
             Self::Disabled => key_disabled_message(key_arn),
-            Self::CallerDenied => caller_denied_message(caller, key_arn),
+            Self::CallerDenied => caller_denied_message(key_arn, &new_kms_request_id()),
         }
     }
 
@@ -392,30 +398,38 @@ pub fn key_disabled_message(key_arn: &str) -> String {
     format!("KMS key {key_arn} is disabled.")
 }
 
-/// How it states the dry run that refused the CALLER its use of the key.
+/// How it states the dry run that refused the CALLER its use of the key: the key the request
+/// named, the permission the caller's own policy has to grant on it, and the id of the KMS
+/// exchange this refusal came out of.
 ///
-/// The caller's own `kms:Decrypt` dry run is the one AWS runs "with the caller's credentials"
-/// (`AssociateDatasetKmsKey`), so what refuses the association is an AUTHORIZATION refusal over
-/// that principal and that key rather than a statement about the key's own condition. The
-/// sentence is the tree's one rendering of such a refusal
-/// ([`::service_common::iam_authorization`]), closed by the clause for the reading this service
-/// refuses on — an explicit `Deny` in the key's own policy, which is a RESOURCE-based one
-/// ([`withheld_from_caller`], the only reading that withholds the caller's dry run here), so
-/// the sentence states the decision the code took and nothing else. Another service of this
-/// tree is recorded relaying the same sentence for a refused `kms:Decrypt`, with the clause of
-/// the reading ITS decision rested on
-/// (`issues/things-that-now-work/20261028T021654Z-sfn-4-net-new-behavioral-root-causes-asl.md`).
+/// THIS SERVICE authors the sentence, rather than relaying the authorization decision KMS took
+/// over the principal and the key: what failed is the dataset association's own dry run — "a
+/// kms:Decrypt dry-run is run with the caller's credentials to verify that the calling principal
+/// can use the new key" (`AssociateDatasetKmsKey`) — so what a caller is told is which permission
+/// to add to ITS OWN policy on that key, not that an IAM principal was denied an operation it
+/// never asked for. The behavioural corpus compares this text on all three of the operation's
+/// caller-refusal checks, up to the id.
+///
+/// `kms_request_id` is the id of the internal KMS call the dry run was made through
+/// ([`new_kms_request_id`]) — the only handle a client has for correlating this refusal with that
+/// call, which the response carries nowhere else.
 #[must_use]
-pub fn caller_denied_message(caller: &str, key_arn: &str) -> String {
+pub fn caller_denied_message(key_arn: &str, kms_request_id: &str) -> String {
     format!(
-        "{} {}",
-        ::service_common::iam_authorization::not_authorized_to_perform(
-            caller,
-            CALLER_DRY_RUN_OPERATION,
-            key_arn,
-        ),
-        ::service_common::iam_authorization::RESOURCE_POLICY_EXPLICIT_DENY,
+        "Caller lacks {CALLER_DRY_RUN_OPERATION} permission on KMS key {key_arn}. Update your IAM \
+         policy to include {CALLER_DRY_RUN_OPERATION} on this key. KMS request id: \
+         {kms_request_id}."
     )
+}
+
+/// The id of ONE internal KMS call: a fresh correlation id per refusal, in the form a KMS request
+/// id carries, so two refusals are distinguishable and neither is a value a client can predict.
+///
+/// Per-REQUEST rather than per-key or per-dataset: the id names the exchange this one dry run was
+/// made through, which is what an operator correlates against.
+#[must_use]
+fn new_kms_request_id() -> String {
+    ::service_common::query_error_envelope::new_request_id()
 }
 
 /// How it states a `KmsKeyArn` whose account segment is not the calling identity's own account:

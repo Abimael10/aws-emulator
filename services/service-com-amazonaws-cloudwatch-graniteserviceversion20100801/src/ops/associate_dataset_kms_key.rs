@@ -273,10 +273,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nothing KMS stated, so nothing about the key withholds the association.
             | crate::state::dataset_kms_key::KeyCondition::Unknown => {}
             crate::state::dataset_kms_key::KeyCondition::Unusable(unusable) => {
-                let refusal = unusable.message(
-                    &input.kms_key_arn,
-                    caller_principals.first().map_or("", String::as_str),
-                );
+                // The key the REQUEST named is the sentence's variable part, whichever outcome of
+                // the dry run refused it: it is what a caller repairs, or asks its own policy to
+                // grant, and the ARN KMS resolved it to is this service's business rather than
+                // the caller's.
+                let refusal = unusable.message(&input.kms_key_arn);
                 // What was refused decides the STATUS the one wire code travels under: a
                 // condition of the KEY is a fault of the request (400), while the dry run run
                 // "with the caller's credentials" is the caller's own authority over the key,

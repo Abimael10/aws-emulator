@@ -1220,9 +1220,10 @@ pub fn retention_secs_at_period(period: i32) -> f64 {
 /// The ONE period that asks for detail no regular-resolution span holds at all is the
 /// one-second period, which resolves the per-second detail only high-resolution storage keeps
 /// ("CloudWatch stores the metric with sub-minute resolution down to one second",
-/// `MetricDatum$StorageResolution`): a coarser-stored span is reported to such a read only as
-/// the whole aggregate it is, and only once the clock has LEFT that span, more observations
-/// being publishable into a span that is still running.
+/// `MetricDatum$StorageResolution`): such a read is answered from the data stored AT that
+/// granularity and from no other, so a coarser-stored span has no datapoint there at all —
+/// "High-resolution metrics are those metrics stored by a `PutMetricData` call that includes a
+/// `StorageResolution` of 1 second." is what a one-second period selects.
 ///
 /// A window holding no datapoint is never inserted, so what this allocates is bounded by the
 /// datapoints the series holds in the range rather than by the range the request spans. A
@@ -1268,11 +1269,12 @@ pub fn windows_by_unit<'a>(
         // that WHOLE span's aggregate, and that is what such a read is answered with, at the
         // start of the span the datapoint is stored in — a read at a granularity the series
         // does not hold is answered at the granularity it does hold rather than with nothing.
-        // Only the one-second period asks for detail a coarser-stored span holds none of at
-        // all ([`FINEST_WINDOW_DIVISION_SECS`]), and there the span is reported only once the
-        // clock has LEFT it and no further observation can land inside it.
-        if stored_span > span && span < FINEST_WINDOW_DIVISION_SECS && now < instant + stored_span
-        {
+        // The ONE period that asks for detail a coarser-stored span holds none of at all is the
+        // one-second period ([`FINEST_WINDOW_DIVISION_SECS`]), which selects the data stored at
+        // THAT granularity and no other: "High-resolution metrics are those metrics stored by a
+        // `PutMetricData` call that includes a `StorageResolution` of 1 second."
+        // (`GetMetricStatisticsInput$Period`).
+        if stored_span > span && span < FINEST_WINDOW_DIVISION_SECS {
             continue;
         }
         if unit.is_some_and(|wanted| datum.unit() != wanted) {
@@ -1372,9 +1374,9 @@ const START_TIME_ROUNDING_PERIODS: [i32; 4] = [5, 10, 20, 30];
 /// datapoint the range holds at the granularity that datapoint is STORED at. The one period
 /// BELOW it — the one second [`SUB_MINUTE_PERIODS`] also admits — resolves the per-second detail
 /// only high-resolution storage keeps ("CloudWatch stores the metric with sub-minute resolution
-/// down to one second", `MetricDatum$StorageResolution`), which is what makes it the one period a
-/// span stored coarser than it is reported to only once that span has closed
-/// ([`windows_by_unit`]).
+/// down to one second", `MetricDatum$StorageResolution`), which is what makes it the one period
+/// that selects ONLY the data stored at that granularity and reports nothing of a span stored
+/// coarser than it ([`windows_by_unit`]).
 const FINEST_WINDOW_DIVISION_SECS: f64 = 5.0;
 
 /// The start of the first window a read searches: the requested start time rounded DOWN to the
