@@ -397,4 +397,21 @@ impl crate::state::ComAmazonawsDeadlineDeadlineState {
             .sessions
             .get(session_id)
     }
+
+    /// Whether the scheduler is holding `worker_id` on work of `queue_id` right now: the
+    /// worker has a session of one of that queue's jobs that has not ended.
+    ///
+    /// A session is one worker working on one job of one queue (see [`Session`]), and it is
+    /// the worker's until it ends, so this is the question "is this worker working on that
+    /// queue" asked of stored state alone. A session of ANOTHER queue says nothing about this
+    /// one, which is what makes the answer per queue rather than per worker.
+    pub fn worker_works_on_queue(&self, farm_id: &str, queue_id: &str, worker_id: &str) -> bool {
+        self.queue(farm_id, queue_id).is_some_and(|queue| {
+            queue
+                .jobs
+                .values()
+                .flat_map(|job| job.sessions.values())
+                .any(|session| session.worker_id == worker_id && session.open())
+        })
+    }
 }

@@ -47,6 +47,10 @@ pub use scheduling::*;
 mod tags;
 pub use tags::*;
 
+/// What a queue-role credential is, and who may hold one.
+mod queue_role;
+pub use queue_role::*;
+
 /// `QueueStatus` value a freshly created queue carries.
 ///
 /// From `smithy_query(query="shape", shape="QueueStatus")`: `IDLE`, `SCHEDULING`,
