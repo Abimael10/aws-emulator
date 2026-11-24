@@ -171,7 +171,8 @@ pub(crate) fn error_code(body: &Value) -> String {
         .to_string()
 }
 
-fn message(body: &Value) -> String {
+/// The error message an answer carries, whichever casing the envelope spells it with.
+pub(crate) fn message(body: &Value) -> String {
     body.get("message")
         .or_else(|| body.get("Message"))
         .and_then(Value::as_str)
