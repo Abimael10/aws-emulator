@@ -187,6 +187,9 @@ pub async fn run_python(
                 // It is no Lambda durable execution's run either, so it takes no step of one
                 // and checkpoints nothing onto one.
                 durable: None,
+                // And it mounts no Amazon EFS file system: the files the program reaches are
+                // the session's own, which this service holds.
+                file_systems: &[],
             });
             let _ = sender.send(finished);
         });

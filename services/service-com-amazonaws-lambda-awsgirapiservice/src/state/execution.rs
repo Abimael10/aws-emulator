@@ -117,6 +117,12 @@ mod guest_mount;
 /// for the same reason: that source is built with this one's macro too.
 mod guest_ephemeral;
 
+/// The NETWORK FILE SYSTEMS that runtime serves beside both: the Amazon EFS access points the
+/// function's `FileSystemConfigs` mount, whose files are held by the service that owns them.
+/// Declared with the two above and before the runtime, for the same reason: that source is
+/// built with this one's macro too.
+mod guest_file_system;
+
 /// The runtime the handler runs under, in the language the handler is written in.
 mod bootstrap;
 
@@ -753,6 +759,17 @@ pub struct Invocation {
     /// ([`MAX_STREAMED_RESPONSE_BYTES`]) and a streamed answer is not bounded by what one
     /// buffered response carries.
     pub streamed: bool,
+    /// The FILE SYSTEMS this invocation's execution environment MOUNTS: each Amazon EFS access
+    /// point the function's `FileSystemConfigs` name, resolved to the access point's own root
+    /// directory, the identity requests through it are made as, and the files behind it
+    /// ([`super::file_system_mounts`]).
+    ///
+    /// Resolved by the CALLER, where the rest of the invocation is assembled, and carried here
+    /// because the run happens on a thread of its own. Empty for a function that configures no
+    /// file system, and for one whose configuration names an access point this emulator's
+    /// Amazon EFS does not hold — such a path is then no path of the execution environment at
+    /// all.
+    pub file_systems: Vec<super::FileSystemMount>,
     /// The AWS/Lambda series this invocation is metered on once it has RUN — what its run
     /// took, and the failure it came to ([`super::metrics::InvocationMetrics`]) — or `None`
     /// for a run metered nowhere.
@@ -1188,6 +1205,7 @@ pub async fn run_invocation(
                         budget,
                         aws: invocation.aws.clone(),
                         durable,
+                        file_systems: invocation.file_systems.clone(),
                     },
                 ),
                 Engine::Node => node::run(&node::Run {
@@ -2527,6 +2545,7 @@ mod tests {
             initialization_type: crate::state::execution_slot::INITIALIZATION_TYPE_ON_DEMAND,
             aws: None,
             logs: None,
+            file_systems: Vec::new(),
             metrics: None,
             streamed: false,
         }
@@ -3148,6 +3167,7 @@ mod tests {
                     ),
                     aws: None,
                     durable: None,
+                    file_systems: &[],
                 })
             })
             .expect("a run thread")

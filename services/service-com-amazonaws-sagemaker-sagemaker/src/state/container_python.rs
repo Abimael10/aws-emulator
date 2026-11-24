@@ -399,6 +399,9 @@ pub fn run_python_container_program(
                     // It is no Lambda durable execution's run either, so it takes no step of one
                     // and checkpoints nothing onto one.
                     durable: None,
+                    // And it mounts no Amazon EFS file system: the data the program works over
+                    // is what this service placed in the job's own storage.
+                    file_systems: &[],
                 },
                 // The clock the run's own span is read against: one the RUN drives, a tick per
                 // traced event it delivers, stating what the run may take of THIS host besides.

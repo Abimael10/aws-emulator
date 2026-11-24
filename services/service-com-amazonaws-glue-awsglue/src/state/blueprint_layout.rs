@@ -531,6 +531,10 @@ async fn run_layout(
                     aws: access.as_ref(),
                     // A layout is no Lambda durable execution's run.
                     durable: None,
+                    // And it mounts no Amazon EFS file system: a blueprint's layout is run
+                    // from the script this service holds, not from a function configured with
+                    // one.
+                    file_systems: &[],
                 },
                 &python::Clock::driven(BLUEPRINT_LAYOUT_CLOCK_TICK)
                     .waiting()

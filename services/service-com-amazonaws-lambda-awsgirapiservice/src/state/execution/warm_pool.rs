@@ -183,6 +183,9 @@ pub struct Served {
     /// ([`super::super::durable_steps`]), and `None` for an invocation that is no durable
     /// execution's run.
     pub durable: Option<DurableStepJournal>,
+    /// The FILE SYSTEMS its execution environment mounts
+    /// ([`super::super::file_system_mounts`]), resolved for this invocation.
+    pub file_systems: Vec<crate::state::FileSystemMount>,
 }
 
 impl Served {
@@ -201,6 +204,7 @@ impl Served {
             budget: self.budget,
             aws: self.aws.as_ref(),
             durable: self.durable.as_ref(),
+            file_systems: &self.file_systems,
         }
     }
 }

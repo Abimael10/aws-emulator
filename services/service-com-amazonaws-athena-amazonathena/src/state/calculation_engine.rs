@@ -278,6 +278,9 @@ pub async fn run(code: String, calculation_execution_id: String) -> Completion {
                     // A calculation is no Lambda durable execution's run, so it takes no step
                     // of one and checkpoints nothing onto one.
                     durable: None,
+                    // And it mounts no Amazon EFS file system: what the code reads and writes
+                    // is the session's own results location, which this service holds.
+                    file_systems: &[],
                 },
                 // The clock the run's own span is read against: one the RUN drives, a tick per
                 // traced event it delivers and the waits it asks for, so what the CALCULATION

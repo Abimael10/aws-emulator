@@ -70,6 +70,7 @@
 /// sections leave behind are the runtime's own.
 pub(super) const RUNTIME_SOURCE: &str = super::guest_mount::mount_source!(
     super::guest_ephemeral::ephemeral_source!(
+    super::guest_file_system::file_system_source!(
     r##"
 import sys
 
@@ -1279,6 +1280,12 @@ def _prepare(request, library):
         request.get("ephemeralWritableBytes") or 0,
         time.time(),
     )
+    # The NETWORK FILE SYSTEMS of the environment, mounted after both because their calls
+    # dispatch to theirs ([`super::guest_file_system`]): each Amazon EFS access point the
+    # function's `FileSystemConfigs` name, at the `LocalMountPath` it names, with the files
+    # behind it held by the service that owns the file system. A function that configures none
+    # mounts nothing here and keeps the environment it had.
+    _efs_install(request.get("fileSystems") or {})
     # The import directories of the LAYER ROOT, which the finder below resolves a layer's
     # modules from and which site processing extends further down — one list, so a directory a
     # path-configuration file adds is both on the path and importable.
@@ -1566,5 +1573,6 @@ __lambda_prepare = _main_prepare
 __lambda_bind = _main_bind
 __lambda_invoke = _main_invoke
 "##
+    )
     )
 );

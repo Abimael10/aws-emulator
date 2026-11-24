@@ -1201,6 +1201,9 @@ async fn run_script(
                     // A job script is no Lambda durable execution's run, so it takes no step
                     // of one and checkpoints nothing onto one.
                     durable: None,
+                    // And it mounts no Amazon EFS file system: a job run is driven from the
+                    // script this service holds, not from a function configured with one.
+                    file_systems: &[],
                 },
                 // The clock the run's own span is read against: one the RUN drives, a tick
                 // per traced event it delivers and the waits it asks for, so the state the

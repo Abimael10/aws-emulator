@@ -110,10 +110,23 @@ impl MountedFileSystem {
     pub fn metered_bytes(&self) -> i64 {
         let stored: usize = self
             .files()
-            .stored_files()
+            .stored_bytes()
             .map(|(_, contents)| contents.len())
             .sum();
         i64::try_from(stored).unwrap_or(i64::MAX)
+    }
+
+    /// An empty file system with NO record of this store beside it, for the tests of a
+    /// component that MOUNTS one.
+    ///
+    /// A caller serving a request reaches a file system's files through
+    /// [`mount_file_system`] or [`mount_access_point`], which answer only for a file system
+    /// this store really holds — that is what makes a mount one backed by a file system that
+    /// exists, and nothing here changes it. This hands out the same empty tree without a
+    /// record, so the component doing the mounting can be driven over a file system directly.
+    #[must_use]
+    pub fn empty_for_tests() -> Self {
+        Self::new()
     }
 }
 
@@ -277,3 +290,98 @@ pub fn access_point_owner<Eng: Send + Sync + 'static>(
 /// "if this parameter is omitted, the root of the Amazon EFS volume will be used"
 /// (`EFSVolumeConfiguration$rootDirectory`).
 pub const ROOT_DIRECTORY: &str = "/";
+
+/// What a client that mounts ONE ACCESS POINT is given: the view that access point enforces,
+/// and the file system's own files behind it.
+///
+/// An access point "applies an operating system user and group, and a file system path, to any
+/// file system request made through the access point", so a client holding this reaches the
+/// file system's one shared tree ([`Self::files`]) rooted at [`Self::root_directory`] and acts
+/// as [`Self::posix_user`] — the three readings `DescribeAccessPoints` reports, handed over
+/// together so a caller resolves an access point with ONE read of this store.
+#[derive(Debug, Clone)]
+pub struct MountedAccessPoint {
+    /// `AccessPointDescription$AccessPointId`.
+    pub access_point_id: String,
+    /// The file system the access point is a view into.
+    pub file_system_id: String,
+    /// `RootDirectory$Path`, defaulted to the file system's own root for an access point
+    /// created with no `RootDirectory` ([`access_point_root`]).
+    pub root_directory: String,
+    /// `PosixUser`, as `(uid, gid, secondary gids)`, and `None` for an access point that
+    /// enforces no identity ([`access_point_owner`]).
+    pub posix_user: Option<(i64, i64)>,
+    /// `PosixUser$SecondaryGids`.
+    pub secondary_gids: Vec<i64>,
+    /// `RootDirectory$CreationInfo`, "the POSIX IDs and permissions to apply to the access
+    /// point's `RootDirectory`": the owner and the permissions Amazon EFS creates that
+    /// directory with when the path does not yet exist, as `(uid, gid, permissions)`. `None`
+    /// for an access point that states none, whose root directory has to exist already.
+    pub root_creation: Option<(i64, i64, String)>,
+    /// The file system's own files, shared with every other client that mounted it.
+    pub files: MountedFileSystem,
+}
+
+/// The access point `named` as a client MOUNTS it, read out of THIS service's own store
+/// through the one shared engine — by its ARN (`AccessPointDescription$AccessPointArn`, which
+/// is how another service's configuration names one) or by its id.
+///
+/// `None` when that store is unreachable (the engine is not the shared in-memory one), when it
+/// holds no such access point, when that access point is not `available` — "the mount target
+/// is ready for use" is what an `available` lifecycle state promises of every resource of this
+/// service, so one still `creating` is not yet something to mount through — or when the file
+/// system behind it is gone. Nothing is invented for any of them: a mount of what does not
+/// exist reaches nothing.
+///
+/// The transitions the CLOCK has already made due are materialised first, exactly as a
+/// reporting operation of this service materialises them: an access point whose `creating`
+/// span has elapsed is `available` whether or not anybody called.
+///
+/// LOCK ORDER: as [`mount_file_system`].
+#[must_use]
+pub fn mount_access_point<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    named: &str,
+    now: SystemTime,
+) -> Option<MountedAccessPoint> {
+    let state = service_state(engine)?;
+    let mut store = state.lock();
+    store.materialize_due_transitions(now);
+    let access_point = store
+        .access_points
+        .values()
+        .find(|held| held.access_point_arn == named || held.access_point_id == named)
+        .filter(|held| held.life_cycle_state == LIFE_CYCLE_AVAILABLE)
+        .cloned()?;
+    let files = store.mounted_file_system(&access_point.file_system_id)?;
+    Some(MountedAccessPoint {
+        access_point_id: access_point.access_point_id.clone(),
+        file_system_id: access_point.file_system_id.clone(),
+        root_directory: access_point
+            .root_directory
+            .path
+            .clone()
+            .unwrap_or_else(|| ROOT_DIRECTORY.to_string()),
+        posix_user: access_point
+            .posix_user
+            .as_ref()
+            .map(|posix_user| (posix_user.uid, posix_user.gid)),
+        secondary_gids: access_point
+            .posix_user
+            .as_ref()
+            .and_then(|posix_user| posix_user.secondary_gids.clone())
+            .unwrap_or_default(),
+        root_creation: access_point
+            .root_directory
+            .creation_info
+            .as_ref()
+            .map(|creation| {
+                (
+                    creation.owner_uid,
+                    creation.owner_gid,
+                    creation.permissions.clone(),
+                )
+            }),
+        files,
+    })
+}

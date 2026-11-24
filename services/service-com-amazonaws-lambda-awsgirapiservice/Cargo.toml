@@ -71,6 +71,13 @@ service-com-amazonaws-dynamodbstreams-dynamodbstreams-20120810 = { workspace = t
 # engine — which needs that service's state TYPE — so the subnets they sit in resolve to the
 # VPC the function reports and a client reading `DescribeNetworkInterfaces` sees them.
 service-com-amazonaws-ec2-amazonec2 = { workspace = true }
+# A function's `FileSystemConfigs` mounts an Amazon EFS ACCESS POINT into the execution
+# environment, and the files behind it are the file system's own, held by the service that
+# owns it (`state::file_system_mounts`): the access point's root directory, its `PosixUser`
+# and that one shared tree are read out of the Amazon EFS emulator's store over the shared
+# engine, which needs that service's state TYPE — so what one function writes under its mount
+# path, every other client of that file system reads.
+service-com-amazonaws-efs-magnolioapiservice-v20150201 = { workspace = true }
 # A container-image package names an image in the Amazon ECR registry, and Lambda follows
 # that reference when the package is stored (`state::image_source`): the registry's own
 # image and tag records are reached through the shared engine, which needs the owning

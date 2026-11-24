@@ -307,6 +307,9 @@ fn run_in_process(
         budget,
         aws: None,
         durable: None,
+        // An application process mounts no Amazon EFS file system: the files it reaches are
+        // the deployment's own, which this service holds.
+        file_systems: Vec::new(),
     };
     guest_run(warm_pool::serve(&key, served))
 }

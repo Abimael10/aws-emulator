@@ -63,8 +63,8 @@ const CEILING_OUT_OF_REACH: u64 = 32_768 * 1024 * 1024;
 
 /// The names the host installs on the module a run can reach (`state::execution::python`
 /// installs `log`, `record`, `sleep`, `aws`, `child`, `db_auth_token`, `request`, `presign`,
-/// `pagination`, `error_shapes`, `net`, `durable` and `library_source`), in the order a sorted
-/// reading of them answers.
+/// `pagination`, `error_shapes`, `net`, `durable`, `files` and `library_source`), in the order
+/// a sorted reading of them answers.
 ///
 /// None of them begins a phase of the run or raises a bound of it. A name added to the host
 /// module has to be added here too, which is the point of reading the surface rather than a
@@ -76,6 +76,7 @@ const SURFACE: &[&str] = &[
     "durable",
     "ephemeral",
     "error_shapes",
+    "files",
     "library_source",
     "log",
     "net",
@@ -163,6 +164,9 @@ fn ran(source: &str, event: Option<&str>, budget: Budget, clock: &Clock, case: &
                     aws: None,
                     // Nor a durable execution: nothing here is the run of one.
                     durable: None,
+                    // Nor a mounted file system: a function that configures none mounts
+                    // nothing, which is what these rows run with.
+                    file_systems: &[],
                 },
                 &clock,
             );

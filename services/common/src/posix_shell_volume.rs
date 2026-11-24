@@ -185,7 +185,6 @@ pub struct EntryFacts {
     /// the creation or removal of something under it, which is what changes a directory.
     pub modified: SystemTime,
 }
-
 /// What a MOUNTED filesystem reports about itself, as the programs that ask about the mounts
 /// of a machine report it.
 ///
@@ -325,8 +324,21 @@ impl Mount {
 /// The tree one session's commands read and write. See the module docs.
 #[derive(Debug, Clone)]
 pub struct ShellVolume {
-    /// The files a program may read and write, by absolute path.
-    files: BTreeMap<String, String>,
+    /// The files a program may read and write, by absolute path. A file is BYTES: a program
+    /// writing text writes its encoding, and one writing bytes that are no text at all writes
+    /// exactly those ([`ShellVolume::write_bytes`]).
+    files: BTreeMap<String, Vec<u8>>,
+    /// Who each entry of [`Self::files`] and [`Self::directories`] BELONGS TO, as
+    /// `(uid, gid)`, for the entries a caller stated an owner for
+    /// ([`ShellVolume::set_owner`]) — the identity that created it, which is what a listing
+    /// of it reports. An entry nobody stated an owner for belongs to whoever the caller
+    /// reporting it says its entries belong to.
+    owners: BTreeMap<String, (i64, i64)>,
+    /// The PERMISSIONS each entry carries, for the entries a caller stated them for
+    /// ([`ShellVolume::set_mode`]) — the mode it was created with or last changed to. An
+    /// entry nobody stated a mode for carries whatever the caller reporting it says its
+    /// entries carry.
+    modes: BTreeMap<String, u32>,
     /// The paths of [`Self::files`] entries a program may only READ.
     sealed: BTreeSet<String>,
     /// The roots of the subtrees a program may only READ ([`Self::seal_directory`]): every
@@ -410,6 +422,8 @@ impl ShellVolume {
     pub fn new(limits: VolumeLimits) -> Self {
         Self {
             files: BTreeMap::new(),
+            owners: BTreeMap::new(),
+            modes: BTreeMap::new(),
             sealed: BTreeSet::new(),
             sealed_roots: BTreeSet::new(),
             directories: BTreeSet::from([ROOT.to_string()]),
@@ -563,7 +577,7 @@ impl ShellVolume {
             return false;
         };
         self.make_directories_of(&resolved);
-        self.write_resolved(&resolved, contents, false)
+        self.write_resolved(&resolved, contents.as_bytes(), false)
     }
 
     /// Seed a file a program may only READ: a value the machine publishes to its guest
@@ -577,7 +591,7 @@ impl ShellVolume {
             return false;
         };
         self.make_directories_of(&resolved);
-        if !self.write_resolved(&resolved, contents, false) {
+        if !self.write_resolved(&resolved, contents.as_bytes(), false) {
             return false;
         }
         self.sealed.insert(resolved);
@@ -708,9 +722,13 @@ impl ShellVolume {
         }
     }
 
-    /// What reading `path` answers: a file's contents, a sealed file's contents, or the
-    /// empty text a discarding device answers — and `None` for a path the tree does not
+    /// What reading `path` answers: a file's contents as TEXT, a sealed file's contents, or
+    /// the empty text a discarding device answers — and `None` for a path the tree does not
     /// hold, a directory, or a device whose lines are kept (a console is written, not read).
+    ///
+    /// A file holds BYTES, so a file whose bytes are no text at all reads as the text they
+    /// decode to with the replacement character where they do not: a caller that means to read
+    /// the file ITSELF reads [`Self::read_bytes`].
     ///
     /// A path inside a MOUNTED filesystem is read out of that filesystem, which is where its
     /// files are.
@@ -723,7 +741,87 @@ impl ShellVolume {
         if let Some(Device::Discard) = self.devices.get(&resolved) {
             return Some(String::new());
         }
+        self.files
+            .get(&resolved)
+            .map(|contents| String::from_utf8_lossy(contents).into_owned())
+    }
+
+    /// The BYTES the file at `path` holds, which is the file itself — `None` for the paths
+    /// [`Self::read`] answers `None` for.
+    #[must_use]
+    pub fn read_bytes(&self, path: &str) -> Option<Vec<u8>> {
+        let resolved = self.resolve(path)?;
+        if let Some(read) = self.in_mount(&resolved, |files, inside| files.read_bytes(inside)) {
+            return read;
+        }
+        if let Some(Device::Discard) = self.devices.get(&resolved) {
+            return Some(Vec::new());
+        }
         self.files.get(&resolved).cloned()
+    }
+
+    /// Who the entry at `path` BELONGS TO, as `(uid, gid)`, for an entry a caller stated an
+    /// owner for ([`Self::set_owner`]) — and `None` for one nobody did, whose owner is
+    /// whatever the caller reporting it says its entries belong to.
+    #[must_use]
+    pub fn owner_of(&self, path: &str) -> Option<(i64, i64)> {
+        let resolved = self.resolve(path)?;
+        if let Some(owner) = self.in_mount(&resolved, |files, inside| files.owner_of(inside)) {
+            return owner;
+        }
+        self.owners.get(&resolved).copied()
+    }
+
+    /// Record that the entry at `path` belongs to `uid` and `gid`, as the identity that
+    /// CREATED it does on a filesystem: the owner travels with the entry, so every client that
+    /// reads it afterwards reports the same one.
+    ///
+    /// `false` for a path this tree holds no entry at. An entry that goes takes its owner with
+    /// it.
+    pub fn set_owner(&mut self, path: &str, uid: i64, gid: i64) -> bool {
+        let Some(resolved) = self.resolve(path) else {
+            return false;
+        };
+        if let Some(set) = self.in_mount_mut(&resolved, |files, inside| {
+            files.set_owner(inside, uid, gid)
+        }) {
+            return set;
+        }
+        if !self.files.contains_key(&resolved) && !self.directories.contains(&resolved) {
+            return false;
+        }
+        self.owners.insert(resolved, (uid, gid));
+        true
+    }
+
+    /// The PERMISSIONS the entry at `path` carries, for an entry a caller stated them for
+    /// ([`Self::set_mode`]) — and `None` for one nobody did.
+    #[must_use]
+    pub fn mode_of(&self, path: &str) -> Option<u32> {
+        let resolved = self.resolve(path)?;
+        if let Some(mode) = self.in_mount(&resolved, |files, inside| files.mode_of(inside)) {
+            return mode;
+        }
+        self.modes.get(&resolved).copied()
+    }
+
+    /// Record the permissions the entry at `path` carries — the mode it was created with, or
+    /// the one a later change set. Like the owner, the mode travels with the entry.
+    ///
+    /// `false` for a path this tree holds no entry at.
+    pub fn set_mode(&mut self, path: &str, mode: u32) -> bool {
+        let Some(resolved) = self.resolve(path) else {
+            return false;
+        };
+        if let Some(set) = self.in_mount_mut(&resolved, |files, inside| files.set_mode(inside, mode))
+        {
+            return set;
+        }
+        if !self.files.contains_key(&resolved) && !self.directories.contains(&resolved) {
+            return false;
+        }
+        self.modes.insert(resolved, mode);
+        true
     }
 
     /// Whether the tree holds anything at `path` at all — a file, a directory or a device.
@@ -772,6 +870,13 @@ impl ShellVolume {
     /// [`VolumeLimits::files`] or [`VolumeLimits::bytes`]. A device takes the write as the
     /// lines it was given, up to [`VolumeLimits::device_lines`].
     pub fn write(&mut self, path: &str, contents: &str, append: bool) -> bool {
+        self.write_bytes(path, contents.as_bytes(), append)
+    }
+
+    /// [`Self::write`] of BYTES, which is what a file holds: a program writing bytes that are
+    /// no text at all writes exactly those, and a later read of the file answers them
+    /// ([`Self::read_bytes`]).
+    pub fn write_bytes(&mut self, path: &str, contents: &[u8], append: bool) -> bool {
         let Some(resolved) = self.resolve(path) else {
             return false;
         };
@@ -780,9 +885,9 @@ impl ShellVolume {
         }
         // A path inside a MOUNTED filesystem is written to that filesystem, under its own
         // bounds, which is what makes the write one another client of it reads.
-        if let Some(wrote) =
-            self.in_mount_mut(&resolved, |files, inside| files.write(inside, contents, append))
-        {
+        if let Some(wrote) = self.in_mount_mut(&resolved, |files, inside| {
+            files.write_bytes(inside, contents, append)
+        }) {
             return wrote;
         }
         // A write to one of the machine's DATAGRAM addresses is a send rather than storage
@@ -791,14 +896,18 @@ impl ShellVolume {
         // as the file it is here.
         if let Some(sink) = self.datagrams.clone() {
             if let Some((host, port)) = datagram_address(&resolved) {
-                return sink.send(&host, port, contents);
+                // A datagram carries the TEXT of those bytes, which is what the stack this
+                // tree was given takes.
+                return sink.send(&host, port, &String::from_utf8_lossy(contents));
             }
         }
         if self.sealed.contains(&resolved) || self.directories.contains(&resolved) {
             return false;
         }
         if self.devices.contains_key(&resolved) {
-            return self.write_device(&resolved, contents);
+            // A device takes LINES, so what is written to one is the text of those bytes.
+            let written = String::from_utf8_lossy(contents).into_owned();
+            return self.write_device(&resolved, &written);
         }
         // A machine will not create a file in a directory it does not have.
         if Self::parent_of(&resolved).is_some_and(|parent| !self.directories.contains(&parent)) {
@@ -808,12 +917,12 @@ impl ShellVolume {
     }
 
     /// [`Self::write`] once the path is resolved and known to name a file.
-    fn write_resolved(&mut self, resolved: &str, contents: &str, append: bool) -> bool {
+    fn write_resolved(&mut self, resolved: &str, contents: &[u8], append: bool) -> bool {
         let held = self.files.get(resolved);
         if held.is_none() && self.files.len() >= self.limits.files {
             return false;
         }
-        let kept = held.map_or(0, String::len);
+        let kept = held.map_or(0, Vec::len);
         let addition = if append {
             contents.len()
         } else {
@@ -834,10 +943,10 @@ impl ShellVolume {
         self.held_bytes = would_hold;
         let created = held.is_none();
         match self.files.get_mut(resolved) {
-            Some(file) if append => file.push_str(contents),
-            Some(file) => *file = contents.to_string(),
+            Some(file) if append => file.extend_from_slice(contents),
+            Some(file) => *file = contents.to_vec(),
             None => {
-                self.files.insert(resolved.to_string(), contents.to_string());
+                self.files.insert(resolved.to_string(), contents.to_vec());
             }
         }
         self.record_written(resolved);
@@ -903,6 +1012,8 @@ impl ShellVolume {
                     .held_bytes
                     .saturating_sub(contents.len().saturating_add(resolved.len()));
                 self.modified.remove(&resolved);
+                self.owners.remove(&resolved);
+                self.modes.remove(&resolved);
                 self.record_parent_written(&resolved);
                 true
             }
@@ -961,6 +1072,8 @@ impl ShellVolume {
             }
             self.directories.remove(&directory);
             self.modified.remove(&directory);
+            self.owners.remove(&directory);
+            self.modes.remove(&directory);
             removed = true;
         }
         self.record_parent_written(&resolved);
@@ -1074,11 +1187,24 @@ impl ShellVolume {
     /// The files a program may write, as `(path, contents)` — what the caller keeps beside
     /// the machine so the next run of a program on it reads what this one wrote. The sealed
     /// files are left out: they are the service's own seed, not the machine's storage.
+    ///
+    /// A file holds BYTES, and these are the ones that are TEXT: a file whose bytes are no
+    /// text at all is not among them, because what the callers of this keep beside a machine
+    /// is the text its programs wrote. A caller that means EVERY file the tree holds reads
+    /// [`Self::stored_bytes`].
     pub fn stored_files(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.stored_bytes()
+            .filter_map(|(path, contents)| Some((path, ::std::str::from_utf8(contents).ok()?)))
+    }
+
+    /// Every file a program may write, as `(path, bytes)` — [`Self::stored_files`] without the
+    /// reading that they are text, for a caller that means the files themselves (how many
+    /// bytes a filesystem holds, whatever is in them).
+    pub fn stored_bytes(&self) -> impl Iterator<Item = (&str, &[u8])> {
         self.files
             .iter()
             .filter(|(path, _)| !self.sealed.contains(*path))
-            .map(|(path, contents)| (path.as_str(), contents.as_str()))
+            .map(|(path, contents)| (path.as_str(), contents.as_slice()))
     }
 }
 

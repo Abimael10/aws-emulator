@@ -834,6 +834,7 @@ mod tests {
             initialization_type: super::super::execution_slot::INITIALIZATION_TYPE_ON_DEMAND,
             aws: None,
             logs: None,
+            file_systems: Vec::new(),
             metrics: None,
             streamed: false,
         }

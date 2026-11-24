@@ -993,6 +993,9 @@ async fn run_application(
                     budget,
                     aws: access.as_ref(),
                     durable: None,
+                    // A job run mounts no Amazon EFS file system: the files the application
+                    // reaches are the application's own, which this service holds.
+                    file_systems: &[],
                 },
                 // The clock the run's own span is read against: one the RUN drives, a tick per
                 // traced event it delivers and the waits it asks for, so the state the run comes
@@ -1454,6 +1457,7 @@ mod tests {
                             // an application making no call needs none.
                             aws: None,
                             durable: None,
+                            file_systems: &[],
                         },
                         &python::Clock::driven(WORKLOAD_CLOCK_TICK)
                             .waiting()

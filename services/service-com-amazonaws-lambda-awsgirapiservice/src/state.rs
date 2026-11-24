@@ -313,6 +313,13 @@ pub use vpc_attachment_authorization::unattachable_vpc_config;
 pub mod file_system_attachment;
 pub use file_system_attachment::unreachable_file_system_refusal;
 
+/// The mount ITSELF — the Amazon EFS access point a function's `FileSystemConfigs` names,
+/// resolved to the files behind it and to what the function's execution role may do there —
+/// lives in [`file_system_mounts`], beside the gate above that admits the configuration, and is
+/// re-exported for the same reason: a handler names it as `crate::state::…`.
+pub mod file_system_mounts;
+pub use file_system_mounts::{mounted_file_systems, FileSystemMount};
+
 /// The attachment itself — the elastic network interfaces Lambda stands up in the account's
 /// EC2 inventory for a function's configured subnets, and the VPC those subnets resolve to —
 /// lives in [`vpc_interfaces`], beside the authorization above that gates it, and is

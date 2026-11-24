@@ -552,6 +552,9 @@ async fn run_cell(
                     aws: access.as_ref(),
                     // A cell is no Lambda durable execution's run.
                     durable: None,
+                    // And it mounts no Amazon EFS file system: a cell runs in the session this
+                    // service holds, not in a function configured with one.
+                    file_systems: &[],
                 },
                 &python::Clock::driven(STATEMENT_CLOCK_TICK)
                     .waiting()

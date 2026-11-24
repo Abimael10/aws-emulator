@@ -70,6 +70,8 @@ fn ran(source: &str, event: &str) -> Finished {
                 aws: None,
                 // Nor a durable execution: nothing here is the run of one.
                 durable: None,
+                // Nor a mounted file system: what these runs read is the environment's own.
+                file_systems: &[],
             })
         })
         .expect("a run thread")

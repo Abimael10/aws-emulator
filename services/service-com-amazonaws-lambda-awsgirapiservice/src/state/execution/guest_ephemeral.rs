@@ -1247,14 +1247,25 @@ def _fs_dup(descriptor):
 
 def _tmp_next_descriptor(named=None):
     """The next descriptor number this environment hands out, refused once it holds as many as
-    it has ([`_TMP_MAX_DESCRIPTORS`])."""
-    if len(_TMP_DESCRIPTORS) + len(_MOUNT_DESCRIPTORS) >= _TMP_MAX_DESCRIPTORS:
+    it has ([`_TMP_MAX_DESCRIPTORS`]).
+
+    Every filesystem of the environment hands its descriptors out of this one count — the
+    storage, the read-only mounts and the network file systems it mounts
+    ([`super::guest_file_system`]) — because the quota is the ENVIRONMENT's and not one
+    filesystem's.
+    """
+    if _tmp_descriptors_held() >= _TMP_MAX_DESCRIPTORS:
         if named is None:
             raise OSError(errno.EMFILE, _TMP_TOO_MANY_FILES)
         raise OSError(errno.EMFILE, _TMP_TOO_MANY_FILES, named)
     descriptor = _MOUNT_NEXT_DESCRIPTOR[0]
     _MOUNT_NEXT_DESCRIPTOR[0] = descriptor + 1
     return descriptor
+
+
+def _tmp_descriptors_held():
+    """How many descriptors the environment holds open, across every filesystem it has."""
+    return len(_TMP_DESCRIPTORS) + len(_MOUNT_DESCRIPTORS) + len(_EFS_DESCRIPTORS)
 
 
 def _fs_dup2(descriptor, second, inheritable=True):
@@ -1265,10 +1276,7 @@ def _fs_dup2(descriptor, second, inheritable=True):
         # A number outside the descriptors this environment has is not one it can hold.
         raise OSError(errno.EBADF, "Bad file descriptor")
     held = second in _TMP_DESCRIPTORS or second in _MOUNT_DESCRIPTORS
-    if (
-        not held
-        and len(_TMP_DESCRIPTORS) + len(_MOUNT_DESCRIPTORS) >= _TMP_MAX_DESCRIPTORS
-    ):
+    if not held and _tmp_descriptors_held() >= _TMP_MAX_DESCRIPTORS:
         raise OSError(errno.EMFILE, _TMP_TOO_MANY_FILES)
     if second in _TMP_DESCRIPTORS:
         del _TMP_DESCRIPTORS[second]

@@ -290,6 +290,11 @@ pub struct Run<'a> {
     /// execution's run — whose durable SDK then records no checkpoint, because there is no
     /// execution to record one on.
     pub durable: Option<&'a DurableStepJournal>,
+    /// The FILE SYSTEMS this run's execution environment mounts: each Amazon EFS access point
+    /// the function's `FileSystemConfigs` name, resolved to the files behind it
+    /// ([`super::super::file_system_mounts`]). Empty for a function that configures none,
+    /// which is an environment with no mount of its own.
+    pub file_systems: &'a [crate::state::FileSystemMount],
 }
 
 /// Run `request`'s handler to completion.
@@ -381,8 +386,14 @@ impl Prepared {
     pub(super) fn start(request: &Run<'_>, clock: &Clock) -> Result<Self, Box<Finished>> {
         let capture = Arc::new(Mutex::new(Capture::new(request.budget.log_bytes)));
         let bounds = Arc::new(Bounds::new(&request.budget, clock.clone()));
-        let session = Session::new(&capture, &bounds, request.aws, request.durable);
-        let input = match runtime_input(request) {
+        let session = Session::new(
+            &capture,
+            &bounds,
+            request.aws,
+            request.durable,
+            request.file_systems,
+        );
+        let input = match runtime_input(request, &session) {
             Ok(input) => input,
             Err(error) => {
                 return Err(Box::new(settled(
@@ -529,8 +540,13 @@ impl Prepared {
             None => {
                 let capture = Arc::new(Mutex::new(Capture::new(request.budget.log_bytes)));
                 let bounds = Arc::new(Bounds::new(&request.budget, clock.clone()));
-                self.session
-                    .bind(&capture, &bounds, request.aws, request.durable);
+                self.session.bind(
+                    &capture,
+                    &bounds,
+                    request.aws,
+                    request.durable,
+                    request.file_systems,
+                );
                 watch_run(&bounds);
                 (capture, bounds, true)
             }
@@ -586,7 +602,9 @@ impl Prepared {
         // No SDK seam: a callback running as the environment is torn down belongs to no
         // invocation, so there is no caller whose identity a call could be made as — and no
         // durable execution either, so nothing it does is checkpointed on one.
-        self.session.bind(&capture, &bounds, None, None);
+        // No mounts either: what the environment mounted belongs to the invocations it served,
+        // and a callback running as it is torn down is serving none.
+        self.session.bind(&capture, &bounds, None, None, &[]);
         watch_run(&bounds);
         self.torn_down();
     }
@@ -650,6 +668,11 @@ pub(super) struct Session {
     /// ([`super::guest_socket`]). Held by the environment, like the session itself, and given
     /// up with the invocation that opened them.
     sockets: super::guest_socket::Sockets,
+    /// The FILE SYSTEMS the invocation being served has mounted
+    /// ([`super::guest_file_system`]): the trees the host answers this environment's
+    /// filesystem calls on paths of those mounts out of. Resolved per invocation, so what a
+    /// handler reaches is the file system Amazon EFS holds at the instant it runs.
+    file_systems: Mutex<super::guest_file_system::GuestFileSystems>,
 }
 
 /// The invocation an environment is serving right now.
@@ -671,6 +694,7 @@ impl Session {
         bounds: &Arc<Bounds>,
         aws: Option<&AwsAccess>,
         durable: Option<&DurableStepJournal>,
+        file_systems: &[crate::state::FileSystemMount],
     ) -> Arc<Self> {
         Arc::new(Self {
             serving: Mutex::new(Serving {
@@ -682,6 +706,9 @@ impl Session {
             calls: AtomicU64::new(0),
             children: AtomicU64::new(0),
             sockets: super::guest_socket::Sockets::default(),
+            file_systems: Mutex::new(super::guest_file_system::GuestFileSystems::attach(
+                file_systems,
+            )),
         })
     }
 
@@ -694,6 +721,7 @@ impl Session {
         bounds: &Arc<Bounds>,
         aws: Option<&AwsAccess>,
         durable: Option<&DurableStepJournal>,
+        file_systems: &[crate::state::FileSystemMount],
     ) {
         let mut serving = self.serving.lock().unwrap_or_else(PoisonError::into_inner);
         serving.capture = Arc::clone(capture);
@@ -708,6 +736,32 @@ impl Session {
         // Nothing of the invocation before it is carried over on a connection either: every
         // socket it opened is closed here, and the next invocation starts with none.
         self.sockets.release();
+        // The mounts are this invocation's own too: the file systems its function's
+        // configuration names are resolved for it, so a handler reaches the file system Amazon
+        // EFS holds now and what that function's role may do to it now.
+        *self
+            .file_systems
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) =
+            super::guest_file_system::GuestFileSystems::attach(file_systems);
+    }
+
+    /// What the host answers for ONE call the invocation being served made on a path of the
+    /// file systems it mounted ([`super::guest_file_system`]).
+    fn file_system_call(&self, document: &str) -> String {
+        self.file_systems
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .answered(document)
+    }
+
+    /// The mount table the GUEST is handed, which says where each file system is mounted and
+    /// what the handler may do there.
+    fn file_system_table(&self) -> ::serde_json::Value {
+        self.file_systems
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .table()
     }
 
     /// Where the invocation being served writes its output.
@@ -1508,7 +1562,7 @@ fn read_completion(answered: &str, response_bytes: usize, phase: Phase) -> Compl
 }
 
 /// The JSON document the runtime source is handed.
-fn runtime_input(request: &Run<'_>) -> Result<String, String> {
+fn runtime_input(request: &Run<'_>, session: &Session) -> Result<String, String> {
     // The entries of the deployment package and the entries the function's LAYERS mount are
     // two MOUNTS of the execution environment, so they are handed over apart: each is
     // resolved from its own root and reports its own path ([`super::bootstrap`]).
@@ -1549,6 +1603,13 @@ fn runtime_input(request: &Run<'_>) -> Result<String, String> {
             .budget
             .ephemeral_bytes
             .min(super::MAX_EPHEMERAL_HELD_BYTES),
+        // The NETWORK FILE SYSTEMS of the environment: where each Amazon EFS access point the
+        // function's `FileSystemConfigs` name is mounted, the identity requests through it are
+        // made as, and whether the function's role may write to it
+        // ([`super::guest_file_system`]). It is what the HOST really attached, so a
+        // configuration naming an access point this emulator's Amazon EFS does not hold is not
+        // in it and that path is no path of the environment.
+        "fileSystems": session.file_system_table(),
     });
     ::serde_json::to_string(&document).map_err(|error| error.to_string())
 }
@@ -1721,14 +1782,15 @@ fn clamp_recursion(vm: &VirtualMachine, limit: usize) -> PyResult<()> {
 
 /// The module the host functions live on, and the whole of what guest code can call of
 /// this process: `log`, `sleep`, `aws`, `db_auth_token`, `request`, `presign`, `pagination`,
-/// `net`, `durable`, `ephemeral` and `library_source` — the invocation log, a sleep clamped to what the run has left, ONE AWS SDK
+/// `net`, `durable`, `ephemeral`, `files` and `library_source` — the invocation log, a sleep clamped to what the run has left, ONE AWS SDK
 /// call into this same emulator, the authentication token an SDK mints in its client, the one
 /// request a handler sends itself, the one URL it has signed, what the called service's
 /// own model states about paging one operation through, the one call a handler makes on a
 /// stream socket it opened to a data-plane listener of this emulator, one checkpoint of
 /// the durable execution this invocation is the run of, what the run wrote to the
-/// ephemeral storage its function is configured for, and the source of one module of the
-/// standard library this runtime ships. Nothing else of the
+/// ephemeral storage its function is configured for, one call on a path of a file system the
+/// function mounted, and the source of one module of the standard library this runtime ships.
+/// Nothing else of the
 /// host is reachable from guest code, and nothing here moves a bound.
 ///
 /// Installed ONCE per execution environment, with its interpreter: every one of these
@@ -2179,6 +2241,26 @@ fn host_module(vm: &VirtualMachine, session: &Arc<Session>) -> PyResult<PyRef<Py
                 .into())
         },
     );
+    // ONE CALL on a path of a FILE SYSTEM this function has mounted
+    // ([`super::guest_file_system`]): the Amazon EFS access points its `FileSystemConfigs`
+    // name. WHERE those mounts are, what is in them and what this function's role may do to
+    // them are all the host's — the files are the file system's own, held by the service that
+    // owns it — so what the guest decides is only which call it makes on which path of its own
+    // mounts. Nothing is dispatched to another service and no bound of the run is reachable
+    // from here: every write is bounded by the file system's own bounds.
+    let reading = Arc::clone(session);
+    set_function(
+        vm,
+        &module,
+        "files",
+        move |args: FuncArgs, vm: &VirtualMachine| {
+            let document: String = args.bind(vm)?;
+            Ok(vm
+                .ctx
+                .new_str(reading.file_system_call(&document))
+                .into())
+        },
+    );
     // CHECKED, once for the whole surface: the runtime source is driven through these
     // functions, so one that did not take its place is reported here rather than left for
     // guest code to meet as a missing name.
@@ -2209,6 +2291,7 @@ const HOST_MODULE_FUNCTIONS: &[&str] = &[
     "net",
     "durable",
     "ephemeral",
+    "files",
     "library_source",
 ];
 
@@ -3011,6 +3094,8 @@ mod tests {
                         aws: None,
                         // Nor a durable execution: nothing here is the run of one.
                         durable: None,
+                        // Nor a mounted file system: these runs are the interpreter's own.
+                        file_systems: &[],
                     },
                     &clock,
                 );
@@ -3847,6 +3932,7 @@ mod tests {
             "durable",
             "ephemeral",
             "error_shapes",
+            "files",
             "library_source",
             "log",
             "net",

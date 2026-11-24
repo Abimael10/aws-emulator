@@ -615,6 +615,9 @@ async fn run_notebook_cells(
                 // It is no Lambda durable execution's run either, so it takes no step of one
                 // and checkpoints nothing onto one.
                 durable: None,
+                // And it mounts no Amazon EFS file system: what the cells reach is the
+                // notebook's own storage, which this service holds.
+                file_systems: &[],
             });
             let _ = sender.send(finished);
         });

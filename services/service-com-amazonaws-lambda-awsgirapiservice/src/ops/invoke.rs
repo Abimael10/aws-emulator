@@ -797,6 +797,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         &function_name,
                         &record.vpc_network_interface_ids,
                     ),
+                    // The FILE SYSTEMS the run mounts: each Amazon EFS access point the
+                    // function's `FileSystemConfigs` name, resolved to the access point's own
+                    // root directory and the files behind it
+                    // (`crate::state::file_system_mounts`).
+                    file_systems: crate::state::mounted_file_systems(
+                        &*self.engine,
+                        &region,
+                        &resolved_config,
+                        now,
+                    ),
                     // Where the run's log is delivered, and what the function's execution
                     // role may do there (`crate::state::execution::log_delivery`).
                     logs: Some(crate::state::log_target(
@@ -982,6 +992,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &resolved_config.role,
                 &function_name,
                 &vpc_network_interface_ids,
+            ),
+            // The FILE SYSTEMS the run mounts: each Amazon EFS access point the function's
+            // `FileSystemConfigs` name, resolved to the access point's own root directory and
+            // the files behind it (`crate::state::file_system_mounts`).
+            file_systems: crate::state::mounted_file_systems(
+                &*self.engine,
+                &region,
+                &resolved_config,
+                now,
             ),
             // Where the run's log is delivered, and what the function's execution role may
             // do there (`crate::state::execution::log_delivery`).

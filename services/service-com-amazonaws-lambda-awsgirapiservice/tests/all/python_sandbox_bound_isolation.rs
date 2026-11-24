@@ -133,6 +133,9 @@ fn ran(source: &str, budget: Budget, clock: &Clock, case: &str) -> Finished {
                     aws: None,
                     // Nor a durable execution: nothing here is the run of one.
                     durable: None,
+                    // Nor a mounted file system: a function that configures none mounts
+                    // nothing, which is what these rows run with.
+                    file_systems: &[],
                 },
                 &clock,
             );

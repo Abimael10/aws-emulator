@@ -181,6 +181,10 @@ pub async fn run(claimed: &ClaimedAction, access: Option<AwsAccess>) -> ActionOu
                         // A script step is no Lambda durable execution's run, so it takes no
                         // step of one and checkpoints nothing onto one.
                         durable: None,
+                        // And it mounts no Amazon EFS file system: a step's script runs from
+                        // the document this service holds, not from a function configured
+                        // with one.
+                        file_systems: &[],
                     },
                     // The clock the run's own span is read against: one the RUN drives, a
                     // tick per traced event it delivers and the waits it asks for, so what
