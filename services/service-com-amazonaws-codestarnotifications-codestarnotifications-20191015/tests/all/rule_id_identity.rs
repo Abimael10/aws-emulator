@@ -16,7 +16,10 @@
 //! rules are named, never the identity reported for one that is.
 //!
 //! The last suite drives that same relation as the INVARIANT it is, over populations and
-//! narrowings drawn by a seeded generator rather than written out as rows.
+//! narrowings drawn by a seeded generator rather than written out as rows, and the suite
+//! after it reads a listing page through the JSON types themselves: every entry carries
+//! exactly the two members `NotificationRuleSummary` models, each a plain string, so an
+//! identity reported in any other form is caught rather than coerced away.
 //!
 //! The harness (`Emulator`, `string`, ...) is the one `notification_rule_lifecycle`
 //! already builds: one shared engine behind the same `MultiServiceRouter` dispatch the
@@ -1312,4 +1315,222 @@ async fn every_path_reports_the_minted_identifier_in_the_hex_form_it_is_minted_i
         FORM_CASES.len(),
         "every row must have minted its own identifier, got {minted:?}"
     );
+}
+
+/// The members a `NotificationRuleSummary` carries, sorted: the WHOLE shape
+/// (`smithy_query(query="shape",shape="NotificationRuleSummary")` — `Id` ->
+/// `NotificationRuleId`, `Arn` -> `NotificationRuleArn`), under the names the model spells
+/// them with and no others.
+const SUMMARY_MEMBERS: [&str; 2] = ["Arn", "Id"];
+
+/// The members one page of a listing may carry — `ListNotificationRulesResult`'s own
+/// (`smithy_query(query="operation",operation="ListNotificationRules")`:
+/// `NotificationRules` -> `NotificationRuleBatch`, `NextToken` -> `NextToken`).
+const RESULT_MEMBERS: [&str; 2] = ["NextToken", "NotificationRules"];
+
+/// The `(Id, Arn)` pairs one listing page reports, read off the page as the model lays it
+/// out: `NotificationRules` a JSON array, every entry an object carrying exactly
+/// [`SUMMARY_MEMBERS`], each of them a plain JSON string, the `Id` being that entry's own
+/// `Arn`'s resource segment, and `NextToken` — when the page carries one at all — a
+/// non-empty string.
+///
+/// This reads the page through the JSON types themselves rather than through the suite's
+/// string helper, so a member carried in any other form (absent, null, a number, a nested
+/// object, a second copy under another name) fails here instead of being coerced away.
+fn page_identities(case: &str, page: &Value) -> Vec<(String, String)> {
+    let object = page
+        .as_object()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a JSON object body, got {page}"));
+    for member in object.keys() {
+        assert!(
+            RESULT_MEMBERS.contains(&member.as_str()),
+            "case {case:?}: a listing page carries only {RESULT_MEMBERS:?}, got the member \
+             {member:?} in {page}"
+        );
+    }
+    if let Some(token) = object.get("NextToken") {
+        assert!(
+            token.as_str().is_some_and(|value| !value.is_empty()),
+            "case {case:?}: expected NextToken to be a non-empty string, got {token}"
+        );
+    }
+    let summaries = object
+        .get("NotificationRules")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: expected NotificationRules to be a JSON array, got {page}")
+        });
+    let mut identities: Vec<(String, String)> = Vec::with_capacity(summaries.len());
+    for summary in summaries {
+        let entry = summary.as_object().unwrap_or_else(|| {
+            panic!("case {case:?}: expected a summary to be a JSON object, got {summary}")
+        });
+        let mut members: Vec<&str> = entry.keys().map(String::as_str).collect();
+        members.sort_unstable();
+        assert_eq!(
+            members.as_slice(),
+            SUMMARY_MEMBERS.as_slice(),
+            "case {case:?}: expected a summary to carry exactly {SUMMARY_MEMBERS:?}, got {summary}"
+        );
+        let id = entry
+            .get("Id")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: expected Id to be a plain JSON string, got {summary}")
+            });
+        let arn = entry
+            .get("Arn")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: expected Arn to be a plain JSON string, got {summary}")
+            });
+        assert_canonical_rule_id(case, id);
+        assert_eq!(
+            id,
+            id_of_arn(case, arn),
+            "case {case:?}: expected the entry's Id to be the resource segment of its own Arn, \
+             got {id:?} for {arn:?}"
+        );
+        identities.push((id.to_string(), arn.to_string()));
+    }
+    identities
+}
+
+/// RULE: a listing reports a rule it names by that rule's own identity and nothing else —
+/// each entry of `NotificationRules` carries exactly the two members
+/// `NotificationRuleSummary` models, each as a plain string, with `Id` byte-for-byte the
+/// resource segment after `notificationrule/` in that same entry's `Arn` — however the
+/// listing was narrowed by `Filters` or split by `MaxResults`.
+///
+/// The rows span what the rule generalises over: how many rules the listing names (all of
+/// them, the subsets each filter name selects, and none at all), which filter name narrowed
+/// it, and whether the collection arrives in one page or one entry at a time. The identity
+/// a narrowed or paged listing reports is asserted to be the SAME pair the unnarrowed one
+/// did, so splitting and narrowing decide only which rules are named.
+#[tokio::test]
+async fn a_listing_carries_each_named_rules_identity_as_the_plain_modelled_members() {
+    let emulator = Emulator::new();
+    let seeded = seed(&emulator, "id-projection").await;
+
+    // `CreatedBy` is the caller's own principal, so the CREATED_BY row below narrows on
+    // what the service recorded rather than on a value the case wrote.
+    let described = emulator
+        .ok(
+            "created-by",
+            "/describeNotificationRule",
+            &json!({ "Arn": seeded[0].arn }),
+        )
+        .await;
+    let created_by = string(&described, "CreatedBy");
+    assert!(
+        !created_by.is_empty(),
+        "the store must record the caller as CreatedBy, got {described}"
+    );
+
+    let every_arn: Vec<String> = seeded.iter().map(|rule| rule.arn.clone()).collect();
+    let with_resource: Vec<String> = seeded
+        .iter()
+        .filter(|rule| rule.resource == seeded[0].resource)
+        .map(|rule| rule.arn.clone())
+        .collect();
+    let with_event_type: Vec<String> = seeded
+        .iter()
+        .filter(|rule| rule.event_type_id == seeded[2].event_type_id)
+        .map(|rule| rule.arn.clone())
+        .collect();
+    let with_target: Vec<String> = seeded
+        .iter()
+        .filter(|rule| rule.target_address == seeded[0].target_address)
+        .map(|rule| rule.arn.clone())
+        .collect();
+
+    // Each row is (case, the request body, the ARNs the page must name in order): the
+    // unnarrowed listing, one row per `ListNotificationRulesFilterName` value, and a
+    // narrowing whose value no rule carries, which names nothing at all.
+    let rows: Vec<(String, Value, Vec<String>)> = vec![
+        ("no filter".to_string(), json!({}), every_arn.clone()),
+        (
+            format!("{} on the shared resource", FILTER_NAMES[2]),
+            json!({ "Filters": [{ "Name": FILTER_NAMES[2], "Value": seeded[0].resource }] }),
+            with_resource,
+        ),
+        (
+            format!("{} on one row's event type", FILTER_NAMES[0]),
+            json!({ "Filters": [{ "Name": FILTER_NAMES[0], "Value": seeded[2].event_type_id }] }),
+            with_event_type,
+        ),
+        (
+            format!("{} on the shared target address", FILTER_NAMES[3]),
+            json!({ "Filters": [{ "Name": FILTER_NAMES[3], "Value": seeded[0].target_address }] }),
+            with_target,
+        ),
+        (
+            format!("{} on the caller's principal", FILTER_NAMES[1]),
+            json!({ "Filters": [{ "Name": FILTER_NAMES[1], "Value": created_by }] }),
+            every_arn.clone(),
+        ),
+        (
+            format!("{} on a resource no rule watches", FILTER_NAMES[2]),
+            json!({ "Filters": [{
+                "Name": FILTER_NAMES[2],
+                "Value": "arn:aws:codecommit:us-east-1:123456789012:NoProjectionRepo",
+            }] }),
+            Vec::new(),
+        ),
+    ];
+
+    for (row, body, wanted) in &rows {
+        // The whole selection in one page: the request carries no `MaxResults`, so the
+        // page holds every rule the narrowing names and ends the collection.
+        let case = format!("{row} in one page");
+        let page = emulator.ok(&case, "/listNotificationRules", body).await;
+        let identities = page_identities(&case, &page);
+        assert_eq!(
+            identities
+                .iter()
+                .map(|(_, arn)| arn.clone())
+                .collect::<Vec<String>>(),
+            *wanted,
+            "case {case:?}: expected the page to name exactly those rules, got {identities:?}"
+        );
+        assert!(
+            page.get("NextToken").is_none(),
+            "case {case:?}: a page holding the whole selection ends it, got {page}"
+        );
+
+        // The same selection one entry at a time: the modelled minimum page size, so
+        // every entry is projected on a page of its own.
+        let case = format!("{row} one entry a page");
+        let mut paged: Vec<(String, String)> = Vec::new();
+        let mut token: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let mut request = body.clone();
+            request["MaxResults"] = json!(1);
+            if let Some(value) = &token {
+                request["NextToken"] = json!(value);
+            }
+            let page = emulator.ok(&case, "/listNotificationRules", &request).await;
+            let on_page = page_identities(&case, &page);
+            assert!(
+                on_page.len() <= 1,
+                "case {case:?}: expected at most one entry at MaxResults=1, got {on_page:?}"
+            );
+            paged.extend(on_page);
+            pages += 1;
+            assert!(
+                pages <= 64,
+                "case {case:?}: pagination did not terminate after {pages} pages"
+            );
+            match page.get("NextToken").and_then(Value::as_str) {
+                Some(next) => token = Some(next.to_string()),
+                None => break,
+            }
+        }
+        assert_eq!(
+            paged, identities,
+            "case {case:?}: splitting the selection over pages must report the same \
+             identities, got {paged:?}"
+        );
+    }
 }

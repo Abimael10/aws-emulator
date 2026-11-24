@@ -12,6 +12,31 @@ Issue-Commit: ef271dbe26f379074e11bf8bd2be74a0451dc7db
 
 # codestar-notifications ListNotificationRules reports a NotificationRuleSummary.Id the recorded listing does not accept
 
+## Resolution (all three causes pass; the rule is now pinned by a test)
+
+All THREE causes (task#6, task#7 and task#8) replay green against this checkout: the
+fixture `codestar-notifications-list-and-filter-rules` passes end to end and both
+`Issue-Key` lines report `fixed`. The identity the report blames has moved since the
+commit this issue was written against: `crate::state::new_rule_id` no longer draws a
+canonical hyphenated UUID but forty lowercase hexadecimal characters of freshly drawn
+random bytes — the whole width `NotificationRuleId`'s `@length 1..40` allows, the only
+constraint the model places on the member — and `crate::state::notification_rule_arn`
+still embeds exactly that value as the ARN's `notificationrule/<id>` segment, which
+`ListNotificationRules` reports unchanged as `NotificationRuleSummary.Id`.
+
+What this resolution adds is the regression test the three causes lacked:
+`tests/all/rule_id_identity.rs` now reads a listing page through the JSON types
+themselves — `NotificationRules` a JSON array, every entry carrying exactly the two
+members `NotificationRuleSummary` models, each a plain string, the `Id` byte-for-byte the
+resource segment after `notificationrule/` in that same entry's `Arn` — over a table of
+narrowings (unfiltered, one row per `ListNotificationRulesFilterName` value, and a
+narrowing nothing matches) read both in one page and one entry a page, asserting that a
+narrowed or paged listing reports the same identity pair as the unnarrowed one.
+
+Do NOT serve the recording's id or derive one from the request: a rule id is drawn once
+per rule and recurs in no later run, so the UUIDs this report quotes are one run's
+fill-ins, not a requirement.
+
 > _Note: this issue was identified against the code base at commit `ef271dbe26f379074e11bf8bd2be74a0451dc7db`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation
