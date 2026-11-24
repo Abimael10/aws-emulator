@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! WHICH form a constraint clause takes is a fact of the MEMBER of the served operation.
+//! WHICH form a constraint clause takes is a fact of the SERVED OPERATION.
 //!
 //! The rule under test: a request member outside the bound its target shape declares is refused
-//! 400 `ValidationException` whose clause is worded in the form the served operation states THAT
-//! MEMBER in — so two members of ONE operation can be stated in two different forms, and one
-//! member name shared by two operations can be stated differently by each:
+//! 400 `ValidationException` whose clause is worded in the form the served operation states its
+//! clauses in — so one member name shared by two operations can be stated differently by each,
+//! while every member of ONE operation is stated the one way:
 //!
 //! * the ITEM-REQUEST form names the member by its WIRE spelling and echoes no value (`Value at
 //!   'TotalSegments' failed to satisfy constraint: …`);
@@ -18,10 +18,14 @@
 //! `@range{min:1,max:1000000}` and `Scan$Segment` `@range{min:0,max:999999}`
 //! (`smithy_query(query="operation", operation="Scan")`) — and `Query$Limit` targets the very
 //! same shape as the walk's page size (`smithy_query(query="operation", operation="Query")`),
-//! yet the walk states its page size with the value echoed while it states its parallel-scan
-//! bounds, and the keyed read states that same page-size member, by the wire spelling. So the
-//! form has to be read off the member of the operation being served, which is what the rows
-//! below read back.
+//! which the two item requests state alike while a control-plane listing states its own page
+//! size, of the same violation class, in the other form. So the form has to be read off the
+//! operation being served, which is what the rows below read back.
+//!
+//! The rows differ along what the rule generalises over: the OPERATION (a table walk, a keyed
+//! read, a control-plane listing), the MEMBER (a page size, both parallel-scan bounds), which
+//! end of the published bound the value broke, how far past it the value went, and how many
+//! members of one request were outside their bounds at once.
 //!
 //! The rows differ along what the rule generalises over: the OPERATION (a table walk, a keyed
 //! read, a control-plane listing), the MEMBER (a page size, both parallel-scan bounds), which
@@ -98,15 +102,15 @@ async fn refusal(
     message(&body)
 }
 
-/// RULE: the walk states its own page size with the rejected value echoed under the validator's
-/// path, whatever that value is, while the keyed read states the SAME member by its wire
-/// spelling with nothing echoed.
+/// RULE: both item requests state their page size by its wire spelling with nothing echoed,
+/// whatever value was rejected, while a control-plane listing states the SAME member name
+/// breaking the SAME kind of bound with the rejected value echoed under the validator's path.
 #[tokio::test]
 async fn one_member_name_is_stated_in_the_form_each_operation_gives_it() {
     let router = seeded().await;
 
-    // The values span the rejected side of the one bound both members declare: zero, one below,
-    // a handful below, and the smallest value a 32-bit member carries.
+    // The values span the rejected side of the one bound every member below declares: zero, one
+    // below, a handful below, and the smallest value a 32-bit member carries.
     for rejected in [0_i64, -1, -9, -2_147_483_648] {
         let walk = refusal(
             &router,
@@ -115,11 +119,16 @@ async fn one_member_name_is_stated_in_the_form_each_operation_gives_it() {
             json!({"TableName": TABLE, "Limit": rejected}),
         )
         .await;
-        let expected = envelope(&[echoing_clause("limit", rejected, &at_least(1))]);
+        let expected = envelope(&[wire_clause("Limit", &at_least(1))]);
         assert_eq!(
             walk, expected,
             "case \"a table walk's page size\" (Limit {rejected}): expected {expected:?}, got \
              {walk:?}"
+        );
+        assert!(
+            !walk.contains(&format!("'{rejected}'")),
+            "case \"a table walk's page size\" (Limit {rejected}): this form echoes no part of \
+             the rejected value, got {walk:?}"
         );
 
         let keyed = refusal(
@@ -141,13 +150,27 @@ async fn one_member_name_is_stated_in_the_form_each_operation_gives_it() {
             "case \"a keyed read's page size\" (Limit {rejected}): this form echoes no part of \
              the rejected value, got {keyed:?}"
         );
+
+        let listing = refusal(
+            &router,
+            "a control-plane listing's page size",
+            "ListBackups",
+            json!({"Limit": rejected}),
+        )
+        .await;
+        let expected = envelope(&[echoing_clause("limit", rejected, &at_least(1))]);
+        assert_eq!(
+            listing, expected,
+            "case \"a control-plane listing's page size\" (Limit {rejected}): expected \
+             {expected:?}, got {listing:?}"
+        );
     }
 }
 
-/// RULE: the other members of the same operation keep that operation's own form — so the walk
+/// RULE: every other member of the same operation keeps that operation's form — so the walk
 /// states its parallel-scan bounds by their wire spelling at either end of their ranges, and a
-/// request outside two of its bounds at once states one clause per member, each in that member's
-/// form, inside the one envelope that counts them.
+/// request outside two of its bounds at once states one clause per member, both in that
+/// operation's form, inside the one envelope that counts them.
 #[tokio::test]
 async fn every_other_member_of_the_walk_keeps_its_operations_form() {
     let router = seeded().await;
@@ -177,7 +200,7 @@ async fn every_other_member_of_the_walk_keeps_its_operations_form() {
             "the page size and the segment count at once",
             json!({"TableName": TABLE, "Limit": 0, "TotalSegments": 0}),
             envelope(&[
-                echoing_clause("limit", 0, &at_least(1)),
+                wire_clause("Limit", &at_least(1)),
                 wire_clause("TotalSegments", &at_least(1)),
             ]),
         ),
@@ -185,7 +208,7 @@ async fn every_other_member_of_the_walk_keeps_its_operations_form() {
             "the page size and the segment at once",
             json!({"TableName": TABLE, "Limit": -3, "Segment": -1}),
             envelope(&[
-                echoing_clause("limit", -3, &at_least(1)),
+                wire_clause("Limit", &at_least(1)),
                 wire_clause("Segment", &at_least(0)),
             ]),
         ),

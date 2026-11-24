@@ -245,25 +245,25 @@ async fn a_scan_states_a_range_clause_in_the_form_its_operation_states() {
     paged_table(&router, "ScanClauses").await;
 
     // Rows differ in the member, which end of its published range the value broke, and how
-    // far past the bound it went. The form is the one the served operation states THAT MEMBER
-    // in: the walk's parallel-scan bounds take the item-request form, which names the member
-    // as the model spells it and echoes no value, while its own page size is stated in the
-    // request validator's form, which names the member by its lowerCamel path and echoes the
-    // rejected value — the form the last row's control-plane listing states its page size in
-    // too (`tests/all/page_size_clause_forms.rs` pins every form side by side).
+    // far past the bound it went. The form is the one the served operation states its clauses
+    // in: the walk's own page size and its parallel-scan bounds alike take the item-request
+    // form, which names the member as the model spells it and echoes no value, while the last
+    // row's control-plane listing states its page size in the request validator's form, which
+    // names the member by its lowerCamel path and echoes the rejected value
+    // (`tests/all/page_size_clause_forms.rs` pins every form side by side).
     let cases: [(&str, &str, Value, &str); 6] = [
         (
             "a page size one below its range minimum",
             "Scan",
             json!({"TableName": "ScanClauses", "Limit": 0}),
-            "1 validation error detected: Value '0' at 'limit' failed to satisfy constraint: \
+            "1 validation error detected: Value at 'Limit' failed to satisfy constraint: \
              Member must have value greater than or equal to 1",
         ),
         (
             "a page size far below that minimum states the same requirement",
             "Scan",
             json!({"TableName": "ScanClauses", "Limit": -7}),
-            "1 validation error detected: Value '-7' at 'limit' failed to satisfy constraint: \
+            "1 validation error detected: Value at 'Limit' failed to satisfy constraint: \
              Member must have value greater than or equal to 1",
         ),
         (

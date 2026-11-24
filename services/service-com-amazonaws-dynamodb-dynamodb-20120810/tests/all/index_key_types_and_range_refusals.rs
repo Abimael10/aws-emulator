@@ -23,8 +23,8 @@
 //!    `ValidationError` reason, and answers a fault of the VALUE the request carried
 //!    (the emptiness rule) directly, like every other write path;
 //! 2. a numeric input member outside the `@range` its model declares is refused by
-//!    a clause whose FORM follows the OPERATION it was refused on AND the MEMBER it
-//!    is about: the item-request form names the member by the spelling the model
+//!    a clause whose FORM follows the OPERATION it was refused on: the
+//!    item-request form names the member by the spelling the model
 //!    gives it on the wire and echoes no value, while the request validator's form
 //!    names it by the lowerCamel input path that validator builds and echoes the
 //!    NUMBER the request carried.
@@ -786,17 +786,17 @@ async fn a_numeric_member_outside_its_range_is_refused_in_its_operation_s_form()
         },
         RangeRow {
             // The SAME bound on the SAME member name as the keyed read above, through the
-            // other data-plane read: the walk states ITS page size in the echoing form, so one
-            // violation is worded two ways while the walk's parallel-scan bounds below keep the
-            // wire form (`tests/all/clause_form_per_member.rs` pins every form side by side).
+            // other data-plane read: both state it in the wire form, as the walk's
+            // parallel-scan bounds below do
+            // (`tests/all/clause_form_per_member.rs` pins every form side by side).
             case: "the same bound on another data-plane read, far below it",
             operation: "Scan",
             member: "Limit",
-            path: "limit",
+            path: "Limit",
             value: -7,
             requirement: "",
             table: Some(TABLE),
-            echoes: true,
+            echoes: false,
         },
         RangeRow {
             case: "a parallel-scan segment count one past its maximum",

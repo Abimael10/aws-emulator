@@ -15,13 +15,13 @@
 //! Nothing about the model chooses between them: `Query$Limit` and `Scan$Limit` both target
 //! `PositiveIntegerObject` with `@range{min:1}`
 //! (`smithy_query(query="operation", operation="Query,Scan")`), and `ListBackups$Limit` targets
-//! `BackupsInputLimit` with `@range{min:1,max:100}`, yet the keyed read states that member in
-//! the item-request form, the table walk — whose own parallel-scan bounds, `TotalSegments`
-//! (`@range{min:1,max:1000000}`) and `Segment` (`@range{min:0,max:999999}`), take the
-//! item-request form — states its PAGE SIZE in the request-validator form, and the
-//! control-plane listings state theirs in the request-validator form too. So the form is a fact
-//! of the served operation's MEMBER, which is what these rows read back: one member name, one
-//! trait, two sentences — and one operation stating both of them, for two members of its own.
+//! `BackupsInputLimit` with `@range{min:1,max:100}`, yet both item requests state that member —
+//! and the table walk's own parallel-scan bounds, `TotalSegments`
+//! (`@range{min:1,max:1000000}`) and `Segment` (`@range{min:0,max:999999}`), beside it — in the
+//! item-request form, while the control-plane listings state theirs in the request-validator
+//! form. So the form is a fact of the served OPERATION, which is what these rows read back: one
+//! member name, one trait, two sentences — and every member of one operation stated the one
+//! way.
 //!
 //! The rows differ along what the rule generalises over — the OPERATION (a keyed read, a table
 //! walk, a control-plane listing), the MEMBER (a page size, both parallel-scan bounds), which
@@ -117,24 +117,24 @@ fn rows() -> Vec<Row> {
         },
         Row {
             // The SAME member name breaking the SAME bound of the SAME target shape as the
-            // two rows above, through the other item request: the walk states that member in
-            // the other form, so the two reads word one violation differently.
+            // two rows above, through the other item request: both item requests word that
+            // violation the one way.
             case: "a table walk's page size one below that same minimum",
             operation: "Scan",
             request: json!({"TableName": TABLE, "Limit": 0}),
-            expected: envelope(&[echoing_clause("limit", 0, &at_least(1))]),
+            expected: envelope(&[wire_clause("Limit", &at_least(1))]),
         },
         Row {
             case: "the same member far below it, through the same walk",
             operation: "Scan",
             request: json!({"TableName": TABLE, "Limit": -7}),
-            expected: envelope(&[echoing_clause("limit", -7, &at_least(1))]),
+            expected: envelope(&[wire_clause("Limit", &at_least(1))]),
         },
         Row {
             case: "the same member one below it, through the same walk",
             operation: "Scan",
             request: json!({"TableName": TABLE, "Limit": -1}),
-            expected: envelope(&[echoing_clause("limit", -1, &at_least(1))]),
+            expected: envelope(&[wire_clause("Limit", &at_least(1))]),
         },
         Row {
             case: "the walk's segment count one past its maximum",
@@ -179,13 +179,13 @@ fn rows() -> Vec<Row> {
             expected: envelope(&[echoing_clause("limit", 101, &at_most(100))]),
         },
         Row {
-            // Two violated members of ONE request: one clause per member, each in the form
-            // that member states, inside one envelope that counts both.
+            // Two violated members of ONE request: one clause per member, both in the form
+            // that operation states, inside one envelope that counts both.
             case: "the walk's page size and its segment count, both outside their bounds",
             operation: "Scan",
             request: json!({"TableName": TABLE, "Limit": 0, "TotalSegments": 0}),
             expected: envelope(&[
-                echoing_clause("limit", 0, &at_least(1)),
+                wire_clause("Limit", &at_least(1)),
                 wire_clause("TotalSegments", &at_least(1)),
             ]),
         },
@@ -193,11 +193,11 @@ fn rows() -> Vec<Row> {
 }
 
 /// RULE: a numeric member outside the range the model declares is refused 400
-/// `ValidationException` whose clause takes the form the SERVED OPERATION states THAT MEMBER
+/// `ValidationException` whose clause takes the form the SERVED OPERATION states its clauses
 /// in — the wire spelling with nothing echoed, or the validator's path with the rejected value
 /// — with one clause per violated member inside the envelope that counts them.
 #[tokio::test]
-async fn a_range_clause_takes_the_form_its_operation_states_that_member_in() {
+async fn a_range_clause_takes_the_form_its_operation_states_its_clauses_in() {
     let router = seeded().await;
 
     for Row {
@@ -244,7 +244,7 @@ async fn only_the_request_validator_form_repeats_the_rejected_value() {
             "Scan",
             json!({"TableName": TABLE, "Limit": 0}),
             "0",
-            true,
+            false,
         ),
         (
             "the walk's segment count",
