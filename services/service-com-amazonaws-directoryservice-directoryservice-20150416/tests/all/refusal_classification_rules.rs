@@ -651,7 +651,7 @@ struct ElementCase {
     /// The element shape's whole declared constraint set, as the clause nests it.
     requirements: &'static str,
     /// Whether the nested set closes with the requirement that the MEMBER be carried: the
-    /// model declares this one `@required` or gives it a `@default`.
+    /// model declares this one `@required`.
     carried: bool,
 }
 
@@ -660,8 +660,8 @@ struct ElementCase {
 /// nested at the list member.
 ///
 /// `carried` says whether the nested set closes with the requirement that the MEMBER be
-/// there: it does for a member the model never leaves optional, and not for one a request
-/// may omit.
+/// there: it does for a member the model declares `@required`, and not for one a request may
+/// omit — one the model leaves optional, and one carrying a `@default`.
 fn one_element_error(quoted: &str, path: &str, requirements: &str, carried: bool) -> String {
     let nested = if carried {
         format!("{requirements}, {ENTRY_PRESENT}")
@@ -674,10 +674,9 @@ fn one_element_error(quoted: &str, path: &str, requirements: &str, carried: bool
     )
 }
 
-/// The requirement the nested set CLOSES with, for a collection member the model never
-/// leaves optional — one it declares `@required`, and one carrying a `@default`, which a
-/// request cannot submit as null either. A member a request may omit altogether states the
-/// element shape's constraints alone.
+/// The requirement the nested set CLOSES with, for a collection member the model declares
+/// `@required`. A member a request may omit altogether — one the model leaves optional, and
+/// one carrying a `@default` — states the element shape's constraints alone.
 const ENTRY_PRESENT: &str = "Member must not be null";
 
 /// The `@pattern` each element shape under test declares, read off the model
@@ -719,8 +718,9 @@ async fn a_constraint_a_lists_elements_break_is_stated_at_the_list_member() {
             path: "dnsIpAddrs",
             quoted: "999.999.999.999",
             requirements: IP_ADDR_PATTERN,
-            // `CreateConditionalForwarderRequest$DnsIpAddrs` carries a `@default` of `[]`.
-            carried: true,
+            // `CreateConditionalForwarderRequest$DnsIpAddrs` carries a `@default` of `[]`,
+            // which a request may omit altogether, so the model does not require it.
+            carried: false,
         },
         ElementCase {
             case: "a bad DNS address after a good one",
@@ -733,7 +733,7 @@ async fn a_constraint_a_lists_elements_break_is_stated_at_the_list_member() {
             path: "dnsIpAddrs",
             quoted: "10.0.0.1, not-an-address",
             requirements: IP_ADDR_PATTERN,
-            carried: true,
+            carried: false,
         },
         ElementCase {
             case: "two bad DNS addresses around a good one",
@@ -746,7 +746,7 @@ async fn a_constraint_a_lists_elements_break_is_stated_at_the_list_member() {
             path: "dnsIpAddrs",
             quoted: "256.0.0.1, 10.0.0.2, 10.0.0",
             requirements: IP_ADDR_PATTERN,
-            carried: true,
+            carried: false,
         },
         ElementCase {
             case: "a directory id of the wrong form in a filter",
@@ -783,8 +783,8 @@ async fn a_constraint_a_lists_elements_break_is_stated_at_the_list_member() {
             path: "cidrIps",
             quoted: "198.51.100.0",
             requirements: CIDR_IP_PATTERN,
-            // `RemoveIpRoutesRequest$CidrIps` carries a `@default` of `[]`.
-            carried: true,
+            // `RemoveIpRoutesRequest$CidrIps` carries a `@default` of `[]` too.
+            carried: false,
         },
         ElementCase {
             case: "a tag key outside its character class",
@@ -840,7 +840,7 @@ async fn a_constraint_a_lists_elements_break_is_stated_at_the_list_member() {
             quoted: "10.0.0.10, 999.1.1.1",
             requirements: IP_ADDR_PATTERN,
             // `DirectoryConnectSettings$CustomerDnsIps` carries a `@default` of `[]`.
-            carried: true,
+            carried: false,
         },
     ];
 
@@ -908,9 +908,14 @@ async fn a_constraint_a_lists_elements_break_is_stated_at_the_list_member() {
         message.contains(&format!(
             "Value '[999.999.999.999]' at 'dnsIpAddrs' failed to satisfy constraint: Member \
              must satisfy constraint: [Member must satisfy regular expression pattern: \
-             {IP_ADDR_PATTERN}, {ENTRY_PRESENT}]"
+             {IP_ADDR_PATTERN}]"
         )),
         "case {case:?}: expected the list clause among them, got {message:?}"
+    );
+    assert!(
+        !message.contains(ENTRY_PRESENT),
+        "case {case:?}: a defaulted list member states no presence requirement, got \
+         {message:?}"
     );
     assert!(
         message.contains("at 'remoteDomainName' failed to satisfy constraint:"),

@@ -32,7 +32,7 @@
 //! what is this service's own is the ORDER its own validator lists an enum's value set in
 //! ([`super::stated_enum_values`] states the same order for a clause about a plain member),
 //! which list the clause quotes ([`quotable_lists`]), and that the nested set closes
-//! with the requirement that the MEMBER be carried where the model never leaves it optional
+//! with the requirement that the MEMBER be carried where the model declares it `@required`
 //! ([`element_set_in_the_services_own_order`] over [`super::stated_element_sets`]).
 //!
 //! WHY THE WHOLE LIST AND NOT THE OFFENDING ENTRIES. A recorded refusal of a ONE-entry list
@@ -243,12 +243,12 @@ fn quotable_lists(
 /// The requirement a clause stated at `collection` nests: the element shape's whole declared
 /// constraint set, with an enum's value set listed in the order this SERVICE lists it
 /// ([`super::stated_enum_values`]), closing with the requirement that the MEMBER be carried
-/// where the model never leaves it optional ([`super::stated_element_sets`]).
+/// where the model declares it `@required` ([`super::stated_element_sets`]).
 ///
 /// The constraints themselves are the ones the shared reading of the schema produces
 /// ([`element_constraint_set`]) — the model's, constraint for constraint — and what this
 /// service adds to them is the ORDER an enum's values are listed in and the closing
-/// not-null requirement a member the model always carries brings with it. A collection the
+/// not-null requirement a member the model requires brings with it. A collection the
 /// operation's input
 /// declares ITSELF is looked up by its whole path; one inside a structure that input nests is
 /// looked up by its OWN member name on the structures this service nests ([`NESTED_SHAPES`]),
@@ -281,10 +281,10 @@ fn element_set_in_the_services_own_order(
             requirement(kind)
         })
         .collect();
-    // ...and, last, that the member be CARRIED at all, for a member the model never leaves
-    // optional — one it declares `@required`, and one carrying a `@default`, which a request
-    // cannot submit as null either. A member a request may omit altogether states the
-    // element shape's constraints alone. Which of the two a member is read off this
+    // ...and, last, that the member be CARRIED at all, for a member the model declares
+    // `@required`. Every other list member — one the model leaves optional, and one carrying
+    // a `@default`, which a request may omit altogether — states the element shape's
+    // constraints alone. Which of the two a member is read off this
     // service's own model ([`super::stated_element_sets`]), so the clause follows the
     // declaration rather than the operation a refusal came from. The sentence is the
     // framework's own for an absent member ([`requirement`]), so one wording serves both the
