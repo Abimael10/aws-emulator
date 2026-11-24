@@ -1018,6 +1018,11 @@ async fn a_repeated_request_is_answered_from_the_stored_record_not_from_the_cloc
     }
 }
 
+/// One row of [`paging_a_transcript_visits_every_item_exactly_once`]: the request the
+/// first page is asked for, how many items that page holds, and which of the ids that were
+/// sent the whole walk must cover (taken from them in the order they were sent).
+type PagingCase = (Value, usize, fn(&[String]) -> Vec<String>);
+
 #[tokio::test]
 async fn paging_a_transcript_visits_every_item_exactly_once() {
     let router = router();
@@ -1027,20 +1032,30 @@ async fn paging_a_transcript_visits_every_item_exactly_once() {
         sent.push(send_message(&router, &token, &format!("message {index}")).await);
     }
 
-    // Rows differ in page size, sort order and scan direction: whatever the scan, the
-    // pages together must cover the transcript with no repeat and no drop.
-    let cases: &[(Value, usize)] = &[
-        (json!({"MaxResults": 1, "SortOrder": "ASCENDING", "ScanDirection": "FORWARD"}), 1),
-        (json!({"MaxResults": 2, "SortOrder": "ASCENDING", "ScanDirection": "FORWARD"}), 2),
-        (json!({"MaxResults": 3, "SortOrder": "DESCENDING", "ScanDirection": "BACKWARD"}), 3),
-        (json!({"MaxResults": 7, "SortOrder": "DESCENDING", "ScanDirection": "BACKWARD"}), 7),
-        (json!({"MaxResults": 100, "SortOrder": "ASCENDING", "ScanDirection": "BACKWARD"}), 7),
+    // Rows differ in page size, sort order, scan direction and where the scan starts:
+    // whatever the scan, the pages together must cover exactly the items that scan
+    // reaches, with no repeat and no drop. The third member is which of the sent ids
+    // that is, in the order they were sent.
+    let cases: &[PagingCase] = &[
+        (json!({"MaxResults": 1, "SortOrder": "ASCENDING", "ScanDirection": "FORWARD"}), 1, <[String]>::to_vec),
+        (json!({"MaxResults": 2, "SortOrder": "ASCENDING", "ScanDirection": "FORWARD"}), 2, <[String]>::to_vec),
+        (json!({"MaxResults": 3, "SortOrder": "DESCENDING", "ScanDirection": "BACKWARD"}), 3, <[String]>::to_vec),
+        (json!({"MaxResults": 7, "SortOrder": "DESCENDING", "ScanDirection": "BACKWARD"}), 7, <[String]>::to_vec),
+        (json!({"MaxResults": 100, "SortOrder": "ASCENDING", "ScanDirection": "BACKWARD"}), 7, <[String]>::to_vec),
         // An absent MaxResults takes the documented default of 10.
-        (json!({"SortOrder": "ASCENDING", "ScanDirection": "FORWARD"}), 7),
-        (json!({"SortOrder": "DESCENDING"}), 7),
+        (json!({"SortOrder": "ASCENDING", "ScanDirection": "FORWARD"}), 7, <[String]>::to_vec),
+        (json!({"SortOrder": "DESCENDING"}), 7, <[String]>::to_vec),
+        // A scan that starts partway through the transcript reaches only what lies ahead
+        // of its anchor: `StartPosition.MostRecent` counts back from the newest item, so a
+        // forward scan from it covers exactly those newest items.
+        (
+            json!({"MaxResults": 2, "ScanDirection": "FORWARD", "StartPosition": {"MostRecent": 3}}),
+            2,
+            |sent| sent[sent.len() - 3..].to_vec(),
+        ),
     ];
 
-    for (request, first_page_len) in cases {
+    for (request, first_page_len, covers) in cases {
         let case = request.to_string();
         let mut seen: Vec<String> = Vec::new();
         let mut page_request = request.clone();
@@ -1072,11 +1087,11 @@ async fn paging_a_transcript_visits_every_item_exactly_once() {
         }
         let mut sorted_seen = seen.clone();
         sorted_seen.sort();
-        let mut sorted_sent = sent.clone();
-        sorted_sent.sort();
+        let mut covered = covers(&sent);
+        covered.sort();
         assert_eq!(
-            sorted_seen, sorted_sent,
-            "case {case}: the pages must cover exactly the sent items, got {seen:?}"
+            sorted_seen, covered,
+            "case {case}: the pages must cover exactly {covered:?}, got {seen:?}"
         );
     }
 
@@ -1273,34 +1288,31 @@ async fn start_position_decides_where_the_scan_begins() {
         "case malformed AbsoluteTime: got {body:?}"
     );
 
-    let (status, body) = post(
-        &router,
-        "/participant/transcript",
-        Some(&token),
-        &json!({"NextToken": "not-a-token-we-issued"}),
-    )
-    .await;
-    assert_eq!(status, 400, "case foreign NextToken: got {body:?}");
-    assert_eq!(
-        error_type(&body),
-        "ValidationException",
-        "case foreign NextToken: got {body:?}"
-    );
-
-    // An oversized NextToken (still within the modelled 1..1000 length) is refused too.
-    let (status, body) = post(
-        &router,
-        "/participant/transcript",
-        Some(&token),
-        &json!({"NextToken": "ab".repeat(400)}),
-    )
-    .await;
-    assert_eq!(status, 400, "case oversized NextToken: got {body:?}");
-    assert_eq!(
-        error_type(&body),
-        "ValidationException",
-        "case oversized NextToken: got {body:?}"
-    );
+    // A `NextToken` no scan of this transcript issued is refused whatever its length: the
+    // rows span a value of ordinary length, an oversized one, the longest value the member
+    // holds (`NextToken` is modelled len 1..1000, smithy_query operation=GetTranscript)
+    // and one character past that maximum.
+    let next_tokens: &[(&str, String)] = &[
+        ("foreign NextToken", "not-a-token-we-issued".to_string()),
+        ("oversized NextToken", "ab".repeat(400)),
+        ("the longest value the member holds", "t".repeat(1000)),
+        ("one character past the maximum", "t".repeat(1001)),
+    ];
+    for (case, value) in next_tokens {
+        let (status, body) = post(
+            &router,
+            "/participant/transcript",
+            Some(&token),
+            &json!({"NextToken": value}),
+        )
+        .await;
+        assert_eq!(status, 400, "case {case:?}: got {status} and {body:?}");
+        assert_eq!(
+            error_type(&body),
+            "ValidationException",
+            "case {case:?}: got {body:?}"
+        );
+    }
 }
 
 #[tokio::test]

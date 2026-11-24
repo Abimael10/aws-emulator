@@ -346,11 +346,16 @@ const MAX_RESULTS_CEILING: usize = 100;
 
 /// The `NextToken` the page that ends a scan reports: the empty string.
 ///
-/// A paginated read reports its pagination token on every page, with the terminal page
-/// carrying a token that continues nothing — so a client reads the member whether or not
-/// more items remain, rather than having to tell an absent member from an exhausted scan.
-/// It is not a token this service issues a continuation from: `NextToken` is modelled with
-/// a minimum length of 1, so feeding it back is refused as the input it is.
+/// This is the value the service reports there, recorded on the terminal page of a
+/// `GetTranscript` 200 — the wire trace `connectparticipant-participant-session-lifecycle`
+/// carries `"NextToken": ""` on the page that ends its scan — so it is reported there: the
+/// member is on every page, and the page that ends a scan carries a token that names no
+/// page. That is what a paginated client reads the member for — it pages while the token
+/// names a page — and it is why this value is reported rather than the member being
+/// dropped, even though `NextToken` is modelled with a minimum length of 1.
+///
+/// It is not a token this service issues a continuation from: that same modelled minimum
+/// is what refuses it as the input it is, so a scan is never restarted from it.
 const TERMINAL_NEXT_TOKEN: &str = "";
 
 /// The longest `NextToken` this service can have issued: a cursor's JSON is a fixed set
