@@ -923,6 +923,25 @@ fn columns_per_page() -> usize {
     ((1.0 - state::PAGE_MARGIN) / state::CHAR_WIDTH) as usize
 }
 
+/// The character column the lines of [`a_document_wider_than_the_page_grid_still_lays_out`]
+/// START at, of the [`columns_per_page`] the grid addresses: most of the way across the
+/// page, so what is drawn after it already stands near the grid's last column.
+///
+/// A line's own LEFT MARGIN is part of the line that is laid out — the recogniser reports it
+/// as the leading spaces of the line's text — so a line that begins this far across the page
+/// carries that many characters before its first mark, and a handful of words after it then
+/// stand at columns the grid cannot address. That is the same line, laid out the same way:
+/// what a box saturates at is the COLUMN the word it is computed for stands at, and a column
+/// is as unaddressable whether the columns before it were drawn blank or inked.
+///
+/// Why the page is drawn this way: every mark on it is a mark the recogniser has to name
+/// against its whole bank of faces, at each of the page's quarter turns, so what a page costs
+/// to read is its INK. Reaching past the last column on ink alone costs a mark for every
+/// second column of the page and reaches no further past it than this does.
+fn indent_columns() -> usize {
+    columns_per_page() * 3 / 4
+}
+
 /// A line can be wider than the page it is laid out on, in every feature set: the layout
 /// must saturate rather than panic, and the geometry must stay on the page.
 ///
@@ -930,29 +949,46 @@ fn columns_per_page() -> usize {
 /// every structure the four feature sets derive a block from — a label and the value it
 /// labels, and a row of tab-separated columns — so the `KEY_VALUE_SET`, `TABLE` and `CELL`
 /// blocks are laid out from a line the grid cannot address, and so is a word that starts
-/// past the page's right edge and is longer than what is left of the page.
+/// past the page's right edge, so that the whole of it stands off the page.
+///
+/// Both lines begin at [`indent_columns`] and carry just enough words past that to run off
+/// the grid's last column.
 #[tokio::test]
 async fn a_document_wider_than_the_page_grid_still_lays_out() {
     let router = harness();
     let columns = columns_per_page();
+    let indent = " ".repeat(indent_columns());
+    // Letters the recogniser names off their own ink alone, so the marks drawn here come
+    // back as the characters they were drawn as.
+    let mut faces = "HEXTOAWMNKRB".chars().cycle();
     // Single letters, so the line reaches past the page's last column on as few marks as
     // a line of words can: one letter and the space after it cover two columns.
-    let spread: String = "HEXTOAWMNKRB"
-        .chars()
-        .cycle()
-        .take(columns / 2 + 1)
-        .map(String::from)
-        .collect::<Vec<_>>()
-        .join(" ");
-    let past_the_edge = "V".repeat(12);
-    // Each cell covers five columns — four of text and the tab that ends it — so this is
-    // the shortest row of columns that still runs past the page's last one.
-    let cell_count = columns / 5 + 2;
-    let wide_row: String = (0..cell_count)
-        .map(|i| format!("c{i} x"))
-        .collect::<Vec<_>>()
-        .join("\t");
-    let text = format!("Label: {spread} {past_the_edge}\n{wide_row}");
+    let mut labelled = format!("{indent}Label:");
+    while labelled.chars().count() <= columns {
+        labelled.push(' ');
+        labelled.push(faces.next().expect("the faces cycle"));
+    }
+    // A word that starts past the page's right edge — the line already runs past the last
+    // column the grid addresses — so the whole of it stands off the page.
+    let past_the_edge = "VV";
+    labelled.push(' ');
+    labelled.push_str(past_the_edge);
+    // A row of tab-separated columns, carried past the page's last column the same way, so
+    // the cell a `CELL` block is laid out from stands off the grid too. Each cell holds two
+    // words of one letter, which with the tab that ends it is four characters of the row's
+    // text: the fewest marks a column of several words covers four columns on.
+    let mut wide_row = indent.clone();
+    let mut cell_count = 0usize;
+    while wide_row.chars().count() <= columns {
+        if cell_count > 0 {
+            wide_row.push('\t');
+        }
+        wide_row.push(faces.next().expect("the faces cycle"));
+        wide_row.push(' ');
+        wide_row.push(faces.next().expect("the faces cycle"));
+        cell_count += 1;
+    }
+    let text = format!("{labelled}\n{wide_row}");
     let drawn = drawn_lines(&text);
     assert!(
         text.lines().all(|line| line.chars().count() > columns),
