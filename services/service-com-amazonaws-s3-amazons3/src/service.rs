@@ -625,6 +625,70 @@ pub const XML_DOCUMENT_PAYLOAD_MEMBERS: &[&str] = &[
     "websiteConfiguration",
 ];
 
+/// The members of [`XML_DOCUMENT_PAYLOAD_MEMBERS`] the model marks `@required`: the
+/// operations whose document is not optional, so a request that carries no body at all
+/// carried no document for them.
+///
+/// What a refusal needs this for: S3 answers a request that sent NO body where the operation
+/// requires one with the code its error-responses list publishes for exactly that
+/// ([`crate::state::MISSING_REQUEST_BODY_CODE`]), not with the schema refusal a document that
+/// did arrive and did not validate earns — the caller has to send a document, not fix the one
+/// it sent. An operation whose document the model leaves OPTIONAL is absent from this list and
+/// keeps the reading its own handler gives a request that names none (`PutBucketAcl`'s ACL
+/// travels in headers instead, and `CreateBucket` with no body creates a bucket).
+///
+/// Source: the `@required` structured `@httpPayload` members of this service's operation
+/// inputs, re-derived from the model by `tests/all/missing_request_body.rs` so a model update
+/// that requires another document cannot quietly leave it out. It is a LIST rather than a
+/// question asked of the member's schema because the runtime `Schema` a request is read
+/// against carries no `@required` trait at all — the macro turns required-ness into a
+/// non-`Option` field — so there is nothing to ask; were such an accessor to appear, the
+/// predicate would be read off the member and both this list and
+/// [`XML_DOCUMENT_PAYLOAD_MEMBERS`] would go.
+pub const REQUIRED_XML_DOCUMENT_PAYLOAD_MEMBERS: &[&str] = &[
+    "abacStatus",
+    "accelerateConfiguration",
+    "analyticsConfiguration",
+    "annotationTableConfiguration",
+    "bucketLoggingStatus",
+    "cORSConfiguration",
+    "delete",
+    "intelligentTieringConfiguration",
+    "inventoryConfiguration",
+    "inventoryTableConfiguration",
+    "journalTableConfiguration",
+    "metadataConfiguration",
+    "metadataTableConfiguration",
+    "metricsConfiguration",
+    "notificationConfiguration",
+    "objectEncryption",
+    "ownershipControls",
+    "publicAccessBlockConfiguration",
+    "replicationConfiguration",
+    "requestPaymentConfiguration",
+    "serverSideEncryptionConfiguration",
+    "tagging",
+    "versioningConfiguration",
+    "websiteConfiguration",
+];
+
+/// Whether `violation` reports that the DOCUMENT an operation requires in its body did not
+/// arrive at all — the refusal [`wire::missing_request_body_violation`] mints for a request
+/// whose body carries no bytes.
+///
+/// The document is bound to ONE input member, so the violation names that member and nothing
+/// below it; a value refused INSIDE a document always descends past it
+/// ([`violation_is_in_request_document`] reads the same shape of path).
+fn violation_is_the_absent_request_document(violation: &Violation) -> bool {
+    let mut segments = violation.path.split('.');
+    let Some(root) = segments.next() else {
+        return false;
+    };
+    violation.kind == ViolationKind::MissingRequiredMember
+        && segments.next().is_none()
+        && REQUIRED_XML_DOCUMENT_PAYLOAD_MEMBERS.contains(&root)
+}
+
 /// Whether `violation` names a value that arrived inside the request's XML document.
 ///
 /// Two things decide it. The path is the trail of member names from the operation input
@@ -658,6 +722,11 @@ fn violation_is_in_request_document(violation: &Violation) -> bool {
 /// fails one in a header, a query parameter or a URI label is `InvalidArgument`, "invalid
 /// argument". Both are HTTP 400, the status the protocol already renders a refusal with.
 ///
+/// A request that carried NO BODY where the operation requires a document is refused for
+/// the body itself ([`crate::state::MISSING_REQUEST_BODY_CODE`]) ahead of all of these: no
+/// member of a document nobody sent can be named, and the caller has to send a document
+/// rather than fix the one it sent.
+///
 /// A field S3 PUBLISHES its own refusal for is answered with that refusal (see
 /// [`published_refusal`]) ahead of either, because the published wording is the contract
 /// for that field. Otherwise `MalformedXML` carries the fixed text its own error-responses
@@ -666,6 +735,16 @@ fn violation_is_in_request_document(violation: &Violation) -> bool {
 /// member, and the constraint it broke — since that is the only thing left that says which
 /// argument was rejected.
 fn s3_refusal(violation: &Violation) -> Refused {
+    // A body that did not arrive at all is reported against the BODY, before anything about
+    // the document it would have carried: S3 publishes one code for a request that sends
+    // none where the operation requires one, and no member of a document nobody sent can be
+    // named.
+    if violation_is_the_absent_request_document(violation) {
+        return Refused {
+            code: crate::state::MISSING_REQUEST_BODY_CODE.to_string(),
+            message: crate::state::MISSING_REQUEST_BODY_MESSAGE.to_string(),
+        };
+    }
     if let Some(published) = published_refusal(violation) {
         return published;
     }

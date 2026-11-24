@@ -789,6 +789,49 @@ fn xml_charset_violation(request: &Request, input_schema: &Schema) -> Option<Vio
 pub(crate) const XML_CHARACTER_SET: &str =
     "#x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]";
 
+/// The violation to refuse `request` with when the DOCUMENT its operation requires in the
+/// body did not arrive at all — the body carries no bytes — or `None` for a request whose
+/// body is not a required document, or one that carries something.
+///
+/// A request whose body is empty sent no document, which S3 answers with the code its
+/// error-responses list publishes for a request carrying none where one is required
+/// (`crate::state::MISSING_REQUEST_BODY_CODE`), and not with the schema refusal a document
+/// that DID arrive and did not validate earns. Refusing it here, before the codec reads the
+/// body, is what keeps the two apart: the codec reads an empty body as a container with no
+/// members in it, so every such request would otherwise be answered about a member of a
+/// document nobody sent — and for the few containers whose members are all optional it would
+/// be SERVED as if the caller had sent an empty one.
+///
+/// Scoped by the member the codec would bind: only a STRUCTURED `@httpPayload` the model
+/// marks `@required` (`crate::service::REQUIRED_XML_DOCUMENT_PAYLOAD_MEMBERS`), so an
+/// operation whose document is optional, one whose body is an object's bytes, and one that
+/// binds no body at all are all left exactly as they were.
+///
+/// A body this service is handed is always available AS BYTES — the framework buffers a
+/// request before any operation is reached, which is what lets the document normalization
+/// below read and rewrite it — so an empty one is `Some` of no bytes rather than `None`; a
+/// body that somehow is not readable is left to that normalization, which reports it as the
+/// body it could not read.
+fn missing_request_body_violation(request: &Request, input_schema: &Schema) -> Option<Violation> {
+    let payload = input_schema
+        .members()
+        .iter()
+        .find(|member| is_xml_document_payload(member))?;
+    let member = path::member(payload.member_name()?);
+    if !crate::service::REQUIRED_XML_DOCUMENT_PAYLOAD_MEMBERS.contains(&member.as_str()) {
+        return None;
+    }
+    if !request.body().bytes().is_some_and(<[u8]>::is_empty) {
+        return None;
+    }
+    Some(Violation {
+        path: member,
+        kind: ViolationKind::MissingRequiredMember,
+        value: None,
+        sensitive: false,
+    })
+}
+
 /// Whether the input's XML document payload is a `WebsiteConfiguration` — the one document
 /// whose own refusals `PutBucketWebsite` is the place that states them, so the rewrite above
 /// is scoped to it by the member the codec would bind rather than by anything the
@@ -3470,6 +3513,12 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         remember_object_attributes_header(
             request.headers().get(crate::state::OBJECT_ATTRIBUTES_HEADER),
         );
+        // A request whose body IS an XML document is refused here when the document the
+        // operation REQUIRES did not arrive at all. See
+        // [`missing_request_body_violation`].
+        if let Some(violation) = missing_request_body_violation(request, input_schema) {
+            return Err(ProtocolError::Invalid(vec![violation]));
+        }
         // A request whose body IS an XML document is refused here when that document
         // carries a character XML cannot hold, before any codec reads it. See
         // [`xml_charset_violation`].

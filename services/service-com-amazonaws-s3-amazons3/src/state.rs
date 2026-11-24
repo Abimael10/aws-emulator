@@ -1909,10 +1909,15 @@ pub const MALFORMED_ACL_CODE: &str = "MalformedACLError";
 /// The code S3 answers a request that carries no body where one is required: "This happens
 /// when the user sends an empty XML document as a request. The error message is, 'Request
 /// body is empty'", HTTP 400 (same list) — what an ACL request that names no ACL at all
-/// gets, since the ACL travels either in the body or in the request headers.
+/// gets, since the ACL travels either in the body or in the request headers, and what every
+/// operation whose document the model REQUIRES answers a request that sent no body
+/// (`crate::service::REQUIRED_XML_DOCUMENT_PAYLOAD_MEMBERS`).
 pub const MISSING_REQUEST_BODY_CODE: &str = "MissingRequestBodyError";
-/// See [`MISSING_REQUEST_BODY_CODE`].
-pub const MISSING_REQUEST_BODY_MESSAGE: &str = "Request body is empty";
+/// The `<Message>` S3 sends with [`MISSING_REQUEST_BODY_CODE`], as the wire sends it: the
+/// error-responses list paraphrases the sentence in prose ("the error message is, 'Request
+/// body is empty'") and the element itself carries it capitalized this way, which is the
+/// text a client renders and a message-matching caller keys on.
+pub const MISSING_REQUEST_BODY_MESSAGE: &str = "Request Body is empty";
 
 /// The code S3 answers an attempt to set an ACL on a bucket whose Object Ownership setting
 /// is `BucketOwnerEnforced`: "AccessControlListNotSupported - The bucket does not allow

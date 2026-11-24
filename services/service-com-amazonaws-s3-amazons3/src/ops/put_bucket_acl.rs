@@ -507,7 +507,7 @@ fn requested_grants(
 
     // No canned ACL, no grant header and no body: the request names no ACL at all, so
     // there is nothing to set. S3 answers a request that carries no document where one is
-    // required with `MissingRequestBodyError` ("Request body is empty", HTTP 400).
+    // required with `MissingRequestBodyError` ("Request Body is empty", HTTP 400).
     Err(crate::scaffolded::Scaffolded::unmodeled(
         crate::state::MISSING_REQUEST_BODY_CODE,
         ACL_REFUSAL_STATUS,

@@ -264,7 +264,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "You specify the lifecycle configuration in your request body": a request that
         // carries none names no configuration to apply, which S3 answers with
-        // `MissingRequestBodyError` ("Request body is empty", HTTP 400) — the channel
+        // `MissingRequestBodyError` ("Request Body is empty", HTTP 400) — the channel
         // `PutBucketAcl` answers a request that names no ACL at all through.
         let Some(configuration) = input.lifecycle_configuration else {
             return Err(crate::scaffolded::Scaffolded::unmodeled(

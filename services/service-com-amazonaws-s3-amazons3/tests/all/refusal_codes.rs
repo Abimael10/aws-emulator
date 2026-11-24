@@ -39,7 +39,11 @@ struct Row {
 }
 
 /// This service's Smithy model, parsed.
-fn model() -> Value {
+///
+/// `pub(crate)`: the suite that derives the REQUIRED subset of the same catalog
+/// ([`super::missing_request_body`]) reads the model through this one reader rather than a
+/// second copy of it.
+pub(crate) fn model() -> Value {
     let model_path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/smithy-model/com-amazonaws-s3-amazons3.json"
@@ -52,7 +56,9 @@ fn model() -> Value {
 
 /// A member name as a validation path spells it: lowerCamel, the casing
 /// `aws_smithy_schema_server::constraints::path::member` applies.
-fn lower_camel(name: &str) -> String {
+///
+/// `pub(crate)` beside [`model`], and for the same reason.
+pub(crate) fn lower_camel(name: &str) -> String {
     let mut chars = name.chars();
     match chars.next() {
         None => String::new(),
