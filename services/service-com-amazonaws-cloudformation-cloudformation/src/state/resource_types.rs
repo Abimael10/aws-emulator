@@ -110,7 +110,7 @@ use super::template::{
     CLOUDHSM_CLUSTER,
     CUSTOMER_PROFILES_DOMAIN, DIRECT_CONNECT_GATEWAY, DIRECT_CONNECT_RESILIENCY_GROUP,
     DIRECTORY_SERVICE_MICROSOFT_AD, DIRECTORY_SERVICE_SIMPLE_AD,
-    DLM_LIFECYCLE_POLICY, GLUE_TABLE_OPTIMIZER,
+    DLM_LIFECYCLE_POLICY, ECR_SIGNING_CONFIGURATION, GLUE_TABLE_OPTIMIZER,
     HEALTHLAKE_DATA_TRANSFORMATION_PROFILE, HEALTHLAKE_FHIR_DATASTORE,
     IOT_CORE_DEVICE_ADVISOR_SUITE_DEFINITION, MEDIACONVERT_CERTIFICATE_ASSOCIATION,
     MWAA_ENVIRONMENT, NEPTUNE_GRAPH_GRAPH,
@@ -594,6 +594,10 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::ECR::RegistryPolicy",
     "AWS::ECR::ReplicationConfiguration",
     "AWS::ECR::Repository",
+    // The signing configuration of that private registry, which this emulator creates in
+    // Amazon ECR itself (`super::provisioner`) through the call documented to create or update
+    // it.
+    ECR_SIGNING_CONFIGURATION,
     // Amazon ECS
     "AWS::ECS::CapacityProvider",
     "AWS::ECS::Cluster",

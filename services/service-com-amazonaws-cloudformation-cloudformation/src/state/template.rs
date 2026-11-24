@@ -3121,6 +3121,9 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     EC2_VPN_GATEWAY,
     ECR_PUBLIC_REPOSITORY,
     ECR_REPOSITORY,
+    // The private registry's own signing configuration, publishing the one return value its
+    // section names: the registry it belongs to.
+    ECR_SIGNING_CONFIGURATION,
     ECS_CLUSTER,
     ECS_SERVICE,
     ECS_TASK_DEFINITION,

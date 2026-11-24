@@ -25,6 +25,12 @@ mod bucket_website;
 mod ecr_repositories;
 pub(in crate::state) use ecr_repositories::*;
 
+/// The `AWS::ECR::SigningConfiguration` arms — the ONE signing configuration that same private
+/// registry holds, whose create is an upsert the stack has to probe before — as one concern of
+/// their own.
+mod ecr_signing_configurations;
+pub(in crate::state) use ecr_signing_configurations::*;
+
 use bucket_access_controls::apply_access_controls;
 use bucket_replication::declared_replication_configuration;
 pub(in crate::state) use bucket_website::{declared_website_configuration, WEBSITE_CONFIGURATION};

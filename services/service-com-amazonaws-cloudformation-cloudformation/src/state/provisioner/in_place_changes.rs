@@ -795,6 +795,16 @@ impl Provisioner {
             // ([`update_repository`]). Its tags travel separately
             // ([`Self::retag`]).
             Self::EcrRepository => update_repository(ctx, region, resource, declared).await,
+            // And the registry's own signing configuration through the PUT that wrote it,
+            // documented "Creates or updates the registry's signing configuration": the call
+            // that created it is the call that applies a changed declaration to it, and the
+            // registry holds one, so the configuration in force is replaced rather than
+            // doubled.
+            Self::EcrSigningConfiguration => {
+                put_signing_configuration(ctx, region, resource, declared)
+                    .await
+                    .map(Some)
+            }
             // `UpdateConfigurationManager` takes the `ManagerArn` Quick Setup minted together
             // with a new name and description — everything that call can change on a manager
             // that exists — so a changed declaration of either reaches the manager the stack

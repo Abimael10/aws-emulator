@@ -1573,6 +1573,32 @@ pub const ECR_PUBLIC_REPOSITORY: &str = "AWS::ECR::PublicRepository";
 /// An Amazon ECR repository's resource type (ECR's model: `cloudFormationName: ECR`).
 pub const ECR_REPOSITORY: &str = "AWS::ECR::Repository";
 
+/// The SIGNING CONFIGURATION of that private registry, under the same namespace: the one
+/// configuration an account's registry holds, which `PutSigningConfiguration` is documented to
+/// create or update ("Creates or updates the registry's signing configuration") and
+/// `DeleteSigningConfiguration` removes.
+///
+/// Neither call takes an identifier, and the two that report one answer the `registryId` the
+/// configuration belongs to — so the resource's identity is that REGISTRY rather than a name of
+/// its own, exactly as the account's grouping configuration
+/// ([`APPLICATION_SIGNALS_GROUPING_CONFIGURATION`]) is identified by the account whose it is. A
+/// second declaration in the same account therefore names the same resource, which is why a
+/// deployment of one probes the registry before putting it.
+pub const ECR_SIGNING_CONFIGURATION: &str = "AWS::ECR::SigningConfiguration";
+
+/// Every `Fn::GetAtt` attribute an [`ECR_SIGNING_CONFIGURATION`] publishes, in the sorted order
+/// a resource's own attribute map holds them in: the registry whose configuration it is — the
+/// `registryId` both `GetSigningConfiguration` and `DeleteSigningConfiguration` answer, which is
+/// also what this type's `Ref` returns.
+///
+/// It is a value these naming rules compute: a registry id is the owning account's id
+/// (`RegistryId`: `^[0-9]{12}$`), which is the one account this emulator mints.
+pub(super) const ECR_SIGNING_CONFIGURATION_ATTRIBUTES: &[&str] = &[ECR_REGISTRY_ID_ATTRIBUTE];
+
+/// The one attribute of [`ECR_SIGNING_CONFIGURATION_ATTRIBUTES`], which is the identity a `Ref`
+/// to one resolves to.
+pub(crate) const ECR_REGISTRY_ID_ATTRIBUTE: &str = "RegistryId";
+
 /// An AWS CodeBuild report group's resource type (CodeBuild's model:
 /// `awsService.cloudFormationName: CodeBuild`). This is the type `super::provisioning`
 /// creates in CodeBuild itself, through that service's own `CreateReportGroup`.

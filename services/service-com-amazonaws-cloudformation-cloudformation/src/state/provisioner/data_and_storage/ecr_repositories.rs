@@ -208,7 +208,7 @@ fn lifecycle_policy_request(
 }
 
 /// One Amazon ECR call, over the awsJson1.1 wire that registry speaks.
-async fn call_ecr(
+pub(super) async fn call_ecr(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     operation: &str,

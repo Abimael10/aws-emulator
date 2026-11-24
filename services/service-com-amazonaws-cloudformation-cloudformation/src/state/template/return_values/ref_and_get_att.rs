@@ -2290,6 +2290,19 @@ pub(crate) fn return_values(
             }
             (arn, attributes)
         }
+        // The signing configuration an `AWS::ECR::SigningConfiguration` declares.
+        // `PutSigningConfiguration` keeps ONE configuration per registry ("Creates or updates
+        // the registry's signing configuration") and takes no identifier for it, while the two
+        // calls that report one answer the `registryId` it belongs to — so the resource's
+        // identity is that registry, not a name of its own, and a second declaration of the
+        // type in the same account names the same resource. The registry id is the owning
+        // account's id (`RegistryId`: `^[0-9]{12}$`), which this emulator mints, so the value
+        // is computed here rather than standing in for one Amazon ECR assigns.
+        ECR_SIGNING_CONFIGURATION => {
+            let registry_id = ::emulator_server::emulator_account_id().to_string();
+            attributes.insert(ECR_REGISTRY_ID_ATTRIBUTE.to_string(), registry_id.clone());
+            (registry_id, attributes)
+        }
         // The grouping configuration an `AWS::ApplicationSignals::GroupingConfiguration`
         // declares. `PutGroupingConfiguration` keeps ONE configuration per account and Region
         // ("Creates or updates the grouping configuration for this account") and takes no

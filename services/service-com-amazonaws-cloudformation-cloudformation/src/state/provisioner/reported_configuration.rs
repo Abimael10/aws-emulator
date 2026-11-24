@@ -56,6 +56,10 @@ impl Provisioner {
                 describe_public_repository(ctx, region, physical_resource_id).await
             }
             Self::EcrRepository => describe_repository(ctx, region, physical_resource_id).await,
+            // That registry's own read of its signing configuration, which carries no
+            // identifier: a registry holds one, and it is the resource the stack declared.
+            Self::EcrSigningConfiguration => describe_signing_configuration(ctx, region).await,
+
             Self::Ec2Vpc => describe_ec2_vpc(ctx, region, physical_resource_id).await,
             Self::Ec2Subnet => describe_ec2_subnet(ctx, region, physical_resource_id).await,
             Self::Ec2SecurityGroup => {

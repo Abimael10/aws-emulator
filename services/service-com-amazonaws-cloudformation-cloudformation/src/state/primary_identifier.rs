@@ -127,6 +127,11 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         APPLICATION_SIGNALS_SERVICE_LEVEL_OBJECTIVE
         | APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG => "Arn",
         APPLICATION_SIGNALS_GROUPING_CONFIGURATION => "AwsAccountId",
+        // The private Amazon ECR registry's own signing configuration, identified by the
+        // REGISTRY whose configuration it is: a registry holds one, neither the put nor the
+        // delete takes an identifier at all, and `registryId` is the one member the calls that
+        // report one answer it against.
+        ECR_SIGNING_CONFIGURATION => ECR_REGISTRY_ID_ATTRIBUTE,
         // An Application Insights application, identified by the ARN that type's `Ref` returns —
         // the `ApplicationARN` a client names one by — rather than by a name of its own, which
         // the type does not declare.

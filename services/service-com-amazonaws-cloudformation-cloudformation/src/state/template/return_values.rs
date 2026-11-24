@@ -385,6 +385,9 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         // so no attribute carries it ([`DIRECTORY_SERVICE_MICROSOFT_AD_ATTRIBUTES`]).
         DIRECTORY_SERVICE_MICROSOFT_AD => DIRECTORY_SERVICE_MICROSOFT_AD_ATTRIBUTES,
         DIRECTORY_SERVICE_SIMPLE_AD => DIRECTORY_SERVICE_SIMPLE_AD_ATTRIBUTES,
+        // The private Amazon ECR registry's own SIGNING CONFIGURATION publishes the registry it
+        // belongs to, which these naming rules compute from the account this emulator mints.
+        ECR_SIGNING_CONFIGURATION => ECR_SIGNING_CONFIGURATION_ATTRIBUTES,
         // An Application Signals service level objective publishes the ARN these naming rules
         // compute from its name beside the four read-only values that service decides; a
         // GROUPING CONFIGURATION publishes the one instant its put recorded; and an

@@ -507,7 +507,8 @@ use super::template::{
     COGNITO_USER_POOL_GROUP, DEFAULT_SCHEDULE_GROUP, DLM_LIFECYCLE_POLICY, EC2_LAUNCH_TEMPLATE, EC2_SECURITY_GROUP,
     EC2_SUBNET,
     EC2_VOLUME, EC2_VPC,
-    ECR_PUBLIC_REPOSITORY, ECR_REPOSITORY, ECS_CLUSTER, ECS_SERVICE, EKS_ACCESS_ENTRY,
+    ECR_PUBLIC_REPOSITORY, ECR_REPOSITORY, ECR_SIGNING_CONFIGURATION, ECS_CLUSTER, ECS_SERVICE,
+    EKS_ACCESS_ENTRY,
     EKS_ADDON,
     EKS_CLUSTER,
     EKS_NODEGROUP,
@@ -720,6 +721,13 @@ pub(super) enum Provisioner {
     /// stack created rather than dropped ([`update_repository`]), and its
     /// tags travel through that registry's own tagging calls ([`Self::retag`]).
     EcrRepository,
+    /// `AWS::ECR::SigningConfiguration`: the ONE signing configuration that private registry
+    /// holds, which `PutSigningConfiguration` is documented to create or update ("Creates or
+    /// updates the registry's signing configuration") and `DeleteSigningConfiguration` removes.
+    /// The put is therefore this type's create and its update alike, and no call of the three
+    /// takes an identifier: the resource is the registry's own configuration, so a deployment
+    /// probes the registry before putting one ([`ecr_signing_configurations`]).
+    EcrSigningConfiguration,
     /// `AWS::EC2::VPC`: a VPC of Amazon EC2, whose `vpc-…` identifier that service assigns.
     Ec2Vpc,
     /// `AWS::EC2::Subnet`: a subnet of one of those VPCs, whose `subnet-…` identifier is
@@ -1692,6 +1700,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         CLOUDWATCH_DASHBOARD => Some(Provisioner::CloudWatchDashboard),
         ECR_PUBLIC_REPOSITORY => Some(Provisioner::EcrPublicRepository),
         ECR_REPOSITORY => Some(Provisioner::EcrRepository),
+        ECR_SIGNING_CONFIGURATION => Some(Provisioner::EcrSigningConfiguration),
         EC2_VPC => Some(Provisioner::Ec2Vpc),
         EC2_SUBNET => Some(Provisioner::Ec2Subnet),
         EC2_SECURITY_GROUP => Some(Provisioner::Ec2SecurityGroup),
@@ -2068,6 +2077,12 @@ impl Provisioner {
                 create_public_repository(ctx, region, resource, propagated).await
             }
             Self::EcrRepository => create_repository(ctx, region, resource, propagated).await,
+            // The registry's signing configuration publishes no `Tags` property and its put
+            // takes no tag member at all — it is the registry's own configuration rather than a
+            // named resource — so no tags are propagated to one.
+            Self::EcrSigningConfiguration => {
+                create_signing_configuration(ctx, region, resource).await
+            }
             Self::Ec2Vpc => create_ec2_vpc(ctx, region, resource, propagated).await,
             Self::Ec2Subnet => create_ec2_subnet(ctx, region, resource, propagated).await,
             Self::Ec2SecurityGroup => {
@@ -3570,6 +3585,9 @@ impl Provisioner {
                 delete_public_repository(ctx, region, physical_resource_id).await
             }
             Self::EcrRepository => delete_repository(ctx, region, resource).await,
+            // The delete takes the configuration away from the registry it belongs to, which
+            // is the one this emulator serves: it carries no identifier at all.
+            Self::EcrSigningConfiguration => delete_signing_configuration(ctx, region).await,
             Self::Ec2Vpc => delete_ec2_vpc(ctx, region, physical_resource_id).await,
             Self::Ec2Subnet => delete_ec2_subnet(ctx, region, physical_resource_id).await,
             Self::Ec2SecurityGroup => {

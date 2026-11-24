@@ -1422,6 +1422,16 @@ fn own_failure_reason(refusal: &Refusal) -> String {
 /// the Region manages is nothing CloudFormation can add to — a name another account holds, or
 /// one a client took outside any stack — so that service's own message stands.
 ///
+/// That sentence is about a physical NAME, so it is reported only for a resource whose
+/// identifier the DECLARATION names ([`crate::state::template::name_property`]). A resource whose
+/// identifier no property of its declaration states is one no template named: its identifier is
+/// the identity of a resource an account, a registry or a parent holds at most one of — the
+/// registry an `AWS::ECR::SigningConfiguration` configures, the account an
+/// `AWS::ApplicationSignals::GroupingConfiguration` groups — and there is no name the caller
+/// asked for to report as taken, so what the resource's event carries is the HANDLER's own
+/// already-exists report ([`handler_failure_reason`]), which says that a resource of that type
+/// is already there.
+///
 /// Asked at the refusal rather than ahead of the create for the reason
 /// [`crate::state::physical_name`] records: a create the owning service ACCEPTS under a name one of
 /// this Region's stacks holds is a deployment that got the resource it declared, and nothing
@@ -1434,6 +1444,7 @@ pub(super) fn already_managed_reason(
     if handler_error_code(&refusal.code) != HANDLER_ERROR_ALREADY_EXISTS {
         return None;
     }
+    crate::state::template::name_property(&resource.resource_type, &resource.properties)?;
     crate::state::physical_name::taken_by_another_stack(
         resource,
         &stack.managed_names,
