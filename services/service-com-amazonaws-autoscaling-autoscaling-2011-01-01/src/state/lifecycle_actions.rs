@@ -1280,6 +1280,9 @@ impl AutoScalingState {
             if event.activity_id == step.activity_id {
                 event.due = at;
                 event.outcome = outcome;
+                // The activity ends in the code this outcome gives it, which is the code the
+                // event reports.
+                event.status_code = outcome.status_code();
                 event.status_message =
                     status_message.map(::std::string::ToString::to_string);
                 if let Some(topics) = topics.as_ref() {

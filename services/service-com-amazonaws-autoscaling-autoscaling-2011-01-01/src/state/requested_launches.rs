@@ -33,9 +33,10 @@ use std::time::SystemTime;
 use crate::ops::types::{InstanceCollection, LaunchInstancesError2};
 
 use super::{
-    ec2_instances, zone_id_of, AutoScalingState, BlockedLaunch, GroupLaunch, GroupLaunchOutcome,
-    InstanceLifecycle, InstanceLifecycleChange, LaunchDestination, PendingCapacity,
-    LAUNCH_FAILED_SENTENCE, LIFECYCLE_TRANSITION, PROCESS_LAUNCH, UNPLACED_INSTANCE_MESSAGE,
+    ec2_instances, zone_id_of, AutoScalingState, BlockedLaunch, FailedLifecycleStep, GroupLaunch,
+    GroupLaunchOutcome, InstanceLifecycle, InstanceLifecycleChange, LaunchDestination,
+    PendingCapacity, LAUNCH_FAILED_SENTENCE, LIFECYCLE_TRANSITION, PROCESS_LAUNCH,
+    UNPLACED_INSTANCE_MESSAGE,
 };
 
 /// The most instances ONE launch places.
@@ -244,7 +245,7 @@ impl AutoScalingState {
         let unplaced = launch.unplaced;
         let unplaced_message = launch.unplaced_message(UNPLACED_INSTANCE_MESSAGE);
         let unplaced_status_code = launch.unplaced_status_code();
-        let unplaced_descriptions = launch.unplaced_descriptions(&unplaced_message);
+        let unplaced_steps = launch.unplaced_steps(&unplaced_message);
         let error_code = if launch.blocked.is_some() {
             LAUNCH_BLOCKED_CODE
         } else {
@@ -319,15 +320,20 @@ impl AutoScalingState {
                 },
             );
         }
-        for description in unplaced_descriptions {
-            self.record_failed_activity(
-                request.group_name,
-                &arn,
-                description,
-                unplaced_message.clone(),
-                unplaced_status_code,
-                cause.clone(),
-                now,
+        for (instance_id, description) in unplaced_steps {
+            self.record_failed_lifecycle_step(
+                engine,
+                &FailedLifecycleStep {
+                    kind: InstanceLifecycle::Launched,
+                    group_name: request.group_name,
+                    group_arn: &arn,
+                    instance_id: instance_id.as_deref(),
+                    description,
+                    status_message: unplaced_message.clone(),
+                    status_code: unplaced_status_code,
+                    cause: &cause,
+                    at: now,
+                },
             );
         }
 

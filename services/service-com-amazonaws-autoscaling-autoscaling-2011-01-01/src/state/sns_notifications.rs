@@ -244,7 +244,7 @@ fn lifecycle_document(event: &PendingLifecycleEvent) -> String {
     insert_text(&mut document, "Service", NOTIFICATION_SERVICE);
     insert_text(&mut document, "Time", &date_time_text(event.due));
     insert_text(&mut document, "EC2InstanceId", &event.instance_id);
-    insert_text(&mut document, "StatusCode", event.outcome.status_code());
+    insert_text(&mut document, "StatusCode", event.status_code);
     insert_text(
         &mut document,
         "StatusMessage",

@@ -257,8 +257,8 @@ pub mod sns_notifications;
 pub mod lifecycle_hook_test_notification;
 
 pub use lifecycle_events::{
-    drive_lifecycle_clock, InstanceLifecycle, InstanceLifecycleChange, PendingLifecycleEvent,
-    StepOutcome,
+    drive_lifecycle_clock, FailedLifecycleStep, InstanceLifecycle, InstanceLifecycleChange,
+    PendingLifecycleEvent, StepOutcome,
 };
 
 /// The instances a caller asks a group to launch outright — `LaunchInstances` — beside
@@ -1153,6 +1153,11 @@ pub struct StoredGroup {
     /// ([`WITHDRAWN_LAUNCH_RETRY`]) rather than made on every pass over the store. Cleared
     /// with [`Self::owes_launch`], and never consulted by a capacity change a CALLER asked
     /// for: a client that repairs the key and asks for the capacity again is served at once.
+    ///
+    /// It is an instant the CLOCK waits on while the group still owes a launch
+    /// ([`lifecycle_events`]), so the attempt is made when it falls due whether or not
+    /// anybody calls — a client watching the group through its event stream makes no further
+    /// Auto Scaling call.
     pub launch_retry_due: Option<SystemTime>,
     /// The group's lifecycle hooks, keyed by `LifecycleHookName`: the ONE collection
     /// every reader and writer of a hook of this group reaches
@@ -2430,7 +2435,7 @@ impl AutoScalingState {
         let launched_ids = launch.launched_ids.clone();
         let unplaced_message = launch.unplaced_message(UNPLACED_INSTANCE_MESSAGE);
         let unplaced_status_code = launch.unplaced_status_code();
-        let unplaced_descriptions = launch.unplaced_descriptions(&unplaced_message);
+        let unplaced_steps = launch.unplaced_steps(&unplaced_message);
 
         let group = self
             .groups
@@ -2506,15 +2511,24 @@ impl AutoScalingState {
                 },
             );
         }
-        for description in unplaced_descriptions {
-            self.record_failed_activity(
-                group_name,
-                &arn,
-                description,
-                unplaced_message.clone(),
-                unplaced_status_code,
-                cause.to_string(),
-                now,
+        for (instance_id, description) in unplaced_steps {
+            // A unit of capacity the group set out to place and did not is as much a step of
+            // the group as one it placed: the activity records why, and the event reporting
+            // it goes out under the launch's UNSUCCESSFUL detail-type
+            // ([`AutoScalingState::record_failed_lifecycle_step`]).
+            self.record_failed_lifecycle_step(
+                engine,
+                &FailedLifecycleStep {
+                    kind: InstanceLifecycle::Launched,
+                    group_name,
+                    group_arn: &arn,
+                    instance_id: instance_id.as_deref(),
+                    description,
+                    status_message: unplaced_message.clone(),
+                    status_code: unplaced_status_code,
+                    cause,
+                    at: now,
+                },
             );
         }
     }
@@ -3436,7 +3450,7 @@ impl AutoScalingState {
         let launched_ids = launch.launched_ids.clone();
         let unplaced_message = launch.unplaced_message(UNPLACED_INSTANCE_MESSAGE);
         let unplaced_status_code = launch.unplaced_status_code();
-        let unplaced_descriptions = launch.unplaced_descriptions(&unplaced_message);
+        let unplaced_steps = launch.unplaced_steps(&unplaced_message);
         let replaced = if launched_ids.is_empty() {
             Vec::new()
         } else {
@@ -3472,15 +3486,20 @@ impl AutoScalingState {
                 },
             );
         }
-        for description in unplaced_descriptions {
-            self.record_failed_activity(
-                group_name,
-                &arn,
-                description,
-                unplaced_message.clone(),
-                unplaced_status_code,
-                cause.to_string(),
-                now,
+        for (instance_id, description) in unplaced_steps {
+            self.record_failed_lifecycle_step(
+                engine,
+                &FailedLifecycleStep {
+                    kind: InstanceLifecycle::Launched,
+                    group_name,
+                    group_arn: &arn,
+                    instance_id: instance_id.as_deref(),
+                    description,
+                    status_message: unplaced_message.clone(),
+                    status_code: unplaced_status_code,
+                    cause,
+                    at: now,
+                },
             );
         }
         launched_ids.first().cloned()
@@ -3598,16 +3617,20 @@ impl GroupLaunchOutcome {
             .map_or(ACTIVITY_FAILED, |blocked| blocked.status_code)
     }
 
-    /// What the activity of each unplaced unit DESCRIBES, one per unit: the instance of the
-    /// attempt where Amazon EC2 made one and took it back — the launch was made, so the
-    /// activity names the instance it launched, exactly as a launch that carried through does
-    /// ([`InstanceLifecycle::description`]) — and the reason the launch was not made where no
-    /// attempt was made at all ([`failed_launch_description`]).
-    fn unplaced_descriptions(&self, message: &str) -> Vec<String> {
+    /// What the activity of each unplaced unit DESCRIBES and the ATTEMPT it was made for, one
+    /// per unit: the instance of the attempt where Amazon EC2 made one and took it back — the
+    /// launch was made, so the activity names the instance it launched, exactly as a launch
+    /// that carried through does ([`InstanceLifecycle::description`]) — and the reason the
+    /// launch was not made where no attempt was made at all
+    /// ([`failed_launch_description`]), which names no instance.
+    fn unplaced_steps(&self, message: &str) -> Vec<(Option<String>, String)> {
         (0..self.unplaced)
             .map(|index| match self.withdrawn_ids.get(index) {
-                Some(instance_id) => InstanceLifecycle::Launched.description(instance_id),
-                None => failed_launch_description(message),
+                Some(instance_id) => (
+                    Some(instance_id.clone()),
+                    InstanceLifecycle::Launched.description(instance_id),
+                ),
+                None => (None, failed_launch_description(message)),
             })
             .collect()
     }

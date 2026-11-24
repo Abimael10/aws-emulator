@@ -21,7 +21,12 @@
 //! [`INSTANCE_TERMINATE_UNSUCCESSFUL`], chosen by [`StepOutcome`]): a launch that never
 //! brought the instance into service is as much a fact about that instance as one that did,
 //! and a client watching the group through the event stream can only tell the two apart if
-//! both are published.
+//! both are published. That holds whether the step moved an instance and lost it (a launch a
+//! lifecycle hook abandoned, [`super::lifecycle_actions`]) or placed nothing at all (a
+//! capacity change whose launch the account's own stores could not satisfy,
+//! [`AutoScalingState::record_failed_lifecycle_step`]) — otherwise a client waiting on the
+//! failure of a capacity change waits for an event that is never published, which is worse
+//! than being told the launch failed.
 //!
 //! The model's own `AutoScalingNotificationTypes` catalog
 //! (`autoscaling:EC2_INSTANCE_LAUNCH`, `autoscaling:EC2_INSTANCE_TERMINATE` and their
@@ -35,11 +40,13 @@
 //! ([`super::LIFECYCLE_TRANSITION`], materialised by
 //! [`super::AutoScalingState::materialize_due`]). The ONE place a launch or a termination
 //! records its scaling activity also queues the event that reports it
-//! ([`super::AutoScalingState::record_instance_lifecycle_change`]), due at the instant that
+//! ([`super::AutoScalingState::record_instance_lifecycle_change`] for a step that moves an
+//! instance, [`super::AutoScalingState::record_failed_lifecycle_step`] for one that moved
+//! none), due at the instant that
 //! activity completes — so a step is queued exactly once however it was asked for (a
-//! capacity change, an instance refresh's replacement, a forced delete of the group) and
-//! none can be published twice. The queue is bounded ([`MAX_PENDING_EVENTS`], oldest
-//! dropped first) because every step appends to it.
+//! capacity change, a launch request, an instance refresh's replacement, a forced delete of
+//! the group) and none can be published twice. The queue is bounded
+//! ([`MAX_PENDING_EVENTS`], oldest dropped first) because every step appends to it.
 //!
 //! A queued event is published with no lock held ([`publish_pending`]): EventBridge is
 //! reached the way every emulated service reaches another, through the framework's
@@ -60,7 +67,11 @@
 //! group through EventBridge needs: it makes no further Auto Scaling call, so an event
 //! published only by the next reader would never be published at all. The pump changes WHEN
 //! nothing — it materialises only what the stored due instant has already made due, exactly
-//! as a reading door does.
+//! as a reading door does. The capacity a launch could not place is one of those owed
+//! instants ([`group_due_instants`], from [`super::StoredGroup::launch_retry_due`]): a group
+//! maintains the capacity it is configured for, so the attempt that reaches it once the
+//! client has repaired what blocked it is owed on the clock too, and the step it publishes
+//! needs no call from anybody either.
 
 use std::collections::VecDeque;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -358,6 +369,16 @@ pub struct PendingLifecycleEvent {
     /// That activity's `StatusMessage`: why a step that did NOT carry through did not, and
     /// `None` for one that did — "an activity that did not fail carries no status message".
     pub status_message: Option<String>,
+    /// That activity's terminal `ScalingActivityStatusCode`, which is the `StatusCode` the
+    /// event reports.
+    ///
+    /// The step's OUTCOME decides which detail-type it is published under
+    /// ([`StepOutcome`]); which terminal code the activity ends in is the activity's own —
+    /// a step the group could not make the attempt for and one the attempt was taken back
+    /// from are both unsuccessful and end in different codes
+    /// ([`super::BlockedLaunch`]) — so the event carries the code the activity carries and
+    /// a read of the same instant cannot disagree with it.
+    pub status_code: &'static str,
     /// That activity's `StartTime`.
     pub start_time: SystemTime,
     /// WHEN the step completed: the event's `time`, its `detail.EndTime`, and the instant
@@ -379,6 +400,64 @@ impl PendingLifecycleEvent {
     pub fn notification_event(&self) -> &'static str {
         self.kind.notification_event(self.outcome)
     }
+
+    /// The resources the envelope names: everything the event is about — the group, and the
+    /// instance that moved where the step had one.
+    ///
+    /// A step the group set out to take and made no attempt for names no instance (nothing
+    /// was ever minted for it), so the envelope names the group alone rather than an ARN
+    /// that resolves nowhere.
+    #[must_use]
+    pub fn resources(&self) -> Vec<String> {
+        let mut resources = vec![self.group_arn.clone()];
+        if !self.instance_id.is_empty() {
+            resources.push(instance_arn(&self.region, &self.instance_id));
+        }
+        resources
+    }
+
+    /// What a batch that could not be delivered is named by in the log: the instance the step
+    /// moved, or the group for a step that moved none.
+    #[must_use]
+    pub fn subject(&self) -> String {
+        if self.instance_id.is_empty() {
+            self.group_name.clone()
+        } else {
+            self.instance_id.clone()
+        }
+    }
+}
+
+/// One lifecycle step a group SET OUT to take and did not carry through at all: the terminal
+/// scaling activity it records, and the event that reports it.
+///
+/// The counterpart of [`InstanceLifecycleChange`] for a step that moved no instance into (or
+/// out of) service — a launch the group could not place, whichever of the two terminal codes
+/// the reason ends it in ([`super::BlockedLaunch`]).
+#[derive(Debug, Clone)]
+pub struct FailedLifecycleStep<'a> {
+    /// Which step the group set out to take.
+    pub kind: InstanceLifecycle,
+    /// The group it was taking it with.
+    pub group_name: &'a str,
+    /// That group's ARN, which the event's envelope names it by.
+    pub group_arn: &'a str,
+    /// The ATTEMPT the step made, where one was made: the instance the account's Amazon EC2
+    /// store minted and took back, which the activity's description names
+    /// ([`super::GroupLaunchOutcome::unplaced_steps`]). `None` for a step no instance was
+    /// ever minted for.
+    pub instance_id: Option<&'a str>,
+    /// `Activity$Description`: what the step set out to do.
+    pub description: String,
+    /// `Activity$StatusMessage`: why it did not.
+    pub status_message: String,
+    /// The terminal `ScalingActivityStatusCode` that reason ends the activity in.
+    pub status_code: &'static str,
+    /// `Activity$Cause`: what asked for the change the step belonged to.
+    pub cause: &'a str,
+    /// When the step was taken, which is the whole of the activity's span: a step that moved
+    /// nothing ended the instant it was made, so the event it owes is due at once.
+    pub at: SystemTime,
 }
 
 impl AutoScalingState {
@@ -473,8 +552,87 @@ impl AutoScalingState {
             cause: change.cause.to_string(),
             // A step that is under way has not failed at anything, so it states no reason.
             status_message: None,
+            // And it is going to complete, so the code the activity will end in is the one
+            // that outcome gives it; the one place a step that did NOT complete is settled
+            // re-marks both ([`Self::settle_held_step`]).
+            status_code: StepOutcome::Completed.status_code(),
             start_time: change.start_time,
             due,
+        });
+        activity_id
+    }
+
+    /// Record the terminal scaling activity of ONE lifecycle step the group set out to take
+    /// and did not carry through, and queue the event that reports it.
+    ///
+    /// THE ONE place a step that moved nothing is written down, exactly as
+    /// [`Self::record_instance_lifecycle_change`] is the one place a step that moved an
+    /// instance is: the activity is appended ([`Self::record_failed_activity`]) and the event
+    /// reporting it is queued for the same instant, under that step's UNSUCCESSFUL
+    /// detail-type ([`StepOutcome::Unsuccessful`]). A step the group set out to take is a
+    /// fact about the group either way, so a client watching it through the event stream
+    /// learns that the capacity it asked for did not arrive instead of waiting for an event
+    /// that never comes.
+    ///
+    /// Answers the activity's id, which the event names in its `detail.ActivityId`.
+    ///
+    /// `engine` is the shared engine the caller holds: the subnet the event names is the one
+    /// the account's own Amazon EC2 store placed the attempt in, read from there.
+    pub(crate) fn record_failed_lifecycle_step<Eng: Send + Sync + 'static>(
+        &mut self,
+        engine: &Eng,
+        step: &FailedLifecycleStep<'_>,
+    ) -> String {
+        let activity_id = self.record_failed_activity(
+            step.group_name,
+            step.group_arn,
+            step.description.clone(),
+            step.status_message.clone(),
+            step.status_code,
+            step.cause.to_string(),
+            step.at,
+        );
+        let region = self
+            .groups
+            .get(step.group_name)
+            .map(|group| group.region.clone())
+            .unwrap_or_else(|| super::DEFAULT_REGION.to_string());
+        // The topics the group's configurations asked to be told about THIS step, which for a
+        // step that did not carry through is the `_ERROR` event of it
+        // ([`InstanceLifecycle::notification_event`]).
+        let notification_topics = self
+            .groups
+            .get(step.group_name)
+            .map(|group| {
+                group.notification_topics(step.kind.notification_event(StepOutcome::Unsuccessful))
+            })
+            .unwrap_or_default();
+        let availability_zone = step
+            .instance_id
+            .and_then(|instance_id| self.instance_zone(step.group_name, instance_id));
+        let subnet_id = step
+            .instance_id
+            .and_then(|instance_id| super::ec2_instances::subnet_of(engine, instance_id));
+        self.queue_lifecycle_event(PendingLifecycleEvent {
+            kind: step.kind,
+            outcome: StepOutcome::Unsuccessful,
+            notification_topics,
+            group_name: step.group_name.to_string(),
+            group_arn: step.group_arn.to_string(),
+            region,
+            // The attempt the step made, where one was made at all: a step that minted no
+            // instance names none rather than an id that resolves nowhere.
+            instance_id: step.instance_id.unwrap_or_default().to_string(),
+            availability_zone,
+            subnet_id,
+            activity_id: activity_id.clone(),
+            description: step.description.clone(),
+            cause: step.cause.to_string(),
+            status_message: Some(step.status_message.clone()),
+            status_code: step.status_code,
+            start_time: step.at,
+            // The step is already over, so the event it owes is due at once.
+            due: step.at,
         });
         activity_id
     }
@@ -673,6 +831,20 @@ fn group_due_instants(group: &StoredGroup) -> Vec<SystemTime> {
                 }),
         )
         .chain(
+            // And the next ATTEMPT a group whose last launch Amazon EC2 took back is waiting
+            // for ([`StoredGroup::launch_retry_due`]): a group maintains the capacity it is
+            // configured for, so that attempt is owed at its own instant whether or not
+            // anybody calls — a client watching the group through the event stream makes no
+            // further Auto Scaling call, so a retry the next reader performed would never be
+            // performed at all. Only a group that still owes a launch names an instant, and
+            // only once it has one, so a shortfall nothing is waiting on keeps the clock
+            // where it is.
+            group
+                .owes_launch
+                .then_some(group.launch_retry_due)
+                .flatten(),
+        )
+        .chain(
             // The transient states of the instances the group's warm pool holds, which
             // the same clock owes.
             group
@@ -724,7 +896,7 @@ fn lifecycle_event_detail(event: &PendingLifecycleEvent) -> ::serde_json::Value 
     let mut detail = ::serde_json::Map::new();
     detail.insert(
         "StatusCode".to_string(),
-        ::serde_json::Value::String(event.outcome.status_code().to_string()),
+        ::serde_json::Value::String(event.status_code.to_string()),
     );
     detail.insert(
         "Description".to_string(),
@@ -946,13 +1118,10 @@ async fn publish_batch(
             detail_type: event.detail_type(),
             time: event.due,
             // The event names every resource it is about: the group, and the instance that
-            // moved.
-            resources: vec![
-                event.group_arn.clone(),
-                instance_arn(&event.region, &event.instance_id),
-            ],
+            // moved where the step moved one ([`PendingLifecycleEvent::resources`]).
+            resources: event.resources(),
             detail: lifecycle_event_detail(event).to_string(),
-            subject: event.instance_id.clone(),
+            subject: event.subject(),
         })
         .collect();
     publish_events(callback, &outbound).await;

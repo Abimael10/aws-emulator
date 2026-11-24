@@ -420,6 +420,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 cause: cause.clone(),
                 // The delete carried every one of them out, so none states a reason.
                 status_message: None,
+                // And each ended in the code a step that carried through ends in.
+                status_code: crate::state::StepOutcome::Completed.status_code(),
                 start_time: now,
                 // The delete terminated them as it ran, so there is nothing further the
                 // clock owes before the terminations are a fact.
