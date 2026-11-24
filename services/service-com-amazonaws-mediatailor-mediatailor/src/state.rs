@@ -11,6 +11,15 @@ use crate::ops::types::*;
 mod channel_playback;
 pub use channel_playback::*;
 
+/// The alerts this service holds AGAINST a resource — the one store every read
+/// of a resource's alerts reports.
+mod alerts;
+pub use alerts::*;
+
+/// The continuation token every paginated read of this service issues.
+mod page_token;
+pub use page_token::*;
+
 /// The number of playback configurations this emulator will hold at once.
 ///
 /// A real account's playback configurations are limited per Region through
@@ -173,10 +182,11 @@ pub const DEFAULT_AD_BUFFET_MODE: &str = "INSERT_ALL";
 /// each event type it has to name never reaches it.
 pub const MAX_LOG_EVENT_TYPES_PER_LIST: usize = 100;
 
-/// The largest page `ListPlaybackConfigurations` serves, and the page size it
-/// applies when the request names none: `MaxResults`' modelled `range 1..100`,
-/// whose maximum is also the documented default ("The default value is 100.").
-/// The handler clamps to it itself rather than relying on boundary validation.
+/// The largest page a paginated read of this service serves, and the page size
+/// it applies when the request names none: `MaxResults`' modelled `range 1..100`
+/// on each of them, whose maximum is also the documented default ("The default
+/// value is 100."). Each handler clamps to it itself rather than relying on
+/// boundary validation.
 pub const MAX_PAGE_SIZE: usize = 100;
 
 /// Per-service state for com-amazonaws-mediatailor-mediatailor. A handler reaches it through [`service_state`].
@@ -220,10 +230,17 @@ pub struct ComAmazonawsMediatailorMediatailorState {
     /// visible through both.
     ///
     /// Every key is a stored resource's OWN ARN — the tagging operations refuse
-    /// any other ARN (see [`Self::taggable_resource_exists`]), a replacement
+    /// any other ARN (see [`Self::resource_exists`]), a replacement
     /// that re-mints the ARN moves the entry, and a delete removes it — so this
     /// map holds at most one entry per stored resource.
     pub tags_by_arn: BTreeMap<String, BTreeMap<String, String>>,
+    /// The alerts held against every resource that carries one, keyed by that
+    /// resource's ARN and then by the alert's own `AlertCode`. This is the
+    /// SINGLE source of truth for alerts: `ListAlerts` reports it, and a
+    /// resource's entry is released with the resource by the delete that
+    /// removes it, so the store holds at most one entry per stored resource.
+    /// See [`AlertRecord`] for what raises an alert and what does not.
+    pub alerts: BTreeMap<String, BTreeMap<String, AlertRecord>>,
 }
 
 impl ComAmazonawsMediatailorMediatailorState {
@@ -258,8 +275,9 @@ impl ComAmazonawsMediatailorMediatailorState {
         self.channels.len() < MAX_CHANNELS
     }
 
-    /// Whether `arn` names a resource this emulator currently holds, so the
-    /// tagging operations can refuse an ARN that addresses nothing.
+    /// Whether `arn` names a resource this emulator currently holds, so a route
+    /// that addresses a resource by its ARN — the tagging operations, the read
+    /// of a resource's alerts — can refuse an ARN that addresses nothing.
     ///
     /// The whole ARN has to match the one the resource itself reports — its
     /// partition, region and account as well as its type and name — so an ARN
@@ -271,7 +289,7 @@ impl ComAmazonawsMediatailorMediatailorState {
     /// Every MediaTailor resource type this emulator persists is listed here:
     /// an ARN naming a type it does not persist yet addresses nothing, and an
     /// ARN this service does not own is not a resource of this service at all.
-    pub fn taggable_resource_exists(&self, arn: &str) -> bool {
+    pub fn resource_exists(&self, arn: &str) -> bool {
         let stored_arn = match resource_from_arn(arn) {
             Some(("playbackConfiguration", name)) => self
                 .playback_configurations
@@ -308,12 +326,13 @@ pub fn playback_configuration_not_found_message(name: &str) -> String {
 /// How this service states that the ARN a request addresses names no resource
 /// this account holds.
 ///
-/// The tagging routes address a resource by ARN rather than by name, and the
-/// sentence they answer a miss with says only that the resource was not found:
-/// it has NO variable part, so the caller gets this text whichever ARN it sent,
-/// and the text is the tagging routes' own — distinct from the sentence a
-/// channel route answers a missing channel with. Returned as the service's HTTP
-/// 404, the same status a read of the resource itself answers.
+/// The routes that address a resource by ARN rather than by name — the tagging
+/// operations and the read of a resource's alerts — answer a miss with a
+/// sentence that says only that the resource was not found: it has NO variable
+/// part, so the caller gets this text whichever ARN it sent, and the text is
+/// those routes' own — distinct from the sentence a channel route answers a
+/// missing channel with. Returned as the service's HTTP 404, the same status a
+/// read of the resource itself answers.
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource was not found";
 
 /// Why a tag set cannot be stored, or `None` when it can.

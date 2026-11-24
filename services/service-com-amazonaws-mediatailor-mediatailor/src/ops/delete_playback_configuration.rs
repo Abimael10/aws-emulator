@@ -138,6 +138,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // name the deleted one's tags.
         if let Some(record) = store.playback_configurations.remove(&input.name) {
             store.tags_by_arn.remove(&record.arn);
+            // The alerts held against the configuration are keyed by its ARN
+            // too, so they go with it for the same reason: an alert of a
+            // resource that no longer exists would be held against an ARN
+            // addressing nothing.
+            store.alerts.remove(&record.arn);
         }
 
         Ok(DeletePlaybackConfigurationOutput {})

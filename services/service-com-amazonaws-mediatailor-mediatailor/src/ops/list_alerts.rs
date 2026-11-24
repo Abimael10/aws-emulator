@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAlerts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAlerts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAlerts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the alerts this service holds against the resource an ARN addresses, in pages
+//! bounded by `MaxResults`: the alerts live in this service's state, keyed by the
+//! resource's ARN, and this read reports that resource's own entry and writes nothing. A
+//! resource that carries no alert reports the EMPTY set, while an ARN the account holds no
+//! resource under is refused as not found, in the words the addressed resource kind's own
+//! reads word a miss with — two answers a caller has to tell apart.
 //!
 //! ## Shape of an operation
 //!
@@ -89,9 +87,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-mediatailor-mediatailor
 // here — hence the `ListAlertsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mediatailor#ListAlerts")]
+//
+// `BadRequestException` — "A request contains unexpected data", HTTP 400, the one client
+// error this SERVICE models — is widened in through `extra_errors`: `NextToken` is a token
+// this service issued, and a value that is not one addresses no page boundary, so the read
+// has to refuse it rather than serve the first page as though no token had been sent. Only
+// this operation's error list omits the shape; the service models it and the service's
+// other paginated read declares it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.mediatailor#ListAlerts",
+    extra_errors = ["BadRequestException"]
+)]
 #[derive(Debug)]
 pub enum ListAlertsErrorModeled {
+    BadRequestException(BadRequestException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -143,20 +152,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAlerts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAlertsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAlerts"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in this emulator: the router builds one
+            // `InMemoryEngine` and hands it to every operation. Without the
+            // store there is nothing to report, so answer the scaffold's 501
+            // rather than a response nothing backs.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("ListAlerts"));
+        };
+
+        // A `NextToken` names the page boundary a listing resumes after, so one
+        // this service did not issue addresses no boundary at all: refused,
+        // rather than served as though the request had carried no token.
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(boundary) => Some(boundary),
+                None => {
+                    return Err(ListAlertsErrorModeled::BadRequestException(
+                        BadRequestException {
+                            message: Some(
+                                "NextToken is not a pagination token this service issued."
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            },
+            None => None,
+        };
+
+        // The page size is clamped HERE, not left to the boundary validator
+        // alone: `MaxResults`' modelled range is 1..100 and its documented
+        // default is 100, and the handler bounds the work and the response size
+        // it will produce itself.
+        let page_size = input.max_results.map_or(crate::state::MAX_PAGE_SIZE, |max| {
+            max.clamp(1, crate::state::MAX_PAGE_SIZE as i32) as usize
+        });
+
+        let store = state.lock();
+        // An alert is held AGAINST a resource, so there has to be one: an ARN
+        // that names no resource this service holds addresses nothing to report
+        // alerts for, which is a different answer from a resource that holds
+        // none. The refusal names the resource the ARN addressed, in the words
+        // that resource kind's own reads use.
+        if !store.resource_exists(&input.resource_arn) {
+            return Err(crate::scaffolded::Scaffolded::not_found(
+                crate::state::alerts_resource_not_found_message(&input.resource_arn),
+            ));
+        }
+
+        let mut remaining = store
+            .alerts_of(&input.resource_arn)
+            .into_iter()
+            .filter(|alert| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|boundary| alert.alert_code.as_str() > boundary)
+            })
+            .peekable();
+
+        let items: Vec<Alert> = remaining.by_ref().take(page_size).collect();
+
+        // A token is issued only when an alert is left to report, so the last
+        // page carries none and a caller knows it has them all.
+        let next_token = if remaining.peek().is_some() {
+            items
+                .last()
+                .map(|last| crate::state::encode_page_token(&last.alert_code))
+        } else {
+            None
+        };
+
+        Ok(ListAlertsOutput {
+            items: Some(items),
+            next_token,
+        })
     }
 }

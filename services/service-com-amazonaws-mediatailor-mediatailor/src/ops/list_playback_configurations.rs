@@ -96,19 +96,12 @@ pub enum ListPlaybackConfigurationsErrorModeled {
     BadRequestException(BadRequestException),
 }
 
-/// A page boundary travels as an opaque token. It encodes the `Name` of the last
-/// item of the page just served, so the next page resumes at the first stored
-/// name after it — the store is ordered by name, so the boundary needs nothing
-/// else. Hex keeps the token opaque to a caller and total over every name.
-fn encode_token(name: &str) -> String {
-    hex::encode(name.as_bytes())
-}
-
-/// The name a continuation token resumes after, or `None` when the token is not
-/// one this service issued.
-fn decode_token(token: &str) -> Option<String> {
-    String::from_utf8(hex::decode(token).ok()?).ok()
-}
+// A page boundary travels as an opaque token carrying the `Name` of the last item
+// of the page just served, so the next page resumes at the first stored name after
+// it — the store is ordered by name, so the boundary needs nothing else. The token
+// is built and read by the service's ONE page-token codec
+// (`crate::state::encode_page_token` / `decode_page_token`), so every paginated
+// read of this service issues the same form.
 
 /// This operation's error channel, as the generated `impl Operation` names it
 /// (`crate::ops::list_playback_configurations::ListPlaybackConfigurationsError`). Wrapping the modeled enum is what
@@ -172,7 +165,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let resume_after = match input.next_token.as_deref() {
-            Some(token) => match decode_token(token) {
+            Some(token) => match crate::state::decode_page_token(token) {
                 Some(name) => Some(name),
                 None => {
                     return Err(ListPlaybackConfigurationsErrorModeled::BadRequestException(
@@ -221,7 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             items
                 .last()
                 .and_then(|last| last.name.as_deref())
-                .map(encode_token)
+                .map(crate::state::encode_page_token)
         } else {
             None
         };

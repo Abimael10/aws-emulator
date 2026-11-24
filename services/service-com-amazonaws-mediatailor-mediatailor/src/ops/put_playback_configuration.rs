@@ -542,6 +542,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(tags) = store.tags_by_arn.remove(&previous_arn) {
                 store.tags_by_arn.insert(arn.clone(), tags);
             }
+            // An alert is held against the configuration rather than against the
+            // string that addresses it either, so it moves with the resource and
+            // reports the ARN the resource now reports.
+            if let Some(alerts) = store.alerts.remove(&previous_arn) {
+                let moved = alerts
+                    .into_iter()
+                    .map(|(code, mut held)| {
+                        held.resource_arn = arn.clone();
+                        (code, held)
+                    })
+                    .collect();
+                store.alerts.insert(arn.clone(), moved);
+            }
         }
 
         let record = PlaybackConfigurationRecord {

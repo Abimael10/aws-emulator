@@ -30,6 +30,8 @@
 
 use serde_json::{json, Value};
 
+use service_com_amazonaws_mediatailor_mediatailor::state::{service_state, AlertRecord};
+
 use crate::channel_lifecycle::{
     encode, expected_arn, table, Emulator, Reply, CHANNEL_NOT_FOUND_MESSAGE, NOT_FOUND_CODE,
     NOT_FOUND_STATUS, RESOURCE_NOT_FOUND_MESSAGE,
@@ -175,6 +177,16 @@ async fn delete_removes_the_channel_and_is_idempotent() {
             for (call, reply) in tagging_calls(&emulator, &arn).await {
                 assert_not_found(&case, call, &reply, RESOURCE_NOT_FOUND_MESSAGE);
             }
+
+            // The alerts read addresses the channel by ARN too, and the
+            // resource it addressed is the channel, so it is refused in the
+            // channel's own words.
+            assert_not_found(
+                &case,
+                "ListAlerts",
+                &emulator.list_alerts(&arn).await,
+                CHANNEL_NOT_FOUND_MESSAGE,
+            );
         }
     }
 }
@@ -378,4 +390,122 @@ async fn deleting_a_name_the_account_holds_no_channel_under_succeeds_and_stores_
         "expected the stored channel to report its own name, got {:?}",
         described.get("/ChannelName")
     );
+}
+
+/// The alert one row raises against a channel, written straight into the one
+/// store the mounted service reads: an alert is a condition MediaTailor raises
+/// against a resource, so the API surface only READS them (`ListAlerts` is
+/// `@readonly` and the model declares no alert write), and seeding the store is
+/// how this suite puts an alert in front of that read. The code and the sentence
+/// are this suite's own data — `Alert`'s `AlertCode` and `AlertMessage` are
+/// plain strings the model constrains to no value set
+/// (`smithy_query(query="shape",shape="Alert")`).
+const ALERT_CODE: &str = "NOT_PROCESSED";
+
+fn seed_alert(emulator: &Emulator, arn: &str) {
+    let state = service_state(&**emulator.engine()).expect("the service's own store");
+    let mut store = state.lock();
+    store.alerts.entry(arn.to_string()).or_default().insert(
+        ALERT_CODE.to_string(),
+        AlertRecord {
+            alert_code: ALERT_CODE.to_string(),
+            alert_message: "The request was not processed.".to_string(),
+            last_modified_time: ::aws_smithy_types::DateTime::from_secs(1_700_000_000),
+            related_resource_arns: Vec::new(),
+            resource_arn: arn.to_string(),
+            category: Some("SCHEDULING_ERROR".to_string()),
+        },
+    );
+}
+
+/// The `AlertCode`s a reply reports, in the order it reports them.
+fn reported_alert_codes(reply: &Reply) -> Vec<String> {
+    reply
+        .get("/Items")
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    item.get("AlertCode")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn a_deleted_channels_alerts_go_with_it() {
+    for (case, name, request) in table() {
+        let emulator = Emulator::new();
+
+        let created = emulator.create(name, &request).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: expected the channel under test to be created, got {} {:?}",
+            created.status, created.body
+        );
+        let arn = created.string("/Arn");
+
+        // A channel this emulator holds carries no alert, so the read of its
+        // alerts is SERVED with the empty set — not refused, and not the answer
+        // an ARN addressing nothing gets.
+        let listed = emulator.list_alerts(&arn).await;
+        assert_eq!(
+            listed.status, 200,
+            "case {case:?}: expected the alerts of a stored channel to be served, got {} {:?}",
+            listed.status, listed.body
+        );
+        assert_eq!(
+            listed.get("/Items"),
+            &json!([]),
+            "case {case:?}: expected a channel carrying no alert to report none, got {:?}",
+            listed.get("/Items")
+        );
+
+        // An alert held against the channel is reported for it.
+        seed_alert(&emulator, &arn);
+        assert_eq!(
+            reported_alert_codes(&emulator.list_alerts(&arn).await),
+            vec![ALERT_CODE.to_string()],
+            "case {case:?}: expected the alert held against the channel to be reported"
+        );
+
+        assert_eq!(
+            emulator.delete(name).await.status,
+            DELETE_STATUS,
+            "case {case:?}: expected the channel to be deleted"
+        );
+
+        // The channel is gone, so its ARN addresses nothing to read alerts for,
+        // and the refusal names the resource the ARN addressed: the channel.
+        assert_not_found(
+            case,
+            "ListAlerts",
+            &emulator.list_alerts(&arn).await,
+            CHANNEL_NOT_FOUND_MESSAGE,
+        );
+
+        // And the alert went with the channel rather than waiting for the next
+        // channel created under the same name.
+        let recreated = emulator.create(name, &request).await;
+        assert_eq!(
+            recreated.status, 200,
+            "case {case:?}: expected the name to be free again, got {} {:?}",
+            recreated.status, recreated.body
+        );
+        assert_eq!(
+            recreated.string("/Arn"),
+            arn,
+            "case {case:?}: expected the new channel to report the same ARN"
+        );
+        assert_eq!(
+            emulator.list_alerts(&arn).await.get("/Items"),
+            &json!([]),
+            "case {case:?}: expected the new channel to carry no alert of the deleted one"
+        );
+    }
 }

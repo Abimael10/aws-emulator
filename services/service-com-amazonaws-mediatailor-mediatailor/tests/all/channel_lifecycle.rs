@@ -183,6 +183,17 @@ impl Emulator {
             .await
     }
 
+    /// `ListAlerts`: the resource's ARN and the page members all travel in the
+    /// query string.
+    pub(crate) async fn list_alerts(&self, arn: &str) -> Reply {
+        self.request(
+            "GET",
+            &format!("/alerts?resourceArn={}", encode(arn)),
+            None,
+        )
+        .await
+    }
+
     pub(crate) async fn tag(&self, arn: &str, tags: Value) -> Reply {
         self.request(
             "POST",
