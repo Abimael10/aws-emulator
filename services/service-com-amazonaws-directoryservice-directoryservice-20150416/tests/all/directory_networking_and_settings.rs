@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! IP routing, tag removal, snapshot limits, the LDAPS and client-authentication reads,
-//! and Region removal — driven end to end over HTTP.
+//! Region removal, and a directory's RADIUS multi-factor authentication configuration —
+//! driven end to end over HTTP.
 //!
 //! Every case goes through the same front door a client uses: `POST /` with
 //! `X-Amz-Target: DirectoryService_20150416.<Operation>` and an `awsJson1_1` body,
@@ -28,7 +29,14 @@
 //!   a seeded setting is reported member for member, filtered by type and paged;
 //! * `RemoveRegion` acts on the Region the call was signed for: the primary Region is
 //!   refused as unsupported, a Region the directory does not exist in is refused as
-//!   not found, and a replicated Region is dropped.
+//!   not found, and a replicated Region is dropped;
+//! * a directory carries at most ONE RADIUS configuration: `EnableRadius` records the
+//!   settings it names (minus the shared secret, which no read reports) under a modelled
+//!   `RadiusStatus` that converges on `Completed`, a second enable is refused with
+//!   `ClientException` and leaves that configuration in place, `DisableRadius` withdraws it
+//!   and is refused with the same class when there is none to withdraw, and both writes
+//!   resolve the `DirectoryId` in the store first — each over a table of directory types and
+//!   settings blocks.
 //!
 //! `EnableLDAPS` and `EnableClientAuthentication` are still scaffolded, and a Simple AD
 //! directory does not replicate across Regions, so the settings those operations would
@@ -1500,6 +1508,633 @@ async fn none_of_these_operations_answers_the_scaffold_501() {
             json!({ "DirectoryId": id }),
         ),
         ("RemoveRegion", json!({ "DirectoryId": id })),
+    ];
+    for (operation, body) in calls {
+        let (status, parsed) = call(&router, operation, body).await;
+        assert_ne!(
+            status, 501,
+            "case {operation:?}: no longer a scaffold stub, got {status} with {parsed}"
+        );
+        assert!(
+            !parsed.to_string().contains("NotImplemented"),
+            "case {operation:?}: the answer must not carry the scaffold signal, got {parsed}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// A directory's RADIUS multi-factor authentication configuration: `EnableRadius`,
+// `DisableRadius` and what every read of the directory then reports about them.
+//
+// The cases below live in this suite rather than in one of their own because this crate's
+// integration target is rooted at a hand-maintained `tests/all.rs` declaration list, which
+// no new suite may be declared in; this file already hosts several slices of the service for
+// the same reason. The rules are asserted over TABLES, as everywhere else here: the
+// configuration round trip over directories of each type and settings differing in server
+// count, address family, port, timeout, retry count, protocol, label and which optional
+// members the request carries; the single-configuration rule over whether the status the
+// enable owes has settled; the directory lookup over the shared table of well-formed ids no
+// directory is stored under; the shared-secret requirement over settings blocks differing in
+// which other members they carry.
+// ---------------------------------------------------------------------------------------
+
+/// A shared secret the modelled `RadiusSharedSecret` admits (length 8–512, pattern
+/// `^(\p{LD}|\p{Punct}| )+$`).
+const RADIUS_SECRET: &str = "radius-shared-secret-1";
+
+/// A second one, so a row can ask for different settings than the row before it.
+const OTHER_RADIUS_SECRET: &str = "radius-shared-secret-2";
+
+/// The status a configuration reports once the transition the enable owes has fallen due:
+/// the `Completed` value of the modelled `RadiusStatus` enum
+/// (`smithy_query(query="shape", shape="RadiusStatus")` answers
+/// `["Creating", "Completed", "Failed"]`).
+const RADIUS_COMPLETED: &str = "Completed";
+
+/// The whole modelled `RadiusStatus` catalog, from that same query.
+const RADIUS_STATUSES: [&str; 3] = ["Creating", "Completed", "Failed"];
+
+/// Which create places the directory a RADIUS row configures. The configuration is a record
+/// of the directory whatever type it is, so the rows span the three types this service
+/// stores.
+#[derive(Debug, Clone, Copy)]
+enum DirectoryKind {
+    SimpleAd,
+    MicrosoftAd,
+    AdConnector,
+}
+
+/// A directory of `kind` named `name`, created over HTTP, as its minted id.
+async fn directory_of(
+    router: &MultiServiceRouter,
+    kind: DirectoryKind,
+    name: &str,
+    case: &str,
+) -> String {
+    match kind {
+        DirectoryKind::SimpleAd => create_directory(router, minimal_create(name), case).await,
+        DirectoryKind::MicrosoftAd => {
+            crate::microsoft_ad::create_microsoft_ad(
+                router,
+                crate::microsoft_ad::minimal_microsoft_ad(name),
+                case,
+            )
+            .await
+        }
+        DirectoryKind::AdConnector => {
+            crate::ad_connector::connect_directory(
+                router,
+                crate::ad_connector::minimal_connect(name),
+                case,
+            )
+            .await
+        }
+    }
+}
+
+/// A call that must be refused with HTTP 400, the modelled error code `code` and exactly
+/// `message` ahead of the envelope's request-id suffix — and with no shared secret anywhere
+/// in it.
+async fn refused_radius(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+    code: &str,
+    message: &str,
+    case: &str,
+) {
+    let (status, parsed) = call(router, operation, body).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected {operation} to answer 400, got {status} with {parsed}"
+    );
+    let wire_type = parsed["__type"].as_str().unwrap_or_default();
+    assert!(
+        wire_type.contains(code),
+        "case {case:?}: expected {code} from {operation}, got {parsed}"
+    );
+    let reported = parsed["Message"].as_str().unwrap_or_default();
+    assert!(
+        reported.starts_with(message),
+        "case {case:?}: expected {operation} to state {message:?}, got {reported:?}"
+    );
+    assert!(
+        !reported.contains(RADIUS_SECRET) && !reported.contains(OTHER_RADIUS_SECRET),
+        "case {case:?}: expected no shared secret in the refusal, got {reported:?}"
+    );
+}
+
+/// The diagnostic an enable meeting a configuration that is already there is refused with.
+fn radius_already_enabled_message(directory_id: &str) -> String {
+    format!(
+        "Could not enable radius as it is already enabled or currently being configured for \
+         directory: {directory_id}"
+    )
+}
+
+/// The diagnostic a disable with nothing to withdraw is refused with.
+fn radius_not_enabled_message(directory_id: &str) -> String {
+    format!("Could not disable radius as it is not enabled for directory: {directory_id}")
+}
+
+/// The RADIUS status `directory_id` reports, or the empty string while it reports none.
+async fn reported_radius_status(
+    router: &MultiServiceRouter,
+    directory_id: &str,
+    case: &str,
+) -> String {
+    let described = crate::directory_lifecycle::describe_one(router, directory_id, case).await;
+    described["RadiusStatus"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Wait until `directory_id` reports `awaited` as its RADIUS status, polling the reporting
+/// operation the way a client with a waiter does: the CONDITION is waited for rather than a
+/// span of time, so no case's outcome depends on how fast the host runs.
+async fn poll_until_radius_status(
+    router: &MultiServiceRouter,
+    directory_id: &str,
+    awaited: &str,
+    case: &str,
+) {
+    crate::harness::poll_until_reported(
+        case,
+        &format!("{directory_id} to report RadiusStatus {awaited}"),
+        crate::harness::POLL_DEADLINE,
+        || reported_radius_status(router, directory_id, case),
+        |observed: &String| observed == awaited,
+    )
+    .await;
+}
+
+/// Assert that `described` reports exactly the members `reported` names for its RADIUS
+/// settings, and that no shared secret appears anywhere in it.
+fn assert_reported_radius_settings(described: &Value, reported: &Value, case: &str) {
+    let settings = &described["RadiusSettings"];
+    for (member, value) in reported
+        .as_object()
+        .expect("the expectation is an object")
+        .iter()
+    {
+        assert_eq!(
+            &settings[member], value,
+            "case {case:?}: expected RadiusSettings.{member} to be {value}, got {settings}"
+        );
+    }
+    assert!(
+        settings["SharedSecret"].is_null(),
+        "case {case:?}: expected no SharedSecret reported, got {settings}"
+    );
+    let whole = described.to_string();
+    assert!(
+        !whole.contains(RADIUS_SECRET) && !whole.contains(OTHER_RADIUS_SECRET),
+        "case {case:?}: expected no shared secret anywhere in the description, got {whole}"
+    );
+}
+
+/// One row of the configuration table: the directory to place, the settings an enable names
+/// and what the reads must then report for them.
+struct RadiusCase {
+    case: &'static str,
+    kind: DirectoryKind,
+    name: &'static str,
+    settings: Value,
+    reported: Value,
+}
+
+#[tokio::test]
+async fn a_directorys_radius_configuration_is_reported_from_what_the_enable_recorded() {
+    let (router, _engine) = emulator();
+
+    // The rows differ along what the rule generalises over: the directory type, and which
+    // members of the settings block the request carries — including the published bounds of
+    // `RadiusPort` (1025–65535), `RadiusTimeout` (1–50) and `RadiusRetries` (0–10).
+    let rows = vec![
+        RadiusCase {
+            case: "a Simple AD directory, every member sent",
+            kind: DirectoryKind::SimpleAd,
+            name: "radius.simple.example.com",
+            settings: json!({
+                "RadiusServers": ["radius1.example.com", "radius2.example.com"],
+                "RadiusPort": 1812,
+                "RadiusTimeout": 30,
+                "RadiusRetries": 3,
+                "SharedSecret": RADIUS_SECRET,
+                "AuthenticationProtocol": "MS-CHAPv2",
+                "DisplayLabel": "Corp RADIUS",
+                "UseSameUsername": true,
+            }),
+            reported: json!({
+                "RadiusServers": ["radius1.example.com", "radius2.example.com"],
+                "RadiusPort": 1812,
+                "RadiusTimeout": 30,
+                "RadiusRetries": 3,
+                "AuthenticationProtocol": "MS-CHAPv2",
+                "DisplayLabel": "Corp RADIUS",
+                "UseSameUsername": true,
+            }),
+        },
+        RadiusCase {
+            case: "a Managed Microsoft AD directory, one IPv6 endpoint at two bounds",
+            kind: DirectoryKind::MicrosoftAd,
+            name: "radius.managed.example.com",
+            settings: json!({
+                "RadiusServersIpv6": ["2001:db8::53"],
+                "RadiusPort": 1025,
+                "RadiusTimeout": 50,
+                "RadiusRetries": 0,
+                "SharedSecret": OTHER_RADIUS_SECRET,
+                "AuthenticationProtocol": "PAP",
+            }),
+            reported: json!({
+                "RadiusServersIpv6": ["2001:db8::53"],
+                "RadiusPort": 1025,
+                "RadiusTimeout": 50,
+                "RadiusRetries": 0,
+                "AuthenticationProtocol": "PAP",
+            }),
+        },
+        RadiusCase {
+            case: "an AD Connector, only the shared secret sent",
+            kind: DirectoryKind::AdConnector,
+            name: "radius.connector.example.com",
+            // Every other member of the shape is optional, so this is the smallest settings
+            // block an enable can carry; `RadiusRetries` and `UseSameUsername` carry
+            // `@default`s, which is what the read reports for a request that names neither.
+            settings: json!({ "SharedSecret": RADIUS_SECRET }),
+            reported: json!({ "RadiusRetries": 0, "UseSameUsername": false }),
+        },
+        RadiusCase {
+            case: "a Simple AD directory, the retry ceiling and three endpoints",
+            kind: DirectoryKind::SimpleAd,
+            name: "radius.retries.example.org",
+            settings: json!({
+                "RadiusServers": ["10.0.0.11", "10.0.0.12", "10.0.0.13"],
+                "RadiusPort": 65535,
+                "RadiusTimeout": 1,
+                "RadiusRetries": 10,
+                "SharedSecret": RADIUS_SECRET,
+                "AuthenticationProtocol": "CHAP",
+                "UseSameUsername": false,
+            }),
+            reported: json!({
+                "RadiusServers": ["10.0.0.11", "10.0.0.12", "10.0.0.13"],
+                "RadiusPort": 65535,
+                "RadiusTimeout": 1,
+                "RadiusRetries": 10,
+                "AuthenticationProtocol": "CHAP",
+                "UseSameUsername": false,
+            }),
+        },
+    ];
+
+    for row in rows {
+        let case = row.case;
+        let id = directory_of(&router, row.kind, row.name, case).await;
+
+        // Before any enable both members are structurally ABSENT: a directory that holds no
+        // configuration has none to describe.
+        let fresh = crate::directory_lifecycle::describe_one(&router, &id, case).await;
+        assert!(
+            fresh["RadiusSettings"].is_null() && fresh["RadiusStatus"].is_null(),
+            "case {case:?}: expected neither RadiusSettings nor RadiusStatus before an \
+             enable, got {fresh}"
+        );
+
+        let answer = ok(
+            &router,
+            "EnableRadius",
+            json!({ "DirectoryId": &id, "RadiusSettings": row.settings }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            answer,
+            json!({}),
+            "case {case:?}: expected EnableRadius to report no members, got {answer}"
+        );
+
+        // The settings are reported from the store, and the status is one the model declares.
+        let described = crate::directory_lifecycle::describe_one(&router, &id, case).await;
+        assert_reported_radius_settings(&described, &row.reported, case);
+        let status = described["RadiusStatus"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            RADIUS_STATUSES.contains(&status.as_str()),
+            "case {case:?}: expected a modelled RadiusStatus one of {RADIUS_STATUSES:?}, got \
+             {status:?}"
+        );
+
+        // Bringing the MFA server connection up is the service's own transition, so the
+        // status CONVERGES on the settled value without any further call, and the settings
+        // are untouched by it.
+        poll_until_radius_status(&router, &id, RADIUS_COMPLETED, case).await;
+        let settled = crate::directory_lifecycle::describe_one(&router, &id, case).await;
+        assert_reported_radius_settings(&settled, &row.reported, case);
+
+        // The withdrawal takes the configuration off the record, so the reads report what
+        // they reported before the enable...
+        ok(&router, "DisableRadius", json!({ "DirectoryId": &id }), case).await;
+        let withdrawn = crate::directory_lifecycle::describe_one(&router, &id, case).await;
+        assert!(
+            withdrawn["RadiusSettings"].is_null() && withdrawn["RadiusStatus"].is_null(),
+            "case {case:?}: expected neither RadiusSettings nor RadiusStatus after the \
+             disable, got {withdrawn}"
+        );
+
+        // ...and the directory can be configured again, which is the other half of the
+        // withdrawal having really happened.
+        ok(
+            &router,
+            "EnableRadius",
+            json!({
+                "DirectoryId": &id,
+                "RadiusSettings": { "SharedSecret": OTHER_RADIUS_SECRET, "RadiusPort": 1645 }
+            }),
+            case,
+        )
+        .await;
+        let again = crate::directory_lifecycle::describe_one(&router, &id, case).await;
+        assert_eq!(
+            again["RadiusSettings"]["RadiusPort"],
+            json!(1645),
+            "case {case:?}: expected the second configuration reported, got {again}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_second_enable_is_refused_and_leaves_the_first_configuration_in_place() {
+    let (router, _engine) = emulator();
+
+    // The rows differ along the directory type, whether the transition the first enable owes
+    // has settled when the second request arrives, and whether that request asks for the
+    // same settings or different ones.
+    let rows: [(&str, DirectoryKind, &str, bool, Value); 3] = [
+        (
+            "a Simple AD directory, the second enable arriving at once",
+            DirectoryKind::SimpleAd,
+            "twice.simple.example.com",
+            false,
+            json!({ "SharedSecret": OTHER_RADIUS_SECRET, "RadiusPort": 1645 }),
+        ),
+        (
+            "a Managed Microsoft AD directory, the second enable after the status settled",
+            DirectoryKind::MicrosoftAd,
+            "twice.managed.example.com",
+            true,
+            json!({ "SharedSecret": OTHER_RADIUS_SECRET, "RadiusPort": 1645 }),
+        ),
+        (
+            "an AD Connector, the second enable repeating the first settings",
+            DirectoryKind::AdConnector,
+            "twice.connector.example.com",
+            true,
+            json!({ "SharedSecret": RADIUS_SECRET, "RadiusPort": 1812, "RadiusRetries": 2 }),
+        ),
+    ];
+
+    for (case, kind, name, settle_first, second) in rows {
+        let id = directory_of(&router, kind, name, case).await;
+        ok(
+            &router,
+            "EnableRadius",
+            json!({
+                "DirectoryId": &id,
+                "RadiusSettings": {
+                    "RadiusServers": ["radius1.example.com"],
+                    "RadiusPort": 1812,
+                    "RadiusRetries": 2,
+                    "SharedSecret": RADIUS_SECRET,
+                }
+            }),
+            case,
+        )
+        .await;
+        if settle_first {
+            poll_until_radius_status(&router, &id, RADIUS_COMPLETED, case).await;
+        }
+
+        refused_radius(
+            &router,
+            "EnableRadius",
+            json!({ "DirectoryId": &id, "RadiusSettings": second }),
+            "ClientException",
+            &radius_already_enabled_message(&id),
+            case,
+        )
+        .await;
+
+        // The refused request recorded nothing: the settings the FIRST enable named are the
+        // ones still reported.
+        let described = crate::directory_lifecycle::describe_one(&router, &id, case).await;
+        assert_eq!(
+            described["RadiusSettings"]["RadiusPort"],
+            json!(1812),
+            "case {case:?}: expected the first configuration untouched, got {described}"
+        );
+        assert_eq!(
+            described["RadiusSettings"]["RadiusServers"],
+            json!(["radius1.example.com"]),
+            "case {case:?}: expected the first configuration untouched, got {described}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_radius_writes_resolve_the_directory_in_the_store_first() {
+    let (router, _engine) = emulator();
+    // One stored directory in the same store as the control, so a refusal below is about the
+    // id the request named and not about an empty account.
+    let stored = create_directory(&router, minimal_create("resolved.example.com"), "setup").await;
+
+    for (absent, class) in ABSENT_DIRECTORY_IDS {
+        refused_radius(
+            &router,
+            "EnableRadius",
+            json!({
+                "DirectoryId": absent,
+                "RadiusSettings": { "SharedSecret": RADIUS_SECRET }
+            }),
+            "EntityDoesNotExistException",
+            &format!("Directory: '{absent}' does not exist."),
+            class,
+        )
+        .await;
+        refused_radius(
+            &router,
+            "DisableRadius",
+            json!({ "DirectoryId": absent }),
+            "EntityDoesNotExistException",
+            &format!("Directory: '{absent}' does not exist."),
+            class,
+        )
+        .await;
+    }
+
+    // An id the MODEL refuses never reaches that resolution: the boundary validator answers
+    // it, in the validation class rather than in a modelled one.
+    for malformed in ["d-ABCDEF0123", "d-123", "directory-1"] {
+        refused(
+            &router,
+            "EnableRadius",
+            json!({
+                "DirectoryId": malformed,
+                "RadiusSettings": { "SharedSecret": RADIUS_SECRET }
+            }),
+            "ValidationException",
+            malformed,
+        )
+        .await;
+    }
+
+    // None of those refusals configured the directory the store does hold.
+    let described =
+        crate::directory_lifecycle::describe_one(&router, &stored, "after the refusals").await;
+    assert!(
+        described["RadiusSettings"].is_null() && described["RadiusStatus"].is_null(),
+        "expected the stored directory to hold no configuration, got {described}"
+    );
+}
+
+#[tokio::test]
+async fn an_enable_without_a_shared_secret_is_refused_and_records_nothing() {
+    let (router, _engine) = emulator();
+    let id = create_directory(&router, minimal_create("secretless.example.com"), "setup").await;
+
+    // The rows differ along which OTHER members the settings block carries: the requirement
+    // is the shared secret's own, so none of them satisfies it.
+    let rows: [(&str, Value); 3] = [
+        ("an empty settings block", json!({})),
+        (
+            "endpoints and a port, no secret",
+            json!({ "RadiusServers": ["radius1.example.com"], "RadiusPort": 1812 }),
+        ),
+        (
+            "every member but the secret",
+            json!({
+                "RadiusServers": ["radius1.example.com"],
+                "RadiusServersIpv6": ["2001:db8::53"],
+                "RadiusPort": 1812,
+                "RadiusTimeout": 20,
+                "RadiusRetries": 1,
+                "AuthenticationProtocol": "MS-CHAPv1",
+                "DisplayLabel": "No secret",
+                "UseSameUsername": true,
+            }),
+        ),
+    ];
+
+    for (case, settings) in rows {
+        refused_radius(
+            &router,
+            "EnableRadius",
+            json!({ "DirectoryId": &id, "RadiusSettings": settings }),
+            "InvalidParameterException",
+            "SharedSecret is required for enabling RADIUS on the directory.",
+            case,
+        )
+        .await;
+        let described = crate::directory_lifecycle::describe_one(&router, &id, case).await;
+        assert!(
+            described["RadiusSettings"].is_null() && described["RadiusStatus"].is_null(),
+            "case {case:?}: expected the refusal to record nothing, got {described}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_disable_with_no_configuration_to_withdraw_is_refused() {
+    let (router, _engine) = emulator();
+
+    // A directory of each type that no enable has ever named, and then the same directory
+    // once a configuration has been enabled and withdrawn: both carry nothing to withdraw.
+    let rows: [(&str, DirectoryKind, &str); 3] = [
+        (
+            "a fresh Simple AD directory",
+            DirectoryKind::SimpleAd,
+            "nomfa.simple.example.com",
+        ),
+        (
+            "a fresh Managed Microsoft AD directory",
+            DirectoryKind::MicrosoftAd,
+            "nomfa.managed.example.com",
+        ),
+        (
+            "a fresh AD Connector",
+            DirectoryKind::AdConnector,
+            "nomfa.connector.example.com",
+        ),
+    ];
+
+    for (case, kind, name) in rows {
+        let id = directory_of(&router, kind, name, case).await;
+        refused_radius(
+            &router,
+            "DisableRadius",
+            json!({ "DirectoryId": &id }),
+            "ClientException",
+            &radius_not_enabled_message(&id),
+            case,
+        )
+        .await;
+
+        ok(
+            &router,
+            "EnableRadius",
+            json!({
+                "DirectoryId": &id,
+                "RadiusSettings": { "SharedSecret": RADIUS_SECRET }
+            }),
+            case,
+        )
+        .await;
+        ok(&router, "DisableRadius", json!({ "DirectoryId": &id }), case).await;
+        refused_radius(
+            &router,
+            "DisableRadius",
+            json!({ "DirectoryId": &id }),
+            "ClientException",
+            &radius_not_enabled_message(&id),
+            &format!("{case}, after a withdrawal"),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn neither_radius_write_answers_the_scaffold_501() {
+    // The census this change is against: both operations answered HTTP 501 `NotImplemented`
+    // for every request. Neither may answer it again — not for a request that succeeds, and
+    // not for one that is refused.
+    let (router, _engine) = emulator();
+    let id = create_directory(&router, minimal_create("census.example.com"), "no 501").await;
+    let calls: [(&str, Value); 4] = [
+        // A request that is refused for its own settings, one that succeeds, one that is
+        // refused on the directory's own state, and the withdrawal.
+        (
+            "EnableRadius",
+            json!({ "DirectoryId": &id, "RadiusSettings": {} }),
+        ),
+        (
+            "EnableRadius",
+            json!({
+                "DirectoryId": &id,
+                "RadiusSettings": { "SharedSecret": RADIUS_SECRET }
+            }),
+        ),
+        (
+            "EnableRadius",
+            json!({
+                "DirectoryId": &id,
+                "RadiusSettings": { "SharedSecret": RADIUS_SECRET }
+            }),
+        ),
+        ("DisableRadius", json!({ "DirectoryId": &id })),
     ];
     for (operation, body) in calls {
         let (status, parsed) = call(&router, operation, body).await;

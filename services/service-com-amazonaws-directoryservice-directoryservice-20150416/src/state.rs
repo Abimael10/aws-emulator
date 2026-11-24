@@ -107,6 +107,10 @@ pub mod ec2_subnets;
 /// topic a binding points at. Re-exported below, so the three operations that reach them do
 /// so as `crate::state::<name>`.
 pub mod event_topics;
+/// The RADIUS multi-factor authentication configuration one directory holds, the status
+/// `EnableRadius` records for it and the wording each of its refusals is stated with.
+/// Re-exported below, so every operation that reaches it does so as `crate::state::<name>`.
+pub mod radius;
 pub mod security_log;
 pub mod subnet_zones;
 
@@ -135,6 +139,10 @@ pub use ec2_security_groups::{
 pub use ec2_subnets::{resolve_subnet_networks, vpc_absence, SubnetResolution};
 pub use event_topics::{
     EventTopicRegistration, SnsTopics, TOPIC_STATUS_REGISTERED, TOPIC_STATUS_TOPIC_NOT_FOUND,
+};
+pub use radius::{
+    radius_already_enabled, radius_not_enabled, RadiusConfiguration, RADIUS_SHARED_SECRET_REQUIRED,
+    RADIUS_STATUS_COMPLETED, RADIUS_STATUS_CREATING,
 };
 pub use subnet_zones::placement_defect;
 
@@ -2455,6 +2463,13 @@ pub struct Directory {
     /// directory takes it with it. `None` for a directory no enable has ever named, which
     /// reports [`CA_ENROLLMENT_POLICY_DISABLED`].
     pub ca_enrollment_policy: Option<CaEnrollmentPolicyRecord>,
+    /// The RADIUS multi-factor authentication configuration `EnableRadius` recorded for this
+    /// directory, if any; every operation that reports a directory reports it
+    /// ([`Self::reported_radius_settings`], [`Self::reported_radius_status`]). A directory
+    /// holds at most one (see [`radius`]), and it lives on the directory record, so deleting
+    /// the directory takes it with it. `None` for a directory no enable has ever named, which
+    /// reports neither settings nor a status.
+    pub radius: Option<RadiusConfiguration>,
     /// Creation rank, from
     /// [`ComAmazonawsDirectoryserviceDirectoryservice20150416State::next_seq`]. A
     /// listing pages over directories sorted by this, and its opaque `NextToken`
@@ -3005,9 +3020,11 @@ impl Directory {
 
     /// This directory as the modelled `DirectoryDescription`.
     ///
-    /// The members this slice has no record behind — RADIUS, sharing, the owner
+    /// The members this slice has no record behind — sharing, the owner
     /// description — are left absent rather than invented: the operations that would
-    /// populate them are still scaffolded. The placement members are REPORTED rather than
+    /// populate them are still scaffolded. The RADIUS members are reported from the
+    /// configuration `EnableRadius` recorded ([`Self::reported_radius_settings`],
+    /// [`Self::reported_radius_status`]), and stay absent for a directory that holds none. The placement members are REPORTED rather than
     /// echoed: the DNS addresses ([`Self::dns_ip_addrs`]) and the Availability Zones
     /// ([`Self::availability_zones`]) come from the subnets the create resolved against the
     /// service that owns them, so the directory reports the network it was really placed in.
@@ -3035,6 +3052,8 @@ impl Directory {
             sso_enabled: self.sso_enabled,
             desired_number_of_domain_controllers: self.desired_number_of_domain_controllers,
             network_type: self.reported_network_type(),
+            radius_settings: self.reported_radius_settings(),
+            radius_status: self.reported_radius_status(),
             regions_info: Some(self.regions_info()),
             ..DirectoryDescription::default()
         }
@@ -3948,7 +3967,8 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// status when
     /// `StartADAssessment` ran, a directory's data-access status when
     /// `EnableDirectoryDataAccess` ran, a directory's CA enrollment policy status when
-    /// `EnableCAEnrollmentPolicy` or `DisableCAEnrollmentPolicy` ran, a directory
+    /// `EnableCAEnrollmentPolicy` or `DisableCAEnrollmentPolicy` ran, a directory's RADIUS
+    /// status when `EnableRadius` ran, a directory
     /// setting's status when
     /// `UpdateSettings` ran, a domain controller's status when the placement or the
     /// retirement of it ran, a directory's teardown stage when `DeleteDirectory` ran.
@@ -4024,6 +4044,12 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
             // `Disabled`. A directory that holds no policy has nothing to settle.
             if let Some(policy) = directory.ca_enrollment_policy.as_mut() {
                 policy.advance_clock(now);
+            }
+            // The transition `EnableRadius` owes: the transient `Creating` the enable
+            // records settles on `Completed`. A directory that holds no RADIUS
+            // configuration has nothing to settle.
+            if let Some(configuration) = directory.radius.as_mut() {
+                configuration.advance_clock(now);
             }
             // The transition an `UpdateSettings` owes: the value the update REQUESTED
             // becomes the value APPLIED to the directory, and the setting's transient

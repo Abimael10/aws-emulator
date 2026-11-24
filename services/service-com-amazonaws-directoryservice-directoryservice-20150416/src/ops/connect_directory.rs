@@ -434,6 +434,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `EnableCAEnrollmentPolicy` is what enrolls a directory's clients with a
             // Private CA connector; a fresh one holds no such policy.
             ca_enrollment_policy: None,
+            // `EnableRadius` is what configures RADIUS multi-factor authentication for a
+            // directory; a fresh one holds no RADIUS configuration.
+            radius: None,
             seq,
         };
         store.directories.insert(directory_id.clone(), record);

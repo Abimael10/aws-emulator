@@ -1,15 +1,38 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableRadius
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableRadius`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableRadius::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records the RADIUS multi-factor authentication configuration of a stored directory, by
+//! writing the one [`crate::state::RadiusConfiguration`] a directory holds. The directory
+//! has at most one — this operation's result is modelled with no members at all, so it
+//! reports nothing a caller could read the outcome from — so the configuration is reported
+//! from here on by every operation that describes the directory
+//! (`DescribeDirectories$RadiusSettings` and `$RadiusStatus`), the same way the other
+//! per-directory records this service holds are reported.
+//!
+//! Bringing the MFA server connection up is not instant: the enable answers in the
+//! transient first value of the modelled `RadiusStatus` enum
+//! ([`crate::state::RADIUS_STATUS_CREATING`]) and the clock settles it on
+//! [`crate::state::RADIUS_STATUS_COMPLETED`] one span later, which is the one place that
+//! transition is made.
+//!
+//! The shared secret the request carries is what decides the enable and is then dropped
+//! rather than stored — see the module docs of [`crate::state::radius`].
+//!
+//! The modelled constraints (the `DirectoryId` pattern, the port and timeout ranges, the
+//! shared secret's length and pattern, the authentication protocol's value set) are refused
+//! by the framework's boundary validator BEFORE this handler runs, so a well-formed request
+//! reaches this handler's own requirements: a request carrying no `SharedSecret`, which that
+//! member's documentation makes a requirement of the ENABLE ("Required for enabling RADIUS
+//! on the directory"), is refused with `InvalidParameterException`; an id no directory is
+//! stored under is refused with `EntityDoesNotExistException`; and a directory that already
+//! carries a RADIUS configuration is refused with `ClientException`, the class Directory
+//! Service answers a repeated enable in, since there is no second configuration to make.
+//!
+//! The stage the directory is in is NOT a precondition here: the model declares no
+//! `DirectoryUnavailableException` for this operation, and the configuration is a record of
+//! the directory rather than anything built on its servers, so the enable is served for
+//! every stored directory — and so is the refusal of a second one.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +165,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableRadius` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableRadiusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableRadius"))
+        let _ = ctx;
+
+        // The shared secret is what the directory would authenticate to the RADIUS server
+        // with, and the member's own documentation makes it a requirement of the enable, so
+        // a request without one is refused before the store is consulted at all: nothing is
+        // read and nothing is written for a request that cannot configure anything.
+        if input.radius_settings.shared_secret.is_none() {
+            return Err(EnableRadiusErrorModeled::InvalidParameterException(
+                crate::state::refusal(crate::state::RADIUS_SHARED_SECRET_REQUIRED),
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.advance_clock(now);
+
+        // The configuration hangs off the directory the request names, so an id naming no
+        // stored directory is refused and records nothing. This operation models no
+        // directory-specific absence, so the entity-level one it does model reports it,
+        // with this service's shared sentence for a directory that is not there.
+        let directory = store
+            .directories
+            .get_mut(&input.directory_id)
+            .ok_or_else(|| {
+                EnableRadiusErrorModeled::EntityDoesNotExistException(crate::state::refusal(
+                    crate::state::no_such_directory(&input.directory_id),
+                ))
+            })?;
+
+        // A directory carries at most ONE RADIUS configuration, so an enable meeting one
+        // that is already there has no second entity to make — whether the transition the
+        // earlier enable owes has settled or not, since the configuration exists either
+        // way. `UpdateRadius` is what changes the settings of the one that is there.
+        if directory.radius.is_some() {
+            return Err(EnableRadiusErrorModeled::ClientException(crate::state::refusal(
+                crate::state::radius_already_enabled(&input.directory_id),
+            ))
+            .into());
+        }
+
+        // The request is accepted: the settings are recorded against the directory, in the
+        // transient status the enable answers in, and the clock settles that status one span
+        // later — so a caller reading the directory straight after this call still sees the
+        // MFA server connection being brought up.
+        directory.radius = Some(crate::state::RadiusConfiguration::enabling(
+            &input.radius_settings,
+            now,
+        ));
+
+        Ok(EnableRadiusOutput {})
     }
 }
