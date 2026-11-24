@@ -1964,6 +1964,14 @@ impl Owner {
             Self::ApiGatewayRestApi(_) if code == API_GATEWAY_VALIDATION => {
                 super::HANDLER_ERROR_SERVICE_FAILED
             }
+            // An api provider reads the definition a declaration holds in Amazon S3 itself
+            // ([`apigateway_definitions`]), and a read it could not make is an exception the
+            // plugin has no mapping for: the provider classified it itself, and the class it
+            // carries as its code is what it is reported under — exactly as AWS AppSync's
+            // providers' own reads above are.
+            Self::ApiGatewayRestApi(_) if code == apigateway_definitions::READ_FAILED => {
+                super::HANDLER_ERROR_SERVICE_FAILED
+            }
             // Its MODELLED errors are mapped per TYPE, because each of these types has a
             // provider of its own: the module that owns a type states the mapping its provider
             // was recorded wording ([`apigateway_rest_api::handler_error_class`]).

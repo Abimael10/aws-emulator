@@ -19,9 +19,10 @@
 //! The object is read through the in-process callback into this same emulator
 //! ([`crate::state::provisioner::s3_client`]), exactly as the rest of provisioning reaches
 //! another service: the document a client staged with its own `PutObject` is the one the
-//! resource is created from. Nothing here opens a socket or leaves the host, and nothing is
-//! read from the reference but the bucket, the key and the object version it addresses —
-//! through the one reading of a caller-addressed object this crate holds
+//! resource is created from. The read itself is the one reading a resource PROVIDER of this
+//! crate makes of a staged object ([`super::staged_object`]), and nothing is read from the
+//! reference but the bucket, the key and the object version it addresses — through the one
+//! reading of a caller-addressed object this crate holds
 //! ([`crate::state::template_url::addressed_object`]), so a reference may be written in the
 //! `s3://<bucket>/<key>` form a template states or in either http(s) addressing style.
 //!
@@ -46,6 +47,7 @@
 
 use serde_json::{Map, Value};
 
+use super::staged_object::{self, ReadFailure, UNIDENTIFIED_FAILURE};
 use super::Refusal;
 use crate::state::provisioner::attribute_text;
 use crate::state::template_url;
@@ -84,14 +86,6 @@ pub(super) const CHANNEL_NAMESPACE_DOCUMENTS: &[(&str, &str)] =
 /// exception it has no mapping for falls in the class for a service that failed, which is what
 /// [`super::Owner::handler_error_class`] reads this code as.
 pub(super) const READ_FAILED: &str = super::HANDLER_ERROR_SERVICE_FAILED;
-
-/// What stands in as the inner diagnosis where Amazon S3 identified nothing: the read was not
-/// served — or was served and carried no text — and nothing on the other end said why.
-const UNIDENTIFIED_FAILURE: &str = "InternalFailure";
-
-/// Amazon S3's own signing name, which routes the read in process and is what the diagnostic
-/// looks the SDK's name for that service up under ([`super::sdk_message`]).
-const S3_SIGNING_NAME: &str = "s3";
 
 /// How many bytes of a referenced object are read.
 ///
@@ -165,8 +159,6 @@ async fn read(
     reference: &str,
     location: &str,
 ) -> Result<String, Refusal> {
-    use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
-
     let object = template_url::addressed_object(location).ok_or_else(|| {
         // Text that addresses no object was never a reference to one, which is the sentence
         // this service words about a member carrying such text.
@@ -176,47 +168,21 @@ async fn read(
             &template_url::not_a_readable_object(reference),
         )
     })?;
-    let answered = crate::state::provisioner::s3_client(ctx, region)
-        .get_object()
-        .bucket(&object.bucket)
-        .key(&object.key)
-        .set_version_id(object.version.clone())
-        .send()
+    staged_object::text(ctx, region, &object, MAX_DOCUMENT_BYTES)
         .await
-        .map_err(|error| {
-            let code = error.code().unwrap_or(UNIDENTIFIED_FAILURE);
-            let message = error.message().unwrap_or(code);
-            // The exception an Amazon S3 client raises for the refused read: that service's
-            // own message and its SDK's diagnostic of the call, which is what the provider
-            // caught. An answer that carried no response at all is reported as it was worded,
-            // with no diagnostic invented for it.
-            let raised = match error.raw_response().map(|answer| answer.status().as_u16()) {
-                Some(status) => super::sdk_message(S3_SIGNING_NAME, status, code, message),
-                None => message.to_string(),
+        .map_err(|failure| {
+            // What the read reported, as this provider words it: the exception an Amazon S3
+            // client raises for a refusal that service answered — that service's own message and
+            // its SDK's diagnostic of the call, which is what the provider caught — an object
+            // past the bound as the sentence about that member, and a read that served no
+            // document with nothing identified about it.
+            let answered = match &failure {
+                ReadFailure::TooLarge => too_large(reference),
+                answered => staged_object::s3_exception(answered)
+                    .unwrap_or_else(|| UNIDENTIFIED_FAILURE.to_string()),
             };
-            read_refusal(document, reference, &raised)
-        })?;
-    // The length the object REPORTS, before a single byte of it is held.
-    if answered
-        .content_length()
-        .is_some_and(|length| length > MAX_DOCUMENT_BYTES as i64)
-    {
-        return Err(read_refusal(document, reference, &too_large(reference)));
-    }
-    let body = answered
-        .body
-        .collect()
-        .await
-        // The object was handed over and the body then stopped: nothing identified why.
-        .map_err(|_| read_refusal(document, reference, UNIDENTIFIED_FAILURE))?
-        .into_bytes();
-    if body.len() > MAX_DOCUMENT_BYTES {
-        return Err(read_refusal(document, reference, &too_large(reference)));
-    }
-    // What the reference addressed is the TEXT of a property; an object that is not valid
-    // UTF-8 carries none, so the read served no document.
-    String::from_utf8(body.to_vec())
-        .map_err(|_| read_refusal(document, reference, UNIDENTIFIED_FAILURE))
+            read_refusal(document, reference, &answered)
+        })
 }
 
 /// The refusal the provider reports for a document it could not read: its own diagnosis of the

@@ -605,10 +605,11 @@ const REST_API_BODY: &str = "Body";
 /// specification" — so a declaration carrying neither is refused rather than named here.
 const REST_API_NAME: &str = "Name";
 
-/// The property carrying that definition as an Amazon S3 OBJECT instead. The object has to
-/// be FETCHED from S3 before any api can be imported from it, which nothing here does, so a
-/// declaration stating it is refused rather than created without its definition.
-const REST_API_BODY_S3_LOCATION: &str = "BodyS3Location";
+/// The property carrying that definition as an Amazon S3 OBJECT instead. The object is READ
+/// before the api is imported from it, through the one reading of a declared api definition
+/// held in Amazon S3 this crate holds ([`super::apigateway_definitions`]), so a declaration
+/// stating it is created from the document that object holds.
+const REST_API_BODY_S3_LOCATION: &str = super::apigateway_definitions::BODY_S3_LOCATION;
 
 /// The property that governs how a CHANGED definition is applied to an api that already has
 /// one ("overwrite" / "merge"), which is `PutRestApi`'s own `mode`. A create has no
@@ -674,9 +675,11 @@ const ENDPOINT_TYPES_PARAMETER: &str = "endpointConfigurationTypes";
 ///
 /// A declaration carrying a `Body` is IMPORTED from that definition
 /// ([`import_rest_api`]), which is the call that creates an api WITH its resources, its
-/// methods and their integrations; one that carries none is `CreateRestApi` with the
-/// declared properties as that call's own members and the tags CloudFormation gives the
-/// resource as its tag map.
+/// methods and their integrations; one that holds its definition in Amazon S3 instead is
+/// imported from the document the object its `BodyS3Location` addresses holds
+/// ([`super::apigateway_definitions`]); and one that carries no definition at all is
+/// `CreateRestApi` with the declared properties as that call's own members and the tags
+/// CloudFormation gives the resource as its tag map.
 ///
 /// "Ref returns the RestApi ID", which only that service produces, so the `id` it answers
 /// replaces the stand-in the naming rules computed, and the `rootResourceId` it reports is
@@ -689,18 +692,16 @@ async fn create_rest_api(
     propagated: &[(String, String)],
 ) -> Result<Created, Refusal> {
     refuse_unpublished(resource, REST_API_PROPERTIES)?;
-    if resource.properties.get(REST_API_BODY_S3_LOCATION).is_some() {
-        return Err(Refusal {
-            code: NOT_IMPLEMENTED.to_string(),
-            message: format!(
-                "this emulator does not read the definition a {APIGATEWAY_REST_API} holds in \
-                 Amazon S3, so the api was not created from its {REST_API_BODY_S3_LOCATION} \
-                 property"
-            ),
-        });
-    }
     if let Some(definition) = resource.properties.get(REST_API_BODY) {
         return import_rest_api(ctx, region, resource, definition, propagated).await;
+    }
+    // A definition the declaration holds in Amazon S3 is the same document submitted another
+    // way: the object is read and the api imported from the text it holds.
+    if let Some(location) = resource.properties.get(REST_API_BODY_S3_LOCATION) {
+        let definition = Value::String(
+            super::apigateway_definitions::read_definition(ctx, region, location).await?,
+        );
+        return import_rest_api(ctx, region, resource, &definition, propagated).await;
     }
     let mut request = Map::new();
     for (property, member) in REST_API_MEMBERS {

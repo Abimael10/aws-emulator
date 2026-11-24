@@ -9,8 +9,10 @@
 //! — and classifies it under the `HandlerErrorCode` its mapping puts the answered error code
 //! in: a code the owning service's model does not declare at all is an exception the provider
 //! has no mapping for, so it is reported under the class for a service that FAILED rather than
-//! as a request the provider found fault with. A refusal the provider makes ITSELF, before it
-//! calls that service, carries no SDK diagnostic and is a refusal of the request.**
+//! as a request the provider found fault with. A step the provider takes ITSELF, before it
+//! calls that service — reading the definition a declaration holds in Amazon S3 — is reported
+//! as the exception the provider raised for that step, with no SDK diagnostic of a call nobody
+//! made, and under the same class for an exception the plugin cannot map.**
 //!
 //! Why it matters: tooling triages a rolled-back deployment by `HandlerErrorCode` — it decides
 //! whether a failure is worth retrying and whether the template or the service is at fault —
@@ -22,8 +24,8 @@
 //! The rows differ along what the rule generalises over: WHICH member of the create the
 //! declaration breaks (the api's key source and its endpoint type, two different enums, one
 //! travelling as a body member and one as an element of a list), and WHO refused it (the
-//! owning service's constraint layer, and the provider itself for a declaration it cannot
-//! act on).
+//! owning service's constraint layer, and the provider itself for a definition it could not
+//! read out of Amazon S3).
 //!
 //! `apigateway_refused_resource_sdk_diagnostic.rs` owns the same question for the api's
 //! DEPLOYMENT, whose provider words the bare envelope and maps that service's own modelled
@@ -45,11 +47,10 @@ const ROLLBACK_COMPLETE: &str = "ROLLBACK_COMPLETE";
 /// model's `awsService.cloudFormationName`.
 const API_GATEWAY_SERVICE: &str = "ApiGateway";
 
-/// The `HandlerErrorCode` classes these rows fall in, both values of the model's own
+/// The `HandlerErrorCode` class these rows fall in, a value of the model's own
 /// `HandlerErrorCode` enum: the class a provider reports an exception it has no mapping for
-/// under, and the class of a request the provider itself refused.
+/// under — the owning service's constraint refusals and the provider's own failed read alike.
 const GENERAL_SERVICE_EXCEPTION: &str = "GeneralServiceException";
-const INVALID_REQUEST: &str = "InvalidRequest";
 
 /// One row: the property document the api is declared with, and what its failed event must
 /// report.
@@ -83,14 +84,25 @@ fn off_enum_endpoint_type(stack: &str) -> Value {
     })
 }
 
-/// A declaration the provider refuses ITSELF: the api's definition is held in Amazon S3, which
-/// is a document this emulator cannot read, so nothing is asked of the owning service at all.
+/// A declaration whose definition the provider reads ITSELF: the api's definition is held in
+/// Amazon S3, and Amazon S3 holds no record of the bucket the reference names — so the step
+/// the provider failed at is its own read, and nothing is asked of the owning service at all.
 fn definition_in_s3(stack: &str) -> Value {
     json!({
         "Name": format!("{stack}-api"),
         "BodyS3Location": { "Bucket": "definitions", "Key": "openapi.json" },
     })
 }
+
+/// What the api's handler reports for a definition reference it could not materialise: its own
+/// sentence naming the property, the diagnostic of the exception it raised — which identified
+/// nothing — and the diagnostic it was raised as, stating the status the read answered (Amazon
+/// S3 answers 404 for a bucket it holds no record of) and that control plane's own bad-request
+/// class.
+const UNREADABLE_DEFINITION: &str =
+    "Unable to parse BodyS3Location (Service: null; Status Code: 0; Error Code: null; \
+     Request ID: null; Proxy: null) (Service: null; Status Code: 404; Error Code: \
+     BadRequestException; Request ID: null; Proxy: null)";
 
 const ROWS: &[Row] = &[
     Row {
@@ -110,12 +122,12 @@ const ROWS: &[Row] = &[
         class: GENERAL_SERVICE_EXCEPTION,
     },
     Row {
-        case: "a definition the provider itself cannot read",
+        case: "a definition the provider could not read out of Amazon S3",
         stack: "apigw-restapi-reason-s3-definition",
         properties: definition_in_s3,
-        sentence: None,
+        sentence: Some(UNREADABLE_DEFINITION),
         status: None,
-        class: INVALID_REQUEST,
+        class: GENERAL_SERVICE_EXCEPTION,
     },
 ];
 
@@ -215,6 +227,14 @@ async fn a_refused_rest_api_reports_the_exception_its_provider_raised() {
                 );
                 assert_counted_sdk_diagnostic(row.case, &quoted, status);
             }
+            // A step the provider took ITSELF: no call was made, so what the reason quotes is
+            // the exception that provider raised, whole, with no SDK diagnostic of a call.
+            (Some(sentence), None) => assert_eq!(
+                quoted, sentence,
+                "case {:?}: expected the exception the provider raised for its own step, got \
+                 {quoted:?}",
+                row.case
+            ),
             _ => assert!(
                 !quoted.contains("(Service: "),
                 "case {:?}: expected the provider's own refusal with no SDK diagnostic, got \

@@ -1225,10 +1225,13 @@ pub(crate) const APIGATEWAYV2_IMPORT_PROPERTIES: &[&str] = &[
 /// "to import an HTTP API, you must specify a Body or BodyS3Location".
 pub(crate) const APIGATEWAYV2_BODY: &str = "Body";
 
-/// The property that carries that definition as an Amazon S3 OBJECT instead. The object has
-/// to be FETCHED from S3 before any api can be imported from it, which nothing here does, so
-/// a declaration stating it is still refused rather than created without its definition.
-pub(crate) const APIGATEWAYV2_BODY_S3_LOCATION: &str = "BodyS3Location";
+/// The property that carries that definition as an Amazon S3 OBJECT instead: "to import an
+/// HTTP API, you must specify a Body or BodyS3Location". The object is READ before the api is
+/// imported from it, through the one reading of a declared api definition held in Amazon S3
+/// this crate holds ([`crate::state::provisioning::apigateway_definitions`]), so a declaration
+/// stating it is created from the document that object holds.
+pub(crate) const APIGATEWAYV2_BODY_S3_LOCATION: &str =
+    crate::state::provisioning::apigateway_definitions::BODY_S3_LOCATION;
 
 /// The two properties that govern how a definition is READ, which are `ImportApi`'s own
 /// query parameters (`basepath`, `failOnWarnings`).
@@ -1272,7 +1275,20 @@ pub(crate) async fn create_apigatewayv2_api(
     propagated: &[(String, String)],
 ) -> Result<Created, Refusal> {
     if let Some(definition) = resource.properties.get(APIGATEWAYV2_BODY) {
-        return import_apigatewayv2_api(ctx, region, resource, definition).await;
+        return import_apigatewayv2_api(ctx, region, resource, &resource.properties, definition)
+            .await;
+    }
+    // A definition the declaration holds in Amazon S3 is the same document submitted another
+    // way: the object is read and the api imported from the text it holds.
+    if let Some(location) = resource.properties.get(APIGATEWAYV2_BODY_S3_LOCATION) {
+        let definition = Value::String(
+            crate::state::provisioning::apigateway_definitions::read_definition(
+                ctx, region, location,
+            )
+            .await?,
+        );
+        let properties = apigatewayv2_read_definition_properties(&resource.properties, &definition);
+        return import_apigatewayv2_api(ctx, region, resource, &properties, &definition).await;
     }
     let request = api_gateway_request(resource, propagated, APIGATEWAYV2_IMPORT_PROPERTIES, &[])?;
     let answered = call_rest_json(
@@ -1285,6 +1301,40 @@ pub(crate) async fn create_apigatewayv2_api(
     )
     .await?;
     apigatewayv2_api_created(&answered, region, "CreateApi")
+}
+
+/// The declaration an api whose definition was READ from Amazon S3 is imported from: the
+/// declared properties with the document that object holds stated as the `Body` it is, and the
+/// reference it was read from gone.
+///
+/// The reference is no member of any owning call — what the api is imported from is the
+/// document it addressed — so it is replaced by that document rather than carried beside it,
+/// which is the same reading the AppSync documents of this emulator take of such a pair
+/// ([`crate::state::provisioning::apigateway_definitions`]). Every OTHER property the
+/// declaration states is left exactly as it is, so the type's own rule about what may sit
+/// beside a definition is judged by the one reader of an import's declaration
+/// ([`apigatewayv2_definition_request`]).
+fn apigatewayv2_read_definition_properties(properties: &Value, definition: &Value) -> Value {
+    let mut stated = properties.as_object().cloned().unwrap_or_else(Map::new);
+    stated.remove(APIGATEWAYV2_BODY_S3_LOCATION);
+    stated.insert(APIGATEWAYV2_BODY.to_string(), definition.clone());
+    Value::Object(stated)
+}
+
+/// Whether `declared` changes what the IMPORT of a definition held in Amazon S3 takes, against
+/// the properties the api was last deployed with: the reference that addresses the document, or
+/// either knob that governs how that document is read ([`APIGATEWAYV2_IMPORT_QUERY`]).
+///
+/// A declaration that changed none of them asks for the definition the api already holds, so
+/// there is nothing to read and nothing to put over it.
+fn apigatewayv2_definition_import_changed(stored: &Value, declared: &Value) -> bool {
+    [
+        APIGATEWAYV2_BODY_S3_LOCATION,
+        APIGATEWAYV2_BASE_PATH,
+        APIGATEWAYV2_FAIL_ON_WARNINGS,
+    ]
+    .iter()
+    .any(|property| stored.get(*property) != declared.get(*property))
 }
 
 /// Import the api an `AWS::ApiGatewayV2::Api` declares a DEFINITION for, so a client that
@@ -1305,19 +1355,24 @@ pub(crate) async fn create_apigatewayv2_api(
 /// Body or BodyS3Location, don't specify CorsConfiguration, CredentialsArn,
 /// DisableExecuteApiEndpoint, Name, ProtocolType, RouteKey, RouteSelectionExpression, Tags,
 /// Target, or Version"), so one that does is REFUSED rather than imported with that property
-/// silently dropped — including `BodyS3Location`, whose object nothing here fetches.
+/// silently dropped.
 ///
 /// The api's identity is that service's exactly as it is for a create: `ImportApi` answers
 /// the `ApiId` it assigned and the `ApiEndpoint` it serves the api on.
+///
+/// `properties` is the declaration the import is judged against, which is the resource's own
+/// except for a definition READ from Amazon S3: there the reference is replaced by the
+/// document it addressed ([`apigatewayv2_read_definition_properties`]).
 pub(crate) async fn import_apigatewayv2_api(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resource: &StoredResource,
+    properties: &Value,
     definition: &Value,
 ) -> Result<Created, Refusal> {
     let (query, payload) = apigatewayv2_definition_request(
         &resource.resource_type,
-        &resource.properties,
+        properties,
         definition,
         "the resource was not created.",
     )?;
@@ -1349,7 +1404,9 @@ pub(crate) async fn import_apigatewayv2_api(
 /// you specify a Body or BodyS3Location, don't specify CorsConfiguration, CredentialsArn,
 /// DisableExecuteApiEndpoint, Name, ProtocolType, RouteKey, RouteSelectionExpression, Tags,
 /// Target, or Version"), so one that does is REFUSED rather than read with that property
-/// silently dropped — including `BodyS3Location`, whose object nothing here fetches.
+/// silently dropped. A definition held in Amazon S3 reaches this as the document it addressed
+/// ([`apigatewayv2_read_definition_properties`]), since what the api is imported from is that
+/// document and the reference is a member of no call.
 /// `unapplied` is what that refusal says became of the resource, which is the deployment's
 /// to state: a create left nothing behind, and an update left the api as it stood.
 fn apigatewayv2_definition_request(
@@ -1498,20 +1555,50 @@ async fn apigatewayv2_clear_dropped_properties(
 /// A declaration carrying a DEFINITION is applied by reading that definition over the api
 /// instead: `ReimportApi` (`PUT /v2/apis/{ApiId}`) "puts an Api resource" under the same
 /// `ApiId`, so a changed definition changes THIS api — its name, its description and the
-/// routes and integrations the document declares — rather than making a second one.
+/// routes and integrations the document declares — rather than making a second one. A
+/// definition the new declaration holds in Amazon S3 is the same change: the object is read
+/// and that document put over the api, exactly as it is for a create.
 ///
 /// `Ok(None)` is a change neither call can make, so the deployment reports it as not applied
-/// rather than as a success that dropped it: a property outside both sets stated differently
-/// — a changed `Tags` map, which no member of `UpdateApi` carries, and a `BodyS3Location`,
-/// whose object nothing here fetches. (A changed `ProtocolType` never reaches this: the api's
-/// protocol is create-only, so such a declaration asks for a different api and the stack
-/// replaces it.)
+/// rather than as a success that dropped it: a property outside both sets stated differently —
+/// a changed `Tags` map, which no member of `UpdateApi` carries. (A changed `ProtocolType`
+/// never reaches this: the api's protocol is create-only, so such a declaration asks for a
+/// different api and the stack replaces it.)
 pub(crate) async fn update_apigatewayv2_api(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resource: &StoredResource,
     declared: &Value,
 ) -> Result<Option<Created>, Refusal> {
+    // The definition the new declaration states, which is the document it carries inline or
+    // the one the object it addresses holds — read here, since what is put over the api is the
+    // document either way. A REFERENCE is read only where this declaration CHANGED what the
+    // import takes ([`apigatewayv2_definition_import_changed`]), which is the one rule the REST
+    // plane's own update applies too: the document is the object's, and the api already holds
+    // the one the stored reference addressed, so an update that touched something else does
+    // not put that document over the api again.
+    let read = match (
+        declared.get(APIGATEWAYV2_BODY),
+        declared.get(APIGATEWAYV2_BODY_S3_LOCATION),
+    ) {
+        (None, Some(location))
+            if apigatewayv2_definition_import_changed(&resource.properties, declared) =>
+        {
+            Some(Value::String(
+                crate::state::provisioning::apigateway_definitions::read_definition(
+                    ctx, region, location,
+                )
+                .await?,
+            ))
+        }
+        _ => None,
+    };
+    // The declaration this update is applied from, with a definition read from Amazon S3
+    // stated as the document it is ([`apigatewayv2_read_definition_properties`]).
+    let read_declaration = read
+        .as_ref()
+        .map(|definition| apigatewayv2_read_definition_properties(declared, definition));
+    let declared = read_declaration.as_ref().unwrap_or(declared);
     if let Some(definition) = declared.get(APIGATEWAYV2_BODY) {
         let (query, payload) = apigatewayv2_definition_request(
             &resource.resource_type,

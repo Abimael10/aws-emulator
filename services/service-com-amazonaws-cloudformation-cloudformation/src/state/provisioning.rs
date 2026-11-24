@@ -247,6 +247,16 @@ mod appsync_resources;
 /// channel namespace's handlers — read from the object the declaration addresses and submitted
 /// as the property whose text they are ([`appsync_s3_documents`]).
 mod appsync_s3_documents;
+/// Reading the Amazon S3 OBJECT a declaration addresses as the text of the property whose
+/// document it is — the one reading a resource PROVIDER of this crate makes of a staged object
+/// ([`staged_object`]); a read made AS THE CALLER is [`crate::state::template_url`]'s.
+mod staged_object;
+/// The OpenAPI definition an api declaration holds in Amazon S3 rather than in the template,
+/// read from the object the declaration addresses and imported as the document it is
+/// ([`apigateway_definitions`]). Visible to the rest of this service's state because BOTH api
+/// types publish that reference and one of the two arms that reads it lives in
+/// [`crate::state::provisioner`].
+pub(in crate::state) mod apigateway_definitions;
 /// Reading a declared property document as the TYPES the owning API models its members as —
 /// the one walk every provisioning arm whose owning model types a member as a number or a
 /// boolean reaches ([`modelled_declaration`]).

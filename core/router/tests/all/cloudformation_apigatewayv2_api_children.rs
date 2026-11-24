@@ -766,12 +766,13 @@ async fn an_api_declared_with_an_inline_definition_is_imported_and_readable() {
     );
 }
 
-/// A definition held in Amazon S3 names an object that has to be FETCHED before any api can
-/// be imported from it, which nothing here does — so the declaration is refused and the
-/// stack rolls back, rather than completing with an api configured differently from what it
-/// declared.
+/// A definition held in Amazon S3 names an object that is READ before any api can be imported
+/// from it, and this suite's router carries no Amazon S3 for that read to reach — so the
+/// declaration fails rather than completing with an api configured differently from what it
+/// declared. What a stack whose object Amazon S3 DOES serve imports, and what a failed read
+/// reports, is `cloudformation_api_definition_in_s3.rs`.
 #[tokio::test]
-async fn an_api_declared_with_a_definition_in_s3_is_refused() {
+async fn an_api_whose_definition_object_cannot_be_read_is_not_created() {
     let router = build_router();
     let case = "an api whose definition is an Amazon S3 object";
     let stack = "cfn-apigwv2-body-s3";
@@ -788,10 +789,11 @@ async fn an_api_declared_with_a_definition_in_s3_is_refused() {
     .to_string();
 
     create_stack(&router, case, stack, &template).await;
-    tokio::time::sleep(PAST_THE_STACK).await;
-
-    let described = describe_stack(&router, case, stack).await;
-    let status = xml_text(&described, "StackStatus").unwrap_or_default();
+    // Polled to a terminal status rather than waited out: what this case waits on is the
+    // create SETTLING, which is the condition the shared reader looks for — not a span of
+    // clock this host may run through at any speed.
+    let (status, described) =
+        crate::cloudformation_completed_stack_output_values::settled_status(&router, stack).await;
     assert!(
         status.contains("ROLLBACK") || status == "CREATE_FAILED",
         "case {case:?}: expected the stack not to complete, got {status:?} in {described}"

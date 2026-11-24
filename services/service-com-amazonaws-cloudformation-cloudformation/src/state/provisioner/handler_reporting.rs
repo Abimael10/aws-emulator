@@ -138,6 +138,21 @@ impl Provisioner {
         if matches!(self, Self::AcmPcaPermission) && code == ACMPCA_VALIDATION_EXCEPTION {
             return super::provisioning::HANDLER_ERROR_SERVICE_FAILED;
         }
+        // The `AWS::ApiGatewayV2::Api` provider reads the definition a declaration holds in
+        // Amazon S3 itself ([`super::provisioning::apigateway_definitions`]), and a read it
+        // could not make is an exception the plugin has no mapping for: the provider
+        // classified that failure itself, and the class it carries as its code is what it is
+        // reported under. Recorded behaviour, read from the reason of the failed resource of a
+        // stack whose api declares an object that is not there (in the behavioral corpus
+        // `simparity-behavioral-aws-v1`, check `apigatewayv2__cloudformation.deploy-\
+        // apigatewayv2-cfn-bodys3location-missing-object-fails-stack`, whose reason closes
+        // `HandlerErrorCode: GeneralServiceException`). Its refusals of a modelled error of
+        // that service keep the class their own codes fall in.
+        if matches!(self, Self::ApiGatewayV2Api)
+            && code == super::provisioning::apigateway_definitions::READ_FAILED
+        {
+            return super::provisioning::HANDLER_ERROR_SERVICE_FAILED;
+        }
         // Each `AWS::AmplifyUIBuilder::*` provider maps none of Amplify UI Builder's
         // validation refusals either — an entity name that service does not accept is one —
         // and the plugin those three providers are written against falls back to its own

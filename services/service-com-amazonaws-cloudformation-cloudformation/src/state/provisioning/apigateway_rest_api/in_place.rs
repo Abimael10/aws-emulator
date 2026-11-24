@@ -126,7 +126,8 @@ const ENDPOINT_MEMBERS: &[(&str, &str, bool)] = &[
 /// The scalar configuration and the endpoint configuration are `UpdateRestApi` patches; a
 /// changed DEFINITION is `PutRestApi`, the call that puts a definition on an api that already
 /// has one, under the `Mode` the declaration states; and the tags are that service's own
-/// tagging calls, which address the api by ARN.
+/// tagging calls, which address the api by ARN. A definition the declaration holds in Amazon
+/// S3 is put on the api the same way, from the document the object it addresses holds.
 async fn update_rest_api(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -141,6 +142,7 @@ async fn update_rest_api(
             REST_API_MEDIA_TYPES.0,
             "EndpointConfiguration",
             REST_API_BODY,
+            REST_API_BODY_S3_LOCATION,
             REST_API_MODE,
             "Tags",
         ])
@@ -178,13 +180,31 @@ async fn update_rest_api(
         }
     }
     let api_id = own_id(resource)?.to_string();
+    // The definition a declaration holding it in Amazon S3 states, read from the object its
+    // reference addresses. The read is made for a reference the declaration CHANGED, which is
+    // the only change to such a definition a template states: the document is the object's,
+    // and the api already has the one the stored reference addressed.
+    let reference_before = stated_property(&resource.properties, REST_API_BODY_S3_LOCATION);
+    let reference_now = stated_property(declared, REST_API_BODY_S3_LOCATION);
+    let read = match reference_now.filter(|now| reference_before != Some(*now)) {
+        Some(location) if stated_property(declared, REST_API_BODY).is_none() => Some(Value::String(
+            super::super::apigateway_definitions::read_definition(ctx, region, location).await?,
+        )),
+        _ => None,
+    };
     // Everything this change CANNOT express is decided BEFORE the first call: a declaration
     // that drops the definition takes nothing off the api (that call puts a document on one,
     // and there is none to put), so it is reported as not applied with the api untouched
     // rather than after half of the change has landed.
     let definition_before = stated_property(&resource.properties, REST_API_BODY);
-    let definition_now = stated_property(declared, REST_API_BODY);
-    if definition_now.is_none() && definition_before.is_some() {
+    let definition_now = read
+        .as_ref()
+        .or_else(|| stated_property(declared, REST_API_BODY));
+    // The declaration no longer states the definition it was deployed with: an inline one it
+    // dropped, or a reference it dropped.
+    let dropped_inline = definition_before.is_some();
+    let dropped_reference = reference_before.is_some() && reference_now.is_none();
+    if definition_now.is_none() && (dropped_inline || dropped_reference) {
         return Ok(None);
     }
     if !patches.is_empty() {
