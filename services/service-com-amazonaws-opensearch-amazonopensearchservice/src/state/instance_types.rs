@@ -1655,9 +1655,14 @@ pub fn data_node_count_refusal(cluster: Option<&ClusterConfig>) -> Option<Valida
 }
 
 /// The numbers of Availability Zones a zone-aware cluster's data nodes are spread across,
-/// as words, for the sentence a refusal states: `ZoneAwarenessConfig$AvailabilityZoneCount`
-/// publishes "valid values are `2` and `3`", and the service names the count in words
-/// rather than in digits where it says how many nodes such a deployment takes.
+/// as words, for the sentences the refusals below state:
+/// `ZoneAwarenessConfig$AvailabilityZoneCount` publishes "valid values are `2` and `3`", and
+/// the service names the count in words rather than in digits where it says how many nodes
+/// such a deployment takes.
+///
+/// Each entry carries the count, that count as a word, and the STEP the node count of a
+/// deployment in that many zones goes up in — the requirement a cluster running at least one
+/// node per zone but not a whole number of them per zone is held to.
 const ZONE_COUNT_WORDS: [(i32, &str, &str); 2] =
     [(2, "two", "an even number of"), (3, "three", "a multiple of three")];
 
@@ -1724,33 +1729,49 @@ pub fn zone_count_refusal(cluster: Option<&ClusterConfig>) -> Option<ValidationE
 }
 
 /// Whether the data nodes `cluster` runs can be spread across the Availability Zones it
-/// asks to be placed in, and the refusal naming the count that deployment takes otherwise.
+/// asks to be placed in, and the refusal stating the requirement it breaks otherwise.
 ///
 /// `ClusterConfig$ZoneAwarenessEnabled` "indicates whether multiple Availability Zones are
 /// enabled", and the service spreads the cluster's data nodes EVENLY across those zones
-/// ([`super::nodes_per_zone`]) — so a zone-aware cluster runs a number of data nodes that
-/// divides by the number of zones it is placed in, and one that does not describes a
-/// deployment the service cannot provision. The request is refused rather than stored, with
-/// the sentence the service states for that number of zones ([`ZONE_COUNT_WORDS`]).
+/// ([`super::nodes_per_zone`]) — so a zone-aware cluster runs a whole number of data nodes
+/// per zone, and one that does not describes a deployment the service cannot provision. The
+/// request is refused rather than stored, stating the requirement the count is outside of:
+/// the FLOOR for a cluster running fewer nodes than it is placed in zones — one zone of such
+/// a deployment would hold no data node at all — and the STEP
+/// ([`ZONE_COUNT_WORDS`]) for one that runs at least one per zone but not a whole number of
+/// them. Both sentences name the zone count in words, as the service states them.
 ///
 /// `InstanceCount` is "number of data nodes in the cluster", so it is the count judged.
 /// `None` for a cluster that asks for no zone awareness (one zone holds any number of
 /// nodes), for one whose zone count is not a supported one ([`zone_count_refusal`] refuses
 /// that count itself), and for one that names no data-node count at all — that names no
-/// number of nodes to spread, and the member's absence is not this rule's to refuse.
+/// number of nodes to spread, and the member's absence is not this rule's to refuse. `None`
+/// too for a cluster asking for a STANDBY zone: that deployment's own published requirement
+/// states the spread ([`multi_az_with_standby_refusal`]), so this rule does not speak over
+/// it.
 pub fn zone_awareness_refusal(cluster: Option<&ClusterConfig>) -> Option<ValidationException> {
     let cluster = cluster?;
+    if cluster.multi_az_with_standby_enabled == Some(true) {
+        return None;
+    }
     let zones = requested_zone_count(cluster)?;
     let nodes = cluster.instance_count?;
     if nodes > 0 && nodes % zones == 0 {
         return None;
     }
-    let (_, zones_word, nodes_word) = ZONE_COUNT_WORDS
+    let (_, zones_word, step) = ZONE_COUNT_WORDS
         .into_iter()
         .find(|(count, _, _)| *count == zones)?;
+    // Fewer nodes than zones is outside the FLOOR rather than off the step: what the caller
+    // has to raise the count to is one node per zone, so that is what the sentence names.
+    let requirement = if nodes < zones {
+        format!("a minimum of {zones_word}")
+    } else {
+        step.to_string()
+    };
     Some(ValidationException {
         message: Some(format!(
-            "You must choose {nodes_word} data nodes for a {zones_word} Availability Zone \
+            "You must choose {requirement} data nodes for a {zones_word} Availability Zone \
              deployment"
         )),
     })
@@ -2071,16 +2092,33 @@ fn standby_zone_requirement() -> i32 {
     *super::ZONE_COUNT_RANGE.end()
 }
 
-/// Whether `cluster` is placed in the Availability Zones a standby zone takes, and the
-/// refusal naming that requirement otherwise.
+/// The requirement a standby deployment's data-node count is published with: the count has
+/// to be a whole number of nodes per Availability Zone the domain is configured for.
+///
+/// FIXED text, stating the rule rather than the configuration that broke it — the sentence
+/// interpolates neither the zone count nor the node count the request carried, unlike the
+/// per-zone-count sentences a deployment without a standby is refused with
+/// ([`zone_awareness_refusal`]).
+const STANDBY_DATA_NODES_PER_ZONE: &str = "The number of data nodes must be a multiple of \
+                                           the number of Availability Zones configured for \
+                                           the domain.";
+
+/// Whether `cluster` is placed in the Availability Zones a standby zone takes AND runs a
+/// data-node count that deployment admits, and the refusal naming the requirement it breaks
+/// otherwise.
 ///
 /// A standby zone is one of the domain's own zones held in reserve, so a cluster asking
 /// for one has to be zone-aware across [`standby_zone_requirement`] zones: one that asks
 /// for a standby without zone awareness at all — a single-zone deployment, whatever its
 /// node count — or with fewer zones than that describes a topology the service does not
-/// provision, and the request is refused rather than stored. How the data nodes are
-/// spread across those zones is the rule above ([`zone_awareness_refusal`]), and the
-/// create and the update paths apply both alike.
+/// provision, and the request is refused rather than stored.
+///
+/// Placed in those zones, its data nodes are spread across them the same way every
+/// zone-aware cluster's are, and the count is held to the requirement this deployment is
+/// published with ([`STANDBY_DATA_NODES_PER_ZONE`]) rather than to the per-zone-count
+/// sentences [`zone_awareness_refusal`] states — which is why that rule steps aside for a
+/// cluster asking for a standby and the spread of such a cluster is judged here. The create
+/// and the update paths apply both alike.
 pub fn multi_az_with_standby_refusal(
     cluster: Option<&ClusterConfig>,
 ) -> Option<ValidationException> {
@@ -2089,14 +2127,22 @@ pub fn multi_az_with_standby_refusal(
         return None;
     }
     let required = standby_zone_requirement();
-    if requested_zone_count(cluster) == Some(required) {
+    if requested_zone_count(cluster) != Some(required) {
+        return Some(ValidationException {
+            message: Some(format!(
+                "You must enable zone awareness with {required} Availability Zones to use \
+                 Multi-AZ with Standby."
+            )),
+        });
+    }
+    // A count the request does not carry asks for the service's own default rather than for
+    // a spread to judge, exactly as it does for a cluster without a standby.
+    let nodes = cluster.instance_count?;
+    if nodes > 0 && nodes % required == 0 {
         return None;
     }
     Some(ValidationException {
-        message: Some(format!(
-            "You must enable zone awareness with {required} Availability Zones to use \
-             Multi-AZ with Standby."
-        )),
+        message: Some(STANDBY_DATA_NODES_PER_ZONE.to_string()),
     })
 }
 

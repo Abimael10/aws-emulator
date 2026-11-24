@@ -831,7 +831,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::zone_awareness_refusal(Some(&merged.cluster_config)),
             // ... and a standby zone is one of the domain's own zones held in reserve, so
             // a change that would leave the cluster asking for a standby without the
-            // zones that takes is refused for the same reason the create path refuses it.
+            // zones that takes, or with a data-node count that deployment's published
+            // requirement does not admit, is refused for the same reason the create path
+            // refuses it.
             crate::state::multi_az_with_standby_refusal(Some(&merged.cluster_config)),
             // ... and the daily automated snapshot is taken at an hour of the day, so a
             // change naming a value that is no hour is refused for the same reason the

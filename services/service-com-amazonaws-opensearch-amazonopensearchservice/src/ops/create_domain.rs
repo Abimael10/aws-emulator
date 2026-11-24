@@ -617,7 +617,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::zone_count_refusal(input.cluster_config.as_ref()),
             crate::state::zone_awareness_refusal(input.cluster_config.as_ref()),
             // ... and a standby zone is one of the domain's own zones held in reserve, so
-            // a cluster asking for one has to be placed in the zones that takes
+            // a cluster asking for one has to be placed in the zones that takes, with a
+            // data-node count that deployment's published requirement admits
             // ([`crate::state::multi_az_with_standby_refusal`]), by the same rule the
             // update path applies.
             crate::state::multi_az_with_standby_refusal(input.cluster_config.as_ref()),
