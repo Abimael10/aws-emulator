@@ -1038,3 +1038,146 @@ async fn a_created_task_reports_the_feature_toggles_the_service_applied() {
         );
     }
 }
+
+/// The `OutputFormat` values the model enumerates, from `smithy_query(query="shape",
+/// shape="OutputFormat")`: `alaw | json | mp3 | mulaw | ogg_opus | ogg_vorbis | pcm`,
+/// each with the suffix its output object carries. These are the three the shared table
+/// above does not drive — and none of them is the format the recorded case named.
+const REMAINING_OUTPUT_FORMATS: &[(&str, &str)] = &[
+    ("ogg_vorbis", "ogg"),
+    ("alaw", "alaw"),
+    ("mulaw", "mulaw"),
+];
+
+/// One row per remaining output format, each also differing in the Region the call is
+/// signed for, the voice, the engine, the text type and the key prefix — so what the
+/// rows share is only that a task is being started, not the shape of one request.
+fn rows_over_the_remaining_formats() -> Vec<(String, &'static str, &'static str, serde_json::Value)>
+{
+    // Region, voice, engine (None leaves the request's own default), text type and key
+    // prefix, zipped with the formats above.
+    let shapes: &[(&str, &str, Option<&str>, &str, &str)] = &[
+        ("us-east-1", "Matthew", None, "text", "vorbis/"),
+        ("eu-west-1", "Joanna", Some("neural"), "text", ""),
+        ("us-west-2", "Aditi", None, "ssml", "telephony-"),
+    ];
+    REMAINING_OUTPUT_FORMATS
+        .iter()
+        .zip(shapes)
+        .map(|((format, suffix), (region, voice, engine, text_type, key_prefix))| {
+            let mut request = serde_json::json!({
+                "Text": match *text_type {
+                    "ssml" => "<speak>Hello there.</speak>",
+                    _ => "Hello from the emulator.",
+                },
+                "VoiceId": voice,
+                "OutputFormat": format,
+                "OutputS3BucketName": OUTPUT_BUCKET,
+            });
+            if *text_type == "ssml" {
+                request["TextType"] = serde_json::json!(text_type);
+            }
+            if let Some(engine) = engine {
+                request["Engine"] = serde_json::json!(engine);
+            }
+            if !key_prefix.is_empty() {
+                request["OutputS3KeyPrefix"] = serde_json::json!(key_prefix);
+            }
+            (
+                format!("a {format} task started in {region} as {text_type}"),
+                *region,
+                *suffix,
+                request,
+            )
+        })
+        .collect()
+}
+
+/// RULE, over the rest of the format catalog and on the RAW WIRE: the task-creation
+/// response serializes the SDK feature toggle list unconditionally — a list member,
+/// empty when the request turns no toggle on — whatever the request asks for, and it is
+/// in the BYTES the service answers with rather than something a model-driven decoder
+/// supplies, which is what a client comparing the raw body against an AWS capture reads.
+/// Nothing else about the envelope moves: the modelled member set is exactly the one the
+/// request has values for, the output location still names the requested format's own
+/// suffix, and the task read still reports the modelled members alone.
+#[tokio::test]
+async fn the_wire_body_of_a_created_task_carries_the_toggle_list_for_every_output_format() {
+    let polly = Polly::new();
+    for (case, region, suffix, request) in rows_over_the_remaining_formats() {
+        let response = start(&polly, region, &request).await;
+        assert_eq!(
+            response.status(),
+            200,
+            "case {case:?}: the task must be created, body {:?}",
+            json(&response)
+        );
+
+        // On the wire: the member's NAME is in the bytes the service wrote.
+        let raw = String::from_utf8_lossy(response.body()).to_string();
+        assert!(
+            raw.contains(&format!("\"{TOGGLES_MEMBER}\"")),
+            "case {case:?}: the creation body must carry {TOGGLES_MEMBER} on the wire, \
+             got {raw:?}"
+        );
+
+        let body = json(&response);
+        let reported = body["SynthesisTask"]
+            .as_object()
+            .unwrap_or_else(|| panic!("case {case:?}: no SynthesisTask object in {body}"))
+            .clone();
+        assert_eq!(
+            reported.get(TOGGLES_MEMBER),
+            Some(&serde_json::json!([])),
+            "case {case:?}: the created task must report an empty {TOGGLES_MEMBER} list, \
+             got {:?}",
+            reported.get(TOGGLES_MEMBER)
+        );
+        let carried: BTreeSet<&str> = reported.keys().map(String::as_str).collect();
+        let expected = expected_members(&request);
+        assert_eq!(
+            carried, expected,
+            "case {case:?}: wrong member set, got {carried:?}, expected {expected:?}"
+        );
+
+        // The modelled members the extra one sits beside are unaffected: the location
+        // still addresses the object of the requested format under the requested prefix.
+        let task_id = reported["TaskId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no TaskId in {reported:?}"))
+            .to_string();
+        let announced = reported["OutputUri"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no OutputUri in {reported:?}"))
+            .to_string();
+        let key_prefix = request["OutputS3KeyPrefix"].as_str().unwrap_or_default();
+        let tail = format!("/{OUTPUT_BUCKET}/{key_prefix}{task_id}.{suffix}");
+        assert!(
+            announced.ends_with(&tail),
+            "case {case:?}: the location must address {tail:?}, got {announced:?}"
+        );
+
+        // The task READ reports the modelled members alone.
+        let read = get_task(&polly, &task_id).await;
+        assert_eq!(
+            read.status(),
+            200,
+            "case {case:?}: the started task must read back, body {:?}",
+            json(&read)
+        );
+        let read_body = json(&read);
+        let read_task = &read_body["SynthesisTask"];
+        assert!(
+            read_task.get(TOGGLES_MEMBER).is_none(),
+            "case {case:?}: a task read must report no {TOGGLES_MEMBER}, got {:?}",
+            read_task.get(TOGGLES_MEMBER)
+        );
+        assert_eq!(
+            read_task["OutputUri"].as_str(),
+            Some(announced.as_str()),
+            "case {case:?}: the read must report the location the creation announced, \
+             got {:?}",
+            read_task["OutputUri"].as_str()
+        );
+    }
+}
