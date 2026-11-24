@@ -3,21 +3,24 @@
 //! End-to-end tests for what `CreateUser` answers every caller that issues the SAME user
 //! pool create at the same time.
 //!
-//! RULE: a `(UserName, AuthenticationType)` identity is allocated AT MOST ONCE — the
-//! lookup and the insert happen under one lock, so of any number of identical creates in
-//! flight together EXACTLY ONE allocates the username and every other is refused
-//! `ResourceAlreadyExistsException` (400) as a name that is taken, and the pool afterwards
-//! reports exactly one enabled user for that identity, built from the record the winning
-//! create allocated. Nothing about the request's own shape decides this: it holds whatever
-//! form the user name takes, however many callers issue the create, and whichever other
-//! identities are being allocated beside it.
+//! RULE: an `(AuthenticationType, UserName)` identity is allocated AT MOST ONCE, and
+//! allocating it takes a moment — the create that claims the username holds the claim while
+//! the record is written. A create that arrives while the allocation of exactly the user it
+//! asks for is still running therefore conflicts with nothing: it joins that allocation and
+//! is answered the same empty result, so creates of one user issued together are ALL
+//! answered HTTP 200 and the pool afterwards holds exactly one enabled user for the
+//! identity, built from the record they allocated. A create that asks for a DIFFERENT user
+//! under that identity does conflict: it is refused `ResourceAlreadyExistsException` (400)
+//! with AWS's sentence, as is every create issued once the allocation has settled — which
+//! the sibling suites [`crate::user_allocation_window`] and [`crate::user_duplicate_create`]
+//! span over a settled pool.
 //!
 //! The rows differ along what the rule generalises over: the form and the length of the
 //! user name (an ASCII email address, a tagged address, non-ASCII letters, a bare name, a
 //! name carrying a symbol, the longest name the member admits), how many callers issue the
-//! create together (one, a pair, several, a dozen), what those identical creates carry
-//! beside the identity (nothing, a suppressed welcome email, one name, both names), and
-//! how many identities are raced side by side.
+//! create together (one, a pair, several, a dozen), what those creates carry beside the
+//! identity (nothing, a suppressed welcome email, one name, both names), whether they ask
+//! for the same user or for different ones, and how many identities are raced side by side.
 //!
 //! Every case drives the awsJson1_1 front door through the shared
 //! [`Emulator`](crate::stack_fleet_lifecycle::Emulator) harness, so what is exercised is
@@ -37,48 +40,9 @@ use crate::stack_fleet_lifecycle::{error_code, Emulator};
 /// what the service states rather than a copy of it.
 const ALREADY_EXISTS: &str = state::USER_ALREADY_EXISTS_MESSAGE;
 
-/// Assert the answers `answers` carry exactly one allocation of the identity and that every
-/// other caller was refused as a username that is taken.
-fn assert_one_allocation(case: &str, racers: usize, answers: &[(u16, Value)]) {
-    assert_eq!(
-        answers.len(),
-        racers,
-        "case {case:?}: every caller must be answered, got {answers:?}"
-    );
-    let mut allocated = 0_usize;
-    for (status, payload) in answers {
-        if *status == 200 {
-            allocated += 1;
-            assert_eq!(
-                payload,
-                &json!({}),
-                "case {case:?}: the modelled result carries no members, got {payload}"
-            );
-            continue;
-        }
-        assert_eq!(
-            *status, 400,
-            "case {case:?}: a create is either answered 200 or refused 400, got {status} \
-             {payload}"
-        );
-        assert_eq!(
-            error_code(payload),
-            "ResourceAlreadyExistsException",
-            "case {case:?}: a create that lost the allocation must be refused as a username \
-             that is taken, got {payload}"
-        );
-        assert_eq!(
-            payload.get("Message").and_then(Value::as_str),
-            Some(ALREADY_EXISTS),
-            "case {case:?}: expected AWS's sentence {ALREADY_EXISTS:?}, got {payload}"
-        );
-    }
-    assert_eq!(
-        allocated, 1,
-        "case {case:?}: exactly one of the {racers} creates must allocate the identity, got \
-         {allocated}"
-    );
-}
+/// The wire error code a create of a taken username answers, one of `CreateUser`'s
+/// modelled errors (`smithy_query(query="operation", operation="CreateUser")`).
+const ALREADY_EXISTS_CODE: &str = "ResourceAlreadyExistsException";
 
 /// The only authentication type the user pool operations manage, which
 /// `CreateUser.AuthenticationType` documents as "You must specify USERPOOL".
@@ -101,8 +65,8 @@ fn create_request(user_name: &str, extra: &Value) -> Value {
     request
 }
 
-/// Issue every request at once and answer what each of them was answered, in no
-/// particular order.
+/// Issue every request at once and answer what each of them was answered, in the order the
+/// requests were given.
 async fn issued_together(emulator: &Arc<Emulator>, requests: Vec<Value>) -> Vec<(u16, Value)> {
     let mut issued = Vec::with_capacity(requests.len());
     for request in requests {
@@ -141,6 +105,38 @@ async fn reported(emulator: &Emulator, case: &str, user_name: &str) -> Vec<Value
         .into_iter()
         .filter(|user| user.get("UserName").and_then(Value::as_str) == Some(user_name))
         .collect()
+}
+
+/// Assert one answer is the empty success.
+fn assert_empty_success(case: &str, status: u16, payload: &Value) {
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the create must be answered the empty success, got {status} {payload}"
+    );
+    assert_eq!(
+        payload,
+        &json!({}),
+        "case {case:?}: the modelled result carries no members, got {payload}"
+    );
+}
+
+/// Assert one answer is the refusal of a username that is taken.
+fn assert_refused_as_taken(case: &str, status: u16, payload: &Value) {
+    assert_eq!(
+        status, 400,
+        "case {case:?}: a create is either answered 200 or refused 400, got {status} {payload}"
+    );
+    assert_eq!(
+        error_code(payload),
+        ALREADY_EXISTS_CODE,
+        "case {case:?}: a create that asks for another user under a taken username must be \
+         refused as a name that is taken, got {payload}"
+    );
+    assert_eq!(
+        payload.get("Message").and_then(Value::as_str),
+        Some(ALREADY_EXISTS),
+        "case {case:?}: expected AWS's sentence {ALREADY_EXISTS:?}, got {payload}"
+    );
 }
 
 /// One row of the race table: how the identity is named, how many callers issue the create
@@ -222,14 +218,21 @@ fn races() -> Vec<Race> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn identical_creates_issued_together_allocate_the_identity_exactly_once() {
+async fn identical_creates_issued_together_are_all_answered_the_empty_success() {
     for row in races() {
         let case = row.case;
         let emulator = Arc::new(Emulator::in_region(REGION));
         let request = create_request(&row.user_name, &row.extra);
         let answers = issued_together(&emulator, vec![request; row.racers]).await;
 
-        assert_one_allocation(case, row.racers, &answers);
+        assert_eq!(
+            answers.len(),
+            row.racers,
+            "case {case:?}: every caller must be answered, got {answers:?}"
+        );
+        for (status, payload) in &answers {
+            assert_empty_success(case, *status, payload);
+        }
     }
 }
 
@@ -290,11 +293,142 @@ async fn creates_issued_together_allocate_one_enabled_user_for_the_identity() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_issued_once_the_burst_has_been_answered_is_refused_as_a_taken_username() {
+    // However many creates allocated the identity together, the allocation has settled by
+    // the time they were all answered: a create issued afterwards claims a username that is
+    // taken, and the pool is left exactly as the burst allocated it.
+    for row in races() {
+        let case = row.case;
+        let emulator = Arc::new(Emulator::in_region(REGION));
+        let request = create_request(&row.user_name, &row.extra);
+        issued_together(&emulator, vec![request.clone(); row.racers]).await;
+        let allocated = reported(&emulator, case, &row.user_name).await;
+
+        let (status, payload) = emulator.call("CreateUser", request).await;
+        assert_refused_as_taken(case, status, &payload);
+
+        let after = reported(&emulator, case, &row.user_name).await;
+        assert_eq!(
+            after, allocated,
+            "case {case:?}: the refused create must leave the stored user exactly as the \
+             burst allocated it, got {after:?}"
+        );
+    }
+}
+
+/// One row of the conflicting-burst table: what each create issued together carries beside
+/// the one identity they all name. They do not all ask for the same user, so they do not
+/// all join one allocation.
+struct Conflicting {
+    case: &'static str,
+    user_name: &'static str,
+    /// What each caller carries beside the identity, one entry per caller.
+    carried: Vec<Value>,
+}
+
+/// The conflicting-burst table. The rows differ along what the rule generalises over: how
+/// many callers disagree, which attribute they disagree on, whether one of them names an
+/// attribute the others leave out, and how many of them agree with each other.
+fn conflicting_bursts() -> Vec<Conflicting> {
+    vec![
+        Conflicting {
+            case: "two callers, different first names",
+            user_name: "disagreeing.pair@example.com",
+            carried: vec![json!({ "FirstName": "Ada" }), json!({ "FirstName": "Augusta" })],
+        },
+        Conflicting {
+            case: "three callers, each a different last name",
+            user_name: "disagreeing.trio@example.com",
+            carried: vec![
+                json!({ "LastName": "Lovelace" }),
+                json!({ "LastName": "Byron" }),
+                json!({ "LastName": "Hopper" }),
+            ],
+        },
+        Conflicting {
+            case: "one caller names an attribute the others leave out",
+            user_name: "ユーザー@example.com",
+            carried: vec![
+                json!({}),
+                json!({}),
+                json!({ "FirstName": "Grace" }),
+                json!({}),
+            ],
+        },
+        Conflicting {
+            case: "two groups of callers, each agreeing with itself",
+            user_name: "two.groups",
+            carried: vec![
+                json!({ "FirstName": "Ada", "LastName": "Lovelace" }),
+                json!({ "FirstName": "Grace", "LastName": "Hopper" }),
+                json!({ "FirstName": "Ada", "LastName": "Lovelace" }),
+                json!({ "FirstName": "Grace", "LastName": "Hopper" }),
+            ],
+        },
+    ]
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn creates_issued_together_for_different_users_allocate_the_identity_once() {
+    for row in conflicting_bursts() {
+        let case = row.case;
+        let emulator = Arc::new(Emulator::in_region(REGION));
+        let requests: Vec<Value> = row
+            .carried
+            .iter()
+            .map(|extra| create_request(row.user_name, extra))
+            .collect();
+        let answers = issued_together(&emulator, requests).await;
+        assert_eq!(
+            answers.len(),
+            row.carried.len(),
+            "case {case:?}: every caller must be answered, got {answers:?}"
+        );
+
+        // The identity is allocated once: the pool holds one user for the name.
+        let stored = reported(&emulator, case, row.user_name).await;
+        assert_eq!(
+            stored.len(),
+            1,
+            "case {case:?}: the identity must be allocated exactly once, got {stored:?}"
+        );
+        let user = &stored[0];
+
+        // Every caller is answered the empty success or the taken-username refusal, and
+        // every caller answered success asked for exactly the user the pool holds — a
+        // success is never reported for a user that was not allocated.
+        let mut allocated = 0_usize;
+        for (extra, (status, payload)) in row.carried.iter().zip(&answers) {
+            let case = format!("{case}, caller carrying {extra}");
+            if *status == 200 {
+                allocated += 1;
+                assert_empty_success(&case, *status, payload);
+                for member in ["FirstName", "LastName"] {
+                    assert_eq!(
+                        user.get(member),
+                        extra.get(member),
+                        "case {case:?}: a caller answered success must have asked for the \
+                         user the pool holds, expected {member} {:?}, got {user:?}",
+                        extra.get(member)
+                    );
+                }
+                continue;
+            }
+            assert_refused_as_taken(&case, *status, payload);
+        }
+        assert!(
+            allocated >= 1,
+            "case {case:?}: the first of them must allocate the identity, got {answers:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn identities_raced_side_by_side_are_each_allocated_exactly_once() {
     // Rows: how many identities are created at once, and how many callers race each of
-    // them. The allocation is per identity: exactly one create per name allocates it, the
-    // others are refused, and the pool holds one enabled user per name — never one user for
-    // the whole batch.
+    // them. The allocation is per identity: the callers of one name are all answered the
+    // empty success, and the pool holds one enabled user per name — never one user for the
+    // whole batch.
     for (identities, racers) in [(2_usize, 2_usize), (4, 3), (8, 2)] {
         let case = format!("{identities} identities raced by {racers} caller(s) each");
         let emulator = Arc::new(Emulator::in_region(REGION));
@@ -308,30 +442,8 @@ async fn identities_raced_side_by_side_are_each_allocated_exactly_once() {
             requests.extend(std::iter::repeat_n(request, racers));
         }
         let answers = issued_together(&emulator, requests).await;
-        let allocated = answers
-            .iter()
-            .filter(|(status, _)| *status == 200)
-            .count();
-        assert_eq!(
-            allocated, identities,
-            "case {case:?}: one create per identity must allocate it, got {allocated} of \
-             {identities} from {answers:?}"
-        );
         for (status, payload) in &answers {
-            if *status == 200 {
-                continue;
-            }
-            assert_eq!(
-                *status, 400,
-                "case {case:?}: a create is either answered 200 or refused 400, got {status} \
-                 {payload}"
-            );
-            assert_eq!(
-                error_code(payload),
-                "ResourceAlreadyExistsException",
-                "case {case:?}: a create that lost its identity's allocation must be refused \
-                 as a username that is taken, got {payload}"
-            );
+            assert_empty_success(&case, *status, payload);
         }
 
         for name in &names {

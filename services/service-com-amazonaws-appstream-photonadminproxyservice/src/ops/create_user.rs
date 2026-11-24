@@ -4,10 +4,15 @@
 //! IMPLEMENTED: allocates the `(AuthenticationType, UserName)` identity in the account's
 //! user pool by persisting a [`crate::state::UserRecord`], so a later `DescribeUsers`
 //! reports that user with the ARN, `CreatedTime` and names this call stored. The identity
-//! is allocated AT MOST ONCE: a create of a username the pool already holds under that
-//! authentication type asks for a user under a name that is taken and answers
-//! `ResourceAlreadyExistsException` (HTTP 400), whatever else it carries, leaving the
-//! stored user untouched.
+//! is allocated AT MOST ONCE, and allocating it is not instantaneous: the create holds the
+//! claim while the record is written (`crate::state::user_allocation`), and a create of the
+//! username the pool already holds under that authentication type asks for a name that is
+//! taken and answers `ResourceAlreadyExistsException` (HTTP 400), whatever else it carries,
+//! leaving the stored user untouched. A create that arrives while the allocation of exactly
+//! the user it asks for is still running conflicts with nothing: it JOINS that allocation
+//! and is answered the same empty result once it settles, so the identity is still
+//! allocated once. One naming a DIFFERENT user under that identity is refused like any
+//! other claim on a taken username.
 //!
 //! `MessageAction` selects what happens to the welcome email, which this emulator has no
 //! mail plane to send, so no email action is carried out or claimed for any value of it:
@@ -209,36 +214,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::not_implemented("CreateUser"))?;
         let region = crate::state::request_region(ctx.parts());
-        let mut state = state.lock();
 
         // Email addresses are case-sensitive, so the identity is the name exactly as the
         // request spells it, under the authentication type it names.
-        let identity = (input.authentication_type.clone(), input.user_name.clone());
-        if state.users.contains_key(&identity) {
-            // The username is taken: the pool holds a user under this identity, so this
-            // create claims a name that is already allocated, whatever attributes it
-            // carries beside the identity. The lookup and the insert below happen under
-            // one lock, so the pool holds exactly one record per identity and the second
-            // of two creates is the one refused.
-            return Err(CreateUserErrorModeled::ResourceAlreadyExistsException(
-                ResourceAlreadyExistsException {
-                    message: Some(crate::state::USER_ALREADY_EXISTS_MESSAGE.to_string()),
-                },
-            )
-            .into());
-        }
-
-        // The store must not grow per request without a ceiling, so a record past it is
-        // refused with the modelled error AWS uses for an account's limit.
-        if state.users.len() >= crate::state::MAX_RECORDS_PER_STORE {
-            return Err(CreateUserErrorModeled::LimitExceededException(
-                LimitExceededException {
-                    message: Some(crate::state::limit_exceeded_message("users")),
-                },
-            )
-            .into());
-        }
-
+        let identity = crate::state::user_identity(&input.authentication_type, &input.user_name);
         let record = crate::state::UserRecord {
             arn: crate::state::user_arn(&region, &input.authentication_type, &input.user_name),
             user_name: input.user_name.clone(),
@@ -251,7 +230,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_name: input.last_name,
             created_time: crate::state::now(),
         };
-        state.users.insert(identity, record);
+
+        // The lookup and the claim are ONE step under the state's lock
+        // (`state/user_allocation.rs`), so the identity is allocated at most once however
+        // many creates arrive together.
+        let claimed = {
+            let mut guard = state.lock();
+            guard.start_user_allocation(record, ::std::time::Instant::now())
+        };
+        match claimed {
+            // The username is taken: the pool holds a user under this identity, or an
+            // allocation of it for a DIFFERENT user is still running, so this create claims
+            // a name that is already allocated whatever attributes it carries beside the
+            // identity.
+            crate::state::UserAllocation::Taken => {
+                return Err(CreateUserErrorModeled::ResourceAlreadyExistsException(
+                    ResourceAlreadyExistsException {
+                        message: Some(crate::state::USER_ALREADY_EXISTS_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
+            // The store must not grow per request without a ceiling, so a record past it is
+            // refused with the modelled error AWS uses for an account's limit.
+            crate::state::UserAllocation::PoolFull => {
+                return Err(CreateUserErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(crate::state::limit_exceeded_message("users")),
+                    },
+                )
+                .into());
+            }
+            // This create opened the allocation of the user it asked for, or joined the
+            // identical one already running.
+            crate::state::UserAllocation::InProgress => {}
+        }
+
+        // The create is answered once the allocation it opened or joined has settled, so a
+        // success means the pool really holds that user: every caller that was answered can
+        // read it back, and the next create of the username is answered as a name that is
+        // taken. Whichever of them reaches the due instant first writes the record.
+        loop {
+            let due = {
+                let guard = state.lock();
+                guard.user_allocation_due(&identity)
+            };
+            let Some(due) = due else {
+                break;
+            };
+            let now = ::std::time::Instant::now();
+            if due <= now {
+                state.lock().settle_user_allocation(&identity);
+                break;
+            }
+            ::tokio::time::sleep(due - now).await;
+        }
 
         // The modelled result carries no members: what this call allocated is read back
         // through `DescribeUsers`.

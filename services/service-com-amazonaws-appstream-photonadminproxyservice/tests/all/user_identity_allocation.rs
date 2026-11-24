@@ -14,9 +14,11 @@
 //!   create of a username the pool holds is refused `ResourceAlreadyExistsException` (400)
 //!   with AWS's sentence — which states that the username is taken and echoes nothing —
 //!   whatever that create carries, and leaves the stored user exactly as it was;
-//! * creates ISSUED TOGETHER on one identity are serialised on the pool: exactly one of
-//!   them allocates the username, every other is refused as a name that is taken, and the
-//!   pool holds one enabled user for the name afterwards, however many there are;
+//! * creates ISSUED TOGETHER on one identity are serialised on the pool: the identity is
+//!   allocated once, and because allocating it takes a moment, creates of the SAME user
+//!   that arrive while that allocation is still running join it and are all answered the
+//!   empty success, however many there are — the burst is spanned by
+//!   [`crate::user_concurrent_creation`];
 //! * deleting the identity frees the username: a create afterwards allocates it again,
 //!   while a delete of an identity the pool does not hold is refused
 //!   `ResourceNotFoundException` (400) — gone means unusable, not merely unlisted.
@@ -24,7 +26,7 @@
 use serde_json::{json, Value};
 
 use crate::refusal_messages::refusal;
-use crate::stack_fleet_lifecycle::{error_code, Emulator};
+use crate::stack_fleet_lifecycle::Emulator;
 
 /// The only authentication type the user pool operations accept, which both
 /// `CreateUser.AuthenticationType` and `DescribeUsers.AuthenticationType` document as
@@ -201,9 +203,9 @@ async fn an_identity_differing_only_in_capitalisation_is_still_free() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn creates_issued_together_on_one_identity_allocate_it_once() {
     // Rows: how many callers issue the create together, and what each of them carries.
-    // However many of them arrive at once, exactly one allocates the username, the others
-    // are refused as a name that is taken, and the pool holds one enabled user for the
-    // name afterwards.
+    // However many of them arrive at once, they ask for the one user the allocation they
+    // joined is writing, so each of them is answered the empty success and the pool holds
+    // exactly one enabled user for the name afterwards.
     for (racers, extra) in [
         (2_usize, json!({})),
         (6, json!({ "MessageAction": "SUPPRESS" })),
@@ -221,35 +223,19 @@ async fn creates_issued_together_on_one_identity_allocate_it_once() {
                 emulator.call("CreateUser", request).await
             }));
         }
-        let mut allocated = 0_usize;
         for call in issued {
             let (status, payload) = call.await.expect("the racing call completes");
-            if status == 200 {
-                allocated += 1;
-                assert_eq!(
-                    payload,
-                    json!({}),
-                    "case {case:?}: the create that allocated the identity gets the empty \
-                     result, got {payload}"
-                );
-                continue;
-            }
             assert_eq!(
-                status, 400,
-                "case {case:?}: a create is either answered 200 or refused 400, got \
-                 {status} {payload}"
+                status, 200,
+                "case {case:?}: a create of the user being allocated must be answered the \
+                 empty success, got {status} {payload}"
             );
             assert_eq!(
-                error_code(&payload),
-                "ResourceAlreadyExistsException",
-                "case {case:?}: a create that lost the allocation must be refused as a \
-                 username that is taken, got {payload}"
+                payload,
+                json!({}),
+                "case {case:?}: the modelled result carries no members, got {payload}"
             );
         }
-        assert_eq!(
-            allocated, 1,
-            "case {case:?}: exactly one of them must allocate the identity, got {allocated}"
-        );
 
         let stored = user_pool(&emulator, &case).await;
         assert_eq!(
@@ -264,7 +250,8 @@ async fn creates_issued_together_on_one_identity_allocate_it_once() {
             stored[0]
         );
 
-        // And a further create is a claim on a username that is taken.
+        // And once they have all been answered, the allocation has settled: a further
+        // create is a claim on a username that is taken.
         refusal(
             &emulator,
             &case,

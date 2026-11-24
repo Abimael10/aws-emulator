@@ -32,7 +32,7 @@
 use serde_json::{json, Value};
 
 use crate::refusal_messages::refusal;
-use crate::stack_fleet_lifecycle::{assert_error, error_code, Emulator};
+use crate::stack_fleet_lifecycle::{assert_error, Emulator};
 use crate::user_allocation_window::refused_as_a_username_that_is_taken;
 
 /// The account every emulated resource belongs to.
@@ -337,9 +337,13 @@ async fn a_repeat_create_of_an_identity_that_exists_is_refused() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn creates_racing_on_one_identity_allocate_it_exactly_once() {
     // Rows: how many callers race on the same identity, and what each of them carries. The
-    // lookup and the insert happen under one lock, so however many arrive at once exactly
-    // ONE of them allocates the username and every other is refused as a name that is
-    // taken — the pool holds one user for that name afterwards.
+    // lookup and the claim happen under one lock, so however many arrive at once the
+    // username is allocated ONCE; and because allocating it takes a moment, a racer asking
+    // for the user that allocation is writing joins it rather than conflicting with it, so
+    // each of these racers is answered the empty success and the pool holds one user for
+    // that name afterwards. What a create of a user OTHER than the one being allocated is
+    // answered, and what a create after the allocation has settled is answered, are spanned
+    // by `crate::user_concurrent_creation`.
     for (racers, extra) in [
         (2_usize, json!({})),
         (6, json!({ "MessageAction": "SUPPRESS" })),
@@ -363,38 +367,19 @@ async fn creates_racing_on_one_identity_allocate_it_exactly_once() {
                 emulator.call("CreateUser", request).await
             }));
         }
-        let mut allocated = 0_usize;
         for racer in racing {
             let (status, payload) = racer.await.expect("the racing call completes");
-            match status {
-                200 => {
-                    allocated += 1;
-                    assert_eq!(
-                        payload,
-                        json!({}),
-                        "case {case:?}: the racer that allocated the identity gets the empty \
-                         result, got {payload}"
-                    );
-                }
-                _ => {
-                    assert_eq!(
-                        status, 400,
-                        "case {case:?}: a racer is either answered 200 or refused 400, got \
-                         {status} {payload}"
-                    );
-                    assert_eq!(
-                        error_code(&payload),
-                        "ResourceAlreadyExistsException",
-                        "case {case:?}: a losing racer must be refused as a username that is \
-                         taken, got {payload}"
-                    );
-                }
-            }
+            assert_eq!(
+                status, 200,
+                "case {case:?}: a racer asking for the user being allocated must be \
+                 answered the empty success, got {status} {payload}"
+            );
+            assert_eq!(
+                payload,
+                json!({}),
+                "case {case:?}: the modelled result carries no members, got {payload}"
+            );
         }
-        assert_eq!(
-            allocated, 1,
-            "case {case:?}: exactly one racer must allocate the identity, got {allocated}"
-        );
 
         let users = user_pool(&emulator, &case).await;
         assert_eq!(
@@ -710,21 +695,43 @@ async fn a_page_the_read_cannot_answer_with_is_refused() {
 const CEILING: usize =
     service_com_amazonaws_appstream_photonadminproxyservice::state::MAX_RECORDS_PER_STORE;
 
-#[tokio::test]
+/// How many of the ceiling's creates are issued at once while filling the store.
+///
+/// The fill is about the SIZE of the store, not about the order the records are written in,
+/// so the users are created in batches issued together: every one of them is its own
+/// identity, so each is allocated on its own and the ceiling is reached exactly as a
+/// one-at-a-time fill reaches it.
+const FILL_BATCH: usize = 50;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_user_store_refuses_a_user_past_its_ceiling() {
     let case = "users";
-    let emulator = Emulator::new();
-    for index in 0..CEILING {
-        emulator
-            .ok(
-                case,
-                "CreateUser",
-                json!({
-                    "UserName": format!("u{index:05}@example.com"),
-                    "AuthenticationType": USER_POOL,
-                }),
-            )
-            .await;
+    let emulator = std::sync::Arc::new(Emulator::new());
+    for batch in (0..CEILING).step_by(FILL_BATCH) {
+        let mut issued = Vec::with_capacity(FILL_BATCH);
+        for index in batch..(batch + FILL_BATCH).min(CEILING) {
+            let emulator = std::sync::Arc::clone(&emulator);
+            issued.push(tokio::spawn(async move {
+                emulator
+                    .call(
+                        "CreateUser",
+                        json!({
+                            "UserName": format!("u{index:05}@example.com"),
+                            "AuthenticationType": USER_POOL,
+                        }),
+                    )
+                    .await
+            }));
+        }
+        for (offset, create) in issued.into_iter().enumerate() {
+            let index = batch + offset;
+            let (status, payload) = create.await.expect("the create completes");
+            assert_eq!(
+                status, 200,
+                "case {case:?}: user {index} must be allocated below the ceiling, got \
+                 {status} {payload}"
+            );
+        }
     }
 
     assert_error(

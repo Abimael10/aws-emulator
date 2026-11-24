@@ -134,6 +134,28 @@ async fn create_user(emulator: &Emulator, case: &str, name: &str) {
         .await;
 }
 
+/// Create every named user pool user, the users of one batch issued together.
+///
+/// Each name is its own identity, so each is allocated on its own and the pool ends up
+/// holding exactly the users a one-at-a-time setup would create; issuing them together is
+/// what keeps a setup that fills the store from being paced by the allocations.
+async fn create_users(emulator: &std::sync::Arc<Emulator>, case: &'static str, names: &[String]) {
+    const TOGETHER: usize = 50;
+    for batch in names.chunks(TOGETHER) {
+        let mut issued = Vec::with_capacity(batch.len());
+        for name in batch {
+            let emulator = std::sync::Arc::clone(emulator);
+            let name = name.clone();
+            issued.push(tokio::spawn(async move {
+                create_user(&emulator, case, &name).await;
+            }));
+        }
+        for create in issued {
+            create.await.expect("the create completes");
+        }
+    }
+}
+
 /// Run one batch operation and return the `errors` list it reports.
 async fn batch(emulator: &Emulator, case: &str, operation: &str, items: &[Value]) -> Vec<Value> {
     let payload = emulator
@@ -942,10 +964,10 @@ async fn following_next_token_reports_every_association_exactly_once() {
 // The store's ceiling
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_association_store_refuses_an_edge_past_its_ceiling() {
     let case = "user/stack associations";
-    let emulator = Emulator::new();
+    let emulator = std::sync::Arc::new(Emulator::new());
     for stack in ["filled", "spare"] {
         create_stack(&emulator, case, stack).await;
     }
@@ -955,9 +977,7 @@ async fn the_association_store_refuses_an_edge_past_its_ceiling() {
     let names: Vec<String> = (0..CEILING)
         .map(|index| format!("u{index:05}@example.com"))
         .collect();
-    for name in &names {
-        create_user(&emulator, case, name).await;
-    }
+    create_users(&emulator, case, &names).await;
     for chunk in names.chunks(MAX_BATCH) {
         let items: Vec<Value> = chunk
             .iter()

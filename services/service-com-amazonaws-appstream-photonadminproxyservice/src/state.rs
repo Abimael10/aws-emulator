@@ -129,6 +129,7 @@ mod images;
 mod stack_attribute_conflicts;
 mod stack_defaults;
 mod theme_branding;
+mod user_allocation;
 mod vpc_access_endpoints;
 mod wire_refusals;
 
@@ -138,6 +139,7 @@ pub use images::*;
 pub use stack_attribute_conflicts::*;
 pub use stack_defaults::*;
 pub use theme_branding::*;
+pub use user_allocation::*;
 pub use vpc_access_endpoints::*;
 pub use wire_refusals::*;
 
@@ -1866,7 +1868,16 @@ pub struct ComAmazonawsAppstreamPhotonadminproxyserviceState {
     /// Users by `(AuthenticationType, UserName)` — the identity a user pool user is
     /// created under. `BTreeMap` so every page of a read walks a stable order, and so
     /// one authentication type's users form a contiguous range.
-    pub users: BTreeMap<(String, String), UserRecord>,
+    pub users: BTreeMap<UserIdentity, UserRecord>,
+    /// The identities whose allocation is still IN PROGRESS, by the identity being
+    /// allocated: a user a `CreateUser` has claimed the username for and the pool does not
+    /// hold yet. `state/user_allocation.rs` owns what one is and when it settles into
+    /// [`Self::users`]; a read of the pool reports only what that map holds, so a user is
+    /// reported once its allocation has settled and never before.
+    ///
+    /// Counted against [`MAX_RECORDS_PER_STORE`] together with [`Self::users`], since an
+    /// allocation in progress is a record the pool is about to hold.
+    pub pending_users: BTreeMap<UserIdentity, PendingUserAllocation>,
     /// User/stack associations by [`UserStackAssociationKey`] — one edge per user
     /// entitled to one stack, written by `BatchAssociateUserStack` and removed by
     /// `BatchDisassociateUserStack`.
@@ -1906,6 +1917,7 @@ impl Default for ComAmazonawsAppstreamPhotonadminproxyserviceState {
             app_block_builder_app_block_associations: BTreeSet::new(),
             usage_report_subscription: None,
             users: BTreeMap::new(),
+            pending_users: BTreeMap::new(),
             user_stack_associations: BTreeMap::new(),
             entitlements: BTreeMap::new(),
         }
