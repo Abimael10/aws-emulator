@@ -34,6 +34,7 @@ mod burstable_rows;
 mod burstable_xen_rows;
 mod dense_hdd_storage_rows;
 mod eighth_generation_intel_rows;
+mod fifth_generation_intel_rows;
 mod fourth_generation_xen_rows;
 mod general_purpose_nvme_rows;
 mod gpu_rows;
@@ -381,6 +382,12 @@ pub struct PublishedInstanceTypeFacts {
     /// (`NetworkInfo$FlexibleEnaQueuesSupport`), where AWS's answer for the type is its own
     /// rather than the one its hardware generation gives.
     pub flexible_ena_queues_supported: Option<bool>,
+    /// The ENA queues each of the type's network interfaces is given by default
+    /// (`NetworkCardInfo$DefaultEnaQueueCountPerInterface`): a figure of the adapter the type's
+    /// network card carries, which AWS publishes per instance type. A row that publishes none
+    /// leaves the member absent, the way every other member the catalog has no fact for is
+    /// reported absent rather than invented.
+    pub ena_queues_per_interface: Option<i32>,
     /// The most network interfaces it can have attached.
     pub maximum_network_interfaces: Option<i32>,
     /// The most private IPv4 addresses each of those interfaces can have.
@@ -493,6 +500,7 @@ impl PublishedInstanceTypeFacts {
             network_bandwidth_gbps: None,
             bandwidth_weightings: None,
             flexible_ena_queues_supported: None,
+            ena_queues_per_interface: None,
             maximum_network_interfaces: None,
             ipv4_addresses_per_interface: None,
             efa_interfaces: None,
@@ -715,6 +723,13 @@ impl PublishedInstanceTypeFacts {
     /// list of the types offered that says.
     const fn flexible_ena_queues(mut self, supported: bool) -> Self {
         self.flexible_ena_queues_supported = Some(supported);
+        self
+    }
+
+    /// The ENA queues each of the type's interfaces is given by default, as the published
+    /// queue counts of its adapter say.
+    const fn ena_queues(mut self, queues: i32) -> Self {
+        self.ena_queues_per_interface = Some(queues);
         self
     }
 
@@ -4773,7 +4788,8 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
 /// groups — the AMD EPYC families, the accelerated ones, the network optimized ones, the
 /// previous generation ones, the burstable families on Nitro and the one on pre-Nitro
 /// hardware, the dense HDD storage ones, the eighth generation Intel compute optimized ones,
-/// those of them that carry local NVMe devices, the general purpose families with local
+/// the fifth generation Intel general purpose one, those of them that carry local NVMe
+/// devices, the general purpose families with local
 /// NVMe devices, the families whose accelerators are Neuron devices, the compute optimized
 /// families on the newest AWS Graviton hardware, the storage optimized Graviton ones, the
 /// fourth generation families on the Xen hypervisor and the memory optimized ones with local
@@ -4798,6 +4814,7 @@ fn published_rows() -> impl Iterator<Item = &'static PublishedInstanceTypeFacts>
         .chain(burstable_xen_rows::BURSTABLE_XEN_INSTANCE_TYPE_FACTS)
         .chain(dense_hdd_storage_rows::DENSE_HDD_STORAGE_INSTANCE_TYPE_FACTS)
         .chain(eighth_generation_intel_rows::EIGHTH_GENERATION_INTEL_INSTANCE_TYPE_FACTS)
+        .chain(fifth_generation_intel_rows::FIFTH_GENERATION_INTEL_INSTANCE_TYPE_FACTS)
         .chain(fourth_generation_xen_rows::FOURTH_GENERATION_XEN_INSTANCE_TYPE_FACTS)
         .chain(general_purpose_nvme_rows::GENERAL_PURPOSE_NVME_INSTANCE_TYPE_FACTS)
         .chain(memory_optimized_nvme_rows::MEMORY_OPTIMIZED_NVME_INSTANCE_TYPE_FACTS)

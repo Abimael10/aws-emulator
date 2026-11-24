@@ -349,24 +349,37 @@ async fn a_guest_reports_the_cpu_topology_its_launch_asked_for() {
 /// ([`READING_PROGRAM`]): a layout published under a label or a path those pipelines do not
 /// find is a layout no licence check or thread-pool sizing inside the guest can read.
 ///
-/// The rows differ along whether the launch turns multithreading off and how many cores it
-/// asks for.
+/// The rows differ along whether the launch turns multithreading off, how many cores it asks
+/// for and the instance type it asks them of: the type the first rows launch takes its cores
+/// two at a time, which is what the catalog publishes for its family, so the single-core row
+/// asks a memory optimized type of the same generation, whose published core counts include
+/// one.
 #[tokio::test]
 async fn a_guests_own_script_reads_that_layout_with_the_utilities_it_has() {
-    // (case, cores, threads per core)
+    // (case, instance type, cores, threads per core)
     let rows = [
-        ("two cores with multithreading turned off", 2, 1),
-        ("two cores with multithreading left on", 2, 2),
-        ("one core with multithreading turned off", 1, 1),
+        (
+            "two cores with multithreading turned off",
+            INSTANCE_TYPE,
+            2,
+            1,
+        ),
+        ("two cores with multithreading left on", INSTANCE_TYPE, 2, 2),
+        (
+            "one core with multithreading turned off",
+            "r5.2xlarge",
+            1,
+            1,
+        ),
     ];
 
-    for (case, cores, threads_per_core) in rows {
+    for (case, instance_type, cores, threads_per_core) in rows {
         let (router, image_id) = emulator();
         let instance_id = launch(
             &router,
             case,
             &image_id,
-            INSTANCE_TYPE,
+            instance_type,
             READING_PROGRAM,
             &[
                 param("CpuOptions.CoreCount", &cores.to_string()),

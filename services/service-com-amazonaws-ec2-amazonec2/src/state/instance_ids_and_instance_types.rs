@@ -1740,10 +1740,11 @@ pub(super) const PREVIOUS_GENERATION_FAMILIES: [&str; 16] = [
 /// The dense HDD storage family `d2` is on it beside the three the page names, as are the
 /// families the recorded catalog reports as previous generation while still reporting IPv6
 /// addresses per interface for them — the fourth generation general purpose and memory
-/// optimized families and the fifth generation graphics one: those two facts are read apart
+/// optimized families, the fifth generation general purpose one and the fifth generation
+/// graphics one: those two facts are read apart
 /// here the way the doc comment above says.
-pub(super) const IPV6_PREVIOUS_GENERATION_FAMILIES: [&str; 7] =
-    ["c3", "d2", "g5", "i2", "m4", "r3", "r4"];
+pub(super) const IPV6_PREVIOUS_GENERATION_FAMILIES: [&str; 8] =
+    ["c3", "d2", "g5", "i2", "m4", "m5", "r3", "r4"];
 
 /// The families that run on the Nitro System from BEFORE their fifth generation, as the
 /// EC2 User Guide's list of "instances built on the Nitro System" names them. The
@@ -2959,9 +2960,10 @@ pub(super) fn network_performance(baseline_centi: i64, peak_centi: i64) -> Strin
 /// what may be attached to a card: an ordinary network interface, plus the Elastic Fabric
 /// Adapter on a type that is offered one.
 ///
-/// `published_performance` is the network performance AWS publishes for the type, where the
-/// catalog holds it, and `published_bandwidth` is that same published figure in Gbps
-/// ([`crate::state::PublishedInstanceTypeFacts::network_bandwidth_gbps`]). A card reports the
+/// `facts` is the published row the catalog holds for the type, where it holds one: its
+/// network performance as the published table writes that column, that same figure in Gbps
+/// ([`PublishedInstanceTypeFacts::network_bandwidth_gbps`]) and the ENA queues one interface
+/// of the type is given. A card reports the
 /// figures it CARRIES and the text of those same figures, so the two readings of one card
 /// cannot disagree: a card of a type whose row publishes the Gbps figure carries that whole
 /// figure — a card is the instance's network adapter rather than a share of it — and so does
@@ -2974,9 +2976,12 @@ pub(super) fn network_cards(
     cards: i32,
     maximum_network_interfaces: i32,
     efa_interfaces: i32,
-    published_performance: Option<&str>,
-    published_bandwidth: Option<(f64, f64)>,
+    facts: Option<&'static PublishedInstanceTypeFacts>,
 ) -> Vec<NetworkCardInfo> {
+    let published_performance =
+        facts.and_then(PublishedInstanceTypeFacts::published_network_performance);
+    let published_performance = published_performance.as_deref();
+    let published_bandwidth = facts.and_then(|facts| facts.network_bandwidth_gbps);
     let (baseline, peak) = network_bandwidth_centi_gbps(name, sixteenths);
     let count = i64::from(cards.max(1));
     let per_card_baseline = (baseline / count).max(1);
@@ -3010,7 +3015,13 @@ pub(super) fn network_cards(
             additional_flexible_network_interfaces: None,
             baseline_bandwidth_in_gbps: Some(per_card_baseline_gbps),
             peak_bandwidth_in_gbps: Some(per_card_peak_gbps),
-            default_ena_queue_count_per_interface: None,
+            // "The default number of the ENA queues for each interface"
+            // (`NetworkCardInfo$DefaultEnaQueueCountPerInterface`): the figure the catalog
+            // publishes for the type's adapter, and nothing at all for a type whose published
+            // queue counts this emulator does not hold — an absent member rather than an
+            // invented one.
+            default_ena_queue_count_per_interface: facts
+                .and_then(|facts| facts.ena_queues_per_interface),
             maximum_ena_queue_count: None,
             maximum_ena_queue_count_per_interface: None,
             interface_types: Some(interface_types.clone()),
@@ -3153,7 +3164,6 @@ pub fn instance_type_info(instance_type: &str) -> Option<InstanceTypeInfo> {
     // with each other or with the instance.
     let cards = network_card_count(instance_type);
     let published_performance = facts.and_then(PublishedInstanceTypeFacts::published_network_performance);
-    let published_bandwidth = facts.and_then(|facts| facts.network_bandwidth_gbps);
     let (baseline_centi, peak_centi) = network_bandwidth_centi_gbps(&name, sixteenths);
     let instance_store_disks = record
         .instance_storage
@@ -3326,8 +3336,7 @@ pub fn instance_type_info(instance_type: &str) -> Option<InstanceTypeInfo> {
                 cards,
                 record.maximum_network_interfaces,
                 efa_interfaces,
-                published_performance.as_deref(),
-                published_bandwidth,
+                facts,
             )),
             ipv4_addresses_per_interface: Some(record.ipv4_addresses_per_interface),
             // "The maximum number of IPv6 addresses per network interface"

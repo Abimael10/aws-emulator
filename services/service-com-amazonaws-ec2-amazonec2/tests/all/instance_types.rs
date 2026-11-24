@@ -802,12 +802,14 @@ fn a_size_component_is_read_into_sixteenths_only_within_the_published_ladder() {
 // ---------------------------------------------------------------------------
 
 /// The vCPU options one type offers are consistent with its default: its cores times its
-/// threads per core are its vCPUs, `ValidCores` runs from one core up to that default,
-/// and `ValidThreadsPerCore` offers one thread per core only where there is a second
-/// thread to disable.
+/// threads per core are its vCPUs, `ValidCores` runs from one core up to that default for a
+/// type whose family publishes no step of its own, and `ValidThreadsPerCore` offers one thread
+/// per core only where there is a second thread to disable.
 ///
 /// The rows span single-vCPU, single-thread (Graviton, Apple silicon) and two-thread
-/// (Intel, AMD-era) types, at sizes from `nano` to `metal`.
+/// (Intel, AMD-era) types, at sizes from `nano` to `metal`. A family whose published core
+/// counts go up in a step of their own — the fifth generation Intel ladder among them — is
+/// held to that published list by the published-rows suites instead.
 #[tokio::test]
 async fn the_vcpu_options_are_consistent_with_the_default() {
     let (router, _engine) = super::ec2_query::emulator();
@@ -815,8 +817,8 @@ async fn the_vcpu_options_are_consistent_with_the_default() {
         "t3.nano",
         "t2.micro",
         "m5.large",
-        "m5.xlarge",
-        "m5.4xlarge",
+        "r5.xlarge",
+        "r5.4xlarge",
         "m5.metal",
         "c6g.medium",
         "m7g.large",

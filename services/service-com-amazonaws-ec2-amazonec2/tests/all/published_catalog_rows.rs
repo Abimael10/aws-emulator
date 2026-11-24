@@ -540,13 +540,14 @@ async fn every_reported_type_carries_the_whole_member_set() {
     }
 
     // Traffic Mirroring copies a session's packets under the guest, which a bare metal
-    // instance has nothing to do.
+    // instance has nothing to do — unless the catalog publishes that the host's own card does
+    // it for the type anyway, which is read per type rather than off the hypervisor.
     let rows = [
         ("c4.large", "supported"),
         ("t3.micro", "supported"),
         ("x2iedn.32xlarge", "supported"),
         ("x2iedn.metal", "unsupported"),
-        ("m5.metal", "unsupported"),
+        ("m5.metal", "supported"),
     ];
     for (instance_type, expected) in rows {
         let case = instance_type;

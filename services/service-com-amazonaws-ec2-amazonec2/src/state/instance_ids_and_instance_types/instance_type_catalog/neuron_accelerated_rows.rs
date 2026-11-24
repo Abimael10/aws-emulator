@@ -90,6 +90,71 @@ pub(super) static NEURON_ACCELERATED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTyp
         .host_features(false, false)
         .inference(16, "Inferentia", "AWS", 8_192)
         .neurons(16, "Inferentia", 4, 1, 8_192),
+    // Inf2 — inference accelerated on a 3rd generation AMD EPYC host at a sustained 3.6 GHz,
+    // carrying AWS Inferentia2 devices of 32 GiB, each with two NeuronCores of the second
+    // version: one device up to the `8xlarge`, six on the `24xlarge` and the host's whole
+    // twelve on the size that holds it — a count the size multiplier does not give, since two
+    // sizes of the ladder hold the same single device. Its EBS figures are its rows of "Amazon
+    // EBS optimized instance types": the narrowest size publishes a baseline it bursts above,
+    // up to 10,000 Mbps and 40,000 IOPS, and the bandwidth is dedicated from the `8xlarge` up,
+    // reaching 60,000 Mbps and 240,000 IOPS on the whole host. Its network figures are the
+    // size's share of a host that carries 100 Gbps, which the two narrowest sizes burst above
+    // their share up to 15 and 25 Gbps rather than to the ceiling every other family bursts to,
+    // and each interface is given the lesser of the size's vCPUs and the eight queues its
+    // adapter carries.
+    // NO size of the family is offered an Elastic Fabric Adapter, its adapter encrypts traffic
+    // between instances, and CloudWatch action based recovery is not offered on it at all. A
+    // Dedicated Host carries the two sizes that hold at least half of one and not the two
+    // narrower ones, which also publish one attachment fewer than the pool the derivation
+    // counts. Every size but the narrowest takes its cores ALL at once, so the one count it can
+    // be configured with is its default, while the narrowest takes them one at a time.
+    PublishedInstanceTypeFacts::of("inf2.xlarge")
+        .ebs(1_250, 6_000, 10_000, 40_000)
+        .ebs_attachments(26)
+        .network_bandwidth(2.083, 15.0)
+        .ena_queues(4)
+        .efa(0)
+        .processor("AMD", 3.6)
+        .dedicated_hosts(false)
+        .auto_recovery(false)
+        .encryption_in_transit(true)
+        .inference(1, "Inferentia2", "AWS", 32_768)
+        .neurons(1, "Inferentia2", 2, 2, 32_768),
+    PublishedInstanceTypeFacts::of("inf2.8xlarge")
+        .cores_all_at_once()
+        .ebs(10_000, 40_000, 10_000, 40_000)
+        .ebs_attachments(26)
+        .network_bandwidth(16.667, 25.0)
+        .ena_queues(8)
+        .efa(0)
+        .processor("AMD", 3.6)
+        .dedicated_hosts(false)
+        .auto_recovery(false)
+        .encryption_in_transit(true)
+        .inference(1, "Inferentia2", "AWS", 32_768)
+        .neurons(1, "Inferentia2", 2, 2, 32_768),
+    PublishedInstanceTypeFacts::of("inf2.24xlarge")
+        .cores_all_at_once()
+        .ebs(30_000, 120_000, 30_000, 120_000)
+        .network_bandwidth(50.0, 50.0)
+        .ena_queues(8)
+        .efa(0)
+        .processor("AMD", 3.6)
+        .auto_recovery(false)
+        .encryption_in_transit(true)
+        .inference(6, "Inferentia2", "AWS", 32_768)
+        .neurons(6, "Inferentia2", 2, 2, 32_768),
+    PublishedInstanceTypeFacts::of("inf2.48xlarge")
+        .cores_all_at_once()
+        .ebs(60_000, 240_000, 60_000, 240_000)
+        .network_bandwidth(100.0, 100.0)
+        .ena_queues(8)
+        .efa(0)
+        .processor("AMD", 3.6)
+        .auto_recovery(false)
+        .encryption_in_transit(true)
+        .inference(12, "Inferentia2", "AWS", 32_768)
+        .neurons(12, "Inferentia2", 2, 2, 32_768),
     // Trn1 — training accelerated on the 3rd generation Intel Xeon Scalable (Ice Lake) host at
     // a sustained 3.5 GHz, carrying AWS Trainium devices of 32 GiB, each with two NeuronCores
     // of the second version: ONE device on the narrow size and the host's whole sixteen on the
