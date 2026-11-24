@@ -150,6 +150,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The worker types this service runs are a LARGER set than this checkout's model
+        // declares, so `WorkerType` is judged here rather than at the boundary
+        // (`skip_validation` on `JobUpdate`), exactly as the create judges its own
+        // ([`crate::service::worker_types`]). The member path is the one the boundary's walk
+        // spells for a member of the submitted definition.
+        if let Some(message) = crate::service::worker_types::worker_type_refusal(
+            "jobUpdate.workerType",
+            input.job_update.worker_type.as_deref(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // An unreachable store is an internal mounting fault, reported through this
             // operation's own server error, the same way `CreateJob` reports it.
@@ -164,8 +176,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let update = &input.job_update;
 
         // `JobName` is `@required` with `length 1..255`, and `Timeout`'s `range 1..` and
-        // the `JobMode`/`WorkerType`/`ExecutionClass` enums are refused at the boundary —
-        // so the checks here are the ones the MODEL cannot express.
+        // the `JobMode`/`ExecutionClass` enums are refused at the boundary — so the checks
+        // here are the ones the MODEL cannot express, beside the worker type above.
 
         // "The `JobCommand` that runs this job (required)": the submitted definition
         // replaces the stored one whole, so a definition naming no command at all names
@@ -191,8 +203,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .is_none_or(|role| role.trim().is_empty())
         {
             return Err(invalid_input(
-                crate::state::messages::job_definition_member_null("Role"),
+                crate::state::messages::job_definition_member_null_or_empty("Role"),
             ));
+        }
+
+        // The command a definition names needs the script it runs: "Specifies the Amazon
+        // Simple Storage Service (Amazon S3) path to a script that runs a job"
+        // (`JobCommand$ScriptLocation`). The same rule, in the same sentence, the create
+        // holds its own definition to.
+        if let Some(message) = crate::state::script_location_defect(command) {
+            return Err(invalid_input(message));
         }
 
         // "In Spark jobs, `GlueVersion` determines the versions of Apache Spark and Python
@@ -231,6 +251,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_input(
                 crate::state::messages::MAX_CAPACITY_EXCLUDES_WORKERS.to_string(),
             ));
+        }
+
+        // "Instead, you should specify a `Worker type` and the `Number of workers`": the
+        // submitted definition replaces the stored one whole, so a definition that expresses
+        // its capacity as workers has to express BOTH halves of it — one of them alone is half
+        // a capacity and sizes no job. The same rule, in the same sentence, the create holds
+        // its own definition to.
+        if update.worker_type.is_some() != update.number_of_workers.is_some() {
+            return Err(invalid_input(
+                crate::state::messages::WORKER_TYPE_AND_COUNT_TOGETHER.to_string(),
+            ));
+        }
+
+        // A worker configuration is admissible only on a command the service SIZES in workers
+        // ([`crate::state::command_takes_a_worker_configuration`]), the same rule the create
+        // holds its own definition to.
+        if update.worker_type.is_some()
+            && !crate::state::command_takes_a_worker_configuration(command_name)
+        {
+            return Err(invalid_input(
+                crate::state::messages::worker_type_unsupported_for_command(command_name),
+            ));
+        }
+
+        // And a worker configuration states at least as many workers as the service admits
+        // for that worker type, the same floor the create holds its own definition to
+        // ([`crate::state::min_workers_for_worker_type`]).
+        if let (Some(worker_type), Some(workers)) =
+            (update.worker_type.as_deref(), update.number_of_workers)
+        {
+            let floor = crate::state::min_workers_for_worker_type(worker_type);
+            if workers < floor {
+                return Err(invalid_input(
+                    crate::state::messages::worker_count_below_minimum(worker_type, floor),
+                ));
+            }
         }
 
         let region = crate::state::request_region(ctx.parts());

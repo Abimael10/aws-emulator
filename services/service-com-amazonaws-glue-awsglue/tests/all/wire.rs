@@ -180,6 +180,10 @@ pub async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> V
 /// Register one usage profile, with the smallest `Configuration` `CreateUsageProfile` admits
 /// and the `Description` the caller names, if any.
 ///
+/// The job section defaults the worker type beside the worker count, because the two together
+/// are a job's capacity and the service refuses a job configuration that defaults one of them
+/// alone (`crate::usage_profile_job_worker_defaults`).
+///
 /// One copy, shared: every suite that reads usage profiles back stages them the same way, so
 /// the request shape the create is driven with is maintained in one place.
 pub async fn given_usage_profile(
@@ -192,6 +196,7 @@ pub async fn given_usage_profile(
         "Configuration": {
             "JobConfiguration": {
                 "numberOfWorkers": { "DefaultValue": "5", "MinValue": "1", "MaxValue": "10" },
+                "workerType": { "DefaultValue": "G.1X" },
             },
         },
     });

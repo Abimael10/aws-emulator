@@ -234,8 +234,16 @@ from awsglue.blueprint.job import *
 def generate_layout(user_params, system_params):
     workflow_name = user_params["WorkflowName"]
     role = user_params["PassRole"]
-    first = Job(Name="%s_first" % workflow_name, Role=role, Command={"Name": "glueetl"})
-    second = Job(Name="%s_second" % workflow_name, Role=role, Command={"Name": "glueetl"})
+    first = Job(
+        Name="%s_first" % workflow_name,
+        Role=role,
+        Command={"Name": "glueetl", "ScriptLocation": user_params["ScriptLocation"]},
+    )
+    second = Job(
+        Name="%s_second" % workflow_name,
+        Role=role,
+        Command={"Name": "glueetl", "ScriptLocation": user_params["ScriptLocation"]},
+    )
     gate = ConditionalTrigger(
         Name="%s_gate" % workflow_name,
         Predicate=Predicate(

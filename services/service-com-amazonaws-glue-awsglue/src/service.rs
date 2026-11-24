@@ -71,7 +71,8 @@
 //! the body stay as the renderer wrote them.
 
 use service_common::query_error_envelope::{
-    RequestIdEnvelopeDefinition, RequestIdHeaderOperation, RequestIdReportingOperation,
+    RequestIdEnvelopeDefinition, RequestIdHeaderOperation, RequestIdReportedOperation,
+    RequestIdReportingOperation,
 };
 use smithy_server_runtime::{
     http, BoxFuture, ErasedOperation, ErasedServiceDefinition, Operation, OperationContext,
@@ -101,6 +102,15 @@ pub mod partition_indexes;
 #[path = "state/integration_properties.rs"]
 pub mod integration_properties;
 
+/// The predefined worker types this service accepts, and the clause a value outside them is
+/// refused with: the one statement of that value set, which several operations judge a
+/// request against.
+///
+/// Declared from here for the same reason [`partition_indexes`] is, and its source file sits
+/// with the rest of this service's state.
+#[path = "state/worker_types.rs"]
+pub mod worker_types;
+
 /// The `com-amazonaws-glue-awsglue` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -126,6 +136,12 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// and names the request its response answers. Held, not built per request:
     /// `override_operation` hands back a borrow of it.
     request_id: RequestIdHeaderOperation,
+    /// Serves the operations this service answers in the REST/JSON MEDIA TYPE
+    /// ([`REST_JSON_MEDIA_TYPE_OPERATIONS`]) exactly as the generated routing table would,
+    /// and reports the request id on the answer the same way [`Self::request_id`] does —
+    /// with the response's media type additionally stated as that front end states it
+    /// ([`with_rest_json_media_type`]). Held for the same reason.
+    rest_json_media_type: RequestIdReportedOperation,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -137,6 +153,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             entry: RequestIdEnvelopeDefinition::header_only(crate::ServiceDefinition::new(engine)),
             input_refusals: glue_input_validation_table::<Eng>(),
             request_id: RequestIdHeaderOperation,
+            rest_json_media_type: RequestIdReportedOperation::new(with_rest_json_media_type),
         }
     }
 }
@@ -181,6 +198,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         let key = self.entry.protocol().routing_key(req).ok()?;
         if let Some(wrapper) = self.input_refusals.get(key) {
             return Some(&**wrapper);
+        }
+        // The operations served by the front end that answers in the REST/JSON media type
+        // ([`REST_JSON_MEDIA_TYPE_OPERATIONS`]): the same service, through the same
+        // generated routing table, with the one element of the envelope that front end
+        // states differently stated here rather than in the handler, which is handed no
+        // response to state it on.
+        if REST_JSON_MEDIA_TYPE_OPERATIONS.contains(&key) {
+            return self
+                .entry
+                .routes(req)
+                .then_some(&self.rest_json_media_type as &dyn ErasedOperation);
         }
         // NOT a re-route: every other request is served by the operation this service's
         // own routing table names for it, through the shared `RequestIdHeaderOperation` —
@@ -233,6 +261,49 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         let _ = error;
         None
     }
+}
+
+// ---------------------------------------------------------------------------
+// The media type the REST/JSON front end answers in
+// ---------------------------------------------------------------------------
+
+/// The media type the operations below carry their response in.
+///
+/// RECORDED: the rest of this service answers in its protocol's own media type
+/// (`application/x-amz-json-1.1`, which the framework's awsJson renderer writes), and the
+/// operations below answer in this one.
+const REST_JSON_MEDIA_TYPE: &str = "application/json";
+
+/// The operations this service answers in [`REST_JSON_MEDIA_TYPE`].
+///
+/// `SearchAssets` is bound to a REST ROUTE by the model (`@http POST /search-assets`, inert
+/// under this service's awsJson1_1 protocol, which dispatches on `X-Amz-Target` instead), and
+/// the recorded answer to it carries that route's media type rather than the protocol's —
+/// the asset search is served by the front end that owns those routes. Stated per operation
+/// and from the RECORDING, not derived from the route binding alone: the other operations
+/// the model binds to a route are left answering the protocol's media type, which is what
+/// their own recordings show.
+///
+/// The table is read AFTER [`EmulatedService::input_refusals`], so an operation this service
+/// words its own pre-handler refusal for would keep the protocol's media type on that one
+/// refusal; none of the operations below is in that table, so nothing of the kind arises
+/// today.
+const REST_JSON_MEDIA_TYPE_OPERATIONS: [&str; 1] = ["SearchAssets"];
+
+/// A response of one of [`REST_JSON_MEDIA_TYPE_OPERATIONS`] as this service sends it: the
+/// request id named exactly as on every other response of this service
+/// (`service_common::query_error_envelope::with_request_id_header`, the one writer of that
+/// report), and the media type the front end serving those operations states.
+///
+/// Nothing else about the response changes: the status, the other headers and every byte of
+/// the body stay as the renderer wrote them.
+fn with_rest_json_media_type(
+    resp: aws_smithy_runtime_api::http::Response,
+) -> aws_smithy_runtime_api::http::Response {
+    let mut resp = ::service_common::query_error_envelope::with_request_id_header(resp);
+    resp.headers_mut()
+        .insert("content-type", REST_JSON_MEDIA_TYPE);
+    resp
 }
 
 // ---------------------------------------------------------------------------

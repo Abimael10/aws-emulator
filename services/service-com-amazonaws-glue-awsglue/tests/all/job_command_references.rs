@@ -7,21 +7,23 @@
 //! asserted is HTTP behaviour and not a direct call into a handler.
 //!
 //! The rule under test: a job definition's references are STORED AS SUBMITTED and resolved
-//! only when a run of the job is started, so a write of a definition refuses none of them.
-//! `JobCommand$Name` is an OPTIONAL `GenericString` with no enum, length or pattern
-//! (`smithy_query shape=JobCommand`), so every string — and no string at all — is a command
-//! name a definition may carry; `JobCommand$ScriptLocation` is a path ("Specifies the Amazon
-//! Simple Storage Service (Amazon S3) path to a script that runs a job") and `Role` is "the
-//! name or Amazon Resource Name (ARN) of the IAM role associated with this job", neither of
-//! which has to resolve for the definition to be stored. The names `JobCommand$Name`
-//! documents per job kind ("For an Apache Spark ETL job, this must be `glueetl`. For a
-//! Python shell job, it must be `pythonshell` … `gluestreaming` … `glueray`") tell a caller
-//! which name to use; they only pick the defaults the service fills in, they do not close
-//! the set a write admits.
+//! only when a run of the job is started, so a write of a definition refuses neither the
+//! command name it carries nor the paths it points at. `JobCommand$Name` is an OPTIONAL
+//! `GenericString` with no enum, length or pattern (`smithy_query shape=JobCommand`), so
+//! every string — and no string at all — is a command name a definition may carry;
+//! `JobCommand$ScriptLocation` is a path ("Specifies the Amazon Simple Storage Service
+//! (Amazon S3) path to a script that runs a job") and `Role` is "the name or Amazon Resource
+//! Name (ARN) of the IAM role associated with this job", neither of which has to resolve for
+//! the definition to be stored. The names `JobCommand$Name` documents per job kind ("For an
+//! Apache Spark ETL job, this must be `glueetl`. For a Python shell job, it must be
+//! `pythonshell` … `gluestreaming` … `glueray`") tell a caller which name to use; they only
+//! pick the defaults the service fills in, they do not close the set a write admits. What a
+//! NAMED command does have to carry is a script for it to run, which is
+//! [`crate::job_definition_member_refusals`]'s rule rather than this one's.
 //!
 //! Each suite is a TABLE whose rows differ along what the rule generalises over: the command
 //! name (one of the documented four, another casing of one, a vendor name outside them, one
-//! carrying spaces and punctuation, and none at all), whether the command names a script,
+//! carrying spaces and punctuation, and none at all), the script the command points at,
 //! whether the role is an ARN or a bare name, and which write submitted the definition
 //! (`CreateJob` or the `UpdateJob` that overwrites it).
 
@@ -90,10 +92,6 @@ fn command_rows() -> Vec<CommandRow> {
         CommandRow {
             case: "a command name carrying spaces and punctuation",
             command: json!({ "Name": "spark 3.5 (preview)", "ScriptLocation": SCRIPT_LOCATION }),
-        },
-        CommandRow {
-            case: "a command naming no script",
-            command: json!({ "Name": "spark" }),
         },
         CommandRow {
             // The member is optional, so a command may name no kind at all.
@@ -231,11 +229,13 @@ async fn an_update_stores_the_command_it_was_given() {
 async fn a_worker_configuration_sizes_a_job_whatever_its_command_is_named() {
     let router = emulator();
 
-    // (case, command name, worker type, worker count, the DPUs that pair amounts to)
+    // (case, command name, worker type, worker count, the DPUs that pair amounts to). Every
+    // count is at or above the floor a definition's worker configuration has
+    // (`crate::job_capacity_refusal`), which is not what this rule is about.
     let rows: Vec<(&str, &str, &str, i64, f64)> = vec![
         ("the recorded two one-DPU workers", "spark", "G.1X", 2, 2.0),
         ("four two-DPU workers", "spark", "G.2X", 4, 8.0),
-        ("a single quarter-DPU worker", "sparkmagic", "G.025X", 1, 0.25),
+        ("two quarter-DPU workers", "sparkmagic", "G.025X", 2, 0.5),
         ("ten one-DPU workers on a documented command", "glueetl", "G.1X", 10, 10.0),
     ];
 

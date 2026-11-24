@@ -191,6 +191,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The worker types this service runs are a LARGER set than this checkout's model
+        // declares, so `WorkerType` is judged here rather than at the boundary
+        // (`skip_validation` on `UpdateMLTransformRequest`), exactly as the create judges its
+        // own ([`crate::service::worker_types`]). Judged first, as the boundary's own check
+        // was, so a refused update writes nothing.
+        if let Some(message) = crate::service::worker_types::worker_type_refusal(
+            "workerType",
+            input.worker_type.as_deref(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // This operation models a server fault, so an unreachable store is reported as
             // that rather than as a client error the caller could act on — the same way

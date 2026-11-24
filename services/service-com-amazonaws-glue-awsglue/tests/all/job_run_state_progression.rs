@@ -105,9 +105,15 @@ struct Row {
 
 /// A `CreateJob` body for the row: the three `@required` members, the command kind it names
 /// and the script location it points at, plus room for the one run each row begins.
+///
+/// A definition whose command NAMES a command has to carry the script that command runs
+/// (`crate::job_definition_member_refusals`), so a row that stages no script names no command
+/// either — which is the definition whose run has nothing to run, and what such a row is
+/// about.
 fn job_body(row: &Row, location: Option<&str>) -> Value {
-    let mut command = json!({ "Name": row.command });
+    let mut command = json!({});
     if let Some(location) = location {
+        command["Name"] = json!(row.command);
         command["ScriptLocation"] = json!(location);
     }
     json!({

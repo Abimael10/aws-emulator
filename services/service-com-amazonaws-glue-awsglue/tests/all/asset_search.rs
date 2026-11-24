@@ -25,7 +25,7 @@ use crate::wire::{call, emulator, error_code, error_message, ok};
 
 /// The asset type every asset staged here is an instance of: one name, so the asset type is
 /// never what distinguishes two rows.
-const ASSET_TYPE: &str = "DataTable";
+pub(crate) const ASSET_TYPE: &str = "DataTable";
 
 /// Register a form type and return the identifier the catalog assigned it.
 async fn form_type(router: &MultiServiceRouter, name: &str) -> String {
@@ -44,7 +44,10 @@ async fn form_type(router: &MultiServiceRouter, name: &str) -> String {
 
 /// Register the one asset type these suites use, over one form type, and report the form
 /// type's identifier — which the assets below name in their own forms.
-async fn given_asset_type(router: &MultiServiceRouter) -> String {
+///
+/// `pub(crate)` because the suite that asserts the search's own ENVELOPE
+/// ([`crate::search_assets_envelope`]) searches over assets staged exactly this way.
+pub(crate) async fn given_asset_type(router: &MultiServiceRouter) -> String {
     let form = form_type(router, "TableForm").await;
     let mut forms = Map::new();
     forms.insert(
@@ -62,16 +65,16 @@ async fn given_asset_type(router: &MultiServiceRouter) -> String {
 
 /// One asset to stage: its identifier, its name, the description it carries (if any) and the
 /// JSON content of the one form it holds (if any).
-struct Staged<'a> {
-    id: &'a str,
-    name: &'a str,
-    description: Option<&'a str>,
-    content: Option<&'a str>,
+pub(crate) struct Staged<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) name: &'a str,
+    pub(crate) description: Option<&'a str>,
+    pub(crate) content: Option<&'a str>,
 }
 
 /// Store one asset, an instance of [`ASSET_TYPE`], with the form content it carries held under
-/// the form name `Details`.
-async fn put_asset(router: &MultiServiceRouter, form_type_id: &str, asset: &Staged<'_>) {
+/// the form name `Details`. `pub(crate)` for the reason given on [`given_asset_type`].
+pub(crate) async fn put_asset(router: &MultiServiceRouter, form_type_id: &str, asset: &Staged<'_>) {
     let mut forms = Map::new();
     if let Some(content) = asset.content {
         forms.insert(

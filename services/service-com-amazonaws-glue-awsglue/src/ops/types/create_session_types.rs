@@ -11,7 +11,12 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.glue#CreateSessionRequest")]
+// `skip_validation = ["WorkerType"]`: the same member, the same reason, as
+// `CreateJobRequest` — see the note there.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.glue#CreateSessionRequest",
+    skip_validation = ["WorkerType"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct CreateSessionInput {
     pub id: String,

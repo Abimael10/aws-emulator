@@ -302,7 +302,10 @@ async fn capacity_is_derived_from_every_documented_worker_type() {
             per_worker,
             "worker type {worker_type:?}: the per-worker DPU figure the model documents"
         );
-        for workers in [1i64, 2, 7, 299] {
+        // Every count is at or above the floor a definition's worker configuration has
+        // (`crate::job_capacity_refusal` asserts the refusal below it), so what these rows
+        // vary is the worker type and how many of them, not whether the floor holds.
+        for workers in [2i64, 7, 299] {
             let name = format!("capacity-{worker_type}-{workers}");
             let case = name.clone();
             ok(
@@ -456,6 +459,10 @@ async fn an_omitted_worker_configuration_takes_the_documented_capacity_defaults(
         for (member, value) in named.as_object().expect("the named members") {
             members.insert(member.clone(), value.clone());
         }
+        // Every row names a command, and a named command carries the script it runs — which
+        // the service requires of a job definition
+        // (`crate::job_definition_member_refusals`) and is not what these rows differ along.
+        body["Command"]["ScriptLocation"] = json!("s3://etl-scripts/defaults.py");
         ok(&router, "CreateJob", &body).await;
 
         let job = get_job(&router, &name).await;

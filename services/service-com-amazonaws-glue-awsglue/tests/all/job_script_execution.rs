@@ -379,9 +379,15 @@ print("this script was not stopped")
 "#;
 
 /// The `CreateJob` body for one row.
+///
+/// A definition whose command NAMES a command has to carry the script that command runs
+/// (`crate::job_definition_member_refusals`), so the row that names no script names no
+/// command either — which is the definition a run can still be started from with nothing to
+/// run, and what that row is about.
 fn job_body(row: &Row, location: Option<String>, language: Option<&str>) -> Value {
-    let mut command = json!({ "Name": "pythonshell", "PythonVersion": "3.9" });
+    let mut command = json!({ "PythonVersion": "3.9" });
     if let Some(location) = location {
+        command["Name"] = json!("pythonshell");
         command["ScriptLocation"] = json!(location);
     }
     let mut defaults = row.default_arguments.clone();

@@ -18,7 +18,12 @@ pub struct UpdateJobInput {
     pub job_update: JobUpdate,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.glue#JobUpdate")]
+// `skip_validation = ["WorkerType"]`: the same member, the same reason, as
+// `CreateJobRequest` — see the note there.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.glue#JobUpdate",
+    skip_validation = ["WorkerType"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct JobUpdate {
     pub job_mode: Option<String>,

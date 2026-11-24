@@ -151,6 +151,11 @@ impl UsageProfileEntry {
 /// Within one parameter the default is checked against the maximum first, then against
 /// the minimum, then the two bounds against each other, which is the order the service
 /// reports a parameter breaking more than one of them in.
+///
+/// Last comes the one check that is over TWO parameters rather than inside one
+/// ([`job_worker_defaults_defect`]): a job's capacity is the worker type and the worker
+/// count together, so a job configuration that defaults one of them and not the other
+/// configures half a capacity and is refused as well.
 pub fn usage_profile_configuration_defect(configuration: &ProfileConfiguration) -> Option<String> {
     for (section, parameters) in [
         ("JobConfiguration", configuration.job_configuration.as_ref()),
@@ -173,7 +178,44 @@ pub fn usage_profile_configuration_defect(configuration: &ProfileConfiguration) 
             }
         }
     }
-    None
+    job_worker_defaults_defect(configuration)
+}
+
+/// The parameter of a usage profile's JOB configuration that defaults the kind of worker a
+/// job runs on, named as the member of a job definition it configures (`Job$WorkerType`) in
+/// the lowerCamel spelling a profile's parameters are keyed by.
+const WORKER_TYPE_PARAMETER: &str = "workerType";
+
+/// The same for the parameter that defaults how many of those workers a job runs with
+/// (`Job$NumberOfWorkers`).
+const NUMBER_OF_WORKERS_PARAMETER: &str = "numberOfWorkers";
+
+/// Why the service refuses a `ProfileConfiguration` whose JOB configuration defaults exactly
+/// one of the two parameters that together state a job's capacity, or `None` when it defaults
+/// both or neither.
+///
+/// A job's capacity is a worker TYPE and a worker COUNT together — the one is no capacity
+/// without the other ("you should specify a `Worker type` and the `Number of workers`",
+/// `CreateJob$MaxCapacity`) — so a profile that hands a job a default for one of them alone
+/// would default half a capacity, which no job could be sized from. The pair is read by the
+/// parameter names a profile keys those two job members under, and only a `DefaultValue` is
+/// read: a parameter that merely bounds or enumerates what a job may ask for states no
+/// default at all, and the rule is about the default.
+///
+/// The SESSION configuration is not judged here: the recorded sentence states the rule over
+/// the job configuration, and a session's capacity is settled by the service when a session
+/// names none ([`super::sessions::DEFAULT_SESSION_WORKER_TYPE`]).
+fn job_worker_defaults_defect(configuration: &ProfileConfiguration) -> Option<String> {
+    let parameters = configuration.job_configuration.as_ref()?;
+    let defaults = |parameter: &str| {
+        parameters
+            .get(parameter)
+            .is_some_and(|object| object.default_value.is_some())
+    };
+    if defaults(WORKER_TYPE_PARAMETER) == defaults(NUMBER_OF_WORKERS_PARAMETER) {
+        return None;
+    }
+    Some(messages::JOB_WORKER_DEFAULTS_INCOMPLETE.to_string())
 }
 
 /// The incoherence in ONE parameter's `ConfigurationObject`, as the message it is refused

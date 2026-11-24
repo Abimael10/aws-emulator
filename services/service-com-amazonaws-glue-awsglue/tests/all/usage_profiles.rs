@@ -58,7 +58,11 @@ async fn get(router: &MultiServiceRouter, name: &str) -> Value {
 /// member for member — INCLUDING the difference between a configuration map that was sent
 /// empty and one that was not sent at all, which awsJson spells as `{}` and as an omitted
 /// member.
-fn assert_configuration(case: &str, sent: &Value, got: &Value) {
+///
+/// `pub(crate)` because the suite that covers the rule over the job capacity defaults
+/// ([`crate::usage_profile_job_worker_defaults`]) reads a stored configuration back the same
+/// way.
+pub(crate) fn assert_configuration(case: &str, sent: &Value, got: &Value) {
     for member in ["SessionConfiguration", "JobConfiguration"] {
         let expected = sent.get(member);
         let actual = got.get(member).filter(|value| !value.is_null());
@@ -591,6 +595,10 @@ async fn a_coherent_configuration_is_stored() {
             json!({
                 "JobConfiguration": {
                     "numberOfWorkers": { "DefaultValue": "5", "MinValue": "2", "MaxValue": "10" },
+                    // A job's capacity is the worker type and the worker count together,
+                    // so defaulting one of them means defaulting both
+                    // (`crate::usage_profile_job_worker_defaults`).
+                    "workerType": { "DefaultValue": "G.1X" },
                 },
             }),
         ),
@@ -643,6 +651,8 @@ async fn a_coherent_configuration_is_stored() {
                         "MaxValue": "G.1X",
                         "AllowedValues": ["G.1X", "G.2X"],
                     },
+                    // The other half of the capacity pair, for the reason given above.
+                    "numberOfWorkers": { "DefaultValue": "2" },
                 },
             }),
         ),

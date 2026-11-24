@@ -549,6 +549,54 @@ pub const JOB_NOT_FOUND: &str = "Job not found.";
 pub const MAX_CAPACITY_EXCLUDES_WORKERS: &str =
     "Please do not set Max Capacity if using Worker Type and Number of Workers.";
 
+/// A job DEFINITION that states its capacity as workers and states only HALF of it: the kind
+/// of worker without how many, or how many without which kind. "Instead, you should specify a
+/// `Worker type` and the `Number of workers`" (`CreateJobRequest$MaxCapacity`) — the two
+/// together are one capacity, so a definition carrying one of them alone sizes no job.
+///
+/// Recorded constant, and the whole message: entirely fixed text with no variable part,
+/// stating the two members in the same SPACED-OUT prose spelling
+/// [`MAX_CAPACITY_EXCLUDES_WORKERS`] states them in, and ending in a period. One constant,
+/// shared by the writes that carry a whole job definition, so a client matching the sentence
+/// recognises the refusal whichever of them reported it.
+pub const WORKER_TYPE_AND_COUNT_TOGETHER: &str =
+    "Please set both Worker Type and Number of Workers.";
+
+/// A job DEFINITION that allocates fewer workers of its `WorkerType` than the service admits
+/// for that type ([`super::min_workers_for_worker_type`]).
+///
+/// RECORDED template: fixed text around TWO variable parts — the worker type the definition
+/// named, echoed as it was sent, and the floor the service publishes for it, which is the
+/// value the check was made against rather than a number written into the sentence. Named in
+/// the same SPACED-OUT prose spelling the other capacity refusals use.
+pub fn worker_count_below_minimum(worker_type: &str, minimum: i32) -> String {
+    format!(
+        "To use Worker Type {worker_type}, minimum allowed value of Number of Workers is \
+         {minimum}."
+    )
+}
+
+/// A job DEFINITION whose `JobCommand` names the command the job runs and no script for it to
+/// run ([`super::script_location_defect`]).
+///
+/// RECORDED template: fixed text around ONE variable part, the command the definition named,
+/// taken from the request. It states both ways the member carries no value — absent and empty
+/// — in one sentence, because one check covers both, and it closes with no period, which is
+/// how the recorded response words it.
+pub fn script_location_null_or_empty(command_name: &str) -> String {
+    format!("Script location cannot be null or empty for {command_name} command")
+}
+
+/// A job DEFINITION that gives a worker configuration to a command the service does not size
+/// in workers ([`super::command_takes_a_worker_configuration`]).
+///
+/// RECORDED template: fixed text around ONE variable part, the command the definition named,
+/// taken from the request, and closing with no period. It names the `WorkerType` member in
+/// the same SPACED-OUT prose spelling the other capacity refusals use.
+pub fn worker_type_unsupported_for_command(command_name: &str) -> String {
+    format!("Worker Type is not supported for Job Command {command_name}")
+}
+
 /// `CreateCrawler` for an S3 target whose `EventQueueArn` (or `DlqEventQueueArn`) names a
 /// queue the crawler's `Role` is shown nothing about: its policies admit no call of that
 /// queue's own service on it ([`super::event_queue_refusal`]).
@@ -1001,16 +1049,30 @@ pub const TABLE_UPDATE_CONCURRENT_MODIFICATION: &str =
 pub const JOB_METADATA_MISSING: &str = "Failed to start job run due to missing metadata.";
 
 /// A write that takes a JOB DEFINITION (`CreateJob`, `UpdateJob`) whose definition carries
-/// no value for a member the job cannot run without — the command it runs, or the role it
-/// runs under.
+/// no value for a STRUCTURE member the job cannot run without — the command it runs.
 ///
 /// RECORDED template: fixed text plus ONE variable part, the member the definition left out,
-/// spelled as the model spells that member of the definition (`JobUpdate$Command`,
-/// `JobUpdate$Role`) rather than as the wire path it travelled under. The members are judged
-/// in the order the definition declares them to be needed — the command before the role — so
-/// a definition missing both is refused about the command.
+/// spelled as the model spells that member of the definition (`JobUpdate$Command`) rather
+/// than as the wire path it travelled under. The members are judged in the order the
+/// definition declares them to be needed — the command before the role — so a definition
+/// missing both is refused about the command.
+///
+/// A member whose value is a STRING states the same requirement over both ways a string
+/// carries no value ([`job_definition_member_null_or_empty`]): such a member can be sent
+/// blank as well as left out, and the one check that covers both says so.
 pub fn job_definition_member_null(member: &str) -> String {
     format!("{member} should not be null.")
+}
+
+/// The same, for a STRING member of a job definition the job cannot run without — the role
+/// it runs under (`JobUpdate$Role`, documented "(required)").
+///
+/// RECORDED template, with the same one variable part: the sentence states BOTH ways such a
+/// member carries no value, because one check covers both — the member absent, and the
+/// member sent as a string with nothing in it — so a client reading it is told the rule and
+/// not just the case its own request hit.
+pub fn job_definition_member_null_or_empty(member: &str) -> String {
+    format!("{member} should not be null or empty.")
 }
 
 /// A write that takes a JOB DEFINITION (`CreateJob`, `UpdateJob`) whose `GlueVersion` is of
@@ -2588,6 +2650,17 @@ pub fn configuration_min_above_max(parameter: &str, section: &str, max_value: &s
              to max value {max_value}."
     )
 }
+
+/// A usage profile whose JOB configuration defaults exactly one of the two parameters that
+/// together state a job's capacity — the worker type and the number of workers
+/// ([`super::security_configurations`] holds the check).
+///
+/// RECORDED constant, and the whole message: it states the rule rather than the request, so
+/// it names neither the parameter the configuration did default nor the value it gave it, and
+/// one wording answers either half of the pair being the one supplied.
+pub const JOB_WORKER_DEFAULTS_INCOMPLETE: &str =
+    "Please set default value for both Worker type and Number of workers in jobs \
+     configuration, if you intend to set default for either parameter.";
 
 /// A `PutDataCatalogExportConfiguration` whose `EncryptionConfiguration` is not the
 /// encryption the table bucket the export writes into is already protected by

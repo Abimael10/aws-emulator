@@ -250,6 +250,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The worker types this service runs are a LARGER set than this checkout's model
+        // declares, so `WorkerType` is judged here rather than at the boundary
+        // (`skip_validation` on `StartJobRunRequest`), exactly as the create judges its own
+        // ([`crate::service::worker_types`]).
+        if let Some(message) = crate::service::worker_types::worker_type_refusal(
+            "workerType",
+            input.worker_type.as_deref(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // An unreachable store is an internal mounting fault, reported through this
             // operation's own server error, the same way `CreateJob` reports it.
@@ -262,8 +273,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `JobName` is `@required` with `length 1..255`, and `Timeout`'s `range 1..` and
-        // the `WorkerType`/`ExecutionClass` enums are refused at the boundary — so the
-        // checks here are the ones the MODEL cannot express.
+        // the `ExecutionClass` enum are refused at the boundary — so the checks here are the
+        // ones the MODEL cannot express, beside the worker type above.
 
         // "Jobs must have timeout values less than 7 days or 10080 minutes. Otherwise,
         // the jobs will throw an exception." (`StartJobRun$Timeout`.)

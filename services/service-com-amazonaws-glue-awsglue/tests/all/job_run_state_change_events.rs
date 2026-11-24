@@ -372,9 +372,13 @@ async fn a_job_run_that_comes_to_rest_publishes_a_glue_job_state_change() {
     for (index, row) in rows().into_iter().enumerate() {
         let case = row.case;
         let job_name = format!("job_event_{index}");
-        let mut command = json!({ "Name": "pythonshell", "PythonVersion": "3.9" });
+        // A definition whose command NAMES a command has to carry the script that command
+        // runs (`crate::job_definition_member_refusals`), so the row that stages no script
+        // names no command either — a definition whose run has nothing to run.
+        let mut command = json!({ "PythonVersion": "3.9" });
         if let Some(script) = row.script {
             let location = stage_script(&router, &format!("{SCRIPTS}{job_name}.py"), script).await;
+            command["Name"] = json!("pythonshell");
             command["ScriptLocation"] = json!(location);
         }
         ok(

@@ -102,7 +102,13 @@ async fn a_job_that_has_never_run_has_no_bookmark() {
         (
             "a Python shell job",
             "shell_job",
-            json!({ "Command": { "Name": "pythonshell", "PythonVersion": "3.9" } }),
+            json!({
+                "Command": {
+                    "Name": "pythonshell",
+                    "PythonVersion": "3.9",
+                    "ScriptLocation": "s3://etl-scripts/shell.py",
+                },
+            }),
         ),
     ];
 

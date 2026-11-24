@@ -366,7 +366,11 @@ async fn an_update_replaces_the_stored_configuration() {
             members: json!({
                 "Configuration": {
                     "JobConfiguration": {
+                        // Both halves of the capacity pair: the service refuses a job
+                        // configuration that defaults one of them alone
+                        // (`crate::usage_profile_job_worker_defaults`).
                         "numberOfWorkers": { "DefaultValue": "9" },
+                        "workerType": { "DefaultValue": "G.2X" },
                     },
                     "SessionConfiguration": {
                         "idleTimeout": { "DefaultValue": "15" },
@@ -374,7 +378,10 @@ async fn an_update_replaces_the_stored_configuration() {
                 },
             }),
             configuration: json!({
-                "JobConfiguration": { "numberOfWorkers": { "DefaultValue": "9" } },
+                "JobConfiguration": {
+                    "numberOfWorkers": { "DefaultValue": "9" },
+                    "workerType": { "DefaultValue": "G.2X" },
+                },
                 "SessionConfiguration": { "idleTimeout": { "DefaultValue": "15" } },
             }),
             description: "as created",
@@ -429,6 +436,10 @@ async fn an_update_of_an_absent_profile_is_the_modelled_miss() {
     let configuration = json!({
         "JobConfiguration": {
             "numberOfWorkers": { "DefaultValue": "2", "MinValue": "1", "MaxValue": "4" },
+            // The other half of the capacity pair, which the service requires defaulted
+            // beside the worker count (`crate::usage_profile_job_worker_defaults`) — so what
+            // these rows are refused for is the NAME they address.
+            "workerType": { "DefaultValue": "G.1X" },
         },
     });
 

@@ -179,6 +179,35 @@ pub fn is_supported_glue_version(glue_version: &str) -> bool {
     glue_version == AUTO_GLUE_VERSION || SUPPORTED_GLUE_VERSIONS.contains(&glue_version)
 }
 
+/// Why the service refuses the `JobCommand` of a submitted job DEFINITION, as the `Message`
+/// of the refusal, or `None` when the command names something to run.
+///
+/// A command NAMES the command the job runs and the script that command runs: "Specifies the
+/// Amazon Simple Storage Service (Amazon S3) path to a script that runs a job"
+/// (`JobCommand$ScriptLocation`). So a definition that names the command and carries no
+/// script location for it — absent, or a string with nothing in it — names nothing for that
+/// command to run, and is refused with the sentence the service states that requirement in,
+/// naming the command the definition asked for
+/// ([`messages::script_location_null_or_empty`]).
+///
+/// The requirement follows the NAME rather than a closed set of names: the member's documented
+/// names ("for an Apache Spark ETL job, this must be `glueetl` …") pick the defaults the
+/// service fills in and do not close the set a write admits, and whatever a definition names
+/// still has to be given a script to run. A command that names nothing at all is left to the
+/// members a definition is judged on ([`messages::job_definition_member_null`]): there is no
+/// command to state the requirement of.
+pub fn script_location_defect(command: &JobCommand) -> Option<String> {
+    let name = command.name.as_deref()?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let script = command.script_location.as_deref().unwrap_or_default();
+    if !script.trim().is_empty() {
+        return None;
+    }
+    Some(messages::script_location_null_or_empty(name))
+}
+
 /// The `JobCommand` a submitted job definition is STORED with: the one submitted, with the
 /// members the SERVICE fills in present on it.
 ///
@@ -224,6 +253,27 @@ pub const DEFAULT_SPARK_WORKER_TYPE: &str = "G.1X";
 /// `CreateJob$MaxCapacity` documents as a Spark job's default.
 pub const DEFAULT_SPARK_WORKERS: i32 = 10;
 
+/// The fewest workers of ANY worker type a job definition may allocate: the floor the
+/// service's published figures put under a worker configuration, which is two, because a
+/// job's documented capacity range starts there ("you can allocate from 2 to 100 DPUs",
+/// `CreateJob$MaxCapacity`) and two workers is the smallest configuration inside it.
+const SMALLEST_WORKER_CONFIGURATION: i32 = 2;
+
+/// The fewest workers of `worker_type` a job definition may allocate.
+///
+/// The service publishes the floor PER WORKER TYPE — its refusal names the type beside the
+/// number ([`messages::worker_count_below_minimum`]) — so it is asked for here by type rather
+/// than read off one constant. Every type publishes the same floor,
+/// [`SMALLEST_WORKER_CONFIGURATION`]: that is the one the recorded refusal states (for `G.1X`)
+/// and the one the documented capacity range puts under every worker type, and a type the
+/// service publishes another figure for is a row for this function rather than a second
+/// constant elsewhere.
+#[must_use]
+pub fn min_workers_for_worker_type(worker_type: &str) -> i32 {
+    let _ = worker_type;
+    SMALLEST_WORKER_CONFIGURATION
+}
+
 /// The lowest `GlueVersion` whose jobs express capacity as a worker configuration, by the
 /// sentence quoted on [`DEFAULT_SPARK_WORKER_TYPE`].
 pub const MIN_WORKER_TYPE_GLUE_VERSION: f64 = 2.0;
@@ -235,6 +285,23 @@ pub const SPARK_STREAMING_COMMAND: &str = "gluestreaming";
 /// The `JobCommand$Name` of a Python shell job, the command [`DEFAULT_PYTHON_SHELL_DPUS`]
 /// is documented for.
 pub const PYTHON_SHELL_COMMAND: &str = "pythonshell";
+
+/// Whether a job of this command may be sized by a WORKER CONFIGURATION at all.
+///
+/// A Python shell job's capacity is a DPU FIGURE and not a number of workers: "When you
+/// specify a Python shell job (`JobCommand.Name`="pythonshell"), you can allocate either
+/// 0.0625 or 1 DPU" (`CreateJob$MaxCapacity`), and the worker types the model documents are
+/// documented for Spark and Ray jobs ("Accepts a value of G.1X, G.2X, G.4X, G.8X or G.025X
+/// for Spark jobs. Accepts the value Z.2X for Ray jobs", `CreateJob$WorkerType`). So a
+/// definition that gives a Python shell job a worker type asks for a capacity that job cannot
+/// have, which the write refuses ([`messages::worker_type_unsupported_for_command`]).
+///
+/// Every OTHER command may carry one, the names the model documents and the names it does
+/// not alike: `JobCommand$Name` does not close the set a write admits, and a definition's
+/// worker configuration is what sizes the job whatever it named.
+pub fn command_takes_a_worker_configuration(command_name: &str) -> bool {
+    command_name != PYTHON_SHELL_COMMAND
+}
 
 /// The capacity a job definition runs with when it named none of `MaxCapacity`,
 /// `WorkerType` and `NumberOfWorkers`, as `(worker_type, number_of_workers,

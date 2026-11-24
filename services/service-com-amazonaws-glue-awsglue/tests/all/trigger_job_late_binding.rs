@@ -51,7 +51,7 @@ async fn register_held(router: &MultiServiceRouter) {
         &json!({
             "Name": HELD_JOB,
             "Role": "arn:aws:iam::000000000000:role/GlueJobRole",
-            "Command": { "Name": "glueetl" },
+            "Command": { "Name": "glueetl", "ScriptLocation": "s3://etl-scripts/held.py" },
         }),
     )
     .await;
@@ -309,7 +309,10 @@ async fn the_firing_resolves_the_job_the_action_names() {
         &json!({
             "Name": "late-arriving-job",
             "Role": "arn:aws:iam::000000000000:role/GlueJobRole",
-            "Command": { "Name": "pythonshell" },
+            "Command": {
+                "Name": "pythonshell",
+                "ScriptLocation": "s3://etl-scripts/late.py",
+            },
         }),
     )
     .await;

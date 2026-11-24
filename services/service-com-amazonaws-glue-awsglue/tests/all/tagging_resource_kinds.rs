@@ -319,6 +319,10 @@ async fn create_resource(
                                 "MinValue": "1",
                                 "MaxValue": "10",
                             },
+                            // Both halves of a job's capacity pair, which the service
+                            // requires defaulted together
+                            // (`crate::usage_profile_job_worker_defaults`).
+                            "workerType": { "DefaultValue": "G.1X" },
                         },
                     },
                     "Tags": tags,

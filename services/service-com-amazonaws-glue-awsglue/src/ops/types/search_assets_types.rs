@@ -69,12 +69,47 @@ pub enum SearchMapFilterValue {
     StringValue(String),
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.glue#SearchAssetsOutput")]
+/// `SearchAssets`'s response: the two members the model declares, in the model's own member
+/// order, and the count the real service reports beside them appended last.
+///
+/// Member set and order from `smithy_query(query="operation", operation="SearchAssets")`,
+/// plus `TotalCount` — a member the real service reports and the on-disk model omits, which
+/// is why the schema and the serializer come from `types/recorded_catalog_members.rs` rather
+/// than from the derive (see that module's note).
 #[derive(Debug, Clone, Default)]
 pub struct SearchAssetsOutput {
     pub items: Option<Vec<SearchResultItem>>,
     pub next_token: Option<String>,
+    /// How many assets the search matched in total, which is NOT the size of the page
+    /// `items` carries: the service reports it on every answer, 0 included, so a client can
+    /// tell "no match" from "not reported".
+    pub total_count: i32,
 }
+
+glue_schema_and_serializer!(
+    SearchAssetsOutput,
+    SEARCH_ASSETS_OUTPUT_SCHEMA,
+    "com.amazonaws.glue#SearchAssetsOutput",
+    "com.amazonaws.glue",
+    "SearchAssetsOutput",
+    (
+        M_ITEMS,
+        items,
+        "Items",
+        0,
+        opt,
+        list_of_struct(SearchResultItem)
+    ),
+    (M_NEXT_TOKEN, next_token, "NextToken", 1, opt, string),
+    (
+        M_TOTAL_COUNT,
+        total_count,
+        "TotalCount",
+        2,
+        req,
+        recorded("com.amazonaws.glue.recorded", integer)
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.glue#SearchResultItem")]
 #[derive(Debug, Clone, Default)]

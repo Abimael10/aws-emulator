@@ -11,12 +11,15 @@
 //! refused with the modelled `EntityNotFoundException`. This operation words that miss with the
 //! sentence a read words it with, closed with a period
 //! ([`crate::state::messages::usage_profile_not_found_on_update`]), which is how the recorded
-//! responses word it here.
+//! responses word it here — but the configuration the request carries is judged FIRST, so a
+//! request whose own content the service will not take is told about that rather than about
+//! the name it addressed.
 //!
 //! `Configuration` is `@required`, so what the request carries REPLACES the stored parameter
 //! set; a configuration whose parameters contradict their own bounds configures a parameter
-//! no value satisfies and is refused with `InvalidInputException` before anything is written,
-//! exactly as the create refuses it
+//! no value satisfies, and one whose job section defaults half of the worker-type/
+//! number-of-workers pair configures half a job capacity — either is refused with
+//! `InvalidInputException` before anything is written, exactly as the create refuses it
 //! ([`crate::state::usage_profile_configuration_defect`]).
 //!
 //! ## Shape of an operation
@@ -178,6 +181,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A `ProfileConfiguration` whose parameters contradict their own bounds configures a
+        // parameter no value satisfies, and one whose job section defaults half a capacity
+        // configures a job nothing could be sized from: either is refused as invalid input —
+        // the same rule, in the same wording, the create enforces.
+        //
+        // Judged BEFORE the name is resolved, because the request's own content is wrong
+        // whether or not the account holds a profile under that name: answering the miss
+        // instead would tell the caller the configuration it sent was well formed. RECORDED:
+        // the service answers this refusal for a name it holds no profile under.
+        if let Some(message) =
+            crate::state::usage_profile_configuration_defect(&input.configuration)
+        {
+            return Err(UpdateUsageProfileErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(message),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
         let mut store = state.lock();
 
         // `Name` is the whole address of a usage profile, so a name this account holds no
@@ -190,22 +214,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message: Some(crate::state::messages::usage_profile_not_found_on_update(
                         &input.name,
                     )),
-                    from_federation_source: None,
-                },
-            )
-            .into());
-        }
-
-        // A `ProfileConfiguration` whose parameters contradict their own bounds configures a
-        // parameter no value satisfies, so it is refused as invalid input BEFORE anything is
-        // written and the store never comes to hold a profile a read could not report — the
-        // same rule, in the same wording, the create enforces.
-        if let Some(message) =
-            crate::state::usage_profile_configuration_defect(&input.configuration)
-        {
-            return Err(UpdateUsageProfileErrorModeled::InvalidInputException(
-                InvalidInputException {
-                    message: Some(message),
                     from_federation_source: None,
                 },
             )

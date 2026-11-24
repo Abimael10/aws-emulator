@@ -266,6 +266,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The worker types this service runs are a LARGER set than this checkout's model
+        // declares, so `WorkerType` is judged here rather than at the boundary
+        // (`skip_validation` on `CreateJobRequest`): a value outside the set the service
+        // accepts is refused in the same constraint envelope the boundary states one in,
+        // naming the set it had to come from, and every value in that set is admitted
+        // ([`crate::service::worker_types`]). Judged first, as the boundary's own check was.
+        if let Some(message) = crate::service::worker_types::worker_type_refusal(
+            "workerType",
+            input.worker_type.as_deref(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // An unreachable store is an internal mounting fault, and this operation
             // DOES model a server fault — so it is reported as that, the same shape
@@ -284,12 +297,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The name or Amazon Resource Name (ARN) of the IAM role associated with this
         // job": `RoleString` carries no length constraint, so a blank role reaches here
-        // and names no role at all — stated the way a job definition's missing member is
-        // stated ([`crate::state::messages::job_definition_member_null`]).
+        // and names no role at all — stated the way a job definition's missing STRING member
+        // is stated, which covers both an absent and a blank value
+        // ([`crate::state::messages::job_definition_member_null_or_empty`]).
         if input.role.trim().is_empty() {
             return Err(CreateJobErrorModeled::InvalidInputException(
                 InvalidInputException {
-                    message: Some(crate::state::messages::job_definition_member_null("Role")),
+                    message: Some(
+                        crate::state::messages::job_definition_member_null_or_empty("Role"),
+                    ),
                     from_federation_source: None,
                 },
             )
@@ -315,11 +331,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `JobCommand$Name` is an OPTIONAL `GenericString` with no enum, length or pattern:
         // the names the member documents per job kind ("for an Apache Spark ETL job, this
         // must be `glueetl` …") tell a caller which name to use, they do not close the set
-        // the create admits. A job definition's references — its command, its role and its
-        // script location — are stored as submitted and resolved when a run of the job is
-        // started, so nothing about the command is refused here; the documented names only
-        // pick the defaults the service fills in (see [`crate::state::default_capacity`]).
+        // the create admits — so a name outside them is stored as submitted and resolved when
+        // a run of the job is started, and the documented names only pick the defaults the
+        // service fills in (see [`crate::state::default_capacity`]).
         let command_name = input.command.name.as_deref().unwrap_or_default();
+
+        // What a named command DOES need is the script it runs: "Specifies the Amazon Simple
+        // Storage Service (Amazon S3) path to a script that runs a job"
+        // (`JobCommand$ScriptLocation`). A definition that names the command and no script
+        // names nothing for that command to run, so it is refused with the sentence the
+        // service states that requirement in, naming the command the definition asked for
+        // ([`crate::state::messages::script_location_null_or_empty`]).
+        if let Some(message) = crate::state::script_location_defect(&input.command) {
+            return Err(CreateJobErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(message),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
 
         // "Jobs must have timeout values less than 7 days or 10080 minutes. Otherwise,
         // the jobs will throw an exception."
@@ -356,6 +387,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+
+        // "Instead, you should specify a `Worker type` and the `Number of workers`": a
+        // definition that expresses its capacity as workers expresses it with BOTH members,
+        // so one of them alone is half a capacity and sizes no job — refused rather than
+        // stored with the other half missing. Asked after the ambiguity above, so a
+        // definition that also carries `MaxCapacity` is told about that first.
+        if input.worker_type.is_some() != input.number_of_workers.is_some() {
+            return Err(CreateJobErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(
+                        crate::state::messages::WORKER_TYPE_AND_COUNT_TOGETHER.to_string(),
+                    ),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
+        // A worker configuration is admissible only on a command the service SIZES in workers
+        // ([`crate::state::command_takes_a_worker_configuration`]): a Python shell job's
+        // capacity is a DPU figure, so a worker type on one asks for a capacity that job
+        // cannot have, whatever the count beside it.
+        if input.worker_type.is_some()
+            && !crate::state::command_takes_a_worker_configuration(command_name)
+        {
+            return Err(CreateJobErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(
+                        crate::state::messages::worker_type_unsupported_for_command(command_name),
+                    ),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
+        // And a worker configuration states at least as many workers as the service admits
+        // for that worker type ([`crate::state::min_workers_for_worker_type`]) —
+        // `NumberOfWorkers` is a `NullableInteger` with no modelled range, so a count below
+        // the floor, zero included, reaches here and is refused with the floor the service
+        // publishes for the type the definition named.
+        if let (Some(worker_type), Some(workers)) =
+            (input.worker_type.as_deref(), input.number_of_workers)
+        {
+            let floor = crate::state::min_workers_for_worker_type(worker_type);
+            if workers < floor {
+                return Err(CreateJobErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(crate::state::messages::worker_count_below_minimum(
+                            worker_type,
+                            floor,
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            }
         }
 
         // "Only jobs with Glue version 3.0 and above and command type `glueetl` will be

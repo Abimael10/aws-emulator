@@ -311,7 +311,7 @@ fn rows() -> Vec<Row> {
             expected_tags: &[("Owner", "analytics")],
         },
         Row {
-            case: "a job named literally, in YAML, with a Python shell command, a worker \
+            case: "a job named literally, in YAML, with a streaming command, a worker \
                    configuration and tags written as a list",
             region: "us-west-2",
             template: |_| {
@@ -335,7 +335,7 @@ fn rows() -> Vec<Row> {
                     "      Description: the nightly ingest",
                     "      Role: !GetAtt GlueJobRole.Arn",
                     "      Command:",
-                    "        Name: pythonshell",
+                    "        Name: gluestreaming",
                     "        PythonVersion: '3.9'",
                     "        ScriptLocation: s3://sim2real-etl/ingest.py",
                     "      MaxRetries: 2",
@@ -367,7 +367,7 @@ fn rows() -> Vec<Row> {
             expected_members: |_| {
                 vec![
                     ("/Description", json!("the nightly ingest")),
-                    ("/Command/Name", json!("pythonshell")),
+                    ("/Command/Name", json!("gluestreaming")),
                     ("/Command/PythonVersion", json!("3.9")),
                     ("/Command/ScriptLocation", json!("s3://sim2real-etl/ingest.py")),
                     ("/MaxRetries", json!(2)),

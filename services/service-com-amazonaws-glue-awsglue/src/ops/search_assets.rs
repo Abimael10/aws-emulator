@@ -34,6 +34,15 @@
 //! a sort naming an attribute no asset carries, because a filter the service cannot evaluate
 //! must not be answered as though it selected nothing.
 //!
+//! Two things about the ANSWER are the served surface's rather than the on-disk model's. It
+//! carries a `TotalCount` — how many assets matched in total, which is the whole result set
+//! this page was cut from and not the page's own size, reported on every answer and 0 when
+//! nothing matched — which the model does not declare, so the response shape carries its
+//! schema and serializer from `types/recorded_catalog_members.rs`
+//! ([`super::types::SearchAssetsOutput`]). And it is served in the media type of the REST
+//! route the model binds this operation to rather than in the protocol's, which the service
+//! states on the response ([`crate::service`]) because a handler is handed none.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -1028,10 +1037,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `Items` is reported even when the search matched nothing, so a client can tell "no
-        // hit" from "not reported".
+        // hit" from "not reported" — and `TotalCount` reports how many assets MATCHED, the
+        // whole result set this page was cut from rather than the page's own size, so a
+        // client can size the result set from one call (0 when nothing matched).
         Ok(SearchAssetsOutput {
             items: Some(items),
             next_token,
+            total_count: i32::try_from(matching.len()).unwrap_or(i32::MAX),
         })
     }
 }

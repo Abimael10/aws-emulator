@@ -11,7 +11,15 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.glue#CreateJobRequest")]
+// `skip_validation = ["WorkerType"]`: the set of worker types the service accepts is larger
+// than this checkout's model declares, so the member is judged by the handler against the
+// set the service really runs (`crate::service::worker_types`) instead of against the
+// model's `@enum` at the boundary — which would refuse a worker type the service accepts and
+// enumerate a stale set in the refusal.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.glue#CreateJobRequest",
+    skip_validation = ["WorkerType"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct CreateJobInput {
     pub name: String,
