@@ -48,6 +48,13 @@
 //! Each test builds its own engine, so the state one test writes is invisible to the
 //! others.
 
+// What a refusal of a create past a record-count ceiling SAYS is its own suite. This file
+// is itself loaded by `#[path]` from `tests/all.rs`, so a submodule of it is looked up
+// beside it rather than in a directory named after it: the `#[path]` here is what points
+// at `tests/all/refusal_wording/`.
+#[path = "refusal_wording/quota_sentences.rs"]
+mod quota_sentences;
+
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};

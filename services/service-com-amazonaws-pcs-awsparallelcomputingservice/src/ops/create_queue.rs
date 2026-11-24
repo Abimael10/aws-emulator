@@ -368,7 +368,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The cluster's ceiling, answered the way PCS answers a reached queue quota.
         if cluster.queues.len() >= crate::state::MAX_QUEUES_PER_CLUSTER {
             return Err(CreateQueueErrorModeled::ServiceQuotaExceededException(
-                crate::state::quota_exceeded("queue", crate::state::MAX_QUEUES_PER_CLUSTER),
+                crate::state::quota_exceeded(crate::state::QUEUE),
             )
             .into());
         }

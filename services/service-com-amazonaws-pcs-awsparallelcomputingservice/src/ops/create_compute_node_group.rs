@@ -450,10 +450,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if cluster.compute_node_groups.len() >= crate::state::MAX_COMPUTE_NODE_GROUPS_PER_CLUSTER {
             return Err(
                 CreateComputeNodeGroupErrorModeled::ServiceQuotaExceededException(
-                    crate::state::quota_exceeded(
-                        "computenodegroup",
-                        crate::state::MAX_COMPUTE_NODE_GROUPS_PER_CLUSTER,
-                    ),
+                    crate::state::quota_exceeded(crate::state::COMPUTE_NODE_GROUP),
                 )
                 .into(),
             );

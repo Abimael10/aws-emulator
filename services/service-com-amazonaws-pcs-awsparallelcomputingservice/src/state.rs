@@ -1717,16 +1717,36 @@ pub fn apply_queue_slurm_update(
 }
 
 /// The modelled `ServiceQuotaExceededException` (HTTP 402) for a create that would take
-/// a store past its ceiling. `quota_code` is left absent rather than invented: the
-/// emulator stands in for the quota, it does not reproduce Service Quotas' codes.
-pub fn quota_exceeded(resource_type: &str, limit: usize) -> ServiceQuotaExceededException {
+/// a store past its record-count ceiling ([`MAX_CLUSTERS`], [`MAX_QUEUES_PER_CLUSTER`],
+/// [`MAX_COMPUTE_NODE_GROUPS_PER_CLUSTER`]).
+///
+/// The message is the service's own FIXED sentence for the ceiling that was reached, the
+/// one the error's own documentation states for it
+/// (`smithy_query(query="doc", shape="ServiceQuotaExceededException")`): clusters and
+/// queues are counted for the ACCOUNT, compute node groups for the cluster they belong
+/// to. It carries no number and no caller-supplied value — the ceiling this emulator
+/// keeps is its own, not a quota AWS publishes, so publishing it in the prose would state
+/// something the service never says — and it names the resource by no token either: the
+/// kind travels in the modelled `resourceType` member, which is where this service's
+/// `resourceType` vocabulary belongs. `quota_code` is left absent rather than invented:
+/// the emulator stands in for the quota, it does not reproduce Service Quotas' codes.
+pub fn quota_exceeded(kind: ResourceKind) -> ServiceQuotaExceededException {
+    // Each kind a create mints states the sentence for the count its ceiling is held at:
+    // clusters and queues are counted for the account, a cluster's compute node groups
+    // for that cluster. [`UNNAMED_RESOURCE`] names no resource this service creates, so
+    // no create reaches a ceiling for it; it is answered the account sentence rather than
+    // a sentence about a cluster that no such request names.
+    let message = match kind.resource_type {
+        resource_type if resource_type == COMPUTE_NODE_GROUP.resource_type => {
+            "The max number of compute node groups has been reached for the associated cluster."
+        }
+        _ => "The max number of clusters or queues has been reached for the account.",
+    };
     ServiceQuotaExceededException {
-        message: format!(
-            "the maximum number of {resource_type} resources ({limit}) has been reached"
-        ),
+        message: message.to_string(),
         service_code: "pcs".to_string(),
         resource_id: None,
-        resource_type: Some(resource_type.to_string()),
+        resource_type: Some(kind.resource_type.to_string()),
         quota_code: None,
     }
 }
