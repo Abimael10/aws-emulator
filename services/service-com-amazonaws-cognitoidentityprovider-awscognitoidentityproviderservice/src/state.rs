@@ -2603,10 +2603,12 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
     /// `DEVICE_KEY` this user already holds — that device is recognized, and only
     /// its last-authenticated instant moves. Anything else is an unrecognized
     /// device: a device is stored for the user and its key, beside the pool's
-    /// device group key, is what the caller gets back. A key the user does not
-    /// hold — another user's, or one nothing minted — is unrecognized by this
-    /// user pool for this user, so it is answered the same way as none at all
-    /// rather than refusing the sign-in the first factor already passed.
+    /// device group key, is what the caller gets back. A sign-in that presented a
+    /// key naming no device of this user on a pool that remembers devices never
+    /// reaches here: it is refused as the device that does not exist
+    /// ([`UserPool::registers_no_presented_device`]), so the device minted here
+    /// is the one of a sign-in that presented NO key, or of a pool that remembers
+    /// no devices and reports nothing for it either way.
     ///
     /// The stored device is NOT confirmed yet: `ConfirmDevice` is what confirms
     /// it and decides whether it is remembered.

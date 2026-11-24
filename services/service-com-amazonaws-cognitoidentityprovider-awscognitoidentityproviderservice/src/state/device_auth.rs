@@ -105,6 +105,33 @@ impl UserPool {
         let device = user.remembered_device(presented_device_key?)?;
         device_srp_material(device).is_some().then_some(device)
     }
+
+    /// Whether `presented_device_key` names NO device this pool has registered
+    /// to `user` — a key that names a device which does not exist.
+    ///
+    /// A presented `DEVICE_KEY` names the device the caller is signing in from:
+    /// `AuthParameters` is where a caller "add[s] `DEVICE_KEY` if you want to
+    /// bypass multi-factor authentication with a remembered device", and
+    /// `ChallengeResponses` is where it "include[s] a `DEVICE_KEY` for device
+    /// authentication" (this service's model). So it has to name one of the
+    /// devices this pool holds for that user — the device a sign-in registered
+    /// a key for, whether or not a `ConfirmDevice` has confirmed it since — and
+    /// a key naming none of them states a device of nobody: one no sign-in ever
+    /// minted, one minted for another user, or one a forget has removed.
+    ///
+    /// Asked only of a pool that ACTIVATED device remembering
+    /// ([`UserPool::remembers_devices`]): a pool that remembers no devices
+    /// registers none, so it holds no device for any key to name and a
+    /// presented key states nothing about the sign-in.
+    pub fn registers_no_presented_device(
+        &self,
+        user: &User,
+        presented_device_key: Option<&str>,
+    ) -> bool {
+        self.remembers_devices()
+            && presented_device_key
+                .is_some_and(|device_key| !user.devices.contains_key(device_key))
+    }
 }
 
 /// The `ChallengeParameters` of a `DEVICE_SRP_AUTH` challenge: the user it is

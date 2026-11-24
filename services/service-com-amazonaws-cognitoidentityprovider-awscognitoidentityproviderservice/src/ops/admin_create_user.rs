@@ -777,7 +777,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminCreateUser<E
             // for one minted, and it has expressed no passkey MFA preference of
             // its own.
             software_token_registered: false,
-            software_token_authenticated_step: None,
+            software_token_spent_step: None,
             software_token_key: None,
             web_authn_mfa_enabled: None,
             // Nothing has been attempted against this user yet, so its threat

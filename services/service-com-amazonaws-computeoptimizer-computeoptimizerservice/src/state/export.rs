@@ -840,6 +840,14 @@ fn timestamp(at: f64) -> String {
         .unwrap_or_default()
 }
 
+/// [`timestamp`] for an instant a reader ALREADY carries as the modelled timestamp: the
+/// number that reader puts on the wire is this value's own epoch seconds, so the file states
+/// what THAT number denotes — the same ONE conversion, reached from the reader's own value
+/// rather than from a number a row converted for itself.
+fn timestamp_of(at: &::aws_smithy_types::DateTime) -> String {
+    timestamp(at.as_secs_f64())
+}
+
 /// Record `value` for `field` in `row`, unless it is empty: a field the analysis records no
 /// value for has no entry at all, so its cell is empty whatever column order a request asks
 /// for.
@@ -2050,13 +2058,15 @@ fn rds_database_row(recommendation: &RDSDBRecommendation, last_refresh: Option<f
     // "The timestamp of when the DB instance recommendation was last generated": the instant
     // the recommendation reports where the analysis recorded one, and otherwise the instant
     // this account's analysis was last refreshed, which is what every other export file of
-    // this service states.
+    // this service states. The instant the recommendation itself carries is stated FROM that
+    // value ([`timestamp_of`]), so the cell and the reader's own number denote one instant.
     let refreshed = recommendation
         .last_refresh_timestamp
-        .map(|at| at.as_secs_f64())
-        .or(last_refresh);
-    if let Some(at) = refreshed {
-        put(&mut row, "LastRefreshTimestamp", timestamp(at));
+        .as_ref()
+        .map(timestamp_of)
+        .or_else(|| last_refresh.map(timestamp));
+    if let Some(stated) = refreshed {
+        put(&mut row, "LastRefreshTimestamp", stated);
     }
     row
 }
@@ -2292,13 +2302,15 @@ fn volume_row(recommendation: &VolumeRecommendation, last_refresh: Option<f64>) 
     // "The timestamp of when the volume recommendation was last generated": the instant the
     // recommendation reports where the analysis recorded one, and otherwise the instant this
     // account's analysis was last refreshed, which is what every other export file of this
-    // service states.
+    // service states. The instant the recommendation itself carries is stated FROM that value
+    // ([`timestamp_of`]), so the cell and the reader's own number denote one instant.
     let refreshed = recommendation
         .last_refresh_timestamp
-        .map(|at| at.as_secs_f64())
-        .or(last_refresh);
-    if let Some(at) = refreshed {
-        put(&mut row, "LastRefreshTimestamp", timestamp(at));
+        .as_ref()
+        .map(timestamp_of)
+        .or_else(|| last_refresh.map(timestamp));
+    if let Some(stated) = refreshed {
+        put(&mut row, "LastRefreshTimestamp", stated);
     }
     row
 }
@@ -2762,13 +2774,16 @@ fn ecs_service_row(
     // "The timestamp of when the Amazon ECS service recommendation was last generated": the
     // instant the recommendation reports — the newest observation it was computed from — and
     // otherwise the instant this account's analysis was last refreshed, which is what every
-    // other export file of this service states.
+    // other export file of this service states. The instant the recommendation itself carries
+    // is stated FROM that value ([`timestamp_of`]), so the cell and the reader's own number
+    // denote one instant.
     let refreshed = recommendation
         .last_refresh_timestamp
-        .map(|at| at.as_secs_f64())
-        .or(last_refresh);
-    if let Some(at) = refreshed {
-        put(&mut row, "LastRefreshTimestamp", timestamp(at));
+        .as_ref()
+        .map(timestamp_of)
+        .or_else(|| last_refresh.map(timestamp));
+    if let Some(stated) = refreshed {
+        put(&mut row, "LastRefreshTimestamp", stated);
     }
     row
 }

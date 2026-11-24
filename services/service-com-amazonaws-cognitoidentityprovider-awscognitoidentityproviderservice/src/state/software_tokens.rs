@@ -70,8 +70,8 @@ pub const NO_SOFTWARE_TOKEN_CREDENTIAL_MESSAGE: &str = "Invalid Access Token";
 /// (`AssociateSoftwareToken.SecretCode` in this service's model).
 ///
 /// Spelled in base32, the encoding an authenticator app provisioned with a shared
-/// secret reads a key in, and the one [`software_token_emits`] reads it back
-/// from, so the code a user's app shows is computed over the same key this
+/// secret reads a key in, and the one [`User::software_token_step_of`] reads it
+/// back from, so the code a user's app shows is computed over the same key this
 /// service stored.
 ///
 /// Nothing in a service may construct a secret itself, so the material is minted
@@ -259,13 +259,6 @@ pub enum SoftwareTokenRegistration {
 }
 
 impl User {
-    /// Whether the authenticator this user associated a private key for emits
-    /// `user_code` around `at`. A user that has associated none emits no code,
-    /// so nothing presented for it matches.
-    pub fn software_token_emits(&self, user_code: &str, at: SystemTime) -> bool {
-        self.software_token_step_of(user_code, at).is_some()
-    }
-
     /// The time step whose one-time password `user_code` is, for the
     /// authenticator this user associated a private key for as of `at`, and
     /// `None` for a code that key emits in no step of the window — a user that
@@ -274,6 +267,25 @@ impl User {
         self.software_token_key
             .as_ref()
             .and_then(|key| key.emitting_step(user_code, at))
+    }
+
+    /// Whether the one-time password of the time step `step` is one this user's
+    /// software token has already SPENT ([`User::software_token_spent_step`]):
+    /// the step recorded as spent and every step before it, since a password
+    /// older than the last one accepted is at least as used up as that one.
+    pub fn software_token_step_spent(&self, step: u64) -> bool {
+        self.software_token_spent_step
+            .is_some_and(|spent| step <= spent)
+    }
+
+    /// Record the one-time password of the time step `step` as SPENT by this
+    /// user's software token, keeping the LATEST step spent
+    /// ([`User::software_token_spent_step`]).
+    pub fn spend_software_token_step(&mut self, step: u64) {
+        self.software_token_spent_step = Some(match self.software_token_spent_step {
+            Some(spent) => spent.max(step),
+            None => step,
+        });
     }
 
     /// Whether this user holds a software token at all: a registered
@@ -299,7 +311,7 @@ impl User {
     /// private key a presented one-time password is checked against — a new
     /// setup mints its own ([`ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState::associate_software_token`]) —
     /// and the time step that key spent
-    /// ([`User::software_token_authenticated_step`]), which belongs to a key
+    /// ([`User::software_token_spent_step`]), which belongs to a key
     /// nothing reads from any more.
     ///
     /// A factor the user can no longer receive is not one it has activated, so
@@ -314,7 +326,7 @@ impl User {
         }
         self.software_token_registered = false;
         self.software_token_key = None;
-        self.software_token_authenticated_step = None;
+        self.software_token_spent_step = None;
         self.mfa_setting_list
             .retain(|setting| setting != SOFTWARE_TOKEN_MFA_SETTING);
         if self.preferred_mfa_setting.as_deref() == Some(SOFTWARE_TOKEN_MFA_SETTING) {
@@ -425,10 +437,10 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
             Some(user) => {
                 user.software_token_key = Some(SoftwareTokenKey::spelled(secret_code));
                 // The key the one-time passwords are read from is a NEW one, so
-                // no step of it has authenticated anything yet: what the user's
-                // previous key spent is not spent on this one
-                // ([`User::software_token_authenticated_step`]).
-                user.software_token_authenticated_step = None;
+                // no step of it has been spent yet: what the user's previous key
+                // spent is not spent on this one
+                // ([`User::software_token_spent_step`]).
+                user.software_token_spent_step = None;
                 true
             }
             None => false,
@@ -444,12 +456,23 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
     /// (`VerifySoftwareToken` in this service's model), which is the delivery
     /// configuration TOTP MFA is delivered with
     /// ([`User::holds_mfa_delivery_config`]), so from here the user can activate
-    /// `SOFTWARE_TOKEN_MFA`. The registration proves the authenticator holds the
-    /// key rather than authenticating a sign-in, so the code it presents is not
-    /// one of the sign-in passwords a later challenge response may not reuse
-    /// ([`User::software_token_authenticated_step`]). Any other code registers
-    /// nothing and leaves the user exactly as it was, so the setup can be
-    /// completed with the next code the authenticator shows.
+    /// `SOFTWARE_TOKEN_MFA`. The code the registration CONSUMED is spent by it
+    /// ([`User::software_token_spent_step`]): one time step's password is good
+    /// for one use, so the code that registered the authenticator is not one a
+    /// later sign-in can be completed with. Any other code registers nothing and
+    /// leaves the user exactly as it was, so the setup can be completed with the
+    /// next code the authenticator shows.
+    ///
+    /// A code this user's token has already SPENT still registers the
+    /// authenticator rather than being refused here: this call proves possession
+    /// of the key rather than authenticating a sign-in — it mints no token and
+    /// moves no sign-in forward — and the error a used-up password earns,
+    /// `ExpiredCodeException`, is one this operation's model does not declare
+    /// (`smithy_query(query="operation",operation="VerifySoftwareToken")` lists
+    /// `CodeMismatchException`, `EnableSoftwareTokenMFAException`,
+    /// `SoftwareTokenMFANotFoundException` and the rest, and no expired-code
+    /// error), so the refusal belongs to the challenge responses that DO
+    /// authenticate with a code and declare it.
     pub fn register_software_token(
         &mut self,
         caller: &SoftwareTokenCaller,
@@ -462,10 +485,14 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         else {
             return SoftwareTokenRegistration::UserGone;
         };
-        if !user.software_token_emits(user_code, now) {
+        let Some(step) = user.software_token_step_of(user_code, now) else {
             return SoftwareTokenRegistration::CodeMismatch;
-        }
+        };
         user.software_token_registered = true;
+        // The presented password is used up: the step it belongs to has now
+        // proved that the authenticator holds the key, and nothing it is
+        // presented to again accepts it.
+        user.spend_software_token_step(step);
         // The registration is a change to the user record itself: what the user
         // holds as an MFA delivery configuration is now one more than before.
         user.user_last_modified_date = now;

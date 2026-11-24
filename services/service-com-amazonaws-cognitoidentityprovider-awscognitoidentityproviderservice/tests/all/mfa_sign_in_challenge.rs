@@ -273,16 +273,21 @@ async fn enrolled(emulator: &Emulator, name: &str, pool_extra: Value) -> Enrolle
         .as_str()
         .expect("the association reports a key")
         .to_string();
-    // The registration presents the one-time password the authenticator shows
-    // now: proving the authenticator holds the key is not a sign-in, so the code
-    // it presents is not one the sign-ins each row drives afterwards may not
-    // reuse.
+    // The registration presents the one-time password of the time step BEFORE
+    // this one, which an authenticator a step behind the server shows and the
+    // resynchronisation window accepts: one time step's password is good for one
+    // use, and the code a registration consumes is spent, so enrolling with the
+    // previous step's code leaves the code each row then presents for a SIGN-IN
+    // unspent.
     ok_self_service(
         emulator,
         "VerifySoftwareToken",
         &json!({
             "AccessToken": access_token,
-            "UserCode": one_time_password(&secret_code, current_step(SystemTime::now())),
+            "UserCode": one_time_password(
+                &secret_code,
+                current_step(SystemTime::now()).saturating_sub(1),
+            ),
         }),
     )
     .await;
@@ -773,21 +778,24 @@ async fn only_a_remembered_device_skips_the_factor() {
             .expect("a completed sign-in issues an access token")
             .to_string();
 
-        // A key that names NO device of this user bypasses nothing, whatever the
-        // pool remembers.
-        let unknown = ok_self_service(
+        // A key that names NO device of this user names a device that does not
+        // exist, whatever the pool remembers, so the sign-in presenting it is
+        // refused rather than falling back on the user's own factor.
+        let (status, unknown) = dispatch(
             &emulator,
             "InitiateAuth",
             &Driver::Client.sign_in_body(
                 &fixture,
                 json!({ "DEVICE_KEY": format!("{device_key}-no-such-device") }),
             ),
+            false,
         )
         .await;
-        challenge_session(
-            &format!("{case}, with a key naming no device"),
-            SOFTWARE_TOKEN_MFA,
-            &unknown,
+        assert_eq!(
+            (status, error_code(&unknown), error_message(&unknown)),
+            (400, "ResourceNotFoundException", "Device does not exist."),
+            "case {case:?}: a key naming no device of this user is refused, got {status} with \
+             {unknown}"
         );
 
         ok_self_service(

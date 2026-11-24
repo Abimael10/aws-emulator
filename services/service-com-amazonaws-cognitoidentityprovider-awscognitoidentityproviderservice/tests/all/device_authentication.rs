@@ -598,8 +598,7 @@ async fn a_claim_that_does_not_cover_what_the_challenge_served_is_refused() {
 
 /// One row of the routing table: what the pool's `DeviceConfiguration` asks for,
 /// whether the user remembered the confirmed device, what `DEVICE_KEY` the
-/// sign-in presents, and the `ChallengeName` it must be answered with — `None`
-/// for a sign-in that completes.
+/// sign-in presents, and what that sign-in must be answered with.
 struct RoutingCase {
     case: &'static str,
     device_configuration: fn() -> Value,
@@ -609,7 +608,20 @@ struct RoutingCase {
     /// What the sign-in presents: the device's own key, a key naming no device,
     /// or no key at all.
     presented: Presented,
-    challenge: Option<&'static str>,
+    routed: Routed,
+}
+
+/// What the sign-in of one row is answered with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Routed {
+    /// The challenge it is left outstanding on.
+    Challenge(&'static str),
+    /// No challenge at all: the sign-in completes and mints tokens.
+    Completed,
+    /// The refusal a presented key that names no device of the user earns: a
+    /// `DEVICE_KEY` states the device the sign-in comes from, so one naming a
+    /// device the pool registered none of names a device that does not exist.
+    DeviceNotFound,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -629,7 +641,7 @@ const ROUTING_CASES: &[RoutingCase] = &[
         remember: true,
         registered: Registered::Derived,
         presented: Presented::OwnDevice,
-        challenge: Some(DEVICE_SRP_AUTH),
+        routed: Routed::Challenge(DEVICE_SRP_AUTH),
     },
     RoutingCase {
         case: "a confirmed device the user has not remembered",
@@ -637,7 +649,7 @@ const ROUTING_CASES: &[RoutingCase] = &[
         remember: false,
         registered: Registered::Derived,
         presented: Presented::OwnDevice,
-        challenge: Some(SOFTWARE_TOKEN_MFA),
+        routed: Routed::Challenge(SOFTWARE_TOKEN_MFA),
     },
     RoutingCase {
         case: "a key naming no device of this user",
@@ -645,7 +657,7 @@ const ROUTING_CASES: &[RoutingCase] = &[
         remember: true,
         registered: Registered::Derived,
         presented: Presented::UnknownDevice,
-        challenge: Some(SOFTWARE_TOKEN_MFA),
+        routed: Routed::DeviceNotFound,
     },
     RoutingCase {
         case: "a sign-in that presents no device at all",
@@ -653,7 +665,7 @@ const ROUTING_CASES: &[RoutingCase] = &[
         remember: true,
         registered: Registered::Derived,
         presented: Presented::Nothing,
-        challenge: Some(SOFTWARE_TOKEN_MFA),
+        routed: Routed::Challenge(SOFTWARE_TOKEN_MFA),
     },
     RoutingCase {
         case: "a remembered device whose confirmation registered no usable verifier",
@@ -661,7 +673,7 @@ const ROUTING_CASES: &[RoutingCase] = &[
         remember: true,
         registered: Registered::Unusable,
         presented: Presented::OwnDevice,
-        challenge: Some(SOFTWARE_TOKEN_MFA),
+        routed: Routed::Challenge(SOFTWARE_TOKEN_MFA),
     },
     RoutingCase {
         case: "a remembered device of a pool that asks for no device challenge",
@@ -669,7 +681,7 @@ const ROUTING_CASES: &[RoutingCase] = &[
         remember: true,
         registered: Registered::Derived,
         presented: Presented::OwnDevice,
-        challenge: None,
+        routed: Routed::Completed,
     },
 ];
 
@@ -695,19 +707,44 @@ async fn the_device_challenge_stands_where_the_pool_asks_for_it() {
             Presented::Nothing => None,
         };
         let signed_in =
-            sign_in(&emulator, Driver::Client, &fixture, presented.as_deref(), case).await;
-        match row.challenge {
-            Some(challenge) => {
-                challenge_session(case, challenge, &signed_in);
+            attempt_sign_in(&emulator, Driver::Client, &fixture, presented.as_deref()).await;
+        match row.routed {
+            Routed::Challenge(challenge) => {
+                let (status, payload) = signed_in;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: the sign-in must be served, got {status} with {payload}"
+                );
+                challenge_session(case, challenge, &payload);
             }
-            None => {
-                assert!(
-                    signed_in.get("ChallengeName").is_none(),
-                    "case {case:?}: expected a completed sign-in, got {signed_in}"
+            Routed::Completed => {
+                let (status, payload) = signed_in;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: the sign-in must be served, got {status} with {payload}"
                 );
                 assert!(
-                    signed_in["AuthenticationResult"]["AccessToken"].is_string(),
-                    "case {case:?}: a completed sign-in issues tokens, got {signed_in}"
+                    payload.get("ChallengeName").is_none(),
+                    "case {case:?}: expected a completed sign-in, got {payload}"
+                );
+                assert!(
+                    payload["AuthenticationResult"]["AccessToken"].is_string(),
+                    "case {case:?}: a completed sign-in issues tokens, got {payload}"
+                );
+            }
+            Routed::DeviceNotFound => {
+                let (status, payload) = signed_in;
+                assert_eq!(
+                    (status, error_code(&payload), error_message(&payload)),
+                    (REFUSED, RESOURCE_NOT_FOUND, DEVICE_NOT_FOUND_MESSAGE),
+                    "case {case:?}: a key naming no device is refused, got {status} with \
+                     {payload}"
+                );
+                assert!(
+                    payload.get("AuthenticationResult").is_none()
+                        && payload.get("ChallengeName").is_none(),
+                    "case {case:?}: a refused sign-in answers neither tokens nor a challenge, \
+                     got {payload}"
                 );
             }
         }
@@ -875,23 +912,35 @@ async fn sign_in(
     device_key: Option<&str>,
     case: &str,
 ) -> Value {
-    let parameters = match device_key {
-        Some(device_key) => json!({ "DEVICE_KEY": device_key }),
-        None => json!({}),
-    };
-    let (status, payload) = dispatch(
-        emulator,
-        driver.initiate(),
-        &driver.sign_in_body(fixture, parameters),
-        driver.signed(),
-    )
-    .await;
+    let (status, payload) = attempt_sign_in(emulator, driver, fixture, device_key).await;
     assert_eq!(
         status, 200,
         "case {case:?}: {} must be served, got {status} with {payload}",
         driver.initiate()
     );
     payload
+}
+
+/// Start a password sign-in through `driver`, presenting `device_key` where one
+/// is given, and return the status and body it answered — the rows that assert a
+/// REFUSAL read it here rather than through [`sign_in`].
+async fn attempt_sign_in(
+    emulator: &Emulator,
+    driver: Driver,
+    fixture: &Fixture,
+    device_key: Option<&str>,
+) -> (u16, Value) {
+    let parameters = match device_key {
+        Some(device_key) => json!({ "DEVICE_KEY": device_key }),
+        None => json!({}),
+    };
+    dispatch(
+        emulator,
+        driver.initiate(),
+        &driver.sign_in_body(fixture, parameters),
+        driver.signed(),
+    )
+    .await
 }
 
 /// Assert that `payload` is an outstanding challenge for `challenge_name` and

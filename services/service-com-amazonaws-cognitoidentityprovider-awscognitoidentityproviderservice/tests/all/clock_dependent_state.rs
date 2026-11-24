@@ -122,7 +122,7 @@ fn stored_user(password_permanent: bool, password_set_at: Option<SystemTime>) ->
         provider_links: std::collections::BTreeMap::new(),
         software_token_registered: false,
         software_token_key: None,
-        software_token_authenticated_step: None,
+        software_token_spent_step: None,
         web_authn_mfa_enabled: None,
         auth_events: Vec::new(),
     }

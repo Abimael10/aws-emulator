@@ -813,6 +813,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminInitiateAuth
                 "Temporary password has expired and must be reset by an administrator.",
             ));
         }
+        // The request has proved it holds this user's password, so the DEVICE it
+        // presented is read: a `DEVICE_KEY` names the device the sign-in comes
+        // from, and a key naming no device this pool registered to that user
+        // names a device that does not exist — one no sign-in minted, one
+        // minted for another user, or one a forget removed.
+        if pool.registers_no_presented_device(user, presented_device_key) {
+            return Err(device_not_found());
+        }
 
         Ok(Decided::Outcome(
             if user.status == crate::state::UserStatus::ForceChangePassword {
@@ -1063,6 +1071,18 @@ fn user_pool_not_found(user_pool_id: &str) -> AdminInitiateAuthError {
 fn client_not_found(message: String) -> AdminInitiateAuthError {
     AdminInitiateAuthErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: Some(message),
+    })
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for a presented [`DEVICE_KEY`]
+/// that names no device the pool has registered to the signing-in user
+/// ([`crate::state::UserPool::registers_no_presented_device`]). Carries the
+/// fixed sentence every device lookup of this service answers
+/// ([`crate::state::DEVICE_NOT_FOUND_MESSAGE`]), which quotes no key back.
+fn device_not_found() -> AdminInitiateAuthError {
+    AdminInitiateAuthErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::DEVICE_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }

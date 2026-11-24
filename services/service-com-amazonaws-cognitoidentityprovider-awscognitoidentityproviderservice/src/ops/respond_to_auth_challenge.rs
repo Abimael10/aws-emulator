@@ -565,6 +565,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RespondToAuthChal
             if input.challenge_name != session.challenge_name {
                 return Err(invalid_challenge_state());
             }
+            // A response that names a DEVICE answers for that device, so the key has to
+            // name one this pool registered to the session's own user: a key naming no
+            // device of that user — one no sign-in minted, one minted for another user,
+            // or one a forget removed — names a device that does not exist, whichever
+            // challenge the response is answering.
+            if let Some(pool) = guard.pool(&user_pool_id) {
+                let presents_no_device = pool.user(&session.username).is_some_and(|user| {
+                    pool.registers_no_presented_device(
+                        user,
+                        responses.get(DEVICE_KEY).map(String::as_str),
+                    )
+                });
+                if presents_no_device {
+                    return Err(device_not_found());
+                }
+            }
             // Which challenge the stored session is waiting on decides what the response
             // has to carry: each is answered against the state its own challenge left.
             // `NEW_PASSWORD_REQUIRED` carries the password the user chose and the
@@ -1275,7 +1291,9 @@ fn device_auth_refused(
 
 /// This operation's `ResourceNotFoundException` for a response answering for a
 /// device this pool holds no proof-of-possession credentials of for the user its
-/// session was started for. The sentence names no value from the request.
+/// session was started for, and for one naming a device the pool registered none
+/// of at all ([`crate::state::UserPool::registers_no_presented_device`]). The
+/// sentence names no value from the request.
 fn device_not_found() -> RespondToAuthChallengeError {
     RespondToAuthChallengeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: Some(crate::state::DEVICE_NOT_FOUND_MESSAGE.to_string()),

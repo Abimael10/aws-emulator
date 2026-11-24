@@ -140,6 +140,14 @@ fn error_code(payload: &Value) -> &str {
         .unwrap_or("<no __type>")
 }
 
+/// The `message` of an error body.
+fn error_message(payload: &Value) -> &str {
+    payload
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("<no message>")
+}
+
 /// Call `operation` expecting a refusal, and assert its status and wire error code.
 async fn refused(
     router: &MultiServiceRouter,
@@ -278,6 +286,24 @@ async fn sign_in(
     username: &str,
     device_key: Option<&str>,
 ) -> Value {
+    let (status, payload) = attempt_sign_in(router, fixture, sign_in, username, device_key).await;
+    assert_eq!(
+        status, 200,
+        "{} must succeed, got {status} with {payload}",
+        sign_in.operation
+    );
+    payload["AuthenticationResult"].clone()
+}
+
+/// Sign `username` in through `sign_in`, presenting `device_key` when one is given, and
+/// return the status and body it answered — what the rows asserting a REFUSAL read.
+async fn attempt_sign_in(
+    router: &MultiServiceRouter,
+    fixture: &Fixture,
+    sign_in: SignIn,
+    username: &str,
+    device_key: Option<&str>,
+) -> (u16, Value) {
     let mut parameters = Map::new();
     parameters.insert("USERNAME".to_string(), json!(username));
     parameters.insert("PASSWORD".to_string(), json!(GOOD_PASSWORD));
@@ -291,8 +317,7 @@ async fn sign_in(
     if sign_in.operation == "AdminInitiateAuth" {
         body.insert("UserPoolId".to_string(), json!(fixture.user_pool_id));
     }
-    let payload = ok(router, sign_in.operation, &Value::Object(body)).await;
-    payload["AuthenticationResult"].clone()
+    dispatch(router, sign_in.operation, &Value::Object(body)).await
 }
 
 /// Whether `device_key` satisfies the modelled `DeviceKeyType`: pattern
@@ -412,40 +437,62 @@ async fn new_device_metadata_follows_the_pools_device_configuration() {
 }
 
 /// One row of the presented-device table: which `DEVICE_KEY` the second sign-in carries,
-/// and whether that sign-in owes a new device.
+/// and what that sign-in is answered with.
 struct PresentedRow {
     case: &'static str,
     /// Built from the keys the setup minted: the device of this user, the device of
     /// another user, or a key nothing minted.
     presented: fn(&str, &str) -> Option<String>,
-    mints: bool,
+    answered: Answered,
 }
 
+/// What a sign-in presenting one row's key is answered with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answered {
+    /// The sign-in completes and the pool answers the key of a device it minted
+    /// for it, which is what a caller needs to confirm that device.
+    MintsADevice,
+    /// The sign-in completes and answers no new device: the key it presented
+    /// names one the pool already holds for that user.
+    RecognizesTheDevice,
+    /// The key names no device the pool holds for that user, so it names a
+    /// device that does not exist and the sign-in is refused.
+    DeviceNotFound,
+}
+
+/// The refusal a `DEVICE_KEY` naming no device of the signing-in user earns: every
+/// refusal of this service is answered 400 and names its class in the body
+/// (asserted by [`super::error_wire`]), and the sentence is the fixed one every
+/// device lookup of this API answers.
+const RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
+const DEVICE_NOT_FOUND_MESSAGE: &str = "Device does not exist.";
+
 /// A sign-in answers `NewDeviceMetadata` for a device the user pool does not recognise
-/// and nothing for one it does: the key it already holds for THAT user is recognized,
-/// and every other key — another user's, or one no sign-in minted — is not.
+/// and nothing for one it does — and is REFUSED where the key it presented names no
+/// device the pool holds for that user at all: another user's key, or one no sign-in
+/// minted, names a device that does not exist.
 #[tokio::test]
 async fn a_recognized_device_key_is_not_minted_again() {
     let rows = [
         PresentedRow {
             case: "no DEVICE_KEY presented",
             presented: |_, _| None,
-            mints: true,
+            answered: Answered::MintsADevice,
         },
         PresentedRow {
             case: "the DEVICE_KEY this user's first sign-in minted",
             presented: |own, _| Some(own.to_string()),
-            mints: false,
+            answered: Answered::RecognizesTheDevice,
         },
         PresentedRow {
             case: "a DEVICE_KEY minted for another user of the same pool",
             presented: |_, other| Some(other.to_string()),
-            mints: true,
+            answered: Answered::DeviceNotFound,
         },
         PresentedRow {
             case: "a well-formed DEVICE_KEY no sign-in minted",
             presented: |_, _| Some("us-east-1_00000000-0000-0000-0000-000000000000".to_string()),
-            mints: true,
+            answered: Answered::DeviceNotFound,
         },
     ];
 
@@ -466,14 +513,37 @@ async fn a_recognized_device_key_is_not_minted_again() {
         );
 
         let presented = (row.presented)(&own, &other);
-        let second = sign_in(&router, &fixture, SIGN_INS[0], "alice", presented.as_deref()).await;
+        let (status, payload) = attempt_sign_in(
+            &router,
+            &fixture,
+            SIGN_INS[0],
+            "alice",
+            presented.as_deref(),
+        )
+        .await;
+        if row.answered == Answered::DeviceNotFound {
+            assert_eq!(
+                (status, error_code(&payload), error_message(&payload)),
+                (400, RESOURCE_NOT_FOUND, DEVICE_NOT_FOUND_MESSAGE),
+                "case {:?}: a key naming no device of this user is refused, got {status} with \
+                 {payload}",
+                row.case
+            );
+            continue;
+        }
+        assert_eq!(
+            status, 200,
+            "case {:?}: the sign-in must be served, got {status} with {payload}",
+            row.case
+        );
+        let second = payload["AuthenticationResult"].clone();
         let minted = new_device_key(row.case, &second);
         assert_eq!(
             minted.is_some(),
-            row.mints,
+            row.answered == Answered::MintsADevice,
             "case {:?}: expected NewDeviceMetadata present={}, got {second}",
             row.case,
-            row.mints
+            row.answered == Answered::MintsADevice
         );
         if let Some(minted) = minted {
             assert_ne!(
@@ -1140,8 +1210,9 @@ async fn the_device_listing_follows_what_was_confirmed_and_forgotten() {
          got {admin_listed:?}"
     );
 
-    // Forgetting a device takes it out of the listing — and out of what the pool
-    // recognises, so a sign-in presenting its key mints a device again.
+    // Forgetting a device takes it out of the listing — and out of what the pool holds
+    // for that user, so a sign-in presenting its key names a device that does not
+    // exist.
     ok(
         &router,
         "ForgetDevice",
@@ -1155,7 +1226,7 @@ async fn the_device_listing_follows_what_was_confirmed_and_forgotten() {
         "case \"after ForgetDevice\": the forgotten device leaves the listing, \
          got {after_forget:?}"
     );
-    let reminted = sign_in(
+    let (status, payload) = attempt_sign_in(
         &router,
         &fixture,
         SIGN_INS[0],
@@ -1163,9 +1234,11 @@ async fn the_device_listing_follows_what_was_confirmed_and_forgotten() {
         Some(&expected[0]),
     )
     .await;
-    assert!(
-        new_device_key("sign-in from a forgotten device", &reminted).is_some(),
-        "case \"sign-in from a forgotten device\": the pool no longer recognises it, got {reminted}"
+    assert_eq!(
+        (status, error_code(&payload), error_message(&payload)),
+        (400, RESOURCE_NOT_FOUND, DEVICE_NOT_FOUND_MESSAGE),
+        "case \"sign-in from a forgotten device\": the pool holds no such device any more, \
+         got {status} with {payload}"
     );
 
     ok(

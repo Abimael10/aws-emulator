@@ -694,7 +694,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> SignUp<Eng> {
             // for one minted, and it has expressed no passkey MFA preference of
             // its own.
             software_token_registered: false,
-            software_token_authenticated_step: None,
+            software_token_spent_step: None,
             software_token_key: None,
             web_authn_mfa_enabled: None,
             // The registration this call logs is appended once the user is

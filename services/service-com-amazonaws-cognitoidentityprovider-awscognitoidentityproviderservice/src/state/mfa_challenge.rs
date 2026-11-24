@@ -429,8 +429,8 @@ pub enum MfaAnswer {
     /// A code IS there to present and the presented value is not it.
     CodeMismatch,
     /// The presented value is a one-time password this user's software token
-    /// already authenticated a sign-in with, so it authenticates nothing more
-    /// ([`User::software_token_authenticated_step`]).
+    /// already spent — on a registration or on an earlier sign-in — so it
+    /// authenticates nothing more ([`User::software_token_spent_step`]).
     CodeAlreadyUsed,
     /// The factor the challenge asked for is not one the user holds any more —
     /// its authenticator or its delivered code is gone — so there is nothing to
@@ -469,10 +469,10 @@ pub fn mfa_code_mismatch_message(challenge_name: &str) -> &'static str {
     }
 }
 
-/// The message a one-time password this user's software token already
-/// authenticated a sign-in with is refused with: one time step's password
-/// authenticates once ([`User::software_token_authenticated_step`]), which is
-/// what has been used up rather than anything about the request.
+/// The message a one-time password this user's software token already spent is
+/// refused with: one time step's password is good for one use
+/// ([`User::software_token_spent_step`]), which is what has been used up rather
+/// than anything about the request.
 pub const SOFTWARE_TOKEN_CODE_USED_MESSAGE: &str =
     "Your software token has already been used once.";
 
@@ -495,8 +495,8 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
     /// the caller can present the right code while the session lasts. The
     /// software token is checked against the key the user's authenticator was
     /// provisioned with ([`User::software_token_step_of`]) and the time step of
-    /// an accepted code is recorded, because one step's password authenticates
-    /// once ([`User::software_token_authenticated_step`]); a message factor is
+    /// an accepted code is recorded, because one step's password is good for one
+    /// use ([`User::software_token_spent_step`]); a message factor is
     /// checked against the code its own challenge delivered, which is held on
     /// the session because the challenge is answerable exactly while that
     /// session lasts.
@@ -517,13 +517,10 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
             let Some(step) = user.software_token_step_of(presented, now) else {
                 return MfaAnswer::CodeMismatch;
             };
-            if user
-                .software_token_authenticated_step
-                .is_some_and(|authenticated| step <= authenticated)
-            {
+            if user.software_token_step_spent(step) {
                 return MfaAnswer::CodeAlreadyUsed;
             }
-            user.software_token_authenticated_step = Some(step);
+            user.spend_software_token_step(step);
             return MfaAnswer::Accepted;
         }
         match session.code.as_ref() {

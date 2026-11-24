@@ -150,21 +150,27 @@ pub struct User {
     /// no association has minted one for.
     ///
     /// It is the key a presented one-time password is checked against
-    /// ([`User::software_token_emits`]), which is what registers the
+    /// ([`User::software_token_step_of`]), which is what registers the
     /// authenticator, so it is held beside the registration rather than with the
     /// call that minted it. Never rendered: no modelled member reports a user's
     /// key, and the one response that carries it is the association's own.
     pub software_token_key: Option<SoftwareTokenKey>,
     /// The time step of the LAST one-time password this user's software token
-    /// authenticated a sign-in with, or `None` while none has
-    /// ([`ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState::answer_mfa_challenge`]).
+    /// SPENT, or `None` while it has spent none.
     ///
-    /// One time step's password authenticates once: "the verifier MUST NOT
+    /// One time step's password is good for ONE use: "the verifier MUST NOT
     /// accept the second attempt of the OTP generated for the same time step"
     /// (RFC 6238 §5.2, the resynchronisation rule the drift window comes from),
-    /// so a code presented again after it was accepted authenticates nothing.
-    /// Never rendered: no modelled member reports it.
-    pub software_token_authenticated_step: Option<u64>,
+    /// so a code presented again after it was accepted proves nothing more.
+    /// Every call that CHECKS a code against this user's authenticator spends
+    /// the step it belongs to — the registration that proves the authenticator
+    /// holds the key
+    /// ([`ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState::register_software_token`])
+    /// and the challenge response that signs the user in
+    /// ([`ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState::answer_mfa_challenge`])
+    /// — so a code accepted by either is accepted by neither again. Never
+    /// rendered: no modelled member reports it.
+    pub software_token_spent_step: Option<u64>,
     /// Whether this user has activated or deactivated passkey MFA for itself
     /// (`SetUserMFAPreference.WebAuthnMfaSettings.Enabled`), or `None` while the
     /// user has expressed no preference and the pool's passkey configuration
