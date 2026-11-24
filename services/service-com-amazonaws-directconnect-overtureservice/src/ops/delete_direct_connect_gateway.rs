@@ -166,9 +166,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // with the record as it stands rather than starting the teardown a second
         // time.
         let Some(gateway) = store.gateways.get(&gateway_id) else {
-            return Err(client_error(format!(
-                "Direct Connect gateway ID {gateway_id} does not exist"
-            )));
+            return Err(client_error(
+                crate::state::direct_connect_gateway_not_found_message(
+                    ::engine::emulator_account_id(),
+                    &gateway_id,
+                ),
+            ));
         };
         if matches!(
             gateway.direct_connect_gateway_state.as_str(),
@@ -208,9 +211,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "deleted: The Direct Connect gateway is deleted and cannot pass traffic"
         // is what the clock owes from here.
         let Some(gateway) = store.gateways.get_mut(&gateway_id) else {
-            return Err(client_error(format!(
-                "Direct Connect gateway ID {gateway_id} does not exist"
-            )));
+            return Err(client_error(
+                crate::state::direct_connect_gateway_not_found_message(
+                    ::engine::emulator_account_id(),
+                    &gateway_id,
+                ),
+            ));
         };
         gateway.direct_connect_gateway_state = "deleting".to_string();
         gateway.due = Some(crate::state::DueTransition {

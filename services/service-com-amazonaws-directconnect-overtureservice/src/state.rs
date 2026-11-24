@@ -173,15 +173,25 @@ pub fn tags_of_resource_mut<'a>(
     }
 }
 
-/// How this service STATES a refusal of a tag call naming an ARN it holds no resource
-/// under.
+/// How this service STATES a refusal of a tag call whose `resourceArn` names no resource
+/// it holds.
 ///
 /// Every client fault of this service shares the one error shape and the one 400
-/// status, so the sentence is the whole discriminator: the ARN the request submitted,
-/// then fixed text. Stated here beside this service's other refusal wording, so the tag
-/// write and the tag removal word it alike.
+/// status, so the sentence is the whole discriminator — and there are two faults to tell
+/// apart, since `ResourceArn` carries no `@pattern` and so a value that is not an ARN at
+/// all reaches the call as readily as an ARN naming nothing. Both sentences are stated
+/// here beside this service's other refusal wording, so the tag write and the tag removal
+/// word each alike:
+///
+/// * a value that is not an ARN is refused about its FORM, naming the value the request
+///   carried. RECORDED behaviour: the FIXED text is "Invalid ARN format: ".
+/// * an ARN that parses but resolves to no resource of this account is refused about the
+///   resource: the ARN the request submitted, then fixed text.
 pub fn resource_arn_not_found_message(resource_arn: &str) -> String {
-    format!("Resource {resource_arn} does not exist")
+    match ::service_common::arn::parse(resource_arn) {
+        None => format!("Invalid ARN format: {resource_arn}"),
+        Some(_) => format!("Resource {resource_arn} does not exist"),
+    }
 }
 
 /// How a tag REMOVAL states a refusal of a key list longer than the tag set a resource
@@ -282,6 +292,23 @@ pub fn amazon_side_asn_not_valid_message(asn: i64) -> String {
     format!("{asn} is not a valid value for Amazon Side ASN")
 }
 
+/// How this service STATES a refusal naming a Direct Connect gateway that no account
+/// holds.
+///
+/// Every operation that resolves a `directConnectGatewayId` and finds no gateway under it
+/// words the refusal from here, so a client matching this sentence to decide "already
+/// deleted, treat as success" matches it on each of them. `DirectConnectClientException`
+/// carries nothing a client can branch on but the sentence, and the model states none, so
+/// this is RECORDED behaviour: the FIXED text is "Direct Connect Gateway for owner ",
+/// " and with id " and " does not exist", and the VARIABLE parts are the owner account the
+/// lookup was made for and the id the request carried — the account being the
+/// distinguishing detail when a gateway exists but is owned elsewhere.
+pub fn direct_connect_gateway_not_found_message(owner_account: &str, gateway_id: &str) -> String {
+    format!(
+        "Direct Connect Gateway for owner {owner_account} and with id {gateway_id} does not exist"
+    )
+}
+
 /// The largest page a `maxResults` of `MaxResultSetSize` can ask for: "If
 /// MaxResults is given a value larger than 100, only 100 results are returned."
 pub const MAX_RESULT_SET_SIZE: i32 = 100;
@@ -353,6 +380,42 @@ pub fn first_duplicate_tag_key(tags: &[Tag]) -> Option<&str> {
         }
     }
     None
+}
+
+/// How this service STATES a refusal of a tag set naming one key twice, which the modelled
+/// `DuplicateTagKeysException` ("A tag key was specified more than once") refuses.
+///
+/// The model states no sentence, so this is RECORDED behaviour: the FIXED text is "Tag "
+/// and " is specified more than once.", and the VARIABLE part is the key the request
+/// repeated. Stated here once, so every write that refuses such a set words it alike.
+pub fn duplicate_tag_key_message(key: &str) -> String {
+    format!("Tag {key} is specified more than once.")
+}
+
+/// How this service STATES a refusal of a tag set past [`MAX_TAGS_PER_RESOURCE`], which the
+/// modelled `TooManyTagsException` refuses.
+///
+/// The sentence is the one the model's own `TooManyTagsException` documents ("you have
+/// reached the limit on the number of tags that can be assigned"); it is FIXED — nothing
+/// of the request varies it, and the limit is not restated in it. Stated here once, so
+/// every write of this service that refuses such a set words it alike.
+pub const TOO_MANY_TAGS_MESSAGE: &str =
+    "You have reached the limit on the number of tags that can be assigned.";
+
+/// Apply `submitted` to the tag set `held` a resource already carries: "if a tag with the
+/// same key is already associated with the resource, this action updates its value", and a
+/// key the resource does not hold yet is added after the ones it does — so a repeated write
+/// of the same tag set changes nothing.
+///
+/// The ONE merge of a submitted tag set into a stored one, so every tag write of this
+/// service updates and appends alike.
+pub fn merge_tags(held: &mut Vec<Tag>, submitted: Vec<Tag>) {
+    for tag in submitted {
+        match held.iter_mut().find(|existing| existing.key == tag.key) {
+            Some(existing) => existing.value = tag.value,
+            None => held.push(tag),
+        }
+    }
 }
 
 /// A state change the clock owes a resource: at [`DueTransition::at`] the resource
@@ -579,8 +642,9 @@ impl ComAmazonawsDirectconnectOvertureserviceState {
     }
 
     /// Render a stored [`DirectConnectGateway`] into the generated
-    /// `DirectConnectGateway` output shape: the ONE rendering of a stored
-    /// gateway, so every operation answers the same field set.
+    /// `DirectConnectGateway` output shape: the ONE rendering of a stored gateway, so
+    /// every operation — create, listing, rename and delete alike — answers the same
+    /// field set.
     ///
     /// A method rather than a free function because
     /// `DirectConnectGateway$totalPrefixPoolAllocations` ("the total number of

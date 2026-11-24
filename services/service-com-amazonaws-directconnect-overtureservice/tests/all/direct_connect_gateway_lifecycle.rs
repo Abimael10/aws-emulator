@@ -43,7 +43,7 @@ use service_com_amazonaws_directconnect_overtureservice::state::{
     PRIVATE_AMAZON_SIDE_ASN_RANGES,
 };
 
-use crate::connection_and_virtual_interface_lifecycle::{error_code, Emulator};
+use crate::connection_and_virtual_interface_lifecycle::{connection, error_code, Emulator};
 
 /// The group lengths of a UUID (`8-4-4-4-12`), the form AWS reports a
 /// `directConnectGatewayId` in.
@@ -2063,12 +2063,14 @@ async fn deleting_a_gateway_moves_it_to_a_tombstone_and_is_refused_while_it_carr
             json!({"directConnectGatewayId": "00000000-0000-4000-8000-000000000000"}),
         )
         .await;
+    // The sentence is written out rather than taken from the service: its wording is what
+    // a client branches on, so the wording is what this pins (see the table below over
+    // every operation that resolves a gateway id).
     assert_eq!(
         (status, error_message(&unknown)),
         (
             400,
-            "Direct Connect gateway ID 00000000-0000-4000-8000-000000000000 does not exist"
-                .to_string()
+            gateway_not_found("00000000-0000-4000-8000-000000000000")
         ),
         "expected the unresolved-id refusal, got {status} with {unknown}"
     );
@@ -2774,5 +2776,388 @@ async fn an_association_is_refused_about_the_gateway_to_associate_before_the_dir
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// How an unresolved identifier is WORDED: the ARN of a tag call that names no resource of
+// this account, and the id of a gateway no account holds.
+//
+// The rules pinned below:
+//
+// 1. A tag call whose `resourceArn` is not an ARN at all is refused about its FORM, while
+//    one that parses but names no resource of this account is refused about the resource.
+// 2. One wording for an unresolved gateway id, on every operation that resolves one.
+// ---------------------------------------------------------------------------------------
+
+
+/// The ARN resource path of each kind of Direct Connect resource these suites name, and
+/// the Region such an ARN carries — none for a kind that is global. Written out rather
+/// than taken from the service, so the FORM is what the test pins.
+const GATEWAY_PATH: &str = "dx-gateway";
+const RESILIENCY_GROUP_PATH: &str = "dx-resiliency-group";
+const REGIONAL: &str = "us-east-1";
+const GLOBAL: &str = "";
+
+/// One row of the unresolved-gateway-id table: case, the operation, and the request body
+/// built around the id it must be refused about.
+type UnresolvedRow = (&'static str, &'static str, Value);
+
+/// One row of the tag-wording table: case, the operation, and a request body built around
+/// the tag set the row submits, so only that set differs between the cases.
+type TagWordingRow = (
+    &'static str,
+    &'static str,
+    Box<dyn Fn(&[(&str, &str)]) -> Value>,
+);
+
+/// `TagResource` with `tags` on `resource_arn`.
+async fn tag_resource(dx: &Emulator, resource_arn: &str, tags: &[(&str, &str)]) -> (u16, Value) {
+    dx.call(
+        "TagResource",
+        json!({"resourceArn": resource_arn, "tags": tag_list(tags)}),
+    )
+    .await
+}
+
+/// The ONE sentence this service states for a `directConnectGatewayId` no gateway exists
+/// under, written out here: its wording is what a client branches on to tell this refusal
+/// from any other client fault of the operation, so the wording is what the test pins.
+fn gateway_not_found(gateway_id: &str) -> String {
+    format!(
+        "Direct Connect Gateway for owner {} and with id {gateway_id} does not exist",
+        engine::EMULATOR_ACCOUNT_ID
+    )
+}
+
+#[tokio::test]
+async fn a_tag_call_is_refused_about_the_arns_form_or_about_the_resource_it_names() {
+    let dx = Emulator::new();
+    let (status, created) = dx
+        .call(
+            "CreateDirectConnectGateway",
+            create_gateway_body("tag-refusal-gateway", None, &[("held", "already")]),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "setup: expected CreateDirectConnectGateway to succeed, got {status} with {created}"
+    );
+    let gateway_id = created["directConnectGateway"]["directConnectGatewayId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let gateway_arn = direct_connect_arn(GLOBAL, GATEWAY_PATH, &gateway_id);
+    let held_before = tags_of(&dx, &gateway_arn).await;
+
+    // (case, the value the write names, the sentence it is refused with) — a value that is
+    // not an ARN at all is refused about its FORM, and an ARN that parses but names no
+    // resource of this account about the RESOURCE: a gateway ARN whose id nobody holds, a
+    // gateway ARN carrying a Region (a gateway is global, so its ARN carries none), an ARN
+    // of another service, and an ARN of this service naming a resource path it does not
+    // publish.
+    let unresolved: &[(&str, String, String)] = &[
+        (
+            "a gateway ARN whose id nobody holds",
+            direct_connect_arn(GLOBAL, GATEWAY_PATH, "00000000-0000-4000-8000-000000000000"),
+            format!(
+                "Resource {} does not exist",
+                direct_connect_arn(GLOBAL, GATEWAY_PATH, "00000000-0000-4000-8000-000000000000")
+            ),
+        ),
+        (
+            "a gateway ARN carrying a Region",
+            direct_connect_arn(REGIONAL, GATEWAY_PATH, &gateway_id),
+            format!(
+                "Resource {} does not exist",
+                direct_connect_arn(REGIONAL, GATEWAY_PATH, &gateway_id)
+            ),
+        ),
+        (
+            "an ARN of another service",
+            format!(
+                "arn:aws:ec2:{REGIONAL}:{}:vpc/vpc-0123456789abcdef0",
+                engine::EMULATOR_ACCOUNT_ID
+            ),
+            format!(
+                "Resource arn:aws:ec2:{REGIONAL}:{}:vpc/vpc-0123456789abcdef0 does not exist",
+                engine::EMULATOR_ACCOUNT_ID
+            ),
+        ),
+        (
+            "a resource path this service does not publish",
+            direct_connect_arn(GLOBAL, "dx-not-a-resource", &gateway_id),
+            format!(
+                "Resource {} does not exist",
+                direct_connect_arn(GLOBAL, "dx-not-a-resource", &gateway_id)
+            ),
+        ),
+        (
+            "a value that is no ARN at all",
+            gateway_id.clone(),
+            format!("Invalid ARN format: {gateway_id}"),
+        ),
+        (
+            "a value that only starts out like an ARN",
+            "arn:aws:directconnect".to_string(),
+            "Invalid ARN format: arn:aws:directconnect".to_string(),
+        ),
+        (
+            "an ARN whose resource field is empty",
+            format!("arn:aws:directconnect::{}:", engine::EMULATOR_ACCOUNT_ID),
+            format!(
+                "Invalid ARN format: arn:aws:directconnect::{}:",
+                engine::EMULATOR_ACCOUNT_ID
+            ),
+        ),
+    ];
+    for (case, resource_arn, refusal) in unresolved {
+        let (status, body) = tag_resource(&dx, resource_arn, &[("new", "tag")]).await;
+        assert_eq!(
+            (status, error_code(&body), error_message(&body)),
+            (
+                400,
+                "DirectConnectClientException".to_string(),
+                refusal.clone()
+            ),
+            "case {case:?}: expected the unresolved-ARN refusal, got {status} with {body}"
+        );
+        // A removal resolves the ARN the same way, so it is refused with the same sentence.
+        let (status, body) = dx
+            .call(
+                "UntagResource",
+                json!({"resourceArn": resource_arn, "tagKeys": ["held"]}),
+            )
+            .await;
+        assert_eq!(
+            (status, error_code(&body), error_message(&body)),
+            (
+                400,
+                "DirectConnectClientException".to_string(),
+                refusal.clone()
+            ),
+            "case {case:?}: expected the removal to be refused alike, got {status} with {body}"
+        );
+    }
+
+    // None of those calls reached a resource: the gateway holds what it held, and a
+    // resource no call named holds no tags at all.
+    assert_eq!(
+        tags_of(&dx, &gateway_arn).await,
+        held_before,
+        "a refused call must leave the resource it failed to name as it was"
+    );
+    let other = group(&dx, "tag-refusal-group", "basic-resiliency").await;
+    assert_eq!(
+        tags_of(&dx, &direct_connect_arn(GLOBAL, RESILIENCY_GROUP_PATH, &other)).await,
+        tag_list(&[]),
+        "a resource no call named must hold no tags"
+    );
+}
+
+#[tokio::test]
+async fn a_tag_set_one_resource_cannot_carry_is_refused_alike_on_every_write_of_it() {
+    // RULE: a tag set naming one key twice, and one past the number of tags a resource may
+    // hold, are refused with the ONE sentence this service states for each — the tag write
+    // and every create that carries a tag set alike, since the sentence is all a client has
+    // to tell the two faults apart.
+    //
+    // The rows are the writes that take a tag set: `TagResource` and each create of a
+    // taggable resource this service mints, so no one of them can word either refusal
+    // differently. Each row names the request body around a tag set, so only the tag set
+    // differs between the duplicate-key and the ceiling case.
+    let dx = Emulator::new();
+    let connection_id = connection(&dx, "tag-wording-connection", "EqDC2-EQ", "1Gbps").await;
+    let gateway_id = gateway(&dx, "tag-wording-gateway").await;
+    let gateway_arn = direct_connect_arn(GLOBAL, GATEWAY_PATH, &gateway_id);
+
+    // One key twice, and one key more than a resource may hold.
+    let repeated: Vec<(&str, &str)> = vec![("twice", "first"), ("twice", "second")];
+    let keys: Vec<String> = (0..=MAX_TAGS_PER_RESOURCE)
+        .map(|index| format!("key-{index}"))
+        .collect();
+    let past_ceiling: Vec<(&str, &str)> = keys
+        .iter()
+        .map(|key| (key.as_str(), "one-too-many"))
+        .collect();
+
+    // (case, the operation, a request body built around `tags`)
+    let writes: Vec<TagWordingRow> = vec![
+        (
+            "TagResource",
+            "TagResource",
+            Box::new({
+                let arn = gateway_arn.clone();
+                move |tags| json!({"resourceArn": &arn, "tags": tag_list(tags)})
+            }),
+        ),
+        (
+            "CreateDirectConnectGateway",
+            "CreateDirectConnectGateway",
+            Box::new(|tags| create_gateway_body("tag-wording-gw", None, tags)),
+        ),
+        (
+            "CreateConnection",
+            "CreateConnection",
+            Box::new(|tags| {
+                json!({
+                    "connectionName": "tag-wording-conn",
+                    "location": "EqDC2-EQ",
+                    "bandwidth": "1Gbps",
+                    "tags": tag_list(tags),
+                })
+            }),
+        ),
+        (
+            "CreateResiliencyGroup",
+            "CreateResiliencyGroup",
+            Box::new(|tags| create_group_body("tag-wording-group", "basic-resiliency", tags, None)),
+        ),
+        (
+            "CreatePrivateVirtualInterface",
+            "CreatePrivateVirtualInterface",
+            Box::new({
+                let connection_id = connection_id.clone();
+                move |tags| {
+                    json!({
+                        "connectionId": &connection_id,
+                        "newPrivateVirtualInterface": {
+                            "virtualInterfaceName": "tag-wording-vif",
+                            "vlan": 303,
+                            "asn": 65000,
+                            "virtualGatewayId": "vgw-0123456789abcdef0",
+                            "tags": tag_list(tags),
+                        },
+                    })
+                }
+            }),
+        ),
+    ];
+
+    for (case, target, body_of) in &writes {
+        // The error CODE is whatever each operation's model declares for the fault
+        // (`CreateDirectConnectGateway` declares no tag-specific error, so it answers the
+        // one client fault it has); what every one of them must share is the SENTENCE.
+        let (status, refused) = dx.call(target, body_of(&repeated)).await;
+        assert_eq!(
+            (status, error_message(&refused)),
+            (400, "Tag twice is specified more than once.".to_string()),
+            "case {case:?}: expected the one duplicate-key sentence, got {status} with {refused}"
+        );
+
+        let (status, refused) = dx.call(target, body_of(&past_ceiling)).await;
+        assert_eq!(
+            (status, error_message(&refused)),
+            (
+                400,
+                "You have reached the limit on the number of tags that can be assigned."
+                    .to_string()
+            ),
+            "case {case:?}: expected the one tag-ceiling sentence, got {status} with {refused}"
+        );
+    }
+
+    // Neither refusal stored anything: the gateway still holds no tags, and no resource of
+    // the refused creates was minted.
+    assert_eq!(
+        tags_of(&dx, &gateway_arn).await,
+        tag_list(&[]),
+        "a refused write must leave the resource untagged"
+    );
+    let (listed, _) = describe(&dx, json!({})).await;
+    let named: Vec<Value> = listed
+        .iter()
+        .map(|held| held["directConnectGatewayName"].clone())
+        .collect();
+    assert!(
+        !named.contains(&json!("tag-wording-gw")),
+        "a refused create must store no gateway, got {named:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_gateway_id_no_gateway_exists_under_is_refused_with_the_one_stated_sentence() {
+    let dx = Emulator::new();
+    let connection_id = connection(
+        &dx,
+        "unresolved-gateway-connection",
+        "EqDC2-EQ",
+        "1Gbps",
+    )
+    .await;
+
+    // Every operation of this service that resolves a `directConnectGatewayId`, against ids
+    // of each form that names no stored gateway: a UUID nobody holds, an id of another
+    // resource of this service, and a value that is no gateway id at all.
+    let unknown_ids: &[(&str, &str)] = &[
+        (
+            "a UUID nobody holds",
+            "00000000-0000-4000-8000-000000000000",
+        ),
+        ("another resource's id", "dxcon-00000000"),
+        ("a value that is no gateway id", "not-a-gateway-id"),
+    ];
+
+    for (id_case, gateway_id) in unknown_ids {
+        let rows: Vec<UnresolvedRow> = vec![
+            (
+                "DeleteDirectConnectGateway",
+                "DeleteDirectConnectGateway",
+                json!({"directConnectGatewayId": gateway_id}),
+            ),
+            (
+                "UpdateDirectConnectGateway",
+                "UpdateDirectConnectGateway",
+                json!({
+                    "directConnectGatewayId": gateway_id,
+                    "newDirectConnectGatewayName": "renamed",
+                }),
+            ),
+            (
+                "CreatePrivateVirtualInterface, which terminates on the gateway",
+                "CreatePrivateVirtualInterface",
+                json!({
+                    "connectionId": &connection_id,
+                    "newPrivateVirtualInterface": {
+                        "virtualInterfaceName": "unresolved-gateway-vif",
+                        "vlan": 222,
+                        "asn": 65000,
+                        "directConnectGatewayId": gateway_id,
+                    },
+                }),
+            ),
+        ];
+
+        for (case, target, body) in rows {
+            let (status, response) = dx.call(target, body).await;
+            assert_eq!(
+                (status, error_code(&response), error_message(&response)),
+                (
+                    400,
+                    "DirectConnectClientException".to_string(),
+                    gateway_not_found(gateway_id)
+                ),
+                "case {case:?} with {id_case:?}: expected the one stated refusal, got {status} \
+                 with {response}"
+            );
+        }
+    }
+
+    // A gateway the account DOES hold is refused by none of them, so the refusal is about
+    // the id resolving to nothing rather than about the request's shape.
+    let held = gateway(&dx, "resolved-gateway").await;
+    let (status, renamed) = dx
+        .call(
+            "UpdateDirectConnectGateway",
+            json!({
+                "directConnectGatewayId": &held,
+                "newDirectConnectGatewayName": "resolved-gateway-renamed",
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case \"a gateway the account holds\": expected the rename to succeed, got {status} with \
+         {renamed}"
+    );
 }
 

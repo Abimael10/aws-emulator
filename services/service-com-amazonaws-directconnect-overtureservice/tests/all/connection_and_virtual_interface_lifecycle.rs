@@ -156,7 +156,10 @@ fn create_vif_body(connection_id: &str, name: &str, vlan: i64, extra: &[(&str, V
 }
 
 /// Create one connection and return its id, failing the test if it was refused.
-async fn connection(dx: &Emulator, name: &str, location: &str, bandwidth: &str) -> String {
+///
+/// `pub(crate)` so a sibling suite in this same test target mints a connection through the
+/// one setup helper rather than a second copy of it.
+pub(crate) async fn connection(dx: &Emulator, name: &str, location: &str, bandwidth: &str) -> String {
     let (status, body) = dx
         .call(
             "CreateConnection",

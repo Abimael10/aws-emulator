@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
+//! Removes the named tag keys from the stored Direct Connect resource the `resourceArn`
+//! names ([`crate::state::tags_of_resource_mut`]), which is the record `DescribeTags`
+//! projects — so a key removed here is gone from that read.
 //!
 //! ## Shape of an operation
 //!
@@ -160,6 +163,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // call on this store does.
         store.settle_due_transitions();
 
+        // The resource the ARN names, resolved the ONE way this service resolves a tagged
+        // resource by ARN — so a removal reaches exactly the record `DescribeTags` reads.
         let Some(tags) = crate::state::tags_of_resource_mut(&mut store, &input.resource_arn) else {
             return Err(UntagResourceErrorModeled::DirectConnectClientException(
                 DirectConnectClientException {

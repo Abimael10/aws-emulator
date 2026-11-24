@@ -190,15 +190,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The tag-count ceiling is checked FIRST, so it bounds the per-tag work
         // every later check does on a caller-chosen list length.
         if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
-            return Err(client_error(format!(
-                "{} tags were supplied; a Direct Connect resource accepts at most {}",
-                tags.len(),
-                crate::state::MAX_TAGS_PER_RESOURCE
-            )));
+            return Err(client_error(
+                crate::state::TOO_MANY_TAGS_MESSAGE.to_string(),
+            ));
         }
         if let Some(duplicate) = crate::state::first_duplicate_tag_key(&tags) {
-            return Err(client_error(format!(
-                "Tag key {duplicate} was specified more than once"
+            return Err(client_error(crate::state::duplicate_tag_key_message(
+                duplicate,
             )));
         }
 

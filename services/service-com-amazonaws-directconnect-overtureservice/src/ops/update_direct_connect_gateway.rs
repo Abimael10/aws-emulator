@@ -176,9 +176,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // being torn down, or already gone, is not one, so its name is not the
         // caller's to change.
         let Some(gateway) = store.gateways.get_mut(&gateway_id) else {
-            return Err(client_error(format!(
-                "Direct Connect gateway ID {gateway_id} does not exist"
-            )));
+            return Err(client_error(
+                crate::state::direct_connect_gateway_not_found_message(
+                    ::engine::emulator_account_id(),
+                    &gateway_id,
+                ),
+            ));
         };
         if matches!(
             gateway.direct_connect_gateway_state.as_str(),

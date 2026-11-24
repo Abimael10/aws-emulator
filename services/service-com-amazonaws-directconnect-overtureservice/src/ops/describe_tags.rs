@@ -176,7 +176,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 resource_arn: Some(resource_arn.clone()),
                 // The tag list is always PRESENT, empty when nothing tagged the
                 // resource, rather than absent: a client reading it never has to tell
-                // "no tags" from "not reported".
+                // "no tags" from "not reported". (`TagList`'s `@length 1..` bounds what a
+                // tag WRITE may submit; it is not what this read reports for a resource
+                // nobody has tagged.)
                 tags: Some(tags),
             });
         }

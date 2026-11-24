@@ -291,10 +291,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&input.direct_connect_gateway_id)
             .is_some_and(|stored| stored.direct_connect_gateway_state != "deleted")
         {
-            return Err(client_error(format!(
-                "Direct Connect gateway ID {} does not exist",
-                input.direct_connect_gateway_id
-            )));
+            return Err(client_error(
+                crate::state::direct_connect_gateway_not_found_message(
+                    &owner_account,
+                    &input.direct_connect_gateway_id,
+                ),
+            ));
         }
 
         // The gateway "must not be associated with another Direct Connect gateway":

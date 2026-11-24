@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
+//! Writes the submitted tags onto the stored Direct Connect resource the `resourceArn`
+//! names ([`crate::state::tags_of_resource_mut`]), which is the record `DescribeTags`
+//! projects — so a tag written here is read back by that operation.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -118,14 +122,12 @@ impl<Eng> TagResource<Eng> {
 /// [`crate::state::MAX_TAGS_PER_RESOURCE`], stated once so both the request-count
 /// ceiling and the stored-count ceiling word it alike.
 ///
-/// `TooManyTagsException` is documented as "you have reached the limit on the number of
-/// tags that can be assigned", which is the sentence it carries; the limit is not
-/// restated in it.
+/// The sentence is the one the model's own `TooManyTagsException` documents, shared with
+/// every other write of this service that refuses a tag set past the ceiling
+/// ([`crate::state::TOO_MANY_TAGS_MESSAGE`]).
 fn too_many_tags() -> TagResourceError {
     TagResourceErrorModeled::TooManyTagsException(TooManyTagsException {
-        message: Some(
-            "You have reached the limit on the number of tags that can be assigned".to_string(),
-        ),
+        message: Some(crate::state::TOO_MANY_TAGS_MESSAGE.to_string()),
     })
     .into()
 }
@@ -172,10 +174,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Each tag consists of a key and an optional value", so one key may be
         // written once per call: a request naming a key twice does not say which
         // value it means.
-        if crate::state::first_duplicate_tag_key(&input.tags).is_some() {
+        if let Some(duplicate) = crate::state::first_duplicate_tag_key(&input.tags) {
             return Err(TagResourceErrorModeled::DuplicateTagKeysException(
                 DuplicateTagKeysException {
-                    message: Some("A tag key was specified more than once".to_string()),
+                    message: Some(crate::state::duplicate_tag_key_message(duplicate)),
                 },
             )
             .into());
@@ -186,6 +188,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // call on this store does.
         store.settle_due_transitions();
 
+        // The resource the ARN names, resolved the ONE way this service resolves a tagged
+        // resource by ARN — so a write reaches exactly the record `DescribeTags` reads.
         let Some(tags) = crate::state::tags_of_resource_mut(&mut store, &input.resource_arn) else {
             return Err(TagResourceErrorModeled::DirectConnectClientException(
                 DirectConnectClientException {
@@ -200,14 +204,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "If a tag with the same key is already associated with the resource, this
         // action updates its value" — so the write MERGES by key rather than appending
         // a second entry under one key, and the resource keeps the tags the request
-        // does not name.
+        // does not name ([`crate::state::merge_tags`], the one merge of a submitted set
+        // into a stored one).
         let mut merged = tags.clone();
-        for tag in input.tags {
-            match merged.iter_mut().find(|held| held.key == tag.key) {
-                Some(held) => held.value = tag.value,
-                None => merged.push(tag),
-            }
-        }
+        crate::state::merge_tags(&mut merged, input.tags);
 
         // "Each resource can have a maximum of 50 tags": the ceiling is on what the
         // resource would HOLD, so a call that only updates the values of tags already

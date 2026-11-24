@@ -1113,4 +1113,37 @@ async fn a_gateway_the_account_cannot_associate_is_refused_and_stores_nothing() 
             "case {case:?}: a refused create must store no association, got {held:?}"
         );
     }
+
+    // The WORDING of the unresolved-Direct-Connect-gateway refusal, not only the id it
+    // names: this operation shares one client-fault shape with every other client fault,
+    // so the sentence is all a client has to tell "that gateway is gone" from the rest —
+    // and it names the owner account the lookup was made for as well as the id the request
+    // carried.
+    let unknown_gateway = "00000000-0000-4000-8000-000000000000";
+    let refused = dx(
+        &router,
+        "CreateDirectConnectGatewayAssociation",
+        json!({
+            "directConnectGatewayId": unknown_gateway,
+            "gatewayId": attached.clone(),
+        }),
+    )
+    .await;
+    assert_eq!(
+        (
+            refused.status,
+            refused.error_code(),
+            refused.message().to_string()
+        ),
+        (
+            CLIENT_ERROR,
+            CLIENT_EXCEPTION.to_string(),
+            format!(
+                "Direct Connect Gateway for owner {} and with id {unknown_gateway} does not exist",
+                engine::EMULATOR_ACCOUNT_ID
+            )
+        ),
+        "expected the one stated unresolved-gateway refusal, got {}",
+        refused.body
+    );
 }

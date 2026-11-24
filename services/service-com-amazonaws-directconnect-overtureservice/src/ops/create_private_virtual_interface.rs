@@ -258,11 +258,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
             return Err(CreatePrivateVirtualInterfaceErrorModeled::TooManyTagsException(
                 TooManyTagsException {
-                    message: Some(format!(
-                        "{} tags were supplied; a Direct Connect resource accepts at most {}",
-                        tags.len(),
-                        crate::state::MAX_TAGS_PER_RESOURCE
-                    )),
+                    message: Some(crate::state::TOO_MANY_TAGS_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -271,7 +267,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreatePrivateVirtualInterfaceErrorModeled::DuplicateTagKeysException(
                     DuplicateTagKeysException {
-                        message: Some(format!("Tag key {duplicate} was specified more than once")),
+                        message: Some(crate::state::duplicate_tag_key_message(duplicate)),
                     },
                 )
                 .into(),
@@ -391,9 +387,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let amazon_side_asn = match &requested_gateway_id {
             Some(gateway_id) => {
                 let Some(gateway) = store.gateways.get(gateway_id) else {
-                    return Err(client_error(format!(
-                        "Direct Connect gateway ID {gateway_id} does not exist"
-                    )));
+                    return Err(client_error(
+                        crate::state::direct_connect_gateway_not_found_message(
+                            ::engine::emulator_account_id(),
+                            gateway_id,
+                        ),
+                    ));
                 };
                 if gateway.direct_connect_gateway_state == "deleting"
                     || gateway.direct_connect_gateway_state == "deleted"

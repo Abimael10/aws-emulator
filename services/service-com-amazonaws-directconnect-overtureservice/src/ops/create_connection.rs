@@ -233,11 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
             return Err(CreateConnectionErrorModeled::TooManyTagsException(
                 TooManyTagsException {
-                    message: Some(format!(
-                        "{} tags were supplied; a Direct Connect resource accepts at most {}",
-                        tags.len(),
-                        crate::state::MAX_TAGS_PER_RESOURCE
-                    )),
+                    message: Some(crate::state::TOO_MANY_TAGS_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -245,7 +241,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(duplicate) = crate::state::first_duplicate_tag_key(&tags) {
             return Err(CreateConnectionErrorModeled::DuplicateTagKeysException(
                 DuplicateTagKeysException {
-                    message: Some(format!("Tag key {duplicate} was specified more than once")),
+                    message: Some(crate::state::duplicate_tag_key_message(duplicate)),
                 },
             )
             .into());
