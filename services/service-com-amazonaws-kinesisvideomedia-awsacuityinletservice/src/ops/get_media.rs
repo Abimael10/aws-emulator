@@ -674,22 +674,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         })?
                 }
                 // "PRODUCER_TIMESTAMP or SERVER_TIMESTAMP - Start with the chunk
-                // CONTAINING a fragment with the specified timestamp": fragment i
-                // covers from its own timestamp until fragment i+1's, and the newest
-                // fragment covers everything after its own. A timestamp older than
-                // every fragment lands on the earliest one.
+                // CONTAINING a fragment with the specified timestamp": the chunks that
+                // contain the requested instant are the ones carrying the newest stamp
+                // that is not after it, and the session starts with the FIRST of them,
+                // so a run of fragments sharing one instant is delivered whole rather
+                // than reduced to its newest member. A timestamp older than every
+                // fragment carries no such stamp and lands on the earliest chunk.
                 "PRODUCER_TIMESTAMP" | "SERVER_TIMESTAMP" => {
                     let wanted = start_timestamp_millis.unwrap_or_default();
                     let producer = selector_type == "PRODUCER_TIMESTAMP";
+                    let stamped = |fragment: &crate::state::Fragment| {
+                        crate::state::epoch_millis(if producer {
+                            fragment.producer_timestamp
+                        } else {
+                            fragment.server_timestamp
+                        })
+                    };
                     fragments
                         .iter()
-                        .rposition(|fragment| {
-                            let at = crate::state::epoch_millis(if producer {
-                                fragment.producer_timestamp
-                            } else {
-                                fragment.server_timestamp
-                            });
-                            at <= wanted
+                        .filter_map(|fragment| {
+                            let at = stamped(fragment);
+                            (at <= wanted).then_some(at)
+                        })
+                        .max()
+                        .and_then(|covering| {
+                            fragments
+                                .iter()
+                                .position(|fragment| stamped(fragment) == covering)
                         })
                         .unwrap_or(0)
                 }
