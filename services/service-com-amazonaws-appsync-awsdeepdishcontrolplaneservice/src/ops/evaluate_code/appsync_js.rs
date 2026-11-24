@@ -1028,7 +1028,11 @@ fn read_position(stated: &str) -> Option<i32> {
 }
 
 /// The largest byte index at or below `limit` that `text` can be cut at.
-fn boundary_at_or_below(text: &str, limit: usize) -> usize {
+///
+/// Reached by the VELOCITY half of this sandbox too
+/// (`crate::service::graphql_api::mapping_template`), which holds a log line to the same
+/// ceiling: one service cuts one over-long line one way.
+pub(crate) fn boundary_at_or_below(text: &str, limit: usize) -> usize {
     text.char_indices()
         .map(|(index, _)| index)
         .take_while(|index| *index <= limit)

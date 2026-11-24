@@ -17,9 +17,10 @@
 //!    it;
 //! 3. a template that RAISES (`$util.error`, `$util.unauthorized`) is a SERVED call whose
 //!    `error` carries that error's own message, and no `evaluationResult`;
-//! 4. a template that cannot be evaluated at all — it does not parse, or it names a helper
-//!    this reader does not publish — is a 400 `BadRequestException` naming what went wrong,
-//!    and a `context` that is not a map is a 400 `BadRequestException` naming that member;
+//! 4. a template that cannot be EVALUATED at all — it does not parse, or it names a helper
+//!    this reader does not publish — is a SERVED 200 reporting that diagnostic through the
+//!    output `error` member, while a `context` that is not a map is the 400
+//!    `BadRequestException` the modelled constraint takes;
 //! 5. the evaluation is a READ of nothing: the identical call answers identically, and
 //!    nothing one render left behind is reachable from the next.
 //!
@@ -37,9 +38,9 @@ use super::error_contract::{call, router, Answer};
 /// (`smithy_query(query="operation", operation="EvaluateMappingTemplate")`).
 const PATH: &str = "/v1/dataplane-evaluatetemplate";
 
-/// The sentences the tree's one reader of this language states for text it cannot parse,
-/// named from that reader rather than written out here.
-use service_common::velocity_template::{NOT_AN_ASSIGNMENT, NOT_A_DIRECTIVE, NO_END};
+/// The class a Velocity parse failure names, which the `error` of an unparseable template
+/// carries.
+const PARSE_ERROR: &str = "org.apache.velocity.exception.ParseErrorException";
 
 /// Render `template` over `context` and return what the emulator answered.
 async fn evaluate(router: &MultiServiceRouter, template: &str, context: &str) -> Answer {
@@ -78,10 +79,13 @@ async fn the_evaluation_result_is_what_the_template_rendered() {
             "a line of text",
         ),
         (
+            // The context a template is evaluated over is a resolver context, which always
+            // has the stash a run writes through — so the whole of it carries the stash
+            // whether the call stated one or not.
             "the whole context, rendered as JSON",
             "$util.toJson($context)",
             one_argument,
-            r#"{"arguments":{"id":"7"}}"#,
+            r#"{"arguments":{"id":"7"},"stash":{}}"#,
         ),
         (
             "a reference walking into the context by member",
@@ -284,12 +288,15 @@ async fn a_template_that_raises_is_a_served_call_reporting_the_error() {
             "refused in a branch",
         ),
         (
-            // The refusal AppSync words for $util.unauthorized names the field and the type
-            // it belongs to, so it is read out of the context the call supplied.
+            // A template evaluated in the SANDBOX is resolving no field, so the refusal
+            // $util.unauthorized raises is the word on its own — the same answer the
+            // APPSYNC_JS half of this sandbox gives for `util.unauthorized()`. The field-level
+            // sentence belongs to a resolution that names a field and a type, which this
+            // call does not (`graphql_api_field_authorization`).
             "the refusal $util.unauthorized raises",
             "$util.unauthorized()",
             field,
-            "Not Authorized to access field on type Query",
+            "Unauthorized",
         ),
     ];
 
@@ -314,101 +321,97 @@ async fn a_template_that_raises_is_a_served_call_reporting_the_error() {
     }
 }
 
-/// Rule 4: a template this cannot evaluate, and a context that is not a map, are refused 400
-/// `BadRequestException` naming what the request got wrong.
+/// Rule 4: a template this cannot EVALUATE is a served 200 reporting that diagnostic through
+/// the output `error` member, and a `context` that is not a map — a MODELLED constraint of the
+/// request — is the one 400 `BadRequestException` left.
+///
+/// `error` is an output member of this operation's 200 response, so an evaluation that failed
+/// is reported in the body: the rows span the ways a template can fail to parse (a block never
+/// closed, a directive without its parentheses, a `#set` that is no assignment, an `#end`
+/// closing nothing, an unterminated string, an expression with an operand missing) and the
+/// ways a parsed one can fail to run (a helper this reader does not publish), beside the
+/// request shapes that are refused.
 #[tokio::test]
-async fn a_request_this_cannot_evaluate_is_a_bad_request() {
+async fn a_template_this_cannot_evaluate_is_a_served_error_and_a_bad_context_is_refused() {
     let router = router();
 
-    // Each row states the sentence it must be refused with where the reader of the language
-    // publishes one, and `None` where the refusal only has to name the fault itself.
-    let cases: &[(&str, &str, &str, Option<&str>)] = &[
-        (
-            "a block that is never closed",
-            "#if($ctx.arguments.id)open",
-            r#"{"arguments":{"id":"7"}}"#,
-            Some(NO_END),
-        ),
-        (
-            "a loop that is never closed",
-            "#foreach($n in [1, 2])$n",
-            "{}",
-            Some(NO_END),
-        ),
-        (
-            "a directive written without its parentheses",
-            "#if $ctx.arguments.id",
-            r#"{"arguments":{"id":"7"}}"#,
-            Some(NOT_A_DIRECTIVE),
-        ),
-        (
-            "a #set that is no assignment",
-            "#set($ctx.arguments.id)",
-            r#"{"arguments":{"id":"7"}}"#,
-            Some(NOT_AN_ASSIGNMENT),
-        ),
-        ("an #end closing no block", "rendered#end", "{}", None),
-        ("an unterminated string", "#set($x = \"unclosed)", "{}", None),
-        (
-            "an expression with an operand missing",
-            "#if($x ==)yes#end",
-            "{}",
-            None,
-        ),
-        (
-            "a helper this reader does not publish",
-            "$util.noSuchHelper()",
-            "{}",
-            None,
-        ),
-        (
-            "a context that is a list rather than a map",
-            "rendered",
-            "[1]",
-            Some("Invalid context given."),
-        ),
-        (
-            "a context that is a number",
-            "rendered",
-            "12",
-            Some("Invalid context given."),
-        ),
-        (
-            "a context that is a quoted string",
-            "rendered",
-            "\"text\"",
-            Some("Invalid context given."),
-        ),
-        (
-            "a context that is not JSON at all",
-            "rendered",
-            "not json",
-            Some("Invalid context given."),
-        ),
+    // A template that does not PARSE is reported with the Velocity parse diagnostic: the
+    // exception class, the token the parse stopped at and where that token sits.
+    let unparseable: &[(&str, &str, &str)] = &[
+        ("a block that is never closed", "#if($ctx.arguments.id)open", r#"{"arguments":{"id":"7"}}"#),
+        ("a loop that is never closed", "#foreach($n in [1, 2])$n", "{}"),
+        ("a directive written without its parentheses", "#if $ctx.arguments.id", "{}"),
+        ("a #set that is no assignment", "#set($ctx.arguments.id)", "{}"),
+        ("an #end closing no block", "rendered#end", "{}"),
+        ("an unterminated string", "#set($x = \"unclosed)", "{}"),
+        ("an expression with an operand missing", "#if($x ==)yes#end", "{}"),
     ];
-
-    for (case, template, context, expected) in cases {
+    for (case, template, context) in unparseable {
         let answer = evaluate(&router, template, context).await;
+        let message = answer.body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         assert_eq!(
-            (answer.status, answer.error_type.as_str()),
-            (400, "BadRequestException"),
-            "case {case:?}: expected 400 BadRequestException, got {} {} {:?}",
+            answer.status, 200,
+            "case {case:?}: a template that does not parse is a served call, got {} {:?}",
+            answer.status, answer.body
+        );
+        assert!(
+            message.contains(PARSE_ERROR) && message.contains("at line "),
+            "case {case:?}: expected the parse diagnostic, got {message:?}"
+        );
+        assert!(
+            result(&answer).is_none(),
+            "case {case:?}: a template that did not parse rendered nothing, got {:?}",
+            answer.body
+        );
+        // Nothing ran, so the run's own members are the ones it would have started from.
+        assert_eq!(
+            (
+                answer.body["stash"].as_str(),
+                answer.body["outErrors"].as_str(),
+                answer.body["logs"].as_str()
+            ),
+            (Some("{}"), Some("[]"), None),
+            "case {case:?}: expected the members of a run that never happened, got {:?}",
+            answer.body
+        );
+    }
+
+    // A template that parses but cannot be RUN is reported the same way, with the diagnostic
+    // naming what it asked for.
+    let unrunnable = evaluate(&router, "$util.noSuchHelper()", "{}").await;
+    assert_eq!(
+        (
+            unrunnable.status,
+            unrunnable.body["error"]["message"].as_str(),
+            result(&unrunnable)
+        ),
+        (200, Some("No such helper: $util.noSuchHelper"), None),
+        "case a helper this reader does not publish: got {} {:?}",
+        unrunnable.status,
+        unrunnable.body
+    );
+
+    // A `context` that is not the map the model requires is the refusal: the REQUEST is what
+    // is malformed, not the template.
+    let refused: &[(&str, &str)] = &[
+        ("a context that is a list rather than a map", "[1]"),
+        ("a context that is a number", "12"),
+        ("a context that is a quoted string", "\"text\""),
+        ("a context that is not JSON at all", "not json"),
+    ];
+    for (case, context) in refused {
+        let answer = evaluate(&router, "rendered", context).await;
+        assert_eq!(
+            (answer.status, answer.error_type.as_str(), answer.message.as_str()),
+            (400, "BadRequestException", "Invalid context given."),
+            "case {case:?}: expected the refusal, got {} {} {:?}",
             answer.status,
             answer.error_type,
             answer.body
         );
-        match expected {
-            Some(sentence) => assert_eq!(
-                answer.message, *sentence,
-                "case {case:?}: expected {sentence:?}, got {:?}",
-                answer.message
-            ),
-            None => assert!(
-                !answer.message.is_empty(),
-                "case {case:?}: expected the refusal to name the fault, got {:?}",
-                answer.body
-            ),
-        }
         assert!(
             result(&answer).is_none(),
             "case {case:?}: a refused request renders nothing, got {:?}",

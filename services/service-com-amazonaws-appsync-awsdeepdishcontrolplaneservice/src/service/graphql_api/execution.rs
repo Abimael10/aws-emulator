@@ -1870,6 +1870,12 @@ impl Execution<'_> {
             *stash = left.clone();
         }
         self.appended.extend(evaluation.appended);
+        // A template that RAISED refused the field it is resolving — `$util.error`, or the
+        // refusal `$util.unauthorized` states — whatever it had rendered and left behind up to
+        // that point, which the two lines above keep.
+        if let Some(raised) = evaluation.raised {
+            return Err(Failure::Raised(raised));
+        }
         Ok(evaluation.text)
     }
 

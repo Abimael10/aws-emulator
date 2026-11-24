@@ -6,9 +6,10 @@
 //! One function per helper, over the same JSON value model the rest of the language works
 //! in ([`super::values`]). The `$util.dynamodb` family — the helpers that MARSHAL a value as
 //! the attribute value DynamoDB holds it as — lives in [`dynamodb`], one module for one
-//! family. Three of them are not values at all and are answered as their own
-//! outcome: `$util.quiet` produces nothing, and `$util.error` and `$util.unauthorized` RAISE
-//! — "throws a custom error", which is how a template refuses the field it is resolving.
+//! family. Four of them are not values at all and are answered as their own
+//! outcome: `$util.quiet` produces nothing, `$util.log.info` / `$util.log.error` write a line
+//! the response reports, and `$util.error` and `$util.unauthorized` RAISE — "throws a custom
+//! error", which is how a template refuses the field it is resolving.
 //!
 //! A helper this does not implement is a FAULT, named in the answer, rather than an empty
 //! value: a template asking for one gets the field reported as unresolved instead of a value
@@ -17,11 +18,11 @@
 use ::serde_json::{Map as JsonMap, Value as Json};
 
 use super::values;
-// The plane's ONE reading of the refusal `$util.unauthorized` raises, so a template and the
-// executor cannot word it differently.
-use crate::service::graphql_api::field_auth::{
-    unauthorized_field_message, UNAUTHORIZED_FIELD_ERROR_TYPE,
-};
+// The plane's ONE reading of the CLASS `$util.unauthorized` raises under, so a template and
+// the executor cannot classify one refusal two ways. The SENTENCE differs by what names the
+// refusal: a field resolution words it from the field and the type it is of, and a template
+// evaluated outside one carries the refusal on its own ([`UNAUTHORIZED`]).
+use crate::service::graphql_api::field_auth::UNAUTHORIZED_FIELD_ERROR_TYPE;
 
 pub mod dynamodb;
 
@@ -39,6 +40,9 @@ pub enum Answer {
     /// A call that APPENDS an error and goes on: `$util.appendError`, which "appends a
     /// custom error … does not interrupt the evaluation of the request mapping template".
     Appended(Raised),
+    /// A call that LOGS a line and goes on: `$util.log.info` / `$util.log.error`, whose lines
+    /// are what a sandbox evaluation's `logs` reports.
+    Logged(String),
 }
 
 /// How one entry of an `outErrors` list names what the call that appended it carried: the
@@ -162,10 +166,8 @@ impl Raised {
 /// Call the `$util` helper `path` names with `args`.
 ///
 /// `path` is the helper's own name, or the name of a sub-helper and the name within it
-/// (`$util.time.nowISO8601` arrives as `["time", "nowISO8601"]`). `context` is the
-/// `$context` the template is being evaluated over, which is what the one helper that
-/// refuses the FIELD being resolved names it from.
-pub fn call(path: &[String], args: &[Json], context: &Json) -> Result<Answer, String> {
+/// (`$util.time.nowISO8601` arrives as `["time", "nowISO8601"]`).
+pub fn call(path: &[String], args: &[Json]) -> Result<Answer, String> {
     let named: Vec<&str> = path.iter().map(String::as_str).collect();
     let value = |produced: Json| Ok(Answer::Value(produced));
     let argument = |index: usize| args.get(index).cloned().unwrap_or(Json::Null);
@@ -190,25 +192,34 @@ pub fn call(path: &[String], args: &[Json], context: &Json) -> Result<Answer, St
         // "Appends a custom error", which does not stop the evaluation.
         ["appendError"] => Ok(Answer::Appended(raised(args))),
         // "Throws Unauthorized for the field being resolved."
-        ["unauthorized"] => {
-            let named = |member: &str| {
-                context
-                    .get("info")
-                    .and_then(|info| info.get(member))
-                    .and_then(Json::as_str)
-                    .unwrap_or_default()
-                    .to_string()
-            };
-            Ok(Answer::Raised(Raised {
-                message: unauthorized_field_message(
-                    &named("parentTypeName"),
-                    &named("fieldName"),
-                ),
-                error_type: Some(UNAUTHORIZED_FIELD_ERROR_TYPE.to_string()),
-                refuses_the_field: true,
-                ..Raised::default()
-            }))
-        }
+        //
+        // The sentence this carries is the refusal on its OWN: a template evaluated outside
+        // any field resolution — the sandbox — names no field and no type, so there is
+        // nothing to word a field-level denial from. A caller that IS resolving a field words
+        // that denial itself from the field and the type it is of
+        // ([`super::super::field_auth::unauthorized_field_message`]), which is what
+        // [`Raised::refuses_the_field`] marks this raise for.
+        ["unauthorized"] => Ok(Answer::Raised(Raised {
+            message: UNAUTHORIZED.to_string(),
+            error_type: Some(UNAUTHORIZED_FIELD_ERROR_TYPE.to_string()),
+            refuses_the_field: true,
+            ..Raised::default()
+        })),
+        // "A list of logs that were generated by calls to util.log.info and util.log.error in
+        // the evaluated code" (`EvaluateMappingTemplateResponse$logs`): each line states the
+        // LEVEL it was written at and the message the call worded, as the APPSYNC_JS half of
+        // this sandbox states the lines of its own runs
+        // (`crate::ops::evaluate_code::appsync_js`).
+        //
+        // The helper takes a message and the values that message leaves room for: a `{}` in it
+        // is filled by the next value in turn ([`logged_message`]), which is how a template
+        // logs a sentence about the values it is working with rather than a sentence and the
+        // values beside it.
+        ["log", level @ ("info" | "error")] => Ok(Answer::Logged(format!(
+            "{} - {}",
+            level.to_uppercase(),
+            logged_message(args)
+        ))),
         // "Returns a 128-bit randomly generated UUID."
         ["autoId"] => value(Json::String(::uuid::Uuid::new_v4().to_string())),
         // The null and emptiness tests.
@@ -367,6 +378,49 @@ fn unix_millis() -> u64 {
 pub const MAX_PATTERN_PROGRAM_BYTES: usize = 64 * 1024;
 /// See [`MAX_PATTERN_PROGRAM_BYTES`].
 pub const MAX_PATTERN_DFA_BYTES: usize = 256 * 1024;
+
+/// The MESSAGE one `$util.log.info` / `$util.log.error` call logged: the message it worded,
+/// with each `{}` in it filled by the next value the call named, and any value the message
+/// left no room for written after it.
+///
+/// A value is written as the text this language renders it as ([`values::rendered`]) — a
+/// string as itself, since the message is a sentence rather than a document — and a `{}` the
+/// call named no value for stays as it stands.
+fn logged_message(args: &[Json]) -> String {
+    let Some((message, values)) = args.split_first() else {
+        return String::new();
+    };
+    let mut written = String::new();
+    let mut rest = values.iter();
+    let mut left = values::rendered(message);
+    while let Some((before, after)) = left.split_once(PLACEHOLDER) {
+        match rest.next() {
+            Some(value) => {
+                written.push_str(before);
+                written.push_str(&values::rendered(value));
+            }
+            // A placeholder the call named no value for is the message's own text.
+            None => {
+                written.push_str(before);
+                written.push_str(PLACEHOLDER);
+            }
+        }
+        left = after.to_string();
+    }
+    written.push_str(&left);
+    for value in rest {
+        written.push(' ');
+        written.push_str(&values::rendered(value));
+    }
+    written
+}
+
+/// Where a message leaves room for one of the values the call named.
+const PLACEHOLDER: &str = "{}";
+
+/// The refusal `$util.unauthorized` raises on its OWN: the fixed word, naming nothing, which
+/// is the whole sentence where no field resolution is what the raise is reported through.
+pub const UNAUTHORIZED: &str = "Unauthorized";
 
 /// The sentences a helper fault states.
 const NOT_JSON: &str = "This value is not a JSON document.";

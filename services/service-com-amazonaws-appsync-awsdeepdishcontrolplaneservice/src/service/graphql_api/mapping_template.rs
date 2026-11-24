@@ -19,12 +19,13 @@
 //! * REFERENCES (`$context.identity`, `${ctx.args.id}`, `$!{ctx.result}`), which name a
 //!   value of the template's own context, walk into it by member and index, and call the
 //!   `Map`, `List` and `String` methods of the language on it ([`values`]);
-//! * the `$util` HELPERS the resolver reference publishes ([`utilities`]), `$util.toJson`
-//!   and the `$util.error` that refuses a field among them;
+//! * the `$util` HELPERS the resolver reference publishes ([`utilities`]), `$util.toJson`,
+//!   the `$util.log` lines a run reports and the `$util.error` that refuses a field among
+//!   them;
 //! * the DIRECTIVES that make it a template rather than a document: `#set`, `#if` /
 //!   `#elseif` / `#else` / `#end`, `#foreach` / `#end` with `$foreach` and `$velocityCount`,
-//!   `#break`, `#stop`, the `##` and `#* … *#` comments and the `#[[ … ]]#` block that is
-//!   written out unparsed.
+//!   `#break`, `#stop`, the `#return` that ends an evaluation where it stands, the `##` and
+//!   `#* … *#` comments and the `#[[ … ]]#` block that is written out unparsed.
 //!
 //! Every run is bounded in host code the template cannot reach — how long it may run (the
 //! budget its caller hands it, [`MAX_RUN`] at most), how many steps it may take
@@ -41,7 +42,8 @@
 //!
 //! A template that asks for something this does not implement — a method, a helper — is a
 //! FAULT naming it, so the field is reported as one that did not resolve rather than
-//! answered with a value nothing computed.
+//! answered with a value nothing computed. So is text that does not PARSE, which is reported
+//! as the diagnostic the Velocity parser states for it ([`parse_diagnostic`]).
 
 pub mod utilities;
 pub mod values;
@@ -54,6 +56,15 @@ pub use syntax::*;
 use ::serde_json::{Map as JsonMap, Value as Json};
 
 pub use utilities::Raised;
+
+// The two names ONE value of a resolver context is read under, and how many lines a run may
+// log and how long one line may be: stated once for this service
+// (`crate::ops::evaluate_code::appsync_js`), so the two languages this sandbox evaluates read
+// one context and bound one log list the same way.
+use crate::ops::evaluate_code::appsync_js::{
+    boundary_at_or_below, ARGUMENTS_MEMBER, ARGUMENTS_SHORT_MEMBER, MAX_LOG_ENTRIES,
+    MAX_LOG_ENTRY_BYTES,
+};
 
 /// How much TEMPLATE this evaluates: the longest a stored one can be — `MappingTemplate` is
 /// `@length 1..65536` (`smithy_query(query="shape",shape="MappingTemplate")`), which is what
@@ -96,15 +107,32 @@ const BYTES_PER_STEP: usize = 64;
 const MAX_OUTPUT_BYTES: usize = 1 << 20;
 
 /// What evaluating one template came to.
+///
+/// A template that RAISED is one of these too, not a fault: `$util.error` and
+/// `$util.unauthorized` are what a template refuses with, and the run that reached one still
+/// left a stash behind, still wrote whatever lines it logged and still appended whatever
+/// errors it appended before it — so every caller reads what the run left whichever way it
+/// ended. Only text this cannot evaluate at all is a [`Fault`].
 #[derive(Debug, Clone)]
 pub struct Evaluation {
-    /// The rendered text.
+    /// The rendered text — or, for a run an early `#return` ended with a value of its own,
+    /// that value as the text it renders to.
     pub text: String,
     /// The context as the template left it, which is what carries the `stash` on to the
     /// next step of the resolution.
     pub context: Json,
     /// The errors `$util.appendError` appended, which do not stop an evaluation.
     pub appended: Vec<Raised>,
+    /// The lines `$util.log.info` and `$util.log.error` wrote, in the order the run wrote
+    /// them.
+    pub logs: Vec<String>,
+    /// The error the template RAISED, for a run one ended: `$util.error`, or the refusal
+    /// `$util.unauthorized` states. Boxed, because what a raise carries is far larger than
+    /// the rest of this answer.
+    pub raised: Option<Box<Raised>>,
+    /// Whether an early `#return` ended the run rather than the end of the template — a run
+    /// that was CUT SHORT, which is reported differently from one that ran through.
+    pub returned_early: bool,
 }
 
 /// Why an evaluation produced no text.
@@ -131,7 +159,8 @@ impl Fault {
 }
 
 /// Evaluate `template` over `context` — the `$context` (`$ctx`) a resolver reads — and
-/// answer the text it rendered.
+/// answer the text it rendered, the state the run left behind, and the error it raised where
+/// it raised one.
 ///
 /// `budget` is how long this run may take, capped at [`MAX_RUN`]: the caller holds the
 /// request's own remaining time, so the templates of one request cannot add up past it.
@@ -141,7 +170,8 @@ pub fn evaluate(template: &str, context: &Json, budget: ::std::time::Duration) -
             "{TOO_LONG_A_TEMPLATE} {MAX_TEMPLATE_BYTES} bytes."
         )));
     }
-    let nodes = parse(template).map_err(Fault::Fault)?;
+    let nodes = parse_with_position(template)
+        .map_err(|(_, at)| Fault::Fault(parse_diagnostic(template, at)))?;
     let mut env = JsonMap::new();
     env.insert(CONTEXT_KEY.to_string(), context.clone());
     let mut run = Run {
@@ -151,16 +181,31 @@ pub fn evaluate(template: &str, context: &Json, budget: ::std::time::Duration) -
         started: ::std::time::Instant::now(),
         budget: budget.min(MAX_RUN),
         appended: Vec::new(),
+        logs: Vec::new(),
+        returned: None,
     };
-    run.block(&nodes)?;
+    // A RAISE is an answer about the template, so the run it ended is reported with
+    // everything it left behind; anything else that stopped the run is text this cannot
+    // evaluate at all.
+    let (raised, flow) = match run.block(&nodes) {
+        Ok(flow) => (None, flow),
+        Err(Fault::Raised(raised)) => (Some(raised), Flow::Stop),
+        Err(fault) => return Err(fault),
+    };
+    let returned_early = flow == Flow::Return;
     Ok(Evaluation {
         context: run
             .env
             .get(CONTEXT_KEY)
             .cloned()
             .unwrap_or(Json::Object(JsonMap::new())),
-        text: run.out,
+        // "#return(data)" ends the evaluation with the value it names as the template's own
+        // result; one naming no value ends it with the text rendered up to that point.
+        text: run.returned.unwrap_or(run.out),
         appended: run.appended,
+        logs: run.logs,
+        raised,
+        returned_early,
     })
 }
 
@@ -198,6 +243,9 @@ enum Flow {
     Continue,
     Break,
     Stop,
+    /// An early `#return` ended the whole evaluation, which is a run CUT SHORT rather than
+    /// one that reached the end of its template.
+    Return,
 }
 
 /// One evaluation: the variables it holds, the text it has produced, and the bounds it is
@@ -211,6 +259,11 @@ struct Run {
     /// How long this evaluation may run, at most [`MAX_RUN`].
     budget: ::std::time::Duration,
     appended: Vec<Raised>,
+    /// The lines `$util.log.info` / `$util.log.error` wrote, under [`MAX_LOG_ENTRIES`].
+    logs: Vec<String>,
+    /// The value an early `#return` named, as the text it renders to, which is the whole
+    /// result of a run that reached one.
+    returned: Option<String>,
 }
 
 impl Run {
@@ -322,11 +375,21 @@ impl Run {
                     }
                 }
                 Node::ForEach { name, over, body } => match self.iterate(name, over, body)? {
-                    Flow::Stop => return Ok(Flow::Stop),
+                    ended @ (Flow::Stop | Flow::Return) => return Ok(ended),
                     _ => continue,
                 },
                 Node::Break => return Ok(Flow::Break),
                 Node::Stop => return Ok(Flow::Stop),
+                // `#return(data)` ends the evaluation AT this point and makes the value it
+                // names the template's own result; `#return` with no value ends it with what
+                // the template has rendered so far. Either way nothing after it runs.
+                Node::Return(value) => {
+                    if let Some(expression) = value {
+                        let produced = self.expr(expression)?;
+                        self.returned = Some(values::rendered(&produced));
+                    }
+                    return Ok(Flow::Return);
+                }
             }
         }
         Ok(Flow::Continue)
@@ -362,8 +425,8 @@ impl Run {
             match self.block(body)? {
                 Flow::Continue => {}
                 Flow::Break => break,
-                Flow::Stop => {
-                    flow = Flow::Stop;
+                ended @ (Flow::Stop | Flow::Return) => {
+                    flow = ended;
                     break;
                 }
             }
@@ -517,10 +580,17 @@ impl Run {
             .iter()
             .any(|access| matches!(access, Access::Call(..)));
         let key = root_key(&reference.root).to_string();
+        let context = key == CONTEXT_KEY;
         let Some(root) = self.env.get_mut(&key) else {
             return Ok(Resolved::Missing);
         };
-        let walked = walk(root, &reference.accesses, &args)
+        // The arguments map is read under either of the two names a resolver context gives
+        // it, so a context stating one answers a reference written with the other.
+        let aliased = context
+            .then(|| argument_alias(root, &reference.accesses))
+            .flatten();
+        let accesses: &[Access] = aliased.as_deref().unwrap_or(&reference.accesses);
+        let walked = walk(root, accesses, &args)
             .map(Resolved::of)
             .map_err(Fault::Fault)?;
         // A method may have CHANGED the value it was called on — `put`, `add`, `addAll` are
@@ -560,8 +630,7 @@ impl Run {
                 path.join(".")
             )));
         };
-        let context = self.env.get(CONTEXT_KEY).cloned().unwrap_or(Json::Null);
-        let answered = utilities::call(&path, given, &context).map_err(Fault::Fault)?;
+        let answered = utilities::call(&path, given).map_err(Fault::Fault)?;
         match answered {
             utilities::Answer::Value(mut value) => walk(&mut value, rest, rest_args)
                 .map(Resolved::of)
@@ -572,6 +641,18 @@ impl Run {
             utilities::Answer::Raised(raised) => Err(Fault::Raised(Box::new(raised))),
             utilities::Answer::Appended(appended) => {
                 self.appended.push(appended);
+                Ok(Resolved::Nothing)
+            }
+            // "A list of logs that were generated by calls to util.log.info and
+            // util.log.error in the evaluated code": the line is kept for the answer, and the
+            // call itself writes nothing into the rendered text.
+            utilities::Answer::Logged(mut line) => {
+                if self.logs.len() < MAX_LOG_ENTRIES {
+                    if line.len() > MAX_LOG_ENTRY_BYTES {
+                        line.truncate(boundary_at_or_below(&line, MAX_LOG_ENTRY_BYTES));
+                    }
+                    self.logs.push(line);
+                }
                 Ok(Resolved::Nothing)
             }
         }
@@ -595,13 +676,53 @@ impl Run {
             self.env.insert(key, value);
             return Ok(());
         }
+        let context = key == CONTEXT_KEY;
         let slot = self
             .env
             .entry(key)
             .or_insert_with(|| Json::Object(JsonMap::new()));
-        place(slot, &target.accesses, &args, value).map_err(Fault::Fault)
+        // A `#set` into the arguments map reaches it under either of its two names too, for
+        // the same reason a read of one does.
+        let aliased = context
+            .then(|| argument_alias(slot, &target.accesses))
+            .flatten();
+        let accesses: &[Access] = aliased.as_deref().unwrap_or(&target.accesses);
+        place(slot, accesses, &args, value).map_err(Fault::Fault)
     }
 }
+
+/// `accesses` with the name this context states the ARGUMENTS map under in place of the one
+/// the reference wrote, or `None` where no substitution applies.
+///
+/// `arguments` and `args` name ONE value of a resolver context — "the map that holds all of
+/// the contextual information for your resolver invocation" states the field's arguments
+/// under both, which is why the context a resolver step is run over carries both names — so a
+/// context stating only one of them answers a reference written with the other, and a context
+/// stating the name the reference wrote is walked as it stands.
+fn argument_alias(root: &Json, accesses: &[Access]) -> Option<Vec<Access>> {
+    let Some(Access::Prop(first)) = accesses.first() else {
+        return None;
+    };
+    let Json::Object(members) = root else {
+        return None;
+    };
+    let alias = *ARGUMENT_ALIASES
+        .iter()
+        .find_map(|(name, alias)| (*name == first.as_str()).then_some(alias))?;
+    if members.contains_key(first.as_str()) || !members.contains_key(alias) {
+        return None;
+    }
+    let mut rewritten = accesses.to_vec();
+    *rewritten.first_mut()? = Access::Prop(alias.to_string());
+    Some(rewritten)
+}
+
+/// Each name the arguments map is read under, paired with the other one
+/// ([`argument_alias`]).
+const ARGUMENT_ALIASES: [(&str, &str); 2] = [
+    (ARGUMENTS_MEMBER, ARGUMENTS_SHORT_MEMBER),
+    (ARGUMENTS_SHORT_MEMBER, ARGUMENTS_MEMBER),
+];
 
 /// The variables a `#foreach` body reads its position from.
 const FOREACH_VARIABLE: &str = "foreach";
@@ -812,6 +933,58 @@ pub(crate) fn weigh(value: &Json, depth: usize) -> Result<usize, String> {
     }
     Ok(weight)
 }
+
+/// How a template that does not PARSE is reported: the diagnostic the Velocity parser states
+/// for text that stopped being a template — the exception class it raises, the token the parse
+/// stopped at, and the line and column that token sits at in the template the caller
+/// submitted.
+///
+/// `at` is where the parse stopped, in characters
+/// (`::service_common::velocity_template::parse_with_position`). A parse that reached the end
+/// of the text stopped at the end-of-file token, which is what Velocity names it by.
+fn parse_diagnostic(template: &str, at: usize) -> String {
+    let characters: Vec<char> = template.chars().collect();
+    let (line, column) = place_of(&characters, at);
+    let token: String = match characters.get(at..) {
+        None | Some([]) => END_OF_TEMPLATE.to_string(),
+        Some(rest) => rest
+            .iter()
+            .take_while(|character| !character.is_whitespace())
+            .take(MAX_TOKEN_CHARACTERS)
+            .collect(),
+    };
+    let token = if token.is_empty() {
+        END_OF_TEMPLATE.to_string()
+    } else {
+        token
+    };
+    format!("{PARSE_ERROR}: Encountered \"{token}\" at line {line}, column {column}.")
+}
+
+/// Which line and column of `characters` the index `at` sits at, both counted from one, as a
+/// parse diagnostic states a position.
+fn place_of(characters: &[char], at: usize) -> (usize, usize) {
+    let mut line = 1;
+    let mut column = 1;
+    for character in characters.iter().take(at) {
+        if *character == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    (line, column)
+}
+
+/// The class a Velocity parse failure is raised under, which the diagnostic names, and how it
+/// names the end of the template.
+const PARSE_ERROR: &str = "org.apache.velocity.exception.ParseErrorException";
+/// See [`PARSE_ERROR`].
+const END_OF_TEMPLATE: &str = "<EOF>";
+
+/// How much of the token a parse stopped at the diagnostic quotes.
+const MAX_TOKEN_CHARACTERS: usize = 32;
 
 /// The sentences a template fault states. The ones the SYNTAX states are the language's own
 /// ([`::service_common::velocity_template`]); these are what a RUN of a parsed template

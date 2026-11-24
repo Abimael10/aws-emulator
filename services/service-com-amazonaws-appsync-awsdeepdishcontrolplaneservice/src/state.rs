@@ -167,12 +167,16 @@ pub use introspected_cluster::*;
 /// Where the certificate a custom domain is created with came from and whether it covers the
 /// name the domain is created under, read in the services that hold a certificate for this
 /// account.
-mod domain_certificate;
-/// The two forms a request can name a GraphQL API by — the `apiId` AppSync minted and the
+mod domain_certificate;/// The two forms a request can name a GraphQL API by — the `apiId` AppSync minted and the
 /// ARN built on it — and the lookups that resolve either form to the one API.
 mod api_reference;
 pub use api_reference::*;
 pub use domain_certificate::*;
+
+/// The MOCK CONTEXT a sandbox evaluation is run over, checked against the shape of a resolver
+/// context: which of its properties failed that check, and the sentence they are reported
+/// with.
+pub mod mock_context;
 
 use crate::ops::types::{
     AdditionalAuthenticationProvider, Api, ApiAssociation, ApiCache, ApiKey, AppSyncRuntime,

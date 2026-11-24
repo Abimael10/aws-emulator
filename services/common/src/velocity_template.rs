@@ -15,7 +15,10 @@
 //! So this module holds the language and nothing of either service: the SYNTAX ([`parse`],
 //! [`Parse`]) — text, references, the `#set` assignment, the `#if` / `#elseif` / `#else` /
 //! `#end` conditional, the `#foreach` loop, `#break`, `#stop`, the `##` and `#* … *#`
-//! comments, the `#[[ … ]]#` block that is written out unparsed, the expression grammar and
+//! comments, the `#[[ … ]]#` block that is written out unparsed, the `#return` a service may
+//! publish for ending an evaluation early, the expression grammar — whose logical and
+//! relational operators carry both of their spellings, the symbols and the words (`and`, `or`,
+//! `not`, `eq`, `ne`, `lt`, `le`, `gt`, `ge`) — and
 //! the line break a directive's own line ends with — and the VALUE model its operators and
 //! METHODS are defined over ([`truthy`], [`equal`], [`ordering`], [`arithmetic`], [`rendered`],
 //! [`number`], [`method`]), which is JSON because a template's values are the ones its call
@@ -44,6 +47,10 @@ pub const MAX_NESTING: usize = 64;
 /// How far one reference may walk: how many members, indexes and calls it may chain. The
 /// same guard, for the recursion a walk into a value takes.
 pub const MAX_ACCESSES: usize = 64;
+
+/// The word spelling of the prefix `!` ([`Parse::unary`]), beside the word spellings of the
+/// binary operators ([`Parse::word_operator`]).
+const WORDED_NOT: [char; 3] = ['n', 'o', 't'];
 
 /// One piece of a parsed template.
 #[derive(Debug, Clone)]
@@ -74,6 +81,13 @@ pub enum Node {
     Break,
     /// `#stop`, which ends the whole evaluation.
     Stop,
+    /// `#return` / `#return(value)`, which ends the whole evaluation and, where it names one,
+    /// makes that value the template's own result.
+    ///
+    /// Not one of Velocity's own directives: AppSync publishes it for a mapping template
+    /// ("return early" from a request or response template), so a renderer whose service does
+    /// not publish it answers it the way it answers any construct it does not perform.
+    Return(Option<Expr>),
 }
 
 /// A reference: the variable it starts at, and how it walks into the value.
@@ -137,16 +151,28 @@ pub enum Terminator {
 
 /// Parse a whole template.
 pub fn parse(template: &str) -> Result<Vec<Node>, String> {
+    parse_with_position(template).map_err(|(why, _)| why)
+}
+
+/// Parse a whole template, reporting WHERE the parse stopped beside why it did: the index, in
+/// CHARACTERS, the cursor had reached when the text stopped being a template.
+///
+/// A caller that reports a parse failure the way its own API words one — naming the line, the
+/// column and the token the parse stopped at — needs the position as well as the reason, which
+/// is why this is the parse [`parse`] itself is written in terms of.
+pub fn parse_with_position(template: &str) -> Result<Vec<Node>, (String, usize)> {
     let characters: Vec<char> = template.chars().collect();
     let mut parse = Parse {
         src: &characters,
         at: 0,
         nesting: 0,
     };
-    let (nodes, terminator) = parse.block()?;
+    let parsed = parse.block();
+    let at = parse.at.min(characters.len());
+    let (nodes, terminator) = parsed.map_err(|why| (why, at))?;
     match terminator {
         Terminator::Eof => Ok(nodes),
-        _ => Err(UNEXPECTED_DIRECTIVE.to_string()),
+        _ => Err((UNEXPECTED_DIRECTIVE.to_string(), at)),
     }
 }
 
@@ -260,6 +286,12 @@ impl Parse<'_> {
                             let node = self.loop_over()?;
                             flush(&mut text, &mut nodes);
                             nodes.push(node);
+                        }
+                        "return" => {
+                            let value = self.returned()?;
+                            flush(&mut text, &mut nodes);
+                            nodes.push(Node::Return(value));
+                            self.skip_trailing_newline();
                         }
                         "break" | "stop" => {
                             flush(&mut text, &mut nodes);
@@ -523,6 +555,33 @@ impl Parse<'_> {
         }
     }
 
+    /// The value a `#return` names, which is `None` for one written with no value at all and
+    /// for one written as `#return()`: the directive ends the evaluation either way, and only
+    /// a value it names becomes the result.
+    pub fn returned(&mut self) -> Result<Option<Expr>, String> {
+        let opening = self.at;
+        self.skip_spaces();
+        if self.peek(0) != Some('(') {
+            // The spaces belong to the template's own text where the directive names no value
+            // at all, so the cursor is left where the directive ended.
+            self.at = opening;
+            return Ok(None);
+        }
+        self.at += 1;
+        self.skip_spaces();
+        if self.peek(0) == Some(')') {
+            self.at += 1;
+            return Ok(None);
+        }
+        let value = self.expression()?;
+        self.skip_spaces();
+        if self.peek(0) != Some(')') {
+            return Err(NOT_A_DIRECTIVE.to_string());
+        }
+        self.at += 1;
+        Ok(Some(value))
+    }
+
     /// The `( expression )` a directive takes.
     pub fn parenthesised(&mut self) -> Result<Expr, String> {
         self.skip_spaces();
@@ -684,14 +743,24 @@ impl Parse<'_> {
 
     pub fn either(&mut self) -> Result<Expr, String> {
         self.chain(
-            |parse| parse.matches(&['|', '|']).then_some((Operator::Or, 2)),
+            |parse| {
+                parse
+                    .matches(&['|', '|'])
+                    .then_some((Operator::Or, 2))
+                    .or_else(|| parse.word_operator("or", Operator::Or))
+            },
             Self::both,
         )
     }
 
     pub fn both(&mut self) -> Result<Expr, String> {
         self.chain(
-            |parse| parse.matches(&['&', '&']).then_some((Operator::And, 2)),
+            |parse| {
+                parse
+                    .matches(&['&', '&'])
+                    .then_some((Operator::And, 2))
+                    .or_else(|| parse.word_operator("and", Operator::And))
+            },
             Self::equality,
         )
     }
@@ -704,7 +773,9 @@ impl Parse<'_> {
                 } else if parse.matches(&['!', '=']) {
                     Some((Operator::NotEqual, 2))
                 } else {
-                    None
+                    parse
+                        .word_operator("eq", Operator::Equal)
+                        .or_else(|| parse.word_operator("ne", Operator::NotEqual))
                 }
             },
             Self::relational,
@@ -723,11 +794,36 @@ impl Parse<'_> {
                 } else if parse.matches(&['>']) {
                     Some((Operator::Greater, 1))
                 } else {
-                    None
+                    parse
+                        .word_operator("le", Operator::LessOrEqual)
+                        .or_else(|| parse.word_operator("ge", Operator::GreaterOrEqual))
+                        .or_else(|| parse.word_operator("lt", Operator::Less))
+                        .or_else(|| parse.word_operator("gt", Operator::Greater))
                 }
             },
             Self::additive,
         )
+    }
+
+    /// The operator `named` where the cursor is on that WORD spelling of it, and how wide it
+    /// is — `None` where it is not.
+    ///
+    /// The language spells each of its logical and relational operators two ways: `&&` and
+    /// `and`, `||` and `or`, `!` and `not`, `==` and `eq`, `!=` and `ne`, `<` and `lt`, `<=`
+    /// and `le`, `>` and `gt`, `>=` and `ge`. A word is the operator only where it stands on
+    /// its own: one that runs straight into a name (`ltx`) is part of that name, not an
+    /// operator and an operand.
+    #[must_use]
+    pub fn word_operator(&self, named: &str, operator: Operator) -> Option<(Operator, usize)> {
+        let spelling: Vec<char> = named.chars().collect();
+        if !self.matches(&spelling) {
+            return None;
+        }
+        let after = self.peek(spelling.len());
+        let runs_on = after.is_some_and(|character| {
+            character.is_alphanumeric() || character == '_' || character == '-'
+        });
+        (!runs_on).then_some((operator, spelling.len()))
     }
 
     pub fn additive(&mut self) -> Result<Expr, String> {
@@ -757,6 +853,17 @@ impl Parse<'_> {
 
     pub fn unary(&mut self) -> Result<Expr, String> {
         self.skip_spaces();
+        // `not` is the word spelling of `!`: it is the prefix operator where it stands on its
+        // own before an operand, and part of a name where it runs into one.
+        if self.matches(&WORDED_NOT)
+            && matches!(self.peek(WORDED_NOT.len()), Some(' ' | '\t' | '(' | '$' | '!'))
+        {
+            self.at = self.at.saturating_add(WORDED_NOT.len());
+            self.deeper()?;
+            let inner = self.unary();
+            self.shallower();
+            return Ok(Expr::Not(Box::new(inner?)));
+        }
         match self.peek(0) {
             // A prefix operator is one more level of nesting, charged like every other, so a
             // chain of them cannot drive this recursion past the bound.
@@ -1305,6 +1412,8 @@ mod tests {
             ("a conditional", "#if($a)x#end", 1, "If"),
             ("a conditional with branches", "#if($a)x#elseif($b)y#else z#end", 1, "If"),
             ("a loop", "#foreach($x in $a)y#end", 1, "ForEach"),
+            ("an early return", "#return($a)", 1, "Return"),
+            ("an early return naming no value", "#return", 1, "Return"),
             ("a comment, which renders nothing", "## a note", 0, ""),
             ("a block comment", "#* a note *#", 0, ""),
             ("an unparsed block", "#[[ $a #if ]]#", 1, "Text"),
@@ -1329,6 +1438,7 @@ mod tests {
                 Some(Node::ForEach { .. }) => "ForEach",
                 Some(Node::Break) => "Break",
                 Some(Node::Stop) => "Stop",
+                Some(Node::Return(_)) => "Return",
             };
             assert_eq!(
                 shape, *first,

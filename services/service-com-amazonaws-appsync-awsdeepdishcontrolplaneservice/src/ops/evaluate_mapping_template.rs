@@ -5,9 +5,11 @@
 //! the ONE reader of that language this crate holds
 //! ([`crate::service::graphql_api::mapping_template`], which also evaluates the
 //! `requestMappingTemplate` / `responseMappingTemplate` of a resolver), and answers with the
-//! text it rendered, the stash it left and the errors it appended; a template that RAISES is
-//! a served call reporting that error, and one that cannot be evaluated at all is refused
-//! `BadRequestException`. This is the ONLY file to touch for this operation.
+//! text it rendered, the stash it left, the lines it logged and the errors it appended; every
+//! answer about the TEMPLATE — one that RAISES, and one that cannot be evaluated at all — is a
+//! served call reporting that error through the output `error` member, and
+//! `BadRequestException` is left to a request that violates a MODELLED constraint. This is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -94,14 +96,19 @@ use super::types::*;
 // one template renders one way wherever it is submitted.
 use crate::service::graphql_api::mapping_template::{self, Evaluation, Fault, Raised};
 
+// Whether the mock context a call carries is shaped like a resolver context, which BOTH
+// halves of this sandbox check before anything is evaluated
+// (`crate::state::mock_context`).
+use crate::state::mock_context;
+
 // The member of a context that carries the stash, as the other half of this sandbox spells
 // it (`crate::ops::evaluate_code::appsync_js`).
 use crate::ops::evaluate_code::appsync_js::STASH_MEMBER;
 
-/// How an untouched run reports the stash it left, which this operation and the APPSYNC_JS
-/// evaluation beside it state one way
+/// How an untouched run reports the stash it left and the errors it appended, which this
+/// operation and the APPSYNC_JS evaluation beside it state one way
 /// (`crate::service::graphql_api::mapping_template::utilities`).
-use crate::service::graphql_api::mapping_template::utilities::EMPTY_STASH;
+use crate::service::graphql_api::mapping_template::utilities::{EMPTY_OUT_ERRORS, EMPTY_STASH};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -186,8 +193,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             _ => return Err(invalid_member(CONTEXT_MEMBER)),
         };
 
-        answer(rendered(input.template, context).await)
+        // A map that IS one but is not shaped like a resolver context is a SERVED answer about
+        // the mock the caller wrote — the properties of it AppSync could not take — and
+        // nothing is evaluated over it ([`crate::state::mock_context`]).
+        if let Some(failed) = mock_context::failed_validation(&context) {
+            return Ok(EvaluateMappingTemplateOutput {
+                error: Some(ErrorDetail {
+                    message: Some(mock_context::failed_validation_message(&failed)),
+                }),
+                ..Default::default()
+            });
+        }
+
+        let context = with_stash(context);
+        // The stash a run that never happened leaves is the one it would have started from:
+        // what the call stated, or the empty object it was filled in with.
+        let carried = stash(&context);
+
+        answer(rendered(input.template, context).await, carried)
     }
+}
+
+/// `context` with the STASH a resolver run always has: "a single stash object lives through a
+/// single resolver run", so the run this call evaluates has one whether the mock context the
+/// caller wrote states it or not — a template reaches into it (`$ctx.stash.put(…)`) either
+/// way, and the response reports it as the run left it. A context that states one keeps the
+/// value it states.
+///
+/// The same filling-in the APPSYNC_JS half of this sandbox does for a run of its own
+/// (`crate::ops::evaluate_code`).
+fn with_stash(mut context: ::serde_json::Value) -> ::serde_json::Value {
+    if let Some(members) = context.as_object_mut() {
+        members
+            .entry(STASH_MEMBER)
+            .or_insert_with(|| ::serde_json::Value::Object(::serde_json::Map::new()));
+    }
+    context
 }
 
 /// The member a context this operation cannot render over is reported against.
@@ -212,14 +253,12 @@ const MAX_RESULT_BYTES: usize = 65_536;
 
 /// What one render came to, as this operation answers it.
 enum Answered {
-    /// The template RENDERED: the text it produced, the context as it left it and the errors
-    /// it appended.
+    /// The template RENDERED: the text it produced, the context as it left it, the lines it
+    /// logged and the errors it appended — and, where it RAISED, the error it raised.
     Rendered(Evaluation),
-    /// The template RAISED — `$util.error` or `$util.unauthorized` — which is how a template
-    /// refuses what it renders for. The call itself was served.
-    Raised(String),
     /// The template could not be evaluated at all: it does not parse, it names something this
-    /// reader does not implement, or it ran past one of its bounds.
+    /// reader does not implement, or it ran past one of its bounds. The diagnostic is what the
+    /// answer reports.
     Unevaluable(String),
     /// The render did not finish, or did not come back at all.
     DidNotFinish(String),
@@ -232,11 +271,12 @@ async fn rendered(template: String, context: ::serde_json::Value) -> Answered {
     });
     match ::tokio::time::timeout(CALLER_WAIT_CEILING, running).await {
         Ok(Ok(Ok(evaluation))) => Answered::Rendered(evaluation),
-        // A template that RAISED refused what it renders for, which is an answer about the
-        // template rather than about the request; one that could not be evaluated at all —
-        // it does not parse, it names something this reader does not implement, or it ran
-        // past one of its bounds — makes the REQUEST the malformed one.
-        Ok(Ok(Err(Fault::Raised(raised)))) => Answered::Raised(raised.message),
+        // A template this could not evaluate at all — one that does not parse, one naming
+        // something this reader does not publish, one that ran past a bound — is an answer
+        // about the TEMPLATE, which the response reports through its `error` member. A
+        // template that RAISED travels back inside the evaluation itself, with everything
+        // else that run left.
+        Ok(Ok(Err(Fault::Raised(raised)))) => Answered::Unevaluable(raised.message),
         Ok(Ok(Err(Fault::Fault(reason)))) => Answered::Unevaluable(reason),
         // The run did not finish, or did not come back at all: nothing was rendered, and the
         // request was not what was wrong with it.
@@ -248,8 +288,34 @@ async fn rendered(template: String, context: ::serde_json::Value) -> Answered {
 }
 
 /// The response one render is reported as.
+///
+/// Every answer about the TEMPLATE is a served 200 carrying what the evaluation left behind —
+/// `error` is an OUTPUT member of this operation's response, so a template that did not
+/// evaluate is reported in the body rather than as a transport refusal — and "a single stash
+/// object lives through a single resolver run" and `outErrors` is "the list of runtime errors
+/// that are added to the GraphQL operation response", so each is reported as the evaluation
+/// left it, the empty object and the empty list for one that wrote to neither. What differs is
+/// how the evaluation ENDED, exactly as the APPSYNC_JS half of this sandbox reports its own
+/// (`crate::ops::evaluate_code`):
+///
+/// * a run that reached the END of its template answers with its `evaluationResult` and the
+///   `logs` it wrote — "a list of logs that were generated by calls to util.log.info and
+///   util.log.error", the empty list for a run that wrote none;
+/// * a run an early `#return` ended answers with the result it returned and no log list: the
+///   lines a response reports are the lines of a run that ran through;
+/// * a run a RAISE ended answers with that error's own message, no `evaluationResult` and no
+///   log list either — the template refused what it renders for;
+/// * a template that could not be EVALUATED at all — one that does not parse, one naming
+///   something this reader does not publish, one that ran past a bound — answers with that
+///   diagnostic as the `error` message, and with the stash it would have started from: nothing
+///   ran, and the request was not what was wrong with it.
+///
+/// `carried` is that stash. `BadRequestException` is left to a request that violates a
+/// MODELLED constraint — a `context` that is no map, a result longer than the response carries
+/// — and `InternalFailureException` to a run the host did not get back at all.
 fn answer(
     answered: Answered,
+    carried: String,
 ) -> Result<EvaluateMappingTemplateOutput, EvaluateMappingTemplateError> {
     match answered {
         Answered::Rendered(evaluation) => {
@@ -258,32 +324,34 @@ fn answer(
                     "{TOO_MUCH_RESULT} {MAX_RESULT_BYTES} bytes."
                 )));
             }
-            Ok(EvaluateMappingTemplateOutput {
-                evaluation_result: Some(evaluation.text),
-                // "A single stash object lives through a single resolver run" and `outErrors`
-                // is "the list of runtime errors that are added to the GraphQL operation
-                // response": a render has both whatever it did with them, so each is reported
-                // as the render left it — the empty object and the empty list for one that
-                // wrote to neither.
+            let mut output = EvaluateMappingTemplateOutput {
                 stash: Some(stash(&evaluation.context)),
                 out_errors: Some(out_errors(&evaluation.appended)),
-                // "A list of logs that were generated by calls to util.log.info and
-                // util.log.error in the evaluated code": this reader publishes no logging
-                // helper, so a render writes no lines and the list it reports is empty.
-                logs: Some(Vec::new()),
-                error: None,
-            })
+                ..Default::default()
+            };
+            match evaluation.raised {
+                Some(raised) => {
+                    output.error = Some(ErrorDetail {
+                        message: Some(raised.message.clone()),
+                    });
+                }
+                None => {
+                    output.evaluation_result = Some(evaluation.text);
+                    if !evaluation.returned_early {
+                        output.logs = Some(evaluation.logs);
+                    }
+                }
+            }
+            Ok(output)
         }
-        // The call itself was SERVED — the template is what refused — so the error it raised
-        // is the payload of a 200, as the other half of this sandbox reports a raise too.
-        Answered::Raised(message) => Ok(EvaluateMappingTemplateOutput {
+        Answered::Unevaluable(diagnostic) => Ok(EvaluateMappingTemplateOutput {
             error: Some(ErrorDetail {
-                message: Some(message),
+                message: Some(diagnostic),
             }),
-            logs: Some(Vec::new()),
+            stash: Some(carried),
+            out_errors: Some(EMPTY_OUT_ERRORS.to_string()),
             ..Default::default()
         }),
-        Answered::Unevaluable(reason) => Err(bad_request(reason)),
         Answered::DidNotFinish(reason) => Err(EvaluateMappingTemplateErrorModeled::
             InternalFailureException(InternalFailureException {
                 message: Some(reason),

@@ -214,9 +214,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // invocation": a context that is not a map carries no member the code could read,
         // so it is refused before anything runs.
         let context = match ::serde_json::from_str::<::serde_json::Value>(&input.context) {
-            Ok(context) if context.is_object() => resolver_context(context),
+            Ok(context) if context.is_object() => context,
             _ => return Err(invalid_member("context")),
         };
+
+        // A map that IS one but is not shaped like a resolver context is a SERVED answer about
+        // the mock the caller wrote — the properties of it AppSync could not take — and
+        // nothing is evaluated over it. One check for both halves of this sandbox
+        // (`crate::state::mock_context`, which the VELOCITY half reads the same way), because
+        // both take the same `context` member of the same resolver context.
+        if let Some(failed) = crate::state::mock_context::failed_validation(&context) {
+            return Ok(EvaluateCodeOutput {
+                error: Some(EvaluateCodeErrorDetail {
+                    message: Some(crate::state::mock_context::failed_validation_message(&failed)),
+                    code_errors: None,
+                }),
+                ..Default::default()
+            });
+        }
+        let context = resolver_context(context);
 
         // The code is READ before it is run, by the compiler and the APPSYNC_JS rule set this
         // service reads every definition's code with (`crate::state::evaluable_code`): a

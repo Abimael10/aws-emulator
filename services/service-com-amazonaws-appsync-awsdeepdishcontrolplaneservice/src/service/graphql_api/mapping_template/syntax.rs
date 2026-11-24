@@ -10,5 +10,5 @@
 //! parent module), because those are AppSync's own and not the language's.
 
 pub use ::service_common::velocity_template::{
-    parse, Access, Expr, Node, Operator, Reference, MAX_NESTING,
+    parse, parse_with_position, Access, Expr, Node, Operator, Reference, MAX_NESTING,
 };
