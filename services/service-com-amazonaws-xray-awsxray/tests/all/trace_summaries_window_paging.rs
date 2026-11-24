@@ -23,6 +23,12 @@
 //! * a token naming a page the requested window is not served in, or no page at
 //!   all, is refused with the service's one wording for an uninterpretable
 //!   pagination token;
+//! * a narrowing term — a service, a group named in any of its forms, one that
+//!   selects nothing — decides WHICH of the window's traces are reported and
+//!   nothing about which part of the window a page serves, so a filtered or
+//!   group-scoped query over a window shorter than one step is also one page
+//!   carrying every match that window holds, and asking the identical query
+//!   again answers it identically, member for member;
 //! * the token is OPAQUE — base64 carrying its cursor behind an authenticator
 //!   the issuing store's secret computes over it — so no step ordinal, instant or
 //!   trace id of the service's own paging is legible in it, a value the read
@@ -47,8 +53,8 @@ use service_com_amazonaws_xray_awsxray::ops::get_trace_summaries::TRACE_SUMMARIE
 use service_common::page_tokens::{page_token, PageTokenKey, AUTHENTICATOR_BYTES};
 
 use super::xray_wire::{
-    close, reported, reported_trace_ids, root_document, summaries_body, trace_id, Answer, Xray,
-    ALIGNED, HOUR,
+    array, close, reported, reported_trace_ids, root_document, summaries_body, trace_id, Answer,
+    Xray, ALIGNED, HOUR,
 };
 
 /// The refusal message of an answer, or the empty string.
@@ -959,7 +965,175 @@ async fn a_short_window_pages_on_its_results_rather_than_on_an_hour_boundary() {
 }
 
 // =============================================================================
-// 9. The token a page hands out is OPAQUE, and still the cursor of its own query
+// 9. A query that FILTERS or scopes itself to a group is cut from the SAME
+//    requested window, and the identical query answers identically
+// =============================================================================
+
+/// The group the scoped rows below name.
+const SCOPED_GROUP: &str = "window-probe";
+
+/// The service the group's own expression selects.
+const MATCHING_SERVICE: &str = "svc-probe";
+
+/// A service in the same window that the group's expression does not select.
+const OTHER_SERVICE: &str = "svc-other";
+
+/// The traces the scoped rows are read over: the service that reported each one,
+/// and where it starts relative to the case's anchor. The first two lie in the
+/// minutes-wide window asked about, the third well before it.
+const SCOPED_TRACES: [(&str, f64); 3] = [
+    (MATCHING_SERVICE, -120.0),
+    (OTHER_SERVICE, -60.0),
+    (MATCHING_SERVICE, -3_000.0),
+];
+
+/// Store the group and the traces of [`SCOPED_TRACES`] around `anchor`, and
+/// answer their ids in the order that table names them — which is also the order
+/// the ids sort, so an expected list reads off it.
+async fn seed_scoped(xray: &Xray, anchor: f64) -> Vec<String> {
+    let created = xray
+        .call(
+            "/CreateGroup",
+            &json!({
+                "GroupName": SCOPED_GROUP,
+                "FilterExpression": format!("service(\"{MATCHING_SERVICE}\")"),
+            }),
+        )
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "the group the scoped rows name must be created, got {created:?}"
+    );
+
+    let mut stored = Vec::new();
+    for (index, (service, offset)) in SCOPED_TRACES.iter().enumerate() {
+        let id = trace_id(u32::try_from(index + 1).expect("the index fits"));
+        let start = anchor + offset;
+        let document = root_document(
+            &format!("{:016x}", index + 1),
+            &id,
+            service,
+            start,
+            Some(start + 0.5),
+        )
+        .to_string();
+        let put = xray.put_segments(&[document]).await;
+        assert_eq!(
+            (put.status, array(&put.body, "UnprocessedTraceSegments").len()),
+            (200, 0),
+            "seeding {id} at {start} must be accepted whole, got {put:?}"
+        );
+        stored.push(id);
+    }
+    stored
+}
+
+#[tokio::test]
+async fn a_filtered_short_window_answers_its_matches_identically() {
+    // Where the case's anchor sits relative to the absolute hour boundary
+    // [`ALIGNED`], which decides how many boundaries the window below crosses.
+    // The pages of a query are steps of ITS OWN window, so a narrowing term —
+    // a service, a group by either of its forms, one that selects nothing —
+    // changes WHICH of the window's traces are reported and nothing about which
+    // part of the window one page serves: every row answers the matches the
+    // window holds, on its first and only page, wherever its bounds fall.
+    const ANCHORS: [(&str, f64); 4] = [
+        ("just after the top of an hour", 30.0),
+        ("exactly on an hour boundary", 0.0),
+        ("just before an hour boundary", -30.0),
+        ("wholly inside one hour", 1_800.0),
+    ];
+
+    for (placement, offset) in ANCHORS {
+        let xray = Xray::new();
+        let anchor = ALIGNED + offset;
+        let stored = seed_scoped(&xray, anchor).await;
+        // The read-after-write window: twelve minutes back from just past the
+        // anchor. Shorter than one step, holding the first two seeded traces and
+        // not the third.
+        let start = anchor - 600.0;
+        let end = anchor + 120.0;
+        let in_window = vec![stored[0].clone(), stored[1].clone()];
+        let matching = vec![stored[0].clone()];
+
+        let rows: Vec<(&str, Option<String>, Vec<String>)> = vec![
+            ("no narrowing term", None, in_window.clone()),
+            (
+                "a service term",
+                Some(format!("service(\"{MATCHING_SERVICE}\")")),
+                matching.clone(),
+            ),
+            (
+                "the group by name",
+                Some(format!("group.name = \"{SCOPED_GROUP}\"")),
+                matching.clone(),
+            ),
+            (
+                "the group in call form",
+                Some(format!("group(\"{SCOPED_GROUP}\")")),
+                matching.clone(),
+            ),
+            (
+                "a term the window's traces do not match",
+                Some(format!("service(\"{OTHER_SERVICE}-absent\")")),
+                Vec::new(),
+            ),
+        ];
+
+        for (form, filter, expected) in rows {
+            let case = format!("{placement}, {form}");
+            let answered = xray
+                .query_summaries(start, end, filter.as_deref(), None)
+                .await;
+            assert_eq!(
+                answered.status, 200,
+                "case {case:?}: the window [{start}, {end}) must be answered, got {answered:?}"
+            );
+            assert_eq!(
+                reported(&answered),
+                expected,
+                "case {case:?}: expected {expected:?} on the first page, got {:?}",
+                reported(&answered)
+            );
+            assert!(
+                next_token(&answered).is_none(),
+                "case {case:?}: the complete answer to a window shorter than one step carries no \
+                 token, got {answered:?}"
+            );
+            // The count is of the traces the WINDOW holds, which no narrowing
+            // term changes: both in-window traces were taken through the filter,
+            // and the one outside the window was not.
+            let held = i64::try_from(in_window.len()).expect("the case is small");
+            assert_eq!(
+                answered.get("TracesProcessedCount").as_i64(),
+                Some(held),
+                "case {case:?}: the window holds {held} traces however the query narrows, got \
+                 {answered:?}"
+            );
+            assert!(
+                approximate_time(&answered).is_some_and(|at| close(at, start)),
+                "case {case:?}: expected ApproximateTime {start} (the requested StartTime), got \
+                 {answered:?}"
+            );
+
+            // The answer is a function of the window asked about and of what the
+            // store holds, so asking the identical query again answers it
+            // identically — the same ids in the same order, and the same
+            // envelope member for member.
+            let again = xray
+                .query_summaries(start, end, filter.as_deref(), None)
+                .await;
+            assert_eq!(
+                again.body, answered.body,
+                "case {case:?}: the identical query must answer identically, got {again:?} after \
+                 {answered:?}"
+            );
+        }
+    }
+}
+
+// =============================================================================
+// 10. The token a page hands out is OPAQUE, and still the cursor of its own query
 // =============================================================================
 
 /// One paged query, and the pages the rule says it is served in.
