@@ -13,11 +13,11 @@
 //! (`ResourceNotFoundException`, HTTP 404), and WHICH SENTENCE it carries is the recorded
 //! contract of the ROUTE that looked it up:
 //!
-//! * a call ADDRESSED by the INFRASTRUCTURE configuration's own ARN — its read and its
-//!   delete — reports the ARN the request carried, quoted: "The resource ARN '<arn>' was not
-//!   found.", which names no kind.
+//! * a READ addressed by a CONFIGURATION's own ARN — either family — and the INFRASTRUCTURE
+//!   configuration's delete with them, report the ARN the request carried, quoted: "The
+//!   resource ARN '<arn>' was not found.", which names no kind.
 //! * everywhere else — the components, recipes, pipelines, images, workflows, and the
-//!   distribution configuration whichever route looks one up (a read, a delete, an update, a
+//!   distribution configuration whichever other route looks one up (a delete, an update, a
 //!   policy write, a tagging write or a reference) — the required resource it is: "The
 //!   following required resource '<Kind>' cannot be found: '<arn>'.", naming the kind the ARN
 //!   identifies.
@@ -361,9 +361,9 @@ fn distribution_arn(region: &str, normalized: &str) -> String {
 /// Which not-found class a lookup's answer carries.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MissingReport {
-    /// This service's own modelled not-found error for a call ADDRESSED by the INFRASTRUCTURE
-    /// configuration's own ARN — its read and its delete — quoting the ARN the request carried
-    /// and naming no kind.
+    /// This service's own modelled not-found error for a READ addressed by a CONFIGURATION's
+    /// own ARN — either family — and for the INFRASTRUCTURE configuration's delete, quoting
+    /// the ARN the request carried and naming no kind.
     ConfigurationArn,
     /// This service's own modelled not-found error everywhere else, naming the kind and the
     /// ARN.
@@ -505,14 +505,14 @@ fn lookups_of(case: &str, region: &'static str, resource_type: &'static str, arn
             );
         }
         "DistributionConfiguration" => {
-            // Every lookup of a distribution configuration names the kind its ARN identifies —
-            // its read as much as its delete and its update.
+            // A READ addressed by a configuration's own ARN reports that ARN alone, over both
+            // configuration families; this family's delete and its update name the kind.
             push(
                 "GetDistributionConfiguration",
                 "GET",
                 format!("/GetDistributionConfiguration?distributionConfigurationArn={arn}"),
                 None,
-                MissingReport::RequiredResource,
+                MissingReport::ConfigurationArn,
             );
             push(
                 "DeleteDistributionConfiguration",

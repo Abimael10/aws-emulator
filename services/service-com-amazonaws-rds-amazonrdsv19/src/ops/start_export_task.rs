@@ -310,16 +310,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
         };
 
+        // "The ID of the Amazon Web Services KMS key to use to encrypt the data exported to
+        // Amazon S3": a key KMS holds nothing under, or one it holds disabled, cannot
+        // encrypt the export — the modelled `KMSKeyNotAccessibleFault`. The condition of THE
+        // KEY ITSELF is decided FIRST, ahead of the role the grant on it would be created
+        // for: the key is a parameter of the REQUEST, so an export that could not be
+        // encrypted under the key it named is reported as that key's own absence rather than
+        // masked by anything the request NAMES — the role it runs as, or the source it would
+        // have read.
+        if crate::state::kms_key_is_inaccessible(ctx, &region, &input.kms_key_id).await {
+            return Err(StartExportTaskErrorModeled::KMSKeyNotAccessibleFault(
+                KMSKeyNotAccessibleFault {
+                    message: Some(crate::state::export_kms_key_not_accessible_message(
+                        &input.kms_key_id,
+                    )),
+                },
+            )
+            .into());
+        }
+
         // The export encrypts what it writes under the caller's key, and it does that AS the
         // role the request names: "the caller of this operation must be authorized to run the
         // following operations ... kms:CreateGrant kms:DescribeKey" (`KmsKeyId`), which the
         // export is authorized for by a GRANT created FOR that role. So the grant is resolved
         // THROUGH the role, which is why a principal that resolves to no role of this account
-        // is decided FIRST, before any statement about the key itself: there is nothing to
-        // create the grant for, which the recorded behaviour of this operation answers as the
-        // modelled `KMSKeyNotAccessibleFault` in its generic "specified KMS key" wording
+        // is decided ahead of everything the request NAMES — there is nothing to create the
+        // grant for, which the recorded behaviour of this operation answers as the modelled
+        // `KMSKeyNotAccessibleFault` in its generic "specified KMS key" wording
         // ([`crate::state::export_key_grant_not_created_message`], which records the answer and
-        // why the two conditions of that fault are worded differently).
+        // why the two conditions of that fault are worded differently). It is decided AFTER
+        // the key's own condition above, because a key that cannot encrypt the export at all
+        // is reported as the key's absence whatever role the request named.
         //
         // That sentence names the KEY the request's reference resolves to — the key the grant
         // would have been created on, which is what KMS reports an ARN for — and falls back to
@@ -332,23 +353,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(StartExportTaskErrorModeled::KMSKeyNotAccessibleFault(
                 KMSKeyNotAccessibleFault {
                     message: Some(crate::state::export_key_grant_not_created_message(&named)),
-                },
-            )
-            .into());
-        }
-
-        // "The ID of the Amazon Web Services KMS key to use to encrypt the data exported to
-        // Amazon S3": a key KMS holds nothing under, or one it holds disabled, cannot
-        // encrypt the export — the modelled `KMSKeyNotAccessibleFault`. The key is a
-        // parameter of the REQUEST, decided before anything the request NAMES is resolved,
-        // so an export that could not be encrypted is reported as the key fault it is rather
-        // than masked by a not-found of the source it would have read.
-        if crate::state::kms_key_is_inaccessible(ctx, &region, &input.kms_key_id).await {
-            return Err(StartExportTaskErrorModeled::KMSKeyNotAccessibleFault(
-                KMSKeyNotAccessibleFault {
-                    message: Some(crate::state::export_kms_key_not_accessible_message(
-                        &input.kms_key_id,
-                    )),
                 },
             )
             .into());

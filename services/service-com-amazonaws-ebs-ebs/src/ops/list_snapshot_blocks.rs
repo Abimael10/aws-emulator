@@ -278,18 +278,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .next()
             .map(|(block_index, _)| encode_page_token(&snapshot.snapshot_id, *block_index));
 
-        // Whether this page hands out any block token at all: every block it reports
-        // carries one, so a page that reports no block hands out none.
-        let hands_out_block_tokens = !blocks.is_empty();
-
         Ok(ListSnapshotBlocksOutput {
             blocks: Some(blocks),
-            // "The time when the `BlockToken` expires" — the member is OF the tokens this
-            // answer hands out, so an answer that hands out none has no such instant to
-            // report and OMITS it rather than filling it with the expiry of tokens nobody
-            // was given.
-            expiry_time: hands_out_block_tokens
-                .then(|| ::aws_smithy_types::DateTime::from(snapshot.expiry_time)),
+            // "The time when the `BlockToken` expires": the tokens a block of THIS
+            // snapshot is handed out under all stop resolving at the one instant the
+            // snapshot carries, so the member is of the snapshot the listing resolved
+            // rather than of the page it happened to report — a page that reported no
+            // block included, which "Even if additional blocks can be retrieved from the
+            // snapshot, the request can return less blocks than MaxResults or an empty
+            // array of blocks" (`MaxResults`) makes a page of any listing.
+            expiry_time: Some(::aws_smithy_types::DateTime::from(snapshot.expiry_time)),
             // "The size of the volume in GB" and "the size of the blocks IN THE SNAPSHOT,
             // in bytes": both describe the snapshot this listing is of, not the page, and
             // are the same on every page of one listing — including a page that reports no

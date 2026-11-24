@@ -12,9 +12,9 @@
 //! (`ResourceNotFoundException`, HTTP 404; `smithy_query(query="shape",shape="ResourceNotFoundException")`
 //! gives the shape and no message text) and reports it as the required resource it is, naming
 //! the KIND that ARN identifies: "The following required resource '<Kind>' cannot be found:
-//! '<arn>'." — whichever route performed the lookup. The INFRASTRUCTURE configuration's own
-//! read and delete are the one recorded exception: they quote the ARN alone, "The resource ARN
-//! '<arn>' was not found.", naming no kind.
+//! '<arn>'." — whichever route performed the lookup. The READS of the two CONFIGURATION
+//! families, and the INFRASTRUCTURE configuration's delete, are the recorded exception: they
+//! quote the ARN alone, "The resource ARN '<arn>' was not found.", naming no kind.
 //!
 //! The rows span what the rule generalises over: the kind the ARN names (every kind of the
 //! modelled `ImageBuilderArn` alternation whose read is implemented,
@@ -174,8 +174,8 @@ fn arn(region: &str, resource: &str) -> String {
 }
 
 /// RULE: the read of an ARN this Region holds nothing under names the KIND that ARN identifies,
-/// for every kind this service mints one for — the infrastructure configuration's own read
-/// being the one recorded exception, which quotes the ARN alone.
+/// for every kind this service mints one for — the two CONFIGURATION families' own reads being
+/// the recorded exception, which quote the ARN alone.
 #[tokio::test]
 async fn a_read_of_an_absent_arn_names_the_kind_the_arn_identifies() {
     let router = emulator();
@@ -196,7 +196,7 @@ async fn a_read_of_an_absent_arn_names_the_kind_the_arn_identifies() {
         (
             "a distribution configuration nothing created",
             format!("/GetDistributionConfiguration?distributionConfigurationArn={distribution}"),
-            kind_sentence("DistributionConfiguration", &distribution),
+            arn_sentence(&distribution),
         ),
         (
             "a component build version nothing created",
@@ -278,10 +278,10 @@ async fn create_distribution(
 }
 
 /// RULE applied to the whole lifecycle of a distribution configuration: while it is stored
-/// every read answers it, and once it is gone every route that looks it up — the read included
-/// — reports it as the required resource it is, naming the kind its ARN identifies.
+/// every read answers it, and once it is gone every route that looks it up reports it missing
+/// — its READ quoting the ARN alone, and its other routes naming the kind its ARN identifies.
 #[tokio::test]
-async fn every_lookup_of_a_gone_distribution_configuration_names_the_kind() {
+async fn every_lookup_of_a_gone_distribution_configuration_reports_it_missing() {
     let router = emulator();
 
     // The rows differ in the form of the configuration name and in the distributions list the
@@ -345,14 +345,22 @@ async fn every_lookup_of_a_gone_distribution_configuration_names_the_kind() {
             "case {row:?}: expected the delete to succeed, got {status} with {answer}"
         );
 
-        // (which route looks it up, method, target, body)
-        let lookups: Vec<(&str, &str, String, Option<Value>)> = vec![
-            ("GetDistributionConfiguration", "GET", read.clone(), None),
+        // (which route looks it up, method, target, body, the sentence it carries)
+        let kind = kind_sentence("DistributionConfiguration", &stored);
+        let lookups: Vec<(&str, &str, String, Option<Value>, String)> = vec![
+            (
+                "GetDistributionConfiguration",
+                "GET",
+                read.clone(),
+                None,
+                arn_sentence(&stored),
+            ),
             (
                 "DeleteDistributionConfiguration",
                 "DELETE",
                 format!("/DeleteDistributionConfiguration?distributionConfigurationArn={stored}"),
                 None,
+                kind.clone(),
             ),
             (
                 "UpdateDistributionConfiguration",
@@ -363,17 +371,18 @@ async fn every_lookup_of_a_gone_distribution_configuration_names_the_kind() {
                     "clientToken": format!("after-{name}"),
                     "distributions": [entry(REGION)],
                 })),
+                kind.clone(),
             ),
             (
                 "TagResource",
                 "POST",
                 format!("/tags/{}", encode_label(&stored)),
                 Some(json!({ "tags": { "owner": "platform" } })),
+                kind,
             ),
         ];
 
-        let expected = kind_sentence("DistributionConfiguration", &stored);
-        for (operation, method, uri, body) in lookups {
+        for (operation, method, uri, body, expected) in lookups {
             let case = format!("{operation} after the delete of the configuration with {row}");
             assert_reports_missing(
                 &router,

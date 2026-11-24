@@ -7,15 +7,20 @@
 //!
 //! * `ExpiryTime` is "The time when the `BlockToken` expires"
 //!   (`smithy_query(query="doc",shape="ListSnapshotBlocksResponse",member="ExpiryTime")`),
-//!   so it is of the tokens the answer handed out. Every block an answer reports carries a
-//!   token and an answer that reports no block hands out none, so a page that reports
-//!   nothing has no expiry instant to report and omits the member.
+//!   and every token a snapshot's blocks are handed out under stops resolving at the one
+//!   instant that snapshot carries — so a SNAPSHOT listing reports it on every answer that
+//!   resolved the snapshot, whatever the page held.
 //! * `VolumeSize` ("The size of the volume in GB") and `BlockSize` ("The size of the blocks
 //!   in the snapshot, in bytes") describe the snapshot the listing is of, not the page, and
-//!   are the same on every page of one listing. An answer that resolved a snapshot reports
-//!   both — a page that reports no block included, which `MaxResults` ("Even if additional
-//!   blocks can be retrieved from the snapshot, the request can return less blocks than
-//!   MaxResults or an empty array of blocks") makes a page of any listing.
+//!   are the same on every page of one listing. A snapshot listing reports both on every
+//!   answer that resolved the snapshot — a page that reports no block included, which
+//!   `MaxResults` ("Even if additional blocks can be retrieved from the snapshot, the
+//!   request can return less blocks than MaxResults or an empty array of blocks") makes a
+//!   page of any listing.
+//! * A COMPARISON that reports no changed block reports the empty list ALONE: it states
+//!   that the two snapshots hold the same content at every index of the page and nothing
+//!   about the geometry of either, so `VolumeSize`, `BlockSize` and `ExpiryTime` are all
+//!   omitted.
 //!
 //! Each listing is asserted over a TABLE, whose rows differ along WHY the page reports
 //! nothing (a snapshot that holds no block, a start past every index it holds, a comparison
@@ -27,13 +32,12 @@
 use crate::changed_blocks_between_snapshots::{compared, sealed_snapshot};
 use crate::snapshot_block_loop::{list_blocks, router, write_snapshot, Reply, BLOCK_SIZE};
 
-/// RULE, asserted on one answer: `array` reports exactly `expected`, the snapshot geometry
-/// is reported whatever the page reported, and `ExpiryTime` is reported exactly when the
-/// answer handed out at least one block token.
+/// RULE, asserted on one answer of a SNAPSHOT listing: `array` reports exactly `expected`,
+/// and the snapshot geometry and the token expiry are reported whatever the page reported.
 ///
 /// `volume_size` is the size the snapshot the listing is of was declared with, which is what
 /// every answer about it must report.
-fn assert_page_members(
+fn assert_snapshot_page_members(
     case: &str,
     reply: &Reply,
     array: &str,
@@ -41,6 +45,74 @@ fn assert_page_members(
     volume_size: i64,
 ) {
     let answer = reply.json();
+    assert_reported_indexes(case, &answer, array, expected);
+    assert_eq!(
+        answer.get("BlockSize").and_then(serde_json::Value::as_i64),
+        Some(i64::from(BLOCK_SIZE)),
+        "case {case:?}: every answer must report the block size of the snapshot it is of, \
+         got {answer}"
+    );
+    assert_eq!(
+        answer.get("VolumeSize").and_then(serde_json::Value::as_i64),
+        Some(volume_size),
+        "case {case:?}: every answer must report the volume size of the snapshot it is of, \
+         got {answer}"
+    );
+    assert!(
+        answer.get("ExpiryTime").is_some(),
+        "case {case:?}: every answer must report when the snapshot's block tokens expire, \
+         got {answer}"
+    );
+}
+
+/// RULE, asserted on one answer of a COMPARISON: `array` reports exactly `expected`; an
+/// answer that reports a changed block reports the geometry of the snapshots it compared and
+/// the expiry of the tokens it handed out, and one that reports none reports neither.
+fn assert_comparison_page_members(
+    case: &str,
+    reply: &Reply,
+    array: &str,
+    expected: &[i32],
+    volume_size: i64,
+) {
+    let answer = reply.json();
+    assert_reported_indexes(case, &answer, array, expected);
+    if expected.is_empty() {
+        for member in ["BlockSize", "VolumeSize", "ExpiryTime"] {
+            assert!(
+                answer.get(member).is_none(),
+                "case {case:?}: a comparison that reports no changed block must omit \
+                 {member}, got {answer}"
+            );
+        }
+    } else {
+        assert_eq!(
+            answer.get("BlockSize").and_then(serde_json::Value::as_i64),
+            Some(i64::from(BLOCK_SIZE)),
+            "case {case:?}: a comparison that reports a changed block must report the block \
+             size of the snapshots it compared, got {answer}"
+        );
+        assert_eq!(
+            answer.get("VolumeSize").and_then(serde_json::Value::as_i64),
+            Some(volume_size),
+            "case {case:?}: a comparison that reports a changed block must report the volume \
+             size of the snapshots it compared, got {answer}"
+        );
+        assert!(
+            answer.get("ExpiryTime").is_some(),
+            "case {case:?}: a comparison that handed out block tokens must report when they \
+             expire, got {answer}"
+        );
+    }
+}
+
+/// Assert `array` of `answer` reports exactly the block indexes `expected`, in that order.
+fn assert_reported_indexes(
+    case: &str,
+    answer: &serde_json::Value,
+    array: &str,
+    expected: &[i32],
+) {
     let reported = answer.get(array).and_then(serde_json::Value::as_array);
     assert!(
         reported.is_some(),
@@ -65,39 +137,14 @@ fn assert_page_members(
         expected.to_vec(),
         "case {case:?}: expected the indexes {expected:?} in {array}, got {answer}"
     );
-    assert_eq!(
-        answer.get("BlockSize").and_then(serde_json::Value::as_i64),
-        Some(i64::from(BLOCK_SIZE)),
-        "case {case:?}: every answer must report the block size of the snapshot it is of, \
-         got {answer}"
-    );
-    assert_eq!(
-        answer.get("VolumeSize").and_then(serde_json::Value::as_i64),
-        Some(volume_size),
-        "case {case:?}: every answer must report the volume size of the snapshot it is of, \
-         got {answer}"
-    );
-    if expected.is_empty() {
-        assert!(
-            answer.get("ExpiryTime").is_none(),
-            "case {case:?}: an answer that handed out no block token must omit ExpiryTime, \
-             got {answer}"
-        );
-    } else {
-        assert!(
-            answer.get("ExpiryTime").is_some(),
-            "case {case:?}: an answer that handed out block tokens must report when they \
-             expire, got {answer}"
-        );
-    }
 }
 
 /// One row of the `ListSnapshotBlocks` table: the case, which fixture snapshot to list, the
 /// query the request carries, and the block indexes the page must report.
 type SnapshotBlocksRow<'a> = (&'a str, usize, &'a str, Vec<i32>);
 
-/// The rule over `ListSnapshotBlocks`: the geometry of the snapshot on every answer, the
-/// token expiry only where the page handed tokens out.
+/// The rule over `ListSnapshotBlocks`: the geometry of the snapshot and the expiry of its
+/// block tokens on every answer that resolved it.
 #[tokio::test]
 async fn a_snapshot_listing_reports_the_geometry_whatever_the_page_reported() {
     let router = router();
@@ -180,7 +227,7 @@ async fn a_snapshot_listing_reports_the_geometry_whatever_the_page_reported() {
             listed.status,
             String::from_utf8_lossy(&listed.body)
         );
-        assert_page_members(case, &listed, "Blocks", &expected, *volume_size);
+        assert_snapshot_page_members(case, &listed, "Blocks", &expected, *volume_size);
     }
 }
 
@@ -189,8 +236,9 @@ async fn a_snapshot_listing_reports_the_geometry_whatever_the_page_reported() {
 /// indexes the page must report.
 type ChangedBlocksRow<'a> = (&'a str, &'a str, &'a str, &'a str, i64, Vec<i32>);
 
-/// The same rule over `ListChangedBlocks`: a comparison that reports no changed block still
-/// reports the geometry of the snapshots it compared.
+/// The rule over `ListChangedBlocks`: a comparison that reports a changed block reports the
+/// geometry of the snapshots it compared, and one that reports none reports the empty list
+/// alone.
 #[tokio::test]
 async fn a_comparison_reports_the_geometry_whatever_the_page_reported() {
     let router = router();
@@ -249,6 +297,6 @@ async fn a_comparison_reports_the_geometry_whatever_the_page_reported() {
 
     for (case, first, second, query, volume_size, expected) in rows {
         let reply = compared(&router, case, first, second, query).await;
-        assert_page_members(case, &reply, "ChangedBlocks", &expected, volume_size);
+        assert_comparison_page_members(case, &reply, "ChangedBlocks", &expected, volume_size);
     }
 }

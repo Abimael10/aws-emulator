@@ -327,10 +327,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         });
 
-        // Whether this page hands out any block token at all. A changed index is one at
+        // Whether this answer reports any changed block at all. A changed index is one at
         // least one side holds a block at, so a page carrying changed blocks always
         // carries tokens, and a page carrying none carries none.
-        let hands_out_block_tokens = !page.is_empty();
+        let reports_changed_blocks = !page.is_empty();
 
         Ok(ListChangedBlocksOutput {
             changed_blocks: Some(page),
@@ -339,20 +339,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // which any of them stops resolving. An answer that hands out no token has no
             // such instant to report, so the member is OMITTED rather than filled with the
             // expiry of tokens nobody was given.
-            expiry_time: hands_out_block_tokens.then(|| {
+            expiry_time: reports_changed_blocks.then(|| {
                 ::aws_smithy_types::DateTime::from(first.expiry_time.min(second.expiry_time))
             }),
             // "The size of the volume in GB" and "the size of the blocks IN THE SNAPSHOT,
             // in bytes", read off the snapshot the request named: a snapshot taken from a
-            // parent is of that parent's volume, so the two sides agree on both. Both
-            // describe the snapshots the comparison is of rather than the page it reported,
-            // and are the same on every page of one comparison — a page that reports no
-            // changed block included, which "the request can return less blocks than
-            // MaxResults or an empty array of blocks" (`MaxResults`) makes a page a
-            // continuing listing may carry. So they are reported on every answer that
-            // resolved both sides.
-            volume_size: Some(second.volume_size),
-            block_size: Some(second.block_size),
+            // parent is of that parent's volume, so the two sides agree on both. A
+            // comparison that reports NO changed block reports the empty list alone — it
+            // states that the two snapshots hold the same content and nothing about the
+            // geometry of either, which is what a caller reading an empty comparison is
+            // told (recorded behavior).
+            volume_size: reports_changed_blocks.then_some(second.volume_size),
+            block_size: reports_changed_blocks.then_some(second.block_size),
             next_token,
         })
     }

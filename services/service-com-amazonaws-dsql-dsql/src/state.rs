@@ -1704,8 +1704,7 @@ fn is_arn_region_segment(value: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-/// The per-cluster suffix the VPC endpoint service of a cluster is QUALIFIED by,
-/// and that the cluster's VPC connection endpoint names the same service with.
+/// The per-cluster suffix the VPC endpoint service of a cluster is QUALIFIED by.
 ///
 /// It IS the cluster's own identifier — a value the mint already drew once per
 /// cluster, so nothing second has to be minted or stored for a suffix to be
@@ -1716,10 +1715,9 @@ fn is_arn_region_segment(value: &str) -> bool {
 /// `ResourceNotFoundException` for an unknown one, and `ServiceName`'s pattern
 /// (`smithy_query(query="shape", shape="ServiceName")`:
 /// `^com\.amazonaws\.[a-z0-9-]+\.dsql[a-z0-9-]*$`) admits exactly such a suffix
-/// after `dsql` — and BOTH members of the reply are built from here
-/// ([`vpc_endpoint_service_name`], [`cluster_vpc_endpoint`]), so the suffix the
-/// service name carries and the one the connection endpoint's host carries cannot
-/// differ however the suffix is derived later.
+/// after `dsql` — so the NAME of the service is a label built around the cluster,
+/// where the HOST the same reply reports is an address a client dials and is
+/// therefore read from where this emulator answers ([`cluster_endpoint`]).
 #[must_use]
 pub fn vpc_endpoint_service_suffix(identifier: &str) -> &str {
     identifier
@@ -1735,36 +1733,6 @@ pub fn vpc_endpoint_service_suffix(identifier: &str) -> &str {
 pub fn vpc_endpoint_service_name(region: &str, identifier: &str) -> String {
     format!(
         "com.amazonaws.{region}.dsql-{}",
-        vpc_endpoint_service_suffix(identifier)
-    )
-}
-
-/// The VPC CONNECTION endpoint of one cluster — `GetVpcEndpointServiceName`'s
-/// `clusterVpcEndpoint`, "The VPC connection endpoint for the cluster"
-/// (`smithy_query(query="doc", shape="GetVpcEndpointServiceNameOutput",
-/// member="clusterVpcEndpoint")`).
-///
-/// It is a DNS HOST, and the one a client reaches THAT cluster at through the
-/// endpoint service of the same reply, so it is laid out the way such a host is:
-/// the cluster's own identifier as its leading label, then the `dsql` label
-/// carrying the same per-cluster endpoint-service suffix the `serviceName` beside
-/// it carries ([`vpc_endpoint_service_suffix`]), then the cluster's Region — so a
-/// client that parses the host recovers the cluster, the endpoint service and the
-/// Region, and two clusters are never named by one host.
-///
-/// `zone` is the DNS zone the host sits in: the zone THIS emulator may announce a
-/// name of its own in ([`announced_zone`]), never the zone Amazon Web Services
-/// publishes its own endpoints in — a name there resolves nowhere near this
-/// process or, worse, at genuine infrastructure, so a client handed one leaves the
-/// emulated environment entirely.
-///
-/// Every label is well inside the 63 octets DNS allows one, and the whole value
-/// satisfies `ClusterVpcEndpoint`'s `^[a-zA-Z0-9.-]+$`
-/// ([`is_endpoint_host`]) for every Region segment and zone this emulator can be
-/// reached in.
-pub fn cluster_vpc_endpoint(region: &str, identifier: &str, zone: &str) -> String {
-    format!(
-        "{identifier}.dsql-{}.{region}.{zone}",
         vpc_endpoint_service_suffix(identifier)
     )
 }

@@ -7,13 +7,14 @@
 //! serialization, the modelled-constraint walk and the handlers — so what is asserted is what
 //! a signed AWS SDK request observes.
 //!
-//! The rule under test: which not-found sentence a refusal carries follows the RESOURCE the
-//! lookup addressed. Every lookup of a distribution configuration — its read, its delete, its
-//! update and a tagging write on it — reports it as the required resource it is, naming the
-//! kind its ARN identifies: "The following required resource 'DistributionConfiguration'
-//! cannot be found: '<arn>'.", while the sibling INFRASTRUCTURE configuration's own read and
-//! delete quote the ARN they could not resolve by itself: "The resource ARN '<arn>' was not
-//! found." The second test pins that boundary on the infrastructure configuration.
+//! The rule under test: which not-found sentence a refusal carries follows the ROUTE's own
+//! recorded contract. A READ addressed by a configuration's own ARN — over BOTH
+//! configuration families — reports the ARN it could not resolve, quoted and by itself:
+//! "The resource ARN '<arn>' was not found." Every other lookup of a distribution
+//! configuration — its delete, its update and a tagging write on it — reports it as the
+//! required resource it is, naming the kind its ARN identifies: "The following required
+//! resource 'DistributionConfiguration' cannot be found: '<arn>'." The second test pins that
+//! boundary on the sibling INFRASTRUCTURE configuration.
 //!
 //! The rows span what the rule generalises over: which operation performs the lookup, why the
 //! ARN resolves to nothing (never created, deleted after an accepted update, a name that only
@@ -185,25 +186,29 @@ async fn create_distribution(router: &MultiServiceRouter, region: &str, name: &s
         .to_string()
 }
 
-/// Every lookup of the distribution configuration `arn`, as (operation, method, uri, body) —
-/// each one reports a configuration it cannot resolve in the kind-naming sentence.
+/// Every lookup of the distribution configuration `arn`, as (operation, method, uri, body,
+/// the sentence a configuration it cannot resolve is reported in) — the READ reports the ARN
+/// alone, and every other route names the kind.
 fn distribution_lookups(
     region: &str,
     arn: &str,
-) -> Vec<(String, &'static str, String, Option<Value>)> {
+) -> Vec<(String, &'static str, String, Option<Value>, String)> {
     let name = arn.rsplit('/').next().unwrap_or(arn);
+    let kind = kind_sentence("DistributionConfiguration", arn);
     vec![
         (
             "GetDistributionConfiguration".to_string(),
             "GET",
             format!("/GetDistributionConfiguration?distributionConfigurationArn={arn}"),
             None,
+            arn_sentence(arn),
         ),
         (
             "DeleteDistributionConfiguration".to_string(),
             "DELETE",
             format!("/DeleteDistributionConfiguration?distributionConfigurationArn={arn}"),
             None,
+            kind.clone(),
         ),
         (
             "UpdateDistributionConfiguration".to_string(),
@@ -214,31 +219,34 @@ fn distribution_lookups(
                 "clientToken": format!("update-{region}-{name}"),
                 "distributions": [entry(region)],
             })),
+            kind.clone(),
         ),
         (
             "TagResource".to_string(),
             "POST",
             format!("/tags/{}", encode_label(arn)),
             Some(json!({ "tags": { "owner": "platform" } })),
+            kind.clone(),
         ),
         (
             "UntagResource".to_string(),
             "DELETE",
             format!("/tags/{}?tagKeys=owner", encode_label(arn)),
             None,
+            kind,
         ),
     ]
 }
 
 /// Assert `arn` is reported missing by every lookup of a distribution configuration, each in
-/// the kind-naming sentence.
+/// the sentence that route carries.
 async fn assert_every_lookup_reports_it_missing(
     router: &MultiServiceRouter,
     row: &str,
     region: &'static str,
     arn: &str,
 ) {
-    for (operation, method, uri, body) in distribution_lookups(region, arn) {
+    for (operation, method, uri, body, expected) in distribution_lookups(region, arn) {
         let case = format!("{operation} on {row}");
         let (status, answer) = call_in(router, region, method, &uri, body.as_ref()).await;
         assert_eq!(
@@ -250,7 +258,6 @@ async fn assert_every_lookup_reports_it_missing(
             code, "ResourceNotFoundException",
             "case {case:?}: expected ResourceNotFoundException, got {code:?} with {answer}"
         );
-        let expected = kind_sentence("DistributionConfiguration", arn);
         let actual = error_message(&case, &answer);
         assert_eq!(
             actual, expected,
@@ -260,8 +267,9 @@ async fn assert_every_lookup_reports_it_missing(
 }
 
 /// RULE: a distribution configuration the calling Region holds nothing under is reported
-/// missing by every lookup of it, whatever the reason it resolves to nothing — as the required
-/// resource it is, naming the kind its ARN identifies.
+/// missing by every lookup of it, whatever the reason it resolves to nothing — its READ
+/// quoting the ARN it could not resolve, and its other routes naming the kind that ARN
+/// identifies.
 #[tokio::test]
 async fn every_lookup_of_a_missing_distribution_configuration_reports_it_missing() {
     let router = emulator();
@@ -371,9 +379,9 @@ async fn every_lookup_of_a_missing_distribution_configuration_reports_it_missing
     }
 }
 
-/// RULE's boundary: the INFRASTRUCTURE configuration is reported by its ARN alone for its read
-/// and for its delete — where every lookup of the distribution configuration names the kind —
-/// while a tagging write on either names the kind.
+/// RULE's boundary: the sibling INFRASTRUCTURE configuration's read is reported by its ARN
+/// alone, exactly as the distribution configuration's is, and so is its delete — while a
+/// tagging write on either names the kind.
 #[tokio::test]
 async fn the_infrastructure_configuration_is_still_reported_by_its_arn_alone() {
     let router = emulator();

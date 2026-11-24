@@ -12,13 +12,13 @@
 //! (`ResourceNotFoundException`, HTTP 404), and the message that refusal carries is the one
 //! the ROUTE's own recorded contract gives it:
 //!
-//! * a call addressed by the INFRASTRUCTURE configuration's own ARN — its read or its
-//!   delete — reports the ARN the request carried, quoted, naming no kind: "The resource ARN
-//!   '<arn>' was not found.";
+//! * a READ addressed by a CONFIGURATION's own ARN — over both families, and the
+//!   infrastructure configuration's delete with them — reports the ARN the request carried,
+//!   quoted, naming no kind: "The resource ARN '<arn>' was not found.";
 //! * every other report names the resource KIND the ARN identifies — "The following required
 //!   resource '<Kind>' cannot be found: '<arn>'." — whether the call reads one of the
-//!   versioned families, reads a distribution configuration, deletes one, updates one, tags
-//!   one or resolves a reference to one.
+//!   versioned families, deletes a distribution configuration, updates one, tags one or
+//!   resolves a reference to one.
 //!
 //! The rows span what the rule generalises over: which configuration family the ARN names,
 //! which operation performs the lookup, the form of the configuration name the ARN carries,
@@ -152,8 +152,8 @@ fn assert_ok(case: &str, status: u16, body: Value) -> Value {
 /// Which of this service's two missing-resource sentences an answer has to carry.
 #[derive(Clone, Copy)]
 enum Sentence {
-    /// The one a call addressed by the infrastructure configuration's own ARN carries: the
-    /// ARN the request named, quoted.
+    /// The one a READ addressed by a configuration's own ARN carries: the ARN the request
+    /// named, quoted.
     Arn,
     /// The one every other report carries: the kind the ARN identifies, and the ARN.
     Kind(&'static str),
@@ -310,7 +310,7 @@ const DISTRIBUTION: Family = Family {
     minted: "distributionConfigurationArn",
     read: "/GetDistributionConfiguration?distributionConfigurationArn=",
     delete: "/DeleteDistributionConfiguration?distributionConfigurationArn=",
-    sentence: Sentence::Kind("DistributionConfiguration"),
+    sentence: Sentence::Arn,
 };
 
 /// The ARN a configuration of `family` named `name` carries in `region`, as the modelled

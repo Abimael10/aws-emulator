@@ -186,14 +186,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 GetDistributionConfigurationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        // A distribution configuration this Region holds nothing under is
-                        // reported as the required resource it is, naming the kind its ARN
-                        // identifies (`required_resource_not_found_message`) — the sentence
-                        // every route of this service that looks one up carries, its
-                        // delete, its update and a tagging write on it included. The
-                        // ARN-only sentence (`resource_arn_not_found_message`) belongs to
-                        // the INFRASTRUCTURE configuration's own read and delete.
-                        message: Some(crate::state::required_resource_not_found_message(
+                        // A READ addressed by a configuration's own ARN reports the ARN it
+                        // could not resolve, quoted and by itself
+                        // (`crate::state::resource_arn_not_found_message`) — the sentence
+                        // the sibling `GetInfrastructureConfiguration` carries for the same
+                        // lookup. The kind-naming sentence
+                        // (`required_resource_not_found_message`) belongs to the routes
+                        // whose own recorded contract gives it that wording: this family's
+                        // delete and update, a tagging write on it, and a reference a
+                        // create resolves.
+                        message: Some(crate::state::resource_arn_not_found_message(
                             &input.distribution_configuration_arn,
                         )),
                     },

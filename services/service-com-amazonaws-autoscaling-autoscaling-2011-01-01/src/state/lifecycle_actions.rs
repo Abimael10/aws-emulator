@@ -400,9 +400,7 @@ impl LifecycleActionRefusal {
             Self::NotAddressed => not_addressed_message(),
             Self::NoActiveAction => match (key.token, key.instance_id) {
                 (Some(token), _) => no_active_action_by_token_message(token),
-                (None, Some(instance_id)) => {
-                    no_active_action_under_hook_message(instance_id, key.hook_name)
-                }
+                (None, Some(instance_id)) => no_active_action_by_instance_message(instance_id),
                 (None, None) => not_addressed_message(),
             },
         }
@@ -427,21 +425,19 @@ pub fn no_active_action_by_token_message(token: &str) -> String {
     format!("No active Lifecycle Action found with token {token}")
 }
 
-/// The same, for a call that named the INSTANCE instead: both halves of the address it
-/// sent — the instance and the hook the lookup was made under — because an instance has one
-/// held action per hook, so the pair is what names the action the caller meant and what it
-/// has to correct.
+/// The same, for a call that named the INSTANCE instead: the one variable part is the
+/// INSTANCE the caller addressed, because an instance holds the action a callback is about
+/// and that is the half of the address the caller has to correct. The hook the lookup was
+/// made under is NOT quoted — the refusal states that no active action is held for that
+/// instance, whichever hook the call named.
 ///
 /// ONE sentence for every way such a lookup can come up empty — the action was already
 /// consumed, the hook holds nothing for that instance, the group or the instance does not
 /// exist — because the caller is told the same thing in each: this group holds no active
-/// action for that instance under that hook.
+/// action for that instance.
 #[must_use]
-pub fn no_active_action_under_hook_message(instance_id: &str, hook_name: &str) -> String {
-    format!(
-        "No active Lifecycle Action found with instance ID {instance_id} and HookName \
-         {hook_name}"
-    )
+pub fn no_active_action_by_instance_message(instance_id: &str) -> String {
+    format!("No active Lifecycle Action found with instance ID {instance_id}")
 }
 
 /// How one hold ENDED, which is what the step it was holding reports when the group gave up

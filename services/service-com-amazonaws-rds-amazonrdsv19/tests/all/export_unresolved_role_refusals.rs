@@ -10,17 +10,18 @@
 //! `KMSKeyNotAccessibleFault` (HTTP 400, `Sender`) worded as the generic "specified KMS key"
 //! sentence naming the KEY the request's `KmsKeyId` resolves to — the key the grant would have
 //! been created on.** The grant is resolved THROUGH the role, so that refusal is decided
-//! before anything about the key itself, and the key's OWN policy decides nothing for such a
-//! request: a principal that was never resolved cannot be authorized or refused by it, so the
-//! refusal is never worded as the key's own inaccessibility.
+//! before anything the key's own POLICY says: a principal that was never resolved cannot be
+//! authorized or refused by it. What the grant cannot mask is the key's own EXISTENCE: a
+//! `KmsKeyId` KMS holds no key under is answered as that key's own absence whatever the role
+//! resolves to, because there is no key to create the grant on at all.
 //!
 //! The rows span what the rule generalises over — the forms a value that resolves to no role
 //! of this account takes (a bare role name, a value that is no ARN at all, an IAM ARN of this
 //! account that names no role, an IAM-shaped ARN carrying a Region, an ARN of another
 //! service, an ARN of another account, and a well-formed role ARN of this account IAM holds
 //! nothing under) — crossed with every spelling the request may name the one key by, and with
-//! a reference KMS resolves no key for, which the sentence can only name as the request
-//! carried it and which is answered on the grant all the same. Two controls keep the
+//! a reference KMS resolves no key for, which is answered as the key's own absence instead.
+//! Two controls keep the
 //! neighbouring rules where they are: the export role this account really holds is ACCEPTED,
 //! and that same resolved role against a key whose own policy authorizes it for nothing is
 //! refused with the sentence a key that is itself unusable carries, about the reference the
@@ -199,6 +200,16 @@ const ROWS: &[Row] = &[
     },
 ];
 
+/// The sentence one row's answer has to carry: the grant that could not be created names the
+/// key KMS resolved the reference to, while a reference KMS resolves NO key for is answered as
+/// that key's own absence — the key's existence is decided ahead of the grant.
+fn expected_message(fixture: &Fixture, row: &Row) -> String {
+    match row.key {
+        KeyReference::Unresolvable => key_not_accessible(fixture.key(row.key)),
+        _ => grant_not_created(fixture.named_key(row.key)),
+    }
+}
+
 /// Everything these rows need: the snapshot the export reads, the destination bucket, the
 /// encryption key in every spelling a request may name it by, and the one role IAM really
 /// holds.
@@ -360,8 +371,9 @@ async fn fixture() -> Fixture {
 }
 
 /// Every row: a value that resolves to no role of this account is the modelled key fault
-/// with the generic sentence naming the key the request passed, and nothing of the refused
-/// export is recorded.
+/// with the generic sentence naming the key the request passed — unless the key itself is one
+/// KMS holds nothing under, which is answered as that key's own absence — and nothing of the
+/// refused export is recorded.
 #[tokio::test]
 async fn an_iam_role_arn_that_resolves_to_no_role_is_the_failed_grant() {
     let fixture = fixture().await;
@@ -379,9 +391,9 @@ async fn an_iam_role_arn_that_resolves_to_no_role_is_the_failed_grant() {
         let body = expect_error(case, answered, 400, "KMSKeyNotAccessibleFault");
         let message = text(&body, "Message");
         // Whichever spelling the row passed, it names the ONE key this fixture created, so
-        // the sentence names that key's ARN; a reference KMS resolves nothing for leaves the
-        // sentence naming the reference itself.
-        let expected = grant_not_created(fixture.named_key(row.key));
+        // the sentence names that key's ARN; a reference KMS resolves nothing for is answered
+        // as the key's own absence, naming the reference itself.
+        let expected = expected_message(&fixture, row);
         assert_eq!(
             message, expected,
             "case {case:?}: expected the message {expected:?}, got {message:?} in {body}"

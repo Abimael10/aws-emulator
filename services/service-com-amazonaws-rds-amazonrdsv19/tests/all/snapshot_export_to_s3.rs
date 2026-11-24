@@ -843,10 +843,11 @@ struct RefusalRow {
 /// exist and one whose name is no bucket name), the bucket outside the export's Region that
 /// is refused as the parameter value it is, a role IAM holds nothing under — which is a
 /// principal the export's KMS grant cannot be created for, so it carries the KEY's fault —
-/// the role whose trust policy admits another principal that `IamRoleNotFound` covers, and
-/// the two `KMSKeyNotAccessibleFault` covers for the key itself (a key KMS holds nothing
-/// under and one whose own policy authorizes the export role for nothing), each with its own
-/// bucket, role and key so the variable parts differ from row to row.
+/// the role whose trust policy admits another principal that `IamRoleNotFound` covers, the
+/// two `KMSKeyNotAccessibleFault` covers for the key itself (a key KMS holds nothing under
+/// and one whose own policy authorizes the export role for nothing), and a request that
+/// names an unusable key AND an unresolvable role, which the key's own condition decides —
+/// each with its own bucket, role and key so the variable parts differ from row to row.
 #[tokio::test]
 async fn each_export_refusal_carries_the_services_own_sentence() {
     let destination = destination("emu-refusal-bucket", "emu-refusal-role").await;
@@ -975,6 +976,24 @@ async fn each_export_refusal_carries_the_services_own_sentence() {
             message: format!(
                 "The KMS key arn:aws:kms:{REGION}:{ACCOUNT}:key/11111111-2222-3333-4444-\
                  555555555555 doesn't exist or is disabled."
+            ),
+        },
+        RefusalRow {
+            // The KEY's own condition is decided ahead of the role the grant on it would be
+            // created for, so a request that names BOTH a key KMS holds nothing under and a
+            // role IAM holds nothing under is answered as the key's own absence.
+            case: "a KMS key KMS holds nothing under, named with a role IAM holds nothing \
+                   under",
+            bucket: None,
+            role_arn: Some(absent.clone()),
+            key_id: Some(format!(
+                "arn:aws:kms:{REGION}:{ACCOUNT}:key/22222222-3333-4444-5555-666666666666"
+            )),
+            status: 400,
+            code: "KMSKeyNotAccessibleFault",
+            message: format!(
+                "The KMS key arn:aws:kms:{REGION}:{ACCOUNT}:key/22222222-3333-4444-5555-\
+                 666666666666 doesn't exist or is disabled."
             ),
         },
     ];

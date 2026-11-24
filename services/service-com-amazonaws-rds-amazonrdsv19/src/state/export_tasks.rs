@@ -251,7 +251,9 @@ pub fn export_kms_key_not_accessible_message(key_id: &str) -> String {
 ///
 /// Stated here beside the family's other wordings, through the one function that builds that
 /// sentence, so the two conditions of the export's key fault each have one place that words
-/// them and neither can drift from the other.
+/// them and neither can drift from the other. The KEY's own condition is decided first, so a
+/// request whose key KMS holds nothing under carries the other wording above however its role
+/// resolves; this one is reached for a key KMS does hold.
 pub fn export_key_grant_not_created_message(key: &str) -> String {
     kms_key_not_accessible_message(key)
 }

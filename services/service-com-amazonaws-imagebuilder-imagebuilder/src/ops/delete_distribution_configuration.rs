@@ -199,9 +199,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 DeleteDistributionConfigurationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         // Reported as the required resource it is, naming the kind its ARN
-                        // identifies — the sentence every lookup of a distribution
-                        // configuration carries, this family's read included (see
-                        // `get_distribution_configuration`).
+                        // identifies, which is this route's own recorded wording. The
+                        // ARN-only sentence belongs to the READ of a configuration (see
+                        // `get_distribution_configuration`) and to the sibling
+                        // `DeleteInfrastructureConfiguration`.
                         message: Some(crate::state::required_resource_not_found_message(
                             &input.distribution_configuration_arn,
                         )),

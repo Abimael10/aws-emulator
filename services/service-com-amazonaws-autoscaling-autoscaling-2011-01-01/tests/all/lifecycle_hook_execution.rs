@@ -591,9 +591,9 @@ enum Addressed {
     Nothing,
 }
 
-/// RULE 4: a callback addressed at no held action is refused naming the address it sent —
-/// the token when it named one, and otherwise the INSTANCE together with the HOOK the
-/// lookup was made under, because an instance has one held action per hook.
+/// RULE 4: a callback addressed at no held action is refused naming the IDENTIFIER of the
+/// action it addressed and nothing else — the token when it named one, and otherwise the
+/// INSTANCE it named, never the hook the lookup happened to be made under.
 ///
 /// The rows differ along which half of the address matched nothing — including a group the
 /// account does not hold, which holds no active action either — and each row is driven
@@ -647,24 +647,15 @@ async fn a_callback_naming_no_held_action_says_which_half_matched_nothing() {
         let (addressing, expected): (Vec<(&str, &str)>, String) = match addressed {
             Addressed::AnotherHook => (
                 vec![("InstanceId", instance_id.as_str())],
-                format!(
-                    "No active Lifecycle Action found with instance ID {instance_id} and HookName \
-                     not-a-hook"
-                ),
+                format!("No active Lifecycle Action found with instance ID {instance_id}"),
             ),
             Addressed::ConsumedAction => (
                 vec![("InstanceId", instance_id.as_str())],
-                format!(
-                    "No active Lifecycle Action found with instance ID {instance_id} and HookName \
-                     {hook}"
-                ),
+                format!("No active Lifecycle Action found with instance ID {instance_id}"),
             ),
             Addressed::AbsentInstance => (
                 vec![("InstanceId", absent_instance)],
-                format!(
-                    "No active Lifecycle Action found with instance ID {absent_instance} and \
-                     HookName {hook}"
-                ),
+                format!("No active Lifecycle Action found with instance ID {absent_instance}"),
             ),
             Addressed::UnknownToken => (
                 vec![("LifecycleActionToken", unknown_token)],
@@ -712,10 +703,16 @@ async fn a_callback_naming_no_held_action_says_which_half_matched_nothing() {
                 status, 400,
                 "case {case:?} through {door}: expected HTTP 400, got {status} with {body:?}"
             );
+            let (code, message) = refusal_of(&body);
             assert_eq!(
-                refusal_of(&body),
+                (code, message.clone()),
                 ("ValidationError".to_string(), expected.clone()),
                 "case {case:?} through {door}: got {body}"
+            );
+            assert!(
+                !message.contains(named_hook),
+                "case {case:?} through {door}: the refusal must not name the hook \
+                 {named_hook:?}, got {message:?}"
             );
         }
     }
