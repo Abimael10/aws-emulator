@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! `DescribeAppInstanceBot`, end to end over HTTP.
+//! `DescribeAppInstanceBot` and `UpdateAppInstanceBot`, end to end over HTTP — the bot's
+//! read-and-write round trip, so what an update persists is asserted through the reader
+//! that reports it.
 //!
 //! The RULE pinned here: `DescribeAppInstanceBot` REPORTS the bot persisted under the
 //! `AppInstanceBotArn` it is asked about — that ARN, the `Name`, `Metadata` and
@@ -17,6 +19,15 @@
 //! several locales, with and without a welcome intent), and every way an ARN can fail to
 //! resolve to a bot (never minted, under an absent parent, deleted, cascaded away, or
 //! naming another resource kind entirely).
+//!
+//! The second RULE pinned here: `UpdateAppInstanceBot` REPLACES the stored `Name` and
+//! `Metadata` of the bot its `AppInstanceBotArn` names with the required pair the request
+//! carries, replaces the bot's `Configuration` only when the request carries one — leaving
+//! the stored configuration in place when it does not — re-stamps the bot's last-updated
+//! instant without moving its created instant, and writes to no other bot; an
+//! `AppInstanceBotArn` this service holds no bot for persists nothing and is refused with
+//! the modelled client error, whose table of cases is the same one the describe's refusal
+//! spans.
 
 use serde_json::{json, Value};
 
@@ -644,5 +655,402 @@ async fn one_refusal_answers_every_unresolvable_bot_arn_and_discloses_nothing() 
         member(&body, "Metadata").as_str(),
         Some("still here"),
         "expected the live bot to report the Metadata it was created with, got {body:?}"
+    );
+}
+
+/// `PUT /app-instance-bots/{AppInstanceBotArn}` with the `Name`/`Metadata` pair the model
+/// requires, and a `Configuration` only when the row carries one.
+///
+/// Source: `smithy_query(query="operation",operation="UpdateAppInstanceBot")` — `PUT
+/// /app-instance-bots/{AppInstanceBotArn}`, `Name` (len 0..256) and `Metadata` (len
+/// 0..1024) `@required`, `Configuration` optional, answering 200 with the bot's ARN.
+async fn update_bot(
+    emulator: &Emulator,
+    app_instance_bot_arn: &str,
+    name: &str,
+    metadata: &str,
+    configuration: Option<&Value>,
+) -> (u16, Value) {
+    let mut body = json!({ "Name": name, "Metadata": metadata });
+    if let Some(configuration) = configuration {
+        body["Configuration"] = configuration.clone();
+    }
+    emulator
+        .call(
+            "PUT",
+            &format!("/app-instance-bots/{}", uri_encode(app_instance_bot_arn)),
+            Some(body),
+        )
+        .await
+}
+
+/// The summary `ListAppInstanceBots` reports for `bot_arn` under `app_instance_arn`, or
+/// `Value::Null` when the listing holds no row for it.
+async fn listed_bot(emulator: &Emulator, app_instance_arn: &str, bot_arn: &str) -> Value {
+    let (status, body) = emulator
+        .call(
+            "GET",
+            &format!(
+                "/app-instance-bots?app-instance-arn={}",
+                uri_encode(app_instance_arn)
+            ),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "expected ListAppInstanceBots to answer 200, got {status} {body:?}"
+    );
+    body["AppInstanceBots"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a bot list, got {body:?}"))
+        .iter()
+        .find(|bot| bot["AppInstanceBotArn"].as_str() == Some(bot_arn))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+/// RULE: an update REPLACES the stored `Name`/`Metadata` pair of the bot its ARN names,
+/// replaces the `Configuration` only when the request carries one and otherwise leaves the
+/// stored configuration in place, re-stamps the last-updated instant without moving the
+/// created instant, answers with that bot's ARN, and writes to no other bot.
+#[tokio::test]
+async fn an_update_replaces_the_stored_pair_and_only_the_configuration_it_is_given() {
+    let emulator = Emulator::new();
+    let instance = emulator.app_instance("updated-bots", "tok-update").await;
+
+    let created_configuration = responds_to_configuration("BOTIDUPDAT", "en_US");
+    let target = create_bot(
+        &emulator,
+        &instance,
+        "tok-update-target",
+        Some("created-name"),
+        Some("created-metadata"),
+        &created_configuration,
+    )
+    .await;
+    // A second bot under the same parent: every row below has to leave it exactly as its
+    // create left it, so an update writes to the ONE bot its ARN names.
+    let bystander = create_bot(
+        &emulator,
+        &instance,
+        "tok-update-bystander",
+        Some("bystander"),
+        Some("untouched"),
+        &invoked_by_configuration("BOTIDBYSTA", "en_GB", "ALL", "ALL", Some("Hello")),
+    )
+    .await;
+    let (status, bystander_before) = describe_bot(&emulator, &bystander).await;
+    assert_eq!(
+        status, 200,
+        "expected the bystander bot to describe, got {status} {bystander_before:?}"
+    );
+
+    let (status, before) = describe_bot(&emulator, &target).await;
+    assert_eq!(
+        status, 200,
+        "expected the fresh bot to describe, got {status} {before:?}"
+    );
+    let created = member(&before, "CreatedTimestamp")
+        .as_f64()
+        .unwrap_or_else(|| panic!("expected a numeric CreatedTimestamp, got {before:?}"));
+    let mut previous_update = member(&before, "LastUpdatedTimestamp")
+        .as_f64()
+        .unwrap_or_else(|| panic!("expected a numeric LastUpdatedTimestamp, got {before:?}"));
+
+    // Rows differ along what the rule generalises over: the value and size of the pair
+    // being written (ordinary text, the empty values the model's `min 0` lengths allow,
+    // each member at its modelled maximum, non-ASCII text), and whether the request
+    // carries a `Configuration` at all — one driven by the deprecated `RespondsTo`, one by
+    // `InvokedBy`, and rows carrying none, which must keep whatever the bot already holds.
+    //
+    // Source: `smithy_query(query="operation",operation="UpdateAppInstanceBot")` — `Name`
+    // is `ResourceName` (len 0..256) and `Metadata` is len 0..1024.
+    let max_name = "n".repeat(256);
+    let max_metadata = "m".repeat(1024);
+    let rows: Vec<(&str, String, String, Option<Value>)> = vec![
+        (
+            "an ordinary rename, no Configuration",
+            "renamed".to_string(),
+            "metadata-1".to_string(),
+            None,
+        ),
+        (
+            "the empty Name and Metadata the model allows",
+            String::new(),
+            String::new(),
+            None,
+        ),
+        (
+            "Name at the modelled maximum",
+            max_name.clone(),
+            "metadata-2".to_string(),
+            None,
+        ),
+        (
+            "Metadata at the modelled maximum",
+            "sized".to_string(),
+            max_metadata.clone(),
+            None,
+        ),
+        (
+            "non-ASCII Name and Metadata",
+            "ボット ⚙".to_string(),
+            "メタデータ — ©".to_string(),
+            None,
+        ),
+        (
+            "a Configuration driven by InvokedBy",
+            "reconfigured".to_string(),
+            "metadata-3".to_string(),
+            Some(invoked_by_configuration(
+                "BOTIDNEWCF",
+                "de_DE",
+                "MENTIONS",
+                "ALL",
+                Some("Greet_User"),
+            )),
+        ),
+        (
+            "a Configuration driven by RespondsTo",
+            "reconfigured-again".to_string(),
+            String::new(),
+            Some(responds_to_configuration("BOTIDOLDCF", "ja_JP")),
+        ),
+        (
+            "no Configuration after one was replaced",
+            "pair-only".to_string(),
+            "metadata-4".to_string(),
+            None,
+        ),
+    ];
+
+    let mut expected_configuration = created_configuration.clone();
+    for (label, name, metadata, configuration) in &rows {
+        let (status, answered) =
+            update_bot(&emulator, &target, name, metadata, configuration.as_ref()).await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: expected UpdateAppInstanceBot to answer 200, got {status} \
+             {answered:?}"
+        );
+        assert_eq!(
+            answered["AppInstanceBotArn"].as_str(),
+            Some(target.as_str()),
+            "case {label:?}: expected the update to answer with {target:?}, got {answered:?}"
+        );
+        if let Some(configuration) = configuration {
+            expected_configuration = configuration.clone();
+        }
+
+        let (status, after) = describe_bot(&emulator, &target).await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: expected the updated bot to describe, got {status} {after:?}"
+        );
+        assert_eq!(
+            member(&after, "Name").as_str(),
+            Some(name.as_str()),
+            "case {label:?}: expected Name {name:?} after the update, got {after:?}"
+        );
+        assert_eq!(
+            member(&after, "Metadata").as_str(),
+            Some(metadata.as_str()),
+            "case {label:?}: expected Metadata {metadata:?} after the update, got {after:?}"
+        );
+        assert_eq!(
+            member(&after, "Configuration"),
+            expected_configuration,
+            "case {label:?}: expected the Configuration {expected_configuration:?}, got \
+             {after:?}"
+        );
+        assert_eq!(
+            member(&after, "CreatedTimestamp").as_f64(),
+            Some(created),
+            "case {label:?}: an update must not move the created instant {created}, got \
+             {after:?}"
+        );
+        let updated = member(&after, "LastUpdatedTimestamp").as_f64();
+        assert!(
+            updated.is_some_and(|at| at >= created && at >= previous_update),
+            "case {label:?}: expected a last-updated instant at or after both the created \
+             instant {created} and the previous stamp {previous_update}, got {updated:?}"
+        );
+        previous_update = updated.unwrap_or(previous_update);
+    }
+
+    // The listing reports the pair the LAST update wrote, so the update persisted to the
+    // one store every reader of this bot reads.
+    let (_, final_name, final_metadata, _) = rows.last().expect("a non-empty table");
+    let summary = listed_bot(&emulator, &instance, &target).await;
+    assert_eq!(
+        summary["Name"].as_str(),
+        Some(final_name.as_str()),
+        "expected the listing to report the last Name written, got {summary:?}"
+    );
+    assert_eq!(
+        summary["Metadata"].as_str(),
+        Some(final_metadata.as_str()),
+        "expected the listing to report the last Metadata written, got {summary:?}"
+    );
+
+    // Not one of those updates touched the other bot of the same AppInstance.
+    let (status, bystander_after) = describe_bot(&emulator, &bystander).await;
+    assert_eq!(
+        (status, &bystander_after),
+        (200, &bystander_before),
+        "expected the bystander bot to be exactly what its create left, got \
+         {bystander_after:?}"
+    );
+}
+
+/// RULE: an `UpdateAppInstanceBot` addressed to an `AppInstanceBotArn` this service holds
+/// no bot for persists nothing and is refused with the modelled client error — the
+/// permanent 403 `ForbiddenException` once the bot's own `AppInstance` has been deleted,
+/// and otherwise the modelled 400 `BadRequestException` carrying the `NotFound` code, this
+/// operation declaring no 404 shape.
+#[tokio::test]
+async fn updating_an_arn_this_service_holds_no_bot_for_is_refused_and_writes_nothing() {
+    let emulator = Emulator::new();
+    let instance = emulator
+        .app_instance("unwritable-bots", "tok-update-absent")
+        .await;
+    let user = emulator
+        .user(&instance, "update-absent-user", "tok-update-absent-user")
+        .await;
+    let kept = create_bot(
+        &emulator,
+        &instance,
+        "tok-update-kept",
+        Some("kept"),
+        Some("kept-metadata"),
+        &responds_to_configuration("BOTIDKEPTU", "en_US"),
+    )
+    .await;
+    let (status, kept_before) = describe_bot(&emulator, &kept).await;
+    assert_eq!(
+        status, 200,
+        "expected the kept bot to describe, got {status} {kept_before:?}"
+    );
+
+    let deleted = create_bot(
+        &emulator,
+        &instance,
+        "tok-update-deleted",
+        Some("deleted"),
+        None,
+        &responds_to_configuration("BOTIDDELEU", "en_US"),
+    )
+    .await;
+    delete_bot(&emulator, &deleted).await;
+
+    let doomed_instance = emulator
+        .app_instance("update-doomed", "tok-update-doomed")
+        .await;
+    let cascaded = create_bot(
+        &emulator,
+        &doomed_instance,
+        "tok-update-cascaded",
+        Some("cascaded"),
+        None,
+        &responds_to_configuration("BOTIDCASCU", "en_US"),
+    )
+    .await;
+    delete_app_instance(&emulator, &doomed_instance).await;
+
+    // Rows span every way a well-formed `ChimeArn` can fail to name a bot this service
+    // holds, split by which refusal class the ARN falls in: one at or under a DELETED
+    // `AppInstance` is a request the caller may no longer make, every other is reported
+    // as a resource that was not found.
+    let rows: Vec<(&str, String, u16, &str)> = vec![
+        (
+            "a bot never minted under a live AppInstance",
+            format!("{instance}/bot/never-minted"),
+            400,
+            "NotFound",
+        ),
+        (
+            "a bot under an AppInstance that never existed",
+            format!("{instance}-absent/bot/orphan"),
+            400,
+            "NotFound",
+        ),
+        ("a bot that was deleted", deleted.clone(), 400, "NotFound"),
+        (
+            "a live AppInstanceUser's ARN in the bot space",
+            user.clone(),
+            400,
+            "NotFound",
+        ),
+        (
+            "the live parent AppInstance's own ARN",
+            instance.clone(),
+            400,
+            "NotFound",
+        ),
+        (
+            "a live bot's ARN in another account",
+            in_another_account(&kept),
+            400,
+            "NotFound",
+        ),
+        (
+            "a live bot's ARN in another region",
+            in_another_region(&kept),
+            400,
+            "NotFound",
+        ),
+        (
+            "a bot whose parent AppInstance was deleted",
+            cascaded.clone(),
+            403,
+            "Forbidden",
+        ),
+        (
+            "the deleted AppInstance's own ARN",
+            doomed_instance.clone(),
+            403,
+            "Forbidden",
+        ),
+    ];
+
+    for (label, arn, expected_status, expected_code) in &rows {
+        let (status, body) = update_bot(&emulator, arn, "written", "written", None).await;
+        assert_eq!(
+            status, *expected_status,
+            "case {label:?}: expected {arn:?} to be refused with {expected_status}, got \
+             {status} {body:?}"
+        );
+        assert_eq!(
+            body["Code"].as_str(),
+            Some(*expected_code),
+            "case {label:?}: expected the {expected_code:?} code, got {body:?}"
+        );
+        assert!(
+            body.get("AppInstanceBotArn").is_none(),
+            "case {label:?}: expected the refusal to report no ARN, got {body:?}"
+        );
+        if *expected_status == 403 {
+            assert_eq!(
+                body["Message"].as_str(),
+                Some(FORBIDDEN_MESSAGE),
+                "case {label:?}: expected the forbidden-request sentence, got {body:?}"
+            );
+        }
+    }
+
+    // None of the refused writes landed anywhere: the one live bot is byte for byte what
+    // its create left, last-updated instant included, and the deleted bot is still gone.
+    let (status, kept_after) = describe_bot(&emulator, &kept).await;
+    assert_eq!(
+        (status, &kept_after),
+        (200, &kept_before),
+        "expected the live bot to be untouched by the refusals, got {kept_after:?}"
+    );
+    let (status, body) = describe_bot(&emulator, &deleted).await;
+    assert_eq!(
+        status, 403,
+        "expected the deleted bot to stay unresolvable after the refused update, got \
+         {status} {body:?}"
     );
 }

@@ -433,6 +433,16 @@ impl ComAmazonawsChimesdkidentityChimeidentityserviceState {
         self.app_instances.get(instance_arn)?.bots.get(bot_arn)
     }
 
+    /// The bot with this ARN, for a caller that is about to CHANGE it; resolved through
+    /// the same one-hop index as [`bot`](Self::bot).
+    pub fn bot_mut(&mut self, bot_arn: &str) -> Option<&mut AppInstanceBotRecord> {
+        let instance_arn = self.bots_by_arn.get(bot_arn)?.clone();
+        self.app_instances
+            .get_mut(&instance_arn)?
+            .bots
+            .get_mut(bot_arn)
+    }
+
     /// The name the identity `identity_arn` names carries, for an operation that reports
     /// an `Identity` (an ARN and the name of whatever it names).
     ///

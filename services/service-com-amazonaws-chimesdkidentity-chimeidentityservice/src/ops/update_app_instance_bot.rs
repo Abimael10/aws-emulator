@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAppInstanceBot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAppInstanceBot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAppInstanceBot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -160,20 +151,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAppInstanceBot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAppInstanceBotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAppInstanceBot"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateAppInstanceBotErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the AppInstance store is unavailable".to_string()),
+            })
+        })?;
+        // A bot is an identity, and the name an identity carries is REPORTED by a sibling
+        // Chime service that cannot read this store, so a rename is published to the
+        // family's shared identity NAME directory the same way the create registered it;
+        // resolved before the store is locked, so the lock order (this service's store
+        // first, the shared directory second) cannot invert.
+        let name_directory = crate::state::identity_names(&*self.engine).ok_or_else(|| {
+            UpdateAppInstanceBotErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the Chime identity name directory is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // Which refusal an unresolvable ARN earns is decided from the store BEFORE the
+        // record is taken for writing, so the decision is one read rather than a second
+        // borrow inside the refusal.
+        let unresolved = state.unresolved_arn(&input.app_instance_bot_arn);
+        let Some(record) = state.bot_mut(&input.app_instance_bot_arn) else {
+            return Err(match unresolved {
+                // The AppInstance this bot hung off has been deleted, taking the bot with
+                // it, so nothing is left to write: the answer is the modelled permanent
+                // refusal, as it is for every other write addressed to a dead instance.
+                crate::state::UnresolvedArn::DeletedAppInstance => {
+                    UpdateAppInstanceBotErrorModeled::ForbiddenException(ForbiddenException {
+                        code: Some("Forbidden".to_string()),
+                        message: Some(crate::state::FORBIDDEN_REQUEST_MESSAGE.to_string()),
+                    })
+                    .into()
+                }
+                // This operation models no 404 shape, so an ARN that never named a bot is
+                // refused with the modelled `BadRequestException` carrying the `NotFound`
+                // error code — the same refusal the sibling `UpdateAppInstanceUser`, whose
+                // modelled error set is identical, states for an absent user.
+                crate::state::UnresolvedArn::NeverExisted => {
+                    UpdateAppInstanceBotErrorModeled::BadRequestException(BadRequestException {
+                        code: Some("NotFound".to_string()),
+                        message: Some(format!(
+                            "AppInstanceBot {} does not exist",
+                            input.app_instance_bot_arn
+                        )),
+                    })
+                    .into()
+                }
+            });
+        };
+
+        // `Name` and `Metadata` are both `required`, so an update REPLACES the stored
+        // pair with what the caller sent. `Configuration` is OPTIONAL: a request that
+        // carries one replaces the bot's configuration, and one that carries none leaves
+        // the bot with the configuration it already has, which is `required` on the
+        // record and so always reportable.
+        record.name = Some(input.name);
+        record.metadata = Some(input.metadata);
+        if let Some(configuration) = input.configuration {
+            record.configuration = configuration;
+        }
+        // Every write to a bot re-stamps its last-updated instant.
+        record.last_updated_timestamp = ::std::time::SystemTime::now();
+        let arn = record.arn.clone();
+        let name = record.name.clone().unwrap_or_default();
+        name_directory.lock().register(&arn, &name);
+
+        Ok(UpdateAppInstanceBotOutput {
+            app_instance_bot_arn: Some(arn),
+        })
     }
 }
+
