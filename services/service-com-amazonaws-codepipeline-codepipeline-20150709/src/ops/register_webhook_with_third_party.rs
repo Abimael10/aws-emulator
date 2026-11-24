@@ -13,15 +13,17 @@
 //! `ValidationException`. Which webhooks those are is the one rule its sibling
 //! `DeregisterWebhookWithThirdParty` asks too
 //! ([`crate::state::ComAmazonawsCodepipelineCodepipeline20150709State::webhook_connection`]):
-//! the connection runs between the SOURCE ACTION of the pipeline the webhook's
+//! the connection is authenticated by the shared secret of the webhook's GitHub HMAC
+//! configuration, so a webhook configured with any other `WebhookAuthenticationType`
+//! cannot carry it and is refused on its own configuration first
+//! ([`crate::state::webhook_authentication_unsupported_message`]); and the connection
+//! runs between the SOURCE ACTION of the pipeline the webhook's
 //! `WebhookDefinition$targetPipeline` names and the external tool, and `PutWebhook`
-//! stores that reference without resolving it, so a webhook pointing at a pipeline the
-//! account does not hold has no action for a connection to reach and is refused naming
-//! the webhook and that pipeline
-//! ([`crate::state::webhook_target_pipeline_absent_message`]); and the connection is
-//! authenticated by the shared secret of the webhook's GitHub HMAC configuration, so a
-//! webhook configured with any other `WebhookAuthenticationType` cannot carry it
-//! ([`crate::state::webhook_authentication_unsupported_message`]).
+//! stores that reference without resolving it, so a GitHub HMAC webhook pointing at a
+//! pipeline the account does not hold has no action for a connection to reach and is
+//! refused naming the webhook and that pipeline
+//! ([`crate::state::webhook_target_pipeline_absent_message`]). The order is the one
+//! [`crate::state::WebhookConnection::third_party_refusal`] holds.
 //!
 //! The connection itself is held by the external tool, not by this service: this
 //! emulator reaches no external tool and serves no webhook trigger plane, so there is
@@ -177,12 +179,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What this operation then checks is what the connection it makes is made of,
         // and the store answers both halves at once
         // ([`crate::state::ComAmazonawsCodepipelineCodepipeline20150709State::webhook_connection`]),
-        // so the sibling deregistration cannot judge a webhook differently: the
-        // connection runs to the source action of the pipeline the webhook targets, so
-        // a definition pointing at a pipeline the account does not hold has no action
-        // to reach; and it is authenticated by the shared secret of the webhook's
-        // GitHub HMAC configuration, so a webhook configured with any other
-        // `WebhookAuthenticationType` cannot carry it.
+        // so the sibling deregistration cannot judge a webhook differently: it is
+        // authenticated by the shared secret of the webhook's GitHub HMAC
+        // configuration, so a webhook configured with any other
+        // `WebhookAuthenticationType` cannot carry it at all; and it runs to the source
+        // action of the pipeline the webhook targets, so a definition pointing at a
+        // pipeline the account does not hold has no action to reach. The webhook's own
+        // configuration is judged first, and
+        // [`crate::state::WebhookConnection::third_party_refusal`] is where that order
+        // lives for both operations.
         let connection = {
             let store = state.lock();
             store.webhook_connection(name)
@@ -195,31 +200,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        if !connection.target_pipeline_held {
+        if let Some(message) = connection.third_party_refusal(name) {
             return Err(
                 RegisterWebhookWithThirdPartyErrorModeled::ValidationException(
                     ValidationException {
-                        message: Some(
-                            crate::state::webhook_target_pipeline_absent_message(
-                                name,
-                                &connection.target_pipeline,
-                            ),
-                        ),
-                    },
-                )
-                .into(),
-            );
-        }
-        if connection.authentication != crate::state::AUTHENTICATION_GITHUB_HMAC {
-            return Err(
-                RegisterWebhookWithThirdPartyErrorModeled::ValidationException(
-                    ValidationException {
-                        message: Some(
-                            crate::state::webhook_authentication_unsupported_message(
-                                name,
-                                &connection.authentication,
-                            ),
-                        ),
+                        message: Some(message),
                     },
                 )
                 .into(),

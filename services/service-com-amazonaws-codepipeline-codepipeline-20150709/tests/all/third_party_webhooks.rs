@@ -11,16 +11,17 @@
 //!   carries is refused with `WebhookNotFoundException`, the only outcome besides
 //!   `ValidationException` either operation models, and never with an error code they do
 //!   not declare;
-//! * the connection either operation makes or breaks runs between the SOURCE ACTION of
-//!   the pipeline the webhook's `WebhookDefinition$targetPipeline` names and the
-//!   external tool, so that reference is RESOLVED against the account's pipelines —
-//!   `PutWebhook` stores it without resolving it, so a webhook pointing at a pipeline
-//!   the account does not hold is refused with `ValidationException` naming the webhook
-//!   and the pipeline it points at;
 //! * the connection is the GitHub HMAC one the webhook's shared secret authenticates, so
 //!   a webhook whose stored `WebhookDefinition$authentication` is any other
 //!   `WebhookAuthenticationType` is refused with `ValidationException` stating the
-//!   requirement and the authentication type the store holds for that webhook;
+//!   requirement and the authentication type the store holds for that webhook — what the
+//!   webhook IS, judged before anything its definition points at;
+//! * the connection a GITHUB_HMAC webhook does carry runs between the SOURCE ACTION of
+//!   the pipeline the webhook's `WebhookDefinition$targetPipeline` names and the
+//!   external tool, so that reference is RESOLVED against the account's pipelines —
+//!   `PutWebhook` stores it without resolving it, so such a webhook pointing at a
+//!   pipeline the account does not hold is refused with `ValidationException` naming the
+//!   webhook and the pipeline it points at;
 //! * the webhook itself is left where it is: deregistering is not deleting.
 //!
 //! The rows span what the rules generalise over: the operation, names at both ends of
@@ -117,7 +118,11 @@ fn definition(name: &str, provider: &str, authentication: &str) -> Value {
 
 /// The same definition over an explicit `targetPipeline`, for the rows that vary how
 /// that reference relates to the pipelines the account holds.
-fn definition_targeting(name: &str, target_pipeline: &str, authentication: &str) -> Value {
+pub(crate) fn definition_targeting(
+    name: &str,
+    target_pipeline: &str,
+    authentication: &str,
+) -> Value {
     json!({
         "name": name,
         "targetPipeline": target_pipeline,
@@ -129,7 +134,7 @@ fn definition_targeting(name: &str, target_pipeline: &str, authentication: &str)
 }
 
 /// An emulator holding a pipeline for each provider under test.
-async fn emulator() -> Emulator {
+pub(crate) async fn emulator() -> Emulator {
     let emulator = Emulator::new();
     for (provider, owner) in [("GitHub", "ThirdParty"), ("S3", "AWS")] {
         emulator
@@ -365,10 +370,12 @@ async fn a_webhook_not_configured_with_github_hmac_is_not_supported() {
 
 /// RULE: the connection either third-party operation makes or breaks runs between the
 /// source action of the pipeline the webhook's `WebhookDefinition$targetPipeline` names
-/// and the external tool, so that reference is resolved against the account's pipelines
-/// on every call: a webhook pointing at a pipeline the account does not hold is refused
-/// with `ValidationException` naming the webhook and that pipeline, while a webhook
-/// whose target pipeline is held is served.
+/// and the external tool, so for a webhook that can carry that connection at all the
+/// reference is resolved against the account's pipelines on every call: a GITHUB_HMAC
+/// webhook pointing at a pipeline the account does not hold is refused with
+/// `ValidationException` naming the webhook and that pipeline, while one whose target
+/// pipeline is held is served. A webhook of any other authentication type is refused on
+/// its authentication instead, whatever its reference resolves to.
 ///
 /// The rows span the authentication types `WebhookAuthenticationType` declares (the
 /// served one and both refused ones) against how the target pipeline came to be absent —
@@ -436,13 +443,14 @@ async fn a_dangling_target_pipeline_is_refused_by_either_operation() {
                     );
                     continue;
                 }
-                // The dangling reference is the first thing the connection needs, so it
-                // is what the refusal states; a held reference leaves the
-                // authentication refusal the webhook's own type owes.
-                let expected = if held {
-                    webhook_authentication_unsupported_message(&name, authentication)
-                } else {
+                // What the webhook IS is judged first, so a webhook of another
+                // authentication type is refused on that whether or not its target
+                // pipeline resolves; only for a GITHUB_HMAC webhook does the dangling
+                // reference become the refusal.
+                let expected = if served {
                     webhook_target_pipeline_absent_message(&name, &target_pipeline)
+                } else {
+                    webhook_authentication_unsupported_message(&name, authentication)
                 };
                 assert_eq!(
                     (

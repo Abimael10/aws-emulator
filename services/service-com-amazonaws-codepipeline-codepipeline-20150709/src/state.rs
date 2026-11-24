@@ -1783,6 +1783,35 @@ pub struct WebhookConnection {
     pub target_pipeline_held: bool,
 }
 
+impl WebhookConnection {
+    /// The `ValidationException` message the third-party webhook operations refuse this
+    /// connection with, or `None` when they can serve it.
+    ///
+    /// Both halves of the connection are judged here, in the order the service judges
+    /// them, so neither operation can order them its own way: what a webhook IS comes
+    /// first — only the GitHub HMAC authentication carries the shared secret the
+    /// connection is made with, so a webhook configured with any other
+    /// `WebhookAuthenticationType` is refused on that alone, whatever its definition
+    /// points at ([`webhook_authentication_unsupported_message`]) — and only then what it
+    /// points AT, the pipeline whose source action the connection runs to
+    /// ([`webhook_target_pipeline_absent_message`]).
+    pub fn third_party_refusal(&self, name: &str) -> Option<String> {
+        if self.authentication != AUTHENTICATION_GITHUB_HMAC {
+            return Some(webhook_authentication_unsupported_message(
+                name,
+                &self.authentication,
+            ));
+        }
+        if !self.target_pipeline_held {
+            return Some(webhook_target_pipeline_absent_message(
+                name,
+                &self.target_pipeline,
+            ));
+        }
+        None
+    }
+}
+
 /// One stored webhook: the definition exactly as the caller sent it, plus the
 /// service-owned members `PutWebhook` and `ListWebhooks` report.
 #[derive(Debug, Clone)]
