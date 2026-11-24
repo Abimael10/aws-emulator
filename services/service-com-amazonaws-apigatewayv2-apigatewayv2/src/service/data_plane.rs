@@ -125,6 +125,67 @@ pub use crate::state::LOCAL_ENDPOINT_PREFIX;
 /// cannot drift apart.
 pub const SERVICE_ENDPOINT_HOST: &str = "apigateway.amazonaws.com";
 
+/// What a core-owned SOCKET of this service re-addresses one request as: the reserved
+/// data-plane endpoint of the resource that socket stands for, and the request within it.
+///
+/// Named fields rather than a row of `&str` parameters, because two of them are the CLIENT's
+/// own text and a transposition would be silent.
+pub struct Readdressing<'r> {
+    /// The segment that names the resource's PLANE behind [`LOCAL_ENDPOINT_PREFIX`] — an api's
+    /// (`crate::state::EXECUTE_API_LABEL`) or a portal's
+    /// (`crate::state::PORTAL_ENDPOINT_LABEL`).
+    pub label: &'r str,
+    /// The id of the resource the request is placed on.
+    pub resource_id: &'r str,
+    /// The path WITHIN that resource, as the socket resolved it.
+    pub within: &'r str,
+    /// The query string to carry on, with its leading `?`, or empty for a request that sent
+    /// none.
+    pub query: &'r str,
+}
+
+/// Where a request a core-owned SOCKET of this service accepted goes when that socket stands
+/// for one RESOURCE of this account: this emulator's own front door
+/// ([`SERVICE_ENDPOINT_HOST`]) at that resource's reserved data-plane endpoint
+/// (`/{LOCAL_ENDPOINT_PREFIX}/{label}/{resource_id}`), with the path WITHIN the resource and
+/// the query string the client sent carried under it.
+///
+/// `Addressed::Refused(status, message)` — `refused_with` — for a target that does not render
+/// as one UNDER that endpoint, the one thing a path the CLIENT chose must not be able to
+/// leave. It is read back off the RENDERED URI rather than off the text that built it, so an
+/// escape the rendering resolves is seen.
+///
+/// The ONE statement of that composition, shared by every socket of this service that
+/// re-addresses — a custom domain name's ([`super::domain_name_socket`]), a portal's
+/// ([`super::portal_socket`]) and the api data plane's ([`super::invoke_plane_socket`]) — so
+/// the escape guard cannot drift between them. Each caller brings its own label, resource id
+/// and within-resource path, and the refusal its own endpoint space answers with.
+pub fn readdressed_within(
+    addressed: Readdressing<'_>,
+    refused_with: (u16, &'static str),
+) -> super::websocket::endpoint_http::Addressed {
+    use super::websocket::endpoint_http::Addressed;
+
+    let Readdressing {
+        label,
+        resource_id,
+        within,
+        query,
+    } = addressed;
+    let prefix = format!("/{LOCAL_ENDPOINT_PREFIX}/{label}/{resource_id}");
+    let uri = format!("https://{SERVICE_ENDPOINT_HOST}{prefix}{within}{query}");
+    let stays_under = ::http::Uri::try_from(&uri)
+        .map(|rendered| rendered.path().starts_with(&prefix))
+        .unwrap_or(false);
+    if !stays_under {
+        return Addressed::Refused(refused_with.0, refused_with.1);
+    }
+    Addressed::At {
+        uri,
+        host: SERVICE_ENDPOINT_HOST.to_string(),
+    }
+}
+
 /// The identity-source spellings that name a REQUEST HEADER, from
 /// `Authorizer$IdentitySource`: "this value is route.request.header.Auth … for WebSocket
 /// APIs. For HTTP APIs, use selection expressions prefixed with $, for example,

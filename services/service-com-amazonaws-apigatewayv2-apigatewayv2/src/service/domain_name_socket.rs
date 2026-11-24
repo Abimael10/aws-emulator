@@ -71,8 +71,8 @@ use crate::state::ComAmazonawsApigatewayv2Apigatewayv2State as ServiceStore;
 
 /// The host the re-addressed request names this emulator's front door by — the one every
 /// core-owned socket of this service re-addresses at
-/// (`super::data_plane::SERVICE_ENDPOINT_HOST`). The api itself is named by the reserved
-/// data-plane path, not by this host.
+/// (`super::data_plane::SERVICE_ENDPOINT_HOST`), read here for the tables below.
+#[cfg(test)]
 const SERVICE_ENDPOINT: &str = super::data_plane::SERVICE_ENDPOINT_HOST;
 
 /// The status API Gateway's front door turns a request away with when it reaches no api of
@@ -461,30 +461,23 @@ fn addressed_mapping(record: &crate::state::DomainName, target: &::http::Uri) ->
     // both front doors of a custom domain name share
     // ([`super::invoke::custom_domain_arrival::invoke_path`]).
     let within_api = super::invoke::custom_domain_arrival::invoke_path(&mapping.stage, under);
-    let prefix = format!(
-        "/{marker}/{label}/{api}",
-        marker = crate::state::LOCAL_ENDPOINT_PREFIX,
-        label = crate::state::EXECUTE_API_LABEL,
-        api = mapping.api_id,
-    );
     let query = target
         .query()
         .map(|query| format!("?{query}"))
         .unwrap_or_default();
-    let uri = format!("https://{SERVICE_ENDPOINT}{prefix}{within_api}{query}");
-    // READ BACK off the rendered target: the path under the base path is the CLIENT's own, so
-    // this is the assertion that nothing it carried moved the request to another api, another
-    // plane of this process or another service.
-    let stays_under = ::http::Uri::try_from(&uri)
-        .map(|rendered| rendered.path().starts_with(&prefix))
-        .unwrap_or(false);
-    if !stays_under {
-        return Addressed::Refused(FORBIDDEN, FORBIDDEN_MESSAGE);
-    }
-    Addressed::At {
-        uri,
-        host: SERVICE_ENDPOINT.to_string(),
-    }
+    // Re-addressed through the one statement of that composition every socket of this service
+    // shares, which READS BACK off the rendered target: the path under the base path is the
+    // CLIENT's own, so that is the assertion that nothing it carried moved the request to
+    // another api, another plane of this process or another service.
+    super::data_plane::readdressed_within(
+        super::data_plane::Readdressing {
+            label: crate::state::EXECUTE_API_LABEL,
+            resource_id: &mapping.api_id,
+            within: &within_api,
+            query: &query,
+        },
+        (FORBIDDEN, FORBIDDEN_MESSAGE),
+    )
 }
 
 /// The api mapping of `record` that answers `path`, and the path left UNDER its base path.

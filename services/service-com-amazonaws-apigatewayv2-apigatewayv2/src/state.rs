@@ -4655,9 +4655,21 @@ pub fn execute_api_endpoint(api_id: &str, region: &str, protocol_type: &str) -> 
 /// hosts is announced and the `domainName` an invoke of the api reports cannot drift
 /// apart — that domain is the api's own whichever address a client had to reach this
 /// emulator at.
+///
+/// The api is named by the FIRST DNS LABEL of it, and the Region by the label behind
+/// [`EXECUTE_API_LABEL`], which is the structure the member documents and the one the data
+/// planes read a host back by (`crate::service::data_plane::api_id_of_host`): a request
+/// addressed under this host — at any address this emulator serves the plane on — is served
+/// as the api it names (`crate::service::invoke`, `crate::service::invoke_plane_socket`).
 pub fn execute_api_host(api_id: &str, region: &str) -> String {
-    format!("{api_id}.{EXECUTE_API_LABEL}.{region}.amazonaws.com")
+    format!("{api_id}.{EXECUTE_API_LABEL}.{region}.{EXECUTE_API_DNS_ZONE}")
 }
+
+/// The DNS zone AWS publishes an `execute-api` endpoint in —
+/// `{api-id}.execute-api.{region}.amazonaws.com` (`Api$ApiEndpoint`) — which is the zone the
+/// host AWS itself would answer for sits in, and never one this emulator may announce a name
+/// of its own in.
+pub const EXECUTE_API_DNS_ZONE: &str = "amazonaws.com";
 
 /// The address THIS EMULATOR serves an api's data plane at, which is what an api ANNOUNCES
 /// for a caller to invoke it at — `Api$ApiEndpoint` included.
@@ -4670,7 +4682,12 @@ pub fn execute_api_host(api_id: &str, region: &str) -> String {
 ///   ([`reached_emulator_endpoint`]) comes from a client that resolves nothing else, so the
 ///   api is named on that same endpoint with its own id behind the
 ///   [`LOCAL_ENDPOINT_PREFIX`] marker (`/_aws/execute-api/{api-id}`), the addressing
-///   `crate::service::invoke` serves;
+///   `crate::service::invoke` serves. The api's own `execute-api` NAME is not announced
+///   there, even though every one of this emulator's `execute-api` front doors ANSWERS for
+///   it (`crate::service::invoke`, `crate::service::invoke_plane_socket`): an announced
+///   address is one the caller DIALS, and nothing on the machine this emulator runs on
+///   resolves a name of that form, while this emulator's own endpoint is the one address
+///   such a caller already has;
 /// * any other request on an emulator that IS served on a port
 ///   ([`served_endpoint_authority`]) names that port, the one address this process answers
 ///   on, so a value minted by an in-process call of another service names an address its

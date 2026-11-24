@@ -33,6 +33,13 @@
 //! (there is nothing to serve before then) and is never re-opened, so a URL a client is holding
 //! keeps naming the address that serves it; its life is the store's, and dropping the store
 //! closes the port.
+//!
+//! The api's OWN `execute-api` authority is served there as well, because that is the
+//! addressing `Api$ApiEndpoint` documents: a request arriving on this socket under the host
+//! `{api-id}.execute-api.{region}.{dnsSuffix}` is placed on the api its leading label names
+//! ([`crate::service::invoke_plane_socket`]), exactly as this emulator's front door places one
+//! addressed host-style. What the endpoint ANNOUNCES is still the address above, because an
+//! announced address is one the caller dials and nothing on this machine resolves that name.
 
 use std::sync::Arc;
 
@@ -83,7 +90,9 @@ impl InvokePlaneTransport {
 /// The PATH is the one the front door serves the same api at
 /// (`/_aws/execute-api/{api-id}`, [`crate::state::emulator_served_api_endpoint`]), so an
 /// announced URL says which api it addresses wherever it is read — only the address it is
-/// dialled at is this plane's own.
+/// dialled at is this plane's own. The api's own `execute-api` host is served on this socket
+/// too ([`crate::service::invoke_plane_socket`]); it is not ANNOUNCED, because no resolver on
+/// the machine this emulator runs on answers for it.
 pub fn announced_endpoint(authority: &str, api_id: &str) -> String {
     format!(
         "{}://{authority}/{}/{}/{api_id}",

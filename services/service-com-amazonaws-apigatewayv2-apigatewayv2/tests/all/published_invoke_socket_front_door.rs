@@ -117,6 +117,16 @@ impl Answered {
         serde_json::from_str(&self.body).unwrap_or(Value::Null)
     }
 
+    /// The value this answer carries for the field `name`, matched the way a field name is
+    /// (case-insensitively, RFC 9110 §5.1), or `None` when it wrote none — the ONE reading of
+    /// a field off an answer read on one of these addresses.
+    pub(crate) fn field(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(field, _)| field.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
     /// Whether the body is the one the route's function returns.
     fn carries_the_functions_body(&self) -> bool {
         self.body == MARKER

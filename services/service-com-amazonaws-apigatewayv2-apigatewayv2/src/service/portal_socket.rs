@@ -43,12 +43,6 @@ use ::smithy_server_runtime::EmbeddedEmulator;
 use super::websocket::endpoint_http::{Addressed, Readdress};
 use crate::state::ComAmazonawsApigatewayv2Apigatewayv2State as ServiceStore;
 
-/// The host the re-addressed request names this emulator's front door by — the one every
-/// core-owned socket of this service re-addresses at
-/// ([`super::data_plane::SERVICE_ENDPOINT_HOST`]). The portal itself is named by the reserved
-/// data-plane path, not by this host.
-const SERVICE_ENDPOINT: &str = super::data_plane::SERVICE_ENDPOINT_HOST;
-
 /// The status a request this address serves no page for is turned away with, and the sentence
 /// beside it: the refusal every data plane of this service answers such a request with.
 const FORBIDDEN: u16 = super::data_plane::FORBIDDEN_STATUS;
@@ -192,29 +186,22 @@ fn site_target(
     if ::service_common::data_plane_addressing::carries_a_dot_segment(parts.uri.path()) {
         return Addressed::Refused(FORBIDDEN, FORBIDDEN_MESSAGE);
     }
-    let prefix = format!(
-        "/{marker}/{label}/{portal_id}",
-        marker = crate::state::LOCAL_ENDPOINT_PREFIX,
-        label = crate::state::PORTAL_ENDPOINT_LABEL,
-    );
     let query = parts
         .uri
         .query()
         .map(|query| format!("?{query}"))
         .unwrap_or_default();
-    let within = parts.uri.path();
-    let uri = format!("https://{SERVICE_ENDPOINT}{prefix}{within}{query}");
-    // READ BACK off the rendered target: the path is the CLIENT's own, so this is the
-    // assertion that nothing it carried moved the request to another portal, another plane of
-    // this process or another service.
-    let stays_under = ::http::Uri::try_from(&uri)
-        .map(|rendered| rendered.path().starts_with(&prefix))
-        .unwrap_or(false);
-    if !stays_under {
-        return Addressed::Refused(FORBIDDEN, FORBIDDEN_MESSAGE);
-    }
-    Addressed::At {
-        uri,
-        host: SERVICE_ENDPOINT.to_string(),
-    }
+    // Re-addressed through the one statement of that composition every socket of this service
+    // shares, which READS BACK off the rendered target: the path is the CLIENT's own, so that
+    // is the assertion that nothing it carried moved the request to another portal, another
+    // plane of this process or another service.
+    super::data_plane::readdressed_within(
+        super::data_plane::Readdressing {
+            label: crate::state::PORTAL_ENDPOINT_LABEL,
+            resource_id: portal_id,
+            within: parts.uri.path(),
+            query: &query,
+        },
+        (FORBIDDEN, FORBIDDEN_MESSAGE),
+    )
 }

@@ -17,13 +17,18 @@
 //! socket of this service shares ([`super::websocket::endpoint_http`]), which is also where the
 //! canonical field-name spelling this address exists for is written.
 //!
-//! What is this socket's own is WHICH requests it answers for: the HTTP apis of this account,
-//! each published behind the reserved data-plane marker with its own id
-//! ([`published_target`]). A request addressing anything else — the control plane, a path whose
-//! dot segment would resolve out of the plane — is refused here, in the envelope every answer
-//! of this service's data planes carries, and no service is asked about it. Everything the
-//! answer itself is — the stage, the deployment, the route, its authorization and its
-//! integration — is [`super::invoke`]'s, which serves the same request however it was
+//! What is this socket's own is WHICH requests it answers for: the HTTP apis of this account.
+//! Each is published there with its own id behind the reserved data-plane marker
+//! ([`crate::state::invoke_plane_transport::announced_endpoint`]) and is served as sent under
+//! that path; and each is served under the `execute-api` AUTHORITY AWS PUBLISHES for it as
+//! well — `{api-id}.execute-api.{region}.amazonaws.com`, the addressing `Api$ApiEndpoint`
+//! documents — by re-addressing such a request onto the api its leading label names
+//! ([`published_target`]), so a client that resolves that name to this address reaches the api
+//! there. A request addressing anything else — the control plane, a host in any other zone, a
+//! path whose dot segment would resolve out of the plane — is refused here, in the envelope
+//! every answer of this service's data planes carries, and no service is asked about it.
+//! Everything the answer itself is — the stage, the deployment, the route, its authorization
+//! and its integration — is [`super::invoke`]'s, which serves the same request however it was
 //! addressed.
 
 use std::future::Future;
@@ -41,6 +46,12 @@ use super::websocket::endpoint_http::{Addressed, Readdress};
 /// endpoint space it belongs to does.
 const FORBIDDEN: u16 = super::data_plane::FORBIDDEN_STATUS;
 const FORBIDDEN_MESSAGE: &str = super::data_plane::FORBIDDEN_MESSAGE;
+
+/// The host a re-addressed request names this emulator's own front door by — the one every
+/// core-owned socket of this service re-addresses at
+/// (`super::data_plane::SERVICE_ENDPOINT_HOST`), read here for the tables below.
+#[cfg(test)]
+const SERVICE_ENDPOINT: &str = super::data_plane::SERVICE_ENDPOINT_HOST;
 
 /// The `host:port` this emulator publishes every HTTP api's data plane at, opening the socket
 /// on first use — or `None` when this emulator opens none, in which case the caller announces
@@ -157,15 +168,24 @@ impl NativeHandler for ApiDataPlaneAddress {
     }
 }
 
-/// Where a request `parts` addresses goes on this address: to the router AS SENT, because the
-/// endpoint published on it already carries the api's own id in the path the client dialled
-/// ([`crate::state::invoke_plane_transport::announced_endpoint`]) — the same addressing this
-/// emulator's front door serves the api at, so what answers is the api the target names.
+/// Where a request `parts` addresses goes on this address.
 ///
-/// Refused here, and nothing else is: a path that addresses no api of this plane at all, and
-/// one carrying a dot segment, which could resolve out of the path an api is published at — and
-/// that path is the only thing that says which api must answer. The `Host` allowlist (the
-/// DNS-rebinding guard) is the shared endpoint's, applied to every request it serves as sent.
+/// The endpoint published on this socket carries the api's own id behind the reserved
+/// data-plane marker ([`crate::state::invoke_plane_transport::announced_endpoint`]), so a
+/// client that dialled the published URL names the api in its PATH and that request goes to
+/// the router AS SENT. A client that resolved the api's OWN `execute-api` authority to this
+/// address instead names the api in its `Host` and carries the invoke path alone — the
+/// composition `Api$ApiEndpoint` documents ("the stage name is typically appended to this
+/// URI") — and such a request is RE-ADDRESSED onto the api the host's leading label names, at
+/// the reserved data-plane path this emulator's front door serves the same api at
+/// ([`readdressed`]), so what answers is [`super::invoke`] with the api's stages, routes,
+/// authorizers and integrations — the same answer the front door gives for the same request.
+///
+/// Refused here, and nothing else is: a request that addresses no api of this plane at all —
+/// neither in its host nor in its path — and one carrying a dot segment, which could resolve
+/// out of the path an api is published at, and that path is the only thing that says which api
+/// must answer.
+///
 /// A request a browser sent from ANOTHER SITE is served on this address rather than refused,
 /// and recorded as having been, because what is refused here leaves nothing it carries but an
 /// invoke of an api of this account
@@ -173,14 +193,94 @@ impl NativeHandler for ApiDataPlaneAddress {
 /// stated): the api's own `CorsConfiguration` decides the decoration of the answer, and the
 /// router this endpoint hands the request to still refuses such a request for every request
 /// that names an operation there.
+///
+/// The `Host` ALLOWLIST — the core's DNS-rebinding guard, which the shared endpoint applies to
+/// every request served AS SENT — stays binding on the host-style branch too, through the one
+/// name that branch admits: the host AWS ITSELF publishes the api's endpoint at
+/// ([`addressed_api_id`], the zone `crate::state::EXECUTE_API_DNS_ZONE` names). No resolver an
+/// attacker controls answers for a name in that zone, so admitting it widens the set of names
+/// that reach this address by exactly the one name the api's own endpoint IS, which is what
+/// `Api$ApiEndpoint` documents — while a name in any other zone, which only somebody else's
+/// resolver could point here, is refused exactly as it was before. What a request that IS
+/// admitted may reach is narrowed to the api its host names and the path under that api, which
+/// is what [`readdressed`] renders and reads back.
 fn published_target(parts: &::http::request::Parts) -> Addressed {
     let path = parts.uri.path();
-    if ::service_common::data_plane_addressing::carries_a_dot_segment(path)
-        || !addresses_this_plane(path)
-    {
+    if ::service_common::data_plane_addressing::carries_a_dot_segment(path) {
         return Addressed::Refused(FORBIDDEN, FORBIDDEN_MESSAGE);
     }
-    Addressed::AsSent
+    if addresses_this_plane(path) {
+        return Addressed::AsSent;
+    }
+    match addressed_api_id(parts) {
+        Some(api_id) => readdressed(&api_id, &parts.uri),
+        None => Addressed::Refused(FORBIDDEN, FORBIDDEN_MESSAGE),
+    }
+}
+
+/// The api id the HOST of `parts` names, or `None` for a request whose host is not the api's
+/// own documented `execute-api` endpoint — this socket's own address among them.
+///
+/// The host is read the way every front door of this emulator reads it: the `Host` field, and
+/// the authority of an absolute-form target for a request that carries its endpoint there. Any
+/// userinfo and `:port` and the trailing root dot are removed, and the whole name is folded to
+/// lower case before anything is matched, because a DNS name is case-insensitive (RFC 4343) —
+/// so is the api id, which is answered folded, as the id the store holds. The leading label and
+/// the endpoint label behind it are taken through the data planes' one reading of an
+/// `execute-api` host (`super::data_plane::api_id_of_host`, which admits the `execute-api-…`
+/// variant spellings AWS publishes), so the address published and the address served cannot
+/// drift apart.
+///
+/// Narrowed to the name AWS PUBLISHES that endpoint at and nothing else: exactly one Region
+/// label, then the zone `crate::state::EXECUTE_API_DNS_ZONE` names —
+/// `{api-id}.execute-api.{region}.amazonaws.com`. Admitting a host is admitting a name that may
+/// reach this address without the core's `Host` allowlist, and that name is one no resolver but
+/// AWS's answers for; a name in any other zone, or one carrying no Region or a deeper zone, is
+/// one only somebody else's resolver could point at this machine, which is the rebinding the
+/// allowlist exists to refuse. A client that resolves nothing but this emulator's own endpoint
+/// reaches the api through the PATH instead, which is the address its `ApiEndpoint` publishes.
+fn addressed_api_id(parts: &::http::request::Parts) -> Option<String> {
+    let host = parts
+        .headers
+        .get(::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| parts.uri.host())?;
+    let named = super::data_plane::host_name(host)
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let api_id = super::data_plane::api_id_of_host(&named)?;
+    // What follows the endpoint label: it has to be one Region label and then the zone, so a
+    // name carrying no Region, or a deeper name inside the zone, names no published endpoint.
+    let region = named
+        .splitn(3, '.')
+        .nth(2)?
+        .strip_suffix(crate::state::EXECUTE_API_DNS_ZONE)?
+        .strip_suffix('.')?;
+    (!region.is_empty() && !region.contains('.')).then(|| api_id.to_string())
+}
+
+/// The request a host-style invoke is handed to the router as: the api named by the reserved
+/// data-plane path, the invoke path the client sent carried under it, and the query string
+/// carried on unchanged.
+///
+/// Composed through the one statement of that re-addressing every socket of this service
+/// shares (`super::data_plane::readdressed_within`), which also reads the rendered target back
+/// and refuses one that does not stay UNDER the api's own path — the one thing a path the
+/// CLIENT chose must not be able to leave.
+fn readdressed(api_id: &str, target: &::http::Uri) -> Addressed {
+    let query = target
+        .query()
+        .map(|query| format!("?{query}"))
+        .unwrap_or_default();
+    super::data_plane::readdressed_within(
+        super::data_plane::Readdressing {
+            label: crate::state::EXECUTE_API_LABEL,
+            resource_id: api_id,
+            within: target.path(),
+            query: &query,
+        },
+        (FORBIDDEN, FORBIDDEN_MESSAGE),
+    )
 }
 
 /// Whether `path` addresses an api of this plane: the reserved data-plane marker, the endpoint
@@ -265,6 +365,121 @@ mod tests {
                 addressed, expected,
                 "case {path:?}: expected {expected:?}, got {addressed:?}"
             );
+        }
+    }
+
+    /// RULE: a request that arrives under the `execute-api` host AWS PUBLISHES for an api is
+    /// placed on that api at the reserved data-plane path, with the invoke path and query
+    /// string the client sent carried under it; a host in any other zone — which only somebody
+    /// else's resolver could point at this address — is refused, as the core's own `Host`
+    /// allowlist refuses it.
+    #[test]
+    fn a_host_style_invoke_is_readdressed_onto_the_api_its_leading_label_names() {
+        // The rows span what the reading generalises over: the invoke path (a stage and route
+        // path, a route path alone, the root, a stage alone), a query string, the endpoint
+        // variant label AWS publishes, whether the client wrote the port, a trailing root dot
+        // and the case the name is written in; and the hosts that name no endpoint AWS
+        // publishes (this socket's own address with no plane path, a second label that is not
+        // the endpoint's, a name carrying no Region label, a deeper name inside the zone, and
+        // the SAME api named in another zone — the loopback zone, a name the emulator may be
+        // served under, and a zone of somebody else's).
+        let cases: &[(&str, &str, &str, Option<&str>)] = &[
+            (
+                "abc1230000.execute-api.us-west-2.amazonaws.com",
+                "/prod/orders/7",
+                "",
+                Some("/_aws/execute-api/abc1230000/prod/orders/7"),
+            ),
+            (
+                "abc1230000.execute-api.us-west-2.amazonaws.com:34567",
+                "/items",
+                "?page=2&size=10",
+                Some("/_aws/execute-api/abc1230000/items"),
+            ),
+            (
+                "zzz9990000.execute-api.eu-central-1.amazonaws.com",
+                "/",
+                "",
+                Some("/_aws/execute-api/zzz9990000/"),
+            ),
+            (
+                "0123456789.execute-api-fips.ap-southeast-2.amazonaws.com.",
+                "/prod",
+                "",
+                Some("/_aws/execute-api/0123456789/prod"),
+            ),
+            ("127.0.0.1:34567", "/items", "", None),
+            (
+                "abc1230000.execute-apifoo.us-west-2.amazonaws.com",
+                "/items",
+                "",
+                None,
+            ),
+            (
+                // A DNS name is case-insensitive (RFC 4343), so the same name in any case is
+                // the same endpoint, and the api id it names is the one the store holds.
+                "ABC1230000.EXECUTE-API.US-WEST-2.AMAZONAWS.COM",
+                "/items",
+                "",
+                Some("/_aws/execute-api/abc1230000/items"),
+            ),
+            (
+                // No Region label: no endpoint AWS publishes is named, so this is not the
+                // name admitted without the core's allowlist.
+                "abc1230000.execute-api.amazonaws.com",
+                "/items",
+                "",
+                None,
+            ),
+            (
+                // A deeper name inside the zone is not the published endpoint either.
+                "abc1230000.execute-api.us-west-2.sub.amazonaws.com",
+                "/items",
+                "",
+                None,
+            ),
+            ("abc1230000.execute-api.us-west-2.localhost", "/items", "", None),
+            (
+                "abc1230000.execute-api.us-west-2.emulator.internal",
+                "/items",
+                "",
+                None,
+            ),
+            (
+                "abc1230000.execute-api.us-west-2.attacker.example.com",
+                "/items",
+                "",
+                None,
+            ),
+        ];
+        for (host, path, query, expected) in cases {
+            let request = ::http::Request::builder()
+                .uri(format!("https://{host}{path}{query}"))
+                .header(::http::header::HOST, *host)
+                .body(())
+                .expect("the case's target is a well-formed request");
+            let addressed = published_target(&request.into_parts().0);
+            match expected {
+                Some(expected_path) => {
+                    let Addressed::At { uri, host: named } = &addressed else {
+                        panic!("case {host:?}{path:?}: expected a re-addressed request, got {addressed:?}");
+                    };
+                    assert_eq!(
+                        named, SERVICE_ENDPOINT,
+                        "case {host:?}{path:?}: expected the front door's host, got {named:?}"
+                    );
+                    assert_eq!(
+                        uri,
+                        &format!("https://{SERVICE_ENDPOINT}{expected_path}{query}"),
+                        "case {host:?}{path:?}: expected the api's reserved data-plane path"
+                    );
+                }
+                None => assert_eq!(
+                    addressed,
+                    Addressed::Refused(FORBIDDEN, FORBIDDEN_MESSAGE),
+                    "case {host:?}{path:?}: expected a refusal, got {addressed:?}"
+                ),
+            }
         }
     }
 }
