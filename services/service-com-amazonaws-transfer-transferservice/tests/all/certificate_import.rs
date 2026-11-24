@@ -1400,3 +1400,209 @@ async fn every_certificate_reader_derives_the_status_from_the_stored_window() {
         }
     }
 }
+
+/// One row of the rewritten-window rule: the window the import states, the window the
+/// update then states, and the `Status` every reader derives before and after it.
+struct RewrittenWindowCase {
+    name: &'static str,
+    /// The validity period of the certificate to generate, in whole years — the source
+    /// of a bound neither write names.
+    validity: (i32, i32),
+    /// `ActiveDate`/`InactiveDate` the IMPORT sends, as offsets in seconds from the
+    /// call; `None` sends that member not at all.
+    imported_window: (Option<f64>, Option<f64>),
+    /// The `Status` every reader derives for the record the import left.
+    imported_status: &'static str,
+    /// `ActiveDate`/`InactiveDate` the UPDATE sends, on the same basis.
+    updated_window: (Option<f64>, Option<f64>),
+    /// The `Status` every reader derives once that update has resolved the window.
+    updated_status: &'static str,
+}
+
+/// The rows: each direction a rewritten window can move the reading clock across it,
+/// and each source the rewritten bounds come from.
+fn rewritten_window_cases() -> Vec<RewrittenWindowCase> {
+    vec![
+        RewrittenWindowCase {
+            name: "a certificate whose own period is over, given a window around the clock",
+            validity: (2000, 2001),
+            imported_window: (None, None),
+            imported_status: CERTIFICATE_STATUS_INACTIVE,
+            updated_window: (Some(-FAR_CLEAR), Some(FAR_CLEAR)),
+            updated_status: CERTIFICATE_STATUS_ACTIVE,
+        },
+        RewrittenWindowCase {
+            name: "a certificate inside its own period, closed by the update",
+            validity: (2020, 2100),
+            imported_window: (None, None),
+            imported_status: CERTIFICATE_STATUS_ACTIVE,
+            updated_window: (None, Some(-WELL_CLEAR)),
+            updated_status: CERTIFICATE_STATUS_INACTIVE,
+        },
+        RewrittenWindowCase {
+            name: "an update that names no bound takes the certificate's own period back",
+            validity: (2000, 2001),
+            imported_window: (Some(-FAR_CLEAR), Some(FAR_CLEAR)),
+            imported_status: CERTIFICATE_STATUS_ACTIVE,
+            updated_window: (None, None),
+            updated_status: CERTIFICATE_STATUS_INACTIVE,
+        },
+        RewrittenWindowCase {
+            name: "a certificate whose own period has not begun, opened by the update",
+            validity: (2090, 2100),
+            imported_window: (None, None),
+            imported_status: CERTIFICATE_STATUS_PENDING_ROTATION,
+            updated_window: (Some(-WELL_CLEAR), Some(FAR_CLEAR)),
+            updated_status: CERTIFICATE_STATUS_ACTIVE,
+        },
+        RewrittenWindowCase {
+            name: "an update that moves the opening bound past the clock",
+            validity: (2020, 2100),
+            imported_window: (None, None),
+            imported_status: CERTIFICATE_STATUS_ACTIVE,
+            updated_window: (Some(FAR_CLEAR), None),
+            updated_status: CERTIFICATE_STATUS_PENDING_ROTATION,
+        },
+    ]
+}
+
+/// The entry `ListCertificates` reports for `certificate_id`.
+async fn listed(emulator: &Emulator, case: &str, certificate_id: &str) -> Value {
+    let answer = emulator
+        .call("ListCertificates", json!({"MaxResults": 1000}))
+        .await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case:?}: expected ListCertificates 200, got {} with body {}",
+        answer.status, answer.body
+    );
+    answer
+        .get("Certificates")
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|entry| member_of(entry, "CertificateId").as_str() == Some(certificate_id))
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: certificate {certificate_id} is not listed: {}",
+                answer.body
+            )
+        })
+}
+
+/// RULE: `Status` is a projection over the record's EFFECTIVE window at the reading
+/// instant — the bounds the LAST write named, each bound a write left unnamed taking the
+/// certificate's own `NotBeforeDate`/`NotAfterDate` — so rewriting that window is what
+/// moves the status, in either direction and whichever source the new bounds come from,
+/// and never what the record was imported as. One derivation serves every reader, so
+/// `DescribeCertificate` and `ListCertificates` report the same status and the same
+/// window for the same record, and reading it again reports the same projection.
+///
+/// The rows differ along the direction the clock crosses the rewritten window (a closed
+/// window opened, an open one closed, one not yet open opened, an open one pushed into
+/// the future) and where each rewritten bound comes from (both named, one named alone,
+/// neither named so the certificate's own period is taken back).
+#[tokio::test]
+async fn a_rewritten_window_is_what_moves_a_certificates_status() {
+    let emulator = Emulator::new();
+
+    for case in rewritten_window_cases() {
+        let name = case.name;
+        let generated = generate(case.validity, None);
+
+        // The instants are computed HERE, so every expectation is the value the request
+        // carried or the certificate's own, never one read back out of an answer.
+        let (import_active, import_inactive) = case.imported_window;
+        let import_active = import_active.map(offset_from_now);
+        let import_inactive = import_inactive.map(offset_from_now);
+        let mut request = json!({
+            "Usage": USAGES[0],
+            "Certificate": &generated.certificate,
+        });
+        if let Some(active) = import_active {
+            request["ActiveDate"] = json!(active);
+        }
+        if let Some(inactive) = import_inactive {
+            request["InactiveDate"] = json!(inactive);
+        }
+        let certificate_id = import_ok(&emulator, name, request).await;
+
+        let described = describe(&emulator, name, &certificate_id).await;
+        assert_eq!(
+            member_of(&described, "Status").as_str(),
+            Some(case.imported_status),
+            "case {name:?}: expected Status {:?} for the window the import stated, got \
+             {described}",
+            case.imported_status
+        );
+
+        let (update_active, update_inactive) = case.updated_window;
+        let update_active = update_active.map(offset_from_now);
+        let update_inactive = update_inactive.map(offset_from_now);
+        let mut request = json!({"CertificateId": &certificate_id});
+        if let Some(active) = update_active {
+            request["ActiveDate"] = json!(active);
+        }
+        if let Some(inactive) = update_inactive {
+            request["InactiveDate"] = json!(inactive);
+        }
+        let answer = emulator.call("UpdateCertificate", request).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {name:?}: expected UpdateCertificate 200, got {} with body {}",
+            answer.status, answer.body
+        );
+
+        // The window the update resolved: its own bound where it named one, the
+        // certificate's own date where it named none.
+        let active = update_active.unwrap_or(generated.not_before);
+        let inactive = update_inactive.unwrap_or(generated.not_after);
+        let described = describe(&emulator, name, &certificate_id).await;
+        assert_instant(name, "ActiveDate", member_of(&described, "ActiveDate"), active);
+        assert_instant(
+            name,
+            "InactiveDate",
+            member_of(&described, "InactiveDate"),
+            inactive,
+        );
+        assert_eq!(
+            member_of(&described, "Status").as_str(),
+            Some(case.updated_status),
+            "case {name:?}: expected Status {:?} for the window [{active}, {inactive}) the \
+             update resolved, got {described}",
+            case.updated_status
+        );
+        // The certificate's own period is the material's fact, which no write moves.
+        assert_instant(
+            name,
+            "NotBeforeDate",
+            member_of(&described, "NotBeforeDate"),
+            generated.not_before,
+        );
+        assert_instant(
+            name,
+            "NotAfterDate",
+            member_of(&described, "NotAfterDate"),
+            generated.not_after,
+        );
+
+        // A read REPORTS: the same record read again answers the same projection.
+        let again = describe(&emulator, name, &certificate_id).await;
+        assert_eq!(
+            again, described,
+            "case {name:?}: a second read answered a different projection"
+        );
+
+        // ONE derivation serves every reader.
+        let entry = listed(&emulator, name, &certificate_id).await;
+        for member in ["Status", "ActiveDate", "InactiveDate"] {
+            assert_eq!(
+                member_of(&entry, member),
+                member_of(&described, member),
+                "case {name:?}: the listing reports a different {member} than the read \
+                 ({entry} vs {described})"
+            );
+        }
+    }
+}
