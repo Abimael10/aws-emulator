@@ -41,6 +41,13 @@
 //! field at the API's GraphQL endpoint, and on the SUBSCRIPTION field a `start` names at its
 //! real-time one ([`super::realtime`]).
 //!
+//! WHICH fields such a caller reaches at all is the configuration's own `defaultAction`, "the
+//! action that you want your GraphQL API to take when a request that uses Amazon Cognito user
+//! pool authentication doesn't match the Amazon Cognito user pool configuration": under
+//! `ALLOW` every field the schema does not guard away from the caller, and under `DENY` only
+//! the operation fields the schema GRANTS this mode with one of the mode's own directives
+//! ([`refused_fields`] again, which is the one reading of what a field asks of this caller).
+//!
 //! Nothing here is written: the pool's state is READ for the key set it publishes, and a
 //! token is not consumed by being presented.
 
@@ -82,6 +89,11 @@ const GROUP_GUARD_ARGUMENT: &str = "cognito_groups";
 /// is the value a `CognitoUserPoolConfig` carries no member for: the mode's own default, and
 /// what `$context.identity.defaultAuthStrategy` then reports.
 const DEFAULT_ACTION: &str = "ALLOW";
+
+/// The other action a configuration states (`DefaultAction`'s own values are `ALLOW` and
+/// `DENY`): the one under which a field is reached only where the schema GRANTS it to this
+/// mode ([`denies_ungranted_fields`]).
+const DENY_ACTION: &str = "DENY";
 
 /// What this mode decided about one call.
 #[derive(Debug, Clone)]
@@ -239,13 +251,18 @@ pub fn decided(
 }
 
 /// The fields of `selected` a caller claiming `groups` may not access: the ones the API's
-/// schema writes a GROUP GUARD on that none of those groups satisfies.
+/// schema writes a GROUP GUARD on that none of those groups satisfies, and — where the
+/// configuration DENIES by default — the operation fields the schema grants this mode
+/// nowhere.
 ///
 /// `@aws_auth(cognito_groups: ["…"])` — and `@aws_cognito_user_pools(cognito_groups: ["…"])`,
 /// which is the same guard on an API configured for more than one mode — names the groups a
 /// caller has to be in to reach what it is written on. A guard on the FIELD decides that
 /// field; a guard on the TYPE decides every field of it that writes none of its own; and a
-/// field under no guard at all is reachable by any caller this mode admitted.
+/// field under no guard at all is reachable by any caller this mode admitted — unless the
+/// configuration's `defaultAction` is `DENY`, under which such a field of an OPERATION ROOT
+/// type is reached only where one of the mode's own directives is written on it or on its
+/// type at all, whatever groups it names ([`denies_ungranted_fields`]).
 ///
 /// `selected` is `(typeName, fieldName)` pairs. It is asked field by field as the execution
 /// resolves each one ([`super::execution`]), so a guard on a field of ANY type is judged, not
@@ -260,29 +277,78 @@ pub fn refused_fields(
     let Some(api) = store.graphql_apis.get(&context.api_id) else {
         return Vec::new();
     };
-    selected
+    let denies_ungranted = denies_ungranted_fields(api);
+    // The types the schema binds as its operation roots, read once for the whole selection
+    // and only where the question is asked at all, because reading one re-reads the stored
+    // schema document.
+    let mut operation_roots: Option<[String; 3]> = None;
+    let mut refused: Vec<(String, String)> = Vec::new();
+    for (type_name, field_name) in selected {
+        // WHERE a directive about the field is written is the plane's one reading of that
+        // question ([`super::field_auth::written_directives`]), which the authorization
+        // modes a field is reserved for are judged over too; what differs here is only
+        // the predicate, the GROUPS a guard names.
+        let Some((on_field, on_type)) =
+            super::field_auth::written_directives(api, type_name, field_name)
+        else {
+            continue;
+        };
+        if let Some(required) = required_groups(on_field).or_else(|| required_groups(on_type)) {
+            if !required.iter().any(|group| groups.contains(group)) {
+                refused.push((type_name.clone(), field_name.clone()));
+            }
+            continue;
+        }
+        // No guard names groups for this field. Under `ALLOW` that is a field every caller
+        // this mode admitted reaches; under `DENY` it is reached only where the schema grants
+        // it to this mode at all — on the field, or on the type that declares it.
+        if !denies_ungranted || grants_this_mode(on_field) || grants_this_mode(on_type) {
+            continue;
+        }
+        // The grant is about what the SCHEMA declares: the fields GraphQL's introspection
+        // system adds to a type are declared by no schema ([`super::introspection`]), so no
+        // grant of one is written anywhere and the default action says nothing about them.
+        if !super::field_auth::declares_field(api, type_name, field_name) {
+            continue;
+        }
+        let roots = operation_roots.get_or_insert_with(|| {
+            [
+                api.query_root_type(),
+                api.mutation_root_type(),
+                api.subscription_root_type(),
+            ]
+        });
+        if roots.iter().any(|root| root == type_name) {
+            refused.push((type_name.clone(), field_name.clone()));
+        }
+    }
+    refused
+}
+
+/// Whether the API reaches a field of an operation only where its schema GRANTS that field to
+/// this mode: the API set the mode up as its own `authenticationType` and the configuration it
+/// did that with states `DENY` as its `defaultAction`.
+///
+/// `defaultAction` is "the action that you want your GraphQL API to take when a request that
+/// uses Amazon Cognito user pool authentication doesn't match the Amazon Cognito user pool
+/// configuration", and the mode's own directives are how a schema states which calls of it a
+/// field matches: under `DENY` a field writing none of them (and of a type writing none) is
+/// granted to nobody, and under `ALLOW` — the value every ADDITIONAL provider's configuration
+/// applies, carrying no member for it — only a group guard holds a caller back.
+fn denies_ungranted_fields(api: &crate::state::GraphqlApiRecord) -> bool {
+    api.authentication_type == USER_POOL_AUTH_TYPE
+        && api
+            .user_pool_config
+            .as_ref()
+            .is_some_and(|config| config.default_action == DENY_ACTION)
+}
+
+/// Whether one of this mode's own directives is written among `directives` at all, whatever
+/// arguments it carries: the grant a schema states under a `DENY` default action.
+fn grants_this_mode(directives: &[DirectiveUse]) -> bool {
+    directives
         .iter()
-        .filter(|(type_name, field_name)| {
-            // WHERE a directive about the field is written is the plane's one reading of that
-            // question ([`super::field_auth::written_directives`]), which the authorization
-            // modes a field is reserved for are judged over too; what differs here is only
-            // the predicate, the GROUPS a guard names.
-            let Some((on_field, on_type)) =
-                super::field_auth::written_directives(api, type_name, field_name)
-            else {
-                return false;
-            };
-            let required = match required_groups(on_field) {
-                Some(required) => required,
-                None => match required_groups(on_type) {
-                    Some(required) => required,
-                    None => return false,
-                },
-            };
-            !required.iter().any(|group| groups.contains(group))
-        })
-        .cloned()
-        .collect()
+        .any(|directive| GROUP_GUARD_DIRECTIVES.contains(&directive.name.as_str()))
 }
 
 /// The groups a group guard among `directives` requires, or `None` where they write none —

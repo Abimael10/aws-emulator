@@ -195,6 +195,27 @@ pub fn written_directives<'api>(
     Some((on_field, record.parsed.directives.as_slice()))
 }
 
+/// Whether the API's schema DECLARES `field_name` on `type_name`.
+///
+/// Asked beside [`written_directives`] by the guard that decides a field no directive of this
+/// kind speaks about ([`super::user_pool::refused_fields`]): GraphQL's introspection system
+/// adds fields to a type that the schema itself declares nowhere
+/// ([`super::introspection`]), so no directive about one is written anywhere either.
+#[must_use]
+pub fn declares_field(
+    api: &crate::state::GraphqlApiRecord,
+    type_name: &str,
+    field_name: &str,
+) -> bool {
+    api.types.get(type_name).is_some_and(|record| {
+        record
+            .parsed
+            .fields
+            .iter()
+            .any(|field| field.name == field_name)
+    })
+}
+
 /// Whether `api` set up more than ONE authorization mode, which is the API whose schema says
 /// per field which of them may reach it: one holding an additional authentication provider
 /// that names a type at all, whichever type that is.
