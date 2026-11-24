@@ -37,7 +37,10 @@ use service_com_amazonaws_redshift_redshiftserviceversion20121201::state;
 use crate::cluster_lifecycle::{Answer, Emulator, REGION};
 
 /// Create one cluster and wait for it to be serving, by POLLING the read.
-async fn available_cluster(emulator: &Emulator, identifier: &str) {
+///
+/// `pub(crate)` so a sibling suite about the same operation drives the same
+/// three steps instead of writing a second copy of them.
+pub(crate) async fn available_cluster(emulator: &Emulator, identifier: &str) {
     let created = emulator.create_minimal(identifier).await;
     assert_eq!(
         created.status, 200,
@@ -55,14 +58,14 @@ async fn available_cluster(emulator: &Emulator, identifier: &str) {
 }
 
 /// `ModifyLakehouseConfiguration` with these parameters.
-async fn modify(emulator: &Emulator, params: &[(&str, &str)]) -> Answer {
+pub(crate) async fn modify(emulator: &Emulator, params: &[(&str, &str)]) -> Answer {
     emulator
         .call("ModifyLakehouseConfiguration", params)
         .await
 }
 
 /// `DescribeClusters` for one cluster.
-async fn describe(emulator: &Emulator, identifier: &str) -> Answer {
+pub(crate) async fn describe(emulator: &Emulator, identifier: &str) -> Answer {
     emulator
         .call("DescribeClusters", &[("ClusterIdentifier", identifier)])
         .await
