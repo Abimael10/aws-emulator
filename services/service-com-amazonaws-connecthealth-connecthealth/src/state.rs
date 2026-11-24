@@ -99,18 +99,18 @@ pub const MAX_DOMAINS_HELD: usize = MAX_DOMAINS_PER_ACCOUNT * MAX_DOMAIN_REGIONS
 /// How many `domainId`s this service remembers having allocated, beyond the domains it
 /// currently holds.
 ///
-/// A delete needs to tell an id this service once allocated — whose domain is simply
-/// gone — from one that was never allocated to anybody, because the two answer
-/// DIFFERENT errors (see `DeleteDomain`'s handler, which cites the recording for each).
-/// The history is therefore kept past the domain's own purge, and BOUNDED here: a caller
-/// looping create/delete would otherwise grow the store without limit, which is the one
-/// thing every ceiling in this module exists to prevent.
+/// A MINT consults this history, so an id handed out names no domain this service ever
+/// created — not even one already purged — and the history is therefore kept past the
+/// domain's own purge, and BOUNDED here: a caller looping create/delete would otherwise
+/// grow the store without limit, which is the one thing every ceiling in this module
+/// exists to prevent.
 ///
-/// The bound is the EMULATOR's retention, not a rule of the service: once the history is
-/// full the oldest id is dropped, and a delete of that id then answers as it did before
-/// the id was ever minted. It is set two orders of magnitude above
-/// [`MAX_DOMAINS_PER_ACCOUNT`], so an account has to create and delete this many domains
-/// before its first id is forgotten.
+/// The bound is the EMULATOR's retention, not a rule of the service, and no RESPONSE
+/// depends on it: an id this Region resolves no domain for is reported the same way
+/// whether or not the history still remembers minting it (see `DeleteDomain`'s handler).
+/// Once the history is full the oldest id is dropped and may be minted again. It is set
+/// two orders of magnitude above [`MAX_DOMAINS_PER_ACCOUNT`], so an account has to create
+/// and delete this many domains before its first id is forgotten.
 pub const MAX_DOMAIN_ALLOCATION_HISTORY: usize = 1024;
 
 /// The most `Subscription` records one `Domain` holds, so the product
@@ -1090,9 +1090,9 @@ impl ComAmazonawsConnecthealthConnecthealthState {
     /// Whether `domain_id` was ever allocated to a domain this service created.
     ///
     /// Read by [`Self::mint_domain_id`], so an id it hands out names no domain this
-    /// service ever created, not even one already purged — and by the one operation whose
-    /// answer DEPENDS on an id's allocation history rather than on what is held now
-    /// (`DeleteDomain`), which cites the recording for each of its two branches.
+    /// service ever created, not even one already purged. NO answer this service puts on
+    /// the wire reads it: an id a Region resolves no domain for is reported through the
+    /// modelled not-found whatever its history.
     pub fn has_allocated_domain(&self, domain_id: &str) -> bool {
         self.allocated_domain_ids.contains(domain_id)
     }
