@@ -61,8 +61,8 @@ use service_com_amazonaws_connectcases_amazonconnectcases::state::{
 
 use crate::harness::{
     domain, field_of_type, fields_of_every_type, get_case_fields, instant_at,
-    mandatory_fields_refusal, string_at, tags_path, template, template_required_field_refusal,
-    title_value, Emulator,
+    mandatory_fields_refusal, string_at, tag_resource, template,
+    template_required_field_refusal, title_value, Emulator,
 };
 
 /// An Amazon Connect contact ARN, as a `Contact` related item links to one.
@@ -1794,14 +1794,7 @@ async fn records(emulator: &Emulator, prefix: &str, populated: bool) -> Records 
             format!("/template/{template_id}"),
         ] {
             let arn = cases_arn(&domain_id, &suffix);
-            emulator
-                .ok(
-                    prefix,
-                    "POST",
-                    &tags_path(&arn),
-                    json!({ "tags": { "team": "support" } }),
-                )
-                .await;
+            tag_resource(emulator, prefix, &arn, &json!({ "team": "support" })).await;
         }
     }
 

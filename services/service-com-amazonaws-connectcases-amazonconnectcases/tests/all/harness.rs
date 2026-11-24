@@ -203,17 +203,45 @@ pub fn tags_path(arn: &str) -> String {
     format!("/tags/{}", label(arn))
 }
 
-/// `TagResource` on `arn`: `POST /tags/{arn}`, whose output shape is `Unit`, so
-/// a success carries no body for the caller to parse.
-pub async fn tag_resource(emulator: &Emulator, case: &str, arn: &str, tags: &Value) {
-    let answer = emulator
-        .ok(case, "POST", &tags_path(arn), json!({ "tags": tags }))
-        .await;
+/// The status a success of an operation whose output targets `smithy.api#Unit`
+/// answers: there is no output structure to serialize, so the answer is 204 No
+/// Content with an empty body rather than a 200 carrying a serialized empty
+/// object.
+pub const NO_CONTENT: u16 = 204;
+
+/// Send a call whose operation outputs `smithy.api#Unit` and assert the
+/// no-content answer: [`NO_CONTENT`] and an empty body.
+///
+/// The ONE place a suite asserts that pair, so every Unit-output operation is
+/// checked against the same expectation.
+pub async fn answers_no_content(
+    emulator: &Emulator,
+    case: &str,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) {
+    let (status, answer) = emulator.send(method, path, body).await;
     assert_eq!(
-        answer,
-        Value::Null,
-        "case {case:?}: TagResource answers an empty body, got {answer:?}"
+        (status, &answer),
+        (NO_CONTENT, &Value::Null),
+        "case {case:?}: expected HTTP {NO_CONTENT} with an empty body, got {status} with \
+         body {answer:?}"
     );
+}
+
+/// `TagResource` on `arn`: `POST /tags/{arn}`, whose output shape is `Unit`, so
+/// a success carries no body for the caller to parse and is answered as
+/// [`NO_CONTENT`].
+pub async fn tag_resource(emulator: &Emulator, case: &str, arn: &str, tags: &Value) {
+    answers_no_content(
+        emulator,
+        case,
+        "POST",
+        &tags_path(arn),
+        Some(json!({ "tags": tags })),
+    )
+    .await;
 }
 
 /// The `tags` member `ListTagsForResource` reports for `arn`: `GET /tags/{arn}`,

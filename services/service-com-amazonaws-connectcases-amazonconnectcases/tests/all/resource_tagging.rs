@@ -6,7 +6,7 @@
 //!
 //! The rule under test: `TagResource` merges the request's `tags` into the tag
 //! set of the one resource its `arn` addresses — whatever kind of resource that
-//! ARN names — answering HTTP 200 with an empty body, `UntagResource` drops
+//! ARN names — answering HTTP 204 with no content, `UntagResource` drops
 //! exactly the keys its `tagKeys` names from that same set and leaves every
 //! other pair, and `ListTagsForResource` reports exactly the set the stored
 //! record then carries, as does a read of the resource itself; an ARN that
@@ -32,8 +32,8 @@ use serde_json::{json, Map, Value};
 use service_com_amazonaws_connectcases_amazonconnectcases::state::MAX_TAGS_PER_RESOURCE;
 
 use crate::harness::{
-    domain, field_of_type, fields_of_every_type, label, string_at, tags_path, template, title_value,
-    Emulator,
+    answers_no_content, domain, field_of_type, fields_of_every_type, label, string_at, tags_path,
+    template, title_value, Emulator, NO_CONTENT,
 };
 
 /// The service's generic not-found sentence, written out here rather than taken
@@ -115,22 +115,19 @@ fn expected_set(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// `TagResource` against `arn`, which must answer HTTP 200 with an EMPTY body:
-/// the operation's output shape is `Unit`, so there is nothing for a caller to
-/// parse (`smithy_query(query="operation",operation="TagResource")`).
+/// `TagResource` against `arn`, which must answer the no-content success: the
+/// operation's output shape is `Unit`, so there is no output structure to
+/// serialize and nothing for a caller to parse
+/// (`smithy_query(query="operation",operation="TagResource")`).
 async fn tag_resource(emulator: &Emulator, case: &str, arn: &str, tags: &[(&str, &str)]) {
-    let (status, body) = emulator
-        .send("POST", &tags_path(arn), Some(tag_body(tags)))
-        .await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: expected HTTP 200 from TagResource, got {status} with body {body:?}"
-    );
-    assert_eq!(
-        body,
-        Value::Null,
-        "case {case:?}: TagResource answers an empty body, got {body:?}"
-    );
+    answers_no_content(
+        emulator,
+        case,
+        "POST",
+        &tags_path(arn),
+        Some(tag_body(tags)),
+    )
+    .await;
 }
 
 /// The `UntagResource` path of one resource: its `tagKeys` member is
@@ -148,23 +145,19 @@ fn untag_path(arn: &str, tag_keys: &[&str]) -> String {
     path
 }
 
-/// `UntagResource` against `arn` for `tag_keys`, which must answer HTTP 200 with
-/// an EMPTY body: the operation's output shape is `Unit`, so there is nothing
-/// for a caller to parse
+/// `UntagResource` against `arn` for `tag_keys`, which must answer the
+/// no-content success: the operation's output shape is `Unit`, so there is no
+/// output structure to serialize and nothing for a caller to parse
 /// (`smithy_query(query="operation",operation="UntagResource")`).
 async fn untag_resource(emulator: &Emulator, case: &str, arn: &str, tag_keys: &[&str]) {
-    let (status, body) = emulator
-        .send("DELETE", &untag_path(arn, tag_keys), None)
-        .await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: expected HTTP 200 from UntagResource, got {status} with body {body:?}"
-    );
-    assert_eq!(
-        body,
-        Value::Null,
-        "case {case:?}: UntagResource answers an empty body, got {body:?}"
-    );
+    answers_no_content(
+        emulator,
+        case,
+        "DELETE",
+        &untag_path(arn, tag_keys),
+        None,
+    )
+    .await;
 }
 
 /// The tag set `ListTagsForResource` reports for `arn`.
@@ -1237,6 +1230,95 @@ async fn an_untag_is_bounded_by_the_key_list_the_model_declares() {
             unchanged,
             expected_set(&written),
             "case {case:?}: a refused untag removes nothing, got {unchanged:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_tagging_write_answers_no_content_whatever_it_wrote_while_the_tag_read_carries_a_body() {
+    let emulator = Emulator::new();
+    let resources = one_resource_of_every_kind(&emulator, "unit-output-status").await;
+
+    // Enough pairs for a row that writes several and for rows that name one,
+    // several or none of their keys in a removal.
+    let several: [Pair; 3] = [("team", "support"), ("env", "prod"), ("owner", "cases")];
+
+    for kind in EVERY_KIND {
+        let arn = kind.arn(&resources);
+
+        // Every shape of tag WRITE and of tag REMOVAL against one resource of
+        // this kind: what the call wrote or removed — nothing, one pair,
+        // several, a key the resource carries, one it does not, or exactly the
+        // call before it repeated — never moves the status line, because the
+        // status follows from the operation having no output structure to
+        // serialize and not from the work it did.
+        for (case, method, path, body) in [
+            (
+                "TagResource writing no pair at all",
+                "POST",
+                tags_path(&arn),
+                Some(tag_body(&[])),
+            ),
+            (
+                "TagResource writing one pair",
+                "POST",
+                tags_path(&arn),
+                Some(tag_body(&several[..1])),
+            ),
+            (
+                "TagResource writing several pairs",
+                "POST",
+                tags_path(&arn),
+                Some(tag_body(&several)),
+            ),
+            (
+                "TagResource repeating the same write",
+                "POST",
+                tags_path(&arn),
+                Some(tag_body(&several)),
+            ),
+            (
+                "UntagResource naming a stored key",
+                "DELETE",
+                untag_path(&arn, &["owner"]),
+                None,
+            ),
+            (
+                "UntagResource naming a key the resource does not carry",
+                "DELETE",
+                untag_path(&arn, &["absent"]),
+                None,
+            ),
+            (
+                "UntagResource naming several keys at once",
+                "DELETE",
+                untag_path(&arn, &["team", "env"]),
+                None,
+            ),
+            (
+                "UntagResource repeating the same removal",
+                "DELETE",
+                untag_path(&arn, &["team", "env"]),
+                None,
+            ),
+        ] {
+            let case = format!("{case} on a {kind:?}");
+            answers_no_content(&emulator, &case, method, &path, body).await;
+        }
+
+        // The contrast that places the rule on the OUTPUT SHAPE rather than on
+        // the tagging surface as such: `ListTagsForResource` on the very same
+        // ARN models a response structure, so it answers 200 and carries it.
+        let case = format!("ListTagsForResource on a {kind:?}");
+        let (status, listed) = emulator.send("GET", &tags_path(&arn), None).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: an operation with a modelled output structure answers HTTP 200 \
+             rather than the no-content {NO_CONTENT}, got {status} with body {listed:?}"
+        );
+        assert!(
+            listed.get("tags").is_some(),
+            "case {case:?}: the modelled output structure must reach the wire, got {listed:?}"
         );
     }
 }

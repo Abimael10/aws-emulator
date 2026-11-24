@@ -4,6 +4,9 @@
 //! IMPLEMENTED: merges the request's tags into the tag set of the resource its `arn`
 //! addresses, in [`crate::state`]. It is the ONLY file to touch for this operation.
 //!
+//! Its output targets `smithy.api#Unit`, so a success has nothing to serialize and is
+//! answered as 204 No Content with an empty body (see `SUCCESS_STATUS` below).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -77,8 +80,10 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-connectcases-amazonconn
 pub struct TagResourceOutput;
 
 impl TagResourceOutput {
-    // `with_http` carries this operation's modelled response status. Remove it and
-    // the status falls back to the protocol default, so a modelled 204 answers 200.
+    // `with_http` carries this operation's method and URI. The success status is
+    // NOT read from a shape — two operations may share one output shape and answer
+    // different codes — so the code slot stays unset and the status this operation
+    // answers is declared once, on `SUCCESS_STATUS` below.
     pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
         ::aws_smithy_schema::ShapeId::from_static("smithy.api#Unit", "smithy.api", "Unit"),
         ::aws_smithy_schema::ShapeType::Structure,
@@ -156,7 +161,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "TagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = TAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // This operation's output targets `smithy.api#Unit`
+    // (`smithy_query(query="operation",operation="TagResource")`): there is no output
+    // structure, so a success carries no body and is reported as 204 No Content rather
+    // than the protocol's default 200 with a serialized empty object.
+    const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
         &self,

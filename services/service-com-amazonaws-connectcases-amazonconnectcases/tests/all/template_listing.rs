@@ -33,7 +33,9 @@ use service_com_amazonaws_connectcases_amazonconnectcases::state::MAX_PAGE_SIZE;
 
 // The crate's shared test harness: one emulator behind the production router,
 // and the domain-creating helper every suite in this target uses.
-use crate::harness::{domain, is_minted_id, string_at, tags_path, title_value, Emulator};
+use crate::harness::{
+    domain, is_minted_id, string_at, tag_resource, tags_path, title_value, Emulator,
+};
 
 /// Create a template in `domain_id`, optionally with an explicit `status`, and
 /// hand back its id.
@@ -738,14 +740,13 @@ async fn a_listed_template_is_addressable_through_the_identity_its_entry_reports
             // 2. The tagging operations, which resolve a resource by its OWN ARN
             //    — so the ARN the entry reported is enough to tag the template
             //    and read the tag back.
-            emulator
-                .ok(
-                    &case,
-                    "POST",
-                    &tags_path(&arn),
-                    json!({ "tags": { "listedBy": "ListTemplates" } }),
-                )
-                .await;
+            tag_resource(
+                &emulator,
+                &case,
+                &arn,
+                &json!({ "listedBy": "ListTemplates" }),
+            )
+            .await;
             let tags = emulator.ok(&case, "GET", &tags_path(&arn), Value::Null).await;
             assert_eq!(
                 tags.pointer("/tags/listedBy").and_then(Value::as_str),
