@@ -20,7 +20,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_storagegateway_storagegateway_20130630::state::MAX_TAPE_POOLS;
 
 use crate::gateway_nfs_share_lifecycle::{
-    call, emulator, is_resource_arn, Answer, INVALID_GATEWAY_REQUEST,
+    assert_not_found, call, emulator, is_resource_arn, Answer, ACCOUNT_ID,
+    INVALID_GATEWAY_REQUEST, REGION,
 };
 
 /// The resource type a `PoolARN` names.
@@ -509,5 +510,120 @@ async fn create_tape_pool_refuses_past_the_store_ceiling() {
         MAX_TAPE_POOLS,
         "case at the ceiling: the refused create must store nothing, got {} pools",
         listed.len()
+    );
+}
+
+/// The `error.errorCode` a refusal carries when a `PoolARN` names no custom tape pool.
+///
+/// A missing resource is told apart from a malformed request by this code — both arrive as
+/// the one wire error [`INVALID_GATEWAY_REQUEST`] with HTTP 400 — so it is the resource
+/// kind's own `<Resource>NotFound`, the spelling this service's `ErrorCode` enum uses for
+/// every kind it lists (`GatewayNotFound`, `VolumeNotFound`, `SnapshotNotFound`,
+/// `TapeCartridgeNotFound`, …), and never the generic `InvalidParameters`.
+const POOL_NOT_FOUND: &str = "PoolNotFound";
+
+/// The whole `message` of that refusal: fixed text, with no part taken from the request.
+/// Spelled out here rather than imported, so wording the implementation changes fails.
+const POOL_NOT_FOUND_MESSAGE: &str = "The specified pool was not found.";
+
+/// A `PoolARN` of exactly `len` characters, of the shape Storage Gateway mints, naming a
+/// pool nothing ever created. `PoolARN` is modelled `@length(min: 50, max: 500)`, so the
+/// published maximum gets its own row below.
+fn unknown_pool_arn_of_length(len: usize) -> String {
+    let prefix = format!("arn:aws:storagegateway:{REGION}:{ACCOUNT_ID}:{POOL_RESOURCE}/pool-");
+    assert!(
+        len > prefix.len(),
+        "a {len}-character PoolARN cannot carry the {} -character ARN prefix",
+        prefix.len()
+    );
+    format!("{prefix}{}", "A".repeat(len - prefix.len()))
+}
+
+/// A `PoolARN` that names no stored pool is refused as a MISSING POOL: `error.errorCode`
+/// is the pool kind's not-found code and `message` is that error class's fixed sentence,
+/// whatever ARN the request carried.
+#[tokio::test]
+async fn delete_tape_pool_refuses_a_missing_pool_as_not_found() {
+    let router = emulator();
+
+    // A pool that existed and was deleted — the cleanup path a client retries — and a
+    // pool that never existed.
+    let deleted = create_pool(
+        &router,
+        json!({ "PoolName": "deleted-once", "StorageClass": "GLACIER" }),
+    )
+    .await;
+    let answer = call(&router, "DeleteTapePool", json!({ "PoolARN": &deleted })).await;
+    assert_eq!(
+        answer.status, 200,
+        "case {deleted}: the first delete must succeed, got {} with {:?}",
+        answer.status, answer.body
+    );
+
+    // One pool is left stored, so the rows below are refused for naming no pool rather
+    // than because the store is empty.
+    let kept = create_pool(
+        &router,
+        json!({ "PoolName": "kept-while-refusing", "StorageClass": "DEEP_ARCHIVE" }),
+    )
+    .await;
+
+    // The rows differ along everything the rule generalises over: a pool deleted a moment
+    // ago, an id nothing minted, the modelled maximum ARN length, the shortest ARN of this
+    // account and region, another region, another account, and an ARN naming a different
+    // resource kind entirely.
+    let cases: Vec<(&str, String)> = vec![
+        ("a pool deleted a moment ago", deleted.clone()),
+        ("a pool id nothing ever minted", NEVER_CREATED_POOL.to_string()),
+        (
+            "a 500-character PoolARN, the modelled maximum",
+            unknown_pool_arn_of_length(500),
+        ),
+        (
+            "the shortest PoolARN of this account and region",
+            unknown_pool_arn_of_length(61),
+        ),
+        (
+            "a pool of another region",
+            format!("arn:aws:storagegateway:us-east-1:{ACCOUNT_ID}:{POOL_RESOURCE}/pool-0000FFFF"),
+        ),
+        (
+            "a pool of another account",
+            format!("arn:aws:storagegateway:{REGION}:111122223333:{POOL_RESOURCE}/pool-0000FFFF"),
+        ),
+        (
+            "an ARN naming a gateway rather than a pool",
+            format!("arn:aws:storagegateway:{REGION}:{ACCOUNT_ID}:gateway/sgw-0000FFFF"),
+        ),
+    ];
+
+    for (case, pool_arn) in &cases {
+        let answer = call(&router, "DeleteTapePool", json!({ "PoolARN": pool_arn })).await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case}: expected HTTP 400 from DeleteTapePool, got {} with {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.error_code(),
+            INVALID_GATEWAY_REQUEST,
+            "case {case}: expected {INVALID_GATEWAY_REQUEST}, got {:?}",
+            answer.body
+        );
+        assert_not_found(
+            &answer,
+            case,
+            POOL_NOT_FOUND,
+            POOL_NOT_FOUND_MESSAGE,
+            pool_arn,
+        );
+    }
+
+    // The refusals changed nothing: the other pool is still reported.
+    let listed = all_listed_pools(&router, None).await;
+    assert_eq!(
+        listed,
+        vec![kept],
+        "a refused delete must leave the stored pools alone, got {listed:?}"
     );
 }

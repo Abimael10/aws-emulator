@@ -173,7 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(share) = share else {
                 return Err(
                     DescribeNFSFileSharesErrorModeled::InvalidGatewayRequestException(
-                        crate::state::file_share_not_found(file_share_arn),
+                        crate::state::file_share_not_found(),
                     )
                     .into(),
                 );

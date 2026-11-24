@@ -218,7 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(gateway) = store.gateways.get(&input.gateway_arn) else {
             return Err(
                 DescribeGatewayInformationErrorModeled::InvalidGatewayRequestException(
-                    crate::state::gateway_not_found(&input.gateway_arn),
+                    crate::state::gateway_not_found(),
                 )
                 .into(),
             );

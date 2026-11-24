@@ -170,7 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // emulator holds no upload queue for the wait to be about.
         let Some(share) = store.remove_file_share(&input.file_share_arn) else {
             return Err(DeleteFileShareErrorModeled::InvalidGatewayRequestException(
-                crate::state::file_share_not_found(&input.file_share_arn),
+                crate::state::file_share_not_found(),
             )
             .into());
         };

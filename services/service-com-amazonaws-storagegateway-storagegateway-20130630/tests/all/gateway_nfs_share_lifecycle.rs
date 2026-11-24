@@ -126,6 +126,19 @@ impl Answer {
     pub(crate) fn string(&self, member: &str) -> String {
         self.body[member].as_str().unwrap_or_default().to_string()
     }
+
+    /// The `StorageGatewayError` code the refusal carries in its `error` member
+    /// (`$.error.errorCode`), or the empty string when it carries none. This is the member
+    /// a caller branches on: every bad request in this service arrives as the one wire
+    /// error [`INVALID_GATEWAY_REQUEST`], so the code is what says WHICH refusal it is.
+    pub(crate) fn storage_gateway_error_code(&self) -> &str {
+        self.body["error"]["errorCode"].as_str().unwrap_or_default()
+    }
+
+    /// The refusal's `message` member, or the empty string.
+    pub(crate) fn message(&self) -> &str {
+        self.body["message"].as_str().unwrap_or_default()
+    }
 }
 
 /// Call one operation, the way an SDK client does: `POST /` with `X-Amz-Target`.
@@ -177,6 +190,70 @@ async fn activate_file_gateway(router: &MultiServiceRouter, name: &str) -> Strin
         answer.status, answer.body
     );
     answer.string("GatewayARN")
+}
+
+/// The resource kinds whose not-found refusal this suite checks, each with the
+/// `error.errorCode` that says which kind went missing and the fixed message of its error
+/// class.
+///
+/// A code is the resource kind's own `<Resource>NotFound`, never the generic
+/// `InvalidParameters` that says the request was malformed: `GatewayNotFound` is a member
+/// of this service's `ErrorCode` enum, and the enum's other resource-specific members
+/// (`VolumeNotFound`, `SnapshotNotFound`, `TapeCartridgeNotFound`, …) are where the
+/// spelling for a kind the enum does not list comes from. The message is spelled out here
+/// rather than imported, so wording the implementation changes fails this test.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ResourceKind {
+    Gateway,
+    FileShare,
+}
+
+impl ResourceKind {
+    fn error_code(self) -> &'static str {
+        match self {
+            Self::Gateway => "GatewayNotFound",
+            Self::FileShare => "FileShareNotFound",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::Gateway => "The specified gateway was not found.",
+            Self::FileShare => "The specified file share was not found.",
+        }
+    }
+}
+
+/// Check one not-found refusal's payload: the missing resource's kind is carried by
+/// `error.errorCode`, and `message` is its error class's FIXED sentence — so no part of
+/// the ARN the request named (nor the id inside it) may appear in the message, and two
+/// requests naming different missing resources of the same kind get the same message.
+pub(crate) fn assert_not_found(
+    answer: &Answer,
+    case: &str,
+    expected_code: &str,
+    expected_message: &str,
+    named_arn: &str,
+) {
+    assert_eq!(
+        answer.storage_gateway_error_code(),
+        expected_code,
+        "case {case}: expected error.errorCode {expected_code:?}, got {:?}",
+        answer.body
+    );
+    assert_eq!(
+        answer.message(),
+        expected_message,
+        "case {case}: expected message {expected_message:?}, got {:?}",
+        answer.message()
+    );
+    let identity = named_arn.rsplit('/').next().unwrap_or(named_arn);
+    assert!(
+        !answer.message().contains(named_arn) && !answer.message().contains(identity),
+        "case {case}: the message must carry no part of the request's ARN ({named_arn}), \
+         got {:?}",
+        answer.message()
+    );
 }
 
 /// A create request carrying only the four required members, plus the token.
@@ -922,52 +999,72 @@ async fn create_nfs_file_share_is_idempotent_per_client_token_and_gateway() {
 
 /// An ARN that names no stored record is a refused request — HTTP 400 with the one
 /// modelled client error — never a 200 with empty fields and never a 501. The rule holds
-/// for every operation that takes an ARN, whichever resource it names.
+/// for every operation that takes an ARN, whichever resource it names: the refusal names
+/// the MISSING RESOURCE's kind in `error.errorCode` and carries that error class's fixed
+/// message, with nothing taken from the request spliced into it.
 #[tokio::test]
 async fn an_arn_naming_no_stored_record_is_refused() {
     let router = emulator();
     let gateway = activate_file_gateway(&router, "refusal-gw").await;
     let share = create_share(&router, minimal_share(&gateway, "token-refusal-01")).await;
 
-    let cases: Vec<(&str, &str, Value)> = vec![
+    // Each row: the case, the operation, the request, and the ARN it names that resolves
+    // to nothing. Rows differ along the resource kind (gateway, file share), the
+    // operation's shape (a single ARN member, a list member, a create naming a parent) and
+    // whether the request also names a resource that DOES exist.
+    let cases: Vec<(&str, &str, Value, ResourceKind, &str)> = vec![
         (
             "describing a gateway that was never activated",
             "DescribeGatewayInformation",
             json!({ "GatewayARN": NEVER_ACTIVATED_GATEWAY }),
+            ResourceKind::Gateway,
+            NEVER_ACTIVATED_GATEWAY,
         ),
         (
             "deleting a gateway that was never activated",
             "DeleteGateway",
             json!({ "GatewayARN": NEVER_ACTIVATED_GATEWAY }),
+            ResourceKind::Gateway,
+            NEVER_ACTIVATED_GATEWAY,
         ),
         (
             "creating a share on a gateway that was never activated",
             "CreateNFSFileShare",
             minimal_share(NEVER_ACTIVATED_GATEWAY, "token-unknown-gw"),
+            ResourceKind::Gateway,
+            NEVER_ACTIVATED_GATEWAY,
         ),
         (
             "listing the shares of a gateway that was never activated",
             "ListFileShares",
             json!({ "GatewayARN": NEVER_ACTIVATED_GATEWAY }),
+            ResourceKind::Gateway,
+            NEVER_ACTIVATED_GATEWAY,
         ),
         (
             "describing a share that was never created",
             "DescribeNFSFileShares",
             json!({ "FileShareARNList": [NEVER_CREATED_SHARE] }),
+            ResourceKind::FileShare,
+            NEVER_CREATED_SHARE,
         ),
         (
             "describing a known share beside one that was never created",
             "DescribeNFSFileShares",
             json!({ "FileShareARNList": [&share, NEVER_CREATED_SHARE] }),
+            ResourceKind::FileShare,
+            NEVER_CREATED_SHARE,
         ),
         (
             "deleting a share that was never created",
             "DeleteFileShare",
             json!({ "FileShareARN": NEVER_CREATED_SHARE }),
+            ResourceKind::FileShare,
+            NEVER_CREATED_SHARE,
         ),
     ];
 
-    for (case, operation, request) in cases {
+    for (case, operation, request, kind, missing) in cases {
         let answer = call(&router, operation, request).await;
         assert_eq!(
             answer.status, 400,
@@ -980,6 +1077,7 @@ async fn an_arn_naming_no_stored_record_is_refused() {
             "case {case}: {operation} must answer the modelled client error, got {:?}",
             answer.body
         );
+        assert_not_found(&answer, case, kind.error_code(), kind.message(), missing);
     }
 
     // The refusals changed nothing: the gateway and its one share are still there.

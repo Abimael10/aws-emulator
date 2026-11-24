@@ -175,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let Some(gateway) = store.remove_gateway(&input.gateway_arn) else {
             return Err(DeleteGatewayErrorModeled::InvalidGatewayRequestException(
-                crate::state::gateway_not_found(&input.gateway_arn),
+                crate::state::gateway_not_found(),
             )
             .into());
         };

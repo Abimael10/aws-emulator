@@ -164,6 +164,16 @@ pub const FILE_SHARE_TRANSITION: Duration = Duration::from_millis(500);
 /// no activated gateway.
 pub const ERROR_CODE_GATEWAY_NOT_FOUND: &str = "GatewayNotFound";
 
+/// The `ErrorCode` a refusal names when the request's file share ARN names no
+/// stored file share.
+///
+/// A missing resource carries the code of its OWN resource kind — the `ErrorCode`
+/// enum spells those `<Resource>NotFound` (`GatewayNotFound`,
+/// `VolumeNotFound`, `SnapshotNotFound`, `TapeCartridgeNotFound`, …) — never the
+/// generic [`ERROR_CODE_INVALID_PARAMETERS`], which says the request itself was
+/// malformed.
+pub const ERROR_CODE_FILE_SHARE_NOT_FOUND: &str = "FileShareNotFound";
+
 /// The modeled `ErrorCode` a refusal names when a member's value is one the
 /// service does not accept.
 pub const ERROR_CODE_INVALID_PARAMETERS: &str = "InvalidParameters";
@@ -635,20 +645,29 @@ pub fn invalid_gateway_request(
     }
 }
 
-/// The refusal for a gateway ARN that names no activated gateway.
-pub fn gateway_not_found(gateway_arn: &str) -> InvalidGatewayRequestException {
+/// The refusal for an ARN that names no resource of its kind.
+///
+/// A missing resource is not a malformed request, so the two are told apart by
+/// `error.errorCode`: it names the kind of resource that was not found, and that
+/// code is the whole discriminator a caller branches on. The message is this
+/// error class's fixed sentence — it carries nothing taken from the request, so a
+/// caller can match it as a constant — and `resource` is the noun this service
+/// uses for the kind, not a value the request supplied.
+pub fn resource_not_found(error_code: &str, resource: &str) -> InvalidGatewayRequestException {
     invalid_gateway_request(
-        ERROR_CODE_GATEWAY_NOT_FOUND,
-        format!("The gateway {gateway_arn} was not found."),
+        error_code,
+        format!("The specified {resource} was not found."),
     )
 }
 
+/// The refusal for a gateway ARN that names no activated gateway.
+pub fn gateway_not_found() -> InvalidGatewayRequestException {
+    resource_not_found(ERROR_CODE_GATEWAY_NOT_FOUND, "gateway")
+}
+
 /// The refusal for a file share ARN that names no file share.
-pub fn file_share_not_found(file_share_arn: &str) -> InvalidGatewayRequestException {
-    invalid_gateway_request(
-        ERROR_CODE_INVALID_PARAMETERS,
-        format!("The file share {file_share_arn} was not found."),
-    )
+pub fn file_share_not_found() -> InvalidGatewayRequestException {
+    resource_not_found(ERROR_CODE_FILE_SHARE_NOT_FOUND, "file share")
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

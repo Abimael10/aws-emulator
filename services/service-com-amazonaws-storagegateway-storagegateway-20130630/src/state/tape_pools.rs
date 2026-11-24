@@ -14,8 +14,7 @@
 use std::time::SystemTime;
 
 use super::{
-    invalid_gateway_request, ComAmazonawsStoragegatewayStoragegateway20130630State, ARN_NAMESPACE,
-    ERROR_CODE_INVALID_PARAMETERS,
+    resource_not_found, ComAmazonawsStoragegatewayStoragegateway20130630State, ARN_NAMESPACE,
 };
 use crate::ops::types::{InvalidGatewayRequestException, PoolInfo, Tag};
 
@@ -117,10 +116,18 @@ pub fn tape_pool_arn(region: &str, pool_id: &str) -> String {
     )
 }
 
+/// The `ErrorCode` a refusal names when a pool ARN names no custom tape pool.
+///
+/// The `ErrorCode` enum this service ships lists a `<Resource>NotFound` member
+/// per resource kind (`GatewayNotFound`, `VolumeNotFound`, `SnapshotNotFound`,
+/// `TapeCartridgeNotFound`, …) but no member for a custom tape pool, so this is
+/// the code Storage Gateway answers with rather than one the shipped enum
+/// carries — what the enum does establish is that a missing resource is told
+/// apart by its own kind's code and never by the generic
+/// [`super::ERROR_CODE_INVALID_PARAMETERS`].
+pub const ERROR_CODE_POOL_NOT_FOUND: &str = "PoolNotFound";
+
 /// The refusal for a pool ARN that names no custom tape pool.
-pub fn tape_pool_not_found(pool_arn: &str) -> InvalidGatewayRequestException {
-    invalid_gateway_request(
-        ERROR_CODE_INVALID_PARAMETERS,
-        format!("The tape pool {pool_arn} was not found."),
-    )
+pub fn tape_pool_not_found() -> InvalidGatewayRequestException {
+    resource_not_found(ERROR_CODE_POOL_NOT_FOUND, "pool")
 }

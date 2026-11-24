@@ -168,7 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // proceeds for a pool that exists.
         let Some(pool) = store.remove_tape_pool(&input.pool_arn) else {
             return Err(DeleteTapePoolErrorModeled::InvalidGatewayRequestException(
-                crate::state::tape_pool_not_found(&input.pool_arn),
+                crate::state::tape_pool_not_found(),
             )
             .into());
         };

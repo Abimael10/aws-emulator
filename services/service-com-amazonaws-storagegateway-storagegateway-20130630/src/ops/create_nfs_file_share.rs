@@ -319,7 +319,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => {
                 return Err(
                     CreateNFSFileShareErrorModeled::InvalidGatewayRequestException(
-                        crate::state::gateway_not_found(&input.gateway_arn),
+                        crate::state::gateway_not_found(),
                     )
                     .into(),
                 )

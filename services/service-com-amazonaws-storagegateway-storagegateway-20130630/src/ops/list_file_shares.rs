@@ -181,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(gateway_arn) = input.gateway_arn.as_deref() {
             if !store.gateways.contains_key(gateway_arn) {
                 return Err(ListFileSharesErrorModeled::InvalidGatewayRequestException(
-                    crate::state::gateway_not_found(gateway_arn),
+                    crate::state::gateway_not_found(),
                 )
                 .into());
             }
