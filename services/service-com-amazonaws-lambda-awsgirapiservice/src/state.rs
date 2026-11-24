@@ -2468,15 +2468,21 @@ pub fn alias_name_message(name: &str) -> String {
     pattern_violation_message("name", name, ALIAS_NAME_PATTERN)
 }
 
-/// The message the READ of an alias refuses with when the function holds no alias of that
-/// name: `ResourceNotFoundException`'s own sentence, naming the alias by the
-/// fully-qualified ARN the request asked about.
+/// The message the READ of an alias refuses with when no alias of that name can be read:
+/// `ResourceNotFoundException`'s own sentence, naming the alias by the fully-qualified ARN
+/// the request asked about.
 ///
 /// `alias_arn` is the function's unqualified ARN qualified by the alias name
-/// ([`FunctionRecord::versioned_arn`]), so the whole sentence is built from the request:
-/// the caller recovers the ARN it asked for by stripping the fixed prefix, which is how
-/// every Lambda resource-shaped refusal states the resource it could not find (compare
-/// the `Function not found: <arn>` [`resolve_function`] builds).
+/// ([`FunctionRecord::versioned_arn`] for a function this store holds, and
+/// [`qualified_arn`] over [`function_arn`] for one it does not), so the whole sentence is
+/// built from the request: the caller recovers the ARN it asked for by stripping the fixed
+/// prefix, which is how every Lambda resource-shaped refusal states the resource it could
+/// not find (compare the `Function not found: <arn>` [`resolve_function`] builds for the
+/// operations whose subject is the function itself).
+///
+/// The READ of an alias answers this for every reason the alias cannot be read — the
+/// function holds no alias of the name, or no such function exists — because the resource
+/// the request addressed is the alias either way.
 ///
 /// Lambda words this absence per operation rather than once for the resource kind, so the
 /// WRITE of an alias states the same ARN after its own prefix

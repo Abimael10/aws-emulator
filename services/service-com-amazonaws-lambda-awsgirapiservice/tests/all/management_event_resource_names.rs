@@ -15,7 +15,10 @@
 //! it: a write that MAKES the function, a read of it, a grant on its policy, a write
 //! addressing it by its ARN through a differently-named member, a listing that addresses no
 //! function at all, the refusal of a read naming a function the account does not hold, and
-//! the refusal of a read of a sub-resource the function itself does hold no instance of.
+//! the refusal of a read of a sub-resource the function itself does hold no instance of. The
+//! last of those is read the other way round too: a sub-resource read whose FUNCTION is not
+//! there names no resource, because which absence a refusal was is whether the account holds
+//! the function and not how that operation words its sentence.
 //!
 //! Every call goes over the wire through the same router the production emulator uses (the
 //! harness `function_lifecycle.rs` publishes); the records are read back out of the SHARED
@@ -215,4 +218,36 @@ async fn a_management_record_names_the_function_the_call_acted_on() {
             row.case
         );
     }
+}
+
+/// RULE (the same rule read the other way round): a call refused because the FUNCTION it
+/// addressed is not there names no resource whatever SENTENCE the operation words that
+/// absence with — the read of an alias states the alias it was asked about, and the account
+/// still holds no function for the record to name.
+#[tokio::test]
+async fn a_refused_read_of_an_alias_whose_function_is_absent_names_nothing() {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = router_on(&engine);
+
+    let answered = json_call(
+        &router,
+        "GET",
+        &format!("/2015-03-31/functions/{ABSENT}/aliases/live"),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(
+        answered.status,
+        404,
+        "the read of an alias of a function the account does not hold must be refused, got {} \
+         with {}",
+        answered.status,
+        String::from_utf8_lossy(&answered.body)
+    );
+
+    let actual = named_resources(&engine, "GetAlias");
+    assert!(
+        actual.is_empty(),
+        "expected the record to name no resource, got {actual:?}"
+    );
 }

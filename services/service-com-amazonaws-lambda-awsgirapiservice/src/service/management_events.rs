@@ -341,19 +341,9 @@ const FUNCTION_REFERENCE_MEMBERS: &[&str] = &["FunctionName", "Resource", "Resou
 /// (`smithy_query(query="operation",…)` lists `ResourceNotFoundException`, `httpError` 404,
 /// among the errors of every operation that addresses one).
 ///
-/// The shape alone does not say WHICH resource was missing, so it is read together with the
-/// message below (see [`resolved_resources_only`]).
+/// The shape alone does not say WHICH resource was missing, so a record refused with it
+/// keeps only the functions the account still holds (see [`resolved_resources_only`]).
 const RESOURCE_NOT_FOUND_SHAPE: &str = "ResourceNotFoundException";
-
-/// The fixed opening of the sentence this service refuses a call with when THE FUNCTION a
-/// request addressed is not there (`crate::state::resolve_function` builds
-/// `Function not found: <arn>`, and every operation that words that absence itself states the
-/// same prefix before the ARN).
-///
-/// A refusal whose message opens with it is the one that says the function did not resolve;
-/// the same fault shape with another sentence — an alias, a URL configuration — is a
-/// sub-resource of a function the call DID act on.
-const FUNCTION_NOT_FOUND_OPENING: &str = "Function not found: ";
 
 /// The resources a management call of `operation` acted on, read off the parameters its
 /// record carries: the FUNCTION the request addressed.
@@ -402,25 +392,30 @@ pub fn management_event_resources(
     named
 }
 
-/// `call` with the resources it names dropped when the FUNCTION it addressed did not
-/// resolve: the one refusal that says the function itself is not there.
+/// `call` with the functions the account does not hold dropped from the resources it names,
+/// for a call this service refused because a resource it addressed is not there.
 ///
 /// The resources a record names are the ones the call acted on, and a call refused because
 /// the function is not there acted on nothing — so naming the reference it carried would
-/// report a function this account does not hold to a lookup by `ResourceName` as fact. It is
-/// the MESSAGE and not the fault shape alone that says so: this service answers
+/// report a function this account does not hold to a lookup by `ResourceName` as fact. The
+/// fault shape alone does not say which resource was missing: this service answers
 /// [`RESOURCE_NOT_FOUND_SHAPE`] for a sub-resource of a function it resolved perfectly well
 /// (an alias, a URL configuration, an event-invoke configuration), and such a call did act
-/// on its function, so its record keeps it. Every other outcome keeps the function too.
-fn resolved_resources_only(mut call: ServedApiCall) -> ServedApiCall {
-    let function_missing = call.error_code.as_deref() == Some(RESOURCE_NOT_FOUND_SHAPE)
-        && call
-            .error_message
-            .as_deref()
-            .is_some_and(|message| message.starts_with(FUNCTION_NOT_FOUND_OPENING));
-    if function_missing {
-        call.resources.clear();
+/// on its function, so its record keeps it. Which of the two it was is therefore read off
+/// the STORE — whether the account holds a function of that name — rather than off the
+/// wording of the refusal, which is each operation's own to word for the resource IT
+/// addresses. Every other outcome keeps the function it named.
+fn resolved_resources_only(
+    mut call: ServedApiCall,
+    holds_function: impl Fn(&str) -> bool,
+) -> ServedApiCall {
+    if call.error_code.as_deref() != Some(RESOURCE_NOT_FOUND_SHAPE) {
+        return call;
     }
+    call.resources.retain(|resource| {
+        resource.resource_type != FUNCTION_RESOURCE_TYPE
+            || holds_function(&resource.resource_name)
+    });
     call
 }
 
@@ -455,13 +450,19 @@ impl<Eng: Send + Sync + 'static> AuditedService for FunctionManagementEvents<Eng
             );
             return None;
         };
+        // Which functions the account still holds, read before the log is locked: the
+        // record names only resources this account has (see `resolved_resources_only`).
+        let call = resolved_resources_only(call, |name| {
+            crate::state::service_state(&*self.engine)
+                .is_some_and(|state| state.lock().functions.contains_key(name))
+        });
         // The record, and the event the account's CloudTrail fans out for it while a trail
         // of the Region is logging calls of its kind; publishing it is the wrapper's. The
         // guard is BOUND rather than used as a temporary: a local is released before the
         // handle it borrows, which a temporary at the end of this block would not be.
         let mut recording = log.lock();
         recording.record_delivered(
-            resolved_resources_only(call),
+            call,
             ::std::time::SystemTime::now(),
             answered_as.to_string(),
         )
@@ -749,48 +750,94 @@ mod tests {
         }
     }
 
-    /// RULE (the other half): a call the service refused because the FUNCTION it addressed
-    /// is not there acted on nothing, so its record names no resource; a refusal about a
-    /// sub-resource of a function that resolved, and a refusal for any other reason, acted on
-    /// that function and keep it.
+    /// One row of the table below: the outcome the call was recorded with, whether the
+    /// account holds the function the record names, and how many resources the record keeps.
+    struct ResolvedRow {
+        case: &'static str,
+        error_code: Option<&'static str>,
+        error_message: Option<&'static str>,
+        /// Whether the account holds a function of the name the record carries.
+        held: bool,
+        expected: usize,
+    }
+
+    /// RULE (the other half): a call the service refused because a resource it addressed is
+    /// not there names only the functions the account HOLDS — so one refused because the
+    /// function itself is gone names no resource, while a refusal about a sub-resource of a
+    /// function that resolved, and a refusal for any other reason, acted on that function
+    /// and keep it.
     #[test]
     fn a_call_that_resolved_no_function_names_none() {
-        let rows: &[(&str, Option<&str>, Option<&str>, usize)] = &[
-            ("a served call", None, None, 1),
-            (
-                "the function itself is not there",
-                Some(RESOURCE_NOT_FOUND_SHAPE),
-                Some("Function not found: arn:aws:lambda:us-east-1:000000000000:function:ledger"),
-                0,
-            ),
-            (
-                "the function resolved and its alias did not",
-                Some(RESOURCE_NOT_FOUND_SHAPE),
-                Some("Cannot find alias arn: arn:aws:lambda:us-east-1:000000000000:function:ledger:live"),
-                1,
-            ),
-            (
-                "the statement is already there",
-                Some("ResourceConflictException"),
-                Some("The statement id (named) provided already exists."),
-                1,
-            ),
-            (
-                "a parameter the service refused",
-                Some("InvalidParameterValueException"),
-                Some("1 validation error detected"),
-                1,
-            ),
+        let rows = &[
+            ResolvedRow {
+                case: "a served call",
+                error_code: None,
+                error_message: None,
+                held: true,
+                expected: 1,
+            },
+            ResolvedRow {
+                case: "the function itself is not there",
+                error_code: Some(RESOURCE_NOT_FOUND_SHAPE),
+                error_message: Some(
+                    "Function not found: arn:aws:lambda:us-east-1:000000000000:function:ledger",
+                ),
+                held: false,
+                expected: 0,
+            },
+            ResolvedRow {
+                case: "the function resolved and its alias did not",
+                error_code: Some(RESOURCE_NOT_FOUND_SHAPE),
+                error_message: Some(
+                    "Cannot find alias arn: \
+                     arn:aws:lambda:us-east-1:000000000000:function:ledger:live",
+                ),
+                held: true,
+                expected: 1,
+            },
+            ResolvedRow {
+                case: "the alias is not there because its function is not there either",
+                error_code: Some(RESOURCE_NOT_FOUND_SHAPE),
+                error_message: Some(
+                    "Cannot find alias arn: \
+                     arn:aws:lambda:us-east-1:000000000000:function:ledger:live",
+                ),
+                held: false,
+                expected: 0,
+            },
+            ResolvedRow {
+                case: "the statement is already there",
+                error_code: Some("ResourceConflictException"),
+                error_message: Some("The statement id (named) provided already exists."),
+                held: true,
+                expected: 1,
+            },
+            ResolvedRow {
+                case: "a parameter the service refused",
+                error_code: Some("InvalidParameterValueException"),
+                error_message: Some("1 validation error detected"),
+                held: true,
+                expected: 1,
+            },
+            ResolvedRow {
+                case: "a delete, which served the call and removed the function it acted on",
+                error_code: None,
+                error_message: None,
+                held: false,
+                expected: 1,
+            },
         ];
-        for (case, error_code, error_message, expected) in rows {
+        for row in rows {
             let mut call = recorded_call();
-            call.error_code = error_code.map(ToString::to_string);
-            call.error_message = error_message.map(ToString::to_string);
-            let kept = resolved_resources_only(call);
+            call.error_code = row.error_code.map(ToString::to_string);
+            call.error_message = row.error_message.map(ToString::to_string);
+            let kept = resolved_resources_only(call, |_| row.held);
             assert_eq!(
                 kept.resources.len(),
-                *expected,
-                "case {case:?}: expected {expected} named resource(s), got {:?}",
+                row.expected,
+                "case {:?}: expected {} named resource(s), got {:?}",
+                row.case,
+                row.expected,
                 kept.resources
             );
         }

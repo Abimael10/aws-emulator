@@ -589,6 +589,20 @@ async fn alias_read(emulator: &Emulator, function: &str, alias: &str) -> (u16, S
     (status, message)
 }
 
+/// What AWS Lambda answers for the read of one FUNCTION: the HTTP status and the
+/// message of the body, under either casing the JSON envelopes spell it in.
+async fn function_read(emulator: &Emulator, function: &str) -> (u16, String) {
+    let (status, body) = emulator
+        .lambda("GET", &format!("{FUNCTIONS_URI}/{function}"), Value::Null)
+        .await;
+    let message = body["message"]
+        .as_str()
+        .or_else(|| body["Message"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    (status, message)
+}
+
 /// The names of the aliases AWS Lambda holds for `function`, as `ListAliases`
 /// reports them — the collection an alias that was never created must stay out of.
 async fn alias_names(emulator: &Emulator, function: &str) -> Vec<String> {
@@ -626,7 +640,7 @@ struct Reference {
     /// Its `TargetVersion`.
     target: &'static str,
     /// Whether AWS Lambda holds the function the row names, which is what decides
-    /// which absence its read of that alias reports.
+    /// what its read of that FUNCTION answers.
     function_exists: bool,
 }
 
@@ -656,8 +670,8 @@ async fn an_unresolved_appspec_reference_creates_nothing_in_lambda() {
     // Rows differ along which referent is missing and along how the missing alias
     // name is spelled — the model's `Alias` admits letters, digits, '-' and '_'
     // (`smithy_query(query="shape",shape="Alias")` of the Lambda model) — and the
-    // last row's function is missing as well, so the absence Lambda reports for
-    // the read differs too.
+    // last row's function is missing as well, so the read of the FUNCTION reports an
+    // absence there while the read of the alias reports the same one everywhere.
     let cases: &[Reference] = &[
         Reference {
             case: "an alias nothing created",
@@ -731,18 +745,34 @@ async fn an_unresolved_appspec_reference_creates_nothing_in_lambda() {
 
         // Effect absent: the alias the AppSpec merely named is still not there, so
         // the read of it answers the same absence it answered before the
-        // deployment.
-        let expected_absence = if case.function_exists {
-            alias_not_found_message(&function_arn, case.alias)
-        } else {
-            function_not_found_message(&sibling_function_arn(&function_arn, case.function))
-        };
+        // deployment. AWS Lambda's read of an alias names the ALIAS it was asked
+        // about, whichever reason it cannot be read — including the row whose
+        // function Lambda does not hold either.
+        let referenced_arn = sibling_function_arn(&function_arn, case.function);
+        let expected_absence = alias_not_found_message(&referenced_arn, case.alias);
         let (status, message) = alias_read(&emulator, case.function, case.alias).await;
         assert_eq!(
             (status, message.as_str()),
             (404, expected_absence.as_str()),
             "case {:?}: expected the named alias to be absent with {expected_absence:?}, got \
              {status} {message:?}",
+            case.case
+        );
+
+        // And the FUNCTION the AppSpec named: the read of it names the function, so
+        // the row whose function nothing created still holds none, and the rows whose
+        // function exists still have it.
+        let (status, message) = function_read(&emulator, case.function).await;
+        let expected_function = if case.function_exists {
+            (200, String::new())
+        } else {
+            (404, function_not_found_message(&referenced_arn))
+        };
+        assert_eq!(
+            (status, message.clone()),
+            expected_function,
+            "case {:?}: expected the named function's read to answer {expected_function:?}, \
+             got {status} {message:?}",
             case.case
         );
 

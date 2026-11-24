@@ -19,9 +19,10 @@
 //!   its own sentence, [`CODE_SIGNING_CONFIG_GONE`] around the ARN the request carried,
 //!   whichever of the operations on the configuration asked;
 //! * an ALIAS that does not exist keeps its own sentence, [`ALIAS_NOT_FOUND_PREFIX`]
-//!   followed by the alias ARN built from stored state, so a caller can tell
-//!   alias-not-found from function-not-found by the leading phrase, and a CAPACITY
-//!   PROVIDER keeps its own sentence naming the provider ARN the same way;
+//!   followed by the alias ARN the request named, whatever the reason no such alias can be
+//!   read — so the read of an alias states the alias even when its function is gone, while
+//!   the operations whose subject IS the function keep the function-keyed phrase — and a
+//!   CAPACITY PROVIDER keeps its own sentence naming the provider ARN the same way;
 //! * a REMOVAL on a resource-based policy that finds no policy to act on reports the
 //!   missing POLICY ([`NO_POLICY_REFUSAL`]) rather than the missing resource, which is
 //!   what the READ of that policy reports;
@@ -968,8 +969,8 @@ async fn an_alias_that_does_not_exist_is_refused_by_the_alias_sentence_naming_it
         );
     }
 
-    // A missing FUNCTION keeps its own leading phrase, so the two refusals stay tellable
-    // apart by the phrase alone.
+    // A read whose FUNCTION does not exist states the same absence: the resource the
+    // request addressed is the alias, so the sentence names the alias ARN it asked about.
     let no_function = call(
         &router,
         "GET",
@@ -978,17 +979,37 @@ async fn an_alias_that_does_not_exist_is_refused_by_the_alias_sentence_naming_it
     )
     .await;
     let reported = message(&no_function);
+    let expected = format!(
+        "{ALIAS_NOT_FOUND_PREFIX}{}:live",
+        function_arn("alias-msg-absent")
+    );
     assert_eq!(
-        (no_function.status, reported.starts_with(FUNCTION_NOT_FOUND_PREFIX)),
-        (404, true),
-        "case \"an alias of a function that does not exist\": expected 404 and the \
-         function-not-found phrase, got {} {reported:?}",
+        (no_function.status, reported.clone()),
+        (404, expected.clone()),
+        "case \"an alias of a function that does not exist\": expected 404 {expected:?}, got \
+         {} {reported:?}",
         no_function.status
     );
-    assert!(
-        !reported.starts_with(ALIAS_NOT_FOUND_PREFIX),
-        "case \"an alias of a function that does not exist\": the alias phrase names the \
-         wrong absence, got {reported:?}"
+
+    // The read of the FUNCTION itself keeps the function-keyed phrase, so the two
+    // operations' refusals stay tellable apart.
+    let function = call(
+        &router,
+        "GET",
+        &format!("{FUNCTIONS_URI}/alias-msg-absent"),
+        &Value::Null,
+    )
+    .await;
+    let reported = message(&function);
+    assert_eq!(
+        (
+            function.status,
+            reported.starts_with(FUNCTION_NOT_FOUND_PREFIX)
+        ),
+        (404, true),
+        "case \"GetFunction of the same absent name\": expected 404 and the \
+         function-not-found phrase, got {} {reported:?}",
+        function.status
     );
 }
 

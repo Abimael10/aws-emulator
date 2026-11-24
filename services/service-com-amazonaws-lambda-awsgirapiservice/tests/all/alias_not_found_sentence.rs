@@ -13,10 +13,11 @@
 //! The rows differ along what the rule generalises over: the alias name (its
 //! modelled length bounds, either separator, mixed case), the documented
 //! `FunctionName` form the request addressed the function by (name, function ARN,
-//! partial ARN), and whether the function holds other aliases. The refusal for a
-//! missing FUNCTION is checked too, because it is a different resource and keeps
-//! its own sentence — a caller has to be able to tell "no such function" from
-//! "that function has no such alias".
+//! partial ARN), and whether the function holds other aliases. A read whose
+//! function does not exist either answers the same sentence, because the resource
+//! the request addressed is the alias whatever the reason no alias of that ARN can
+//! be read; the read of the FUNCTION keeps its own function-keyed sentence, so a
+//! caller still has an operation that tells it "no such function".
 
 use std::sync::Arc;
 
@@ -329,16 +330,20 @@ async fn a_function_with_no_aliases_refuses_every_alias_by_its_arn() {
     }
 }
 
-/// RULE: the missing resource is the one the sentence names — a FUNCTION that does
-/// not exist keeps the function-shaped refusal, so a caller can tell the two apart.
+/// RULE: the resource this read addressed is the ALIAS, so a `FunctionName` naming no
+/// function answers the alias sentence too — while the read of the FUNCTION keeps its own
+/// function-keyed sentence, so the two operations stay tellable apart.
 #[tokio::test]
-async fn a_missing_function_keeps_its_own_refusal() {
+async fn a_read_whose_function_does_not_exist_still_names_the_alias() {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let router = router_on(&engine);
 
     for (form, alias) in missing_alias_names() {
         let answer = get_alias(&router, "never-created", &alias).await;
-        let expected = format!("Function not found: {}", function_arn("never-created"));
+        let expected = format!(
+            "Cannot find alias arn: {}:{alias}",
+            function_arn("never-created")
+        );
         assert_eq!(
             (answer.status, answer.error_code()),
             (404, RESOURCE_NOT_FOUND.to_string()),
@@ -349,8 +354,26 @@ async fn a_missing_function_keeps_its_own_refusal() {
         assert_eq!(
             answer.message(),
             expected,
-            "case {form:?}: a missing function must be named as the function, got {:?}",
+            "case {form:?}: expected {expected:?}, got {:?}",
             answer.message()
         );
     }
+
+    // The read of the FUNCTION, whose subject IS the function, keeps the function-keyed
+    // sentence for the same absent name.
+    let function = call(
+        &router,
+        "GET",
+        &format!("{FUNCTIONS_URI}/never-created"),
+        &Value::Null,
+    )
+    .await;
+    let expected = format!("Function not found: {}", function_arn("never-created"));
+    assert_eq!(
+        (function.status, function.message()),
+        (404, expected.clone()),
+        "case \"GetFunction of the same absent name\": expected 404 {expected:?}, got {} {}",
+        function.status,
+        function.text()
+    );
 }

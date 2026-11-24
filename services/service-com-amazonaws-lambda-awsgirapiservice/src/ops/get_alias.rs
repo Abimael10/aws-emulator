@@ -8,6 +8,17 @@
 //! operation (`@readonly`), so it writes nothing of its own and two reads of an
 //! unchanged alias answer the same configuration.
 //!
+//! ## What this read could not find
+//!
+//! The resource this operation addresses is the ALIAS its two URI labels name, so a read
+//! that cannot answer reports that one absence: the modelled `ResourceNotFoundException`
+//! naming the alias by its own ARN ([`crate::state::alias_not_found_message`]), whatever
+//! the reason no such alias can be read — the function holds no alias of the name, or the
+//! account holds no such function at all. The function-keyed sentence belongs to the
+//! operations whose subject IS the function (the resolution builds it for them); keying it
+//! on the function here would answer a request about an alias with the absence of a
+//! different resource.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -185,59 +196,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An alias belongs to the function, so the function is addressed the way every
         // other operation addresses it (any of the documented `FunctionName` forms) and
-        // the alias by its own name.
-        let (record, version) = crate::state::resolve_function(
-            &mut store,
-            &input.function_name,
-            None,
-            &region,
-            now,
-        )
-        .map_err(|failure| match failure {
-            crate::state::ResolveFailure::Malformed(message) => {
-                GetAliasErrorModeled::InvalidParameterValueException(
-                    InvalidParameterValueException {
-                        r#type: None,
-                        message: Some(message),
-                    },
-                )
-            }
-            crate::state::ResolveFailure::NotFound(message) => {
-                GetAliasErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    r#type: None,
-                    message: Some(message),
-                })
-            }
-        })?;
-        // The alias to report is the one `Name` names; a `FunctionName` that qualifies a
-        // version or an alias of its own names no function whose aliases to look in.
-        if version != crate::state::VERSION_LATEST {
-            return Err(GetAliasErrorModeled::InvalidParameterValueException(
-                InvalidParameterValueException {
-                    r#type: None,
-                    message: Some(format!(
-                        "An alias belongs to a function and is named by 'Name', and the \
-                         qualifier '{version}' in 'functionName' names a published version or \
-                         an alias"
-                    )),
-                },
-            )
-            .into());
+        // the alias by its own name. Both facts about the REQUEST are settled by reading
+        // the identifier, before anything is looked up: a value in none of the documented
+        // forms, and one that qualifies a version or an alias of its own — which names no
+        // function whose aliases to look in — exactly as `DeleteAlias` reads the same
+        // member.
+        let reference =
+            crate::state::parse_function_reference(&input.function_name).ok_or_else(|| {
+                invalid_parameter(format!(
+                    "1 validation error detected: Value '{}' at 'functionName' failed to \
+                     satisfy constraint: Member must satisfy one of the documented name \
+                     formats (name, name:qualifier, partial ARN or function ARN)",
+                    input.function_name
+                ))
+            })?;
+        if let Some(qualifier) = reference
+            .qualifier
+            .as_deref()
+            .filter(|qualifier| *qualifier != crate::state::VERSION_LATEST)
+        {
+            return Err(invalid_parameter(format!(
+                "An alias belongs to a function and is named by 'Name', and the qualifier \
+                 '{qualifier}' in 'functionName' names a published version or an alias"
+            )));
         }
 
+        // A Lambda function is a REGIONAL resource, so a `FunctionName` given as another
+        // Region's ARN names no function at this endpoint. That too is settled by reading
+        // the identifier, before the alias is looked up, so it is stated as itself rather
+        // than as an alias that could not be found here
+        // (`crate::state::foreign_region_function_message`).
+        if let Some(message) = crate::state::foreign_region_function_message(&reference, &region) {
+            return Err(not_found(message));
+        }
+
+        // The subject of this read is the ALIAS the operation's two URI labels name, so
+        // every reason it cannot be read is reported as the one absence: the alias, named
+        // by the ARN the request asked about. A `FunctionName` this store holds no record
+        // of therefore answers the same sentence a function holding no alias of that name
+        // does, rather than the resolution's own function-keyed one — the request asked
+        // about an alias, and no alias of that ARN can be read either way.
+        let requested_alias_arn = crate::state::qualified_arn(
+            &crate::state::function_arn(&region, &reference.name),
+            &input.name,
+        );
+        let (record, _version) =
+            crate::state::resolve_function(&mut store, &input.function_name, None, &region, now)
+                .map_err(|failure| match failure {
+                    crate::state::ResolveFailure::Malformed(message) => {
+                        invalid_parameter(message)
+                    }
+                    crate::state::ResolveFailure::NotFound(_) => not_found(
+                        crate::state::alias_not_found_message(&requested_alias_arn),
+                    ),
+                })?;
+
         let Some(alias) = record.aliases.get(&input.name) else {
-            return Err(GetAliasErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    r#type: None,
-                    message: Some(crate::state::alias_not_found_message(
-                        &record.versioned_arn(&input.name),
-                    )),
-                },
-            )
-            .into());
+            // The function resolved, so the ARN of the alias it does not hold is spelled
+            // from the record itself; it is the same ARN the request named.
+            return Err(not_found(crate::state::alias_not_found_message(
+                &record.versioned_arn(&input.name),
+            )));
         };
         Ok(alias_configuration(record.alias_configuration(alias)))
     }
+}
+
+/// The modelled 400 for a `FunctionName` that is not one of the documented name forms,
+/// or that qualifies a version or an alias an alias cannot belong to.
+fn invalid_parameter(message: String) -> GetAliasError {
+    GetAliasErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+        r#type: None,
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled 404 for an alias this read could not find, and for a Region this endpoint
+/// does not serve.
+fn not_found(message: String) -> GetAliasError {
+    GetAliasErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        r#type: None,
+        message: Some(message),
+    })
+    .into()
 }
 
 /// The one `AliasConfiguration` the model declares, in this operation's own generated
