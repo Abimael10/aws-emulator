@@ -122,11 +122,15 @@ const SHAPE_APART: f32 = 0.05;
 /// of them a mark is undecided, so that the ink as each of them draws it settles the answer
 /// ([`settled`]).
 ///
-/// A hair: blurring a grid a cell wide spreads a stroke over its neighbours, so two
-/// characters that differ by one stroke of a letterform — a crossbar, a flat side, a
-/// counter that closes — come out within about this of each other, while two characters
-/// that differ by a whole letterform do not.
-const TIED: f32 = 0.03;
+/// Blurring a grid a cell wide spreads a stroke over its neighbours, so two characters that
+/// differ by one stroke of a letterform — a crossbar, a flat side, a counter that closes —
+/// come out within about this of each other, while two characters that differ by a whole
+/// letterform do not. How far apart that one stroke leaves them depends on the size and the
+/// weight the page was drawn at: the heavier the stroke and the smaller the counter it
+/// closes, the smaller the share of the grid that one letterform covers and the nearer the
+/// two readings stand — so the window has to cover the spread a single stroke of difference
+/// accounts for at any of those sizes, and the sharp ink then settles which character it is.
+const TIED: f32 = 0.05;
 
 /// The side of one glyph cell of the embedded 8x8 bitmap font.
 pub(super) const FONT_CELL: usize = 8;

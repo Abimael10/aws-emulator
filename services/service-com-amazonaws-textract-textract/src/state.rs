@@ -1766,8 +1766,10 @@ struct LineLayout {
     /// reading a row costs time proportional to its cells rather than to their square —
     /// which one line of a caller's document can hold many thousands of.
     cell_starts: Vec<usize>,
-    /// Character column of the `:` that separates a label from its value.
-    colon: Option<usize>,
+    /// Character column the line's LABEL ends at, where the line labels a value: the `:`
+    /// that punctuates it, the break between two columns, or the space before the value on
+    /// a line the page punctuates in no way at all.
+    split: Option<usize>,
 }
 
 /// A deterministic block id, rendered in the 8-4-4-4-12 form Textract's ids take.
@@ -2024,17 +2026,16 @@ fn words_of(line: &str) -> Vec<(usize, String)> {
     words
 }
 
-/// Whether `word` is an AMOUNT: figures, with the currency sign, the separators and the
-/// sign an amount or a date is written with, and no letters.
+/// Whether `word` carries a FIGURE: a token with a digit anywhere in it.
 ///
 /// What tells the value of a labelled line from the words that label it, on a line that
-/// punctuates neither: `12.34`, `$12.34`, `-1,250.00` and `01/02/2023` are amounts, while
-/// `RECEIPT` and `Net30` are not.
-fn is_amount(word: &str) -> bool {
+/// punctuates neither: `12.34`, `$12.34`, `01/02/2023` and `INV-99887` all carry the
+/// figures a label stands against, while `RECEIPT` and `Total` carry none. A value is
+/// taken whole from the first such token to the end of the line, so the letters an
+/// identifier mixes with its figures are no reason to read the value from part way
+/// through it.
+fn carries_figure(word: &str) -> bool {
     word.chars().any(|c| c.is_ascii_digit())
-        && word
-            .chars()
-            .all(|c| c.is_ascii_digit() || "$€£¥+-.,/%()".contains(c))
 }
 
 /// Lay out one page's lines, numbering their words so every read path agrees on ids.
@@ -2097,28 +2098,38 @@ fn layout_page(
             // * on a line laid out in TWO columns, the break between them, since a label
             //   standing in one column and its value in the next is how a form is set out
             //   whether or not the label is punctuated;
-            // * on a plain line whose last word is an AMOUNT, the space before it: a line
-            //   of words ending in figures labels those figures, which is how a receipt
-            //   sets out its total and a statement its balance.
+            // * on a plain line, the space before its FIRST token that carries a figure:
+            //   a line of words followed by figures labels those figures, which is how a
+            //   receipt sets out its total, a statement its balance and an invoice its
+            //   number. The value is the whole run from that token to the end of the line,
+            //   not its last token alone, so a value written as several tokens — an
+            //   identifier the page spaces out, an amount with its currency beside it — is
+            //   labelled whole rather than from part way through.
             //
             // A line of three columns or more is a table row, which labels nothing.
             let labelled = |at: usize| {
                 words.iter().any(|w| w.column <= at) && words.iter().any(|w| w.column > at)
             };
             let punctuated = line.chars().position(|c| c == ':');
-            let amount = words
-                .last()
-                .filter(|last| words.len() > 1 && is_amount(&last.text))
-                .and_then(|last| last.column.checked_sub(1));
+            // The first token of the line that carries a figure, past the one that opens
+            // it: what a labelled line's value begins at where the page punctuates the
+            // label in no way at all. The opening token is never the value — a line whose
+            // very first token carries a figure labels nothing, it IS the figure.
+            let figures = words
+                .iter()
+                .skip(1)
+                .find(|word| carries_figure(&word.text))
+                .and_then(|word| word.column.checked_sub(1));
             let colon = match cell_texts.len() {
                 0 => None,
-                1 => punctuated.or(amount).filter(|at| labelled(*at)),
+                1 => punctuated
+                    .filter(|at| labelled(*at))
+                    .or_else(|| figures.filter(|at| labelled(*at))),
                 2 => punctuated
                     .or_else(|| line.chars().position(|c| c == '\t'))
                     .filter(|at| labelled(*at)),
                 _ => None,
-            };
-            let cells: Vec<usize> = if is_row {
+            };            let cells: Vec<usize> = if is_row {
                 cell_texts
                     .iter()
                     .map(|cell| cell.split_whitespace().count())
@@ -2153,7 +2164,7 @@ fn layout_page(
                 words,
                 cells,
                 cell_starts,
-                colon,
+                split: colon,
             }
         })
         .collect();
@@ -2171,7 +2182,7 @@ fn layout_page(
             .is_some_and(|before| rows[before])
             || rows.get(index + 1).copied().unwrap_or(false);
         if rows[index] && beside {
-            line.colon = None;
+            line.split = None;
         }
     }
     laid_out
@@ -2285,9 +2296,10 @@ fn form_blocks(
     let mut out = Vec::new();
     let mut ids = Vec::new();
     for line in lines {
-        let Some((_, key_words, value_words)) = labelled_split(line) else {
+        let Some(field) = labelled_split(line) else {
             continue;
         };
+        let (key_words, value_words) = (field.label, field.value);
         let key_id = block_id(key, "KEY", &[page_index, line.index]);
         let value_id = block_id(key, "VALUE", &[page_index, line.index]);
 
@@ -2346,26 +2358,45 @@ fn words_confidence(line: &LineLayout, words: &[&WordLayout]) -> f32 {
     (total / characters as f32).clamp(0.0, 100.0)
 }
 
-/// The label and the value halves of a labelled line, with the column of the `:` that
-/// separates them, or `None` when the line labels nothing.
+/// A labelled line read apart: the words and the text of its LABEL, and the words and the
+/// text of the VALUE it labels.
+struct Labelled<'a> {
+    label: Vec<&'a WordLayout>,
+    value: Vec<&'a WordLayout>,
+    label_text: String,
+    value_text: String,
+}
+
+/// The label and the value halves of a labelled line, or `None` when the line labels
+/// nothing.
 ///
-/// The ONE reader of a labelled line: the `FORMS` KEY/VALUE pairs and `AnalyzeExpense`'s
-/// summary fields both split a line here, so the two paths cannot disagree on which
-/// lines carry a field. A half with no text of its own labels nothing.
-fn labelled_split(line: &LineLayout) -> Option<(usize, Vec<&WordLayout>, Vec<&WordLayout>)> {
-    let colon = line.colon?;
-    let label: Vec<&WordLayout> = line.words.iter().filter(|w| w.column <= colon).collect();
-    let value: Vec<&WordLayout> = line.words.iter().filter(|w| w.column > colon).collect();
-    if label.is_empty() || value.is_empty() {
-        return None;
-    }
+/// The ONE reader of a labelled line: the `FORMS` KEY/VALUE pairs, the `QUERIES` field
+/// index and `AnalyzeExpense`'s summary fields all split a line here, so those paths
+/// cannot disagree on which lines carry a field, nor on where the value of one begins.
+///
+/// The VALUE is the line's characters from where its FIRST value word begins to the end of
+/// the line: the text of a field and the words it is made of are therefore the same span of
+/// the page — every character of the value, in order — so a value of several words is never
+/// reported from part way through. The LABEL is the characters before the separator. A half
+/// with no text of its own labels nothing.
+fn labelled_split(line: &LineLayout) -> Option<Labelled<'_>> {
+    let split = line.split?;
+    let label: Vec<&WordLayout> = line.words.iter().filter(|w| w.column <= split).collect();
+    let value: Vec<&WordLayout> = line.words.iter().filter(|w| w.column > split).collect();
     let chars = line.text.chars().count();
-    if char_span(&line.text, 0, colon).trim().is_empty()
-        || char_span(&line.text, colon + 1, chars).trim().is_empty()
-    {
+    let label_text = char_span(&line.text, 0, split).trim().to_string();
+    let value_text = char_span(&line.text, value.first()?.column, chars)
+        .trim()
+        .to_string();
+    if label.is_empty() || label_text.is_empty() || value_text.is_empty() {
         return None;
     }
-    Some((colon, label, value))
+    Some(Labelled {
+        label,
+        value,
+        label_text,
+        value_text,
+    })
 }
 
 /// The page's tables: each one a contiguous run of tab-separated lines, in page order.
@@ -2557,19 +2588,18 @@ pub fn fields(key: &str, content: &DocumentContent) -> Vec<Field> {
     for (page_index, page_text) in content.pages.iter().enumerate() {
         let page_number = i32::try_from(page_index + 1).unwrap_or(i32::MAX);
         for line in layout_page(key, page_index, page_text, content) {
-            let Some((colon, _, value_words)) = labelled_split(&line) else {
+            let Some(field) = labelled_split(&line) else {
                 continue;
             };
-            let label = char_span(&line.text, 0, colon).trim().to_string();
-            let value_region = words_region(&line, &value_words);
-            let value_confidence = words_confidence(&line, &value_words);
+            let value_region = words_region(&line, &field.value);
+            let value_confidence = words_confidence(&line, &field.value);
             out.push(Field {
                 page_number,
-                label_terms: terms(&label).into_iter().collect(),
-                label,
-                value: char_span(&line.text, colon + 1, line.text.chars().count())
-                    .trim()
-                    .to_string(),
+                label_terms: terms(&field.label_text).into_iter().collect(),
+                label: field.label_text,
+                // The answer to a query is the field's WHOLE value as the page draws it,
+                // which is the span [`labelled_split`] read: no offset is taken into it.
+                value: field.value_text,
                 value_region,
                 value_confidence,
             });
@@ -2922,12 +2952,11 @@ fn char_span(text: &str, from: usize, to: usize) -> String {
 fn summary_fields(lines: &[LineLayout], page_number: i32) -> Vec<ExpenseField> {
     let mut out = Vec::new();
     for line in lines {
-        let Some((colon, label_words, value_words)) = labelled_split(line) else {
+        let Some(field) = labelled_split(line) else {
             continue;
         };
-        let chars = line.text.chars().count();
-        let label = char_span(&line.text, 0, colon).trim().to_string();
-        let value = char_span(&line.text, colon + 1, chars).trim().to_string();
+        let (label, value) = (field.label_text, field.value_text);
+        let (label_words, value_words) = (field.label, field.value);
         let value_confidence = words_confidence(line, &value_words);
         out.push(expense_field(
             summary_field_type(&label),
