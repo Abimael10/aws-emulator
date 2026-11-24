@@ -163,15 +163,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "You can specify as many as 50 unique identifiers in this array."
         // The ARRAY ITSELF is bounded first, before any per-element work, so a
-        // request carrying a large array costs nothing to refuse.
+        // request carrying a large array costs nothing to refuse. The cap is
+        // documented rather than modelled, so the refusal is worded here — in
+        // the sentence a constraint violation gets, not in prose of this
+        // operation's own.
         if input.finding_ids.len() > crate::state::MAX_GET_FINDINGS_IDS {
             return Err(GetFindingsErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(format!(
-                        "The findingIds array can contain as many as {} unique identifiers; \
-                         the request named {}.",
-                        crate::state::MAX_GET_FINDINGS_IDS,
-                        input.finding_ids.len()
+                    message: Some(crate::state::too_many_finding_ids_message(
+                        &input.finding_ids,
                     )),
                 },
             )

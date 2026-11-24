@@ -11,17 +11,27 @@
 //! translation is this file's whole concern; what Macie can then DO with the
 //! criterion — compile the expression, or read the object out of this
 //! emulator's own object store — is [`super::allow_lists`]'s.
+//!
+//! The documentation states the RULE. It is not the sentence the service
+//! answers a request that breaks it with: the two sentences below are the
+//! service's own wording for the two ways the rule is broken, and a model's
+//! documentation trait is never the runtime text of a refusal.
 
 use crate::ops::types::{AllowListCriteria, S3WordsList};
 
-/// How the service refuses a `criteria` that does not specify exactly one
-/// criterion. The whole sentence is the documented rule for the shape ("The
-/// criteria must specify a regular expression (regex) or an S3 object
-/// (s3WordsList). It can't specify both"), so it interpolates nothing from the
-/// request.
-pub const CRITERIA_MUST_SPECIFY_ONE_MESSAGE: &str =
-    "The criteria must specify a regular expression (regex) or an S3 object (s3WordsList). \
-     It can't specify both.";
+/// How the service refuses a `criteria` that specifies BOTH a regular
+/// expression and an S3 object. The whole sentence is fixed text for that error
+/// class: it interpolates no name, id, value or member from the request.
+pub const CRITERIA_SPECIFIES_BOTH_MESSAGE: &str =
+    "Allow list criteria can specify a regex or an S3 object, but not both.";
+
+/// How it refuses a `criteria` that specifies NEITHER of them — the
+/// complementary way the one rule is broken, so the sentence is
+/// [`CRITERIA_SPECIFIES_BOTH_MESSAGE`]'s requirement half with the exclusion
+/// half dropped. Fixed text too: a request carrying nothing has nothing to
+/// interpolate.
+pub const CRITERIA_SPECIFIES_NEITHER_MESSAGE: &str =
+    "Allow list criteria must specify a regex or an S3 object.";
 
 /// How the service refuses an edit whose `criteria` specify a DIFFERENT kind of
 /// criterion from the one the stored list specifies. The sentence states the
@@ -53,7 +63,9 @@ pub enum AllowListCriterion {
 
 impl AllowListCriterion {
     /// The one criterion `criteria` specifies, or the message the service
-    /// refuses it with when it specifies both or neither.
+    /// refuses it with — which says WHICH way the rule was broken, because the
+    /// single error code every input problem on these operations carries leaves
+    /// the message as the only discriminator a caller has.
     pub fn from_modeled(criteria: &AllowListCriteria) -> Result<Self, String> {
         match (criteria.regex.as_deref(), criteria.s3_words_list.as_ref()) {
             (Some(regex), None) => Ok(Self::Regex(regex.to_string())),
@@ -61,7 +73,8 @@ impl AllowListCriterion {
                 bucket_name: words.bucket_name.clone(),
                 object_key: words.object_key.clone(),
             }),
-            _ => Err(CRITERIA_MUST_SPECIFY_ONE_MESSAGE.to_string()),
+            (Some(_), Some(_)) => Err(CRITERIA_SPECIFIES_BOTH_MESSAGE.to_string()),
+            (None, None) => Err(CRITERIA_SPECIFIES_NEITHER_MESSAGE.to_string()),
         }
     }
 

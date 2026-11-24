@@ -62,12 +62,14 @@ const STATUS_OK: &str = "OK";
 const STATUS_NOT_FOUND: &str = "S3_OBJECT_NOT_FOUND";
 const STATUS_EMPTY: &str = "S3_OBJECT_EMPTY";
 
-/// How the service refuses a `criteria` that does not specify exactly one
-/// criterion: the documented rule for the shape
-/// (`smithy_query(query="shape",shape="AllowListCriteria")`).
-const CRITERIA_MESSAGE: &str =
-    "The criteria must specify a regular expression (regex) or an S3 object (s3WordsList). \
-     It can't specify both.";
+/// How the service refuses a `criteria` that specifies BOTH a regular
+/// expression and an S3 object: fixed text for that error class, interpolating
+/// nothing from the request.
+const CRITERIA_BOTH_MESSAGE: &str =
+    "Allow list criteria can specify a regex or an S3 object, but not both.";
+
+/// How it refuses a `criteria` that specifies NEITHER of them.
+const CRITERIA_NEITHER_MESSAGE: &str = "Allow list criteria must specify a regex or an S3 object.";
 
 /// This service beside this emulator's own Amazon S3, on one shared engine.
 struct Aws {
@@ -174,6 +176,18 @@ impl Aws {
             "GET",
             &format!("{ALLOW_LISTS_URI}/{id}"),
             "",
+        )
+        .await
+    }
+
+    /// `UpdateAllowList` of `id`, with the body a client sends.
+    async fn update(&self, id: &str, body: &serde_json::Value) -> (u16, serde_json::Value) {
+        call_in(
+            &self.router,
+            REGION,
+            "PUT",
+            &format!("{ALLOW_LISTS_URI}/{id}"),
+            &body.to_string(),
         )
         .await
     }
@@ -324,24 +338,45 @@ async fn a_create_naming_an_absent_object_is_refused_and_stores_nothing() {
 }
 
 /// A `criteria` that specifies both criteria, or neither, is refused 400
-/// `ValidationException` with the documented rule, and stores nothing.
+/// `ValidationException` with the sentence for that violation, and stores
+/// nothing. The rows differ in which criteria are named and in the values they
+/// carry, so no sentence is keyed to one regex, bucket or key.
 #[tokio::test]
 async fn a_create_must_specify_exactly_one_criterion() {
     let aws = Aws::new().await;
     aws.put_object(BUCKET, "staged.txt", b"allowed\n").await;
+    aws.put_object(OTHER_BUCKET, "other.txt", b"also-allowed\n")
+        .await;
 
-    let rows: &[(&str, serde_json::Value)] = &[
+    let rows: &[(&str, serde_json::Value, &str)] = &[
         (
             "both a regex and an S3 object",
             serde_json::json!({
                 "regex": "[0-9]{3}",
                 "s3WordsList": { "bucketName": BUCKET, "objectKey": "staged.txt" },
             }),
+            CRITERIA_BOTH_MESSAGE,
         ),
-        ("neither", serde_json::json!({})),
+        (
+            "both, naming another bucket, key and expression",
+            serde_json::json!({
+                "regex": ".+",
+                "s3WordsList": { "bucketName": OTHER_BUCKET, "objectKey": "other.txt" },
+            }),
+            CRITERIA_BOTH_MESSAGE,
+        ),
+        (
+            "both, naming an object the store holds nothing at",
+            serde_json::json!({
+                "regex": "a",
+                "s3WordsList": { "bucketName": ABSENT_BUCKET, "objectKey": "absent.txt" },
+            }),
+            CRITERIA_BOTH_MESSAGE,
+        ),
+        ("neither", serde_json::json!({}), CRITERIA_NEITHER_MESSAGE),
     ];
 
-    for (index, (case, criteria)) in rows.iter().enumerate() {
+    for (index, (case, criteria, expected)) in rows.iter().enumerate() {
         let name = format!("criteria-{index}");
         let body = serde_json::json!({
             "name": name,
@@ -360,8 +395,8 @@ async fn a_create_must_specify_exactly_one_criterion() {
         );
         let message = error_message(&reply);
         assert_eq!(
-            message, CRITERIA_MESSAGE,
-            "case {case:?}: expected {CRITERIA_MESSAGE:?}, got {message:?}"
+            message, *expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
         );
     }
 
@@ -369,6 +404,82 @@ async fn a_create_must_specify_exactly_one_criterion() {
     assert!(
         listed.is_empty(),
         "a refused create must store nothing, got {listed:?}"
+    );
+}
+
+/// The edit is held to the same rule as the create and refuses it in the same
+/// words, so one error class reads the same whichever operation reports it. The
+/// settings the stored list carries are untouched by a refused edit.
+#[tokio::test]
+async fn an_edit_must_specify_exactly_one_criterion() {
+    let aws = Aws::new().await;
+    aws.put_object(BUCKET, "staged.txt", b"allowed\n").await;
+    aws.put_object(OTHER_BUCKET, "other.txt", b"also-allowed\n")
+        .await;
+
+    let id = created(
+        &aws,
+        &serde_json::json!({
+            "name": "edited-list",
+            "clientToken": "token-edited-list",
+            "criteria": { "regex": "[0-9]{3}" },
+        }),
+        "a regex-only create",
+    )
+    .await;
+
+    let rows: &[(&str, serde_json::Value, &str)] = &[
+        (
+            "both a regex and an S3 object",
+            serde_json::json!({
+                "regex": "[0-9]{4}",
+                "s3WordsList": { "bucketName": BUCKET, "objectKey": "staged.txt" },
+            }),
+            CRITERIA_BOTH_MESSAGE,
+        ),
+        (
+            "both, naming another expression and another bucket",
+            serde_json::json!({
+                "regex": "x+",
+                "s3WordsList": { "bucketName": OTHER_BUCKET, "objectKey": "other.txt" },
+            }),
+            CRITERIA_BOTH_MESSAGE,
+        ),
+        ("neither", serde_json::json!({}), CRITERIA_NEITHER_MESSAGE),
+    ];
+
+    for (case, criteria, expected) in rows {
+        let body = serde_json::json!({
+            "name": "edited-list",
+            "criteria": criteria,
+        });
+        let (status, reply) = aws.update(&id, &body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status} with {reply:?}"
+        );
+        let code = error_code(&reply);
+        assert_eq!(
+            code, "ValidationException",
+            "case {case:?}: expected ValidationException, got {code:?} with {reply:?}"
+        );
+        let message = error_message(&reply);
+        assert_eq!(
+            message, *expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
+        );
+    }
+
+    // The refused edits left the stored criteria alone.
+    let (status, read) = aws.get(&id).await;
+    assert_eq!(
+        status, 200,
+        "the edited list must still be readable, got {status} with {read:?}"
+    );
+    assert_eq!(
+        read["criteria"]["regex"].as_str(),
+        Some("[0-9]{3}"),
+        "a refused edit must leave the stored criteria alone, got {read:?}"
     );
 }
 

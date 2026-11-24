@@ -193,7 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             ListAutomatedDiscoveryAccountsErrorModeled::ValidationException(
                                 ValidationException {
                                     message: Some(
-                                        crate::state::TOO_MANY_ACCOUNT_IDS_MESSAGE.to_string(),
+                                        crate::state::too_many_account_ids_message(ids),
                                     ),
                                 },
                             )

@@ -96,10 +96,25 @@ pub const MACIE_SUSPENDED_RELATIONSHIP_STATUS: &str = "Paused";
 /// status an enable naming none takes.
 pub const MACIE_RUNNING_STATUS: &str = DEFAULT_MACIE_STATUS;
 
+/// The member a `ListAutomatedDiscoveryAccounts` refusal about that cap names,
+/// as the operation's input spells it.
+pub const ACCOUNT_IDS_MEMBER: &str = "accountIds";
+
 /// How `ListAutomatedDiscoveryAccounts` refuses a request naming more accounts
-/// than one call may ask about, which the `accountIds` member documents as 50.
-pub const TOO_MANY_ACCOUNT_IDS_MESSAGE: &str =
-    "The request is rejected because accountIds specifies more than 50 accounts.";
+/// than one call may ask about, which the `accountIds` member documents as
+/// [`MAX_LISTED_AUTOMATED_DISCOVERY_ACCOUNT_IDS`].
+///
+/// The cap is documentation rather than a modelled `@length`, so no walk ahead
+/// of the handler reports it; the sentence is still the one a constraint
+/// violation gets
+/// ([`super::constraint_refusal::strings_over_cap_message`]).
+pub fn too_many_account_ids_message(account_ids: &[String]) -> String {
+    super::constraint_refusal::strings_over_cap_message(
+        ACCOUNT_IDS_MEMBER,
+        account_ids,
+        MAX_LISTED_AUTOMATED_DISCOVERY_ACCOUNT_IDS,
+    )
+}
 
 /// How `BatchUpdateAutomatedDiscoveryAccounts` refuses an account update that
 /// names no account to change the status of.

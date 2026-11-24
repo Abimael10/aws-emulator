@@ -316,6 +316,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// Smithy model; none of them is expressible as a modelled constraint, so the
 /// boundary validator passes them all and this is where they are refused. The
 /// constants are in `crate::state`, each citing the sentence it comes from.
+///
+/// A bound on how many elements a LIST member carries is a constraint on that
+/// member, so it is refused in the sentence a constraint violation gets
+/// (`crate::state::constraint_refusal`), the same one the framework's own walk
+/// states for a size the model declares.
 fn documented_violation(input: &CreateCustomDataIdentifierInput) -> Option<String> {
     let name_chars = input.name.chars().count();
     if name_chars == 0 {
@@ -350,9 +355,10 @@ fn documented_violation(input: &CreateCustomDataIdentifierInput) -> Option<Strin
 
     if let Some(keywords) = input.keywords.as_deref() {
         if keywords.len() > crate::state::MAX_KEYWORDS {
-            return Some(format!(
-                "The keywords array can contain as many as {} keywords.",
-                crate::state::MAX_KEYWORDS
+            return Some(crate::state::strings_over_cap_message(
+                "keywords",
+                keywords,
+                crate::state::MAX_KEYWORDS,
             ));
         }
         if keywords.iter().any(|keyword| {
@@ -369,9 +375,10 @@ fn documented_violation(input: &CreateCustomDataIdentifierInput) -> Option<Strin
 
     if let Some(ignore_words) = input.ignore_words.as_deref() {
         if ignore_words.len() > crate::state::MAX_IGNORE_WORDS {
-            return Some(format!(
-                "The ignoreWords array can contain as many as {} ignore words.",
-                crate::state::MAX_IGNORE_WORDS
+            return Some(crate::state::strings_over_cap_message(
+                "ignoreWords",
+                ignore_words,
+                crate::state::MAX_IGNORE_WORDS,
             ));
         }
         if ignore_words.iter().any(|word| {

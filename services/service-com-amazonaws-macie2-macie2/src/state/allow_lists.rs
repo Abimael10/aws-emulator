@@ -25,7 +25,8 @@ use crate::ops::types::AllowListStatus;
 /// every path that reads an allow list's criteria resolves through this module
 /// as before.
 pub use super::allow_list_criteria::{
-    AllowListCriterion, CRITERIA_MUST_SPECIFY_ONE_MESSAGE, CRITERIA_TYPE_IS_FIXED_MESSAGE,
+    AllowListCriterion, CRITERIA_SPECIFIES_BOTH_MESSAGE, CRITERIA_SPECIFIES_NEITHER_MESSAGE,
+    CRITERIA_TYPE_IS_FIXED_MESSAGE,
 };
 
 /// The resource-type segment of an allow list's ARN, read off the ARN grammar
@@ -425,13 +426,16 @@ mod tests {
             );
         }
 
-        let refused: &[(&str, AllowListCriteria)] = &[
+        // Each way the one rule is broken earns the sentence for THAT way, so
+        // the message tells the two apart.
+        let refused: &[(&str, AllowListCriteria, &str)] = &[
             (
                 "both a regex and an S3 object",
                 AllowListCriteria {
                     regex: Some("[0-9]{3}".to_string()),
                     s3_words_list: Some(words()),
                 },
+                CRITERIA_SPECIFIES_BOTH_MESSAGE,
             ),
             (
                 "neither",
@@ -439,14 +443,15 @@ mod tests {
                     regex: None,
                     s3_words_list: None,
                 },
+                CRITERIA_SPECIFIES_NEITHER_MESSAGE,
             ),
         ];
-        for (case, criteria) in refused {
+        for (case, criteria, expected) in refused {
             let actual = AllowListCriterion::from_modeled(criteria);
             assert_eq!(
                 actual,
-                Err(CRITERIA_MUST_SPECIFY_ONE_MESSAGE.to_string()),
-                "case {case:?}: expected the documented refusal, got {actual:?}"
+                Err((*expected).to_string()),
+                "case {case:?}: expected {expected:?}, got {actual:?}"
             );
         }
     }

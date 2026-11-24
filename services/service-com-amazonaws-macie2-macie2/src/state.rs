@@ -74,6 +74,9 @@ use crate::ops::types::{
 /// The ONE criterion an allow list specifies, and how a request specifying the
 /// wrong number of them is refused.
 pub mod allow_list_criteria;
+/// The ONE wording of a refusal earned by a request member carrying more
+/// elements than its documentation admits.
+pub mod constraint_refusal;
 /// The ONE bounded compile of a regular expression a caller sent, which both
 /// the custom-data-identifier refusal and an allow list's status rest on.
 pub mod bounded_pattern;
@@ -81,6 +84,7 @@ pub mod bounded_pattern;
 pub mod allow_lists;
 
 pub use allow_lists::{AllowList, AllowListCriterion};
+pub use constraint_refusal::*;
 
 /// Region used when a request carries no SigV4 credential scope to read one
 /// from (an unsigned in-process call), matching the emulator's default region.

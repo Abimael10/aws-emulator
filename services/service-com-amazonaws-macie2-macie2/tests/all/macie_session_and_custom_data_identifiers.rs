@@ -1399,3 +1399,153 @@ async fn a_retried_create_replays_the_identifier_its_client_token_minted() {
         );
     }
 }
+
+/// AWS's constraint-violation sentence for a list member that broke a size:
+/// the `N validation error(s) detected:` envelope over one clause quoting the
+/// submitted list, the member path it sat at and the requirement it broke.
+///
+/// Written out here rather than imported, so the suite pins the TEXT instead of
+/// re-asserting whatever the crate happens to render.
+fn constraint_message(member: &str, submitted: &[String], max: usize) -> String {
+    format!(
+        "1 validation error detected: Value '[{}]' at '{member}' failed to satisfy constraint: \
+         Member must have length less than or equal to {max}",
+        submitted.join(", ")
+    )
+}
+
+/// `count` distinct elements of the form `member` carries, so each row's list is
+/// the member's own kind of value rather than one shared filler.
+fn elements(form: &str, count: usize) -> Vec<String> {
+    (0..count)
+        .map(|index| match form {
+            // A finding id is 32 lowercase hex digits (`Finding$id`).
+            "findingIds" => format!("{index:032x}"),
+            // An account id is 12 digits.
+            "accountIds" => format!("{:012}", 100_000_000_000u64 + index as u64),
+            // A keyword or an ignore word carries 4-90 characters, which every
+            // element below sits inside.
+            other => format!("{other}-{index:04}"),
+        })
+        .collect()
+}
+
+/// Every member whose SIZE this service bounds from its documentation rather
+/// than from a modelled `@length` reports the violation in AWS's
+/// constraint-violation sentence: the envelope, the submitted list quoted as a
+/// list renders, the member path and the requirement. The rows differ in the
+/// operation, the member, the cap and the number of elements past it; at the
+/// cap each call is served.
+#[tokio::test]
+async fn an_over_sized_list_member_is_refused_in_the_constraint_sentence() {
+    let router = emulator();
+    enable_in(&router, REGION, "{}").await;
+
+    // `(case, member, cap)` for each bounded list member, from that member's
+    // own documentation: `GetFindings$findingIds` ("as many as 50 unique
+    // identifiers"), `CreateCustomDataIdentifier$keywords` ("as many as 50
+    // keywords") and `$ignoreWords` ("as many as 10 ignore words"), and
+    // `ListAutomatedDiscoveryAccounts$accountIds` ("for as many as 50
+    // accounts").
+    let members: &[(&str, usize)] = &[
+        ("findingIds", macie2::state::MAX_GET_FINDINGS_IDS),
+        ("keywords", macie2::state::MAX_KEYWORDS),
+        ("ignoreWords", macie2::state::MAX_IGNORE_WORDS),
+        (
+            "accountIds",
+            macie2::state::MAX_LISTED_AUTOMATED_DISCOVERY_ACCOUNT_IDS,
+        ),
+    ];
+
+    // One element past the cap, and several past it, so the sentence is keyed
+    // to neither a count nor one list.
+    for (member, cap) in members {
+        for past in [1usize, 7] {
+            let case = format!("{member} {past} past its cap of {cap}");
+            let submitted = elements(member, cap + past);
+            let (status, reply) = call_member(&router, member, &submitted).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: a member past its documented size must be refused, \
+                 got {status} with {reply:?}"
+            );
+            assert_eq!(
+                error_code(&reply),
+                "ValidationException",
+                "case {case:?}: the refusal must be the modelled ValidationException, \
+                 got {reply:?}"
+            );
+            let expected = constraint_message(member, &submitted, *cap);
+            assert_eq!(
+                error_message(&reply),
+                expected,
+                "case {case:?}: expected {expected:?}, got {:?}",
+                error_message(&reply)
+            );
+        }
+
+        // AT the cap the call is served, so the sentence above is earned by the
+        // size and not by the member being named at all.
+        let case = format!("{member} at its cap of {cap}");
+        let submitted = elements(member, *cap);
+        let (status, reply) = call_member(&router, member, &submitted).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a member at its documented size must be served, \
+             got {status} with {reply:?}"
+        );
+    }
+}
+
+/// One request carrying `submitted` at `member`, through the operation that
+/// member belongs to.
+async fn call_member(
+    router: &MultiServiceRouter,
+    member: &str,
+    submitted: &[String],
+) -> (u16, serde_json::Value) {
+    match member {
+        "findingIds" => {
+            let body = serde_json::json!({ "findingIds": submitted });
+            call_in(
+                router,
+                REGION,
+                "POST",
+                "/findings/describe",
+                &body.to_string(),
+            )
+            .await
+        }
+        "accountIds" => {
+            let query: Vec<String> = submitted
+                .iter()
+                .map(|account| format!("accountIds={account}"))
+                .collect();
+            call_in(
+                router,
+                REGION,
+                "GET",
+                &format!("/automated-discovery/accounts?{}", query.join("&")),
+                "",
+            )
+            .await
+        }
+        // The two bounded list members of a create, which carries the required
+        // members beside the one under test.
+        other => {
+            let body = serde_json::json!({
+                "name": format!("for-{other}-{}", submitted.len()),
+                "regex": "a",
+                other: submitted,
+            });
+            call_in(
+                router,
+                REGION,
+                "POST",
+                "/custom-data-identifiers",
+                &body.to_string(),
+            )
+            .await
+        }
+    }
+}

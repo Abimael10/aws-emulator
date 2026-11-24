@@ -45,6 +45,26 @@ pub const MAX_FINDING_PAGE_SIZE: usize = super::MAX_PAGE_SIZE;
 /// array."
 pub const MAX_GET_FINDINGS_IDS: usize = 50;
 
+/// The member a `GetFindings` refusal about that cap names, as the operation's
+/// input spells it.
+pub const FINDING_IDS_MEMBER: &str = "findingIds";
+
+/// How `GetFindings` refuses a request naming more finding ids than
+/// [`MAX_GET_FINDINGS_IDS`].
+///
+/// The cap is documentation rather than a modelled `@length`, so no walk ahead
+/// of the handler reports it; the sentence is still the one a constraint
+/// violation gets ([`super::constraint_refusal::strings_over_cap_message`]), so
+/// this service reports a size it enforces itself exactly as it reports one the
+/// model declares.
+pub fn too_many_finding_ids_message(finding_ids: &[String]) -> String {
+    super::constraint_refusal::strings_over_cap_message(
+        FINDING_IDS_MEMBER,
+        finding_ids,
+        MAX_GET_FINDINGS_IDS,
+    )
+}
+
 /// The prefix every sensitive-data `FindingType` carries, which is what makes a
 /// finding of that type a CLASSIFICATION finding.
 pub const SENSITIVE_DATA_TYPE_PREFIX: &str = "SensitiveData:";
