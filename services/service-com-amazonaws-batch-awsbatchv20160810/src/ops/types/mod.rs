@@ -16,6 +16,7 @@
 
 pub mod cancel_job_types;
 pub mod cancel_jobs_types;
+pub mod container_properties_wire;
 pub mod create_compute_environment_types;
 pub mod create_consumable_resource_types;
 pub mod create_job_queue_types;
@@ -68,6 +69,8 @@ pub mod update_service_job_types;
 pub use cancel_job_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use cancel_jobs_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use container_properties_wire::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use create_compute_environment_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

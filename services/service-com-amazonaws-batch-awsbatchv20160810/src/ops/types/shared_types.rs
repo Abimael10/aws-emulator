@@ -25,8 +25,22 @@ pub const fn member_schema(
     shape_type: ::aws_smithy_schema::ShapeType,
     index: usize,
 ) -> ::aws_smithy_schema::Schema {
+    member_schema_in("com.amazonaws.batch", shape_id, name, shape_type, index)
+}
+
+/// The same, for a member whose shape id sits in a namespace OTHER than this service's own:
+/// a member the on-disk model does not declare at all, which is given a namespace of its own
+/// so it can neither claim to be modelled nor collide with a member a later model refresh
+/// declares (see `crate::ops::types::container_properties_wire`).
+pub const fn member_schema_in(
+    namespace: &'static str,
+    shape_id: &'static str,
+    name: &'static str,
+    shape_type: ::aws_smithy_schema::ShapeType,
+    index: usize,
+) -> ::aws_smithy_schema::Schema {
     ::aws_smithy_schema::Schema::new_member(
-        ::aws_smithy_schema::ShapeId::from_static(shape_id, "com.amazonaws.batch", name),
+        ::aws_smithy_schema::ShapeId::from_static(shape_id, namespace, name),
         shape_type,
         name,
         index,
@@ -282,34 +296,9 @@ pub struct EvaluateOnExit {
     pub action: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.batch#ContainerProperties")]
-#[derive(Debug, Clone, Default)]
-pub struct ContainerProperties {
-    pub image: Option<String>,
-    pub vcpus: Option<i32>,
-    pub memory: Option<i32>,
-    pub command: Option<Vec<String>>,
-    pub job_role_arn: Option<String>,
-    pub execution_role_arn: Option<String>,
-    pub volumes: Option<Vec<Volume>>,
-    pub environment: Option<Vec<KeyValuePair>>,
-    pub mount_points: Option<Vec<MountPoint>>,
-    pub readonly_root_filesystem: Option<bool>,
-    pub privileged: Option<bool>,
-    pub ulimits: Option<Vec<Ulimit>>,
-    pub user: Option<String>,
-    pub instance_type: Option<String>,
-    pub resource_requirements: Option<Vec<ResourceRequirement>>,
-    pub linux_parameters: Option<LinuxParameters>,
-    pub log_configuration: Option<LogConfiguration>,
-    pub secrets: Option<Vec<Secret>>,
-    pub network_configuration: Option<NetworkConfiguration>,
-    pub fargate_platform_configuration: Option<FargatePlatformConfiguration>,
-    pub enable_execute_command: Option<bool>,
-    pub ephemeral_storage: Option<EphemeralStorage>,
-    pub runtime_platform: Option<RuntimePlatform>,
-    pub repository_credentials: Option<RepositoryCredentials>,
-}
+// `ContainerProperties` is declared in `container_properties_wire`, where its schema and
+// codec are written out rather than derived: AWS Batch reports the two deprecated resource
+// reservations whatever the registration supplied, which a derived member cannot express.
 
 #[smithy_macros::smithy(shape = "com.amazonaws.batch#Volume")]
 #[derive(Debug, Clone, Default)]
@@ -424,11 +413,9 @@ pub struct Secret {
     pub value_from: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.batch#NetworkConfiguration")]
-#[derive(Debug, Clone, Default)]
-pub struct NetworkConfiguration {
-    pub assign_public_ip: Option<String>,
-}
+// `NetworkConfiguration` is declared in `container_properties_wire` for the same reason:
+// AWS Batch reports an interface-configuration list on it that the on-disk model does not
+// declare.
 
 #[smithy_macros::smithy(shape = "com.amazonaws.batch#FargatePlatformConfiguration")]
 #[derive(Debug, Clone, Default)]

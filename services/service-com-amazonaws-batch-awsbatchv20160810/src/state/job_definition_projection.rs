@@ -19,6 +19,11 @@
 //! Nothing is invented by it — an empty collection says exactly what the sparse member
 //! said — and nothing is written: it projects a CLONE of the stored record.
 //!
+//! The members a `ContainerProperties` object is reported with WHATEVER the record holds —
+//! its interface-configuration list and the two deprecated resource reservations — need no
+//! projection step at all: they are written by that structure's own serializer
+//! (`crate::ops::types::container_properties_wire`), on every read of every definition.
+//!
 //! Beside it is the one default the register applies, which is a WRITE: the Fargate
 //! platform version the definition's containers will actually run on, stored at
 //! registration so every later read reports it.
