@@ -1057,20 +1057,24 @@ fn authorization_refusal<Eng: Send + Sync + 'static>(
 ) -> Option<RtResponse> {
     let operation = svc.definition().protocol().routing_key(req).ok()?;
     svc.definition().routing_table().get(operation)?;
+    // The Region the request was signed for, which is the Region the resources it names are
+    // in: the ARN of one of them — a resource it addresses, and a resource one of its
+    // condition keys is typed by — carries it.
+    let region = crate::state::request_region(ctx.parts());
     // The resources the request addresses, which an action that supports resource-level
     // permissions is judged against. An action judged over EVERY resource is decided from
     // the caller's policies alone, so nothing is read out of the request for it.
     let resources = if authorization::judged_over_every_resource(operation) {
         Vec::new()
     } else {
-        addressed_resources::addressed_by(req, &crate::state::request_region(ctx.parts()))
+        addressed_resources::addressed_by(req, &region)
     };
     let refusal = authorization::authorize(
         engine,
         ctx,
         operation,
         &resources,
-        &request_conditions::request_conditions(req),
+        &request_conditions::request_conditions(req, operation, &region),
     )
     .err()?;
     // The refusal's own sentence, closed by the encoded authorization failure message where
