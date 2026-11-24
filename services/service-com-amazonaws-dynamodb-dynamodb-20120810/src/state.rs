@@ -147,15 +147,34 @@ pub const MAX_TRANSACTION_SIZE_BYTES: i64 = 4 * 1024 * 1024;
 /// than as the byte count behind it, and the payload is the aggregate this call measured
 /// ([`MAX_TRANSACTION_SIZE_BYTES`]).
 ///
-/// ONE sentence for the quota, whichever side of a transaction crossed it: a transactional
-/// WRITE measures the items and expression values the request carried, a transactional READ
-/// measures the items the store holds for the keys it named, and both are refused with this.
+/// This is the REQUEST side of the quota: a transactional WRITE measures the items and
+/// expression values the request carried, so the payload it names is the one the caller
+/// handed over and the one it has to shrink. The transactional READ side is measured on
+/// what the call would ANSWER, and states the response-side sentence instead
+/// ([`RESPONSE_PAYLOAD_TOO_LARGE_MESSAGE`]).
 ///
 /// The class the refusal takes is a top-level `ValidationException` rather than a
 /// cancellation, because no action of the transaction was applicable to begin with.
 pub fn transaction_size_exceeded_message(payload: i64) -> String {
     format!("Transaction payload size cannot exceed 4MB. Payload Size: {payload}")
 }
+
+/// How a call refused for the aggregate it would ANSWER is refused: one fixed sentence that
+/// says the payload is on the RESPONSE side, with nothing interpolated — no byte count, no
+/// item count, no table or key name.
+///
+/// A transactional READ's 4 MB ([`MAX_TRANSACTION_SIZE_BYTES`]) is a ceiling on the items it
+/// would hand back, not on the request it was handed, and the sentence says which side it
+/// is: that is how a caller tells "the read set I asked for is too big to return", which it
+/// answers by splitting the read set and retrying, from a request-payload or request-limit
+/// defect, which splitting would not help. So the request-payload sentence above belongs to
+/// the WRITE side alone ([`transaction_size_exceeded_message`]), and nothing about the run —
+/// the aggregate it measured least of all — is appended here: the whole sentence is fixed
+/// text, which is what makes it something a client can key on.
+///
+/// Like the request-side refusal it is a top-level `ValidationException` with no
+/// cancellation reasons, because no part of the transaction was served.
+pub const RESPONSE_PAYLOAD_TOO_LARGE_MESSAGE: &str = "Payload in response is too large.";
 
 /// How a `Key` member that is not the table's primary key is refused: AWS's
 /// FIXED sentence for that mismatch, with nothing about WHICH element differs

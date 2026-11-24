@@ -375,13 +375,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "the aggregate size of the items in the transaction cannot exceed 4 MB" — a
         // hundred items each inside the 400 KB item ceiling can still ask for more than one
         // transaction may carry. Asked before any budget is touched, so a request this quota
-        // refuses debits nothing and reports no item, and worded as the same quota is worded
-        // for a transactional WRITE ([`crate::state::transaction_size_exceeded_message`]):
-        // one quota, one sentence, over the aggregate this side measured — the items the
-        // store held for the keys this call named.
+        // refuses debits nothing and reports no item.
+        //
+        // On THIS side the quota is a ceiling on what the call would ANSWER — the items the
+        // store holds for the keys it named — so the refusal states the response-side
+        // sentence, fixed text with nothing of the run interpolated
+        // ([`crate::state::RESPONSE_PAYLOAD_TOO_LARGE_MESSAGE`]); the request-payload
+        // sentence, which names the payload a caller handed over, is the transactional
+        // WRITE's ([`crate::state::transaction_size_exceeded_message`]).
         if aggregate > crate::state::MAX_TRANSACTION_SIZE_BYTES {
             return Err(crate::scaffolded::Scaffolded::validation(
-                crate::state::transaction_size_exceeded_message(aggregate),
+                crate::state::RESPONSE_PAYLOAD_TOO_LARGE_MESSAGE,
             ));
         }
 

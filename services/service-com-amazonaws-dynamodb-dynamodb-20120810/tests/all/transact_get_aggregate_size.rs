@@ -6,8 +6,8 @@
 //! MB" and "DynamoDB rejects the entire TransactGetItems request if [...] the aggregate size
 //! of the items in the transaction exceeded 4 MB" (the `TransactGetItems` doc). So a call
 //! whose items add up to exactly the aggregate is served and reports every one of them,
-//! while one byte more is refused 400 `ValidationException` naming that quota and the
-//! payload the call measured, with no item reported — and the quota is on the items the
+//! while one byte more is refused 400 `ValidationException` stating that the payload the
+//! call would ANSWER is too large, with no item reported — and the quota is on the items the
 //! transaction READS, so a key that holds no item adds nothing to it.
 //!
 //! The rows span what the rule generalises over: the per-item size (items at the stored size
@@ -31,13 +31,12 @@ const TABLE: &str = "TransactGetAggregate";
 /// cannot exceed 4 MB").
 const MAX_TRANSACTION_BYTES: i64 = 4 * 1024 * 1024;
 
-/// The sentence a transaction past that aggregate is refused with, over the payload the
-/// call measured: the same sentence a transactional WRITE states for the same quota
-/// (`state::transaction_size_exceeded_message`), where the payload a READ measures is the
-/// size of the items the store held for the keys it named.
-fn too_large(payload: i64) -> String {
-    format!("Transaction payload size cannot exceed 4MB. Payload Size: {payload}")
-}
+/// The sentence a transactional READ past that aggregate is refused with: on this side the
+/// quota is a ceiling on what the call would ANSWER, so the refusal says the payload is on
+/// the RESPONSE side, in fixed text with nothing of the call interpolated
+/// (`state::RESPONSE_PAYLOAD_TOO_LARGE_MESSAGE`). The request-payload sentence, which names
+/// the payload a caller handed over, is the transactional WRITE's.
+const TOO_LARGE: &str = "Payload in response is too large.";
 
 /// How many bytes each key VALUE carries, so every item's key portion is the same length.
 const KEY_VALUE_BYTES: usize = 10;
@@ -191,17 +190,37 @@ async fn a_transactional_read_past_the_documented_aggregate_is_refused() {
             aggregate > MAX_TRANSACTION_BYTES,
             "case {case:?}: the row must address more than the aggregate, got {aggregate}"
         );
-        let expected = too_large(aggregate);
         assert_eq!(
             (status, error_code(&body).as_str(), message(&body)),
-            (400, "ValidationException", expected.clone()),
-            "case {case:?}: expected the aggregate refusal {expected:?}, got {status} with \
+            (400, "ValidationException", TOO_LARGE.to_string()),
+            "case {case:?}: expected the aggregate refusal {TOO_LARGE:?}, got {status} with \
              {body}"
         );
         assert!(
             body.get("Responses").is_none(),
             "case {case:?}: a refused transaction reports no item, got {body}"
         );
+        assert!(
+            body.get("CancellationReasons").is_none(),
+            "case {case:?}: the refusal is the request's own, so there is nothing to cancel, \
+             got {body}"
+        );
+        // Nothing was read, so every key the refused call addressed still reads back.
+        for at in &addressed {
+            let read = ok(
+                &router,
+                "GetItem",
+                json!({"TableName": TABLE, "Key": {"pk": {"S": key_value(*at)}},
+                       "ProjectionExpression": "pk", "ConsistentRead": true}),
+            )
+            .await;
+            assert_eq!(
+                read["Item"]["pk"]["S"].as_str(),
+                Some(key_value(*at).as_str()),
+                "case {case:?}: {:?} must still be readable after the refusal, got {read}",
+                key_value(*at)
+            );
+        }
     }
 
     // The CONTROL: the ceiling is a quota on the aggregate and not on the call, so the
