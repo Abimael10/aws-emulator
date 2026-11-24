@@ -760,13 +760,16 @@ async fn a_patch_through_cloud_control_changes_the_table_dynamodb_holds() {
 async fn a_create_the_owning_service_would_refuse_fails_with_the_handlers_verdict() {
     let emulator = Emulator::with_dynamodb();
     // The rows differ along WHICH rule the desired state breaks, and so along which handler
-    // verdict the refusal carries: the owning service's own rules for a declared table (a key
-    // attribute nothing defines, an attribute no key uses, a capacity stated for an on-demand
-    // table, a name outside the form a table name takes) are that service's own error, which
-    // the handler reports as the downstream call it was making rather than in that service's
-    // own words, while a property this handler does not apply and a property the type does
-    // not declare at all are faults the handler judges against the type's schema and states
-    // in its own.
+    // verdict the refusal carries: the owning service's own rules for a declared table (an
+    // attribute no key uses, a capacity stated for an on-demand table, a name outside the form
+    // a table name takes) are that service's own error, which the handler reports as the
+    // downstream call it was making rather than in that service's own words, while a key
+    // attribute the model itself defines nowhere, a property this handler does not apply and a
+    // property the type does not declare at all are faults the handler judges against the
+    // type's schema and states in its own.
+    //
+    // `table_key_schema_diagnosis` holds the first of those three to the whole class it stands
+    // for.
     let downstream = "Error occurred during operation 'CreateTable'.".to_string();
     let rows: [(&str, &str, Value, String, &str); 6] = [
         (
@@ -778,8 +781,8 @@ async fn a_create_the_owning_service_would_refuse_fails_with_the_handlers_verdic
                 "AttributeDefinitions": [{ "AttributeName": "other", "AttributeType": "S" }],
                 "BillingMode": "PAY_PER_REQUEST",
             }),
-            downstream.clone(),
-            "GeneralServiceException",
+            super::table_key_schema_diagnosis::KEY_ATTRIBUTE_UNDEFINED.to_string(),
+            "InvalidRequest",
         ),
         (
             "an attribute no key schema uses",

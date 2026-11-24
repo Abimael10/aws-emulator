@@ -24,9 +24,10 @@
 //! * `TableName`, the table's own name, which is its primary identifier and which the schema
 //!   declares create-only;
 //! * `KeySchema` and `AttributeDefinitions`, the primary key and the attributes it is
-//!   declared over, held to the OWNING service's own rules for a declared table
-//!   ([`ddb_create::validated_key_schema`]), so nothing is created here that service's own
-//!   `CreateTable` would refuse;
+//!   declared over, whose contract WITH EACH OTHER this handler settles itself
+//!   ([`key_attributes_declared`]) and which are otherwise held to the OWNING service's own
+//!   rules for a declared table ([`ddb_create::validated_key_schema`]), so nothing is created
+//!   here that service's own `CreateTable` would refuse;
 //! * `BillingMode` and `ProvisionedThroughput`, the capacity mode and the capacity a
 //!   provisioned table holds, resolved by that service's own rule for the pair
 //!   ([`ddb_create::validated_declared_throughput`]) — a CREATE settles the mode, while a
@@ -54,6 +55,7 @@
 //! A table's items are untouched by everything here: this type's schema declares no item
 //! data, so a resource operation of this service never writes one.
 
+use ::std::collections::HashSet;
 use ::std::time::SystemTime;
 
 use ::serde_json::{Map, Value};
@@ -289,10 +291,13 @@ impl NativeResourceProvider for TableProvider {
             },
             Intent::Create,
         )?;
+        // The ONE requirement this model states about itself is settled first, by the
+        // handler, before anything downstream is asked ([`key_attributes_declared`]).
+        key_attributes_declared(&desired.key_schema, &desired.attribute_definitions)?;
         // The primary key, the attributes it is declared over and the capacity the table is
-        // created with are the OWNING service's to accept: its own rules for a declared
-        // table are what refuse a key schema nothing defines, an attribute no schema uses,
-        // and a capacity pair that does not hold with the mode asked for.
+        // created with are otherwise the OWNING service's to accept: its own rules for a
+        // declared table are what refuse an attribute no schema uses and a capacity pair
+        // that does not hold with the mode asked for.
         let declared = ddb_create::DeclaredTable {
             key_schema: &desired.key_schema,
             attribute_definitions: &desired.attribute_definitions,
@@ -539,6 +544,54 @@ fn named(identifier: &str) -> Result<String, NativeRefusal> {
 /// error the downstream service raised.
 fn refusal(error: ddb::RequestError) -> NativeRefusal {
     NativeRefusal::Rejected(error.message().to_string())
+}
+
+/// This type's handler's own diagnosis of a primary key declared over an attribute the model
+/// does not define.
+///
+/// Fixed text, with nothing of the request in it: the attribute the key names, the attributes
+/// the model declares and the table's own name are no part of the sentence, because the fault
+/// it states is a break in the model rather than a value the owning service saw.
+const KEY_ATTRIBUTE_UNDEFINED: &str =
+    "An attribute referenced in a KeySchema element is not defined in AttributeDefinitions";
+
+/// Hold the resource model to the one requirement it states about ITSELF: every `KeySchema`
+/// element names an attribute the model's own `AttributeDefinitions` declares — "the
+/// attributes in `KeySchema` must also be defined in the `AttributeDefinitions` array"
+/// (`CreateTable$KeySchema`), which the type's registry schema carries as the contract of
+/// those two properties.
+///
+/// Settled by the HANDLER, before the owning service is asked anything: the break is visible
+/// in the model alone, so it is a fault in the desired state that the handler judges against
+/// the type's schema ([`NativeRefusal::Invalid`], reported as `InvalidRequest`) and states in
+/// its own fixed sentence ([`KEY_ATTRIBUTE_UNDEFINED`]). Were the call made instead, the
+/// owning service's own validator would refuse it, and relaying what THAT service said would
+/// put its message vocabulary — and the request's own attribute names, which it quotes — on
+/// this API's progress event.
+///
+/// Every other rule about the pair stays where it is held: a repeated definition, an
+/// attribute no schema of the table uses and a key type a primary key cannot have are the
+/// owning service's own, and a key element of the wrong SHAPE is read off the model itself
+/// ([`key_schema_of`]).
+///
+/// Both lists are as long as the model says, so the declared names are collected ONCE and
+/// each key element asked of that set: the work is the sum of the two counts rather than
+/// their product.
+fn key_attributes_declared(
+    key_schema: &[KeySchemaElement],
+    attribute_definitions: &[AttributeDefinition],
+) -> Result<(), NativeRefusal> {
+    let declared: HashSet<&str> = attribute_definitions
+        .iter()
+        .map(|definition| definition.attribute_name.as_str())
+        .collect();
+    if key_schema
+        .iter()
+        .any(|element| !declared.contains(element.attribute_name.as_str()))
+    {
+        return Err(NativeRefusal::Invalid(KEY_ATTRIBUTE_UNDEFINED.to_string()));
+    }
+    Ok(())
 }
 
 /// The resource model one table renders as — the schema's properties the owning record
