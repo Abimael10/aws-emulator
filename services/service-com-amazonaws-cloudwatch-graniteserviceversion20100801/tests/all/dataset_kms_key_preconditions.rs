@@ -40,7 +40,7 @@ use crate::sns_action_topic_policy::CLOUDWATCH_PRINCIPAL;
 /// kms:GenerateDataKey, kms:Encrypt, kms:Decrypt, and kms:ReEncrypt*."
 /// (`AssociateDatasetKmsKey`) — the set a key's owner writes, which is what the permitted rows
 /// grant.
-const DOCUMENTED_PERMISSIONS: [&str; 5] = [
+pub(crate) const DOCUMENTED_PERMISSIONS: [&str; 5] = [
     "kms:DescribeKey",
     "kms:GenerateDataKey",
     "kms:Encrypt",
@@ -64,7 +64,7 @@ const UNHELD_KEY: &str = "arn:aws:kms:us-east-1:000000000000:key/\
 
 /// A customer managed key as `CreateKey` mints it, carrying `policy` and the key spec and usage
 /// `spec` names: its ARN as KMS reports it.
-async fn given_key_with(
+pub(crate) async fn given_key_with(
     emulator: &Emulator,
     case: &str,
     policy: &str,
@@ -86,13 +86,13 @@ async fn given_key_with(
 }
 
 /// One key-policy statement about this service's principal.
-fn service_statement(effect: &str, actions: Value, extra: Value) -> Value {
+pub(crate) fn service_statement(effect: &str, actions: Value, extra: Value) -> Value {
     key_statement(effect, json!({"Service": CLOUDWATCH_PRINCIPAL}), actions, extra)
 }
 
 /// The key policy AWS documents for a dataset's key: the documented permissions, granted to this
 /// service's principal.
-fn documented_policy() -> String {
+pub(crate) fn documented_policy() -> String {
     key_policy(vec![service_statement(
         "Allow",
         json!(DOCUMENTED_PERMISSIONS),
@@ -111,7 +111,7 @@ async fn associate(emulator: &Emulator, key_arn: &str) -> (u16, Value) {
 }
 
 /// The `KmsKeyArn` `GetDataset` reports for the default dataset, or `None` when it omits it.
-async fn reported_key(emulator: &Emulator, case: &str) -> Option<String> {
+pub(crate) async fn reported_key(emulator: &Emulator, case: &str) -> Option<String> {
     let (status, body) = call(
         &emulator.router,
         "GetDataset",
