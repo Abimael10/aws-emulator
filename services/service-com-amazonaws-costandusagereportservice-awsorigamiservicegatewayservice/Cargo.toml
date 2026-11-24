@@ -29,11 +29,16 @@ hex = { workspace = true }
 # `page_tokens`: the secret a paginated read authenticates its continuation tokens under,
 # so a token this service did not issue is refused rather than served.
 service-common = { path = "../common" }
+# The destination bucket of a report definition, and the POLICY on it: the delivery grant a
+# definition is accepted under is read from the object store that owns the bucket.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# The one integration-test target declares every suite under `tests/all/`.
+automod = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 

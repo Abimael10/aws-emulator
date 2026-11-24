@@ -19,6 +19,11 @@ use std::time::SystemTime;
 
 pub use ::service_common::page_tokens::PageTokenKey;
 
+/// The destination bucket's delivery grant: the precondition every operation that accepts a
+/// `ReportDefinition` judges before it stores one.
+mod delivery_grant;
+pub use delivery_grant::*;
+
 use crate::ops::types::{
     ReportDefinition, ReportStatus, ResourceNotFoundException, Tag, ValidationException,
 };

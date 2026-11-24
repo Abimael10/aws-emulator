@@ -141,7 +141,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// and refuses any creation once the account holds [`crate::state::MAX_REPORTS`]
     /// definitions with `ReportLimitReachedException` — the two conditions the modelled
     /// error docs state — and refuses a definition whose Parquet preference is not usable
-    /// ([`crate::state::parquet_preference_is_usable`]) with `ValidationException`.
+    /// ([`crate::state::parquet_preference_is_usable`]), or whose destination bucket does
+    /// not grant the report delivery
+    /// ([`crate::state::validate_delivery_grant`]), with `ValidationException`.
     /// Otherwise the definition is stored member for member, with the tags supplied beside
     /// it, and becomes visible to every later read, which reports it through
     /// [`crate::state::StoredReport::wire_definition`].
@@ -159,6 +161,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // The destination's DELIVERY GRANT, judged before this service's store is even
+        // locked: the bucket's own policy has to let the billing pipeline write the report
+        // there, and a creation pointed at a bucket the report could never be delivered to
+        // is refused rather than stored. The decision reads the object store, so it is
+        // taken outside this store's lock; nothing is persisted on this path.
+        // See `crate::state::delivery_grant`.
+        crate::state::validate_delivery_grant(&*self.engine, &input.report_definition)
+            .map_err(PutReportDefinitionErrorModeled::ValidationException)?;
+
         let mut store = state.lock();
 
         let report_name = input.report_definition.report_name.clone();

@@ -144,7 +144,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ///   error code and HTTP status alone ([`crate::state::report_name_already_held`]);
     /// * a definition whose Parquet preference is not usable
     ///   ([`crate::state::parquet_preference_is_usable`]) — the replacement has to be a
-    ///   definition the service could deliver.
+    ///   definition the service could deliver;
+    /// * a definition whose destination bucket does not grant the report delivery
+    ///   ([`crate::state::validate_delivery_grant`]) — the same precondition the create
+    ///   path judges, because the replacement names a destination this service would have
+    ///   to deliver to.
     async fn handle(
         &self,
         input: Self::Input,
@@ -159,6 +163,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // The replacement's DELIVERY GRANT, judged before this service's store is even
+        // locked: the destination bucket's own policy has to let the billing pipeline write
+        // the report there, so an update that would point a report at a bucket it could
+        // never be delivered to is refused and the stored definition is left as it was. The
+        // decision reads the object store, so it is taken outside this store's lock.
+        // See `crate::state::delivery_grant`.
+        crate::state::validate_delivery_grant(&*self.engine, &input.report_definition)
+            .map_err(ModifyReportDefinitionErrorModeled::ValidationException)?;
+
         let mut store = state.lock();
 
         let Some(at) = store.position(&input.report_name) else {
