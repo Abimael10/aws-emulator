@@ -79,7 +79,10 @@ pub(crate) struct Answer {
 }
 
 impl Answer {
-    fn of(response: http::Response<Bytes>) -> Self {
+    /// `pub(crate)` for the sibling suites that drive this same exchange over their own
+    /// router ([`super::bedrock_agentcore_resource_api_key_authorization`]) rather than
+    /// reading an answer their own way.
+    pub(crate) fn of(response: http::Response<Bytes>) -> Self {
         let status = response.status().as_u16();
         let body = if response.body().is_empty() {
             Value::Null
