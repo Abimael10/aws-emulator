@@ -624,9 +624,15 @@ async fn every_row_publishes_component_defaults_inside_their_constraints() {
                 "case {case}/{member}: the published default must sit inside the published \
                  window, got {default_value:?} in {min:?}..{max:?}"
             );
+            // A published window runs forwards. Its two ends may be the SAME
+            // duration — that is what a parameter Amazon EKS publishes no
+            // alternative value for for a Kubernetes version looks like — so what
+            // this rule forbids is a window that runs backwards, not a window of
+            // one value. Which ends the published table states is asserted in
+            // `control_plane_component_constraints.rs`.
             assert!(
-                min_secs < max_secs,
-                "case {case}/{member}: expected a non-empty window, got {min:?}..{max:?}"
+                min_secs <= max_secs,
+                "case {case}/{member}: expected a window that runs forwards, got {min:?}..{max:?}"
             );
         }
 
@@ -680,19 +686,15 @@ async fn every_row_publishes_component_defaults_inside_their_constraints() {
             panic!("case {case}/terminatedPodGcThreshold: expected constraints.max, got {threshold:?}")
         });
         // The window the catalog publishes is the one a control plane of this
-        // version may be CONFIGURED in: strictly inside the range the model lets
-        // the member carry, with the component's own default as its ceiling (the
-        // largest number of terminated pods a control plane keeps) and a floor
-        // above the modelled minimum.
+        // version may be CONFIGURED in: inside the range the model lets the member
+        // carry, and running forwards — its two ends may be the same value, which
+        // is what a parameter Amazon EKS publishes no alternative value for looks
+        // like. Which ends the published table states is asserted in
+        // `control_plane_component_constraints.rs`.
         assert!(
-            1 < min && min < max && max < 1_000_000,
-            "case {case}/terminatedPodGcThreshold: the published window must be a real window \
-             strictly inside the modelled range, got {min}..{max}"
-        );
-        assert_eq!(
-            max, default_value,
-            "case {case}/terminatedPodGcThreshold: expected the component's own default as the \
-             published ceiling, got {max} against a default of {default_value}"
+            1 <= min && min <= max && max <= 1_000_000,
+            "case {case}/terminatedPodGcThreshold: the published window must run forwards inside \
+             the modelled range, got {min}..{max}"
         );
         assert!(
             min <= default_value && default_value <= max,

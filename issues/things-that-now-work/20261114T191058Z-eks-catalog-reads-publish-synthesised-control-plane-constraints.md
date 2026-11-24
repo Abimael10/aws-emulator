@@ -73,3 +73,28 @@ Smithy model consulted: services/service-com-amazonaws-eks-awswesleyfrontend/smi
    - GET /cluster-versions (optionally scoped with clusterVersions=<a supported version>) and diff clusterVersions[0].controlPlaneComponentConfig against the published EKS control-plane configuration constraints for that version: kubeApiServerConfig.serviceNodePortRange.constraints.minPort/maxPort min and max, kubeApiServerConfig.eventTtl.constraints.min, kubeControllerManagerConfig.podGcControllerConfig.terminatedPodGcThreshold.constraints.min and kubeControllerManagerConfig.horizontalPodAutoscalerControllerConfig.horizontalPodAutoscalerSyncPeriod.constraints.max all come back as emulator-chosen bounds, and kubeSchedulerConfig.nodeResourcesFit.scoringStrategy.constraints.resources.name.allowedValues is truncated to the non-accelerator resources (the GPU and Neuron resource names are missing).
    - Then send UpdateClusterConfig with a serviceNodePortRange value that is legal under the advertised bounds but outside the published ones and observe that the emulator's advertised contract disagrees with AWS's enforcement.
    - GET /addons/supported-versions?addonName=<the add-on named in the fixture's request> (with the fixture's kubernetesVersion filter, if present) and compare addons[0].addonVersions against the AWS catalog: the emulator returns synthesised newest releases with recent-only compatibilities and defaultVersion true, instead of the add-on's published release history (older cluster-version compatibilities, defaultVersion false).
+
+## Fix note
+
+Cause 1 is closed. The control-plane component configuration catalog now carries the
+PUBLISHED per-version configuration limits parameter by parameter, in its own file
+(`src/state/control_plane_component_config.rs`, moved out of `src/state.rs` whole), instead of
+deriving each window from the upstream Kubernetes component's default and from a duration a
+member's documentation names as an example of its spelling: the API server's NodePort window is
+the published one rather than a host's unprivileged port space, the event-TTL floor and the two
+controller-manager windows are the published ones, and the scheduler's scoreable-resource set
+names every accelerator resource beside the two the default strategy weights. The defaults are
+untouched, and the cluster slice keeps reading the same constants, so a cluster that overrides
+nothing still reports exactly what the catalog publishes for it.
+
+Cause 2 is NOT closed and is not guessed at here. The divergence is which published builds the
+catalog holds for one add-on and in what order: the emulator derives an add-on's builds along its
+own release line, one per Kubernetes calendar row, while the recorded listing leads with an older
+build carrying a wider compatibility span and a narrower `computeTypes` set. The replay answers
+"recorded values withheld" for that step, and the published order cannot be derived either — the
+corpus shows one add-on listed newest build first and this one led by an older build, so no single
+ordering rule produces both. The mechanism for a cited build table is already in place
+(`ADDON_PUBLISHED_BUILDS` in `src/state/addon_catalog.rs`); it needs that add-on's published table,
+which cannot be cited from inside this emulator. Writing a history or an ordering that puts one
+build at index 0 would fit the recorded instance rather than implement a rule, so the add-on
+catalog is left exactly as it was.

@@ -576,14 +576,14 @@ async fn the_published_parameter_window_is_the_one_a_cluster_may_be_configured_i
             pod_gc_threshold(&row["controlPlaneComponentConfig"]),
         );
         let (default_value, min, max) = published;
+        // A published window runs forwards and holds the parameter's default. Its
+        // two ends may be the SAME value: a parameter Amazon EKS publishes no
+        // alternative value for for a Kubernetes version is published as that one
+        // value. WHICH ends the table states is published data, asserted in
+        // `control_plane_component_constraints.rs`.
         assert!(
-            min < max,
-            "case {version}: expected a window with room in it, got {min}..{max}"
-        );
-        assert_eq!(
-            max, default_value,
-            "case {version}: expected the component's own default as the published ceiling, got \
-             {max} against a default of {default_value}"
+            min <= max,
+            "case {version}: expected a window that runs forwards, got {min}..{max}"
         );
         assert!(
             min <= default_value && default_value <= max,
