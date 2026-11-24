@@ -100,14 +100,34 @@ pub const RESERVED_PROPERTY_KEYS: [&str; 6] = [
     "impression",
 ];
 
+/// The sentence Amazon Personalize refuses a `properties` map using one of
+/// [`RESERVED_PROPERTY_KEYS`] with.
+///
+/// Fixed text with ONE variable part — the offending keyword, interpolated twice — and the
+/// keyword is written LOWER-CASED, because the rule it broke is case insensitive and the
+/// service states the keyword in one normal form rather than echoing the caller's casing.
+///
+/// `reserved` is the RESERVED name the request's key matched, not the key as submitted:
+/// the two have the same lower-cased form (they match case-insensitively), so the sentence
+/// is the same one either way and no part of the request is reflected back in it.
+pub fn reserved_property_key_message(reserved: &str) -> String {
+    let keyword = reserved.to_lowercase();
+    format!(
+        "{keyword} is not allowed in properties. Please refer to documentation to include \
+         {keyword}"
+    )
+}
+
 /// Parse a `properties` member: the modelled shape is a JSON string map
 /// (`@mediaType("application/json")`, documented as "a string map of ... data" whose
 /// elements are key-value pairs), so a value that is not a JSON object, or — when
 /// `reserved_keys_apply` — one using a reserved key, is not a `properties` map at all.
 ///
 /// Returns the parsed object on success, and on failure the message for the caller's
-/// `InvalidInputException`: it names the member and what was wrong with it, never the
-/// value itself (every `properties` member is `@sensitive`).
+/// `InvalidInputException`. A value that is not a JSON object at all is stated against the
+/// member it was submitted in; a reserved keyword is stated with the service's own
+/// sentence ([`reserved_property_key_message`]). Neither reports a property's VALUE
+/// (every `properties` member is `@sensitive`).
 pub fn parse_properties(
     member: &str,
     raw: &str,
@@ -124,10 +144,7 @@ pub fn parse_properties(
                 .iter()
                 .find(|reserved| reserved.eq_ignore_ascii_case(key))
             {
-                return Err(format!(
-                    "{member} must not use the reserved key {reserved}; \
-                     Personalize reserves it case insensitively"
-                ));
+                return Err(reserved_property_key_message(reserved));
             }
         }
     }

@@ -218,8 +218,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //    under ONE pair of locks — this service's store first and the ingestion
         //    registry second, which is this crate's lock order. The file is rendered from
         //    the rows under the same lock that read them, so what is written is one
-        //    consistent view of the dataset, its columns named as the dataset's own
-        //    schema spells them.
+        //    consistent view of the dataset, each half's columns named as that half names
+        //    them.
         let (arn, dataset_active_at, prepared) = {
             let store = state.lock();
             let Some(dataset) = store.datasets.get(&input.dataset_arn) else {

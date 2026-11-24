@@ -2194,3 +2194,165 @@ async fn a_users_put_against_the_items_dataset_is_refused_and_the_users_dataset_
         emulator.stored_records(USERS_DATASET, MetadataKind::Users)
     );
 }
+
+// ---------------------------------------------------------------------------
+// The WORDING of the reserved-keyword refusal
+// ---------------------------------------------------------------------------
+
+/// The two routes the reserved-keyword rule is documented on: `Event$properties` and
+/// `ActionInteraction$properties`.
+const EVENT_STREAM_ROUTES: [&str; 2] = ["/events", "/action-interactions"];
+
+/// A request for `route` whose one record carries `properties`.
+fn body_carrying_properties(route: &str, properties: &Value) -> Value {
+    let properties = properties.to_string();
+    match route {
+        "/events" => put_events_body(
+            "tracker-1",
+            "session-1",
+            vec![event(
+                "click",
+                1_764_000_000.0,
+                json!({ "itemId": "item-1", "properties": properties }),
+            )],
+        ),
+        "/action-interactions" => put_interactions_body(
+            "tracker-1",
+            vec![interaction(
+                "action-1",
+                1_764_000_000.0,
+                json!({ "properties": properties }),
+            )],
+        ),
+        other => panic!("no body builder for {other}"),
+    }
+}
+
+/// The `message` member of a refusal body.
+fn refusal_message(reply: &Reply) -> String {
+    serde_json::from_str::<Value>(&reply.body)
+        .ok()
+        .as_ref()
+        .and_then(|body| body.get("message").or_else(|| body.get("Message")).cloned())
+        .and_then(|message| message.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("<no message in {:?}>", reply.body))
+}
+
+/// The sentence a reserved keyword earns: fixed text with the keyword lower-cased and
+/// interpolated twice. Stated here independently of the service's own helper, so the
+/// wording cannot drift in one place only.
+fn reserved_keyword_message(key: &str) -> String {
+    let key = key.to_lowercase();
+    format!("{key} is not allowed in properties. Please refer to documentation to include {key}")
+}
+
+/// Every casing of a reserved keyword a request can spell it in: the camel case the model
+/// lists, all upper, all lower, and the camel case with its first letter capitalised.
+fn casings(reserved: &str) -> Vec<String> {
+    let mut capitalised: Vec<char> = reserved.chars().collect();
+    if let Some(first) = capitalised.first_mut() {
+        *first = first.to_ascii_uppercase();
+    }
+    vec![
+        reserved.to_string(),
+        reserved.to_uppercase(),
+        reserved.to_lowercase(),
+        capitalised.into_iter().collect(),
+    ]
+}
+
+/// The shapes of `properties` map one offending key can arrive in: alone, before an
+/// ordinary key, after one, and among several — so the refusal cannot be a function of
+/// where the offending key sits in the map.
+fn maps_carrying(key: &str) -> Vec<(String, Value)> {
+    vec![
+        ("alone".to_string(), json!({ key: "x" })),
+        (
+            "before an ordinary key".to_string(),
+            json!({ key: "x", "zzz": "1" }),
+        ),
+        (
+            "after an ordinary key".to_string(),
+            json!({ "aaa": "1", key: "x" }),
+        ),
+        (
+            "among several ordinary keys".to_string(),
+            json!({ "aaa": "1", key: "x", "numberOfRatings": "12", "zzz": "2" }),
+        ),
+    ]
+}
+
+/// RULE: a `properties` map keyed by a reserved keyword is refused with the service's own
+/// sentence, whose one variable part is that keyword, LOWER-CASED however the request
+/// spelled it and interpolated twice. The rows span every reserved keyword (from
+/// `RESERVED_PROPERTY_KEYS`, which cites the model doc), four casings of each, four
+/// placements in the map and both event streams; the issue cited one of them.
+#[tokio::test]
+async fn a_reserved_properties_keyword_is_refused_with_the_documented_sentence() {
+    let emulator = Emulator::new();
+    emulator.seed_tracker("tracker-1");
+
+    for route in EVENT_STREAM_ROUTES {
+        for reserved in RESERVED_PROPERTY_KEYS {
+            for key in casings(reserved) {
+                for (placement, properties) in maps_carrying(&key) {
+                    let case = format!("{route} properties keyed {key:?} {placement}");
+                    let reply = emulator
+                        .post(route, &body_carrying_properties(route, &properties))
+                        .await;
+                    assert_refused(&case, &reply, 400, "InvalidInputException");
+                    let message = refusal_message(&reply);
+                    assert_eq!(
+                        message,
+                        reserved_keyword_message(&key),
+                        "case {case:?}: unexpected refusal wording, got {message:?}"
+                    );
+                    // One normal form: neither the casing the caller used nor the input
+                    // member it was submitted in is part of the sentence.
+                    assert!(
+                        key == key.to_lowercase() || !message.contains(&key),
+                        "case {case:?}: expected the keyword lower-cased, got {message:?}"
+                    );
+                    assert!(
+                        !message.contains("Event.properties")
+                            && !message.contains("ActionInteraction.properties"),
+                        "case {case:?}: the sentence names no input member, got {message:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    // Nothing of a refused batch is ingested, so the stream is still empty.
+    assert!(
+        emulator.stored_events("tracker-1").is_empty()
+            && emulator.stored_interactions("tracker-1").is_empty(),
+        "a refused batch ingests nothing, got {:?} / {:?}",
+        emulator.stored_events("tracker-1"),
+        emulator.stored_interactions("tracker-1")
+    );
+}
+
+/// The contrast: a key that merely CONTAINS a reserved name, or extends one, is not a
+/// reserved keyword, so the same call is accepted.
+#[tokio::test]
+async fn a_properties_key_that_only_contains_a_reserved_name_is_accepted() {
+    let emulator = Emulator::new();
+    emulator.seed_tracker("tracker-1");
+
+    let accepted = [
+        json!({ "numberOfRatings": "12" }),
+        json!({ "sessionIdentifier": "s", "impressionCount": 3 }),
+        json!({ "userIds": ["a", "b"], "my_timestamp": 1 }),
+        json!({}),
+    ];
+    for route in EVENT_STREAM_ROUTES {
+        for properties in &accepted {
+            let case = format!("{route} properties {properties}");
+            let reply = emulator
+                .post(route, &body_carrying_properties(route, properties))
+                .await;
+            assert_accepted(&case, &reply);
+        }
+    }
+}

@@ -18,10 +18,18 @@
 //! requested kind is refused with `InvalidInputException`, so nothing is ever reported
 //! exported that was not written.
 //!
+//! The second rule: each half is written under the COLUMN names that half uses — a row a
+//! dataset import job read out of a file whose header names the schema's fields is
+//! exported under the schema's declared spelling, and a record the ingestion data plane
+//! put in is exported under the column names that record itself carries — so a client
+//! reading an export back addresses it by the names the half it wants was written with.
+//!
 //! The suites are TABLES: the rows vary what the rule generalises over (the dataset type,
 //! the ingestion mode including its default, which half of the dataset holds data, the
-//! record count and the destination folder's form), and the recorded case the issue cited
-//! — `PutItems` followed by a `PUT` export read back — is one row among them.
+//! spelling each half names its fields with, whether an optional member was sent at all,
+//! the record count and the destination folder's form), and the recorded case the issue
+//! cited — `PutEvents` followed by a `PUT` export read back by `event_type` — is one row
+//! among them.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -29,7 +37,6 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
-use service_com_amazonaws_personalizeevents_amazonpersonalizeevents::state::ComAmazonawsPersonalizeeventsAmazonpersonalizeeventsState as EventsState;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request is signed for, and every minted ARN is scoped to.
@@ -57,7 +64,6 @@ const CLIENT_ERROR_STATUS: u16 = 400;
 /// and S3, all on ONE shared engine — which is what the assembled router does.
 struct Exporter {
     router: MultiServiceRouter,
-    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Exporter {
@@ -80,7 +86,7 @@ impl Exporter {
         router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
             Arc::clone(&engine),
         ));
-        Self { router, engine }
+        Self { router }
     }
 
     /// One control-plane call (`AmazonPersonalize.<Operation>` on `POST /`).
@@ -337,16 +343,44 @@ impl Exporter {
         }
     }
 
-    /// Register an event tracker for `group`, as `CreateEventTracker` in the control
-    /// plane will once it is implemented (it is still a scaffold stub with its own
-    /// issue): a tracking id is minted there, never by the ingestion plane, so a suite
-    /// that needs one seeds the same registry that create would.
-    fn seed_tracker(&self, tracking_id: &str, group: &str) {
-        self.engine
-            .state::<EventsState>()
-            .lock()
-            .register_event_tracker(tracking_id, Some(group.to_string()))
-            .expect("the ingestion store accepts the tracker");
+    /// Create an event tracker for `group` through the control plane and wait for it to
+    /// become `ACTIVE`, then return its `trackingId`: a tracking id is minted by
+    /// `CreateEventTracker`, never by the ingestion plane, so a suite that ingests events
+    /// gets one the same way a client does.
+    async fn active_tracker(&self, case: &str, suffix: &str, group: &str) -> String {
+        let created = self
+            .control_ok(
+                "CreateEventTracker",
+                &json!({
+                    "name": format!("tracker-{suffix}"),
+                    "datasetGroupArn": group,
+                }),
+                case,
+            )
+            .await;
+        let arn = created["eventTrackerArn"]
+            .as_str()
+            .expect("an eventTrackerArn")
+            .to_string();
+        let tracking_id = created["trackingId"]
+            .as_str()
+            .expect("a trackingId")
+            .to_string();
+        let deadline = Instant::now() + TERMINAL_DEADLINE;
+        loop {
+            let tracker = self
+                .control_ok("DescribeEventTracker", &json!({"eventTrackerArn": arn}), case)
+                .await["eventTracker"]
+                .clone();
+            if tracker["status"].as_str() == Some("ACTIVE") {
+                return tracking_id;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "case {case:?}: the event tracker never became ACTIVE: {tracker}"
+            );
+            ::tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 }
 
@@ -406,7 +440,9 @@ fn avro_schema(dataset_type: &str, columns: &[&str]) -> String {
 }
 
 /// The exported file, read as the CSV it is: its header row and one map per record,
-/// keyed by the column names that header names.
+/// keyed by the column names that header names. A cell the record leaves empty is kept as
+/// an empty value, so a case can tell a column the file carries without a value for this
+/// record from a column the file does not carry at all.
 ///
 /// Parsed by the `csv` crate rather than split by hand, so a quoted value is read the way
 /// it was written.
@@ -428,7 +464,6 @@ fn exported_rows(body: &str) -> (Vec<String>, Vec<BTreeMap<String, String>>) {
                 .iter()
                 .cloned()
                 .zip(record.iter().map(str::to_string))
-                .filter(|(_, value)| !value.is_empty())
                 .collect()
         })
         .collect();
@@ -454,8 +489,13 @@ enum Ingested {
         property: &'static str,
         records: &'static [(&'static str, &'static str)],
     },
-    /// `PutEvents` item interactions, as `(userId, itemId)` pairs.
-    Events(&'static [(&'static str, &'static str)]),
+    /// `PutEvents` item interactions, as `(userId, itemId)` pairs. A `None` user is a
+    /// call that sends no `userId` at all, which the model allows (`PutEventsRequest`
+    /// requires only `trackingId`, `sessionId` and `eventList`).
+    Events(&'static [(Option<&'static str>, &'static str)]),
+    /// `PutActionInteractions` records, as `(userId, actionId)` pairs, with the same
+    /// optional user.
+    ActionInteractions(&'static [(Option<&'static str>, &'static str)]),
 }
 
 /// One row of the export table.
@@ -465,7 +505,10 @@ struct ExportCase {
     /// The columns the dataset's schema declares. The first is the one a record of this
     /// type is keyed by, which is what the expectations below name a record with.
     columns: &'static [&'static str],
-    id_column: &'static str,
+    /// The column names a record of this export is keyed by, most specific first: an
+    /// export carries each half of a dataset under the names THAT half uses, so a case
+    /// whose two halves spell the id field differently names both spellings.
+    id_columns: &'static [&'static str],
     /// The CSV imported in bulk, when the case has bulk data.
     bulk: Option<&'static str>,
     ingested: Ingested,
@@ -493,13 +536,13 @@ const BULK_USERS_UPPER: &str =
 
 /// The table: one row per (dataset type, ingestion mode, which half holds data, schema
 /// field spelling) the rule generalises over. The recorded case the issue cited —
-/// `PutItems` then a `PUT` export read back by its `ITEM_ID` — is the row named for it.
+/// `PutItems` then a `PUT` export read back by its `item_id` — is the row named for it.
 const EXPORT_CASES: &[ExportCase] = &[
     ExportCase {
         case: "items, PUT by default, read back with its properties",
         dataset_type: "Items",
         columns: &["item_id", "genre"],
-        id_column: "item_id",
+        id_columns: &["item_id"],
         bulk: None,
         ingested: Ingested::Items {
             property: "genre",
@@ -515,10 +558,10 @@ const EXPORT_CASES: &[ExportCase] = &[
         ],
     },
     ExportCase {
-        case: "items under an upper-case schema are exported under its spellings",
+        case: "items PUT under an upper-case schema keep the record's own id column",
         dataset_type: "Items",
         columns: &["ITEM_ID", "GENRE"],
-        id_column: "ITEM_ID",
+        id_columns: &["item_id"],
         bulk: None,
         ingested: Ingested::Items {
             property: "GENRE",
@@ -531,10 +574,10 @@ const EXPORT_CASES: &[ExportCase] = &[
         expected_values: &[("put-item-1", "GENRE", "drama")],
     },
     ExportCase {
-        case: "a property PUT in another case is exported under the schema's spelling",
+        case: "a property PUT in another case is exported in the case it was PUT in",
         dataset_type: "Items",
         columns: &["ITEM_ID", "GENRE"],
-        id_column: "ITEM_ID",
+        id_columns: &["item_id"],
         bulk: None,
         ingested: Ingested::Items {
             property: "genre",
@@ -545,15 +588,15 @@ const EXPORT_CASES: &[ExportCase] = &[
         expected: &["put-item-1", "put-item-2"],
         unexpected: &[],
         expected_values: &[
-            ("put-item-1", "GENRE", "drama"),
-            ("put-item-2", "GENRE", "comedy"),
+            ("put-item-1", "genre", "drama"),
+            ("put-item-2", "genre", "comedy"),
         ],
     },
     ExportCase {
         case: "a property named like the id column cannot replace the record's own id",
         dataset_type: "Items",
         columns: &["ITEM_ID", "GENRE"],
-        id_column: "ITEM_ID",
+        id_columns: &["item_id"],
         bulk: None,
         ingested: Ingested::Items {
             // What identifies a record comes from the record, so a property a caller
@@ -571,7 +614,7 @@ const EXPORT_CASES: &[ExportCase] = &[
         case: "items, PUT named explicitly, exports only the ingested records",
         dataset_type: "Items",
         columns: &["item_id", "genre"],
-        id_column: "item_id",
+        id_columns: &["item_id"],
         bulk: Some(BULK_ITEMS),
         ingested: Ingested::Items {
             property: "genre",
@@ -587,7 +630,7 @@ const EXPORT_CASES: &[ExportCase] = &[
         case: "items, BULK exports only the imported rows",
         dataset_type: "Items",
         columns: &["item_id", "genre"],
-        id_column: "item_id",
+        id_columns: &["item_id"],
         bulk: Some(BULK_ITEMS),
         ingested: Ingested::Items {
             property: "genre",
@@ -607,7 +650,7 @@ const EXPORT_CASES: &[ExportCase] = &[
         case: "items, ALL exports both halves of the dataset",
         dataset_type: "Items",
         columns: &["item_id", "genre"],
-        id_column: "item_id",
+        id_columns: &["item_id"],
         bulk: Some(BULK_ITEMS),
         ingested: Ingested::Items {
             property: "genre",
@@ -626,7 +669,7 @@ const EXPORT_CASES: &[ExportCase] = &[
         case: "users, PUT exports the ingested users",
         dataset_type: "Users",
         columns: &["user_id", "age"],
-        id_column: "user_id",
+        id_columns: &["user_id"],
         bulk: None,
         ingested: Ingested::Users {
             property: "age",
@@ -639,10 +682,12 @@ const EXPORT_CASES: &[ExportCase] = &[
         expected_values: &[("put-user-2", "age", "33")],
     },
     ExportCase {
-        case: "users, ALL over an upper-case schema folds both halves into one column set",
+        case: "users, ALL carries each half under the names that half uses",
         dataset_type: "Users",
         columns: &["USER_ID", "AGE"],
-        id_column: "USER_ID",
+        // The imported rows are addressed by the schema's spelling, the PUT record by the
+        // one the ingestion plane keys it with.
+        id_columns: &["USER_ID", "user_id"],
         bulk: Some(BULK_USERS_UPPER),
         ingested: Ingested::Users {
             property: "AGE",
@@ -661,7 +706,7 @@ const EXPORT_CASES: &[ExportCase] = &[
         case: "users, ALL with three imported rows and nothing ingested",
         dataset_type: "Users",
         columns: &["user_id", "age"],
-        id_column: "user_id",
+        id_columns: &["user_id"],
         bulk: Some(BULK_USERS),
         ingested: Ingested::Nothing,
         ingestion_mode: Some("ALL"),
@@ -674,19 +719,22 @@ const EXPORT_CASES: &[ExportCase] = &[
         case: "interactions, PUT exports the events a tracker of the group ingested",
         dataset_type: "Interactions",
         columns: &["USER_ID", "ITEM_ID", "TIMESTAMP"],
-        id_column: "USER_ID",
+        id_columns: &["user_id"],
         bulk: None,
-        ingested: Ingested::Events(&[("put-user-1", "put-item-1"), ("put-user-2", "put-item-2")]),
+        ingested: Ingested::Events(&[
+            (Some("put-user-1"), "put-item-1"),
+            (Some("put-user-2"), "put-item-2"),
+        ]),
         ingestion_mode: Some("PUT"),
         folder: "exports/interactions-put/",
         expected: &["put-user-1", "put-user-2"],
         unexpected: &[],
         expected_values: &[
-            ("put-user-1", "ITEM_ID", "put-item-1"),
-            ("put-user-2", "ITEM_ID", "put-item-2"),
-            // The instant the caller reported, in the Unix time the schema's TIMESTAMP
-            // field carries.
-            ("put-user-1", "TIMESTAMP", "1764000000"),
+            ("put-user-1", "item_id", "put-item-1"),
+            ("put-user-2", "item_id", "put-item-2"),
+            // The instant the caller reported, in the Unix time an interaction record
+            // carries it in.
+            ("put-user-1", "timestamp", "1764000000"),
         ],
     },
 ];
@@ -695,9 +743,24 @@ const EXPORT_CASES: &[ExportCase] = &[
 /// `Event$sentAt` carries.
 const SENT_AT: f64 = 1_764_000_000.0;
 
+/// The id an exported row reports, read from the first of `columns` the row carries a
+/// value in: a column the row leaves empty names no record.
+fn row_id<'row>(row: &'row BTreeMap<String, String>, columns: &[&str]) -> Option<&'row String> {
+    columns
+        .iter()
+        .find_map(|column| row.get(*column).filter(|value| !value.is_empty()))
+}
+
 /// Put `ingested` into `dataset` through the ingestion data plane, over the wire.
-async fn ingest(emulator: &Exporter, case: &ExportCase, dataset: &str, group: &str) {
-    match case.ingested {
+async fn ingest(
+    emulator: &Exporter,
+    case: &str,
+    suffix: &str,
+    ingested: Ingested,
+    dataset: &str,
+    group: &str,
+) {
+    match ingested {
         Ingested::Nothing => {}
         Ingested::Items { property, records } => {
             let items: Vec<Value> = records
@@ -713,7 +776,7 @@ async fn ingest(emulator: &Exporter, case: &ExportCase, dataset: &str, group: &s
                 .ingest(
                     "/items",
                     &json!({"datasetArn": dataset, "items": items}),
-                    case.case,
+                    case,
                 )
                 .await;
         }
@@ -731,28 +794,48 @@ async fn ingest(emulator: &Exporter, case: &ExportCase, dataset: &str, group: &s
                 .ingest(
                     "/users",
                     &json!({"datasetArn": dataset, "users": users}),
-                    case.case,
+                    case,
                 )
                 .await;
         }
         Ingested::Events(events) => {
-            let tracking_id = format!("tracker-{}", short(case.case));
-            emulator.seed_tracker(&tracking_id, group);
+            let tracking_id = emulator.active_tracker(case, suffix, group).await;
             for (index, (user, item)) in events.iter().enumerate() {
+                let mut body = json!({
+                    "trackingId": tracking_id,
+                    "sessionId": format!("session-{index}"),
+                    "eventList": [{
+                        "eventType": "click",
+                        "sentAt": SENT_AT,
+                        "itemId": item,
+                    }],
+                });
+                if let Some(user) = user {
+                    body["userId"] = json!(user);
+                }
+                emulator.ingest("/events", &body, case).await;
+            }
+        }
+        Ingested::ActionInteractions(interactions) => {
+            let tracking_id = emulator.active_tracker(case, suffix, group).await;
+            for (index, (user, action)) in interactions.iter().enumerate() {
+                let mut interaction = json!({
+                    "actionId": action,
+                    "sessionId": format!("session-{index}"),
+                    "timestamp": SENT_AT,
+                    "eventType": "Taken",
+                });
+                if let Some(user) = user {
+                    interaction["userId"] = json!(user);
+                }
                 emulator
                     .ingest(
-                        "/events",
+                        "/action-interactions",
                         &json!({
                             "trackingId": tracking_id,
-                            "sessionId": format!("session-{index}"),
-                            "userId": user,
-                            "eventList": [{
-                                "eventType": "click",
-                                "sentAt": SENT_AT,
-                                "itemId": item,
-                            }],
+                            "actionInteractions": [interaction],
                         }),
-                        case.case,
+                        case,
                     )
                     .await;
             }
@@ -785,7 +868,7 @@ async fn an_export_job_writes_the_records_the_ingestion_mode_names() {
         if let Some(bulk) = case.bulk {
             emulator.import(case.case, &suffix, &dataset, bulk).await;
         }
-        ingest(&emulator, case, &dataset, &group).await;
+        ingest(&emulator, case.case, &suffix, case.ingested, &dataset, &group).await;
 
         let job_name = format!("export-{suffix}");
         let path = format!("s3://{BUCKET}/{}", case.folder);
@@ -809,7 +892,7 @@ async fn an_export_job_writes_the_records_the_ingestion_mode_names() {
         let (header, rows) = exported_rows(&body);
         let ids: Vec<String> = rows
             .iter()
-            .filter_map(|row| row.get(case.id_column).cloned())
+            .filter_map(|row| row_id(row, case.id_columns).cloned())
             .collect();
         for expected in case.expected {
             assert!(
@@ -817,7 +900,7 @@ async fn an_export_job_writes_the_records_the_ingestion_mode_names() {
                 "case {:?}: expected the export to carry {expected:?} in {:?}, got {ids:?} \
                  (header {header:?})",
                 case.case,
-                case.id_column
+                case.id_columns
             );
         }
         for unexpected in case.unexpected {
@@ -837,7 +920,7 @@ async fn an_export_job_writes_the_records_the_ingestion_mode_names() {
         for (id, column, value) in case.expected_values {
             let row = rows
                 .iter()
-                .find(|row| row.get(case.id_column).map(String::as_str) == Some(id))
+                .find(|row| row_id(row, case.id_columns).map(String::as_str) == Some(id))
                 .unwrap_or_else(|| {
                     panic!(
                         "case {:?}: expected an exported record {id:?}, got {rows:?}",
@@ -852,12 +935,13 @@ async fn an_export_job_writes_the_records_the_ingestion_mode_names() {
             );
         }
         // Every column of the header is one the records carry; nothing is invented.
-        assert!(
-            header.contains(&case.id_column.to_string()),
-            "case {:?}: expected the header to name {:?}, got {header:?}",
-            case.case,
-            case.id_column
-        );
+        for id_column in case.id_columns {
+            assert!(
+                header.contains(&(*id_column).to_string()),
+                "case {:?}: expected the header to name {id_column:?}, got {header:?}",
+                case.case
+            );
+        }
     }
 }
 
@@ -938,20 +1022,7 @@ async fn an_export_of_data_a_dataset_does_not_hold_is_refused_as_an_input_fault(
             emulator.import(case.case, &suffix, &dataset, bulk).await;
         }
         // The ingestion half of the table reuses the export table's own ingester.
-        let ingesting = ExportCase {
-            case: case.case,
-            dataset_type: case.dataset_type,
-            columns: case.columns,
-            id_column: case.columns[0],
-            bulk: case.bulk,
-            ingested: case.ingested,
-            ingestion_mode: case.ingestion_mode,
-            folder: "unused/",
-            expected: &[],
-            unexpected: &[],
-            expected_values: &[],
-        };
-        ingest(&emulator, &ingesting, &dataset, &group).await;
+        ingest(&emulator, case.case, &suffix, case.ingested, &dataset, &group).await;
 
         let (status, body) = emulator
             .export(
@@ -1225,4 +1296,203 @@ async fn an_export_that_cannot_be_written_is_refused_or_reported_failed() {
         reason.contains(MISSING_BUCKET),
         "case {case:?}: expected the failure reason to name the destination, got {job}"
     );
+}
+
+/// One row of the column-naming table: what a dataset holds, and the columns the export
+/// of it must be addressable by.
+struct ColumnNamingCase {
+    case: &'static str,
+    dataset_type: &'static str,
+    /// The fields the dataset's schema declares, in the upper snake case Amazon
+    /// Personalize's own documented schemas spell them with, so any rename of a record's
+    /// own columns to the schema's is visible in the header.
+    columns: &'static [&'static str],
+    bulk: Option<&'static str>,
+    ingested: Ingested,
+    ingestion_mode: Option<&'static str>,
+    folder: &'static str,
+    /// One entry per exported row: the `(column, value)` cells that row must carry. The
+    /// export holds exactly this many rows, and each entry matches exactly one of them.
+    rows: &'static [&'static [(&'static str, &'static str)]],
+    /// Column names the header must NOT carry.
+    absent_columns: &'static [&'static str],
+}
+
+/// The table: one row per (which half holds data, how that half spells its fields,
+/// whether an optional member of a record was sent at all) the column-naming rule
+/// generalises over. The first row is the recorded shape the issue cited: one `PutEvents`
+/// event carrying no `userId`, exported with `ingestionMode=PUT` and read back by the
+/// record's own `event_type` column.
+const COLUMN_NAMING_CASES: &[ColumnNamingCase] = &[
+    ColumnNamingCase {
+        case: "an event sent with no userId is exported under the record's own columns",
+        dataset_type: "Interactions",
+        columns: &["USER_ID", "ITEM_ID", "TIMESTAMP", "EVENT_TYPE"],
+        bulk: None,
+        ingested: Ingested::Events(&[(None, "put-item-1")]),
+        ingestion_mode: Some("PUT"),
+        folder: "exports/naming-no-user/",
+        rows: &[&[
+            ("event_type", "click"),
+            ("item_id", "put-item-1"),
+            ("session_id", "session-0"),
+            ("timestamp", "1764000000"),
+            // Sent by no one: the column is the record's, so the cell is empty rather
+            // than the column being left out of the file.
+            ("user_id", ""),
+        ]],
+        absent_columns: &["USER_ID", "ITEM_ID", "TIMESTAMP", "EVENT_TYPE"],
+    },
+    ColumnNamingCase {
+        case: "the PUT default exports both events, with and without a user",
+        dataset_type: "Interactions",
+        columns: &["USER_ID", "ITEM_ID", "TIMESTAMP", "EVENT_TYPE"],
+        bulk: None,
+        ingested: Ingested::Events(&[(Some("put-user-1"), "put-item-1"), (None, "put-item-2")]),
+        ingestion_mode: None,
+        folder: "exports/naming-default/",
+        rows: &[
+            &[
+                ("user_id", "put-user-1"),
+                ("item_id", "put-item-1"),
+                ("session_id", "session-0"),
+            ],
+            &[
+                ("user_id", ""),
+                ("item_id", "put-item-2"),
+                ("session_id", "session-1"),
+            ],
+        ],
+        absent_columns: &["USER_ID", "ITEM_ID"],
+    },
+    ColumnNamingCase {
+        case: "action interactions keep their own columns as well",
+        dataset_type: "Action_Interactions",
+        columns: &["USER_ID", "ACTION_ID", "TIMESTAMP", "EVENT_TYPE"],
+        bulk: None,
+        ingested: Ingested::ActionInteractions(&[
+            (Some("put-user-1"), "put-action-1"),
+            (None, "put-action-2"),
+        ]),
+        ingestion_mode: Some("PUT"),
+        folder: "exports/naming-actions/",
+        rows: &[
+            &[
+                ("user_id", "put-user-1"),
+                ("action_id", "put-action-1"),
+                ("event_type", "Taken"),
+                ("timestamp", "1764000000"),
+            ],
+            &[("user_id", ""), ("action_id", "put-action-2")],
+        ],
+        absent_columns: &["USER_ID", "ACTION_ID", "EVENT_TYPE"],
+    },
+    ColumnNamingCase {
+        case: "a BULK export renames the imported rows to the schema's spelling",
+        dataset_type: "Items",
+        columns: &["ITEM_ID", "GENRE"],
+        bulk: Some(BULK_ITEMS),
+        ingested: Ingested::Nothing,
+        ingestion_mode: Some("BULK"),
+        folder: "exports/naming-bulk/",
+        rows: &[
+            &[("ITEM_ID", "bulk-item-1"), ("GENRE", "history")],
+            &[("ITEM_ID", "bulk-item-2"), ("GENRE", "sci-fi")],
+        ],
+        absent_columns: &["item_id", "genre"],
+    },
+    ColumnNamingCase {
+        case: "an ALL export carries each half under its own names",
+        dataset_type: "Items",
+        columns: &["ITEM_ID", "GENRE"],
+        bulk: Some(BULK_ITEMS),
+        ingested: Ingested::Items {
+            property: "genre",
+            records: &[("put-item-1", "drama")],
+        },
+        ingestion_mode: Some("ALL"),
+        folder: "exports/naming-all/",
+        rows: &[
+            &[
+                ("ITEM_ID", "bulk-item-1"),
+                ("GENRE", "history"),
+                // An imported row names no column of the PUT half, so its cells there
+                // are empty.
+                ("item_id", ""),
+            ],
+            &[("ITEM_ID", "bulk-item-2"), ("GENRE", "sci-fi")],
+            &[
+                ("item_id", "put-item-1"),
+                ("genre", "drama"),
+                ("ITEM_ID", ""),
+            ],
+        ],
+        absent_columns: &[],
+    },
+];
+
+#[tokio::test]
+async fn each_half_of_an_export_is_written_under_the_column_names_that_half_uses() {
+    for case in COLUMN_NAMING_CASES {
+        let emulator = Exporter::new();
+        emulator.create_bucket().await;
+        let suffix = short(case.case);
+        let group = emulator.active_group(case.case, &suffix).await;
+        let dataset = emulator
+            .dataset(case.case, &suffix, &group, case.dataset_type, case.columns)
+            .await;
+        if let Some(bulk) = case.bulk {
+            emulator.import(case.case, &suffix, &dataset, bulk).await;
+        }
+        ingest(&emulator, case.case, &suffix, case.ingested, &dataset, &group).await;
+
+        let job_name = format!("export-{suffix}");
+        let path = format!("s3://{BUCKET}/{}", case.folder);
+        let arn = emulator
+            .export_ok(case.case, &job_name, &dataset, &path, case.ingestion_mode)
+            .await;
+        let job = emulator.await_terminal(case.case, &arn).await;
+        assert_eq!(
+            job["status"].as_str().unwrap_or(""),
+            "ACTIVE",
+            "case {:?}: expected the export job to reach ACTIVE, got {job}",
+            case.case
+        );
+
+        let folder = case.folder.trim_end_matches('/');
+        let body = emulator
+            .object(&format!("{folder}/{job_name}.csv"), case.case)
+            .await;
+        let (header, rows) = exported_rows(&body);
+        assert_eq!(
+            rows.len(),
+            case.rows.len(),
+            "case {:?}: expected {} exported rows, got {rows:?}",
+            case.case,
+            case.rows.len()
+        );
+        for expected in case.rows {
+            let matching = rows
+                .iter()
+                .filter(|row| {
+                    expected
+                        .iter()
+                        .all(|(column, value)| row.get(*column).map(String::as_str) == Some(*value))
+                })
+                .count();
+            assert_eq!(
+                matching, 1,
+                "case {:?}: expected exactly one exported row carrying {expected:?}, got \
+                 {rows:?} (header {header:?})",
+                case.case
+            );
+        }
+        for absent in case.absent_columns {
+            assert!(
+                !header.contains(&(*absent).to_string()),
+                "case {:?}: expected the header NOT to name {absent:?}, got {header:?}",
+                case.case
+            );
+        }
+    }
 }

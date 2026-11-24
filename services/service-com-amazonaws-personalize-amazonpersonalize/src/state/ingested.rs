@@ -14,7 +14,12 @@
 //! of them instead of each walking the ingestion store its own way.
 //!
 //! Nothing is invented here: every value comes from a record the ingestion data plane
-//! actually stored.
+//! actually stored, under the column names that record itself carries — a real-time
+//! record is exported as it was ingested, never renamed to the dataset schema's
+//! spellings, which name the rows a dataset import job read in
+//! ([`crate::state::export::export_rows`]). A column of the record's own shape that the
+//! caller sent no value for is an EMPTY cell, so every record of one stream reads the
+//! same way for a client addressing the export by column name.
 
 use std::collections::BTreeMap;
 
@@ -36,6 +41,12 @@ pub const EVENT_TYPE_COLUMN: &str = "event_type";
 /// The column carrying `Event$eventValue`, "the value of the event" an interaction
 /// reports when the caller sent one.
 pub const EVENT_VALUE_COLUMN: &str = "event_value";
+/// The column naming the visit a real-time interaction belongs to.
+///
+/// Source: `PutEventsRequest$sessionId` / `PutActionInteractionsRequest$sessionId`, "the
+/// session ID associated with the user's visit" — part of every record the two event
+/// streams store, so part of every row they export.
+pub const SESSION_ID_COLUMN: &str = "session_id";
 
 /// The string-valued members of a streamed metadata record's `properties` object.
 ///
@@ -190,12 +201,17 @@ fn entity_rows(
 /// Interactions record is keyed by in time, rather than when this emulator received it.
 fn event_row(event: &ingestion::StoredEvent) -> Row {
     let mut row = Row::new();
-    if let Some(user_id) = &event.user_id {
-        row.insert(USER_ID_COLUMN.to_string(), user_id.clone());
-    }
-    if let Some(item_id) = &event.item_id {
-        row.insert(ITEM_ID_COLUMN.to_string(), item_id.clone());
-    }
+    // The record's own columns, every one of them: a caller that sent no user or no item
+    // leaves that cell EMPTY rather than dropping the column from the file.
+    row.insert(
+        USER_ID_COLUMN.to_string(),
+        event.user_id.clone().unwrap_or_default(),
+    );
+    row.insert(
+        ITEM_ID_COLUMN.to_string(),
+        event.item_id.clone().unwrap_or_default(),
+    );
+    row.insert(SESSION_ID_COLUMN.to_string(), event.session_id.clone());
     row.insert(
         TIMESTAMP_COLUMN.to_string(),
         event.sent_at.secs().to_string(),
@@ -209,6 +225,7 @@ fn event_row(event: &ingestion::StoredEvent) -> Row {
         &[
             USER_ID_COLUMN,
             ITEM_ID_COLUMN,
+            SESSION_ID_COLUMN,
             TIMESTAMP_COLUMN,
             EVENT_TYPE_COLUMN,
             EVENT_VALUE_COLUMN,
@@ -222,12 +239,14 @@ fn event_row(event: &ingestion::StoredEvent) -> Row {
 /// `ActionInteraction$timestamp` for the same reason [`event_row`] uses `sentAt`.
 fn action_interaction_row(interaction: &ingestion::StoredActionInteraction) -> Row {
     let mut row = Row::new();
-    if let Some(user_id) = &interaction.user_id {
-        row.insert(USER_ID_COLUMN.to_string(), user_id.clone());
-    }
     row.insert(
-        ACTION_ID_COLUMN.to_string(),
-        interaction.action_id.clone(),
+        USER_ID_COLUMN.to_string(),
+        interaction.user_id.clone().unwrap_or_default(),
+    );
+    row.insert(ACTION_ID_COLUMN.to_string(), interaction.action_id.clone());
+    row.insert(
+        SESSION_ID_COLUMN.to_string(),
+        interaction.session_id.clone(),
     );
     row.insert(
         TIMESTAMP_COLUMN.to_string(),
@@ -242,6 +261,7 @@ fn action_interaction_row(interaction: &ingestion::StoredActionInteraction) -> R
         &[
             USER_ID_COLUMN,
             ACTION_ID_COLUMN,
+            SESSION_ID_COLUMN,
             TIMESTAMP_COLUMN,
             EVENT_TYPE_COLUMN,
         ],

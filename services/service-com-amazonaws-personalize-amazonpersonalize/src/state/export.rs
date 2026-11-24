@@ -21,6 +21,12 @@
 //! ("CREATE PENDING > CREATE IN_PROGRESS > ACTIVE -or- CREATE FAILED"), so the status a
 //! describe reports is a function of the stored due instant and what the export actually
 //! did ([`crate::state::terminal_status`]).
+//!
+//! The COLUMN names of what is written come from the half each row came from, never from
+//! the request: a bulk row was read out of an import file whose header names the dataset
+//! schema's fields, so it is exported under the schema's declared spelling, while a record
+//! the ingestion data plane put in is exported under the column names that record itself
+//! carries ([`export_rows`]).
 
 use std::collections::BTreeSet;
 use std::time::SystemTime;
@@ -184,13 +190,15 @@ pub fn too_many_rows_message(dataset_arn: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// The field names `dataset`'s own schema declares, in the order it declares them — the
-/// COLUMNS of the exported file.
+/// columns of the BULK half of the exported file, and the order every column it names is
+/// written in.
 ///
 /// A dataset "is associated with a dataset type and has a set of required field and
-/// keywords" through the schema `CreateDataset` named, and that schema is where each
-/// column's spelling comes from: a caller reading an export back addresses a column by the
-/// name it wrote in the schema, not by the canonical name this crate matches a field with
-/// (case-insensitively) internally.
+/// keywords" through the schema `CreateDataset` named, and that schema is where a BULK
+/// row's column spelling comes from: those rows are the ones a dataset import job read out
+/// of a file whose header names the schema's fields, so a caller reading them back
+/// addresses them by the name it wrote in the schema rather than by the canonical name
+/// this crate matches a field with (case-insensitively) internally.
 ///
 /// Empty for a dataset whose schema this store no longer holds; the records' own column
 /// names stand then.
@@ -205,9 +213,9 @@ pub fn schema_fields(
         .unwrap_or_default()
 }
 
-/// The name a column is exported under: the schema's own spelling of the field it names,
-/// matched the way every field name in this crate is matched (case-insensitively), or the
-/// column's own name for one the schema does not declare.
+/// The name an IMPORTED column is exported under: the schema's own spelling of the field
+/// it names, matched the way every field name in this crate is matched
+/// (case-insensitively), or the column's own name for one the schema does not declare.
 fn exported_column(schema_fields: &[String], column: &str) -> String {
     schema_fields
         .iter()
@@ -216,10 +224,22 @@ fn exported_column(schema_fields: &[String], column: &str) -> String {
         .unwrap_or_else(|| column.to_string())
 }
 
+/// One imported row with each of its columns named as the dataset's schema spells it.
+fn schema_named_row(schema_fields: &[String], row: &Row) -> Row {
+    row.iter()
+        .map(|(column, value)| (exported_column(schema_fields, column), value.clone()))
+        .collect()
+}
+
 /// The rows `ingestion_mode` exports out of `dataset`: the bulk rows an import job read
-/// into it, the records the ingestion data plane put into it, or both — each column named
-/// as [`schema_fields`] spells it, so one field is one column however the half it came
-/// from wrote it.
+/// into it, the records the ingestion data plane put into it, or both.
+///
+/// Each half is exported under the column names THAT half names its values by: a bulk row
+/// came out of an import file whose header names the schema's fields, so it is written
+/// under the schema's declared spelling ([`schema_fields`]), while a record the ingestion
+/// data plane put in is written under its own column names, which is how Amazon Personalize
+/// exports incrementally ingested data. An `ALL` export therefore carries both halves as
+/// each half names them.
 ///
 /// `Err` is the reason the export could not be carried out, ready for the job's failure
 /// state. A pure read of both stores.
@@ -232,9 +252,16 @@ pub fn export_rows(
     // One more than the ceiling is collected, and only ever one more: the length is what
     // says the store holds more rows than one job writes.
     let budget = MAX_EXPORT_ROWS.saturating_add(1);
+    let schema_fields = schema_fields(store, dataset);
     let mut rows: Vec<Row> = Vec::new();
     if exports_bulk(ingestion_mode) {
-        rows.extend(dataset.imported.iter().take(budget).cloned());
+        rows.extend(
+            dataset
+                .imported
+                .iter()
+                .take(budget)
+                .map(|row| schema_named_row(&schema_fields, row)),
+        );
     }
     if exports_put(ingestion_mode) && rows.len() < budget {
         rows.extend(ingested::put_rows(ingested_store, dataset, budget - rows.len()));
@@ -242,16 +269,7 @@ pub fn export_rows(
     if rows.len() > MAX_EXPORT_ROWS {
         return Err(too_many_rows_message(&dataset.dataset_arn));
     }
-
-    let schema_fields = schema_fields(store, dataset);
-    Ok(rows
-        .into_iter()
-        .map(|row| {
-            row.into_iter()
-                .map(|(column, value)| (exported_column(&schema_fields, &column), value))
-                .collect()
-        })
-        .collect())
+    Ok(rows)
 }
 
 /// The columns of the exported file, in the order its header row lists them.
