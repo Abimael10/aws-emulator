@@ -2356,3 +2356,321 @@ async fn a_properties_key_that_only_contains_a_reserved_name_is_accepted() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// The reserved-keyword refusal over a BATCH, and what the sentence varies with
+// ---------------------------------------------------------------------------
+
+/// The keys an event's `properties` map may not be written with, as the model's own
+/// documentation lists them ("The following can't be included as a keyword for properties
+/// (case insensitive)": `smithy_query(query="doc", shape="Event", member="properties")`,
+/// and the same list on `ActionInteraction$properties`).
+///
+/// Written out here rather than read off the crate so a table that drifted from the
+/// documented one is caught; the first row of the table test below pins the two against
+/// each other.
+const DOCUMENTED_RESERVED_KEYS: [&str; 6] = [
+    "userId",
+    "sessionId",
+    "eventType",
+    "timestamp",
+    "recommendationId",
+    "impression",
+];
+
+/// The batch shapes one offending record can arrive in, as `(record count, index of the
+/// record carrying the offending map)`: a single record, either record of a pair, the
+/// middle of three, and the first, a middle and the last record of a batch at the modelled
+/// maximum (`smithy_query(operation="PutEvents,PutActionInteractions")`: `eventList` and
+/// `actionInteractions` are both `@length(1, 10)`).
+const BATCH_SHAPES: [(usize, usize); 7] = [
+    (1, 0),
+    (2, 0),
+    (2, 1),
+    (3, 1),
+    (10, 0),
+    (10, 4),
+    (10, 9),
+];
+
+/// A `properties` map an event may be written with: the example the member's own
+/// documentation gives.
+const ORDINARY_PROPERTIES: &str = r#"{"numberOfRatings":"12"}"#;
+
+/// A request for `route` carrying `size` records, the one at index `offending` carrying
+/// `properties` and every other an ordinary map.
+///
+/// Each record carries its own `eventId`, so a stream that de-duplicates on that id drops
+/// none of them: an accepted batch of `size` records persists `size` records.
+fn batch_carrying_properties(
+    route: &str,
+    size: usize,
+    offending: usize,
+    properties: &Value,
+) -> Value {
+    let records: Vec<Value> = (0..size)
+        .map(|index| {
+            let map = if index == offending {
+                properties.to_string()
+            } else {
+                ORDINARY_PROPERTIES.to_string()
+            };
+            match route {
+                "/events" => event(
+                    "click",
+                    1_764_000_000.0,
+                    json!({
+                        "eventId": format!("event-{index}"),
+                        "itemId": format!("item-{index}"),
+                        "properties": map,
+                    }),
+                ),
+                "/action-interactions" => interaction(
+                    &format!("action-{index}"),
+                    1_764_000_000.0,
+                    json!({
+                        "eventId": format!("interaction-{index}"),
+                        "properties": map,
+                    }),
+                ),
+                other => panic!("no record builder for {other}"),
+            }
+        })
+        .collect();
+    match route {
+        "/events" => put_events_body("tracker-1", "session-1", records),
+        "/action-interactions" => put_interactions_body("tracker-1", records),
+        other => panic!("no body builder for {other}"),
+    }
+}
+
+/// How many records `route`'s stream holds for `tracking_id`.
+fn stored_record_count(emulator: &Emulator, route: &str, tracking_id: &str) -> usize {
+    match route {
+        "/events" => emulator.stored_events(tracking_id).len(),
+        "/action-interactions" => emulator.stored_interactions(tracking_id).len(),
+        other => panic!("no stream reader for {other}"),
+    }
+}
+
+/// RULE: a reserved keyword in the `properties` map of ANY record of an ingestion batch
+/// refuses the whole call — 400 `InvalidInputException` with the one sentence AWS words
+/// that refusal with, filled by that keyword lower-cased — and ingests none of the batch,
+/// whatever the batch holds besides.
+///
+/// The rows span what the rule generalises over: the stream (both the routes the keyword
+/// list is documented on), which keyword, the casing it is spelled in, the number of
+/// records in the batch and which of them carries the offending map. The recorded case —
+/// one `sessionId`-keyed map in a one-record `/events` batch — is one row.
+#[tokio::test]
+async fn a_reserved_keyword_in_any_record_of_a_batch_refuses_the_whole_batch() {
+    // The table above and the catalog the service matches against are the same list, so
+    // neither can drift from the documented one alone.
+    let mut documented = DOCUMENTED_RESERVED_KEYS.to_vec();
+    let mut served = RESERVED_PROPERTY_KEYS.to_vec();
+    documented.sort_unstable();
+    served.sort_unstable();
+    assert_eq!(
+        documented, served,
+        "case \"the reserved-key catalog\": expected the service to reserve the documented \
+         keys {documented:?}, got {served:?}"
+    );
+
+    for route in EVENT_STREAM_ROUTES {
+        for reserved in DOCUMENTED_RESERVED_KEYS {
+            for key in casings(reserved) {
+                for (size, offending) in BATCH_SHAPES {
+                    let case = format!(
+                        "{route} batch of {size} whose record {offending} is keyed {key:?}"
+                    );
+                    // A fresh emulator per row, so what the row's own call persisted is
+                    // all its store holds.
+                    let emulator = Emulator::new();
+                    emulator.seed_tracker("tracker-1");
+
+                    let reply = emulator
+                        .post(
+                            route,
+                            &batch_carrying_properties(
+                                route,
+                                size,
+                                offending,
+                                &json!({ key.as_str(): "x" }),
+                            ),
+                        )
+                        .await;
+                    assert_refused(&case, &reply, 400, "InvalidInputException");
+                    let message = refusal_message(&reply);
+                    assert_eq!(
+                        message,
+                        reserved_keyword_message(&key),
+                        "case {case:?}: unexpected refusal wording, got {message:?}"
+                    );
+                    assert_eq!(
+                        stored_record_count(&emulator, route, "tracker-1"),
+                        0,
+                        "case {case:?}: a refused batch ingests nothing, got {} record(s)",
+                        stored_record_count(&emulator, route, "tracker-1")
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The positive control for the table above: the SAME batch shapes, with the offending map
+/// replaced by an ordinary one, are served and every record of the batch is persisted — so
+/// the refusals above are earned by the keyword and not by the batch.
+#[tokio::test]
+async fn the_same_batch_without_a_reserved_keyword_is_served_in_full() {
+    for route in EVENT_STREAM_ROUTES {
+        for (size, offending) in BATCH_SHAPES {
+            let case = format!("{route} batch of {size} with no reserved keyword");
+            let emulator = Emulator::new();
+            emulator.seed_tracker("tracker-1");
+
+            let reply = emulator
+                .post(
+                    route,
+                    &batch_carrying_properties(
+                        route,
+                        size,
+                        offending,
+                        &json!({ "numberOfRatings": "12" }),
+                    ),
+                )
+                .await;
+            assert_accepted(&case, &reply);
+            assert_eq!(
+                stored_record_count(&emulator, route, "tracker-1"),
+                size,
+                "case {case:?}: expected every record of the batch to be ingested, got {}",
+                stored_record_count(&emulator, route, "tracker-1")
+            );
+        }
+    }
+}
+
+/// RULE: the keyword is the sentence's ONLY variable part — nothing else the request
+/// carries reaches it. The rows differ in every member the sentence could wrongly be
+/// derived from: the tracking id, the session, the user, the event type, the record count,
+/// the offending record's position, the property's value and the route — and one and the
+/// same keyword earns one and the same sentence across all of them.
+#[tokio::test]
+async fn the_sentence_varies_with_nothing_but_the_keyword() {
+    let keyword = "timestamp";
+    let expected = reserved_keyword_message(keyword);
+
+    let rows: Vec<(&str, &str, Value)> = vec![
+        (
+            "/events",
+            "a one-record batch",
+            json!({
+                "trackingId": "tracker-1",
+                "sessionId": "session-one",
+                "userId": "user-one",
+                "eventList": [{
+                    "eventType": "click",
+                    "sentAt": 1_764_000_000.0,
+                    "properties": json!({ keyword: "x" }).to_string(),
+                }],
+            }),
+        ),
+        (
+            "/events",
+            "another session, user, event type and property value",
+            json!({
+                "trackingId": "tracker-1",
+                "sessionId": "a-much-longer-session-identifier",
+                "userId": "another-user",
+                "eventList": [
+                    {
+                        "eventType": "watch",
+                        "sentAt": 0.0,
+                        "properties": ORDINARY_PROPERTIES,
+                    },
+                    {
+                        "eventType": "rate",
+                        "sentAt": 1.0,
+                        "properties": json!({ "aaa": "1", keyword: 12, "zzz": true })
+                            .to_string(),
+                    },
+                ],
+            }),
+        ),
+        (
+            "/action-interactions",
+            "the other stream",
+            json!({
+                "trackingId": "tracker-1",
+                "actionInteractions": [{
+                    "actionId": "action-9",
+                    "sessionId": "session-nine",
+                    "timestamp": 1_764_000_001.0,
+                    "eventType": "Taken",
+                    "properties": json!({ keyword: ["a", "b"] }).to_string(),
+                }],
+            }),
+        ),
+    ];
+
+    for (route, case, body) in rows {
+        let emulator = Emulator::new();
+        emulator.seed_tracker("tracker-1");
+        let reply = emulator.post(route, &body).await;
+        assert_refused(case, &reply, 400, "InvalidInputException");
+        let message = refusal_message(&reply);
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
+        );
+    }
+}
+
+/// RULE: a record whose map is keyed by SEVERAL reserved keywords is refused with the one
+/// sentence, filled by one of the keywords it carried — the refusal states a keyword the
+/// request really used, lower-cased, and nothing else.
+#[tokio::test]
+async fn a_map_keyed_by_several_reserved_keywords_is_refused_for_one_of_them() {
+    let pairs = [
+        ("userId", "sessionId"),
+        ("EVENTTYPE", "impression"),
+        ("Timestamp", "recommendationId"),
+    ];
+
+    for route in EVENT_STREAM_ROUTES {
+        for (first, second) in pairs {
+            let case = format!("{route} properties keyed {first:?} and {second:?}");
+            let emulator = Emulator::new();
+            emulator.seed_tracker("tracker-1");
+
+            let reply = emulator
+                .post(
+                    route,
+                    &batch_carrying_properties(
+                        route,
+                        2,
+                        1,
+                        &json!({ first: "x", second: "y" }),
+                    ),
+                )
+                .await;
+            assert_refused(&case, &reply, 400, "InvalidInputException");
+            let message = refusal_message(&reply);
+            let admissible = [
+                reserved_keyword_message(first),
+                reserved_keyword_message(second),
+            ];
+            assert!(
+                admissible.contains(&message),
+                "case {case:?}: expected one of {admissible:?}, got {message:?}"
+            );
+            assert_eq!(
+                stored_record_count(&emulator, route, "tracker-1"),
+                0,
+                "case {case:?}: a refused batch ingests nothing, got {} record(s)",
+                stored_record_count(&emulator, route, "tracker-1")
+            );
+        }
+    }
+}
