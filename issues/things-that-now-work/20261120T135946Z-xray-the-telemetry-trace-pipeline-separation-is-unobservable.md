@@ -50,3 +50,40 @@ History: 20261115T022714Z-xray-3-net-new-behavioral-root-causes-getservicegraph-
    d. Page xray.get_service_graph(StartTime=t-600, EndTime=now+300) following NextToken, collecting every Services[*].Name and Services[*].Names[*]. Expect 'svc-probe' present and 'telonly-probe' absent. Record how many pages and how long one full walk takes.
    e. Repeat step (d) ten times, 2 s apart, over the SAME window bounds: 'svc-probe' must be present in every walk and 'telonly-probe' absent in every walk (no node appearing or disappearing across reads of one window).
 4. Re-replay xray.telemetry-only-host-absent-from-service-graph after the fix to confirm it no longer exhausts its budget inside the GetServiceGraph read loops.
+
+## Resolution (cause declined: the reads are already served; the check's own watch outlasts the harness ceiling)
+
+The direct probe this report asks a fixer to gate on (step 3) HOLDS on this build, and it holds on
+the very first read: measured against the booted emulator by instrumenting every request this check
+makes, the check's calls land as
+
+```
++0.000 s  GetTraceSegmentDestination   (the destination pin; answers XRay/ACTIVE, no update)
++0.005 s  PutTraceSegments             (accepted, UnprocessedTraceSegments == [])
++0.010 s  PutTelemetryRecords          (200)
++0.015 s  GetServiceGraph              <- the presence poll is satisfied by THIS first read
++2.021 s  GetServiceGraph              <- the watch loop, one page-through every 2.0055 s
+   ...                                    29 more of them, to +58.17 s, then the harness cuts the
++58.17 s  GetServiceGraph                 check at its 60.0 s ceiling inside the next time.sleep(2)
+```
+
+Every one of those 30 page-throughs answers one page, carries the traced service's `name` as a node
+`Name`, and carries no value `PutTelemetryRecords` stored. That the telemetry half is a real check
+rather than a vacuous one was confirmed by deliberately deriving a node from the telemetry store for
+one run: the check then failed its absence assertion ("the telemetry-only host appeared in the
+service graph after 10 further page-throughs", and at a later threshold "after 18"), which also shows
+the loop counts page-throughs 1:1 with those 2 s reads and does not exit before the ceiling.
+
+So nothing in the GetServiceGraph answers diverges, and no emulator can finish this check under the
+replay harness: the watch loop alone owes 30 sleeps of 2 s — 60.0 s of wall clock — and the harness
+ceiling is 60.0 s, which the first page-through (5 ms after the ingest) cannot buy back. Against AWS
+the same check spent 25-65 s on the presence poll before that watch even began, so the recorded run
+was never inside a 60 s budget either.
+
+What landed instead of a behaviour change: `tests/all/service_map_read_is_repeatable.rs`, which pins
+the two rules the check watches for — a service whose segment was accepted is a node of every window
+holding that segment's instant from the FIRST read onwards, and reading a window answers the same map
+on every later read (node for node, member for member) whatever else the account does in between —
+while no spelling of a `PutTelemetryRecords` reporting source is ever a node name or alias. The
+crate's integration tests were migrated to the `automod` `tests/all/main.rs` root in the same change,
+because that is what adding a suite to this crate now requires.
