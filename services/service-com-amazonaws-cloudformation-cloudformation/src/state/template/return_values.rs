@@ -47,6 +47,11 @@ pub(super) use crate::state::provisioner::redshift_serverless;
 // live beside the arms that provision them
 // ([`crate::state::provisioning::efs_resources`]), for the same reason.
 pub(super) use crate::state::provisioning::efs_resources;
+// The three Amazon Lex V2 types: their own NAMES, the ARN forms they publish and the
+// attributes each of them publishes live beside the arms that provision them
+// ([`crate::state::provisioner::lex_bots`]), so this catalogue and the provisioner cannot
+// name the same attribute differently.
+pub(in crate::state) use crate::state::provisioner::lex_bots;
 pub(super) use crate::state::provisioning::efs_resources::{
     EFS_ACCESS_POINT, EFS_FILE_SYSTEM, EFS_MOUNT_TARGET,
 };
@@ -154,6 +159,13 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
             lake_formation_permissions::RESOURCE_IDENTIFIER_PROPERTY,
         ],
         ACMPCA_CERTIFICATE_AUTHORITY => &["Arn", "CertificateSigningRequest"],
+        // The three Amazon Lex V2 types, each publishing the values that service's own create
+        // answers for one: the bot's ARN and the `botId` inside it, the numeric version it
+        // assigned when it cut a version, and an alias's ARN, its own id and the status it is
+        // in ([`crate::state::provisioner::lex_bots`]).
+        lex_bots::LEX_BOT => lex_bots::LEX_BOT_ATTRIBUTES,
+        lex_bots::LEX_BOT_VERSION => lex_bots::LEX_BOT_VERSION_ATTRIBUTES,
+        lex_bots::LEX_BOT_ALIAS => lex_bots::LEX_BOT_ALIAS_ATTRIBUTES,
         ACMPCA_CERTIFICATE => &["Arn", "Certificate"],
         ACMPCA_CERTIFICATE_AUTHORITY_ACTIVATION => &["CompleteCertificateChain"],
         BACKUP_VAULT => &["BackupVaultArn", "BackupVaultName"],
@@ -1488,6 +1500,12 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // ([`crate::state::provisioner`]'s job-definition arms), and the ARN computed here is
         // the stand-in a declaration is resolved against until then.
         || resource_type == BATCH_JOB_DEFINITION
+        // Every one of the three Amazon Lex V2 types is one too: that service mints a bot's
+        // `botId` and an alias's `botAliasId`, and it assigns the NUMBER a version is cut
+        // under, so none of those identities is a value a template could state and the
+        // identifiers the naming rules compute for one are stand-ins until the create has
+        // answered ([`crate::state::provisioner::lex_bots`]).
+        || lex_bots::kind_of(resource_type).is_some()
 }
 
 /// Whether `resource_type` is one of the six Amazon Bedrock AgentCore types whose identity is
@@ -1664,6 +1682,15 @@ pub fn composite_identity_properties(resource_type: &str) -> &'static [&'static 
         crate::state::provisioning::sagemaker_studio::SAGEMAKER_SPACE => {
             &["DomainId", "SpaceName"]
         }
+        // The two Amazon Lex V2 resources that live INSIDE a bot, each identified by the pair
+        // its own schema declares as its primary identifier: a version by the bot and the
+        // number Amazon Lex assigned it, an alias by its own id and the bot it is an alias of.
+        // The half that service assigns is no part of any declaration, so
+        // [`composite_identity`] answers `None` for one and the identity is built from what
+        // the create answered instead
+        // ([`crate::state::provisioner::lex_bots::bot_version_identity`]).
+        lex_bots::LEX_BOT_VERSION => &["BotId", lex_bots::LEX_BOT_VERSION_ATTRIBUTE],
+        lex_bots::LEX_BOT_ALIAS => &["BotAliasId", "BotId"],
         _ => &[],
     }
 }

@@ -1890,6 +1890,81 @@ pub(crate) fn return_values(
                 attributes,
             )
         }
+        // Amazon Lex V2's model-building plane: the bot an `AWS::Lex::Bot` declares. "Ref
+        // returns the bot Id"; Fn::GetAtt: Arn, Id. That service MINTS the id — `CreateBot`
+        // answers a `botId` of `^[0-9a-zA-Z]{10}$`, which is what every bot-addressed call
+        // takes and which the bot's NAME (`^([0-9a-zA-Z][_-]?){1,100}$`) is not — so the two
+        // values here are STAND-INS of the forms that service's own model fixes, and
+        // `super::provisioning` re-points them at what the create really answered
+        // ([`crate::state::provisioner::lex_bots`]).
+        lex_bots::LEX_BOT => {
+            let id = service_assigned_label(
+                lex_bots::LEX_BOT_ID_SALT,
+                name,
+                lex_bots::LEX_ID_DIGITS,
+            );
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn(
+                    lex_bots::LEX_ARN_NAMESPACE,
+                    region,
+                    &format!("{}/{id}", lex_bots::LEX_BOT_ARN_PATH),
+                ),
+            );
+            attributes.insert("Id".to_string(), id.clone());
+            (id, attributes)
+        }
+        // The immutable VERSION of such a bot. "Fn::GetAtt … BotVersion: the version of the
+        // bot", which is the numeric `NumericalBotVersion` (`^[0-9]+$`, length 1-5) Amazon Lex
+        // assigns when it cuts the version — and exactly what the `botVersion` of an alias
+        // takes, which is how the canonical template wires an aliased bot together. The number
+        // is that service's to assign, so the value here is the one a FIRST version carries
+        // ([`lex_bots::LEX_FIRST_BOT_VERSION`]) and `super::provisioning` re-points it at the
+        // number `CreateBotVersion` really answered. The identity is that service's too — the
+        // pair `(BotId, BotVersion)` the type's schema declares as its primary identifier, of
+        // which the version half only exists once the create has answered — so the resource
+        // keeps the identifier the naming rules computed until then.
+        lex_bots::LEX_BOT_VERSION => {
+            attributes.insert(
+                lex_bots::LEX_BOT_VERSION_ATTRIBUTE.to_string(),
+                lex_bots::LEX_FIRST_BOT_VERSION.to_string(),
+            );
+            (name.to_string(), attributes)
+        }
+        // The ALIAS that points at one of those versions. "Fn::GetAtt … Arn, BotAliasId,
+        // BotAliasStatus". Amazon Lex mints the `botAliasId` the same way it mints a bot's id,
+        // and the ARN carries the bot the alias belongs to beside it
+        // (`bot-alias/<botId>/<botAliasId>`), so both are stand-ins re-pointed at what
+        // `CreateBotAlias` answered; the status stands in as the one an alias is OPENED in,
+        // which that create documents.
+        lex_bots::LEX_BOT_ALIAS => {
+            let alias_id = service_assigned_label(
+                lex_bots::LEX_BOT_ALIAS_ID_SALT,
+                name,
+                lex_bots::LEX_ID_DIGITS,
+            );
+            let bot_id = properties
+                .get("BotId")
+                .and_then(|value| text(value, scope, 0, budget))
+                .unwrap_or_default();
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn(
+                    lex_bots::LEX_ARN_NAMESPACE,
+                    region,
+                    &format!("{}/{bot_id}/{alias_id}", lex_bots::LEX_BOT_ALIAS_ARN_PATH),
+                ),
+            );
+            attributes.insert("BotAliasId".to_string(), alias_id.clone());
+            attributes.insert(
+                "BotAliasStatus".to_string(),
+                lex_bots::LEX_BOT_ALIAS_CREATING.to_string(),
+            );
+            (
+                lex_bots::bot_alias_identity(&alias_id, &bot_id),
+                attributes,
+            )
+        }
         // Amazon Bedrock's own control plane: the guardrail an `AWS::Bedrock::Guardrail`
         // declares. "Ref returns the guardrail ARN" (the type's primary identifier);
         // Fn::GetAtt: GuardrailId, GuardrailArn, Version. Amazon Bedrock MINTS the id —

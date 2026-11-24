@@ -1002,6 +1002,10 @@ impl Provisioner {
                 )
                 .await
             }
+            // Amazon Lex V2's own reads of the three resources a stack declares in it: the bot
+            // by the `botId` it minted, and a version or an alias by the pair its identity is
+            // composed of.
+            Self::LexBot(kind) => describe_lex_resource(ctx, region, kind, resource).await,
         }
     }
 }

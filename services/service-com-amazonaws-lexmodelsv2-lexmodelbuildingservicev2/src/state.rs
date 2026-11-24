@@ -39,7 +39,8 @@
 //! resource of a bot version is keyed by its bot version as well as by its own id: one id
 //! names the same resource in every version that snapshotted it.
 //!
-//! The alias slice (`ListBotAliases`) is served out of `bot_aliases`, keyed by the bot
+//! The alias slice (`CreateBotAlias`, `DescribeBotAlias`, `ListBotAliases`,
+//! `DeleteBotAlias`) is served out of `bot_aliases`, keyed by the bot
 //! and the alias id: a bot is created with the alias Amazon Lex keeps for testing it, so
 //! a bot the store holds always has at least that one alias to report.
 //!
@@ -67,7 +68,8 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
-    AudioFillerSettings, BotAliasSummary, BotMember, BotSummary, BotVersionLocaleDetails,
+    AudioFillerSettings, BotAliasLocaleSettings, BotAliasSummary, BotMember, BotSummary,
+    BotVersionLocaleDetails, ConversationLogSettings, SentimentAnalysisSettings,
     BotVersionSummary, CompositeSlotTypeSetting, DataPrivacy,
     DialogCodeHookSettings, ErrorLogSettings, ExternalSourceSetting, FulfillmentCodeHookSettings,
     GenerativeAISettings, InitialResponseSetting, InputContext, IntentClosingSetting,
@@ -329,6 +331,10 @@ pub const SLOT_RESOURCE_LABEL: &str = "Slot";
 /// See [`name_already_exists`].
 pub const BOT_RESOURCE_LABEL: &str = "Bot";
 
+/// How Amazon Lex V2 names a bot alias in a message about a name that is already in use.
+/// See [`name_already_exists`].
+pub const BOT_ALIAS_RESOURCE_LABEL: &str = "Bot Alias";
+
 /// How Amazon Lex V2 names a slot type in a message about a name that is already in
 /// use. See [`name_already_exists`].
 pub const SLOT_TYPE_RESOURCE_LABEL: &str = "Slot Type";
@@ -457,6 +463,24 @@ impl Bot {
 /// which "the alias is ready for use".
 pub const BOT_ALIAS_STATUS_AVAILABLE: &str = "Available";
 
+/// See [`BOT_ALIAS_STATUS_AVAILABLE`]. `CreateBotAlias` documents the status an alias is
+/// opened in: "The alias is first put into the Creating state. When the alias is ready to
+/// be used, it is put into the Available state."
+pub const BOT_ALIAS_STATUS_CREATING: &str = "Creating";
+
+/// See [`BOT_ALIAS_STATUS_AVAILABLE`]. The status `DeleteBotAlias` reports the alias it
+/// removed in.
+pub const BOT_ALIAS_STATUS_DELETING: &str = "Deleting";
+
+/// How many aliases one bot may hold: the published AWS Lex V2 service quota "Aliases per
+/// bot" (default 50, adjustable on request).
+///
+/// `CreateBotAlias` answers the modelled `ServiceQuotaExceededException` ("You have reached
+/// a quota for your bot", HTTP 402) once the bot holds this many, which is what bounds the
+/// stored aliases: at most [`BOTS_PER_ACCOUNT_QUOTA`] bots times this many records, so a
+/// caller cannot grow that map past it.
+pub const ALIASES_PER_BOT_QUOTA: usize = 50;
+
 /// The working copy of a bot, which is the version an alias points at until it is
 /// pointed at a numbered one: the modelled `BotVersion` admits it beside a number
 /// (`smithy_query(query="shape",shape="BotVersion")`, pattern `^(DRAFT|[0-9]+)$`).
@@ -501,6 +525,20 @@ pub struct BotAlias {
     pub bot_alias_status: String,
     pub creation_date_time: SystemTime,
     pub last_updated_date_time: SystemTime,
+    /// The per-locale settings the create supplied, held exactly as supplied — `None`
+    /// where it supplied none, which is not the same as an empty map.
+    pub bot_alias_locale_settings: Option<HashMap<String, BotAliasLocaleSettings>>,
+    /// The conversation logging the create supplied, held exactly as supplied.
+    pub conversation_log_settings: Option<ConversationLogSettings>,
+    /// The sentiment analysis the create supplied, held exactly as supplied.
+    pub sentiment_analysis_settings: Option<SentimentAnalysisSettings>,
+    /// The tags the create supplied, held exactly as supplied: "you can only add tags when
+    /// you create an alias".
+    pub tags: Option<HashMap<String, String>>,
+    /// The status the clock owes this alias, and the instant it falls due. `None` once the
+    /// alias has reached a status nothing further is owed from. Set it through
+    /// [`BotAlias::schedule_status`] rather than by hand.
+    pub pending_status: Option<(String, Instant)>,
 }
 
 impl BotAlias {
@@ -521,7 +559,23 @@ impl BotAlias {
             bot_alias_status: BOT_ALIAS_STATUS_AVAILABLE.to_string(),
             creation_date_time: now,
             last_updated_date_time: now,
+            bot_alias_locale_settings: None,
+            conversation_log_settings: None,
+            sentiment_analysis_settings: None,
+            tags: None,
+            pending_status: None,
         }
+    }
+
+    /// Apply the status transition the clock has already made due, if any — the same
+    /// contract [`Bot::settle`] holds.
+    pub fn settle(&mut self) {
+        settle_status(&mut self.bot_alias_status, &mut self.pending_status);
+    }
+
+    /// Schedule `status` to become this alias's status once `after` has elapsed.
+    pub fn schedule_status(&mut self, status: &str, after: Duration) {
+        self.pending_status = Some((status.to_string(), Instant::now() + after));
     }
 
     /// This alias as a `ListBotAliases` summary entry.
@@ -1285,6 +1339,91 @@ impl ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State {
         self.bot_aliases
             .insert(bot_alias_key(bot_id, &bot_alias_id), alias);
         bot_alias_id
+    }
+
+    /// Mint an unused `botAliasId`, from the same counter and in the same
+    /// `[0-9a-zA-Z]{10}` space [`Self::mint_bot_id`] draws from, and checked against the
+    /// stored aliases before it is handed out.
+    ///
+    /// The id Amazon Lex keeps for a bot's test alias ([`TEST_BOT_ALIAS_ID`]) is never
+    /// handed out here: the modelled `BotAliasId` singles that one out in its own pattern,
+    /// so it belongs to the test alias of every bot and to no alias a create makes.
+    pub fn mint_bot_alias_id(&mut self) -> String {
+        loop {
+            self.id_seq += 1;
+            let candidate = render_id(self.id_seq);
+            if candidate != TEST_BOT_ALIAS_ID && !self.holds_bot_alias_id(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
+    /// Does any bot hold an alias under this id? An id is checked across every bot, so one
+    /// handed out names exactly one alias in the whole store.
+    fn holds_bot_alias_id(&self, bot_alias_id: &str) -> bool {
+        self.bot_aliases.keys().any(|(_, id)| id == bot_alias_id)
+    }
+
+    /// Is `name` already the name of an alias of that bot? `CreateBotAlias` documents its
+    /// `botAliasName` as "the alias to create. The name must be unique for the bot."
+    pub fn bot_alias_name_taken(&self, bot_id: &str, bot_alias_name: &str) -> bool {
+        self.bot_aliases_of_bot(bot_id)
+            .any(|alias| alias.bot_alias_name == bot_alias_name)
+    }
+
+    /// How many aliases of `bot_id` the store holds — what [`ALIASES_PER_BOT_QUOTA`]
+    /// bounds.
+    pub fn bot_alias_count(&self, bot_id: &str) -> usize {
+        self.bot_aliases_of_bot(bot_id).count()
+    }
+
+    /// The stored alias the pair names, with any due status transition applied first —
+    /// the same contract as [`Self::settled_bot`].
+    pub fn settled_bot_alias(&mut self, bot_id: &str, bot_alias_id: &str) -> Option<&BotAlias> {
+        let alias = self
+            .bot_aliases
+            .get_mut(&bot_alias_key(bot_id, bot_alias_id))?;
+        alias.settle();
+        Some(alias)
+    }
+
+    /// Drop the version the pair names, with everything the version snapshotted, and
+    /// answer whether there was one to drop.
+    ///
+    /// A version is an immutable snapshot of the locales it was taken from
+    /// ([`Self::snapshot_locale`]), so the locales, intents, slot types and slots held
+    /// under that version go with it: otherwise a later read of one would report a
+    /// resource of a version the store no longer holds.
+    pub fn remove_bot_version(&mut self, bot_id: &str, bot_version: &str) -> bool {
+        let removed = self
+            .bot_versions
+            .remove(&bot_version_key(bot_id, bot_version))
+            .is_some();
+        self.bot_locales
+            .retain(|(bot, version, _), _| bot != bot_id || version != bot_version);
+        self.intents
+            .retain(|_, intent| intent.bot_id != bot_id || intent.bot_version != bot_version);
+        self.slot_types.retain(|_, slot_type| {
+            slot_type.bot_id != bot_id || slot_type.bot_version != bot_version
+        });
+        self.slots
+            .retain(|_, slot| slot.bot_id != bot_id || slot.bot_version != bot_version);
+        removed
+    }
+
+    /// Which aliases point at the version the pair names, as the ids of those aliases.
+    ///
+    /// `DeleteBotVersion` "checks if any other resource, such as a bot network, is using
+    /// the bot version before it is deleted" unless the request skips that check, and an
+    /// alias pointing at a version is such a user of it.
+    pub fn bot_aliases_using_version(&self, bot_id: &str, bot_version: &str) -> Vec<String> {
+        let mut using: Vec<String> = self
+            .bot_aliases_of_bot(bot_id)
+            .filter(|alias| alias.bot_version == bot_version)
+            .map(|alias| alias.bot_alias_id.clone())
+            .collect();
+        using.sort();
+        using
     }
 
     /// Every alias of one bot, which is what a listing of that bot's aliases is built

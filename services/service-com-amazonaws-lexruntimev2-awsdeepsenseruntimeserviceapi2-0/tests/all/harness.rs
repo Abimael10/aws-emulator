@@ -143,6 +143,16 @@ impl Emulator {
                 bot_alias_status: lexmodels::state::BOT_ALIAS_STATUS_AVAILABLE.to_string(),
                 creation_date_time: now,
                 last_updated_date_time: now,
+                // The alias carries no per-locale settings, no conversation logging, no
+                // sentiment analysis and no tags: a bot's test alias is created with none of
+                // them, and nothing in these suites reads one.
+                bot_alias_locale_settings: None,
+                conversation_log_settings: None,
+                sentiment_analysis_settings: None,
+                tags: None,
+                // Nothing is owed on this alias: it is written into the store already in the
+                // status an alias ready for use rests in.
+                pending_status: None,
             },
         );
         control_plane.bot_locales.insert(

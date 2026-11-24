@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteBotVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteBotVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteBotVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the version the pair names from [`crate::state`], together with everything the
+//! version snapshotted, so `DescribeBotVersion` can no longer find it and `ListBotVersions`
+//! can no longer report it. A version an ALIAS of the bot points at is in use, and the
+//! delete is refused unless the request asks for that check to be skipped.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +160,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteBotVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteBotVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteBotVersion"))
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteBotVersionErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Lex Models V2 store is unavailable".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+
+        // Nothing is deleted for a pair the store holds no version under: the version has
+        // to be there to delete.
+        if !store
+            .bot_versions
+            .contains_key(&crate::state::bot_version_key(
+                &input.bot_id,
+                &input.bot_version,
+            ))
+        {
+            return Err(DeleteBotVersionErrorModeled::PreconditionFailedException(
+                PreconditionFailedException {
+                    // The sentence this service states when a resource the request names
+                    // does not resolve, whatever the resource and whatever identified it.
+                    message: Some(crate::state::PARENT_RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // "Amazon Lex checks if any other resource, such as a bot network, is using the
+        // bot version before it is deleted" unless `skipResourceInUseCheck` is set. The
+        // users of a version that this slice stores are the aliases pointing at it.
+        if !input.skip_resource_in_use_check {
+            let used_by = store.bot_aliases_using_version(&input.bot_id, &input.bot_version);
+            if !used_by.is_empty() {
+                return Err(DeleteBotVersionErrorModeled::ConflictException(ConflictException {
+                    message: Some(format!(
+                        "Version {} of bot {} is in use by bot alias(es) {}; delete them first or set skipResourceInUseCheck",
+                        input.bot_version,
+                        input.bot_id,
+                        used_by.join(", ")
+                    )),
+                })
+                .into());
+            }
+        }
+
+        store.remove_bot_version(&input.bot_id, &input.bot_version);
+
+        Ok(DeleteBotVersionOutput {
+            bot_id: Some(input.bot_id),
+            bot_version: Some(input.bot_version),
+            // The status the delete call itself puts the bot into, as `DeleteBot` reports
+            // for the bot it removed.
+            bot_status: Some(crate::state::BOT_STATUS_DELETING.to_string()),
+        })
     }
 }

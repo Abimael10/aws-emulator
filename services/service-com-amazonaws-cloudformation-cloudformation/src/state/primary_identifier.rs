@@ -114,8 +114,13 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         // ("Ref returns the spending limit ARN"), which is the handle every spending-limit
         // API takes — the type declares no name a client could name one by.
         BRAKET_SPENDING_LIMIT => "SpendingLimitArn",
-        // An AWS HealthLake FHIR data store is identified by the `DatastoreId` that service
-        // minted for it ("Ref returns the DatastoreId") — the handle every data-store API
+        // An Amazon Lex V2 BOT is identified by the `Id` that service minted for it ("Ref
+        // returns the bot Id") — the `botId` every bot-addressed call takes; its `Name` is only
+        // what the bot is called. (A version and an alias are identified by the PAIR each of
+        // their schemas declares, which is a composite row of
+        // [`super::template::composite_identity_properties`] rather than a published value.)
+        crate::state::provisioner::lex_bots::LEX_BOT => "Id",
+        // An AWS HealthLake FHIR data store is identified by the `DatastoreId` that service        // minted for it ("Ref returns the DatastoreId") — the handle every data-store API
         // takes; its `DatastoreName` is only what the store is called, and the type does not
         // require one at all. A DATA TRANSFORMATION PROFILE is identified by the ARN built
         // around the id that service minted ("Ref returns the profile ARN"), which is the

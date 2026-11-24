@@ -3173,6 +3173,12 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     "AWS::Lambda::Function",
     LAMBDA_ALIAS,
     LAMBDA_VERSION,
+    // The three Amazon Lex V2 types, each publishing the values that service's own create
+    // answers for one: a bot's ARN and the `botId` inside it, the numeric version it assigned
+    // when it cut a version, and an alias's ARN, its own id and the status it is in.
+    crate::state::provisioner::lex_bots::LEX_BOT,
+    crate::state::provisioner::lex_bots::LEX_BOT_VERSION,
+    crate::state::provisioner::lex_bots::LEX_BOT_ALIAS,
     "AWS::Logs::LogGroup",
     MQ_BROKER,
     // An Amazon MQ CONFIGURATION, publishing the ARN and the id that service minted for it

@@ -352,3 +352,421 @@ async fn a_listing_request_outside_what_the_model_accepts_is_refused() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The alias a caller CREATES, beside the one every bot is created with
+// ---------------------------------------------------------------------------
+
+/// `CreateBotAlias`'s URI: `PUT /bots/{botId}/botaliases`, which is [`aliases_uri`] under
+/// another method; one alias is addressed under it by its own id.
+fn alias_uri(bot_id: &str, bot_alias_id: &str) -> String {
+    format!("{}/{bot_alias_id}", aliases_uri(bot_id))
+}
+
+/// Create an alias of a bot; the body carries every member but the bot, which the URI names.
+async fn create_alias(router: &MultiServiceRouter, bot_id: &str, body: Value) -> (u16, Value) {
+    call(router, "PUT", &aliases_uri(bot_id), Some(body)).await
+}
+
+/// Read one alias back: `DescribeBotAlias` is `GET /bots/{botId}/botaliases/{botAliasId}`.
+async fn describe_alias(
+    router: &MultiServiceRouter,
+    bot_id: &str,
+    bot_alias_id: &str,
+) -> (u16, Value) {
+    call(router, "GET", &alias_uri(bot_id, bot_alias_id), None).await
+}
+
+/// Delete one alias, with the resource-in-use check skipped where `skip` says so.
+async fn delete_alias(
+    router: &MultiServiceRouter,
+    bot_id: &str,
+    bot_alias_id: &str,
+    skip: bool,
+) -> (u16, Value) {
+    call(
+        router,
+        "DELETE",
+        &format!(
+            "{}?skipResourceInUseCheck={skip}",
+            alias_uri(bot_id, bot_alias_id)
+        ),
+        None,
+    )
+    .await
+}
+
+/// A bot carrying one `en_US` locale with one intent on its `DRAFT` version, and one
+/// NUMBERED version cut from that locale — which is the estate an alias points into.
+///
+/// Answers the minted `botId` and the number `CreateBotVersion` assigned, so a row that
+/// points an alias at a version uses the number that service really handed out rather than
+/// one written into the test.
+async fn bot_with_a_version(router: &MultiServiceRouter, bot_name: &str) -> (String, String) {
+    let bot_id = create_bot(router, &create_body(bot_name, 300, json!({}))).await;
+    let (status, created) = call(
+        router,
+        "PUT",
+        &crate::bot_locale::locales_uri(&bot_id, state::DRAFT_BOT_VERSION),
+        Some(crate::bot_locale::locale_body("en_US", 0.4, json!({}))),
+    )
+    .await;
+    assert_eq!(
+        status, 202,
+        "CreateBotLocale for {bot_name}: expected 202, got {status} {created:?}"
+    );
+    crate::intents_and_builds::create_intent(
+        router,
+        &bot_id,
+        "en_US",
+        &crate::intents_and_builds::intent_body(
+            "OrderPizza",
+            json!({ "sampleUtterances": [{ "utterance": "I want to order a pizza" }] }),
+        ),
+    )
+    .await;
+    let (status, version) = call(
+        router,
+        "PUT",
+        &format!("/bots/{bot_id}/botversions"),
+        Some(json!({
+            "botVersionLocaleSpecification": {
+                "en_US": { "sourceBotVersion": state::DRAFT_BOT_VERSION },
+            },
+        })),
+    )
+    .await;
+    assert_eq!(
+        status, 202,
+        "CreateBotVersion for {bot_name}: expected 202, got {status} {version:?}"
+    );
+    (bot_id, text(&version, "botVersion"))
+}
+
+/// The alias the deadline waits for, read again until it carries `Available` — the status
+/// `CreateBotAlias` documents an alias reaches "when the alias is ready to be used" — or the
+/// generous deadline passes. Waits for the CONDITION rather than for a fixed time.
+async fn settled_alias(router: &MultiServiceRouter, bot_id: &str, bot_alias_id: &str) -> Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let (status, alias) = describe_alias(router, bot_id, bot_alias_id).await;
+        assert_eq!(
+            status, 200,
+            "DescribeBotAlias {bot_alias_id}: expected 200, got {status} {alias:?}"
+        );
+        if text(&alias, "botAliasStatus") == state::BOT_ALIAS_STATUS_AVAILABLE
+            || std::time::Instant::now() >= deadline
+        {
+            return alias;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// An alias a caller creates is the alias Amazon Lex reports back, points at the version the
+/// create named, and stops resolving once it is deleted.
+///
+/// The rows differ along what the rule generalises over: whether the alias names a VERSION or
+/// leaves it at the bot's working copy, whether it carries a description, per-locale settings,
+/// conversation logging or tags, and the shape of its name.
+#[tokio::test]
+async fn an_alias_is_created_read_back_and_deleted() {
+    // One row per shape of a create. The version placeholder is filled in with the number
+    // `CreateBotVersion` really answered, so no row writes a version number of its own.
+    let rows: Vec<(&str, bool, Value)> = vec![
+        ("only the required members", false, json!({})),
+        (
+            "an alias pointing at a numbered version",
+            true,
+            json!({ "description": "the alias the stack publishes" }),
+        ),
+        (
+            "an alias carrying per-locale settings and tags",
+            true,
+            json!({
+                "botAliasLocaleSettings": { "en_US": { "enabled": true } },
+                "tags": { "team": "voice" },
+            }),
+        ),
+        (
+            "an alias carrying conversation logging and a hyphenated name",
+            false,
+            json!({
+                "description": "d".repeat(2_000),
+                "conversationLogSettings": {
+                    "textLogSettings": [{
+                        "enabled": true,
+                        "destination": {
+                            "cloudWatch": {
+                                "cloudWatchLogGroupArn":
+                                    "arn:aws:logs:us-east-1:000000000000:log-group:/lex/alias",
+                                "logPrefix": "aliases/",
+                            },
+                        },
+                    }],
+                },
+            }),
+        ),
+    ];
+
+    for (index, (case, points_at_version, extra)) in rows.iter().enumerate() {
+        let router = emulator();
+        let (bot_id, bot_version) =
+            bot_with_a_version(&router, &format!("AliasCreateBot{index}")).await;
+        let alias_name = format!("Prod-{index}");
+        let mut body = json!({ "botAliasName": alias_name });
+        let object = body.as_object_mut().expect("the body is a JSON object");
+        for (key, value) in extra.as_object().expect("extras are a JSON object") {
+            object.insert(key.clone(), value.clone());
+        }
+        let expected_version = if *points_at_version {
+            object.insert("botVersion".to_string(), json!(bot_version));
+            bot_version.clone()
+        } else {
+            // An alias created without a version points at the bot's working copy, which the
+            // modelled `BotVersion` admits beside a number.
+            state::DRAFT_BOT_VERSION.to_string()
+        };
+
+        let (status, created) = create_alias(&router, &bot_id, body.clone()).await;
+        assert_eq!(
+            status, 202,
+            "case {case:?}: expected CreateBotAlias to answer 202, got {status} {created:?}"
+        );
+        let bot_alias_id = text(&created, "botAliasId");
+        assert!(
+            bot_alias_id.len() == 10
+                && bot_alias_id.chars().all(|character| character.is_ascii_alphanumeric()),
+            "case {case:?}: expected a minted ^[0-9a-zA-Z]{{10}}$ botAliasId, got \
+             {bot_alias_id:?}"
+        );
+        assert_eq!(
+            (
+                text(&created, "botAliasStatus"),
+                text(&created, "botVersion"),
+                text(&created, "botId"),
+            ),
+            (
+                state::BOT_ALIAS_STATUS_CREATING.to_string(),
+                expected_version.clone(),
+                bot_id.clone(),
+            ),
+            "case {case:?}: expected the create to report the alias it opened, got {created:?}"
+        );
+
+        // Read back off the stored record: every member the create was given is reported,
+        // and the status the clock owed has been materialised.
+        let alias = settled_alias(&router, &bot_id, &bot_alias_id).await;
+        assert_eq!(
+            (
+                text(&alias, "botAliasId"),
+                text(&alias, "botAliasName"),
+                text(&alias, "botVersion"),
+                text(&alias, "botAliasStatus"),
+            ),
+            (
+                bot_alias_id.clone(),
+                alias_name.clone(),
+                expected_version.clone(),
+                state::BOT_ALIAS_STATUS_AVAILABLE.to_string(),
+            ),
+            "case {case:?}: expected the alias to read back as created, got {alias:?}"
+        );
+        for optional in [
+            "description",
+            "botAliasLocaleSettings",
+            "conversationLogSettings",
+        ] {
+            assert_eq!(
+                member(&alias, optional),
+                member(&created, optional),
+                "case {case:?}: expected {optional} to read back as the create reported it, \
+                 got {alias:?}"
+            );
+        }
+
+        // The listing of the bot's aliases holds it beside the test alias every bot carries.
+        let (status, listed) = list(&router, &bot_id, json!({})).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected ListBotAliases to answer 200, got {status} {listed:?}"
+        );
+        let ids = listed_ids(&listed);
+        assert!(
+            ids.contains(&bot_alias_id) && ids.contains(&state::TEST_BOT_ALIAS_ID.to_string()),
+            "case {case:?}: expected the listing to hold the created alias beside the test \
+             alias, got {ids:?}"
+        );
+
+        // And the delete takes it away: the handle stops resolving, while the test alias the
+        // bot was created with is untouched.
+        let (status, deleted) = delete_alias(&router, &bot_id, &bot_alias_id, false).await;
+        assert_eq!(
+            status, 202,
+            "case {case:?}: expected DeleteBotAlias to answer 202, got {status} {deleted:?}"
+        );
+        assert_eq!(
+            text(&deleted, "botAliasStatus"),
+            state::BOT_ALIAS_STATUS_DELETING,
+            "case {case:?}: expected the delete to report the status it put the alias in, got \
+             {deleted:?}"
+        );
+        let (status, gone) = describe_alias(&router, &bot_id, &bot_alias_id).await;
+        assert_eq!(
+            (status, error_code(&gone)),
+            (404, "ResourceNotFoundException"),
+            "case {case:?}: expected the deleted alias to stop resolving, got {status} {gone:?}"
+        );
+        let (status, test_alias) =
+            describe_alias(&router, &bot_id, state::TEST_BOT_ALIAS_ID).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the bot's test alias to survive, got {status} \
+             {test_alias:?}"
+        );
+    }
+}
+
+/// A create outside what the service accepts is refused, each with the error class that
+/// refusal belongs to: a name the bot already carries conflicts, and a bot or a version
+/// nothing backs is a precondition the request does not meet.
+#[tokio::test]
+async fn creating_an_alias_outside_what_the_service_accepts_is_refused() {
+    let router = emulator();
+    let (bot_id, bot_version) = bot_with_a_version(&router, "AliasRefusalBot").await;
+    let (status, created) =
+        create_alias(&router, &bot_id, json!({ "botAliasName": "Prod" })).await;
+    assert_eq!(
+        status, 202,
+        "expected the first create to be accepted, got {status} {created:?}"
+    );
+
+    // Rows differ in WHICH precondition the request misses: the name, the bot, and the
+    // version the alias would point at.
+    let rows: Vec<(&str, String, Value, u16, &str)> = vec![
+        (
+            "a name the bot already carries",
+            bot_id.clone(),
+            json!({ "botAliasName": "Prod" }),
+            409,
+            "ConflictException",
+        ),
+        (
+            "the name of the alias every bot is created with",
+            bot_id.clone(),
+            json!({ "botAliasName": state::TEST_BOT_ALIAS_NAME }),
+            409,
+            "ConflictException",
+        ),
+        (
+            "a bot the store does not hold",
+            "ZZZZZZZZZZ".to_string(),
+            json!({ "botAliasName": "Prod2" }),
+            412,
+            "PreconditionFailedException",
+        ),
+        (
+            "a version the bot does not hold",
+            bot_id.clone(),
+            json!({ "botAliasName": "Prod3", "botVersion": "99" }),
+            412,
+            "PreconditionFailedException",
+        ),
+    ];
+
+    for (case, bot, body, expected_status, expected_code) in &rows {
+        let (status, response) = create_alias(&router, bot, body.clone()).await;
+        assert_eq!(
+            (status, error_code(&response)),
+            (*expected_status, *expected_code),
+            "case {case:?}: expected {expected_status} {expected_code}, got {status} \
+             {response:?}"
+        );
+    }
+
+    // The version the first alias points at IS accepted, which is what makes the row above a
+    // refusal of a version nothing backs rather than of the member itself.
+    let (status, accepted) = create_alias(
+        &router,
+        &bot_id,
+        json!({ "botAliasName": "Staging", "botVersion": bot_version }),
+    )
+    .await;
+    assert_eq!(
+        status, 202,
+        "a version the bot holds must be accepted, got {status} {accepted:?}"
+    );
+}
+
+/// A version an ALIAS points at is in use: its delete is refused until the request asks for
+/// that check to be skipped, and once it is gone the version stops resolving.
+#[tokio::test]
+async fn a_version_an_alias_points_at_is_in_use_until_the_check_is_skipped() {
+    let router = emulator();
+    let (bot_id, bot_version) = bot_with_a_version(&router, "AliasVersionInUseBot").await;
+    let version_uri = format!("/bots/{bot_id}/botversions/{bot_version}");
+    let (status, created) = create_alias(
+        &router,
+        &bot_id,
+        json!({ "botAliasName": "Prod", "botVersion": bot_version }),
+    )
+    .await;
+    assert_eq!(
+        status, 202,
+        "expected CreateBotAlias to answer 202, got {status} {created:?}"
+    );
+
+    let (status, refused) = call(&router, "DELETE", &version_uri, None).await;
+    assert_eq!(
+        (status, error_code(&refused)),
+        (409, "ConflictException"),
+        "expected a version an alias points at to be in use, got {status} {refused:?}"
+    );
+
+    let (status, deleted) = call(
+        &router,
+        "DELETE",
+        &format!("{version_uri}?skipResourceInUseCheck=true"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 202,
+        "expected the delete to be accepted once the check is skipped, got {status} \
+         {deleted:?}"
+    );
+    assert_eq!(
+        (
+            text(&deleted, "botId"),
+            text(&deleted, "botVersion"),
+        ),
+        (bot_id.clone(), bot_version.clone()),
+        "expected the delete to report the version it removed, got {deleted:?}"
+    );
+    let (status, gone) = call(&router, "GET", &version_uri, None).await;
+    assert_eq!(
+        (status, error_code(&gone)),
+        (404, "ResourceNotFoundException"),
+        "expected the deleted version to stop resolving, got {status} {gone:?}"
+    );
+    // The locale the version snapshotted goes with it, while the bot's own working copy is
+    // untouched: a resource of a version the store no longer holds cannot be read back.
+    for (locale_uri, expected, case) in [
+        (
+            crate::bot_locale::locale_uri(&bot_id, &bot_version, "en_US"),
+            404,
+            "the locale the deleted version snapshotted",
+        ),
+        (
+            crate::bot_locale::locale_uri(&bot_id, state::DRAFT_BOT_VERSION, "en_US"),
+            200,
+            "the locale of the bot's working copy",
+        ),
+    ] {
+        let (status, response) = call(&router, "GET", &locale_uri, None).await;
+        assert_eq!(
+            status, expected,
+            "case {case:?}: expected {expected}, got {status} {response:?}"
+        );
+    }
+}

@@ -1720,6 +1720,13 @@ pub(super) enum Provisioner {
     /// ([`vpc_lattice_resources`]). Which of the four the declaration is travels with the
     /// variant, the four sharing one set of arms ([`vpc_lattice_resources::Resource`]).
     VpcLatticeResource(vpc_lattice_resources::Resource),
+    /// One of the three Amazon Lex V2 types [`lex_bots`] creates in that service's
+    /// model-building plane: the bot, the immutable VERSION of one, and the ALIAS that points
+    /// at a version. Each create MINTS the resource's identity — the `botId` or the
+    /// `botAliasId` Amazon Lex drew, or the number it assigned the version — so what the
+    /// stack publishes for one is what that service's own reads resolve. Which of the three it
+    /// is travels with the variant, the three sharing one set of arms ([`lex_bots::Kind`]).
+    LexBot(lex_bots::Kind),
 }
 
 /// The provisioner that owns a template resource type, or `None` for a type this emulator
@@ -2050,7 +2057,9 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         // arms the same way ([`vpc_lattice_resources`]); every other type answers `None` and
         // is left declared-only.
         _ => agentcore_provisioner_for(resource_type).or_else(|| {
-            vpc_lattice_provisioner_for(resource_type).map(Provisioner::VpcLatticeResource)
+            vpc_lattice_provisioner_for(resource_type)
+                .map(Provisioner::VpcLatticeResource)
+                .or_else(|| lex_bots::kind_of(resource_type).map(Provisioner::LexBot))
         }),
     }
 }
@@ -3030,6 +3039,10 @@ impl Provisioner {
             Self::VpcLatticeResource(kind) => {
                 delete_vpc_lattice_resource(ctx, region, kind, physical_resource_id).await
             }
+            // Each Amazon Lex delete addresses its resource by the handle the create answered,
+            // which is this resource's physical id: a bot by the `botId`, and a version or an
+            // alias by the pair its own identity is composed of.
+            Self::LexBot(kind) => delete_lex_resource(ctx, region, kind, resource).await,
         }
     }
 
@@ -3476,6 +3489,13 @@ pub(in crate::state) mod vpc_lattice_resources;
 use vpc_lattice_resources::{
     create_vpc_lattice_resource, delete_vpc_lattice_resource, vpc_lattice_provisioner_for,
 };
+
+/// The three Amazon Lex V2 types — the bot, the immutable version of one and the alias that
+/// points at a version — whose arms are [`lex_bots`]'s. Visible to the rest of this service's
+/// state because that module names the three types it serves, their ARN forms and the
+/// attributes each publishes.
+pub(in crate::state) mod lex_bots;
+use lex_bots::{create_lex_resource, delete_lex_resource, describe_lex_resource};
 
 /// What the owning service says about a resource's LIFECYCLE PROGRESS — whether a created
 /// resource has come up, what it publishes once it has, and whether a deleted one is gone —

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBotAlias
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBotAlias`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBotAlias::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores an alias of a bot in [`crate::state`] and answers from the stored record, so
+//! `DescribeBotAlias` and `ListBotAliases` report back what was stored. The alias starts
+//! in `Creating`; the `Available` transition the clock owes is due
+//! [`crate::state::CREATION_SETTLES_AFTER`] later and is materialised by the next read, so
+//! a caller reading straight back still observes `Creating`.
 //!
 //! ## Shape of an operation
 //!
@@ -194,18 +191,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBotAlias` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBotAliasErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBotAlias"))
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateBotAliasErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Lex Models V2 store is unavailable".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+
+        // An alias is an alias OF a bot, so the bot has to be there to alias.
+        if store.settled_bot(&input.bot_id).is_none() {
+            return Err(CreateBotAliasErrorModeled::PreconditionFailedException(
+                PreconditionFailedException {
+                    // The sentence this service states when a parent the request names
+                    // does not resolve, whatever the parent and whatever identified it.
+                    message: Some(crate::state::PARENT_RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // "The version of the bot that this alias points to" has to be a version the bot
+        // really has: an alias routing to a version nothing holds would route nowhere.
+        // The member is optional, and an alias created without one points at the bot's
+        // working copy, which every bot has.
+        if let Some(bot_version) = input.bot_version.as_deref() {
+            if !store.bot_version_exists(&input.bot_id, bot_version) {
+                return Err(CreateBotAliasErrorModeled::PreconditionFailedException(
+                    PreconditionFailedException {
+                        message: Some(crate::state::PARENT_RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "The name must be unique for the bot", so a second alias under a name the bot
+        // already has conflicts with the alias that is there.
+        if store.bot_alias_name_taken(&input.bot_id, &input.bot_alias_name) {
+            return Err(CreateBotAliasErrorModeled::ConflictException(ConflictException {
+                message: Some(crate::state::name_already_exists(
+                    crate::state::BOT_ALIAS_RESOURCE_LABEL,
+                    &input.bot_alias_name,
+                )),
+            })
+            .into());
+        }
+
+        // The published "Aliases per bot" quota bounds the store: past it the service
+        // answers its modelled quota error rather than growing forever.
+        if store.bot_alias_count(&input.bot_id) >= crate::state::ALIASES_PER_BOT_QUOTA {
+            return Err(CreateBotAliasErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "You have reached the quota of {} aliases for bot {}; delete an alias or request a quota increase",
+                        crate::state::ALIASES_PER_BOT_QUOTA,
+                        input.bot_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let bot_alias_id = store.mint_bot_alias_id();
+        let mut alias = crate::state::BotAlias {
+            bot_id: input.bot_id.clone(),
+            bot_alias_id: bot_alias_id.clone(),
+            bot_alias_name: input.bot_alias_name,
+            description: input.description,
+            // An alias created without a version points at the bot's working copy, which
+            // is the version the modelled `BotVersion` admits beside a number.
+            bot_version: input
+                .bot_version
+                .unwrap_or_else(|| crate::state::DRAFT_BOT_VERSION.to_string()),
+            bot_alias_status: crate::state::BOT_ALIAS_STATUS_CREATING.to_string(),
+            creation_date_time: now,
+            last_updated_date_time: now,
+            bot_alias_locale_settings: input.bot_alias_locale_settings,
+            conversation_log_settings: input.conversation_log_settings,
+            sentiment_analysis_settings: input.sentiment_analysis_settings,
+            tags: input.tags,
+            pending_status: None,
+        };
+        // "When the alias is ready to be used, it is put into the Available state", which
+        // is where an alias Amazon Lex has finished creating settles.
+        alias.schedule_status(
+            crate::state::BOT_ALIAS_STATUS_AVAILABLE,
+            crate::state::CREATION_SETTLES_AFTER,
+        );
+
+        // The response is read back off the record that was just stored, so a
+        // `botAliasId` this operation hands out always has a backing alias.
+        let key = crate::state::bot_alias_key(&input.bot_id, &bot_alias_id);
+        let stored = store.bot_aliases.entry(key).or_insert(alias);
+        Ok(CreateBotAliasOutput {
+            bot_alias_id: Some(stored.bot_alias_id.clone()),
+            bot_alias_name: Some(stored.bot_alias_name.clone()),
+            description: stored.description.clone(),
+            bot_version: Some(stored.bot_version.clone()),
+            bot_alias_locale_settings: stored.bot_alias_locale_settings.clone(),
+            conversation_log_settings: stored.conversation_log_settings.clone(),
+            sentiment_analysis_settings: stored.sentiment_analysis_settings.clone(),
+            bot_alias_status: Some(stored.bot_alias_status.clone()),
+            bot_id: Some(stored.bot_id.clone()),
+            creation_date_time: Some(crate::state::to_date_time(stored.creation_date_time)),
+            tags: stored.tags.clone(),
+        })
     }
 }

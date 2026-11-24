@@ -1192,6 +1192,14 @@ impl Provisioner {
             Self::VpcLatticeResource(kind) => {
                 create_vpc_lattice_resource(ctx, region, kind, resource, propagated).await
             }
+            // `AWS::Lex::Bot` publishes `BotTags` and `TestBotAliasTags` and `AWS::Lex::BotAlias`
+            // publishes `BotAliasTags`, each the tag MAP that resource's own create takes, so a
+            // bot and an alias a stack creates carry the tags CloudFormation gives them beside
+            // the ones their declarations ask for. A bot VERSION is no taggable resource:
+            // `CreateBotVersion` takes no tags and the type publishes no tag property.
+            Self::LexBot(kind) => {
+                create_lex_resource(ctx, region, kind, resource, propagated).await
+            }
         }
     }
 
