@@ -258,9 +258,10 @@ pub fn is_replicator_arn(value: &str) -> bool {
 /// resource type the service mints such an ARN with
 /// ([`REPLICATOR_RESOURCE_TYPE`]) — so the predicate above and every reader of
 /// what a replicator ARN NAMES draw the same line, both around the fields in
-/// front of the resource and around its segments. What those two segments have to
-/// BE for this service to have issued them is a question of its own
-/// (`super::replicator_reference_at_fault`), not this reading's.
+/// front of the resource and around its segments. What the two segments SPELL is
+/// not read beyond their being there: a well-formed ARN this endpoint holds no
+/// replicator for is absent, whatever its name and identifier look like
+/// (`super::replicator_resolves_to_nothing`).
 pub(super) fn replicator_arn_identity(value: &str) -> Option<(&str, &str)> {
     let resource = kafka_arn_resource(value)?;
     let mut segments = resource.split('/');

@@ -288,11 +288,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state.settled_replicator_in(&region, &input.replicator_arn, now)
         else {
             // The two absences the replicator surface tells apart, as the reader
-            // and the delete answer them: a reference this service could never
-            // have held a replicator under — an ARN carrying an identity it does
-            // not issue, or one this Region held and released — is reported as a
-            // fault of the parameter that carries it, while an ARN of the form it
-            // issues that was never minted is the plain not-found.
+            // and the delete answer them: an ARN naming a replicator this Region
+            // held and released is reported as a fault of the parameter that
+            // carries it, while every other ARN this endpoint resolves no
+            // replicator for is the plain not-found.
             let at_fault =
                 crate::state::replicator_reference_at_fault(&state, &region, &input.replicator_arn);
             return Err(UpdateReplicationInfoErrorModeled::NotFoundException(
