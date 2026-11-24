@@ -594,6 +594,20 @@ pub const MAX_JOBS: usize = 1_000;
 /// `ResourceNumberLimitExceededException`.
 pub const MAX_TRIGGERS: usize = 1_000;
 
+/// Ceiling on the `Node$UniqueId` assignments ONE workflow's graph will hold
+/// ([`WorkflowEntry::graph_node_ids`]), for the same reason as [`MAX_CRAWLERS`]: resident
+/// memory bounded against a write any caller can reach.
+///
+/// The keys are the names a trigger's actions and conditions name, which a caller chooses
+/// and an `UpdateTrigger` can replace, so the map is both PRUNED to the nodes the Region's
+/// triggers still name ([`ComAmazonawsGlueAwsglueState::assign_workflow_graph_node_ids`]) and
+/// held at this ceiling: past it no further node is assigned an id, and a node with no id is
+/// no node of the graph ([`ComAmazonawsGlueAwsglueState::workflow_graph`]). It is well above
+/// the nodes the triggers of one workflow can place — each of the [`MAX_TRIGGERS`] triggers
+/// is one node and names a bounded handful of components — so no graph a client builds
+/// reaches it.
+pub const MAX_WORKFLOW_GRAPH_NODES: usize = 4_000;
+
 /// Ceiling on the custom entity types this emulator will hold, for the same reason as
 /// [`MAX_CRAWLERS`]. A create past it is refused with `CreateCustomEntityType`'s own
 /// modelled `ResourceNumberLimitExceededException`.
@@ -1013,6 +1027,27 @@ pub fn new_database_id() -> String {
 /// rendered as 32 lowercase hexadecimal characters. The width of a database id and of a
 /// form type id alike — both are ids the catalog assigns a resource.
 const CATALOG_ID_WORDS: usize = 2;
+
+/// A fresh GENERATED identifier of this service: a version-4 UUID, rendered canonically as
+/// 32 lowercase hexadecimal digits grouped 8-4-4-4-12.
+///
+/// The ONE form this service hands out an identifier the caller never sent and cannot
+/// predict, so every surface that reports one agrees on how it reads: it is the form the
+/// model pins for the generated id it DOES constrain (`SchemaVersionIdString`, `length 36`
+/// and pattern `^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$`), so a
+/// client that validates the id it holds for one of them holds it for all.
+///
+/// The randomness is the `uuid` crate's, reached through `emulator_telemetry`'s uuid-backed
+/// id newtype (`BatchId::random()` is `uuid::Uuid::new_v4()` rendered canonically), which
+/// this crate already depends on: nothing here is a hand-rolled generator. An identifier is
+/// minted ONCE, where the resource or the node it names enters this store, and stored with
+/// it, so every later answer reports the same value and two mintings never agree.
+///
+/// This names a RESOURCE, not a credential: a credential would come from the credential
+/// store, never from here.
+pub fn new_generated_identifier() -> String {
+    ::emulator_telemetry::BatchId::random().as_str().to_string()
+}
 
 /// `words` 64-bit draws rendered as lowercase hexadecimal: how this crate spells an opaque
 /// id the catalog assigns, so every id-minting function below agrees on how it reads.
@@ -2442,6 +2477,11 @@ impl ComAmazonawsGlueAwsglueState {
     /// state a run comes to rest in is what its layout came to, so the record is written by
     /// [`Self::record_blueprint_run`] once that is known. The id is minted here, because the
     /// workflow this creates carries the id of the run that created it.
+    ///
+    /// The nodes the workflow this run creates holds in its graph are assigned their
+    /// identifiers before the call answers ([`Self::assign_workflow_graph_node_ids`]): a
+    /// trigger outlives the workflow it names, so a workflow a run laid out under a name
+    /// triggers already point at is read with the graph those triggers make it of.
     pub fn begin_blueprint_run(
         &mut self,
         input: &StartBlueprintRunInput,
@@ -2450,52 +2490,62 @@ impl ComAmazonawsGlueAwsglueState {
         // Whether the store has room for the workflow the run would create, read before the
         // two maps below are borrowed apart.
         let can_store_workflow = self.can_store_workflow();
-        // The blueprint and the workflows are two different maps of this store, borrowed
-        // apart here so the run and the workflow it lays out are written in ONE pass rather
-        // than by resolving the blueprint a second time.
-        let Self {
-            blueprints,
-            workflows,
-            ..
-        } = self;
-        let Some(blueprint) = blueprints.get_mut(&input.blueprint_name) else {
-            return Err(BlueprintRunNotStarted::NoSuchBlueprint);
-        };
-        // The status the clock had already made due, materialised before it is read: the
-        // registration was owed its terminal status at its due instant whether or not
-        // anybody called.
-        blueprint.settle_if_due(now);
-        if !blueprint.is_active() {
-            return Err(BlueprintRunNotStarted::NoActiveDefinition);
-        }
+        let begun = {
+            // The blueprint and the workflows are two different maps of this store, borrowed
+            // apart here so the run and the workflow it lays out are written in ONE pass rather
+            // than by resolving the blueprint a second time.
+            let Self {
+                blueprints,
+                workflows,
+                ..
+            } = self;
+            let Some(blueprint) = blueprints.get_mut(&input.blueprint_name) else {
+                return Err(BlueprintRunNotStarted::NoSuchBlueprint);
+            };
+            // The status the clock had already made due, materialised before it is read: the
+            // registration was owed its terminal status at its due instant whether or not
+            // anybody called.
+            blueprint.settle_if_due(now);
+            if !blueprint.is_active() {
+                return Err(BlueprintRunNotStarted::NoActiveDefinition);
+            }
 
-        let workflow_name =
-            blueprint_run_workflow_name(&blueprint.name, input.parameters.as_deref());
-        let run_id = new_blueprint_run_id();
-        if workflows.contains_key(&workflow_name) {
-            blueprint.begin_run(
-                input,
-                run_id.clone(),
-                now,
-                &BlueprintRunLayout::WorkflowAlreadyExists(workflow_name),
+            let workflow_name =
+                blueprint_run_workflow_name(&blueprint.name, input.parameters.as_deref());
+            let run_id = new_blueprint_run_id();
+            if workflows.contains_key(&workflow_name) {
+                blueprint.begin_run(
+                    input,
+                    run_id.clone(),
+                    now,
+                    &BlueprintRunLayout::WorkflowAlreadyExists(workflow_name),
+                );
+                return Ok(BlueprintRunBegun::Recorded { run_id });
+            }
+            if !can_store_workflow {
+                return Err(BlueprintRunNotStarted::WorkflowCeilingReached(MAX_WORKFLOWS));
+            }
+            insert_workflow_into(
+                workflows,
+                WorkflowEntry::from_blueprint_run(&workflow_name, &blueprint.name, &run_id, now),
             );
-            return Ok(BlueprintRunBegun::Recorded { run_id });
+            BlueprintLayoutPlan {
+                blueprint_name: blueprint.name.clone(),
+                run_id,
+                workflow_name,
+                blueprint_location: blueprint.blueprint_location.clone(),
+                role_arn: input.role_arn.clone(),
+                parameters: input.parameters.clone(),
+            }
+        };
+        // The workflow this run created is in the store now, so the nodes the Region's
+        // triggers place in its graph are given their identifiers, exactly as they are for a
+        // workflow a create registered ([`Self::insert_workflow`]).
+        let regions: Vec<String> = self.triggers.keys().cloned().collect();
+        for region in regions {
+            self.assign_workflow_graph_node_ids(&region, &begun.workflow_name);
         }
-        if !can_store_workflow {
-            return Err(BlueprintRunNotStarted::WorkflowCeilingReached(MAX_WORKFLOWS));
-        }
-        insert_workflow_into(
-            workflows,
-            WorkflowEntry::from_blueprint_run(&workflow_name, &blueprint.name, &run_id, now),
-        );
-        Ok(BlueprintRunBegun::Deploying(BlueprintLayoutPlan {
-            blueprint_name: blueprint.name.clone(),
-            run_id,
-            workflow_name,
-            blueprint_location: blueprint.blueprint_location.clone(),
-            role_arn: input.role_arn.clone(),
-            parameters: input.parameters.clone(),
-        }))
+        Ok(BlueprintRunBegun::Deploying(begun))
     }
 
     /// Record the run `plan` began, carrying what deploying its layout came to.
@@ -2622,13 +2672,21 @@ impl ComAmazonawsGlueAwsglueState {
     /// `run` is the workflow run the graph is reported BESIDE, whose job runs each `JOB`
     /// node reports as "the information for the job runs represented by the job node"
     /// (`JobNodeDetails$JobRuns`), and `None` for a read that reports no run at all.
+    ///
+    /// Each node is reported under the `UniqueId` the write that put it in the graph assigned
+    /// it ([`Self::assign_workflow_graph_node_ids`]) and each edge references those same
+    /// stored ids, so a client correlates the graph by ids the service issued rather than by
+    /// anything derived from the names it is made of.
     pub fn workflow_graph(
         &self,
         region: &str,
         workflow_name: &str,
         run: Option<&WorkflowRunEntry>,
     ) -> WorkflowGraph {
-        let mut graph = WorkflowGraphBuilder::for_workflow(workflow_name);
+        let mut graph = WorkflowGraphBuilder::default();
+        let Some(workflow) = self.workflow(workflow_name) else {
+            return graph.build();
+        };
         let attached = self
             .triggers
             .get(region)
@@ -2636,13 +2694,27 @@ impl ComAmazonawsGlueAwsglueState {
             .flat_map(BTreeMap::values)
             .filter(|trigger| trigger.workflow_name.as_deref() == Some(workflow_name));
         for trigger in attached {
-            let trigger_id = graph.node(NODE_TYPE_TRIGGER, &trigger.name, Some(trigger), &[]);
+            // A node is in the graph once the write that stored its trigger has identified
+            // it; one no write has placed is no node of the graph, so nothing is reported
+            // for it and no edge reaches it.
+            let Some(trigger_id) = workflow
+                .graph_node_id(region, NODE_TYPE_TRIGGER, &trigger.name)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            graph.node(&trigger_id, NODE_TYPE_TRIGGER, &trigger.name, Some(trigger), &[]);
             for action in &trigger.actions {
                 for (node_type, name) in
                     named_components(action.job_name.as_deref(), action.crawler_name.as_deref())
                 {
+                    let Some(initiated) =
+                        workflow.graph_node_id(region, node_type, name).map(str::to_string)
+                    else {
+                        continue;
+                    };
                     let runs = self.component_job_runs(region, run, node_type, name);
-                    let initiated = graph.node(node_type, name, None, &runs);
+                    graph.node(&initiated, node_type, name, None, &runs);
                     graph.edge(&trigger_id, &initiated);
                 }
             }
@@ -2657,8 +2729,13 @@ impl ComAmazonawsGlueAwsglueState {
                     condition.job_name.as_deref(),
                     condition.crawler_name.as_deref(),
                 ) {
+                    let Some(waited_on) =
+                        workflow.graph_node_id(region, node_type, name).map(str::to_string)
+                    else {
+                        continue;
+                    };
                     let runs = self.component_job_runs(region, run, node_type, name);
-                    let waited_on = graph.node(node_type, name, None, &runs);
+                    graph.node(&waited_on, node_type, name, None, &runs);
                     graph.edge(&waited_on, &trigger_id);
                 }
             }
@@ -2946,8 +3023,20 @@ impl ComAmazonawsGlueAwsglueState {
     /// Store `entry` as this account's workflow under its own name, which is the key every
     /// read addresses it by ([`Self::workflow`]) — so the namespace's key form lives in
     /// [`insert_workflow_into`] rather than in each handler that writes to it.
+    ///
+    /// Every component a trigger ALREADY attached to that name puts in the graph enters the
+    /// graph of the workflow this write stores, so each of those nodes is assigned its
+    /// `UniqueId` here ([`Self::assign_workflow_graph_node_ids`]) — a trigger outlives the
+    /// workflow it names, so a workflow stored under a name triggers already point at is
+    /// read with a graph from the moment it exists. The walk is over the Regions this process
+    /// has been addressed in, and each Region's triggers are bounded by [`MAX_TRIGGERS`].
     pub fn insert_workflow(&mut self, entry: WorkflowEntry) {
+        let name = entry.name.clone();
         insert_workflow_into(&mut self.workflows, entry);
+        let regions: Vec<String> = self.triggers.keys().cloned().collect();
+        for region in regions {
+            self.assign_workflow_graph_node_ids(&region, &name);
+        }
     }
 
     /// Whether the store can hold another crawler, i.e. is below [`MAX_CRAWLERS`].
@@ -3068,11 +3157,72 @@ impl ComAmazonawsGlueAwsglueState {
     }
 
     /// Store `entry` as the Region `region`'s trigger under its own name.
+    ///
+    /// The ONE write that puts a trigger in the store, so it is also where the nodes of the
+    /// graph that trigger belongs to are brought up to date
+    /// ([`Self::assign_workflow_graph_node_ids`]): a node entering a graph is given its
+    /// `UniqueId` by the write that puts it there, a node already in the graph keeps the one
+    /// it has, and a node this write no longer places is dropped from the workflow. A trigger
+    /// attached to no workflow is part of no graph, and one naming a workflow this account
+    /// does not hold reaches no graph either.
     pub fn insert_trigger(&mut self, region: &str, entry: TriggerEntry) {
+        let workflow_name = entry.workflow_name.clone();
         self.triggers
             .entry(region.to_string())
             .or_default()
             .insert(entry.name.clone(), entry);
+        if let Some(workflow_name) = workflow_name {
+            self.assign_workflow_graph_node_ids(region, &workflow_name);
+        }
+    }
+
+    /// Give every node the Region `region`'s triggers place in the graph of `workflow_name`
+    /// its `Node$UniqueId`, and drop the ids of the nodes they no longer place.
+    ///
+    /// Driven by the writes that change what a workflow's graph is MADE of — a trigger stored
+    /// ([`Self::insert_trigger`]), a trigger deleted ([`Self::remove_trigger`]) and a workflow
+    /// stored under a name triggers already point at ([`Self::insert_workflow`]) — so the
+    /// stored assignments are exactly the nodes of the graph a read then reports, and nothing
+    /// an earlier definition placed stays resident. A node already in the graph keeps its id:
+    /// what a client correlated the graph by does not move because another node joined it.
+    ///
+    /// The walk is over that Region's triggers, bounded by [`MAX_TRIGGERS`], and what it
+    /// assigns is held at [`MAX_WORKFLOW_GRAPH_NODES`].
+    pub fn assign_workflow_graph_node_ids(&mut self, region: &str, workflow_name: &str) {
+        let placed = self.workflow_graph_node_keys(region, workflow_name);
+        if let Some(workflow) = self.workflows.get_mut(workflow_name) {
+            for (node_region, node_type, name) in &placed {
+                workflow.assign_graph_node_id(node_region, node_type, name);
+            }
+            workflow.retain_graph_node_ids(region, &placed);
+        }
+    }
+
+    /// The `(region, NodeType, name)` key of every node the Region `region`'s triggers place
+    /// in the graph of `workflow_name` — the nodes that graph is made of, which is what
+    /// [`Self::assign_workflow_graph_node_ids`] assigns ids to and keeps.
+    fn workflow_graph_node_keys(
+        &self,
+        region: &str,
+        workflow_name: &str,
+    ) -> BTreeSet<(String, String, String)> {
+        let attached = self
+            .triggers
+            .get(region)
+            .into_iter()
+            .flat_map(BTreeMap::values)
+            .filter(|trigger| trigger.workflow_name.as_deref() == Some(workflow_name));
+        let mut placed = BTreeSet::new();
+        for trigger in attached {
+            for (node_type, name) in trigger_graph_nodes(trigger) {
+                placed.insert((
+                    region.to_string(),
+                    node_type.to_string(),
+                    name.to_string(),
+                ));
+            }
+        }
+        placed
     }
 
     /// Remove the trigger `name` from the Region `region`, answering the record that was
@@ -3082,13 +3232,23 @@ impl ComAmazonawsGlueAwsglueState {
     /// are held ON the entry ([`TriggerEntry`]), so the name a delete frees carries none of
     /// them into the next create under it. The jobs and crawlers its actions named, and the
     /// workflow it was attached to, are their own records of this store and are left where
-    /// they are. Matched by name and Region exactly as the read path matches them
+    /// they are — but the NODES this trigger placed in that workflow's graph go with it
+    /// ([`Self::assign_workflow_graph_node_ids`]), since a component no trigger names is no
+    /// node of the graph. Matched by name and Region exactly as the read path matches them
     /// ([`Self::trigger`]), and the removed entry is handed back rather than dropped for
     /// symmetry with [`Self::remove_job`].
     pub fn remove_trigger(&mut self, region: &str, name: &str) -> Option<TriggerEntry> {
-        self.triggers
+        let removed = self
+            .triggers
             .get_mut(region)
-            .and_then(|triggers| triggers.remove(name))
+            .and_then(|triggers| triggers.remove(name));
+        if let Some(workflow_name) = removed
+            .as_ref()
+            .and_then(|trigger| trigger.workflow_name.clone())
+        {
+            self.assign_workflow_graph_node_ids(region, &workflow_name);
+        }
+        removed
     }
 
     /// Initiate `actions` — the actions of the trigger `trigger_name`, which has just FIRED

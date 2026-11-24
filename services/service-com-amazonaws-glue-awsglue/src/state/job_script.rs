@@ -449,14 +449,25 @@ pub struct JobScriptExecution {
     pub outcome: JobRunOutcome,
     /// The position the run's own reads reached, as its commit left it.
     pub committed_bookmark: Option<String>,
+    /// Whether an EXECUTOR was provisioned for the run and ran its script: true once the
+    /// script was handed to the interpreter, and false for a run the service could not
+    /// dispatch at all — one whose execution role it cannot assume, whose script it cannot
+    /// read or whose language it cannot run, each of which fails BEFORE any executor exists.
+    ///
+    /// It is what the run's `ExecutionTime` is read off
+    /// ([`JobRunEntry::execution_time_seconds`]), so a run nothing ran for reports no
+    /// consumed resources.
+    pub executor_ran: bool,
 }
 
 impl From<JobRunOutcome> for JobScriptExecution {
-    /// An outcome reached without any script answering, which commits no bookmark.
+    /// An outcome reached without any script answering, which commits no bookmark and for
+    /// which no executor was provisioned.
     fn from(outcome: JobRunOutcome) -> Self {
         Self {
             outcome,
             committed_bookmark: None,
+            executor_ran: false,
         }
     }
 }
@@ -841,7 +852,7 @@ async fn perform_handed_off_job_script(
             return;
         };
         if let Some(run) = job.run_mut(&plan.run_id) {
-            run.record_execution(&execution.outcome, SystemTime::now());
+            run.record_execution(&execution.outcome, execution.executor_ran, SystemTime::now());
         }
         // "job.commit() … updates the state of the job bookmark": the position the script's
         // own commit reached is stored against the job, so the NEXT run of it resumes from
@@ -1198,26 +1209,38 @@ async fn run_script(
             );
             let _ = sender.send(finished);
         });
+    // A thread that could not be started ran nothing: no executor exists for the run, so it
+    // consumed no resources.
     if let Err(error) = spawned {
         return JobRunOutcome::EndedInError(format!(
             "the thread the job script runs on could not be started: {error}"
         ))
         .into();
     }
+    // Past here the script IS being run: an executor exists for this run, whatever the
+    // execution goes on to come to, so the run consumed resources and reports the span it
+    // took.
+    let ran = |outcome: JobRunOutcome, committed_bookmark: Option<String>| JobScriptExecution {
+        outcome,
+        committed_bookmark,
+        executor_ran: true,
+    };
     match ::tokio::time::timeout(JOB_SCRIPT_HOST_WAIT, receiver).await {
-        Ok(Ok(finished)) => JobScriptExecution {
-            outcome: read_outcome(&finished.completion),
-            committed_bookmark: committed_bookmark(&finished.completion),
-        },
-        Ok(Err(_)) => JobRunOutcome::EndedInError(
-            "the thread the job script ran on ended without reporting".to_string(),
-        )
-        .into(),
+        Ok(Ok(finished)) => ran(
+            read_outcome(&finished.completion),
+            committed_bookmark(&finished.completion),
+        ),
+        Ok(Err(_)) => ran(
+            JobRunOutcome::EndedInError(
+                "the thread the job script ran on ended without reporting".to_string(),
+            ),
+            None,
+        ),
         // The thread has still not answered a grace period past the host time one run may
         // take — which the engine has by then stopped the run on — so it is given up on and
         // the run reports that this emulator has no outcome for it. Nothing of the script's
         // own span ran out, so it is not reported as terminated for taking too long.
-        Err(_elapsed) => JobRunOutcome::EndedInError(job_run_script_unanswered()).into(),
+        Err(_elapsed) => ran(JobRunOutcome::EndedInError(job_run_script_unanswered()), None),
     }
 }
 

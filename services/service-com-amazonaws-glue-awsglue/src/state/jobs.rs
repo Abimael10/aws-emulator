@@ -1199,6 +1199,19 @@ pub struct JobRunEntry {
     pub rests_in: Option<String>,
     /// The `JobRun$ErrorMessage` that goes with [`JobRunEntry::rests_in`], held with it.
     pub rests_error: Option<String>,
+    /// Whether an EXECUTOR was provisioned for this run and ran its script.
+    ///
+    /// A run begins having had none — nothing has been provisioned for a run that has only
+    /// just been recorded — and the execution path sets this where the script really was
+    /// handed to the interpreter ([`super::job_script`]), so it says of a FINISHED run
+    /// whether anything of the job ever ran. The run of a job the service could not dispatch
+    /// at all — one whose execution role it cannot assume, whose script it cannot read, whose
+    /// language it cannot run — fails BEFORE any executor exists and so leaves this false.
+    ///
+    /// It is what `JobRun$ExecutionTime` is read off ([`JobRunEntry::execution_time_seconds`]):
+    /// that member is "the amount of time (in seconds) that the job run consumed resources",
+    /// and a run no executor was provisioned for consumed none.
+    pub executor_ran: bool,
     /// Whether this run still owes its job's script ONE execution.
     ///
     /// A run begins owing it, and the execution path clears this when the script has been
@@ -1341,6 +1354,8 @@ impl JobRunEntry {
             rests_in: None,
             rests_error: None,
             awaiting_script: true,
+            // Nothing has been provisioned for a run the start has just recorded.
+            executor_ran: false,
             // Nothing has come to rest, so nothing has been published about this run.
             state_change_published: false,
             arguments: input.arguments.clone(),
@@ -1407,10 +1422,23 @@ impl JobRunEntry {
     /// A run a stop has already been submitted for keeps the stop it was owed: a client
     /// asked for that run to stop, and the script's own outcome does not undo it. Nor does
     /// this move a run that has already come to rest.
-    pub fn record_execution(&mut self, outcome: &super::JobRunOutcome, now: SystemTime) {
+    ///
+    /// `executor_ran` is whether an executor was provisioned for this run and ran its script,
+    /// which is what the run's `ExecutionTime` is read off
+    /// ([`JobRunEntry::executor_ran`]): it is recorded whatever state the run is in, because
+    /// it states what HAPPENED rather than what the run is owed next.
+    pub fn record_execution(
+        &mut self,
+        outcome: &super::JobRunOutcome,
+        executor_ran: bool,
+        now: SystemTime,
+    ) {
         // Whatever happens below, this run no longer owes its script an execution: it has
         // had one.
         self.awaiting_script = false;
+        // An executor that ran is a fact about this run, so it is kept however the run came
+        // to rest, and nothing takes it back.
+        self.executor_ran |= executor_ran;
         if self.is_terminal()
             || self.state == JOB_RUN_STATE_STOPPING
             || self.settles_to == JOB_RUN_STATE_STOPPED
@@ -1491,6 +1519,9 @@ impl JobRunEntry {
             rests_in: None,
             rests_error: None,
             awaiting_script: true,
+            // Nothing has been provisioned for a fresh attempt either, whatever ran for the
+            // attempt it retries.
+            executor_ran: false,
             // A fresh attempt has come to rest at nothing, whatever was published about the
             // attempt it retries.
             state_change_published: false,
@@ -1574,7 +1605,16 @@ impl JobRunEntry {
     /// `JobRun$ExecutionTime`: "The amount of time (in seconds) that the job run consumed
     /// resources" — the whole seconds between the run starting and finishing, and the
     /// model's own default of 0 while it has not finished.
+    ///
+    /// A run NO EXECUTOR was provisioned for consumed no resources, so it reports that same
+    /// 0 however long it took the service to refuse it: a run that could not be dispatched
+    /// at all ([`JobRunEntry::executor_ran`]) spent nothing of the capacity its definition
+    /// asks for, and a figure derived from the record's age would report consumption for
+    /// work nothing ran.
     pub(super) fn execution_time_seconds(&self) -> i32 {
+        if !self.executor_ran {
+            return 0;
+        }
         let Some(completed_on) = self.completed_on else {
             return 0;
         };

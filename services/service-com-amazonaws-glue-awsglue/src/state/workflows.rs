@@ -51,6 +51,59 @@ pub struct WorkflowEntry {
     /// (`Workflow$BlueprintDetails`) is what a read reports it as, so a workflow a blueprint
     /// run laid out names the run it came from and one `CreateWorkflow` wrote names none.
     pub blueprint_run: Option<WorkflowBlueprintRun>,
+    /// The `Node$UniqueId` of every node that has entered this workflow's graph, keyed by
+    /// the Region the node's component is served in and the node's identity inside the graph
+    /// — the `NodeType` and the name of the component it stands for.
+    ///
+    /// "The unique Id assigned to the node within the workflow" is SERVER-ASSIGNED, so it is
+    /// minted once, when the write that puts the node in the graph is served
+    /// ([`ComAmazonawsGlueAwsglueState::assign_workflow_graph_node_ids`]), and read back by
+    /// the graph projection ([`ComAmazonawsGlueAwsglueState::workflow_graph`]) — which is
+    /// what makes every read of an unchanged graph report the same ids while nothing of the
+    /// component's name decides them. The Region is part of the key because a trigger is
+    /// served only through the endpoint that created it, so the graph of a per-account
+    /// workflow is made of the components attached to it in the Region the read is served in.
+    ///
+    /// BOUNDED and PRUNED: what this holds is held at [`MAX_WORKFLOW_GRAPH_NODES`]
+    /// ([`WorkflowEntry::assign_graph_node_id`]) and the assignments of a Region are cut back
+    /// to the nodes that Region's triggers still place in the graph on every trigger write
+    /// ([`WorkflowEntry::retain_graph_node_ids`]), so a renamed action or a deleted trigger
+    /// leaves nothing resident. They also live ON the workflow, so the ids a graph is made of
+    /// go when the workflow does: a workflow re-created under a name a deleted one held is a
+    /// new workflow, and its nodes are new nodes.
+    pub graph_node_ids: BTreeMap<(String, String, String), String>,
+}
+
+/// Every node ONE trigger places in its workflow's graph, as the node type and the name of
+/// each: the trigger's own node, the components "the actions initiated by this trigger"
+/// (`Trigger$Actions`) name, and the components the conditions of "the predicate of this
+/// trigger" (`Trigger$Predicate`) wait on.
+///
+/// The ONE walk of a trigger's nodes, so the write that ASSIGNS their identifiers and the
+/// walk that decides which assignments are still live
+/// ([`ComAmazonawsGlueAwsglueState::workflow_graph_node_keys`]) cannot disagree about what a
+/// trigger places. Bounded by the actions and conditions the stored trigger carries.
+pub(super) fn trigger_graph_nodes(trigger: &TriggerEntry) -> Vec<(&'static str, &str)> {
+    let mut placed: Vec<(&'static str, &str)> = vec![(NODE_TYPE_TRIGGER, trigger.name.as_str())];
+    for action in &trigger.actions {
+        placed.extend(named_components(
+            action.job_name.as_deref(),
+            action.crawler_name.as_deref(),
+        ));
+    }
+    for condition in trigger
+        .predicate
+        .as_ref()
+        .and_then(|predicate| predicate.conditions.as_ref())
+        .into_iter()
+        .flatten()
+    {
+        placed.extend(named_components(
+            condition.job_name.as_deref(),
+            condition.crawler_name.as_deref(),
+        ));
+    }
+    placed
 }
 
 /// Store `entry` in `workflows` under its own name, the key every workflow read addresses it
@@ -94,6 +147,9 @@ impl WorkflowEntry {
             // "The details of the blueprint that this particular workflow is created from":
             // a workflow `CreateWorkflow` registered was created from none.
             blueprint_run: None,
+            // Nothing is attached to a workflow a create has just registered, so its graph
+            // holds no node to have been assigned an id.
+            graph_node_ids: BTreeMap::new(),
         }
     }
 
@@ -125,7 +181,78 @@ impl WorkflowEntry {
                 blueprint_name: blueprint_name.to_string(),
                 run_id: run_id.to_string(),
             }),
+            // Nor is anything attached to the workflow the run has just laid out.
+            graph_node_ids: BTreeMap::new(),
         }
+    }
+
+    /// Assign the node for the component `name` of type `node_type`, served in `region`, a
+    /// fresh identifier unless it already has one.
+    ///
+    /// Driven by the writes that change what this workflow's graph is made of
+    /// ([`ComAmazonawsGlueAwsglueState::assign_workflow_graph_node_ids`]), so a node is given
+    /// its identifier when it ENTERS the graph rather than when somebody reads the graph. A
+    /// node already in the graph KEEPS the one it has — an update that re-stores a trigger
+    /// does not re-identify the components it still names — so the ids a client correlated
+    /// the graph by stay the ids of those nodes.
+    ///
+    /// Past [`MAX_WORKFLOW_GRAPH_NODES`] assignments nothing further is assigned: the keys
+    /// are names a caller chooses, so what one workflow holds is bounded here as every other
+    /// store of this crate is, and a node with no assigned id is no node of the graph
+    /// ([`ComAmazonawsGlueAwsglueState::workflow_graph`]).
+    pub(super) fn assign_graph_node_id(&mut self, region: &str, node_type: &str, name: &str) {
+        let key = (
+            region.to_string(),
+            node_type.to_string(),
+            name.to_string(),
+        );
+        if self.graph_node_ids.len() >= MAX_WORKFLOW_GRAPH_NODES
+            && !self.graph_node_ids.contains_key(&key)
+        {
+            ::tracing::warn!(
+                workflow = %self.name,
+                region = %region,
+                node_type = %node_type,
+                ceiling = MAX_WORKFLOW_GRAPH_NODES,
+                "a Glue workflow graph already holds the most nodes this emulator assigns \
+                 identifiers to, so this component was left out of the graph"
+            );
+            return;
+        }
+        self.graph_node_ids
+            .entry(key)
+            .or_insert_with(new_workflow_graph_node_id);
+    }
+
+    /// Drop the identifier of every node of this workflow's graph in `region` whose key is
+    /// not in `named`, the nodes the Region's triggers still place in it.
+    ///
+    /// What a trigger names is the caller's to change — an `UpdateTrigger` replaces the
+    /// actions and conditions a trigger fires on, and a delete takes the trigger out of the
+    /// graph altogether — so the assignments a write leaves behind are dropped by the write
+    /// that left them: a component no trigger of this workflow names any more is no node of
+    /// its graph, and the id it held is not kept against a later component of that name.
+    /// Another Region's assignments are left alone, since the graph is per-Region.
+    pub(super) fn retain_graph_node_ids(
+        &mut self,
+        region: &str,
+        named: &BTreeSet<(String, String, String)>,
+    ) {
+        self.graph_node_ids
+            .retain(|key, _| key.0 != region || named.contains(key));
+    }
+
+    /// The `Node$UniqueId` assigned to the node for the component `name` of type `node_type`
+    /// in `region`, or `None` when no node of this workflow's graph stands for it — which is
+    /// every component no trigger of this workflow names in that Region.
+    pub fn graph_node_id(&self, region: &str, node_type: &str, name: &str) -> Option<&str> {
+        self.graph_node_ids
+            .get(&(
+                region.to_string(),
+                node_type.to_string(),
+                name.to_string(),
+            ))
+            .map(String::as_str)
     }
 
     /// Apply an `UpdateWorkflow` request to this stored workflow, member by member, as

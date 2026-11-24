@@ -672,12 +672,11 @@ impl SchemaVersionEntry {
 /// A fresh `SchemaVersionId`: a version-4 UUID, the shape the modelled
 /// `SchemaVersionIdString` pins.
 ///
-/// The randomness is the `uuid` crate's, reached through `emulator_telemetry`'s
-/// uuid-backed id newtype (`BatchId::random()` is `uuid::Uuid::new_v4()` rendered
-/// canonically), which this crate already depends on: nothing here is a hand-rolled
-/// generator. This names a RESOURCE, not a credential.
+/// One minting for every generated identifier of this service
+/// ([`super::new_generated_identifier`]), so the id a version carries reads exactly as the
+/// other ids the service assigns. This names a RESOURCE, not a credential.
 pub fn new_schema_version_id() -> String {
-    ::emulator_telemetry::BatchId::random().as_str().to_string()
+    super::new_generated_identifier()
 }
 
 /// A wall-clock instant as the schema registry reports it.

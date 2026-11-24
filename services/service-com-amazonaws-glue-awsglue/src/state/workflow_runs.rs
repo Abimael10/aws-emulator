@@ -309,9 +309,6 @@ impl WorkflowRunEntry {
 /// store.
 #[derive(Debug, Default)]
 pub(super) struct WorkflowGraphBuilder {
-    /// The workflow whose graph is being built, which is part of what identifies each of
-    /// its nodes ([`workflow_node_id`]).
-    pub(super) workflow_name: String,
     /// "A list of the the Glue components belong to the workflow represented as nodes."
     pub(super) nodes: Vec<Node>,
     /// "A list of all the directed connections between the nodes belonging to the
@@ -324,18 +321,8 @@ pub(super) struct WorkflowGraphBuilder {
 }
 
 impl WorkflowGraphBuilder {
-    /// A graph of the workflow `workflow_name`, with nothing placed yet.
-    pub(super) fn for_workflow(workflow_name: &str) -> Self {
-        Self {
-            workflow_name: workflow_name.to_string(),
-            ..Self::default()
-        }
-    }
-}
-
-impl WorkflowGraphBuilder {
-    /// Place the node for the component `name` of type `node_type` unless it is already
-    /// placed, and answer its `UniqueId` either way.
+    /// Place the node for the component `name` of type `node_type` under the `UniqueId` the
+    /// workflow assigned it ([`new_workflow_graph_node_id`]), unless it is already placed.
     ///
     /// `trigger` is the stored trigger a TRIGGER node stands for, and `None` for the job and
     /// crawler nodes: "details of the Trigger when the node represents a Trigger"
@@ -351,17 +338,17 @@ impl WorkflowGraphBuilder {
     /// job node".
     pub(super) fn node(
         &mut self,
+        unique_id: &str,
         node_type: &str,
         name: &str,
         trigger: Option<&TriggerEntry>,
         job_runs: &[JobRun],
-    ) -> String {
-        let unique_id = workflow_node_id(&self.workflow_name, node_type, name);
-        if self.placed_nodes.insert(unique_id.clone()) {
+    ) {
+        if self.placed_nodes.insert(unique_id.to_string()) {
             self.nodes.push(Node {
                 r#type: Some(node_type.to_string()),
                 name: Some(name.to_string()),
-                unique_id: Some(unique_id.clone()),
+                unique_id: Some(unique_id.to_string()),
                 trigger_details: trigger.map(|trigger| TriggerNodeDetails {
                     trigger: Some(trigger.to_trigger()),
                 }),
@@ -380,7 +367,6 @@ impl WorkflowGraphBuilder {
                     .then_some(CrawlerNodeDetails { crawls: None }),
             });
         }
-        unique_id
     }
 
     /// Place the connection from the node `source_id` to the node `destination_id` unless
@@ -424,34 +410,21 @@ pub(super) fn named_components<'a>(
 /// `Node$UniqueId`: "the unique Id assigned to the node within the workflow."
 ///
 /// An OPAQUE id: a client correlates nodes with the graph's edges by it and reads nothing
-/// out of it, so it carries neither the kind of the component nor its name. It is DERIVED
-/// from what identifies the node — the workflow it belongs to and the type and name of the
-/// component it stands for — rather than minted per call, which is what makes every read of
-/// an unchanged graph report the same id for a node while two nodes never share one: a job
-/// and a trigger of the same name are two nodes, and the same component in two workflows is
-/// two nodes as well.
+/// out of it, so it carries neither the kind of the component nor its name. It is MINTED
+/// when the node enters the workflow's graph and stored with the workflow
+/// ([`WorkflowEntry::graph_node_ids`]), so every read of an unchanged graph reports the same
+/// id for a node, two nodes never share one — a job and a trigger of the same name are two
+/// nodes, and the same component in two workflows is two nodes as well — and nothing of the
+/// names the graph is made of can be read out of it or collide through it.
 ///
-/// Spelled as 32 lowercase hexadecimal characters — 128 bits, the width every opaque id this
-/// crate hands out has ([`mint_hex_id`]) — which is inside `NameString`'s "len 1..255"
-/// however long the component's name is. The bits are the leading half of a SHA-256 of the
-/// three parts, each length-prefixed so no pair of triples can be spelled the same way. Not a
-/// credential and not a digest anything is authenticated by.
-pub(super) fn workflow_node_id(workflow_name: &str, node_type: &str, name: &str) -> String {
-    use ::sha2::Digest;
-
-    let keyed = format!(
-        "{}:{workflow_name}:{}:{node_type}:{}:{name}",
-        workflow_name.len(),
-        node_type.len(),
-        name.len()
-    );
-    let digest = ::sha2::Sha256::digest(keyed.as_bytes());
-    ::hex::encode(&digest[..NODE_ID_BYTES])
+/// A GENERATED identifier of this service's own form ([`super::new_generated_identifier`]),
+/// which is inside `NameString`'s "len 1..255".
+///
+/// This names a RESOURCE, not a credential: a credential would come from the credential
+/// store, never from here.
+pub fn new_workflow_graph_node_id() -> String {
+    super::new_generated_identifier()
 }
-
-/// How many bytes of the digest a node id carries: sixteen, i.e. 128 bits rendered as 32
-/// lowercase hexadecimal characters.
-const NODE_ID_BYTES: usize = 16;
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
@@ -1534,9 +1507,16 @@ pub(super) fn is_dqdl_word_char(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_'
 }
 
-/// How many 64-bit words a data quality ruleset's identifier carries: two, i.e. 128 bits
-/// rendered as 32 lowercase hexadecimal characters, the width every opaque id this crate
-/// mints has ([`mint_hex_id`]).
+/// What every data quality RULESET identifier begins with.
+///
+/// RECORDED grammar, and the same grammar the service states for the ids of its other data
+/// quality records ([`DATA_QUALITY_RUN_ID_PREFIX`]): the kind of record, then the token that
+/// identifies the one record it was minted for.
+pub const DATA_QUALITY_RULESET_ID_PREFIX: &str = "dqruleset-";
+
+/// How many 64-bit words a data quality ruleset identifier's token carries: two, i.e. 128
+/// bits rendered as 32 lowercase hexadecimal characters — the width the tokens of this
+/// service's data quality ids are written in ([`DATA_QUALITY_RUN_ID_WORDS`]).
 pub(super) const DATA_QUALITY_RULESET_IDENTIFIER_WORDS: usize = 2;
 
 /// How many data quality ruleset identifiers this process has minted. A nonce source for
@@ -1547,18 +1527,26 @@ pub(super) static MINTED_DATA_QUALITY_RULESET_IDENTIFIERS: AtomicU64 = AtomicU64
 /// A fresh ruleset identifier: the id the service assigns a data quality ruleset when it is
 /// created, and reports beside the ruleset afterwards.
 ///
-/// 32 lowercase hexadecimal characters, i.e. 128 bits, which is inside `HashString`'s
-/// `length 1..255` — the string every id this service hands a data quality resource is
-/// spelled as. It is minted once, at create, and stored on the [`DataQualityRulesetEntry`],
-/// so every later answer about that ruleset reports the same identifier and two rulesets
-/// never share one.
+/// [`DATA_QUALITY_RULESET_ID_PREFIX`] followed by 32 lowercase hexadecimal characters, i.e.
+/// 128 bits — the form this service's data quality records are identified by, a recommendation
+/// run's own id included ([`new_data_quality_rule_recommendation_run_id`]) — which is inside
+/// `HashString`'s `length 1..255`, the string every id this service hands a data quality
+/// resource is spelled as. The bits come from [`mint_hex_id`], so two creates in the same
+/// nanosecond cannot be given the same identifier.
+///
+/// It is minted once, at create, and stored on the [`DataQualityRulesetEntry`], so every
+/// later answer about that ruleset reports the same identifier and nothing of the request the
+/// create carried can be read out of it.
 ///
 /// This names a RESOURCE, not a credential: a credential would come from the credential
 /// store, never from here.
 pub fn new_data_quality_ruleset_identifier() -> String {
-    mint_hex_id(
-        &MINTED_DATA_QUALITY_RULESET_IDENTIFIERS,
-        DATA_QUALITY_RULESET_IDENTIFIER_WORDS,
+    format!(
+        "{DATA_QUALITY_RULESET_ID_PREFIX}{}",
+        mint_hex_id(
+            &MINTED_DATA_QUALITY_RULESET_IDENTIFIERS,
+            DATA_QUALITY_RULESET_IDENTIFIER_WORDS,
+        )
     )
 }
 
