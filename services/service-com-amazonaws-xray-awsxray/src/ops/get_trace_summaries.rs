@@ -33,7 +33,10 @@
 //! a `NextToken` is due while the query has anything left to serve — the rest of
 //! a step holding more summaries than one page carries
 //! ([`TRACE_SUMMARIES_PAGE_SIZE`]), or the step before it while the window
-//! reaches into one.
+//! reaches into one. That token is OPAQUE: the step and the trace it resumes at
+//! travel inside it, authenticated under the store's own secret, so a caller
+//! hands it back unread and nothing of this service's paging is legible on the
+//! wire, while a value this read never issued carries no cursor and is refused.
 //!
 //! A request outside what this read serves is REFUSED with
 //! `InvalidRequestException` rather than answered over part of it: an inverted
@@ -345,7 +348,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(crate::state::group_scope::split)
             .unwrap_or_default();
         let mut filters: Vec<crate::state::filter::FilterExpression> = Vec::new();
-        {
+        // The secret this store's page tokens are minted and resolved under,
+        // taken off the store here so the token this answer hands back is
+        // composed outside the critical sections below.
+        let page_tokens = {
             let store = state.lock();
             let region = crate::state::request_region(ctx.parts());
             for group in &scoped.groups {
@@ -356,7 +362,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     filters.push(filter);
                 }
             }
-        }
+            store.page_tokens
+        };
         if let Some(source) = scoped.filter_expression.as_deref() {
             if !source.trim().is_empty() {
                 filters.push(
@@ -374,14 +381,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // time frame" — and a token names the step the previous page stopped in.
         // A token naming a page this window is not served in never came from a
         // query over this window, and a value that is no cursor of this read at
-        // all cannot be resumed from; both are refused in the crate's one
-        // wording for such a token, which reports it verbatim.
+        // all — one this store never minted, so it carries no cursor to read —
+        // cannot be resumed from; both are refused in the crate's one wording
+        // for such a token, which reports it verbatim.
         let supplied = input.next_token.as_deref();
-        let mut resume: Option<&str> = None;
+        let mut resume: Option<String> = None;
         let page: Option<crate::state::WindowPage> = match supplied {
             None => crate::state::window_page(start, end, 0),
             Some(token) => {
-                let (index, trace) = crate::state::parse_page_token(token)
+                let (index, trace) = crate::state::parse_page_token(&page_tokens, token)
                     .ok_or_else(|| {
                         invalid_request(crate::state::invalid_next_token_message(token))
                     })?;
@@ -404,7 +412,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // even if that exact trace has since been evicted, so an eviction
             // between pages does not fail an in-flight paginator; one beyond it
             // never came from here.
-            if let (Some(token), Some(trace)) = (supplied, resume) {
+            if let (Some(token), Some(trace)) = (supplied, resume.as_deref()) {
                 let within_keyspace = store
                     .traces
                     .keys()
@@ -453,7 +461,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if instant < page.start || instant >= page.end {
                     continue;
                 }
-                if resume.is_none_or(|from| trace.id.as_str() >= from) {
+                if resume.as_deref().is_none_or(|from| trace.id.as_str() >= from) {
                     candidates.push(trace.id.clone());
                 }
             }
@@ -536,11 +544,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stop paginating. A window of several steps pages on even where a step
         // held nothing, because a client that stops at the first empty page has
         // read only the end of the range it asked about.
+        //
+        // Whichever of the two it is, the step and the trace it names travel
+        // inside an OPAQUE token ([`crate::state::page_token`]): a caller hands
+        // the value back unread, so no instant, step ordinal or trace id of this
+        // service's paging is published on the wire.
         let next_token = match (resume_at, page.and_then(|page| page.earlier)) {
-            (Some(trace), _) => {
-                page.map(|page| crate::state::page_token(page.index, Some(trace.as_str())))
-            }
-            (None, Some(earlier)) => Some(crate::state::page_token(earlier, None)),
+            (Some(trace), _) => page.map(|page| {
+                crate::state::page_token(&page_tokens, page.index, Some(trace.as_str()))
+            }),
+            (None, Some(earlier)) => Some(crate::state::page_token(&page_tokens, earlier, None)),
             (None, None) => None,
         };
 

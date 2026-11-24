@@ -23,6 +23,12 @@
 //! * a token naming a page the requested window is not served in, or no page at
 //!   all, is refused with the service's one wording for an uninterpretable
 //!   pagination token;
+//! * the token is OPAQUE — base64 carrying its cursor behind an authenticator
+//!   the issuing store's secret computes over it — so no step ordinal, instant or
+//!   trace id of the service's own paging is legible in it, a value the read
+//!   never issued (a cursor a caller assembled, one minted by another store, an
+//!   issued token with a byte changed) names no page, and handing a genuine one
+//!   back still serves the page it names;
 //! * and because every one of those is read from the REQUESTED window and from
 //!   the summaries it holds, translating a whole query — its window and the
 //!   traces that window covers — across an absolute hour boundary answers it
@@ -38,6 +44,7 @@
 use serde_json::{json, Value};
 
 use service_com_amazonaws_xray_awsxray::ops::get_trace_summaries::TRACE_SUMMARIES_PAGE_SIZE;
+use service_common::page_tokens::{page_token, PageTokenKey, AUTHENTICATOR_BYTES};
 
 use super::xray_wire::{
     close, reported, reported_trace_ids, root_document, summaries_body, trace_id, Answer, Xray,
@@ -947,6 +954,366 @@ async fn a_short_window_pages_on_its_results_rather_than_on_an_hour_boundary() {
             stored,
             "case {label:?}: the pages must yield every trace the window holds exactly once, got \
              {pages:?}"
+        );
+    }
+}
+
+// =============================================================================
+// 9. The token a page hands out is OPAQUE, and still the cursor of its own query
+// =============================================================================
+
+/// One paged query, and the pages the rule says it is served in.
+///
+/// A token's FORM can only be read off a query that issues one, so every row
+/// here is paged; the rows differ along what the rule generalises over: how many
+/// steps the window has, whether one of them is empty, where its bounds fall
+/// relative to the absolute hour grid, whether a step holds more summaries than
+/// one page carries (which is what makes the cursor name a trace to resume at as
+/// well as a step), both of those in one query, and whether the query carries a
+/// filter expression.
+struct TokenCase {
+    label: &'static str,
+    /// Where each seeded trace starts, in seconds from [`ALIGNED`].
+    offsets: Vec<f64>,
+    /// The requested window, in seconds from [`ALIGNED`].
+    start: f64,
+    end: f64,
+    /// The filter expression the query carries, if any.
+    filter: Option<&'static str>,
+    /// The traces each page carries, newest step first, as indices into
+    /// `offsets` — which [`seed`] assigns ids to in sorting order.
+    pages: Vec<Vec<usize>>,
+}
+
+fn token_cases() -> Vec<TokenCase> {
+    // A step holding one summary more than a page carries, with one trace in the
+    // step before it: the query hands out a cursor of both forms in one walk.
+    let mut split_step: Vec<f64> = (0..=TRACE_SUMMARIES_PAGE_SIZE)
+        .map(|index| {
+            #[allow(clippy::cast_precision_loss)]
+            let index = index as f64;
+            HOUR + 10.0 + index
+        })
+        .collect();
+    split_step.push(10.0);
+    let earlier_step = split_step.len() - 1;
+
+    vec![
+        TokenCase {
+            label: "a two-step window, one trace in each step",
+            offsets: vec![10.0, HOUR + 10.0],
+            start: 0.0,
+            end: 2.0 * HOUR,
+            filter: None,
+            pages: vec![vec![1], vec![0]],
+        },
+        TokenCase {
+            label: "a three-step window whose middle step holds nothing",
+            offsets: vec![10.0, 2.0 * HOUR + 10.0],
+            start: 0.0,
+            end: 3.0 * HOUR,
+            filter: None,
+            pages: vec![vec![1], Vec::new(), vec![0]],
+        },
+        TokenCase {
+            label: "a two-step window whose bounds sit off the hour grid",
+            offsets: vec![1_810.0, HOUR + 1_810.0],
+            start: 1_800.0,
+            end: 1_800.0 + 2.0 * HOUR,
+            filter: None,
+            pages: vec![vec![1], vec![0]],
+        },
+        TokenCase {
+            label: "one step holding two summaries more than a page carries",
+            offsets: (0..TRACE_SUMMARIES_PAGE_SIZE + 2)
+                .map(|index| {
+                    #[allow(clippy::cast_precision_loss)]
+                    let index = index as f64;
+                    10.0 + index
+                })
+                .collect(),
+            start: 0.0,
+            end: 1_800.0,
+            filter: None,
+            pages: vec![
+                (0..TRACE_SUMMARIES_PAGE_SIZE).collect(),
+                (TRACE_SUMMARIES_PAGE_SIZE..TRACE_SUMMARIES_PAGE_SIZE + 2).collect(),
+            ],
+        },
+        TokenCase {
+            label: "a step holding more than a page, inside a two-step window",
+            offsets: split_step,
+            start: 0.0,
+            end: 2.0 * HOUR,
+            filter: None,
+            pages: vec![
+                (0..TRACE_SUMMARIES_PAGE_SIZE).collect(),
+                vec![TRACE_SUMMARIES_PAGE_SIZE],
+                vec![earlier_step],
+            ],
+        },
+        TokenCase {
+            label: "a two-step window queried with a filter expression",
+            offsets: vec![10.0, HOUR + 10.0],
+            start: 0.0,
+            end: 2.0 * HOUR,
+            filter: Some("service(\"svc\")"),
+            pages: vec![vec![1], vec![0]],
+        },
+    ]
+}
+
+/// The bytes a value of the base64 alphabet decodes to, or `None` when the text
+/// is not base64 at all.
+fn decoded(token: &str) -> Option<Vec<u8>> {
+    ::aws_smithy_types::base64::decode(token).ok()
+}
+
+/// Assert everything the rule says about the FORM of one issued token: the shape
+/// a cursor travels in, and that nothing of this service's paging can be read
+/// off it.
+fn assert_opaque(case: &str, token: &str, start: f64, end: f64, stored: &[String]) {
+    // One run of base64 carrying more bytes than its cursor is long, because the
+    // authenticator travels in front of it.
+    let bytes = decoded(token)
+        .unwrap_or_else(|| panic!("case {case:?}: expected a base64 cursor, got {token:?}"));
+    assert!(
+        bytes.len() > AUTHENTICATOR_BYTES,
+        "case {case:?}: expected a cursor behind an authenticator, got {} bytes from {token:?}",
+        bytes.len()
+    );
+
+    // And nothing of the paging scheme is readable off the value: not the step
+    // ordinal, which a readable number would be; not the separator the cursor's
+    // two parts are joined by; not an instant of the window being paged; and not
+    // a trace the query reports.
+    assert!(
+        token.parse::<f64>().is_err(),
+        "case {case:?}: a token must not be a readable number, got {token:?}"
+    );
+    assert!(
+        !token.contains(':'),
+        "case {case:?}: a token must not expose the cursor's separator, got {token:?}"
+    );
+    for instant in [start, end, start - start.fract(), end - end.fract()] {
+        let rendered = format!("{instant:.0}");
+        assert!(
+            !token.contains(&rendered),
+            "case {case:?}: a token must not expose the instant {rendered}, got {token:?}"
+        );
+    }
+    for id in stored {
+        assert!(
+            !token.contains(id.as_str()),
+            "case {case:?}: a token must not expose the trace {id}, got {token:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_page_token_is_opaque_and_still_resumes_its_own_query() {
+    for case in token_cases() {
+        let xray = Xray::new();
+        let stored = seed(&xray, &case.offsets).await;
+        let (start, end) = (ALIGNED + case.start, ALIGNED + case.end);
+
+        let mut token: Option<String> = None;
+        let mut served: Vec<Vec<String>> = Vec::new();
+        for page in 0..case.pages.len() {
+            let answered = xray
+                .query_summaries(start, end, case.filter, token.as_deref())
+                .await;
+            assert_eq!(
+                answered.status, 200,
+                "case {:?}: page {page} must be served, got {answered:?}",
+                case.label
+            );
+            served.push(reported(&answered));
+            token = next_token(&answered);
+            assert_eq!(
+                token.is_none(),
+                page + 1 == case.pages.len(),
+                "case {:?}: a token is due on every page of the query but its last, got \
+                 {token:?} on page {page}",
+                case.label
+            );
+            if let Some(token) = token.as_deref() {
+                let label = format!("{} page {page}", case.label);
+                assert_opaque(&label, token, start, end, &stored);
+            }
+        }
+
+        // And the opaque tokens resumed the very pages the query has: which
+        // summaries a page carries is unchanged by the form of the cursor.
+        let expected: Vec<Vec<String>> = case
+            .pages
+            .iter()
+            .map(|page| page.iter().map(|index| stored[*index].clone()).collect())
+            .collect();
+        assert_eq!(
+            served, expected,
+            "case {:?}: the pages the tokens walked must carry the window's traces once each",
+            case.label
+        );
+    }
+}
+
+// =============================================================================
+// 10. A value this read never issued carries no cursor, however well it is
+//     shaped
+// =============================================================================
+
+#[tokio::test]
+async fn a_token_this_read_never_minted_is_refused_with_the_one_wording() {
+    let xray = Xray::new();
+    let stored = seed(&xray, &[10.0, HOUR + 10.0]).await;
+    let (start, end) = (ALIGNED, ALIGNED + 2.0 * HOUR);
+
+    // The cursor this query really issued, which the rows below counterfeit.
+    let first = xray.summaries(start, end, None).await;
+    let issued = next_token(&first)
+        .unwrap_or_else(|| panic!("a two-step window must issue a token, got {first:?}"));
+    let genuine = decoded(&issued).expect("an issued token is base64");
+    let mut forged_authenticator = genuine.clone();
+    forged_authenticator[0] ^= 0x01;
+    let mut forged_cursor = genuine.clone();
+    let last = forged_cursor.len() - 1;
+    forged_cursor[last] ^= 0x01;
+
+    // Rows differ along HOW the value fails to be a cursor this read handed out:
+    // the clear-text forms of the cursor it carries (a step ordinal on its own,
+    // and one naming the trace to resume at), an instant of the service's own
+    // page grid, a value that is no cursor at all, a token of the minted SHAPE
+    // whose authenticator a caller made up, one minted under another store's
+    // secret, and an issued token with a byte changed in its authenticator, a
+    // byte changed in its cursor, or its last byte dropped.
+    let rows: Vec<(&str, String)> = vec![
+        ("the step ordinal in clear text", "1".to_string()),
+        (
+            "the step ordinal and the trace to resume at in clear text",
+            format!("1:{}", stored[0]),
+        ),
+        ("an instant of the page grid", format!("{ALIGNED:.0}")),
+        ("a value that is no cursor at all", "not-a-token".to_string()),
+        ("an empty token", String::new()),
+        (
+            "the minted shape with an authenticator of nothing",
+            ::aws_smithy_types::base64::encode(
+                [vec![0_u8; AUTHENTICATOR_BYTES].as_slice(), b"1".as_slice()].concat(),
+            ),
+        ),
+        (
+            "a token minted under another store's secret",
+            page_token(&PageTokenKey::new(), "1"),
+        ),
+        (
+            "an issued token with a byte of its authenticator changed",
+            ::aws_smithy_types::base64::encode(&forged_authenticator),
+        ),
+        (
+            "an issued token with a byte of its cursor changed",
+            ::aws_smithy_types::base64::encode(&forged_cursor),
+        ),
+        (
+            "an issued token with its last byte dropped",
+            ::aws_smithy_types::base64::encode(&genuine[..genuine.len() - 1]),
+        ),
+    ];
+
+    for (label, token) in rows {
+        let answered = xray.summaries(start, end, Some(&token)).await;
+        assert_eq!(
+            (
+                answered.status,
+                answered.error_type.as_deref(),
+                said(&answered)
+            ),
+            (
+                400,
+                Some("InvalidRequestException"),
+                format!("Invalid token {token}").as_str()
+            ),
+            "case {label:?}: a token this read never minted must be refused with the one \
+             wording, got {answered:?}"
+        );
+    }
+
+    // While the genuine cursor is still served, so the refusals above are about
+    // the values rather than about the query.
+    let resumed = xray.summaries(start, end, Some(&issued)).await;
+    assert_eq!(
+        (resumed.status, reported(&resumed)),
+        (200, vec![stored[0].clone()]),
+        "the issued token must still serve the earlier step, got {resumed:?}"
+    );
+}
+
+// =============================================================================
+// 11. A cursor belongs to the store that minted it
+// =============================================================================
+
+#[tokio::test]
+async fn two_stores_answering_the_same_query_mint_different_cursors() {
+    let offsets = [10.0, HOUR + 10.0];
+    let (start, end) = (ALIGNED, ALIGNED + 2.0 * HOUR);
+
+    // Two emulators seeded and asked identically: the summaries they serve are
+    // the same, because the answer is a function of the window and of the traces
+    // that window holds — while the cursors differ, because a token is
+    // authenticated under the secret of the store that minted it.
+    let first = Xray::new();
+    let second = Xray::new();
+    let stored = seed(&first, &offsets).await;
+    let also = seed(&second, &offsets).await;
+    assert_eq!(stored, also, "both stores must hold the same traces");
+
+    let left = first.summaries(start, end, None).await;
+    let right = second.summaries(start, end, None).await;
+    assert_eq!(
+        (left.status, reported(&left)),
+        (right.status, reported(&right)),
+        "the same query must answer the same summaries in both stores, got {left:?} and \
+         {right:?}"
+    );
+    let left_token = next_token(&left)
+        .unwrap_or_else(|| panic!("a two-step window issues a token, got {left:?}"));
+    let right_token = next_token(&right)
+        .unwrap_or_else(|| panic!("a two-step window issues a token, got {right:?}"));
+    assert_ne!(
+        left_token, right_token,
+        "two stores must not mint the same cursor text for the same query"
+    );
+
+    // Neither store serves the other's cursor, while each serves its own.
+    for (label, emulator, own, foreign) in [
+        (
+            "the second store's cursor at the first",
+            &first,
+            &left_token,
+            &right_token,
+        ),
+        (
+            "the first store's cursor at the second",
+            &second,
+            &right_token,
+            &left_token,
+        ),
+    ] {
+        let refused = emulator.summaries(start, end, Some(foreign.as_str())).await;
+        assert_eq!(
+            (refused.status, refused.error_type.as_deref(), said(&refused)),
+            (
+                400,
+                Some("InvalidRequestException"),
+                format!("Invalid token {foreign}").as_str()
+            ),
+            "case {label:?}: a cursor another store minted must be refused, got {refused:?}"
+        );
+        let served = emulator.summaries(start, end, Some(own.as_str())).await;
+        assert_eq!(
+            (served.status, reported(&served)),
+            (200, vec![stored[0].clone()]),
+            "case {label:?}: a store must serve its own cursor, got {served:?}"
         );
     }
 }

@@ -30,6 +30,21 @@
 //! of the token that resumes it are stated once here, so the handler that serves
 //! a page and the one that resumes one cannot disagree about which step a token
 //! names.
+//!
+//! The token itself is OPAQUE. `NextToken` is "the pagination token returned by a
+//! previous request"
+//! (`smithy_query(query="doc",shape="GetTraceSummariesRequest",member="NextToken")`)
+//! and nothing of its format is published, so a caller hands it back exactly as
+//! it arrived and reads nothing out of it: the step the next page serves and the
+//! trace it resumes at travel INSIDE the token, behind the authenticator the
+//! issuing store's secret computes over them
+//! ([`::service_common::page_tokens`]), rendered as base64. No instant, ordinal
+//! or trace id is therefore legible on the wire, and a value this store never
+//! minted — a cursor a caller assembled, one minted by another store — names no
+//! page at all, which is what the caller refuses
+//! ([`super::invalid_next_token_message`]).
+
+use ::service_common::page_tokens::PageTokenKey;
 
 /// How long one page's step of a trace query's window is, in seconds.
 ///
@@ -38,10 +53,14 @@
 /// window is cut into pages and the instant each page reports.
 pub const TRACE_PAGE_SECONDS: i64 = 60 * 60;
 
-/// The separator between the two parts of a page token: the step the next page
-/// serves, and — when that step still has summaries left in it — the trace the
-/// next page resumes at. A trace id carries no colon
+/// The separator between the two parts of the CURSOR a page token carries: the
+/// step the next page serves, and — when that step still has summaries left in
+/// it — the trace the next page resumes at. A trace id carries no colon
 /// (`smithy_query(query="shape",shape="TraceId")`), so the split is unambiguous.
+///
+/// It is a detail of what travels INSIDE the token, never of the token's own
+/// text: the cursor is authenticated and encoded before it reaches the wire
+/// ([`page_token`]).
 const TOKEN_SEPARATOR: char = ':';
 
 /// The most pages one window is cut into: the widest window a trace query serves
@@ -135,12 +154,18 @@ pub fn window_page(start: f64, end: f64, index: usize) -> Option<WindowPage> {
 
 /// The token that resumes a query at the page `index`, at `trace` when that
 /// page's step still holds summaries past the page just served.
+///
+/// The step and the trace are the CURSOR; the token is that cursor authenticated
+/// under the issuing store's secret `key` and rendered base64, which is the one
+/// opaque spelling this read hands a cursor out in: a caller sends it back
+/// unread, and nothing about which step or trace it names can be read off it.
 #[must_use]
-pub fn page_token(index: usize, trace: Option<&str>) -> String {
-    match trace {
+pub fn page_token(key: &PageTokenKey, index: usize, trace: Option<&str>) -> String {
+    let cursor = match trace {
         Some(trace) => format!("{index}{TOKEN_SEPARATOR}{trace}"),
         None => index.to_string(),
-    }
+    };
+    ::service_common::page_tokens::page_token(key, &cursor)
 }
 
 /// The page and the trace a token issued by [`page_token`] names, or `None` for
@@ -148,16 +173,22 @@ pub fn page_token(index: usize, trace: Option<&str>) -> String {
 /// the uninterpretable token it is
 /// ([`super::invalid_next_token_message`]).
 ///
+/// A value `key` did not mint carries no cursor at all: text that is not base64,
+/// a cursor behind an authenticator a caller assembled, and a token minted by
+/// another store all resolve to nothing, so a page is served only for a cursor
+/// this store itself handed out.
+///
 /// Whether the page it names is one the REQUESTED window has is the caller's
 /// check ([`window_page`]): a token is a cursor into the query that issued it, so
 /// one naming a page beyond the window now being asked about did not come from
 /// it, however well formed it looks.
 #[must_use]
-pub fn parse_page_token(token: &str) -> Option<(usize, Option<&str>)> {
-    let (index, trace) = match token.split_once(TOKEN_SEPARATOR) {
+pub fn parse_page_token(key: &PageTokenKey, token: &str) -> Option<(usize, Option<String>)> {
+    let cursor = ::service_common::page_tokens::page_cursor(key, token)?;
+    let (index, trace) = match cursor.split_once(TOKEN_SEPARATOR) {
         Some((_, "")) => return None,
-        Some((index, trace)) => (index, Some(trace)),
-        None => (token, None),
+        Some((index, trace)) => (index.to_string(), Some(trace.to_string())),
+        None => (cursor, None),
     };
     let index: usize = index.parse().ok()?;
     (index < MAX_WINDOW_PAGES).then_some((index, trace))

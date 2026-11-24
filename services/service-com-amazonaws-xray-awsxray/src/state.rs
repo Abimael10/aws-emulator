@@ -799,6 +799,13 @@ pub struct ComAmazonawsXrayAwsxrayState {
     /// reservoir shares computed from them, and when the account's sampling-rule
     /// configuration last changed.
     pub sampling: SamplingStatisticsStore,
+    /// The secret this store's opaque pagination tokens are authenticated under
+    /// ([`trace_pages::page_token`]).
+    ///
+    /// Drawn from the system's randomness when the store is created and never
+    /// reported, so the position a token carries is readable only by the store
+    /// that minted it and a value a caller assembled names no page at all.
+    pub page_tokens: ::service_common::page_tokens::PageTokenKey,
 }
 
 /// Who reported telemetry: the `PutTelemetryRecords` request's own reporter
