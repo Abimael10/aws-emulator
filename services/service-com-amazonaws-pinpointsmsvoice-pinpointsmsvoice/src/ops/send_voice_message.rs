@@ -235,10 +235,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             caller_id: input.caller_id,
             destination_phone_number: Some(destination),
             origination_phone_number: input.origination_phone_number,
+            // The body is recorded member for member, and WHICH of the three bodies the
+            // request carried is recorded by the body's own presence — every member of
+            // `CallInstructionsMessageType`, `PlainTextMessageType` and `SSMLMessageType`
+            // is optional, so a body is never collapsed into one of its members: that
+            // would make the body the one-body check above accepted read back as the
+            // no-body request the same check refuses.
             content: crate::state::VoiceContentRecord {
-                call_instructions_text: content
-                    .call_instructions_message
-                    .and_then(|body| body.text),
+                call_instructions: content.call_instructions_message.map(|body| {
+                    crate::state::CallInstructionsRecord { text: body.text }
+                }),
                 plain_text: content.plain_text_message.map(|body| {
                     crate::state::VoiceTextRecord {
                         text: body.text,

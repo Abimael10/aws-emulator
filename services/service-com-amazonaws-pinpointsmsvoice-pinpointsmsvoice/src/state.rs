@@ -140,14 +140,26 @@ pub struct SentVoiceMessage {
 
 /// Stored form of `VoiceMessageContent`: whichever one of the three message bodies
 /// the caller supplied.
+///
+/// Each body is its own `Option`, so WHICH body the request carried is recorded
+/// independently of the members that body itself carried: every member of all three
+/// body shapes is optional, so a body present with nothing inside it is still a body
+/// the caller supplied and must not read back as no body at all.
 #[derive(Debug, Clone, Default)]
 pub struct VoiceContentRecord {
-    /// `CallInstructionsMessageType$Text`.
-    pub call_instructions_text: Option<String>,
+    /// `CallInstructionsMessageType`.
+    pub call_instructions: Option<CallInstructionsRecord>,
     /// `PlainTextMessageType`.
     pub plain_text: Option<VoiceTextRecord>,
     /// `SSMLMessageType`.
     pub ssml: Option<VoiceTextRecord>,
+}
+
+/// Stored form of `CallInstructionsMessageType`, which declares the single optional
+/// member `Text` — and only that member, so this is not a [`VoiceTextRecord`].
+#[derive(Debug, Clone, Default)]
+pub struct CallInstructionsRecord {
+    pub text: Option<String>,
 }
 
 /// Stored form of the two spoken-message shapes (`PlainTextMessageType`,
