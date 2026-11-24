@@ -1977,14 +1977,17 @@ pub struct Secret {
     ///
     /// `RotationEnabled` is "whether automatic rotation is turned on for this
     /// secret" (`DescribeSecretResponse$RotationEnabled`, this service's Smithy
-    /// model), a boolean the model gives no default, so the member is reported
-    /// only once rotation has been configured for this secret
-    /// ([`configure_rotation`]) — true while it is on, and false once a call
-    /// turned it off again ([`cancel_rotation`], [`schedule_deletion`]) — and is
-    /// omitted for a secret rotation was never configured for, just as the rest of
-    /// the rotation view is. That presence is what tells a never-configured secret
-    /// apart from one rotation was explicitly turned off for, so neither a read
-    /// nor a call that turns off what was never configured may materialise it.
+    /// model), a boolean the model gives no default: "If the secret has never been
+    /// configured for rotation, Secrets Manager returns null. To turn on rotation,
+    /// use RotateSecret. To turn off rotation, use CancelRotateSecret." The member
+    /// is therefore reported once a call that the model documents as turning
+    /// rotation ON or OFF has decided it — true after [`configure_rotation`], false
+    /// after [`cancel_rotation`] — and is omitted for a secret no such call ever
+    /// reached, just as the rest of the rotation view is. That presence is what
+    /// tells a never-configured secret apart from one rotation was turned off for,
+    /// so a READ never materialises it, and neither does a write that turns off
+    /// nothing of its own accord ([`schedule_deletion`], which stops the schedule
+    /// of a secret on its way out rather than being asked to turn rotation off).
     ///
     /// [`configure_rotation`]: Secret::configure_rotation
     /// [`cancel_rotation`]: Secret::cancel_rotation
@@ -2149,13 +2152,16 @@ impl Secret {
     /// by `RotateSecret` — "to turn on automatic rotation again, call
     /// RotateSecret" — but nothing turns it back on by itself, which is why
     /// [`cancel_deletion`] leaves it off. A secret rotation was never configured
-    /// for is left with no rotation state at all ([`rotation_enabled`]): turning
-    /// off what was never configured decides nothing to report.
+    /// for is left with no rotation state at all ([`rotation_enabled`]): this call
+    /// asks for a deletion, not for rotation to be turned off — only the call the
+    /// model documents as turning rotation off ([`cancel_rotation`]) decides the
+    /// flag for a secret nothing configured rotation for.
     ///
     /// Re-scheduling a secret that is already marked replaces all three, so a
     /// second deletion request measures its window from itself.
     ///
     /// [`cancel_deletion`]: Secret::cancel_deletion
+    /// [`cancel_rotation`]: Secret::cancel_rotation
     /// [`rotation_enabled`]: Secret::rotation_enabled
     pub fn schedule_deletion(
         &mut self,
@@ -3055,11 +3061,16 @@ impl Secret {
     /// cleans them up with `UpdateSecretVersionStage`, which is also why the id
     /// is reported back here.
     ///
-    /// A secret rotation was never configured for has no schedule to turn off, so
-    /// this leaves its ROTATION state as it was: the cancel reports the secret,
-    /// and the secret still reports no rotation view at all
-    /// ([`rotation_enabled`]). It is still a write of the secret, so
-    /// `LastChangedDate` moves as it does for any other.
+    /// The call DECIDES whether rotation is on for this secret, so it records the
+    /// flag whatever the secret held before: "To turn off rotation, use
+    /// CancelRotateSecret" (`DescribeSecretResponse$RotationEnabled`, this
+    /// service's Smithy model), and after it rotation is a thing this secret has
+    /// been told to have off — reportable as the boolean false, which is what tells
+    /// a client "rotation is configured but currently off" from "rotation was never
+    /// set up" ([`rotation_enabled`]). A secret rotation was never configured for
+    /// has no schedule to stop and no rotation to cancel, so nothing else about it
+    /// changes. It is still a write of the secret, so `LastChangedDate` moves as it
+    /// does for any other.
     ///
     /// [`rotation_enabled`]: Secret::rotation_enabled
     pub fn cancel_rotation(&mut self, at: SystemTime) -> Option<String> {
@@ -3076,9 +3087,7 @@ impl Secret {
             self.cancelled_rotation_version_id = cancelled.clone();
         }
         self.rotation_stopped = false;
-        if self.rotation_enabled.is_some() {
-            self.rotation_enabled = Some(false);
-        }
+        self.rotation_enabled = Some(false);
         self.next_rotation_date = None;
         self.last_changed_date = at;
         cancelled

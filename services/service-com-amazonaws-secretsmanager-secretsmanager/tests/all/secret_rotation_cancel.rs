@@ -17,6 +17,10 @@
 //!   rotation left them;
 //! * the call reports the secret's ARN and name and succeeds whether or not
 //!   rotation was ever configured, so repeating it answers the same thing;
+//! * the call DECIDES whether rotation is on, so from there every projection of
+//!   the secret reports `RotationEnabled` as the boolean false even for a secret
+//!   `RotateSecret` never configured rotation for, while a secret no rotation call
+//!   ever reached reports the member not at all;
 //! * a `SecretId` that names no secret is `ResourceNotFoundException`, and a
 //!   secret inside its recovery window — which still exists — is
 //!   `InvalidRequestException`.
@@ -193,6 +197,23 @@ async fn create_secret(
 /// `DescribeSecret` for one secret.
 async fn describe(router: &MultiServiceRouter, secret_id: &str, case: &str) -> Value {
     ok(router, "DescribeSecret", json!({"SecretId": secret_id}), case).await
+}
+
+/// The `SecretListEntry` `ListSecrets` reports for the secret named `name`.
+async fn list_entry(router: &MultiServiceRouter, name: &str, case: &str) -> Value {
+    let listed = ok(
+        router,
+        "ListSecrets",
+        json!({"Filters": [{"Key": "name", "Values": [name]}]}),
+        case,
+    )
+    .await;
+    listed
+        .get("SecretList")
+        .and_then(Value::as_array)
+        .and_then(|entries| entries.first())
+        .cloned()
+        .unwrap_or_else(|| panic!("case {case:?}: no entry for {name} in {listed}"))
 }
 
 /// The ARN without the trailing hyphen and six random characters — the partial
@@ -434,31 +455,108 @@ async fn cancel_turns_rotation_off_and_keeps_the_configuration() {
     }
 }
 
-/// A secret rotation was never configured for has no schedule to turn off, so
-/// the cancel reports the secret and no version id, and leaves it exactly as it
-/// was — including reporting no rotation view at all.
+/// One call a row makes before its cancel: the operation, the members it carries
+/// beside `SecretId`, and whether this service refuses it.
+type PriorCall = (&'static str, Value, bool);
+
+/// One row of [`cancel_reports_rotation_off_whatever_was_configured_before`]: the
+/// case, the call made before the cancel, and how the cancel names the secret.
+type CancelRow = (&'static str, Option<PriorCall>, SecretIdForm);
+
+/// The cancel DECIDES that rotation is off, so from there every projection of the
+/// secret reports `RotationEnabled` as the boolean false — whatever rotation state
+/// the secret held before, including none at all — while it configures nothing: no
+/// rotation function, no schedule and no next due instant appear, and the stored
+/// versions are untouched.
 ///
-/// The rows differ along the form of the `SecretId` and the kind of value the
-/// secret holds.
+/// The rows differ along the rotation state the cancel finds (never touched, a
+/// `RotateSecret` the service refused for a missing function, one it refused for an
+/// unreadable schedule, a write of the secret that configures no rotation) and along
+/// the form of the `SecretId` the cancel names.
 #[tokio::test]
-async fn cancel_succeeds_when_rotation_was_never_configured() {
-    // (case, how the cancel names the secret)
-    let rows: &[(&str, SecretIdForm)] = &[
-        ("by name", |name, _arn| name.to_string()),
-        ("by full ARN", |_name, arn| arn.to_string()),
-        ("by partial ARN", |_name, arn| partial_arn(arn)),
+async fn cancel_reports_rotation_off_whatever_was_configured_before() {
+    // (case, the call made after the create and whether it is refused, how the
+    // cancel names the secret)
+    let rows: &[CancelRow] = &[
+        (
+            "nothing but the create, cancelled by name",
+            None,
+            |name, _arn| name.to_string(),
+        ),
+        (
+            "nothing but the create, cancelled by full ARN",
+            None,
+            |_name, arn| arn.to_string(),
+        ),
+        (
+            "nothing but the create, cancelled by partial ARN",
+            None,
+            |_name, arn| partial_arn(arn),
+        ),
+        (
+            // "You tried to enable rotation on a secret that doesn't already have a
+            // Lambda function ARN configured and you didn't include such an ARN as
+            // a parameter in this call" (`InvalidRequestException`, this service's
+            // Smithy model): the refused call configures nothing.
+            "a RotateSecret refused for naming no rotation function, cancelled by name",
+            Some(("RotateSecret", json!({}), true)),
+            |name, _arn| name.to_string(),
+        ),
+        (
+            "a RotateSecret refused for an unreadable schedule, cancelled by full ARN",
+            Some((
+                "RotateSecret",
+                json!({
+                    "RotationLambdaARN": LAMBDA_ARN,
+                    "RotationRules": {"ScheduleExpression": "every 10 days"},
+                }),
+                true,
+            )),
+            |_name, arn| arn.to_string(),
+        ),
+        (
+            "a tag written on it, which configures no rotation, cancelled by name",
+            Some((
+                "TagResource",
+                json!({"Tags": [{"Key": "team", "Value": "a"}]}),
+                false,
+            )),
+            |name, _arn| name.to_string(),
+        ),
     ];
 
     let router = emulator();
-    for (index, (case, secret_id_of)) in rows.iter().enumerate() {
+    // A sibling secret no cancel ever reaches, described at the end: the member is
+    // reported only because a call decided it, so it stays absent here.
+    create_secret(&router, "untouched", "a-plain-value", "the control").await;
+
+    for (index, (case, before, secret_id_of)) in rows.iter().enumerate() {
         let name = format!("never-rotated-{index}");
         let (arn, current) = create_secret(&router, &name, "a-plain-value", case).await;
-        let secret_id = secret_id_of(&name, &arn);
+        if let Some((operation, members, refused)) = before {
+            let mut body = json!({"SecretId": &name});
+            for (member, value) in members.as_object().expect("the row states an object") {
+                body[member] = value.clone();
+            }
+            if *refused {
+                err(&router, operation, body, case).await;
+            } else {
+                ok(&router, operation, body, case).await;
+            }
+        }
+        let described = describe(&router, &name, case).await;
+        assert_eq!(
+            described.get("RotationEnabled"),
+            None,
+            "case {case:?}: expected no RotationEnabled before any call decided it, got \
+             {described}"
+        );
 
+        let secret_id = secret_id_of(&name, &arn);
         let cancelled = ok(
             &router,
             "CancelRotateSecret",
-            json!({"SecretId": secret_id}),
+            json!({"SecretId": &secret_id}),
             case,
         )
         .await;
@@ -478,24 +576,62 @@ async fn cancel_succeeds_when_rotation_was_never_configured() {
             "case {case:?}: expected no VersionId when no rotation was in progress, got {cancelled}"
         );
 
-        let described = describe(&router, &name, case).await;
+        // Repeated reads answer the same false: the flag is stored, not invented by
+        // the read, and the cancel configured no rotation to go with it.
+        for pass in 1..=2 {
+            let described = describe(&router, &name, case).await;
+            assert_eq!(
+                described.get("RotationEnabled"),
+                Some(&json!(false)),
+                "case {case:?} (describe pass {pass}): expected RotationEnabled false once the \
+                 cancel turned rotation off, got {described}"
+            );
+            for member in ["RotationLambdaARN", "RotationRules", "NextRotationDate"] {
+                assert_eq!(
+                    described.get(member),
+                    None,
+                    "case {case:?} (describe pass {pass}): expected the cancel to configure no \
+                     {member}, got {described}"
+                );
+            }
+            assert_eq!(
+                stages_of(&described, "VersionIdsToStages", &current),
+                vec!["AWSCURRENT".to_string()],
+                "case {case:?}: expected the stored version to be untouched, got {described}"
+            );
+        }
+
+        // The list projection of the same secret reports the same flag.
+        let entry = list_entry(&router, &name, case).await;
         assert_eq!(
-            described.get("RotationEnabled"),
-            None,
-            "case {case:?}: the cancel left a secret rotation was never decided for as it was, \
-             so it still reports no RotationEnabled, got {described}"
+            entry.get("RotationEnabled"),
+            Some(&json!(false)),
+            "case {case:?}: expected ListSecrets to report rotation off too, got {entry}"
         );
+
+        // Cancelling again decides the same thing.
+        ok(
+            &router,
+            "CancelRotateSecret",
+            json!({"SecretId": &secret_id}),
+            case,
+        )
+        .await;
+        let again = describe(&router, &name, case).await;
         assert_eq!(
-            described.get("RotationLambdaARN"),
-            None,
-            "case {case:?}: expected the cancel to configure no rotation function, got {described}"
-        );
-        assert_eq!(
-            stages_of(&described, "VersionIdsToStages", &current),
-            vec!["AWSCURRENT".to_string()],
-            "case {case:?}: expected the stored version to be untouched, got {described}"
+            again.get("RotationEnabled"),
+            Some(&json!(false)),
+            "case {case:?}: expected a repeated cancel to leave rotation off, got {again}"
         );
     }
+
+    let control = describe(&router, "untouched", "the control").await;
+    assert_eq!(
+        control.get("RotationEnabled"),
+        None,
+        "case \"the control\": expected a secret no rotation call ever reached to report no \
+         RotationEnabled at all, got {control}"
+    );
 }
 
 /// Because the cancel keeps the rotation configuration, `RotateSecret` turns

@@ -1,23 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! `RotationEnabled` is reported only for a secret rotation has been CONFIGURED for.
+//! `RotationEnabled` is reported only once a call has DECIDED a secret's rotation.
 //!
 //! The rule under test: `RotationEnabled` is "whether automatic rotation is turned on for this
 //! secret" (`DescribeSecretResponse$RotationEnabled`, this service's Smithy model), a boolean
 //! the model gives no default — so the member is absent from the body of a secret rotation was
 //! never configured for, exactly as the rest of the rotation view (`RotationLambdaARN`,
 //! `RotationRules`, `LastRotatedDate`, `NextRotationDate`) is, and it appears once
-//! `RotateSecret` has configured rotation for the secret: true while rotation is on, false
-//! once a call turned it off again (`CancelRotateSecret`, `DeleteSecret`). Its presence is
-//! what tells a never-configured secret apart from one rotation was explicitly turned off for,
-//! so neither a read nor a call that turns off what was never configured may materialise it.
+//! a call the model documents as DECIDING rotation has been made: true once `RotateSecret`
+//! turned rotation on, false once `CancelRotateSecret` turned it off ("To turn on rotation,
+//! use RotateSecret. To turn off rotation, use CancelRotateSecret"). Its presence is what
+//! tells a never-configured secret apart from one rotation was turned off for, so neither a
+//! read nor a write that was not asked to decide rotation may materialise it.
 //!
 //! The rule holds of every projection of a secret that carries the member, so the tables run
 //! over `DescribeSecret` and the `SecretListEntry` of `ListSecrets`, over the calls that write
-//! a secret without configuring rotation for it (`PutSecretValue`, `UpdateSecret`,
-//! `TagResource`) and the calls that turn off what was never configured
-//! (`CancelRotateSecret`, `DeleteSecret`), over repeated reads of the same secret, and over
-//! each way rotation gets configured and then turned off again.
+//! a secret without deciding its rotation (`PutSecretValue`, `UpdateSecret`,
+//! `TagResource`, `DeleteSecret`), over repeated reads of the same secret, and over each way
+//! rotation gets turned on and then off again.
 
 use std::sync::Arc;
 
@@ -144,17 +144,10 @@ async fn a_secret_rotation_was_never_configured_for_reports_no_rotation_view() {
             "a tag written on it",
             Some(("TagResource", json!({"Tags": [{"Key": "team", "Value": "a"}]}))),
         ),
-        // "Turns off automatic rotation, and if a rotation is currently in progress, cancels
-        // the rotation" (`CancelRotateSecret`, this service's Smithy model): a secret
-        // rotation was never configured for has no schedule to turn off and no rotation to
-        // cancel, so the call configures nothing either.
-        (
-            "its rotation cancelled, having never been configured",
-            Some(("CancelRotateSecret", json!({}))),
-        ),
-        // The same of a delete, which turns rotation off for a secret on its way out: there
-        // is nothing to turn off on a secret rotation was never configured for, and the
-        // secret still exists inside its recovery window to be described.
+        // A delete turns the schedule of a rotating secret off, but it was not asked to
+        // decide rotation: there is nothing to turn off on a secret rotation was never
+        // configured for, and the secret still exists inside its recovery window to be
+        // described.
         (
             "scheduled for deletion, having never been configured for rotation",
             Some(("DeleteSecret", json!({"RecoveryWindowInDays": 30}))),
@@ -242,6 +235,13 @@ async fn configuring_rotation_makes_the_member_appear_and_turning_it_off_keeps_i
                 ),
                 ("CancelRotateSecret", json!({})),
             ],
+            false,
+        ),
+        // "To turn off rotation, use CancelRotateSecret": the call decides the flag, so it has
+        // a value to report even for a secret `RotateSecret` never configured rotation for.
+        (
+            "rotation turned off by CancelRotateSecret, having never been configured",
+            vec![("CancelRotateSecret", json!({}))],
             false,
         ),
         (

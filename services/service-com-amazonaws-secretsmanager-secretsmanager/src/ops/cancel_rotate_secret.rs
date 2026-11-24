@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelRotateSecret
-//! Turns automatic rotation off for a stored secret: rotation is disabled and the
+//! Turns automatic rotation off for a stored secret: rotation is reported off and the
 //! schedule stops making a rotation due, while the rotation function, rules and
 //! external-rotation metadata the secret holds stay stored, so a later
-//! `RotateSecret` can rotate with the values already there.
+//! `RotateSecret` can rotate with the values already there. The call decides the
+//! flag a read reports, so from here `RotationEnabled` is the boolean false even for
+//! a secret no `RotateSecret` ever configured rotation for.
 //!
 //! A rotation that is still in progress is cancelled, and the version id it staked
 //! `AWSPENDING` on is reported back so the caller can clean that partially created
@@ -224,11 +226,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "Turns off automatic rotation, and if a rotation is currently in
-        // progress, cancels the rotation." A secret that rotation was never
-        // configured for has no schedule to turn off and no rotation to cancel,
-        // so the call leaves it as it was and still reports the secret it named:
-        // nothing here is conditional on rotation having been on, which is what
-        // makes a second call answer like the first.
+        // progress, cancels the rotation." The call DECIDES that rotation is off
+        // for this secret, so the flag it reports from here is the boolean false
+        // whether or not rotation had been configured — a secret rotation was
+        // never configured for simply has no schedule to stop and no rotation to
+        // cancel. Nothing here is conditional on rotation having been on, which is
+        // what makes a second call answer like the first.
         let cancelled_version_id = secret.cancel_rotation(now);
 
         Ok(CancelRotateSecretOutput {
