@@ -21249,6 +21249,7 @@ dependencies = [
  "service-com-amazonaws-eventbridge-awsevents",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-lambda-awsgirapiservice",
+ "service-com-amazonaws-route53-awsdnsv20130401",
  "service-com-amazonaws-s3-amazons3",
  "service-com-amazonaws-ses-simpleemailservice",
  "service-com-amazonaws-sns-amazonsimplenotificationservice",

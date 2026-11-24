@@ -131,7 +131,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // Request metadata is not needed: both the identity and the configuration set
         // are keyed by name within the one emulated account.
-        let _ = ctx;
+        // An email identity belongs to the Region it was created in, so the
+        // `EmailIdentity` this request names is resolved among the identities of the
+        // Region the caller signed for ([`crate::state::request_region`]).
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // The engine is not the shared in-memory engine, so this service has no
             // store to write to. That is not a modelled SES state: answer the
@@ -171,10 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|set_name| !store.configuration_sets.contains_key(*set_name))
             .map(str::to_string);
 
-        let Some(record) = store
-            .identities
-            .get_mut(&crate::state::identity_key(&input.email_identity))
-        else {
+        let Some(record) = store.identity_in_mut(&region, &input.email_identity) else {
             // The identity is this write's INPUT — the identity the configuration set
             // would apply to — and not a resource this call addresses, so a value that
             // names none of the account's identities is refused as invalid input

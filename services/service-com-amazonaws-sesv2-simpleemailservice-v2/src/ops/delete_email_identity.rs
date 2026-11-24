@@ -149,7 +149,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // identity back.
         store.settle(now);
         let key = crate::state::identity_key(&input.email_identity);
-        let Some(record) = store.identities.get(&key) else {
+        // An email identity belongs to the Region it was created in, so a delete
+        // reaches only the identities of the Region the caller signed for.
+        let region = crate::state::request_region(ctx.parts());
+        let Some(record) = store.identity_in(&region, &input.email_identity) else {
             return Err(DeleteEmailIdentityErrorModeled::NotFoundException(NotFoundException {
                 // The delete names the identity it does not hold UNQUOTED, which is
                 // the form this operation is recorded answering; the identity reads
@@ -171,10 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .values()
             .any(crate::state::IdentityCertificateRecord::signs)
         {
-            let arn = crate::state::identity_arn(
-                &crate::state::request_region(ctx.parts()),
-                &record.name,
-            );
+            let arn = crate::state::identity_arn(&region, &record.name);
             return Err(DeleteEmailIdentityErrorModeled::BadRequestException(BadRequestException {
                 message: Some(format!(
                     "Cannot delete <{arn}> because it has certificates associated with it. \
@@ -189,8 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // was, in the one sentence every delete of an associable resource words that
         // condition with ([`crate::state::tenant_associations_blocking_delete`]). The
         // refusal names the identity by its ARN, like the certificate gate above.
-        let arn =
-            crate::state::identity_arn(&crate::state::request_region(ctx.parts()), &record.name);
+        let arn = crate::state::identity_arn(&region, &record.name);
         if let Some(refusal) = crate::state::tenant_associations_blocking_delete(&store, &arn) {
             return Err(DeleteEmailIdentityErrorModeled::BadRequestException(
                 BadRequestException {

@@ -154,7 +154,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // Request metadata is not needed: the identity is keyed by name within the
         // one emulated account.
-        let _ = ctx;
+        // An email identity belongs to the Region it was created in, so the
+        // `EmailIdentity` this request names is resolved among the identities of the
+        // Region the caller signed for ([`crate::state::request_region`]).
+        let region = crate::state::request_region(ctx.parts());
 
         // What a policy name and a policy document have to be is the POLICY's rule
         // rather than this operation's, so it is read from `crate::state` — the same
@@ -187,10 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // than a new record — worded the way the identity WRITES word it. Holding the
         // identity is what the rule turns on, not the status of the verification it
         // started, which is the reading `CreateEmailIdentityPolicy` takes too.
-        let Some(record) = store
-            .identities
-            .get_mut(&crate::state::identity_key(&input.email_identity))
-        else {
+        let Some(record) = store.identity_in_mut(&region, &input.email_identity) else {
             return Err(UpdateEmailIdentityPolicyErrorModeled::NotFoundException(
                 NotFoundException {
                     message: Some(crate::state::email_identity_not_found_unquoted(

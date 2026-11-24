@@ -568,7 +568,7 @@ async fn read_account(router: &MultiServiceRouter, what: &str) -> Value {
 #[tokio::test]
 async fn a_handlers_email_service_calls_are_decided_by_its_execution_roles_documents() {
     let _stream = one_invocation_stream_at_a_time().await;
-    let router = emulator();
+    let (router, _engine) = emulator();
 
     // Every action the calls below perform, which is exactly what the allowing role grants.
     let mut actions: Vec<&str> = calls().iter().map(|call| call.operation).collect();

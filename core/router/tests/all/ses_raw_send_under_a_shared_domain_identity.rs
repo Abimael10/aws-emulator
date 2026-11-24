@@ -42,6 +42,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::query_wire::{elements, form_encode, opt_element};
+use crate::sesv2_domain_identity_dkim_publication::given_dkim_publication_stood_in_for;
 
 /// The Region every row signs for, which is the Region a refusal names.
 const REGION: &str = "us-east-1";
@@ -173,8 +174,10 @@ fn rows() -> Vec<Row> {
 }
 
 /// The four services sharing the SigV4 signing name `ses`, over ONE shared engine, as
-/// `core/router/src/lib.rs` mounts them.
-fn router() -> MultiServiceRouter {
+/// `core/router/src/lib.rs` mounts them — handed back beside the router, because the DNS
+/// publication a domain identity's verification waits on is stood in for through it
+/// ([`record_and_await_verification`]).
+fn router() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // These rows exercise routing and handler behaviour, not SigV4.
@@ -193,9 +196,9 @@ fn router() -> MultiServiceRouter {
         ),
     );
     router.register_service(
-        service_com_amazonaws_mailmanager_mailmanagersvc::EmulatedService::new(engine),
+        service_com_amazonaws_mailmanager_mailmanagersvc::EmulatedService::new(Arc::clone(&engine)),
     );
-    router
+    (router, engine)
 }
 
 /// A SigV4 `Authorization` header whose credential scope names `signing_name` and
@@ -341,12 +344,17 @@ fn text_of(value: &Value, member: &str) -> String {
 /// verification as having come through.
 ///
 /// Recording an identity only STARTS its verification, so the row waits for the move the
-/// clock owes the record the way a client does — polling the v2 read — instead of
+/// record is owed the way a client does — polling the v2 read — instead of
 /// reaching into the store. The v2 read is used for every surface because it reports both
 /// halves of the state a send is gated on: whether the identity is verified for sending,
 /// and where the search for its Easy DKIM records stands.
+///
+/// A DOMAIN identity recorded through the v2 surface is verified by the Easy DKIM records
+/// its owner publishes in that domain's own DNS, which this suite serves none of, so it
+/// stands in for that publication ([`given_dkim_publication_stood_in_for`]) before it waits.
 async fn record_and_await_verification(
     router: &MultiServiceRouter,
+    engine: &engine::InMemoryEngine,
     case: &str,
     surface: Surface,
     identity: &str,
@@ -388,6 +396,7 @@ async fn record_and_await_verification(
         }
     }
 
+    given_dkim_publication_stood_in_for(engine);
     let deadline = std::time::Instant::now() + VERIFICATION_WAIT;
     let mut last = Value::Null;
     while std::time::Instant::now() < deadline {
@@ -509,9 +518,9 @@ async fn sent_last_24_hours(router: &MultiServiceRouter, case: &str) -> f64 {
 async fn a_raw_send_is_authorised_by_the_account_s_identity_whichever_api_recorded_it() {
     for row in rows() {
         let case = row.case;
-        let router = router();
+        let (router, engine) = router();
         if let Some((surface, identity)) = row.recorded {
-            record_and_await_verification(&router, case, surface, identity).await;
+            record_and_await_verification(&router, &engine, case, surface, identity).await;
         }
 
         let mut accepted = 0usize;

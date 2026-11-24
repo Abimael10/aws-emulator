@@ -167,7 +167,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // An email identity belongs to the Region it was created in, so the
+        // `EmailIdentity` this request names is resolved among the identities of the
+        // Region the caller signed for ([`crate::state::request_region`]).
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // No store at all, which is not a modelled SES state: answer the
             // scaffold's 501 rather than a throttle an SDK would retry forever.
@@ -182,10 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // what every later caller sees too.
         store.settle(::std::time::SystemTime::now());
 
-        let Some(record) = store
-            .identities
-            .get(&crate::state::identity_key(&input.email_identity))
-        else {
+        let Some(record) = store.identity_in(&region, &input.email_identity) else {
             return Err(GetEmailIdentityErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::email_identity_not_found(&input.email_identity)),
             })

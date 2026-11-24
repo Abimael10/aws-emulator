@@ -154,7 +154,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // An email identity belongs to the Region it was created in, so this listing
+        // reports the identities of the Region the caller signed for and no other's.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // No store at all, which is not a modelled SES state: answer the
             // scaffold's 501 rather than a throttle an SDK would retry forever.
@@ -211,8 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // records and the resume point is a position in that order, which keeps the
         // token valid even if the identity it names has since been deleted.
         let matching: Vec<(&String, &EmailIdentityRecord)> = store
-            .identities
-            .iter()
+            .identities_in(&region)
             .filter(|(_, record)| matches_filters(record, &filters))
             .collect();
         let start = match resume_from.as_deref() {

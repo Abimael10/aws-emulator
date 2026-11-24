@@ -151,9 +151,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Request metadata is not needed: the report is about the address in the
-        // request, read against the one emulated account's records.
-        let _ = ctx;
+        // The mailbox evidence this report reads includes the account's email
+        // identities, which belong to the Region they were created in, so the report is
+        // computed against the identities of the Region the caller signed for.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // No store at all, which is not a modelled SES state: answer the
             // scaffold's 501 rather than a modelled error that reads as one.
@@ -169,7 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle(::std::time::SystemTime::now());
 
         Ok(GetEmailAddressInsightsOutput {
-            mailbox_validation: Some(mailbox_validation(&store, &input.email_address)),
+            mailbox_validation: Some(mailbox_validation(&store, &region, &input.email_address)),
         })
     }
 }
@@ -315,6 +316,7 @@ const RANDOM_INPUT_SIGNALS_FOR_HIGH: usize = 2;
 /// and a domain no DNS zone can cover holds no mailbox.
 fn mailbox_validation(
     store: &crate::state::ComAmazonawsSesv2SimpleemailserviceV2State,
+    region: &str,
     value: &str,
 ) -> MailboxValidation {
     // The local part and the domain of the mailbox the value names, when it names one
@@ -329,7 +331,7 @@ fn mailbox_validation(
 
     let has_valid_syntax = syntax_confidence(value, mailbox);
     let has_valid_dns_records = dns_records_confidence(mailbox);
-    let mailbox_exists = mailbox_confidence(store, value, has_valid_dns_records);
+    let mailbox_exists = mailbox_confidence(store, region, value, has_valid_dns_records);
     let is_role_address = match mailbox {
         Some((local, _)) => role_address_confidence(local),
         // A value that names no mailbox names no role mailbox at a domain either.
@@ -438,6 +440,7 @@ fn dns_records_confidence(mailbox: Option<(&str, &str)>) -> Confidence {
 /// mailbox.
 fn mailbox_confidence(
     store: &crate::state::ComAmazonawsSesv2SimpleemailserviceV2State,
+    region: &str,
     value: &str,
     has_valid_dns_records: Confidence,
 ) -> Confidence {
@@ -453,8 +456,7 @@ fn mailbox_confidence(
         return Confidence::Low;
     }
     let verified_mailbox = store
-        .identities
-        .get(&crate::state::identity_key(value))
+        .identity_in(region, value)
         .is_some_and(|record| {
             record.identity_kind == crate::state::IdentityKind::EmailAddress
                 && record.verification_status == crate::state::SesStatus::Success

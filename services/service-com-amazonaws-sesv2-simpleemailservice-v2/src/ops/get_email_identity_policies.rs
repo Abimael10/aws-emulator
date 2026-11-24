@@ -140,9 +140,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Request metadata is not needed: the identity is keyed by name within the one
-        // emulated account, and nothing in the response is Region- or caller-derived.
-        let _ = ctx;
+        // An email identity belongs to the Region it was created in, so the
+        // `EmailIdentity` this request names is resolved among the identities of the
+        // Region the caller signed for ([`crate::state::request_region`]).
+        let region = crate::state::request_region(ctx.parts());
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // The engine is not the shared in-memory engine, so this service has no
@@ -162,10 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "This API is for the identity owner only": the policies hang off an identity
         // this account holds, so a name it holds none for is the modelled 404, worded
         // the way every identity reader words it.
-        let Some(record) = store
-            .identities
-            .get(&crate::state::identity_key(&input.email_identity))
-        else {
+        let Some(record) = store.identity_in(&region, &input.email_identity) else {
             return Err(GetEmailIdentityPoliciesErrorModeled::NotFoundException(
                 NotFoundException {
                     message: Some(crate::state::email_identity_not_found(&input.email_identity)),

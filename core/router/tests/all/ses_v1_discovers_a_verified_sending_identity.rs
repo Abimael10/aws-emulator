@@ -35,6 +35,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::query_wire::{block_of, entries_of, form_encode, members_of, opt_element};
+use crate::sesv2_domain_identity_dkim_publication::given_dkim_publication_stood_in_for;
 
 /// The Region every row signs for and addresses.
 const REGION: &str = "us-east-1";
@@ -151,7 +152,7 @@ fn rows() -> Vec<Row> {
 /// `core/router/src/lib.rs` mounts them: the hand-off being asserted exists only when the
 /// engine is shared, and the claim that resolves each request to one service exists only
 /// when the peers are there to compete for it.
-fn router() -> MultiServiceRouter {
+fn router() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // These rows exercise routing and handler behaviour, not SigV4.
@@ -171,9 +172,9 @@ fn router() -> MultiServiceRouter {
     );
     router
         .register_service(service_com_amazonaws_mailmanager_mailmanagersvc::EmulatedService::new(
-            engine,
+            Arc::clone(&engine),
         ));
-    router
+    (router, engine)
 }
 
 /// A SigV4 `Authorization` header whose credential scope names the `ses` signing name —
@@ -409,7 +410,7 @@ fn create_fields(name: &str, sender: &str) -> Vec<(&'static str, String)> {
 
 #[tokio::test]
 async fn an_identity_the_account_verified_is_discovered_as_a_sender_through_the_classic_plane() {
-    let router = router();
+    let (router, engine) = router();
 
     // Record every row, each through its own surface.
     for row in rows() {
@@ -446,9 +447,13 @@ async fn an_identity_the_account_verified_is_discovered_as_a_sender_through_the_
         }
     }
 
-    // Recording an identity only STARTS its verification, so the walk is repeated until
-    // the move the clock owes every one of them has fallen due. The deadline is what
+    // Recording an identity only STARTS its verification, and a DOMAIN identity recorded on
+    // the v2 surface is verified by the Easy DKIM records its owner publishes in that
+    // domain's own DNS, which this suite serves none of — so it stands in for that
+    // publication ([`given_dkim_publication_stood_in_for`]) and then repeats the walk until
+    // the move every record is owed has fallen due. The deadline is what
     // turns "no identity ever reads verified" into a failure rather than a hang.
+    given_dkim_publication_stood_in_for(&engine);
     let deadline = Instant::now() + DEADLINE;
     let discovered = loop {
         let discovered = discover(&router, "the whole account").await;

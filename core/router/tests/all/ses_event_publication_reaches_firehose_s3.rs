@@ -36,6 +36,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::query_wire::{element, elements, form_encode};
+use super::sesv2_domain_identity_dkim_publication::given_dkim_publication_stood_in_for;
 
 /// The Region every call below is signed for, and the one every ARN here names.
 const REGION: &str = "us-east-1";
@@ -152,8 +153,11 @@ fn subject(slug: &str, index: usize) -> String {
     format!("{slug} message {index}")
 }
 
-/// The emulator the suite drives: the four services the flow spans, on ONE engine.
-fn emulator() -> MultiServiceRouter {
+/// The emulator the suite drives: the four services the flow spans, on ONE engine, which is
+/// handed back beside the router — the account's own DNS publication a sending domain's
+/// verification waits on is stood in for through that engine
+/// ([`given_verified_identity`]).
+fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signature verification is the emulator's concern, not any of these services'.
@@ -170,9 +174,11 @@ fn emulator() -> MultiServiceRouter {
         Arc::clone(&engine),
     ));
     router.register_service(
-        service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(engine),
+        service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(Arc::clone(
+            &engine,
+        )),
     );
-    router
+    (router, engine)
 }
 
 /// A SigV4 `Authorization` header whose credential scope names `signing_name`. The signature
@@ -451,7 +457,13 @@ async fn given_active_stream(router: &MultiServiceRouter, case: &str, name: &str
 
 /// Wait until the sending identity reports that it is verified for sending, which is what a
 /// send from an address inside it needs.
-async fn given_verified_identity(router: &MultiServiceRouter) {
+///
+/// A DOMAIN identity is verified by the Easy DKIM records its owner publishes in that
+/// domain's own DNS, which this suite serves none of — so it stands in for that publication
+/// the way every other suite over a sending domain does: the verification instant the
+/// identity's record carries is moved into the past, on the record every operation reads.
+/// The wait is then for the CONDITION, never for a span of time.
+async fn given_verified_identity(router: &MultiServiceRouter, engine: &engine::InMemoryEngine) {
     sesv2_ok(
         router,
         "setup",
@@ -460,6 +472,7 @@ async fn given_verified_identity(router: &MultiServiceRouter) {
         Some(json!({"EmailIdentity": IDENTITY})),
     )
     .await;
+    given_dkim_publication_stood_in_for(engine);
     let deadline = Instant::now() + SETTLE_DEADLINE;
     loop {
         let read = sesv2_ok(
@@ -498,7 +511,7 @@ fn event_types(records: &[Value]) -> Vec<String> {
 
 #[tokio::test]
 async fn a_firehose_event_destination_publishes_a_sets_events_into_its_stream() {
-    let router = emulator();
+    let (router, engine) = emulator();
     let delivery_role = given_role(&router, DELIVERY_ROLE, DELIVERY_TRUST).await;
     let publishing_role = given_role(&router, PUBLISHING_ROLE, PUBLISHING_TRUST).await;
     let (status, created_bucket) = send(
@@ -517,7 +530,7 @@ async fn a_firehose_event_destination_publishes_a_sets_events_into_its_stream() 
         "setup: the destination bucket must be created, got {status} {}",
         String::from_utf8_lossy(&created_bucket)
     );
-    given_verified_identity(&router).await;
+    given_verified_identity(&router, &engine).await;
 
     // Every row's stream, set and destination, created together so one wait covers the span
     // the creates armed.

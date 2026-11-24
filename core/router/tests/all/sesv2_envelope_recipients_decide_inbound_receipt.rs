@@ -47,6 +47,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::query_wire::{elements, form_encode};
+use crate::sesv2_domain_identity_dkim_publication::given_dkim_publication_stood_in_for;
 
 /// The Region every call here is signed for.
 const REGION: &str = "us-east-1";
@@ -138,6 +139,9 @@ impl Answer {
 /// is what names the Region and the service) without a signature.
 struct Emulator {
     router: MultiServiceRouter,
+    /// The engine those services share: the DNS publication a domain identity's verification
+    /// waits on is stood in for through it ([`given_verified_identity`]).
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -156,9 +160,9 @@ impl Emulator {
             )),
         );
         router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
-            engine,
+            Arc::clone(&engine),
         ));
-        Self { router }
+        Self { router, engine }
     }
 
     /// One call to `path` on `signing_name`'s endpoint, refusing at the door the two answers the
@@ -276,7 +280,11 @@ fn field(name: impl Into<String>, value: impl Into<String>) -> (String, String) 
 }
 
 /// The account's domain identity, verified for sending: created through SESv2's own
-/// `CreateEmailIdentity`, and waited for until the verification the clock owes it is due.
+/// `CreateEmailIdentity`, and waited for until the verification it is owed is due.
+///
+/// A DOMAIN identity is verified by the Easy DKIM records its owner publishes in that
+/// domain's own DNS, which this suite serves none of, so it stands in for that publication
+/// ([`given_dkim_publication_stood_in_for`]).
 async fn given_verified_identity(emulator: &Emulator, case: &str) {
     let created = emulator
         .sesv2(
@@ -292,6 +300,7 @@ async fn given_verified_identity(emulator: &Emulator, case: &str) {
         json!("DOMAIN"),
         "case {case:?}: {DOMAIN} is a DOMAIN identity, got {created}"
     );
+    given_dkim_publication_stood_in_for(&emulator.engine);
     let deadline = Instant::now() + DEADLINE;
     loop {
         let read = emulator

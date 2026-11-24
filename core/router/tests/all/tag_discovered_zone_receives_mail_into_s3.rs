@@ -612,7 +612,14 @@ async fn discovered_receiving_domain(emulator: &Emulator, case: &str, page_size:
 }
 
 /// The apex of the discovered zone as an SESv2 email identity verified for sending: the
-/// identity is created for it, and the verification the clock owes it is waited for.
+/// identity is created for it, the Easy DKIM records it answers are published in that zone,
+/// and the verification they are the evidence of is waited for.
+///
+/// A domain identity is verified by exactly those records appearing in the domain's own DNS,
+/// so they go in the way a client publishes them — `ChangeResourceRecordSets` into the
+/// account's own zone for the apex, one CNAME per token at `<token>._domainkey.<apex>`
+/// carrying `<token>.dkim.amazonses.com` (the Easy DKIM setup instructions' own form). The
+/// wait is then for the CONDITION, never for a span of time.
 async fn given_verified_identity(emulator: &Emulator, case: &str, apex: &str) -> Value {
     let created = emulator
         .sesv2(
@@ -628,6 +635,34 @@ async fn given_verified_identity(emulator: &Emulator, case: &str, apex: &str) ->
         json!("DOMAIN"),
         "case {case:?}: the apex of a hosted zone is a DOMAIN identity, got {created}"
     );
+    let tokens: Vec<String> = created["DkimAttributes"]["Tokens"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case:?}: Easy DKIM must answer its tokens: {created}"))
+        .iter()
+        .map(|token| token.as_str().unwrap_or_default().to_string())
+        .collect();
+    let zone_id = zone_id_of(emulator, case, apex).await;
+    for token in &tokens {
+        emulator
+            .route53(
+                case,
+                "POST",
+                &format!("/2013-04-01/hostedzone/{zone_id}/rrset"),
+                &format!(
+                    "<ChangeResourceRecordSetsRequest \
+                     xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch>\
+                     <Comment>the identity's Easy DKIM records</Comment><Changes><Change>\
+                     <Action>UPSERT</Action><ResourceRecordSet>\
+                     <Name>{token}._domainkey.{apex}</Name><Type>CNAME</Type><TTL>1800</TTL>\
+                     <ResourceRecords><ResourceRecord>\
+                     <Value>{token}.dkim.amazonses.com</Value></ResourceRecord>\
+                     </ResourceRecords></ResourceRecordSet></Change></Changes></ChangeBatch>\
+                     </ChangeResourceRecordSetsRequest>"
+                ),
+                200,
+            )
+            .await;
+    }
     let deadline = Instant::now() + DEADLINE;
     loop {
         let read = emulator
@@ -649,6 +684,18 @@ async fn given_verified_identity(emulator: &Emulator, case: &str, apex: &str) ->
         );
         tokio::time::sleep(POLL).await;
     }
+}
+
+/// The id of the account's own hosted zone for `apex`, read off the enumeration a client
+/// pages — which is where the records above are published.
+async fn zone_id_of(emulator: &Emulator, case: &str, apex: &str) -> String {
+    let wanted = apex.trim_end_matches('.').to_ascii_lowercase();
+    all_zones(emulator, case, 100)
+        .await
+        .into_iter()
+        .find(|zone| zone.name.trim_end_matches('.').to_ascii_lowercase() == wanted)
+        .map(|zone| zone.id)
+        .unwrap_or_else(|| panic!("case {case:?}: the account must hold a zone for {apex}"))
 }
 
 /// A bucket Amazon SES may write a received message into: created through Amazon S3's own

@@ -153,7 +153,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // Request metadata is not needed: the listing covers one identity of the one
         // emulated account.
-        let _ = ctx;
+        // An email identity belongs to the Region it was created in, so the
+        // `EmailIdentity` this request names is resolved among the identities of the
+        // Region the caller signed for ([`crate::state::request_region`]).
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // No store at all, which is not a modelled SES state: answer the
             // scaffold's 501 rather than a throttle an SDK would retry forever.
@@ -194,7 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // called, so materialising them here changes nothing a later caller would
         // otherwise have seen.
         store.settle(now);
-        let Some(record) = store.identities.get(&crate::state::identity_key(&identity)) else {
+        let Some(record) = store.identity_in(&region, &identity) else {
             return Err(ListEmailIdentityCertificatesErrorModeled::NotFoundException(
                 NotFoundException {
                     message: Some(crate::state::email_identity_not_found(&identity)),

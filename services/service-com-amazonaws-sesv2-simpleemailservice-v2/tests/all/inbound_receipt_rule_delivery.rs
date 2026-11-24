@@ -27,7 +27,7 @@
 //! time.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -61,6 +61,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// account's receipt rule sets, and the object store a rule writes into.
 struct Emulator {
     router: MultiServiceRouter,
+    /// The engine those services share, which is also where the identity whose verification
+    /// this suite stands in for the DNS publication of lives
+    /// ([`Emulator::given_verified_domain`]).
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -80,7 +84,7 @@ impl Emulator {
         router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
             Arc::clone(&engine),
         ));
-        Self { router }
+        Self { router, engine }
     }
 
     /// One call of this surface's own REST API: `(status, body)`.
@@ -155,8 +159,14 @@ impl Emulator {
     /// published, read back through this surface's own `GetEmailIdentity`: the selectors a
     /// signature for the domain may name.
     ///
-    /// The wait is for the CONDITION — the identity reporting itself verified — looked for again
-    /// every [`POLL_INTERVAL`] until [`DELIVERY_DEADLINE`] passes, never for a span of time.
+    /// A domain identity is verified by the Easy DKIM records its owner publishes in that
+    /// domain's DNS, and this suite serves no DNS of its own, so it stands in for that
+    /// publication the way every other suite of this crate does: the verification instant the
+    /// record carries is moved into the past, on the record every operation reads.
+    ///
+    /// The wait is then for the CONDITION — the identity reporting itself verified — looked for
+    /// again every [`POLL_INTERVAL`] until [`DELIVERY_DEADLINE`] passes, never for a span of
+    /// time.
     async fn given_verified_domain(&self, case: &str) -> Vec<String> {
         self.call(
             case,
@@ -165,6 +175,15 @@ impl Emulator {
             Some(json!({"EmailIdentity": DOMAIN})),
         )
         .await;
+        let state = self
+            .engine
+            .state::<service_com_amazonaws_sesv2_simpleemailservice_v2::state::ComAmazonawsSesv2SimpleemailserviceV2State>();
+        let past = SystemTime::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("an instant before now");
+        for record in state.lock().identities.values_mut() {
+            record.verification_due_at = past;
+        }
         let deadline = Instant::now() + DELIVERY_DEADLINE;
         loop {
             let identity = self

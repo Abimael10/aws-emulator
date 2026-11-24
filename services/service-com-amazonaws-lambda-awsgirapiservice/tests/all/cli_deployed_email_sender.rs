@@ -151,7 +151,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// `core/router/src/lib.rs` mounts them: the handler's SDK call is dispatched back into this
 /// same router as the session of its own execution role, and the identities this suite
 /// verifies are the identities that session's send is checked against.
-pub(crate) fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The suite signs nothing: the `Authorization` header carries only the credential scope,
@@ -172,9 +172,11 @@ pub(crate) fn emulator() -> MultiServiceRouter {
         )),
     );
     router.register_service(
-        service_com_amazonaws_sts_awssecuritytokenservicev20110615::EmulatedService::new(engine),
+        service_com_amazonaws_sts_awssecuritytokenservicev20110615::EmulatedService::new(Arc::clone(
+            &engine,
+        )),
     );
-    router
+    (router, engine)
 }
 
 /// A SigV4 `Authorization` whose credential scope names `service`, which is what routes the
@@ -341,9 +343,16 @@ pub(crate) async fn given_message_insights_enabled(router: &MultiServiceRouter) 
 
 /// Create `identity` and read it back until the verification SES owes it is due.
 ///
-/// The transition is owed by the CLOCK, so this looks again until the condition holds instead
-/// of sleeping for a fixed span.
-pub(crate) async fn given_verified_identity(router: &MultiServiceRouter, identity: &str) {
+/// A DOMAIN identity is verified by the Easy DKIM records its owner publishes in that
+/// domain's own DNS, which this suite serves none of, so it stands in for that publication:
+/// the verification instant the identity's record carries is moved into the past, on the
+/// record every operation reads. The wait is then for the CONDITION, so it looks again until
+/// it holds instead of sleeping for a fixed span.
+pub(crate) async fn given_verified_identity(
+    router: &MultiServiceRouter,
+    engine: &engine::InMemoryEngine,
+    identity: &str,
+) {
     let what = format!("the identity {identity}");
     email(
         router,
@@ -355,6 +364,14 @@ pub(crate) async fn given_verified_identity(router: &MultiServiceRouter, identit
         200,
     )
     .await;
+    let state = engine
+        .state::<service_com_amazonaws_sesv2_simpleemailservice_v2::state::ComAmazonawsSesv2SimpleemailserviceV2State>();
+    let past = std::time::SystemTime::now()
+        .checked_sub(Duration::from_secs(1))
+        .expect("an instant before now");
+    for record in state.lock().identities.values_mut() {
+        record.verification_due_at = past;
+    }
     let deadline = std::time::Instant::now() + SETTLE_DEADLINE;
     loop {
         let read = email(
@@ -543,7 +560,7 @@ pub(crate) async fn invoke(
 #[tokio::test]
 async fn a_cli_deployed_function_sends_through_its_own_sdk_and_every_invocation_settles() {
     let _stream = one_invocation_stream_at_a_time().await;
-    let router = emulator();
+    let (router, engine) = emulator();
 
     let role_arn = given_execution_role(
         &router,
@@ -560,8 +577,8 @@ async fn a_cli_deployed_function_sends_through_its_own_sdk_and_every_invocation_
         "setup the execution role: expected the ARN IAM mints for a role of this account, got \
          {role_arn:?}"
     );
-    given_verified_identity(&router, ADDRESS_IDENTITY).await;
-    given_verified_identity(&router, SENDING_DOMAIN).await;
+    given_verified_identity(&router, &engine, ADDRESS_IDENTITY).await;
+    given_verified_identity(&router, &engine, SENDING_DOMAIN).await;
     given_message_insights_enabled(&router).await;
     given_active_function(&router, FUNCTION, HANDLER_SOURCE, &role_arn).await;
 

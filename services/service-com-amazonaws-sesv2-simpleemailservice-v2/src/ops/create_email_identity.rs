@@ -182,9 +182,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Request metadata is not needed: the identity is keyed by name within the
-        // one emulated account.
-        let _ = ctx;
+        // The Region this identity will belong to: an email identity is a REGIONAL
+        // resource, so the account holds the one this call records in the Region the
+        // caller signed for and in no other
+        // ([`crate::state::EmailIdentityRecord::region`]).
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // The engine is not the shared in-memory engine, so this service has no
             // store to write to. That is not a modelled SES state: answer the
@@ -233,6 +235,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut record = EmailIdentityRecord::new(&identity, kind, dkim, now);
+        // The Region the account holds this identity in, which every later read, write
+        // and send of this surface resolves it under.
+        record.region = Some(region);
         // "The configuration set to use by default when sending from this
         // identity" — stored as given; which configuration sets exist is
         // `CreateConfigurationSet`'s half of the service, not this one's.

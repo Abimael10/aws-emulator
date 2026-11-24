@@ -118,6 +118,12 @@ service-com-amazonaws-ses-simpleemailservice = { workspace = true }
 # certificate rather than about the association, so it is read from that service's own
 # store in the one shared engine (`state::identity_certificates`) instead of being assumed.
 service-com-amazonaws-acm-certificatemanager = { workspace = true }
+# Amazon Route 53, which holds the account's own DNS: whether the Easy DKIM CNAME records
+# SES told a domain identity's owner to publish are actually published is a fact of that
+# DNS rather than of this service, so a domain identity's verification is resolved against
+# that store in the one shared engine (`state::dkim_publication`) instead of being assumed
+# — the same way Certificate Manager resolves a certificate's DNS validation.
+service-com-amazonaws-route53-awsdnsv20130401 = { workspace = true }
 # The AWS SDK for Amazon S3, driven over the same in-process callback: an import job's run
 # reads the object its `ImportDataSource$S3Url` names from the account's own object storage,
 # so which terminal status the run reaches is decided by what that store answered

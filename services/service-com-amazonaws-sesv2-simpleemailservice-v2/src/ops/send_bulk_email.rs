@@ -362,7 +362,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // authorises itself; a domain identity authorises every address in that domain
             // and its subdomains.
             let authorised = store
-                .sending_identity(&from)
+                .sending_identity_in(&region, &from)
                 .is_some_and(|identity| identity.verified_for_sending);
             if !authorised {
                 return Err(SendBulkEmailErrorModeled::MessageRejected(MessageRejected {

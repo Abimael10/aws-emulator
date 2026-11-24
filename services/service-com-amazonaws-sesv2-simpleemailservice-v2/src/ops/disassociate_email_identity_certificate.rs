@@ -140,9 +140,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Request metadata is not needed: the association is keyed by the identity and
-        // the address within the one emulated account.
-        let _ = ctx;
+        // An email identity belongs to the Region it was created in, so the
+        // `EmailIdentity` this request names is resolved among the identities of the
+        // Region the caller signed for ([`crate::state::request_region`]).
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // No store at all, which is not a modelled SES state: answer the
             // scaffold's 501 rather than a modelled error that reads as one.
@@ -152,7 +153,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let identity = input.email_identity;
-        let key = crate::state::identity_key(&identity);
         let kind = IdentityKind::of(crate::state::addr_spec(&identity));
 
         // "If the email identity is a domain, specify the FromAddress whose certificate
@@ -185,7 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that follows one whose clean-up has already fallen due sees what a listing
         // would report.
         store.settle(now);
-        let Some(record) = store.identities.get_mut(&key) else {
+        let Some(record) = store.identity_in_mut(&region, &identity) else {
             // "Amazon SES API v2 returns a NotFoundException only when the specified
             // email identity doesn't exist."
             return Err(DisassociateEmailIdentityCertificateErrorModeled::NotFoundException(

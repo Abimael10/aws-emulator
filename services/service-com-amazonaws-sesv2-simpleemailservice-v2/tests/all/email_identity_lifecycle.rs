@@ -13,8 +13,9 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 use service_com_amazonaws_sesv2_simpleemailservice_v2::ops::types::DKIM_SIGNING_KEY_LENGTH_VALUES;
 use service_com_amazonaws_sesv2_simpleemailservice_v2::state::{
-    identity_key, ComAmazonawsSesv2SimpleemailserviceV2State, SentMessage, MAX_IDENTITIES,
-    MAX_SENT_MESSAGES, MAX_STORED_BODY_CHARS, SEND_QUOTA_WINDOW, VERIFICATION_SETTLE,
+    identity_key, ComAmazonawsSesv2SimpleemailserviceV2State, SentMessage,
+    DKIM_RECORD_SEARCH_WINDOW, MAX_IDENTITIES, MAX_SENT_MESSAGES, MAX_STORED_BODY_CHARS,
+    SEND_QUOTA_WINDOW, VERIFICATION_SETTLE,
 };
 use service_com_amazonaws_sesv2_simpleemailservice_v2::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -1131,20 +1132,26 @@ async fn an_identity_becomes_verified_once_the_transition_falls_due() {
     );
 }
 
-/// RULE: the verification transition is OWED by the clock a whole settle span after the
-/// create, so a caller that creates an identity and reads it back in the same breath — with
-/// nothing holding the transition off — still sees the state the create left it in: the
-/// verification `PENDING` and `VerifiedForSendingStatus` false. Nothing in this service
-/// completes a verification the instant it was asked for.
+/// RULE: the verification transition is OWED by the clock rather than made by the create, so
+/// a caller that creates an identity and reads it back in the same breath — with nothing
+/// holding the transition off — still sees the state the create left it in: the verification
+/// `PENDING` and `VerifiedForSendingStatus` false. Nothing in this service completes a
+/// verification the instant it was asked for.
+///
+/// WHEN it is owed depends on what the identity is waiting on: an email-address identity is
+/// verified by its own recipient, a span out; a DOMAIN identity is verified by the Easy DKIM
+/// records its owner publishes in that domain's DNS, so while nothing has published them the
+/// move stays owed at the far end of the window SES searches for them in.
 ///
 /// The rows span the identity kinds the state is reported for: a domain, an address under
 /// another domain, and a deeper subdomain.
 #[tokio::test]
 async fn an_identity_read_back_in_the_same_breath_is_not_verified_yet() {
-    for identity in [
-        "probe.example.com",
-        "sender@probe.example.net",
-        "deep.sub.probe.example.org",
+    // (the identity, the span the create leaves its verification move owed after)
+    for (identity, owed_after) in [
+        ("probe.example.com", DKIM_RECORD_SEARCH_WINDOW),
+        ("sender@probe.example.net", VERIFICATION_SETTLE),
+        ("deep.sub.probe.example.org", DKIM_RECORD_SEARCH_WINDOW),
     ] {
         let ses = Ses::new();
         let created = ses.create(json!({"EmailIdentity": identity})).await;
@@ -1178,9 +1185,9 @@ async fn an_identity_read_back_in_the_same_breath_is_not_verified_yet() {
         );
         let span = ses.verification_span(identity);
         assert_eq!(
-            span, VERIFICATION_SETTLE,
-            "case {identity:?}: expected the transition to be owed a whole settle span after \
-             the create, got {span:?}"
+            span, owed_after,
+            "case {identity:?}: expected the transition to be owed {owed_after:?} after the \
+             create, got {span:?}"
         );
     }
 }

@@ -41,6 +41,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cloudformation_firehose_stream_stabilisation::wait_for_stack_status;
 use crate::query_wire::outputs_of;
+use crate::sesv2_domain_identity_dkim_publication::given_dkim_publication_stood_in_for;
 use crate::sns_lambda_subscription_permission_boundary::{
     cloudformation, drain, iam, lambda, trust_policy, ACCOUNT, CREATE_COMPLETE, LOOK_INTERVAL,
 };
@@ -144,13 +145,15 @@ const ROWS: &[Row] = &[
     },
 ];
 
-/// The whole emulator over one engine, exactly as the binary assembles it.
-fn router() -> MultiServiceRouter {
+/// The whole emulator over one engine, exactly as the binary assembles it — the engine comes
+/// back beside the router, because the DNS publication a sending domain's verification waits
+/// on is stood in for through it ([`given_verified_sender`]).
+fn router() -> (MultiServiceRouter, std::sync::Arc<aws_emulator_router::InMemoryEngine>) {
     let engine = aws_emulator_router::new_engine();
-    let mut router = aws_emulator_router::build_router(engine);
+    let mut router = aws_emulator_router::build_router(std::sync::Arc::clone(&engine));
     // Signature verification is the front door's concern, not this suite's.
     router.set_request_authentication(false);
-    router
+    (router, engine)
 }
 
 /// One SESv2 call: `restJson1` in SESv2's own `/v2/email/…` path space, routed by a SigV4
@@ -206,10 +209,16 @@ async fn sesv2_ok(
     parsed
 }
 
-/// A verified sending domain, so the send below is authorised. The verification is a
-/// transition the CLOCK owes the identity, so this polls the identity's own read for it rather
-/// than waiting out a span.
-async fn given_verified_sender(router: &MultiServiceRouter, case: &str) {
+/// A verified sending domain, so the send below is authorised. A DOMAIN identity is verified
+/// by the Easy DKIM records its owner publishes in that domain's own DNS, which this suite
+/// publishes none of, so it stands in for that publication
+/// ([`given_dkim_publication_stood_in_for`]) and then polls the identity's own read for the
+/// CONDITION rather than waiting out a span.
+async fn given_verified_sender(
+    router: &MultiServiceRouter,
+    engine: &aws_emulator_router::InMemoryEngine,
+    case: &str,
+) {
     sesv2_ok(
         router,
         case,
@@ -218,6 +227,7 @@ async fn given_verified_sender(router: &MultiServiceRouter, case: &str) {
         Some(json!({"EmailIdentity": SENDER_DOMAIN})),
     )
     .await;
+    given_dkim_publication_stood_in_for(engine);
     let deadline = Instant::now() + BUDGET;
     loop {
         let reported = sesv2_ok(
@@ -438,7 +448,7 @@ async fn relayed(
 async fn a_sends_email_events_reach_the_lambda_target_of_a_rule_on_its_bus() {
     for row in ROWS {
         let case = row.case;
-        let router = router();
+        let (router, engine) = router();
         execution_role(&router).await;
         cloudformation(
             &router,
@@ -459,7 +469,7 @@ async fn a_sends_email_events_reach_the_lambda_target_of_a_rule_on_its_bus() {
             });
         wait_until_active(&router, case, &format!("{}-consumer", row.stack)).await;
 
-        given_verified_sender(&router, case).await;
+        given_verified_sender(&router, &engine, case).await;
         given_event_destination(&router, case, row.stack).await;
 
         let message_id = send(&router, case, row.stack, row.recipient).await;

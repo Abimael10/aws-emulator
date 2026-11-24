@@ -319,7 +319,7 @@ async fn sending_enabled(router: &MultiServiceRouter, what: &str, name: &str) ->
 #[tokio::test]
 async fn every_invocation_of_a_deployed_sender_settles_on_one_outcome_class() {
     let _stream = one_invocation_stream_at_a_time().await;
-    let router = emulator();
+    let (router, engine) = emulator();
 
     // The deploy path, twice over: a role that may send and a role that may only write logs,
     // each with its own function, so the refusal the IAM layer takes is taken on a function
@@ -331,7 +331,7 @@ async fn every_invocation_of_a_deployed_sender_settles_on_one_outcome_class() {
     )
     .await;
     let logs_only_role = given_execution_role(&router, LOGS_ONLY_ROLE, json!([logs_only()])).await;
-    given_verified_identity(&router, SENDER).await;
+    given_verified_identity(&router, &engine, SENDER).await;
     given_message_insights_enabled(&router).await;
     given_configuration_set(&router, HELD_SET, true).await;
     given_configuration_set(&router, PAUSED_SET, false).await;

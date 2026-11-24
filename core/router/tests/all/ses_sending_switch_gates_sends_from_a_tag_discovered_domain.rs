@@ -395,6 +395,44 @@ async fn v2_ok(
     answered.json
 }
 
+/// Publish the Easy DKIM records SES handed out for `apex` into the account's own hosted
+/// zone for it — the evidence a domain identity's verification waits on, put in the way a
+/// client puts it in.
+async fn given_published_dkim_records(
+    router: &MultiServiceRouter,
+    case: &str,
+    apex: &str,
+    tokens: &[String],
+) {
+    let wanted = apex.trim_end_matches('.').to_ascii_lowercase();
+    let zone_id = all_zones(router, case, 100)
+        .await
+        .into_iter()
+        .find(|zone| zone.name.trim_end_matches('.').to_ascii_lowercase() == wanted)
+        .map(|zone| zone.id)
+        .unwrap_or_else(|| panic!("case {case:?}: the account must hold a zone for {apex}"));
+    for token in tokens {
+        route53(
+            router,
+            case,
+            "POST",
+            &format!("/2013-04-01/hostedzone/{zone_id}/rrset"),
+            &format!(
+                "<ChangeResourceRecordSetsRequest \
+                 xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch>\
+                 <Comment>the identity's Easy DKIM records</Comment><Changes><Change>\
+                 <Action>UPSERT</Action><ResourceRecordSet>\
+                 <Name>{token}._domainkey.{apex}</Name><Type>CNAME</Type><TTL>1800</TTL>\
+                 <ResourceRecords><ResourceRecord><Value>{token}.dkim.amazonses.com</Value>\
+                 </ResourceRecord></ResourceRecords></ResourceRecordSet></Change></Changes>\
+                 </ChangeBatch></ChangeResourceRecordSetsRequest>"
+            ),
+            200,
+        )
+        .await;
+    }
+}
+
 /// One enumerated hosted zone, as a client reads it off `ListHostedZones`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ListedZone {
@@ -595,9 +633,15 @@ async fn discover(router: &MultiServiceRouter, case: &str) -> Vec<Discovered> {
     resolved.unwrap_or_default()
 }
 
-/// Record the identity for `apex` on `surface`, and wait for the verification the clock
-/// owes it: the v2 plane must then report it a DOMAIN identity, verified for sending, with
-/// its Easy DKIM set up — which is what makes the apex a sender.
+/// Record the identity for `apex` on `surface`, and wait for the verification it is owed:
+/// the v2 plane must then report it a DOMAIN identity, verified for sending, with its Easy
+/// DKIM set up — which is what makes the apex a sender.
+///
+/// A domain identity recorded on the v2 surface is verified by the Easy DKIM records its
+/// owner publishes in that domain's own DNS, so they are published here the way a client
+/// publishes them: one CNAME per token at `<token>._domainkey.<apex>` carrying
+/// `<token>.dkim.amazonses.com`, UPSERT into the account's own zone for the apex. The wait
+/// is then for the CONDITION, never for a span of time.
 async fn verified_sender(router: &MultiServiceRouter, apex: &str, surface: Surface) {
     let case = format!("the apex {apex} recorded on {surface:?}");
     match surface {
@@ -615,6 +659,15 @@ async fn verified_sender(router: &MultiServiceRouter, apex: &str, surface: Surfa
                 json!("DOMAIN"),
                 "case {case:?}: a zone apex is a DOMAIN identity, got {created}"
             );
+            let tokens: Vec<String> = created["DkimAttributes"]["Tokens"]
+                .as_array()
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: Easy DKIM must answer its tokens: {created}")
+                })
+                .iter()
+                .map(|token| token.as_str().unwrap_or_default().to_string())
+                .collect();
+            given_published_dkim_records(router, &case, apex, &tokens).await;
         }
         Surface::V1 => {
             let recorded = v1_ok(

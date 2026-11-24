@@ -720,16 +720,20 @@ pub fn checked_event_destination_definition(
 /// be configured with it — an unverified one would serve nothing. Ownership of a domain is
 /// proved by verifying a domain identity for it, and a verified domain identity speaks for
 /// that domain and every domain under it (the same reading of one that authorises a send,
-/// [`ComAmazonawsSesv2SimpleemailserviceV2State::sending_identity`]), so the most specific
+/// [`ComAmazonawsSesv2SimpleemailserviceV2State::sending_identity_in`]), so the most specific
 /// verified domain identity covering the tracking name is what admits it. Verification is
 /// a state the clock moves, so settle the store before reading this
 /// ([`ComAmazonawsSesv2SimpleemailserviceV2State::settle`]).
+///
+/// `region` is the Region the call executes in: an email identity belongs to one Region, so
+/// only the identities THAT Region holds prove ownership for a set created in it.
 pub fn tracking_domain_is_verified(
     store: &ComAmazonawsSesv2SimpleemailserviceV2State,
+    region: &str,
     domain: &str,
 ) -> bool {
     let tracked = domain_key(domain);
-    store.identities.values().any(|identity| {
+    store.identities_in(region).any(|(_, identity)| {
         identity.identity_kind == IdentityKind::Domain
             && identity.verification_status == SesStatus::Success
             && domain_covers(&domain_key(&identity.name), &tracked)

@@ -167,9 +167,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Request metadata is not needed: a configuration set is keyed by name within
-        // the one emulated account.
-        let _ = ctx;
+        // The Region the call executes in, which is the Region whose email identities
+        // prove ownership of a custom tracking domain this set may serve redirects from.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // The engine is not the shared in-memory engine, so this service has no
             // store to write to. That is not a modelled SES state: answer the
@@ -299,7 +299,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|options| options.custom_redirect_domain.clone())
         {
             store.settle(::std::time::SystemTime::now());
-            if !crate::state::tracking_domain_is_verified(&store, &domain) {
+            if !crate::state::tracking_domain_is_verified(&store, &region, &domain) {
                 return Err(bad_request(crate::state::tracking_domain_not_verified(
                     &domain,
                 )));

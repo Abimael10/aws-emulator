@@ -312,7 +312,7 @@ async fn identity_read(router: &MultiServiceRouter, case: &str, identity: &str) 
 #[tokio::test]
 async fn every_invocation_of_a_deployed_function_answers_what_its_handler_computed() {
     let _stream = one_invocation_stream_at_a_time().await;
-    let router = emulator();
+    let (router, engine) = emulator();
 
     let role_arn = given_execution_role(
         &router,
@@ -320,8 +320,8 @@ async fn every_invocation_of_a_deployed_function_answers_what_its_handler_comput
         json!([logs_only(), allow("ses", &["GetEmailIdentity"], "*")]),
     )
     .await;
-    given_verified_identity(&router, VERIFIED_DOMAIN).await;
-    given_verified_identity(&router, VERIFIED_ADDRESS).await;
+    given_verified_identity(&router, &engine, VERIFIED_DOMAIN).await;
+    given_verified_identity(&router, &engine, VERIFIED_ADDRESS).await;
     given_active_function(&router, FUNCTION, HANDLER_SOURCE, &role_arn).await;
 
     // What each identity row's handler reported about the identity it read, which the closing

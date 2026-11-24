@@ -156,9 +156,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Request metadata is not needed: the association is keyed by the identity and
-        // the address within the one emulated account.
-        let _ = ctx;
+        // An email identity belongs to the Region it was created in, so the
+        // `EmailIdentity` this request names is resolved among the identities of the
+        // Region the caller signed for ([`crate::state::request_region`]).
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // No store at all, which is not a modelled SES state: answer the
             // scaffold's 501 rather than a modelled error that reads as one.
@@ -177,7 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // duplicate check sees the same associations a listing would report — in
         // particular one whose clean-up has already fallen due.
         store.settle(now);
-        let Some(record) = store.identities.get_mut(&key) else {
+        let Some(record) = store.identity_in_mut(&region, &identity) else {
             return Err(AssociateEmailIdentityCertificateErrorModeled::NotFoundException(
                 NotFoundException {
                     message: Some(crate::state::email_identity_not_found(&identity)),
