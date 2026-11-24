@@ -81,6 +81,11 @@ yaml-rust2 = { version = "0.10", default-features = false }
 # are quoted back into the one command line that stands for that vector rather than joined by
 # hand; shell-words is the maintained POSIX word quoter.
 shell-words = "1.1"
+# The bytes a guest's own RANDOM DEVICE answers (`state::guest_disk_io`): a script that
+# generates a payload to write through a block device reads them from `/dev/urandom`, so they
+# come from the maintained generator every other service of this workspace draws random bytes
+# from rather than from a sequence written here.
+rand = "0.9"
 # The `application/x-www-form-urlencoded` parameter list an ec2Query request's body is,
 # read by the authorization gate to learn the resources the request addresses.
 form_urlencoded = "1"

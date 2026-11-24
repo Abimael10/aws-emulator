@@ -113,6 +113,17 @@ pub const MAX_GUEST_RUN_OUTPUT_LINES: usize = 256;
 /// See [`MAX_GUEST_RUN_OUTPUT_LINES`].
 pub const MAX_GUEST_RUN_OUTPUT_LINE_BYTES: usize = 2_048;
 
+/// How many bytes ONE stage of a pipeline in a delivered script may hand the stage after it, and
+/// how much of a redirected command's output is collected for the file it goes to.
+///
+/// Both are the EMULATOR's numbers, stated for a script that performs real BLOCK I/O: a guest reads
+/// a payload back off a device and digests it in one pipeline ([`super::guest_disk_io`]), so a
+/// stage carries one copy's worth ([`super::guest_disk_io::MAX_VOLUME_TRANSFER_BYTES`]) rather than
+/// the few kilobytes a line of text comes to. What the whole RUN may move through those copies is
+/// bounded beside it ([`super::guest_disk_io::MAX_GUEST_RUN_TRANSFER_BYTES`]), so the commands a
+/// script carries cannot multiply it.
+pub const MAX_GUEST_RUN_PIPE_BYTES: usize = super::guest_disk_io::MAX_VOLUME_TRANSFER_BYTES;
+
 /// What one program run in a guest answered: the lines it wrote, the lines it reported it
 /// could not do and the status it exited with.
 #[derive(Debug, Clone, Default)]
@@ -257,11 +268,25 @@ impl ComAmazonawsEc2Amazonec2State {
         // start or stop ([`super::guest_services`]).
         let services =
             super::guest_services::GuestServices::starting_from(&instance.guest_runtime);
-        let volume = guest_volume(&machine, &boot_id, booted_at, &files, &services.taken())
-            // Where a datagram this script SENDS goes: the machine's own network stack, which
-            // carries it to whatever of this guest is listening
-            // ([`super::guest_services::GuestServices::send_datagram`]).
-            .with_datagram_sink(::std::sync::Arc::new(services.clone()));
+        // The DEVICES this machine's guest can address, each holding the bytes its volume holds:
+        // what a command of this run reads and writes through a device goes onto the VOLUME behind
+        // it ([`super::guest_disk_io`]).
+        let disks = self.guest_disks(&machine.block_devices);
+        // How many bytes this machine's storage may hold, which is its own bound and never more
+        // than the store has room for ([`super::guest_disk_io::MAX_GUEST_DATA_BYTES`]).
+        let storage_bytes = self.guest_storage_allowance(instance_id);
+        let volume = guest_volume(
+            &machine,
+            &boot_id,
+            booted_at,
+            &files,
+            &services.taken(),
+            storage_bytes,
+        )
+        // Where a datagram this script SENDS goes: the machine's own network stack, which
+        // carries it to whatever of this guest is listening
+        // ([`super::guest_services::GuestServices::send_datagram`]).
+        .with_datagram_sink(::std::sync::Arc::new(services.clone()));
         let session = ShellSession::in_volume(
             guest_environment(&machine, number),
             SessionConfig {
@@ -269,6 +294,8 @@ impl ComAmazonawsEc2Amazonec2State {
                     commands: MAX_GUEST_RUN_COMMANDS,
                     command_bytes: MAX_GUEST_SCRIPT_BYTES,
                     nesting: MAX_GUEST_SCRIPT_NESTING,
+                    substitution_bytes: MAX_GUEST_RUN_PIPE_BYTES,
+                    file_bytes: MAX_GUEST_RUN_PIPE_BYTES,
                     ..Bounds::default()
                 },
                 output: Some(OutputLimits {
@@ -288,7 +315,7 @@ impl ComAmazonawsEc2Amazonec2State {
         // services with ([`super::guest_services`]) — the same programs the boot's own
         // program has — and, under them, the ones the caller installed.
         .with_environment_programs({
-            let own = super::guest_services::installed_programs(&machine, &services);
+            let own = super::guest_services::installed_programs(&machine, &services, &disks);
             match supplied {
                 Some(supplied) => layered(own, supplied),
                 None => own,
@@ -312,6 +339,10 @@ impl ComAmazonawsEc2Amazonec2State {
             instance.guest_files = written;
             instance.guest_runtime = services.taken();
         }
+        // ... and what it wrote THROUGH a device goes onto the volume behind that device, which is
+        // where the data of a volume lives and what makes it follow the volume across a move
+        // ([`super::guest_disk_io`]).
+        self.apply_guest_disk_writes(disks.taken(), ::std::time::SystemTime::now());
         Some(run)
     }
 
@@ -431,7 +462,15 @@ impl ComAmazonawsEc2Amazonec2State {
         let held = instance.guest_files.clone();
         let runtime = instance.guest_runtime.clone();
         let machine = self.guest_machine(instance);
-        let mut volume = guest_volume(&machine, &boot_id, booted_at, &held, &runtime);
+        let storage_bytes = self.guest_storage_allowance(instance_id);
+        let mut volume = guest_volume(
+            &machine,
+            &boot_id,
+            booted_at,
+            &held,
+            &runtime,
+            storage_bytes,
+        );
         let answered = change(&mut volume);
         let stored: ::std::collections::BTreeMap<String, String> = volume
             .stored_files()

@@ -403,8 +403,12 @@ pub fn publish_instance_metrics_at<Eng: Send + Sync + 'static>(
         store.materialize_due_transitions();
         let samples = due_samples(&mut store, now);
         // What the CloudWatch agent in each guest owes at this instant, which is due at its
-        // own interval rather than at the instance's cadence ([`due_agent_samples`]).
-        let agent_samples = due_agent_samples(&mut store, now);
+        // own interval rather than at the instance's cadence ([`due_agent_samples`]), and the
+        // datapoints the account's VOLUMES owe for the I/O their guests performed on them, which
+        // are measurements of operations that already happened
+        // ([`super::volume_telemetry::due_volume_samples`]).
+        let mut agent_samples = due_agent_samples(&mut store, now);
+        agent_samples.extend(super::volume_telemetry::due_volume_samples(&mut store));
         let publishing = store.instances.values().any(publishes_metrics);
         (samples, agent_samples, publishing)
     };
@@ -479,14 +483,20 @@ fn guest_measurements(
     }
 }
 
-/// Append the agent's datapoints to the CloudWatch metric store, and make the alarms watching
-/// those series due for evaluation.
+/// Append the datapoints a guest's own activity owes to the CloudWatch metric store, and make the
+/// alarms watching those series due for evaluation.
+///
+/// Two kinds travel this way, and both are measurements of things that already happened: what the
+/// CloudWatch AGENT in a guest collected or received ([`super::guest_cloudwatch_agent`]) and the
+/// I/O a guest performed on a VOLUME attached to it ([`super::volume_telemetry`]). Each carries the
+/// namespace, the dimensions and the instant of its own measurement, so one append serves both.
 ///
 /// The same store, through the same accessor, as the instance's own series
-/// ([`append`]): a metric has one home, so the agent's series and every reader of them cannot
-/// drift. Each datapoint is ONE observation — a collection the agent took, or a value its
-/// listener received — so a `Sum` over a period is what that period's datagrams came to and an
-/// `Average` is their mean, exactly as a published datapoint of the same series is.
+/// ([`append`]): a metric has one home, so these series and every reader of them cannot
+/// drift. Each datapoint is ONE observation — a collection the agent took, a value its
+/// listener received, or a transfer a guest performed — so a `Sum` over a period is what that
+/// period's observations came to and an `Average` is their mean, exactly as a published datapoint
+/// of the same series is.
 fn append_agent_samples<Eng: Send + Sync + 'static>(
     engine: &Eng,
     samples: &[super::guest_cloudwatch_agent::AgentSample],
@@ -521,7 +531,7 @@ fn append_agent_samples<Eng: Send + Sync + 'static>(
             ::tracing::warn!(
                 namespace = %sample.namespace,
                 metric = %sample.metric_name,
-                "the CloudWatch metric store is at capacity, so this agent measurement was not \
+                "the CloudWatch metric store is at capacity, so this guest measurement was not \
                  published"
             );
             continue;

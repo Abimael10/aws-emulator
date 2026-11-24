@@ -132,7 +132,14 @@ pub const MAX_BOOT_CONSOLE_LINE_BYTES: usize = 512;
 pub const MAX_GUEST_FILES: usize = 64;
 
 /// See [`MAX_GUEST_FILES`].
-pub const MAX_GUEST_FILE_BYTES: usize = 64 * 1024;
+///
+/// Sized for a machine that performs real BLOCK I/O: a guest generates a payload on its own
+/// storage, writes it through a device and reads it back ([`super::guest_disk_io`]), so the
+/// machine's storage holds a payload of the size one volume holds for its guest
+/// ([`super::guest_disk_io::MAX_VOLUME_GUEST_BYTES`]) rather than the few kilobytes a boot script's
+/// own files come to. Still the EMULATOR's own number, and still far below what would cost this
+/// process anything noticeable.
+pub const MAX_GUEST_FILE_BYTES: usize = super::guest_disk_io::MAX_VOLUME_GUEST_BYTES;
 
 /// How many commands ONE boot's program performs before the session is given up on.
 ///
@@ -456,21 +463,38 @@ pub struct GuestBoot {
     pub runtime: super::guest_services::GuestRuntime,
 }
 
+/// What a boot of one machine STARTS FROM: the storage its earlier boots left behind, how many
+/// bytes of it the machine may hold, the state its init system was in before the machine
+/// restarted, and the DEVICES attached to it.
+///
+/// They travel together because each of them is what the machine HELD when the boot began, and
+/// the boot's own program reads and changes all of them ([`boot_console`]).
+#[derive(Debug, Clone, Copy)]
+pub struct GuestStart<'a> {
+    /// The files the machine's storage already held.
+    pub files: &'a BTreeMap<String, String>,
+    /// How many bytes it may hold ([`guest_volume`]).
+    pub storage_bytes: usize,
+    /// The state its init system was in ([`super::guest_services::GuestRuntime`]).
+    pub runtime: &'a super::guest_services::GuestRuntime,
+    /// The volumes attached to it, as its guest addresses them
+    /// ([`super::guest_disk_io::GuestDisks`]).
+    pub disks: &'a super::guest_disk_io::GuestDisks,
+}
+
 /// What boot number `number` of `machine`'s guest writes to the console, the files it leaves
 /// behind and what it leaves RUNNING.
 ///
-/// `files` are the ones the machine's storage already held (what earlier boots wrote),
-/// `program` is what the instance's user data gives the guest to run, `runtime` is the state
-/// its init system was in before the machine restarted, and `boot_id` and `booted_at` are
-/// this boot's own identity and instant.
+/// `start` is what the machine held when this boot began ([`GuestStart`]), `program` is what the
+/// instance's user data gives the guest to run, and `boot_id` and `booted_at` are this boot's own
+/// identity and instant.
 pub fn boot_console(
     machine: &GuestMachine,
     number: u32,
     boot_id: &str,
     booted_at: SystemTime,
     program: &GuestProgram,
-    files: &BTreeMap<String, String>,
-    runtime: &super::guest_services::GuestRuntime,
+    start: GuestStart<'_>,
 ) -> GuestBoot {
     let mut clock = PrintkClock::default();
     let mut lines: Vec<String> = Vec::new();
@@ -485,9 +509,19 @@ pub fn boot_console(
     // The init system starts the units the machine has ENABLED before it runs the instance's
     // own program, which is what makes a server a previous boot enabled serve again
     // ([`super::guest_services`]).
-    let services = super::guest_services::GuestServices::starting_from(&runtime.restarted());
+    let services = super::guest_services::GuestServices::starting_from(&start.runtime.restarted());
     let (performed, files) = run_guest_program(
-        machine, boot_id, booted_at, number, program, files, &services,
+        machine,
+        boot_id,
+        booted_at,
+        number,
+        program,
+        Performing {
+            files: start.files,
+            storage_bytes: start.storage_bytes,
+            services: &services,
+            disks: start.disks,
+        },
     );
     lines.extend(performed.into_iter().map(|written| match written {
         GuestOutput::Console(line) => line,
@@ -799,6 +833,21 @@ fn guest_machine_id(machine: &GuestMachine) -> String {
     format!("{first}{second}")
 }
 
+/// What one performance of a guest's own program works AGAINST: the storage it reads and writes,
+/// how many bytes of it the machine may hold, the services it may start or stop, and the devices it
+/// may perform I/O through.
+#[derive(Debug, Clone, Copy)]
+struct Performing<'a> {
+    /// The files the machine's storage holds now.
+    files: &'a BTreeMap<String, String>,
+    /// How many bytes it may hold ([`guest_volume`]).
+    storage_bytes: usize,
+    /// The services it is running ([`super::guest_services::GuestServices`]).
+    services: &'a super::guest_services::GuestServices,
+    /// The volumes attached to it ([`super::guest_disk_io::GuestDisks`]).
+    disks: &'a super::guest_disk_io::GuestDisks,
+}
+
 /// Perform the guest's own program for boot number `number`, answering what it wrote, the
 /// files it left on the machine's storage and what it left RUNNING on the machine.
 ///
@@ -813,9 +862,14 @@ fn run_guest_program(
     booted_at: SystemTime,
     number: u32,
     program: &GuestProgram,
-    files: &BTreeMap<String, String>,
-    services: &super::guest_services::GuestServices,
+    against: Performing<'_>,
 ) -> (Vec<GuestOutput>, BTreeMap<String, String>) {
+    let Performing {
+        files,
+        storage_bytes,
+        services,
+        disks,
+    } = against;
     // The files the document's own `write_files` module names are part of the storage the
     // FIRST boot of this instance starts with — that module writes them once per instance —
     // with the directories above them made as the module makes them
@@ -831,10 +885,17 @@ fn run_guest_program(
             }
         }
     }
-    let volume = guest_volume(machine, boot_id, booted_at, &held, &services.taken())
-        // Where a datagram this program SENDS goes: the machine's own network stack, which is
-        // what carries it to whatever of this guest is listening ([`super::guest_services`]).
-        .with_datagram_sink(::std::sync::Arc::new(services.clone()));
+    let volume = guest_volume(
+        machine,
+        boot_id,
+        booted_at,
+        &held,
+        &services.taken(),
+        storage_bytes,
+    )
+    // Where a datagram this program SENDS goes: the machine's own network stack, which is
+    // what carries it to whatever of this guest is listening ([`super::guest_services`]).
+    .with_datagram_sink(::std::sync::Arc::new(services.clone()));
     let mut session = ShellSession::in_volume(
         guest_environment(machine, number),
         SessionConfig {
@@ -855,7 +916,9 @@ fn run_guest_program(
     // The programs this machine has installed in it, which a boot script reads the
     // instance's own facts with ([`super::guest_metadata`]) and installs and starts its
     // services with ([`super::guest_services`]).
-    .with_environment_programs(super::guest_services::installed_programs(machine, services));
+    .with_environment_programs(super::guest_services::installed_programs(
+        machine, services, disks,
+    ));
     // The instant the boot happened is the console's, and it is also what the kernel counts
     // this boot's uptime from ([`GUEST_UPTIME_PATH`]), which the tree above publishes.
     for command in program.commands_for_boot(number) {
@@ -885,12 +948,18 @@ fn run_guest_program(
 /// The ONE construction of that tree, so every program a guest runs — the boot's own
 /// user-data program and a command something later sends it — reads the same machine, with
 /// the same paths sealed and the same bounds, rather than two readings of one guest.
+///
+/// `storage_bytes` is how many bytes this machine's own storage may hold: its own bound and never
+/// more than the store has room for
+/// ([`ComAmazonawsEc2Amazonec2State::guest_storage_allowance`]), so what one machine's programs can
+/// make this store retain is bounded by what every other machine and volume holds.
 pub(super) fn guest_volume(
     machine: &GuestMachine,
     boot_id: &str,
     booted_at: SystemTime,
     files: &BTreeMap<String, String>,
     runtime: &super::guest_services::GuestRuntime,
+    storage_bytes: usize,
 ) -> ShellVolume {
     let published = guest_published_files(machine, boot_id, booted_at);
     let published_bytes: usize = published
@@ -910,7 +979,7 @@ pub(super) fn guest_volume(
     // the caller-supplied — files are bounded by.
     let mut volume = ShellVolume::new(VolumeLimits {
         files: MAX_GUEST_FILES.saturating_add(published.len()),
-        bytes: MAX_GUEST_FILE_BYTES.saturating_add(published_bytes),
+        bytes: storage_bytes.saturating_add(published_bytes),
         directories: VolumeLimits::default()
             .directories
             .saturating_add(published_directories),
@@ -1021,8 +1090,13 @@ fn guest_published_files(
         ));
     }
     // What the kernel publishes about this machine's block devices, for a guest that has any
-    // ([`super::guest_block_devices`]).
+    // ([`super::guest_block_devices`]) — beside the device node of each of them and the stable link
+    // that points at it, which is how a program of the guest ADDRESSES one
+    // ([`super::guest_disk_io`]).
     published.extend(super::guest_block_devices::published_block_device_files(
+        &machine.block_devices,
+    ));
+    published.extend(super::guest_disk_io::published_device_files(
         &machine.block_devices,
     ));
     published
@@ -1053,7 +1127,10 @@ mod tests {
 
     use super::super::guest_services::GuestRuntime;
     use super::super::guest_user_data::GuestProgram;
-    use super::{boot_console, kernel_release_in, GuestMachine, CLOUD_INIT_PREFIX};
+    use super::{
+        boot_console, kernel_release_in, GuestMachine, GuestStart, CLOUD_INIT_PREFIX,
+        MAX_GUEST_FILE_BYTES,
+    };
 
     /// A machine of the shape a launch stores.
     fn machine() -> GuestMachine {
@@ -1105,8 +1182,12 @@ mod tests {
             "6e3f1f2a-0f4d-4b7f-9a2e-7c1d5e8b4a30",
             booted,
             &GuestProgram::default(),
-            &BTreeMap::new(),
-            &GuestRuntime::default(),
+            GuestStart {
+                files: &BTreeMap::new(),
+                storage_bytes: MAX_GUEST_FILE_BYTES,
+                runtime: &GuestRuntime::default(),
+                disks: &super::super::guest_disk_io::GuestDisks::none(),
+            },
         );
         let stamped = boot
             .lines
@@ -1174,8 +1255,12 @@ mod tests {
             "6e3f1f2a-0f4d-4b7f-9a2e-7c1d5e8b4a30",
             booted,
             &program,
-            &BTreeMap::new(),
-            &GuestRuntime::default(),
+            GuestStart {
+                files: &BTreeMap::new(),
+                storage_bytes: MAX_GUEST_FILE_BYTES,
+                runtime: &GuestRuntime::default(),
+                disks: &super::super::guest_disk_io::GuestDisks::none(),
+            },
         );
         assert!(
             first.lines.iter().any(|line| line
@@ -1196,8 +1281,12 @@ mod tests {
             "9a1b2c3d-4e5f-4a6b-8c7d-0e1f2a3b4c5d",
             booted + Duration::from_secs(30),
             &program,
-            &first.files,
-            &first.runtime,
+            GuestStart {
+                files: &first.files,
+                storage_bytes: MAX_GUEST_FILE_BYTES,
+                runtime: &first.runtime,
+                disks: &super::super::guest_disk_io::GuestDisks::none(),
+            },
         );
         assert!(
             second.lines.iter().any(|line| line

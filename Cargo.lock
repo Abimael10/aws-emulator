@@ -14190,6 +14190,7 @@ dependencies = [
  "md-5 0.10.6",
  "pkcs1",
  "pkcs8 0.10.2",
+ "rand 0.9.5",
  "rcgen",
  "roxmltree",
  "serde_json",

@@ -772,8 +772,10 @@ impl ::service_common::posix_shell_volume::DatagramSink for GuestServices {
 /// The programs the GUEST of `machine` has installed in it: the metadata client
 /// ([`super::guest_metadata`]), the programs that install, start and run its services, which
 /// change `services`, the ones that report its CPU layout ([`super::guest_cpu`]), the one
-/// that lists its block devices ([`super::guest_block_devices`]) and the ones that report what
-/// is MOUNTED into it ([`super::guest_mounts`]).
+/// that lists its block devices ([`super::guest_block_devices`]), the ones that perform I/O
+/// THROUGH one ([`super::guest_disk_io`], which change `disks`), the one that reads the clock
+/// ([`super::guest_clock`]) and the ones that report what is MOUNTED into it
+/// ([`super::guest_mounts`]).
 ///
 /// The ONE construction of them, so the boot's own user-data program and a command something
 /// later sends the guest have the same programs over the same machine.
@@ -781,6 +783,7 @@ impl ::service_common::posix_shell_volume::DatagramSink for GuestServices {
 pub fn installed_programs(
     machine: &GuestMachine,
     services: &GuestServices,
+    disks: &super::guest_disk_io::GuestDisks,
 ) -> Box<dyn EnvironmentPrograms> {
     let own: Box<dyn EnvironmentPrograms> = Box::new(GuestEnvironment {
         metadata: super::guest_metadata::guest_programs(machine),
@@ -821,6 +824,16 @@ pub fn installed_programs(
         own,
         super::guest_cloudwatch_agent::package_query_programs(services, &machine.architecture),
     );
+    // ... and the ones that perform I/O THROUGH one of those devices and resolve the links the
+    // kernel publishes for it ([`super::guest_disk_io`]), asked after them for the same reason.
+    let own = ::service_common::posix_shell_session::layered(
+        own,
+        super::guest_disk_io::disk_programs(disks),
+    );
+    // ... and the one that reads the machine's CLOCK ([`super::guest_clock`]), which every machine
+    // has, asked after the programs above for the same reason.
+    let own =
+        ::service_common::posix_shell_session::layered(own, super::guest_clock::clock_programs());
     // ... and the ones that report the filesystems mounted into it, which every machine has
     // (what they answer is what the session's own mount table holds), asked last for the same
     // reason.

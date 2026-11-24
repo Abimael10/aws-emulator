@@ -73,11 +73,8 @@
 //! * several file operands at once are not performed either: `wc` then writes a `total` line,
 //!   `head` writes a header per file, `grep` prefixes every line with the file it came from,
 //!   and all of them pad — none of which follows from one input;
-//! * a `grep` whose BASIC pattern carries one of the escapes a basic expression gives its own
-//!   meaning (`\(`, `\)`, `\{`, `\}`, `\|`, `\+`, `\?`) is not performed, rather than matched
-//!   as though that escape meant what an extended expression means by it; nor is one asking
-//!   for the lines AROUND a match, for the files rather than the lines, or for a walk of a
-//!   directory, none of which follows from one input either;
+//! * a `grep` asking for the lines AROUND a match, for the files rather than the lines, or for
+//!   a walk of a directory is not performed either, none of which follows from one input;
 //! * a `sort` asked to compare by a KEY of each line (`-k`, with its own field separator) or
 //!   to check an order rather than write one (`-c`) is not performed, nor is one asked for an
 //!   order this module computes nothing for (a human-readable, version or random order): each
@@ -661,10 +658,25 @@ enum Flavour {
 /// escaped before the engine reads it.
 const LITERAL_IN_BASIC: [char; 7] = ['+', '?', '|', '(', ')', '{', '}'];
 
-/// The escapes a BASIC regular expression gives ITS OWN meaning to, which is the opposite of
-/// what the engine reads them as. A pattern carrying one is not performed (see the module
-/// docs) rather than matched as something else.
-const BASIC_ESCAPES: [&str; 7] = [r"\(", r"\)", r"\{", r"\}", r"\|", r"\+", r"\?"];
+/// The escapes a BASIC regular expression gives the meaning the engine gives the character
+/// ITSELF, as `(the character the escape spells, what the engine reads for it)`.
+///
+/// They are the other half of [`LITERAL_IN_BASIC`]: such an expression holds each of those
+/// characters as a literal and gives its ESCAPED spelling the special meaning an extended
+/// expression gives the bare character — "in basic regular expressions the meta-characters `?`,
+/// `+`, `{`, `|`, `(`, and `)` lose their special meaning; instead use the backslashed versions
+/// `\?`, `\+`, `\{`, `\|`, `\(`, and `\)`" (GNU grep manual, "Basic vs Extended Regular
+/// Expressions", which is the grep the images these sessions stand for carry). So a pattern
+/// written for that grep — `grep -o '[0-9]\+'` — matches here what it matches there.
+const BASIC_ESCAPES: [(char, char); 7] = [
+    ('(', '('),
+    (')', ')'),
+    ('{', '{'),
+    ('}', '}'),
+    ('|', '|'),
+    ('+', '+'),
+    ('?', '?'),
+];
 
 /// The `grep` invocation `options` and `operands` state, or `None` for an option, operand or
 /// combination this module does not perform (see the module docs).
@@ -770,28 +782,37 @@ fn long_pattern(option: &str) -> Option<&str> {
 ///
 /// A FIXED string is escaped whole, so every character of it matches itself. An EXTENDED
 /// expression is what the engine reads already. A BASIC one differs from it in exactly the
-/// characters above: the ones it holds as literals are escaped ([`LITERAL_IN_BASIC`]), and one
-/// carrying an escape whose meaning the two disagree on is not performed ([`BASIC_ESCAPES`]).
+/// characters above, each way round: the ones it holds as literals are escaped
+/// ([`LITERAL_IN_BASIC`]), and the ESCAPED spelling of each of them is the one that carries the
+/// meaning ([`BASIC_ESCAPES`]).
 fn grep_pattern(written: &str, flavour: Flavour) -> Option<String> {
     match flavour {
         Flavour::Fixed => Some(::regex::escape(written)),
         Flavour::Extended => Some(written.to_string()),
         Flavour::Basic => {
-            if BASIC_ESCAPES
-                .iter()
-                .any(|escape| written.contains(escape))
-            {
-                return None;
-            }
             let mut source = String::with_capacity(written.len());
             let mut characters = written.chars();
             while let Some(character) = characters.next() {
-                // An escape a basic expression and the engine agree on (`\.`, `\*`, `\\`) is
-                // carried through as written, with the character it escapes.
                 if character == '\\' {
-                    source.push(character);
-                    if let Some(escaped) = characters.next() {
-                        source.push(escaped);
+                    let Some(escaped) = characters.next() else {
+                        // A trailing backslash escapes nothing, so it is the character itself.
+                        source.push_str(r"\\");
+                        continue;
+                    };
+                    match BASIC_ESCAPES
+                        .iter()
+                        .find(|(spelled, _)| *spelled == escaped)
+                    {
+                        // The escaped spelling of a character this flavour holds as a literal
+                        // is the one that carries the meaning, so the engine reads the
+                        // character itself for it.
+                        Some((_, reads_as)) => source.push(*reads_as),
+                        // Every other escape a basic expression and the engine agree on
+                        // (`\.`, `\*`, `\\`) is carried through as written.
+                        None => {
+                            source.push(character);
+                            source.push(escaped);
+                        }
                     }
                     continue;
                 }
@@ -2087,6 +2108,36 @@ mod tests {
                 true,
             ),
             (
+                // The GNU basic-expression escapes, which are what a script written for the
+                // grep an image ships reads a figure out of another program's output with.
+                "a basic pattern whose `\\+` quantifies the digits of a figure",
+                words(&["-o", r"[0-9]\+ bytes"]),
+                "16777216 bytes (17 MB, 16 MiB) copied, 0.04 s, 389 MB/s\n",
+                "16777216 bytes\n",
+                true,
+            ),
+            (
+                "a basic pattern whose `\\|` is an alternation inside a `\\(` group",
+                words(&["-o", r"\(isMaster\|instanceId\)"]),
+                "\"instanceId\": \"i-1\"\n",
+                "instanceId\n",
+                true,
+            ),
+            (
+                "a basic pattern whose `\\{n\\}` repeats",
+                words(&["-o", r"i-[0-9a-z]\{8\}"]),
+                "\"instanceId\": \"i-0a1b2c3d\"\n",
+                "i-0a1b2c3d\n",
+                true,
+            ),
+            (
+                "a basic pattern whose `\\?` makes a character optional",
+                words(&["-o", r"colou\?r"]),
+                "color and colour\n",
+                "color\ncolour\n",
+                true,
+            ),
+            (
                 "a basic pattern holds `+` as a literal",
                 words(&["a+b"]),
                 SELECTED_FROM,
@@ -2164,10 +2215,6 @@ mod tests {
         // (case, the arguments)
         let rows: Vec<(&str, Vec<String>)> = vec![
             ("no pattern at all", words(&[])),
-            (
-                "a basic pattern carrying an escape the flavours disagree on",
-                words(&[r"\(isMaster\)"]),
-            ),
             ("-o and -v together", words(&["-o", "-v", "isMaster"])),
             ("two file operands", words(&["isMaster", "one", "two"])),
             ("an option it has none of", words(&["-r", "isMaster"])),

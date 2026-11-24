@@ -392,6 +392,23 @@ pub struct VolumeRecord {
     /// reader observes it through the same reading
     /// ([`ComAmazonawsEc2Amazonec2State::volume_is_withdrawn`]).
     pub withdrawn_at: Option<Instant>,
+    /// The BYTES this volume holds for the guests it is attached to: what a program inside one of
+    /// them wrote through the device the volume is presented as
+    /// ([`crate::state::guest_disk_io`]).
+    ///
+    /// Held on the VOLUME and not on the machine, because that is where the data of a volume is: a
+    /// read-back answers the bytes that were written, and both the bytes and the volume's own
+    /// `AWS/EBS` series follow the volume when it is detached from one instance and attached to
+    /// another. Empty for every volume nothing has written, which is a volume whose every byte
+    /// reads as zero.
+    pub guest_data: super::guest_disk_io::VolumeData,
+    /// The I/O a guest has performed on this volume and nothing has published yet, in the order it
+    /// happened ([`crate::state::volume_telemetry`], which states what one record is and what it is
+    /// published as).
+    ///
+    /// Empty for every volume nothing has read or written, and emptied as the datapoints are
+    /// published: an operation is published once, being a thing that happened once.
+    pub guest_io: Vec<super::volume_telemetry::VolumeIoRecord>,
 }
 
 impl VolumeRecord {
@@ -411,6 +428,10 @@ impl VolumeRecord {
             // Every volume this store mints is one its encryption key will serve: the one
             // path that learns otherwise is `CreateVolume`, which sets the instant itself.
             withdrawn_at: None,
+            // A volume is created empty — every byte of a fresh volume reads as zero — and nothing
+            // has performed I/O on one before it is attached to anything.
+            guest_data: super::guest_disk_io::VolumeData::default(),
+            guest_io: Vec::new(),
         }
     }
 

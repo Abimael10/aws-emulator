@@ -520,6 +520,11 @@ impl Listing {
 
     /// The devices of `devices` this invocation is about: the ones its operands named, and
     /// every one of them for an invocation that named none.
+    ///
+    /// A device is named by its node, by its path, or by the stable link the kernel publishes for
+    /// it ([`super::guest_disk_io::GuestDisk::is_named_by`], the one reading of which paths name
+    /// one device) — the link being how a program that has just attached a volume addresses the
+    /// device carrying it.
     fn selected<'a>(&self, devices: &'a [GuestBlockDevice]) -> Vec<&'a GuestBlockDevice> {
         if self.operands.is_empty() {
             return devices.iter().collect();
@@ -527,9 +532,10 @@ impl Listing {
         devices
             .iter()
             .filter(|device| {
+                let addressed = super::guest_disk_io::GuestDisk::of(device);
                 self.operands.iter().any(|operand| {
                     let named = operand.rsplit('/').next().unwrap_or(operand);
-                    named == device.node
+                    named == device.node || addressed.is_named_by(operand)
                 })
             })
             .collect()

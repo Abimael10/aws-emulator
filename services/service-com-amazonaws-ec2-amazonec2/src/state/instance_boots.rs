@@ -85,6 +85,13 @@ impl ComAmazonawsEc2Amazonec2State {
         // what the rendered half of its console reports is a fact of the instance, its
         // image and its instance type.
         let machine = self.guest_machine(instance);
+        // The DEVICES that machine's guest can address, each holding the bytes its volume holds:
+        // read while the volume store is to hand, because the boot's own program may write through
+        // one of them ([`super::guest_disk_io`]).
+        let disks = self.guest_disks(&machine.block_devices);
+        // How many bytes this machine's storage may hold, which is its own bound and never more
+        // than the store has room for ([`super::guest_disk_io::MAX_GUEST_DATA_BYTES`]).
+        let storage_bytes = self.guest_storage_allowance(instance_id);
         // Minted after that read, since the mint draws on the store's own counter; the id is
         // already known to resolve, so no counter is spent for an instance that is not
         // there.
@@ -106,8 +113,12 @@ impl ComAmazonawsEc2Amazonec2State {
             &boot_id,
             at,
             &program,
-            &instance.guest_files,
-            &instance.guest_runtime,
+            crate::state::guest_console::GuestStart {
+                files: &instance.guest_files,
+                storage_bytes,
+                runtime: &instance.guest_runtime,
+                disks: &disks,
+            },
         );
         instance.guest_files = written.files;
         // What the machine is running once the boot is over: the units it had enabled, which
@@ -126,6 +137,9 @@ impl ComAmazonawsEc2Amazonec2State {
         // The boot that was owed has happened: nothing is owed until something starts the
         // guest again.
         instance.boot_due = None;
+        // What the boot's own program wrote THROUGH a device goes onto the volume behind it, which
+        // is where the data of a volume lives ([`super::guest_disk_io`]).
+        self.apply_guest_disk_writes(disks.taken(), at);
     }
 
     /// Materialise every guest boot the clock already owes at `now`.

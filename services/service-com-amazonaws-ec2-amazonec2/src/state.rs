@@ -2807,6 +2807,30 @@ pub use guest_cloudwatch_agent::InstalledGuestPackage;
 pub mod guest_block_devices;
 pub use guest_block_devices::*;
 
+/// The BLOCK I/O one instance's GUEST performs on the volumes attached to it: the stable device
+/// links the kernel publishes for an attached volume, the program that copies bytes through one,
+/// and the bytes that copy leaves ON that volume. A SUBMODULE for the same reason
+/// [`image_usage_reports`] is one, and re-exported the way [`guest_memory`] is and for the same
+/// reason.
+pub mod guest_disk_io;
+
+/// The `AWS/EBS` series one VOLUME publishes about the I/O performed on it — the metric families,
+/// what one I/O operation is, and the CloudWatch metric store they are appended to. A SUBMODULE for
+/// the same reason [`image_usage_reports`] is one, and reached through its own module for the same
+/// reason [`instance_telemetry`] is.
+pub mod volume_telemetry;
+
+/// What one instance's GUEST reads as the TIME, and the program it reads it with. A SUBMODULE for
+/// the same reason [`image_usage_reports`] is one, and re-exported the way [`guest_memory`] is and
+/// for the same reason.
+pub mod guest_clock;
+
+/// The BYTES one EBS volume holds for the guests it is attached to, as the device's own blocks —
+/// sparse, so a large device costs what was written. A SUBMODULE for the same reason
+/// [`image_usage_reports`] is one, and reached through its own module the way [`guest_memory`] is.
+#[path = "state/zz_probe.rs"]
+pub mod volume_data;
+
 /// What one instance's GUEST sees of the filesystems MOUNTED into it, and the programs it
 /// asks about them with. A SUBMODULE for the same reason [`image_usage_reports`] is one.
 pub mod guest_mounts;
