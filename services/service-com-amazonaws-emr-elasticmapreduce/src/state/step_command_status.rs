@@ -116,8 +116,12 @@ pub fn command_failure_message(status: i32) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepCommand {
     /// A shell PROGRAM: the command line named a shell with `-c`, and this is the text after
-    /// it.
-    Program(String),
+    /// it, beside the words after THAT — which are the program's own positional parameters,
+    /// as `sh -c <program> [name [argument...]]` gives them.
+    Program {
+        program: String,
+        arguments: Vec<String>,
+    },
     /// A utility and its arguments, as the command line wrote them, with no shell of its own
     /// to expand or split them.
     Argv(Vec<String>),
@@ -128,6 +132,11 @@ impl StepCommand {
     /// is not `command-runner.jar`, so its arguments are that jar's own and not a command
     /// line, or the command line is empty.
     ///
+    /// An argument of ZERO LENGTH is no word of the command line: the step's own
+    /// `HadoopJarStep.Args` are what the command runner hands the process it starts, in order
+    /// and byte for byte, and an empty one is dropped there — which is why `DescribeStep`
+    /// still echoes it among the step's configured arguments while the command never sees it.
+    ///
     /// A shell is recognised by the NAME it is named under, however the command line spelled
     /// its path, and its `-c` is read only while the shell is still reading options — a `-c`
     /// standing after the first word that is no option belongs to the command the shell was
@@ -137,7 +146,12 @@ impl StepCommand {
         if !names_command_runner(jar) {
             return None;
         }
-        let words: Vec<String> = args.iter().take(MAX_COMMAND_LINE_WORDS).cloned().collect();
+        let words: Vec<String> = args
+            .iter()
+            .take(MAX_COMMAND_LINE_WORDS)
+            .filter(|word| !word.is_empty())
+            .cloned()
+            .collect();
         let first = words.first()?;
         let utility = first.split('/').next_back().unwrap_or(first);
         if SHELL_COMMAND_NAMES.contains(&utility) {
@@ -147,10 +161,15 @@ impl StepCommand {
                 }
                 if word == SHELL_PROGRAM_OPTION {
                     // `sh [option...] -c <program> [name [argument...]]`: the word after the
-                    // option is the program. A `-c` with nothing after it names no program,
+                    // option is the program, and the words after THAT are the program's own
+                    // positional parameters — `$0` the name it was invoked under and `$1`
+                    // onwards its operands. A `-c` with nothing after it names no program,
                     // and the line is then the shell invocation it is.
                     if let Some(program) = words.get(index + 1) {
-                        return Some(Self::Program(program.clone()));
+                        return Some(Self::Program {
+                            program: program.clone(),
+                            arguments: words.get(index + 2..).unwrap_or_default().to_vec(),
+                        });
                     }
                     break;
                 }
@@ -175,7 +194,7 @@ impl StepCommand {
     pub fn is_bare_sql_client(&self) -> bool {
         match self {
             Self::Argv(words) => words.first().is_some_and(|word| names_sql_client(word)),
-            Self::Program(_) => false,
+            Self::Program { .. } => false,
         }
     }
 
@@ -186,8 +205,18 @@ impl StepCommand {
     /// out of it are exactly the words the step submitted.
     fn as_line(&self) -> String {
         match self {
-            Self::Program(program) => program.clone(),
+            Self::Program { program, .. } => program.clone(),
             Self::Argv(words) => ::shell_words::join(words),
+        }
+    }
+
+    /// The POSITIONAL PARAMETERS the line is performed with: the words a `sh -c` command line
+    /// wrote after its program, which are that program's own `$0`, `$1` and so on. Every
+    /// other form is a utility invocation, which carries none.
+    fn parameters(&self) -> Vec<String> {
+        match self {
+            Self::Program { arguments, .. } => arguments.clone(),
+            Self::Argv(_) => Vec::new(),
         }
     }
 }
@@ -375,7 +404,11 @@ fn performed_command(
     // ([`super::bootstrap_run`]) rather than a narrower session than the one a script of the
     // same cluster gets. The tree is the SESSION's own and nothing of the host's: it is
     // created with the session and dropped with it, and its ceilings are that module's.
-    .with_file_utilities();
+    .with_file_utilities()
+    // The words a `sh -c` command line wrote after its program are that program's own
+    // positional parameters, which is how a step's own arguments reach the process the
+    // command line starts ([`StepCommand::parameters`]).
+    .with_arguments(command.parameters());
     // The node's local disk is what the session's tree STARTS with: a step's command line runs
     // on a node a bootstrap action and the steps before it already wrote to
     // ([`super::node_file_systems`]).

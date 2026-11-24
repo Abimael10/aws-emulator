@@ -57,6 +57,7 @@
 mod column;
 mod context;
 mod dataset;
+mod expression;
 mod filesystem;
 mod functions;
 mod parquet;
@@ -78,16 +79,21 @@ pub struct SparkEnvironment<'a> {
     /// Whether a write leaves the `_SUCCESS` marker object beside its part files, which is
     /// the environment's `mapreduce.fileoutputcommitter.marksuccessfuljobs` setting.
     pub marks_successful_jobs: bool,
+    /// The Spark properties the environment's own configuration SETS, which a submitted
+    /// program's configuration starts with — the `spark-defaults` of the environment, as
+    /// `spark-submit` loads them for the program it submits.
+    pub settings: &'a [(String, String)],
 }
 
 impl<'a> SparkEnvironment<'a> {
     /// An environment shipping `spark_version` whose committer leaves the success marker,
-    /// which is the Hadoop default.
+    /// which is the Hadoop default, and whose own configuration sets nothing.
     #[must_use]
     pub fn shipping(spark_version: Option<&'a str>) -> Self {
         Self {
             spark_version,
             marks_successful_jobs: true,
+            settings: &[],
         }
     }
 
@@ -99,6 +105,12 @@ impl<'a> SparkEnvironment<'a> {
             marks_successful_jobs: false,
             ..self
         }
+    }
+
+    /// The same environment, whose own configuration sets these Spark properties.
+    #[must_use]
+    pub fn setting(self, settings: &'a [(String, String)]) -> Self {
+        Self { settings, ..self }
     }
 }
 
@@ -122,6 +134,10 @@ pub fn pyspark_modules_of(environment: SparkEnvironment<'_>) -> Vec<(String, Str
     vec![
         ("pyspark/__init__.py".to_string(), PYSPARK_SOURCE.to_string()),
         ("pyspark/release.py".to_string(), release_source(environment)),
+        (
+            "pyspark/defaults.py".to_string(),
+            defaults_source(environment.settings),
+        ),
         ("pyspark/conf.py".to_string(), CONF_SOURCE.to_string()),
         (
             "pyspark/filesystem.py".to_string(),
@@ -149,6 +165,10 @@ pub fn pyspark_modules_of(environment: SparkEnvironment<'_>) -> Vec<(String, Str
         (
             "pyspark/sql/functions.py".to_string(),
             functions::FUNCTIONS_SOURCE.to_string(),
+        ),
+        (
+            "pyspark/sql/expression.py".to_string(),
+            expression::EXPRESSION_SOURCE.to_string(),
         ),
     ]
 }
@@ -215,6 +235,35 @@ fn parquet_writer(spark_version: Option<&str>) -> Option<String> {
 const RELEASE_SOURCE: &str = r#""""The Spark this environment's release ships, as its program is told it."""
 "#;
 
+/// `pyspark.defaults`: the Spark properties the ENVIRONMENT's own configuration sets, which
+/// are the defaults a submitted program's configuration starts with.
+///
+/// `spark-submit` loads the environment's `spark-defaults` and hands them to the application
+/// it submits, so a property the environment sets is one the program reads back off its own
+/// configuration — and one every part of this runtime that is governed by a property reads
+/// ([`sql`]). Rendered through the JSON encoder, so a name or a value reaches the module as
+/// the literal it is whatever it holds.
+fn defaults_source(settings: &[(String, String)]) -> String {
+    let mut rendered = String::from(DEFAULTS_SOURCE);
+    rendered.push_str("SETTINGS = {\n");
+    for (name, value) in settings {
+        rendered.push_str(&format!(
+            "    {}: {},\n",
+            ::serde_json::Value::String(name.clone()),
+            ::serde_json::Value::String(value.clone())
+        ));
+    }
+    rendered.push_str("}\n");
+    rendered
+}
+
+/// The doc comment [`defaults_source`] builds `pyspark/defaults.py` from.
+const DEFAULTS_SOURCE: &str = r#""""The Spark properties this environment's own configuration sets."""
+
+# The properties `spark-submit` loaded out of the environment's own configuration, which are
+# the defaults a submitted program's `SparkConf` starts with.
+"#;
+
 /// `pyspark`: the names a program imports from the package itself.
 const PYSPARK_SOURCE: &str = r#"
 """The `pyspark` package, as this emulator supplies it to a submitted program."""
@@ -231,12 +280,19 @@ __all__ = ["SparkConf", "SparkContext", "RDD"]
 const CONF_SOURCE: &str = r#"
 """The configuration of one Spark application."""
 
+# The properties the ENVIRONMENT the program runs in sets, which a configuration that loads
+# the defaults starts with ([`pyspark.defaults`]).
+from pyspark.defaults import SETTINGS as _ENVIRONMENT_SETTINGS
+
 
 class SparkConf(object):
     """The key/value configuration `SparkConf` holds, as set and read back."""
 
     def __init__(self, loadDefaults=True, _jvm=None, _jconf=None):
-        self._settings = {}
+        # "if loadDefaults is true, also load values from the environment": the properties
+        # the environment's own configuration sets are what the program then reads back,
+        # and a setting of its own takes precedence over them.
+        self._settings = dict(_ENVIRONMENT_SETTINGS) if loadDefaults else {}
 
     def set(self, key, value):
         self._settings[str(key)] = str(value)
@@ -309,11 +365,18 @@ pub fn submitted_program_handler() -> String {
 /// Spark the environment the program runs in ships, as [`pyspark_modules`] states it.
 #[must_use]
 pub fn submitted_program_modules(spark_version: Option<&str>) -> Vec<(String, String)> {
+    submitted_program_modules_of(SparkEnvironment::shipping(spark_version))
+}
+
+/// The same modules, for an environment that states what [`SparkEnvironment`] carries — the
+/// Spark release it ships and the properties its own configuration sets.
+#[must_use]
+pub fn submitted_program_modules_of(environment: SparkEnvironment<'_>) -> Vec<(String, String)> {
     ::std::iter::once((
         format!("{SUBMITTED_PROGRAM_MODULE}.py"),
         SUBMITTED_PROGRAM_SOURCE.to_string(),
     ))
-    .chain(pyspark_modules(spark_version))
+    .chain(pyspark_modules_of(environment))
     .collect()
 }
 

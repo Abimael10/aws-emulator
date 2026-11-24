@@ -186,7 +186,7 @@ class Column(object):
     """
 
     def __init__(self, name, read=None, aggregate=None, inner=None, distinct=False,
-                 descending=False, field=None, ignore_nulls=False):
+                 descending=False, field=None, ignore_nulls=False, cast=None):
         self._name = name
         self._read = read
         self._aggregate = aggregate
@@ -196,8 +196,12 @@ class Column(object):
         # What `first` and `last` do with a null: whether they pass over it or answer it.
         self._ignore_nulls = ignore_nulls
         # The column this expression is a bare REFERENCE to, where it is one: a projection
-        # of a reference keeps the type that column already carries.
+        # of a reference keeps the type that column already carries. A CAST of a reference
+        # keeps it too, so an aggregate over the cast values of a column is still known to
+        # be over that column — beside the type the cast reads them as.
         self._field = field
+        # The type a CAST reads this expression's values as, where it is one.
+        self._cast = cast
 
     # --- what it answers ---------------------------------------------------------------
 
@@ -245,6 +249,7 @@ class Column(object):
             self._descending,
             self._field,
             self._ignore_nulls,
+            self._cast,
         )
 
     def name(self, *names):
@@ -272,6 +277,7 @@ class Column(object):
             descending,
             self._field,
             self._ignore_nulls,
+            self._cast,
         )
 
     def __repr__(self):
@@ -435,6 +441,16 @@ class Column(object):
         return Column(
             "CAST(%s AS %s)" % (self._name, kind.upper()),
             lambda row: cast_value(self.of(row), kind),
+            None,
+            None,
+            False,
+            False,
+            # A cast of a bare reference is still a reference to that column, read as the
+            # type named: the engine's aggregate over a SPAN reads the span's own definition
+            # off it, and a projection of it carries the cast type rather than the column's.
+            self._field,
+            False,
+            kind,
         )
 
     def astype(self, dataType):

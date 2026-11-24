@@ -45,6 +45,13 @@ service-com-amazonaws-identitystore-awsidentitystore = { workspace = true }
 # tables a step's work names in that catalog, so the step runner reads the ONE Glue Data
 # Catalog store this emulator holds rather than keeping a second copy of it here.
 service-com-amazonaws-glue-awsglue = { workspace = true }
+# The ONE `python3` CLI this workspace has, which the Systems Manager crate installs into the
+# session a managed node's command runs in: an Amazon EMR release ships that interpreter on
+# every cluster node, and a step's command line that invokes it is performed by THAT program
+# rather than by a second interpreter CLI stood up here (`state::node_interpreter`). It runs
+# in the same contained Python engine this crate already runs a submitted Spark application
+# in, so no execution substrate arrives with this declaration.
+service-com-amazonaws-ssm-amazonssm = { workspace = true }
 # `sqlparser`: the SQL statement a step's command submits is read off that command by
 # PARSING it with the maintained parser this workspace already uses for caller-supplied
 # SQL; the `visitor` feature is what provides `ast::visit_relations`, the walk that

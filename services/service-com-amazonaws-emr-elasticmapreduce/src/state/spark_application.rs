@@ -185,6 +185,57 @@ pub fn submitted_spark_application(jar: &str, args: &[String]) -> Option<SparkAp
     })
 }
 
+/// How many entries of a cluster's configuration tree one reading of its Spark properties
+/// walks. CHOSEN: a bound on what reading one cluster's configuration costs, far above the
+/// classifications a launch really carries.
+const MAX_CONFIGURATIONS_READ: usize = 512;
+
+/// The configuration CLASSIFICATION whose properties are the Spark properties a cluster's
+/// nodes run with: Amazon EMR writes the `spark-defaults` classification into the cluster's
+/// own `spark-defaults.conf`, which `spark-submit` then loads for the application it submits.
+pub const SPARK_DEFAULTS_CLASSIFICATION: &str = "spark-defaults";
+
+/// The Spark properties a cluster's own configuration SETS, by the name it sets each under.
+///
+/// Only the classification above is read: a property of another classification configures
+/// another engine of the cluster and is no part of what a Spark application is submitted
+/// with. The whole tree is walked, so a `spark-defaults` structure nested inside another is
+/// read too, and the first value walked for a name is the one kept. What one reading costs is
+/// bounded ([`MAX_CONFIGURATIONS_READ`]).
+#[must_use]
+pub fn spark_default_properties(configurations: &[Configuration]) -> Vec<(String, String)> {
+    let mut held: BTreeMap<String, String> = BTreeMap::new();
+    let mut pending: Vec<&Configuration> = configurations.iter().collect();
+    let mut walked = 0usize;
+    while let Some(configuration) = pending.pop() {
+        walked += 1;
+        if walked > MAX_CONFIGURATIONS_READ {
+            break;
+        }
+        let names_spark_defaults = configuration
+            .classification
+            .as_deref()
+            .is_some_and(|classification| {
+                classification.trim().eq_ignore_ascii_case(SPARK_DEFAULTS_CLASSIFICATION)
+            });
+        if names_spark_defaults {
+            if let Some(properties) = configuration.properties.as_ref() {
+                for (key, value) in properties {
+                    walked += 1;
+                    if walked > MAX_CONFIGURATIONS_READ {
+                        break;
+                    }
+                    held.entry(key.clone()).or_insert_with(|| value.clone());
+                }
+            }
+        }
+        if let Some(children) = configuration.configurations.as_deref() {
+            pending.extend(children.iter());
+        }
+    }
+    held.into_iter().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

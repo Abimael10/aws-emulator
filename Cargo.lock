@@ -14717,6 +14717,7 @@ dependencies = [
  "service-com-amazonaws-lambda-awsgirapiservice",
  "service-com-amazonaws-s3-amazons3",
  "service-com-amazonaws-sqs-amazonsqs",
+ "service-com-amazonaws-ssm-amazonssm",
  "service-common",
  "sha2 0.10.9",
  "shell-words",

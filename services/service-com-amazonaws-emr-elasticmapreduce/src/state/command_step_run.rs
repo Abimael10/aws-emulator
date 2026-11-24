@@ -207,11 +207,20 @@ pub async fn resolve_due_step_commands<Eng: Send + Sync + 'static>(
                 return;
             };
             let key = cluster.primary_node_key(region);
+            // The programs the node's own applications installed: the Hadoop distribution,
+            // beside the Python interpreter every Amazon EMR release ships on a node
+            // ([`super::node_interpreter`]).
+            let interpreter = node_python_interpreter();
             StepNode {
                 disk: cluster.node_disk(&key),
                 key,
-                programs: cluster_hadoop_cli(cluster, cli.clone())
-                    .map(|hadoop| Box::new(hadoop) as Box<dyn EnvironmentPrograms>),
+                programs: Some(match cluster_hadoop_cli(cluster, cli.clone()) {
+                    Some(hadoop) => ::service_common::posix_shell_session::layered(
+                        Box::new(hadoop) as Box<dyn EnvironmentPrograms>,
+                        interpreter,
+                    ),
+                    None => interpreter,
+                }),
             }
         };
         // One command is performed at a time, so a command another call is still performing —

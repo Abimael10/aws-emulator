@@ -138,7 +138,10 @@ pub const APPLICATION_FIRST_WAIT: Duration = Duration::from_secs(2);
 /// CHOSEN: a run is an interpreter, a thread and the memory the two hold, so the number of
 /// them this process carries is bounded rather than following from how many steps a caller
 /// submits. The permit is held by the run's own thread and given back when that thread ends.
-pub const MAX_CONCURRENT_APPLICATION_RUNS: usize = 2;
+/// A step that found none waits for one rather than being reported as a step nothing ran
+/// ([`StartAttempt::NoInterpreter`]), so this bound decides how long a busy process takes to
+/// answer every owed run and never what any one step ends in.
+pub const MAX_CONCURRENT_APPLICATION_RUNS: usize = 4;
 
 /// How long a run waits for one of [`MAX_CONCURRENT_APPLICATION_RUNS`] to come free before
 /// nothing is run for it. CHOSEN: a bounded wait, so the operation that performs the run
@@ -282,6 +285,9 @@ pub struct StepApplicationPlan {
     /// The version of Spark the cluster's release ships, which is what the application is
     /// told it runs on — `None` for a cluster whose release bundles no Spark.
     pub spark_version: Option<String>,
+    /// The Spark properties the CLUSTER's own configuration sets, which are the defaults the
+    /// application's configuration starts with ([`spark_default_properties`]).
+    pub settings: Vec<(String, String)>,
 }
 
 impl ClusterRecord {
@@ -298,6 +304,9 @@ impl ClusterRecord {
             .as_deref()
             .and_then(|label| release_application_version(label, SPARK_APPLICATION_NAME))
             .map(str::to_string);
+        // The Spark properties this cluster's own configuration sets, which every
+        // application it runs is submitted with.
+        let settings = spark_default_properties(&self.configurations);
         self.steps
             .iter()
             .filter(|step| step.awaits_application() && step.start_date_time.is_some())
@@ -307,6 +316,7 @@ impl ClusterRecord {
                     application: step.application.clone()?,
                     execution_role_arn: step.execution_role_arn.clone(),
                     spark_version: spark_version.clone(),
+                    settings: settings.clone(),
                 })
             })
             .collect()
@@ -404,12 +414,17 @@ pub async fn run_due_step_applications<Eng: Send + Sync + 'static>(
                     None => instance_credentials.clone(),
                 };
                 match run_step_application(engine, ctx, region, &plan, &credentials, now).await {
-                    Some(StartedApplication::Answered(outcome)) => Some(outcome),
-                    Some(StartedApplication::Pending(pending)) => {
+                    StartAttempt::Started(StartedApplication::Answered(outcome)) => Some(outcome),
+                    StartAttempt::Started(StartedApplication::Pending(pending)) => {
                         state.lock().hold_step_application_run(key, pending);
                         continue;
                     }
-                    None => None,
+                    // NOTHING of the application ran: no interpreter of this process was
+                    // free for it. That is a fact about this process's load and no answer
+                    // about the submitted work, so the step stays owed its run for the next
+                    // call to make and is NOT counted as a run that answered nothing.
+                    StartAttempt::NoInterpreter => continue,
+                    StartAttempt::NoAnswer => None,
                 }
             }
         };
@@ -528,8 +543,22 @@ enum StartedApplication {
     Pending(PendingApplicationRun),
 }
 
+/// What ASKING this process to start one application came to.
+enum StartAttempt {
+    /// It was started, and this is where it got to.
+    Started(StartedApplication),
+    /// No interpreter of this process was free inside [`APPLICATION_PERMIT_WAIT`], so nothing
+    /// of the application ran at all. That is a fact about this process's load rather than an
+    /// attempt at the submitted work, so the step stays OWED its run and nothing is counted
+    /// against it.
+    NoInterpreter,
+    /// The run was started and answered nothing: its thread could not be spawned, or it ended
+    /// without reporting. Nothing is known about what the application came to.
+    NoAnswer,
+}
+
 /// Start ONE owed application and answer what its step ends in, the run itself when it is
-/// still going, or `None` when nothing ran at all.
+/// still going, or why nothing of it ran.
 async fn run_step_application<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
@@ -537,25 +566,27 @@ async fn run_step_application<Eng: Send + Sync + 'static>(
     plan: &StepApplicationPlan,
     credentials: &StepCredentials,
     now: SystemTime,
-) -> Option<StartedApplication> {
+) -> StartAttempt {
     let source = match read_application(ctx, region, &plan.application).await {
         Ok(source) => source,
         // The application's own file could not be read, which is a failure of the step
         // itself: there is nothing to run, and the step says exactly that.
         Err(detail) => {
-            return Some(StartedApplication::Answered(failed(
+            return StartAttempt::Started(StartedApplication::Answered(failed(
                 APPLICATION_UNREADABLE_REASON,
                 application_unreadable_message(&plan.application.path, &detail),
             )))
         }
     };
-    let permit = ::tokio::time::timeout(
+    let permit = match ::tokio::time::timeout(
         APPLICATION_PERMIT_WAIT,
         ::std::sync::Arc::clone(&APPLICATION_RUN_PERMITS).acquire_owned(),
     )
     .await
-    .ok()?
-    .ok()?;
+    {
+        Ok(Ok(permit)) => permit,
+        _ => return StartAttempt::NoInterpreter,
+    };
     // The calls the application itself makes present what the step runs with, over the same
     // in-process callback, and the application never sees the credential. An environment that
     // holds NO credential is given no seam at all: a call the application makes is then made
@@ -566,7 +597,10 @@ async fn run_step_application<Eng: Send + Sync + 'static>(
         }
         StepCredentials::Absent => None,
     };
-    run_application(plan, &source, access, permit, now).await
+    match run_application(plan, &source, access, permit, now).await {
+        Some(started) => StartAttempt::Started(started),
+        None => StartAttempt::NoAnswer,
+    }
 }
 
 /// The application's own source, read from the object its path names.
@@ -655,6 +689,7 @@ async fn run_application(
     .to_string();
     let step_id = plan.step_id.clone();
     let plan_spark_version = plan.spark_version.clone();
+    let plan_settings = plan.settings.clone();
     let (sender, mut receiver) = ::tokio::sync::oneshot::channel();
     let spawned = ::std::thread::Builder::new()
         .name("emr-spark-application".to_string())
@@ -662,7 +697,7 @@ async fn run_application(
         .spawn(move || {
             // Held for as long as the application runs, whoever is still waiting for it.
             let _permit = permit;
-            let modules = spark_runtime_modules(plan_spark_version.as_deref());
+            let modules = spark_runtime_modules(plan_spark_version.as_deref(), &plan_settings);
             let handler = application_entry_handler();
             let finished = python::run_against(
                 &python::Run {

@@ -99,3 +99,49 @@ Boot the emulator and replay the ten behavioral checks listed in trace_ids (serv
 4. Cause 4: launch a cluster with a `spark-defaults` Configurations classification setting `spark.sql.shuffle.partitions`, submit a job that reads it via `spark.conf.get`, performs a groupBy shuffle and saves a report; assert State COMPLETED, and on any non-zero exit assert FailureDetails.Message names the failing stage rather than being absent.
 5. Cause 5: submit `command-runner.jar` with Args `["bash", "-c", "set -eu; aws s3 cp s3://<b>/app.py /tmp/app.py; python3 /tmp/app.py \"$@\" > /tmp/out; aws s3 cp /tmp/out s3://<b>/out", "name", "plain", "two words", "", "$NOT_EXPANDED"]`; assert State COMPLETED and that the uploaded report shows the argv delivered byte-for-byte with only the zero-length argument dropped.
 6. Cause 6: submit a trivial SparkPi spark-submit step on a WAITING cluster; assert COMPLETED, then CreatePersistentAppUI/DescribePersistentAppUI for that application.
+
+## Resolution
+
+Causes 3, 4 and 5 are served, and causes 2 and 6's named root causes are no longer in the
+code base. Cause 1 is served only in part, and what remains of it is listed here so a later
+reader is not told it works.
+
+- **Cause 3 (selectExpr resolves no call, cast, operator or literal) — SERVED.** A projection's
+  expressions are read by the SQL expression grammar (`services/common/src/spark_runtime/expression.rs`):
+  literals, column references, calls resolved against `pyspark.sql.functions`' own catalog,
+  `cast(<expression> as <type>)`, the arithmetic, comparison, logical and concatenation
+  operators at their own precedence, `CASE`, and the null, membership and pattern tests. Pinned
+  by `services/service-com-amazonaws-emr-elasticmapreduce/tests/all/spark_step_sql_expressions.rs`.
+- **Cause 4 (`spark-defaults` never reached the application) — SERVED.** The properties a
+  cluster's `spark-defaults` classification sets are the defaults the application's `SparkConf`
+  loads, and `spark.sql.shuffle.partitions` is what a grouped aggregate is spread over. Pinned
+  by the same suite. One stated deviation: where nothing sets that property this engine keeps
+  the grouped dataset's own partitioning rather than Spark's 200, because it computes a whole
+  group in one process (stated on `_shuffle_partitions` in `services/common/src/spark_runtime/sql.rs`).
+- **Cause 5 (a `bash -c` step invoking `python3` exited 127) — SERVED for the step, not yet for
+  its argv.** The node provides `python3` (`state::node_interpreter`), a `sh -c` command line's
+  words after its program are that program's positional parameters, and a zero-length argument
+  is dropped where the command runner drops it. Pinned by
+  `tests/all/step_command_python_program.rs`. STILL OPEN: `"$@"` expands to the operands joined
+  by one space, because field splitting is a form the shared shell session
+  (`services/common/src/posix_shell_session.rs`) does not perform — so a script that reaches
+  for its arguments through `"$@"` rather than through `"$1"`… still does not see them as
+  separate words. That is a change to that session's word expansion.
+- **Causes 2 and 6 (pyspark.sql submodules absent; a SparkPi step FAILED) — the named causes
+  are gone.** The runtime supplies `pyspark/sql/types.py` and `pyspark/sql/functions.py`, and a
+  `spark-submit --class org.apache.spark.examples.SparkPi …` step on a cluster that admits the
+  submission settles COMPLETED. Both were confirmed over the wire before this change. The four
+  replay units behind them now end on a timeout inside the behavioural harness's own budget
+  rather than on the reasons recorded above; for the two persistent-app-UI units that stall is
+  the subject of its own open report.
+- **Cause 1 (a step whose command this emulator cannot run) — PART SERVED, PART OPEN.** Served:
+  a step whose application found no free interpreter in this process no longer settles in the
+  emulator-authored not-executed failure — that is a fact about this process's load and no
+  answer about the submitted work, so the step stays `RUNNING` and owed
+  (`StartAttempt::NoInterpreter` in `state::spark_step_run`). STILL OPEN, and the reason the
+  three traces of this cause still fail: the emulator runs no program for the command each of
+  them submits — `s3-dist-cp` (its copy and its `--groupBy` aggregation), the command the
+  CFN-submitted step carries, and the EMRFS write command of the SSE-KMS fixture. Each needs
+  its program implemented against the object store, beside `state::hadoop_cli` and
+  `state::step_command_transfers`, and until then those steps report the status a shell gives a
+  command it could not find.

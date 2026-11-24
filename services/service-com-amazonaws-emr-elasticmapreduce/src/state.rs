@@ -60,6 +60,11 @@ pub use configuration_classifications::*;
 mod step_runner;
 pub use step_runner::*;
 
+/// The PYTHON INTERPRETER a cluster node's command line runs a program with, split out of
+/// this root as its own concern and re-exported the same way.
+mod node_interpreter;
+pub use node_interpreter::*;
+
 /// The metastore DDL a step's statement submits — the partitions it adds to or removes from
 /// the cluster's Hive metastore — split out of this root as its own concern and re-exported
 /// the same way.

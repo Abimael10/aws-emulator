@@ -117,7 +117,6 @@ HIVE_NULL_PARTITION = "__HIVE_DEFAULT_PARTITION__"
 # where PySpark's own column expressions live, and used by both this engine and the function
 # catalog over it ([`pyspark.sql.column`], [`pyspark.sql.functions`]).
 from pyspark.sql.column import (
-    AGGREGATES,
     CAST_TYPES,
     Column,
     aggregate as _aggregate_of,
@@ -125,100 +124,11 @@ from pyspark.sql.column import (
     field as _field,
     sort_key as _sort_key,
     type_of as _type_of,
-    values_aggregate as _values_aggregate,
 )
 
-
-class _Read(object):
-    """One SQL expression of a projection, as its own grammar reads it.
-
-    `selectExpr` takes "SQL expressions" (`DataFrame.selectExpr`), and this is the reading of
-    the ones this engine computes: a column, optionally cast, optionally inside an aggregate
-    function, optionally named by an alias. It is read by walking the expression's own
-    grammar — the function's parentheses, the `cast(<column> as <type>)` form and the trailing
-    `as <alias>` — and never by matching the expression's text against a known one.
-    """
-
-    def __init__(self, function, column, cast, alias):
-        self.function = function
-        self.column = column
-        self.cast = cast
-        self.alias = alias
-
-
-def _split_alias(text):
-    """`text` and the alias a trailing `as <name>` gives it, or `None` when it names none.
-
-    The `as` that names an alias is one OUTSIDE every bracket: the `cast(<column> as <type>)`
-    form carries an `as` of its own, so the split is made at bracket depth zero and never
-    inside a call. The LAST such `as` is the alias marker, as the expression's own grammar
-    puts it at the end.
-    """
-    lowered = text.lower()
-    depth = 0
-    at = -1
-    for index, character in enumerate(text):
-        if character == "(":
-            depth += 1
-        elif character == ")":
-            depth -= 1
-        elif depth == 0 and lowered[index : index + 4] == " as ":
-            at = index
-    if at < 0:
-        return text.strip(), None
-    alias = text[at + 4 :].strip().strip("`").strip('"')
-    return text[:at].strip(), alias or None
-
-
-def _call(text):
-    """The function `text` calls and its argument, or `None` when it calls none."""
-    if not text.endswith(")"):
-        return None
-    at = text.find("(")
-    if at <= 0:
-        return None
-    return text[:at].strip().lower(), text[at + 1 : -1].strip()
-
-
-def _read_expression(text):
-    """[`_Read`] of one SQL expression."""
-    body, alias = _split_alias(text.strip())
-    function = None
-    called = _call(body)
-    if called is not None and called[0] in AGGREGATES:
-        function, body = called
-    cast = None
-    called = _call(body)
-    if called is not None and called[0] == "cast":
-        inner, kind = _split_alias(called[1])
-        if kind is None:
-            raise AnalysisException("a cast names the type to read the value as: %s" % (text,))
-        if kind.lower() not in CAST_TYPES:
-            raise AnalysisException("cannot resolve the data type %s" % (kind,))
-        cast = kind.lower()
-        body = inner.strip()
-    column = body.strip().strip("`")
-    if alias is None:
-        alias = text.strip()
-    return _Read(function, column, cast, alias)
-
-
-def read_sql_expression(text):
-    """One SQL expression of a projection, as the COLUMN EXPRESSION it names.
-
-    The grammar is the one `selectExpr` takes ([`_read_expression`]), so a form outside it
-    raises that grammar's own analysis failure rather than answering an expression nothing
-    computes.
-    """
-    read = _read_expression(text)
-    if read.function and read.column in ("*", "1", ""):
-        return _aggregate_of(read.function, None).alias(read.alias)
-    held = _field(read.column)
-    if read.cast is not None:
-        held = held.cast(read.cast)
-    if read.function:
-        return _aggregate_of(read.function, held).alias(read.alias)
-    return held.alias(read.alias)
+# The SQL EXPRESSION GRAMMAR a projection's expressions are read by, stated once beside the
+# expression surface it builds ([`pyspark.sql.expression`]).
+from pyspark.sql.expression import read_sql_expression
 
 
 def _range_aggregate(function, span):
@@ -1136,12 +1046,15 @@ class DataFrame(object):
         """The types a projection carries over: those of the columns it refers to.
 
         An expression that is a bare reference projects the column it names, so the type
-        that column already carries is the type of the projected one; anything else is
-        typed by the values it computes.
+        that column already carries is the type of the projected one; one that READS that
+        column as another type carries the type the cast names; anything else is typed by
+        the values it computes.
         """
         held = {}
         for column in columns:
-            if column._field is not None and column._field in self._columns:
+            if column._cast is not None:
+                held[column._name] = CAST_TYPES[column._cast][0]
+            elif column._field is not None and column._field in self._columns:
                 held[column._name] = self._column_type(column._field)
         return held
 
@@ -1149,18 +1062,33 @@ class DataFrame(object):
         """The ONE row every aggregate answers, over `rows` or over this whole dataset."""
         values = {}
         kinds = {}
-        held = self._frame_rows() if rows is None else rows
+        # The rows are made only where an aggregate really needs them: one answered from a
+        # SPAN's own definition needs none, which is what lets a dataset far larger than this
+        # process could hold rows for be aggregated at all.
+        held = rows
         for column in columns:
-            if (
+            inner = column._inner
+            over_the_span = (
                 rows is None
                 and self._span is not None
-                and column._inner is not None
-                and column._inner._field is not None
-                and column._inner._field == self._columns[0]
-            ):
+                and bool(self._columns)
+                and (
+                    # `count(*)` counts the values of the span, which is how many it holds.
+                    (inner is None and column._aggregate == "count")
+                    or (inner is not None and inner._field == self._columns[0])
+                )
+            )
+            if over_the_span:
                 # The span's own definition answers it, so no row of it is ever made.
                 value, kind = _range_aggregate(column._aggregate, self._span)
+                if inner is not None and inner._cast is not None:
+                    # A cast inside the aggregate reads every value as that type, so the
+                    # aggregate's own type is that one and its value is read as it.
+                    value = _cast_value(value, inner._cast)
+                    kind = CAST_TYPES[inner._cast][0]
             else:
+                if held is None:
+                    held = self._frame_rows()
                 value, kind = column.over(held)
             values[column._name] = value
             kinds[column._name] = kind
@@ -1304,72 +1232,20 @@ class DataFrame(object):
     def selectExpr(self, *exprs):
         """The dataset the SQL expressions project, as `selectExpr` takes them.
 
-        Each expression is read by its own grammar ([`_read_expression`]) and then COMPUTED
-        over this dataset: a projection answers one row per row of it, and an aggregate
-        answers the one row every aggregate answers — over the span's own definition where
-        this dataset is a span, and over its values otherwise.
+        Each expression is read by the SQL expression grammar
+        ([`pyspark.sql.expression`]) and then computed over this dataset exactly as the
+        column expressions `select` takes are: a projection answers one row per row of it,
+        and an aggregate answers the one row every aggregate answers — over the span's own
+        definition where this dataset is a span, and over its values otherwise. The name `*`
+        stands for every column of the dataset, as it does in a projection's own grammar.
         """
-        reads = [_read_expression(str(expr)) for expr in exprs]
-        if not reads:
+        held = []
+        for expr in _flattened(exprs):
+            spelled = str(expr)
+            held.append("*" if spelled.strip() == "*" else read_sql_expression(spelled))
+        if not held:
             raise AnalysisException("a projection names no expression")
-        aggregates = [read for read in reads if read.function]
-        if aggregates and len(aggregates) != len(reads):
-            raise AnalysisException(
-                "grouping expressions sequence is empty, and %s is not an aggregate function"
-                % (reads[0].alias,)
-            )
-        if aggregates:
-            values = {}
-            types = {}
-            for read in reads:
-                value, kind = self._aggregate(read)
-                values[read.alias] = value
-                types[read.alias] = kind
-            names = [read.alias for read in reads]
-            return DataFrame([Row(**values)], names, 1, None, types)
-        names = [read.alias for read in reads]
-        rows = []
-        for row in self._frame_rows():
-            projected = {}
-            for read in reads:
-                projected[read.alias] = _cast_value(self._value_of(row, read.column), read.cast)
-            rows.append(Row(**projected))
-        types = {}
-        for read in reads:
-            if read.cast is not None:
-                types[read.alias] = CAST_TYPES[read.cast][0]
-            else:
-                types[read.alias] = self._column_type(read.column)
-        return DataFrame(rows, names, self._partitions, None, types)
-
-    def _value_of(self, row, column):
-        if column not in self._columns:
-            raise AnalysisException("cannot resolve the column %s" % (column,))
-        return row[column]
-
-    def _aggregate(self, read):
-        """What one aggregate expression comes to over this dataset, and the type it has."""
-        if read.function == "count" and read.column in ("*", "1", ""):
-            return self.count(), BIGINT
-        if read.column not in self._columns:
-            raise AnalysisException("cannot resolve the column %s" % (read.column,))
-        if self._span is not None and read.column == self._columns[0]:
-            # The span's own definition answers it, so no row of it is ever made.
-            value, kind = _range_aggregate(read.function, self._span)
-        else:
-            values = [
-                _cast_value(row[read.column], read.cast) for row in self._frame_rows()
-            ]
-            value, kind = _values_aggregate(read.function, values)
-            return value, kind
-        if read.cast is None or value is None:
-            return value, kind
-        # A cast inside the aggregate reads every value as that type, so the aggregate's own
-        # type is that one. The value is the aggregate of the span, read as the cast type:
-        # the sum of a progression is exact in whole numbers, so reading it as a double is
-        # ONE rounding of the true total — which is what a client comparing the two sees the
-        # loss of, rather than the accumulation order of an engine it cannot observe.
-        return _cast_value(value, read.cast), CAST_TYPES[read.cast][0]
+        return self.select(*held)
 
     def show(self, n=20, truncate=True, vertical=False):
         for row in self.take(n):
@@ -1451,7 +1327,9 @@ class GroupedData(object):
         for key in self._keys:
             if key._field is not None:
                 types[key._name] = self._frame._column_type(key._field)
-        return DataFrame(rows, names, 1, None, types)
+        return DataFrame(
+            rows, names, _shuffle_partitions(self._frame._partitions), None, types
+        )
 
     def count(self):
         """How many rows each group holds, under the name Spark gives that column."""
@@ -1487,6 +1365,38 @@ class GroupedData(object):
                 and name not in [key._name for key in self._keys]
             ]
         return self.agg([_aggregate_of(function, _field(name)) for name in named])
+
+
+# "spark.sql.shuffle.partitions": "the default number of partitions to use when shuffling
+# data for joins or aggregations" (the Spark SQL configuration documentation), which is what
+# a GROUPED aggregate's own partitioning is.
+SHUFFLE_PARTITIONS_PROPERTY = "spark.sql.shuffle.partitions"
+
+
+def _shuffle_partitions(held):
+    """How many partitions a SHUFFLE of this engine answers over.
+
+    The property above is what the environment sets it to, so a grouping answers that many
+    partitions where the environment the program runs in sets one — which is what a write of
+    the aggregate then leaves.
+
+    Where NOTHING sets it the answer is `held`, the partitioning of the dataset that was
+    grouped, and that is a DEVIATION stated here rather than Spark's own default of 200: this
+    engine computes a whole group in one process, so there is no exchange to spread a grouping
+    across and 200 partitions would be 199 empty ones in every write. A program that wants a
+    width names it, the way one does on a real cluster, and gets it.
+    """
+    session = SparkSession.getActiveSession()
+    if session is None:
+        return held
+    spelled = session.conf.get(SHUFFLE_PARTITIONS_PROPERTY)
+    if spelled is None:
+        return held
+    try:
+        asked = int(str(spelled))
+    except ValueError:
+        return held
+    return asked if asked > 0 else held
 
 
 class SparkSession(object):

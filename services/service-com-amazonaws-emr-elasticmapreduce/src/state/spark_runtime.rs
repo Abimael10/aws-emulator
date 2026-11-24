@@ -22,17 +22,26 @@ use ::service_com_amazonaws_lambda_awsgirapiservice::state::execution::package::
 
 /// The modules this emulator puts on a submitted application's import path, as the
 /// interpreter takes them: the shared `pyspark` package and the shared entry module that RUNS
-/// the application ([`::service_common::spark_runtime::submitted_program_modules`]).
+/// the application ([`::service_common::spark_runtime::submitted_program_modules_of`]).
 ///
 /// `spark_version` is the version of Spark the cluster's own release ships, which is what the
 /// application is told it is running on — `None` for a cluster whose release bundles no
-/// Spark, where nothing is known to tell it.
+/// Spark, where nothing is known to tell it. `settings` are the Spark properties the
+/// CLUSTER's own configuration sets ([`super::spark_default_properties`]), which are the
+/// defaults the application's configuration starts with, the way `spark-submit` loads a
+/// node's `spark-defaults.conf` for the application it submits.
 #[must_use]
-pub fn spark_runtime_modules(spark_version: Option<&str>) -> Vec<PackageModule> {
-    ::service_common::spark_runtime::submitted_program_modules(spark_version)
-        .into_iter()
-        .map(|(path, source)| PackageModule { path, source })
-        .collect()
+pub fn spark_runtime_modules(
+    spark_version: Option<&str>,
+    settings: &[(String, String)],
+) -> Vec<PackageModule> {
+    ::service_common::spark_runtime::submitted_program_modules_of(
+        ::service_common::spark_runtime::SparkEnvironment::shipping(spark_version)
+            .setting(settings),
+    )
+    .into_iter()
+    .map(|(path, source)| PackageModule { path, source })
+    .collect()
 }
 
 /// The module this emulator runs the submitted application FROM, and the function in it the
