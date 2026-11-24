@@ -890,18 +890,29 @@ async fn the_configuration_schema_matches_the_catalog_flag() {
                 "case {case}: an add-on configuration is an object, got {:?}",
                 root["type"]
             );
+            // A document that declares the install's own namespace key defaults it
+            // to the add-on's own namespace. A document that declares the add-on's
+            // keys ALONE declares no such key, so there is nothing to default.
+            if let Some(declared) = root["properties"].as_object().and_then(|properties| {
+                properties.get("namespace")
+            }) {
+                assert_eq!(
+                    declared["default"].as_str(),
+                    addon["defaultNamespace"].as_str(),
+                    "case {case}: the schema's namespace default is the add-on's own namespace, \
+                     got {declared:?}"
+                );
+            }
+            // `required` is a keyword only a build that cannot be installed
+            // without a property declares, so its PRESENCE is what the catalog's
+            // `requiresConfiguration` reports.
+            let required = root.get("required").map(|required| {
+                required
+                    .as_array()
+                    .unwrap_or_else(|| panic!("case {case}: expected a required list, got {schema:?}"))
+            });
             assert_eq!(
-                root["properties"]["namespace"]["default"].as_str(),
-                addon["defaultNamespace"].as_str(),
-                "case {case}: the schema's namespace default is the add-on's own namespace, \
-                 got {:?}",
-                root["properties"]["namespace"]
-            );
-            let required = root["required"]
-                .as_array()
-                .unwrap_or_else(|| panic!("case {case}: expected a required list, got {schema:?}"));
-            assert_eq!(
-                !required.is_empty(),
+                required.is_some_and(|required| !required.is_empty()),
                 build["requiresConfiguration"].as_bool() == Some(true),
                 "case {case}: the schema requires a property exactly when the catalog's \
                  requiresConfiguration says so, got required {required:?} against {:?}",

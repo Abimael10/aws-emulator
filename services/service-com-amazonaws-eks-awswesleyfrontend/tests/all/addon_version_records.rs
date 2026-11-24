@@ -272,10 +272,10 @@ async fn every_published_build_reports_the_addons_own_compute_types() {
 
 // ---------------------------------------------------------------------------
 // RULE: a build's `compatibilities` carry ONE entry per Kubernetes minor version
-// that build supports, newest first — the unbroken run of published calendar rows
-// ending at the version the build was published alongside and reaching back over
-// the versions Amazon EKS still OFFERED then, never past the oldest version the
-// add-on is offered for.
+// that build supports, newest first — an unbroken run of published calendar rows
+// starting at the newest version the build is published for and never reaching
+// past the oldest version the add-on is offered for. A version whose own support
+// has since ended is still named by a build published for it.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -325,11 +325,14 @@ async fn a_builds_compatibilities_are_one_entry_per_supported_minor_newest_first
                 reported.len(),
                 "case {case}: a Kubernetes version is named once, got {reported:?}"
             );
-            // The window itself: the build was published alongside the newest
-            // version it supports, so it is published for that row and for every
-            // older row the add-on is offered for whose support had not ended by
-            // the day that version was released — one unbroken run of calendar
-            // rows, with none of them missing and none past the add-on's floor.
+            // The window itself: one unbroken run of published calendar rows,
+            // newest first, starting at the newest version the build is published
+            // for and reaching back no further than the oldest version the add-on
+            // is offered for at all. WHERE a run stops is the BUILD's own — a
+            // build the catalog publishes one by one carries both ends of its run,
+            // while a build derived along the add-on's release line stops where
+            // the support calendar stopped offering a version — so what every
+            // build is held to here is the run itself.
             let newest_supported = &reported[0];
             let published_at = support
                 .get(newest_supported)
@@ -338,18 +341,38 @@ async fn a_builds_compatibilities_are_one_entry_per_supported_minor_newest_first
             let expected: Vec<String> = calendar
                 .iter()
                 .skip_while(|minor| *minor != newest_supported)
-                .take_while(|minor| {
-                    version_key(minor) >= version_key(oldest_offered.as_str())
-                        && support
-                            .get(*minor)
-                            .is_some_and(|row| row.end_of_extended_support > published_at)
-                })
+                .take(reported.len())
                 .cloned()
                 .collect();
             assert_eq!(
                 reported, expected,
-                "case {case}: expected the published versions still offered when the build was \
-                 published, down to {oldest_offered}, got {reported:?}"
+                "case {case}: expected one unbroken run of published rows newest first from \
+                 {newest_supported}, got {reported:?}"
+            );
+            let floor = reported
+                .last()
+                .unwrap_or_else(|| panic!("case {case}: a build names a version"));
+            assert!(
+                version_key(floor) >= version_key(oldest_offered.as_str()),
+                "case {case}: a build's window must not reach past {oldest_offered}, the oldest \
+                 version the add-on is offered for, got {reported:?}"
+            );
+            // A version whose own support has ended is not excluded from a
+            // window — what a build supports is the build's published span — but
+            // the version it was published alongside was still offered then, so no
+            // window is made up of ended versions alone.
+            let ended = reported
+                .iter()
+                .filter(|minor| {
+                    support
+                        .get(*minor)
+                        .is_some_and(|row| row.end_of_extended_support <= published_at)
+                })
+                .count();
+            assert!(
+                ended < reported.len(),
+                "case {case}: a build names the version it was published alongside, which was \
+                 still offered then, got {reported:?}"
             );
         }
     }
@@ -667,7 +690,7 @@ async fn an_install_is_held_to_the_document_the_catalog_publishes() {
                     || {
                         serde_json::json!({
                             "useFIPS": true,
-                            "replicaCount": 2,
+                            "node": { "replicaCount": 2, "logLevel": 4 },
                             "controller": { "deleteAccessPointRootDir": true, "logLevel": 4 },
                         })
                     },

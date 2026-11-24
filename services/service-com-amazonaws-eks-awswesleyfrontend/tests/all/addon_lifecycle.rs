@@ -209,7 +209,7 @@ async fn a_created_addon_reads_back_exactly_as_stored() {
             "a YAML configuration document",
             serde_json::json!({
                 "addonName": "aws-efs-csi-driver",
-                "configurationValues": "replicaCount: 2\n",
+                "configurationValues": "useFIPS: true\n",
             }),
         ),
         (

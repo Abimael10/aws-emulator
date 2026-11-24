@@ -233,6 +233,21 @@ fn schema_service_account_default(body: &serde_json::Value, case: &str) -> Optio
         .map(str::to_string)
 }
 
+/// Whether a published configuration document declares the keys the INSTALL
+/// takes: the namespace the add-on is installed into and the service account it
+/// runs as.
+///
+/// A document whose add-on's chart configures its components separately declares
+/// the add-on's own keys ALONE, so it carries neither — the namespace and the
+/// service account are members of `CreateAddon`'s own request there, not keys of
+/// a configuration document.
+fn declares_install_keys(body: &serde_json::Value, case: &str) -> bool {
+    let schema: serde_json::Value =
+        serde_json::from_str(&string_member(body, "configurationSchema"))
+            .unwrap_or_else(|error| panic!("case {case}: configurationSchema must be JSON: {error}"));
+    !schema_root(&schema)["properties"]["namespace"].is_null()
+}
+
 #[tokio::test]
 async fn every_service_account_an_addon_runs_as_is_published_with_its_policies() {
     let router = emulator();
@@ -277,13 +292,20 @@ async fn every_service_account_an_addon_runs_as_is_published_with_its_policies()
         }
 
         // The schema's service account default is the add-on's FIRST published
-        // entry, and an add-on that runs as none declares no default: a second
-        // entry adds a recommendation, it does not change the install default.
+        // entry wherever the document declares that install key: a second entry
+        // adds a recommendation, it does not change the install default. A document
+        // that declares the add-on's OWN keys alone — the charts that configure
+        // their components separately — declares neither of the install's keys, so
+        // it carries no default to read, and an add-on that runs as no service
+        // account of its own declares none either.
         let default = schema_service_account_default(&answer.body, &case);
+        let expected_default = declares_install_keys(&answer.body, &case)
+            .then(|| expected_accounts.first().copied())
+            .flatten();
         assert_eq!(
             default.as_deref(),
-            expected_accounts.first().copied(),
-            "case {case}: expected the first published service account as the schema \
+            expected_default,
+            "case {case}: expected {expected_default:?} as the schema's service account \
              default, got {default:?}"
         );
     }

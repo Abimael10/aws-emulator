@@ -44,6 +44,7 @@ use service_com_amazonaws_eks_awswesleyfrontend::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::addon_catalog_publication::schema_root;
 use crate::addon_deletion::delete_addon;
 use crate::addon_lifecycle::{create_addon, default_cluster_version, describe_addon};
 use crate::addon_versions::describe_addon_versions;
@@ -187,6 +188,64 @@ async fn published_with_owner(
                 .to_owned()
         })
         .collect()
+}
+
+/// Whether the document the catalog publishes for the newest build of
+/// `addon_name` on `kubernetes_version` declares `property` at its root, read out
+/// of `DescribeAddonConfiguration` rather than assumed here.
+///
+/// A published document declares the keys the ADD-ON's own chart exposes, so a
+/// chart that configures its components separately declares its components alone
+/// and not the shared placement keys: an add-on like that is not one a row setting
+/// such a key can be sent to.
+async fn declares_root_key(
+    router: &MultiServiceRouter,
+    addon_name: &str,
+    kubernetes_version: &str,
+    property: &str,
+) -> bool {
+    let listed = describe_addon_versions(
+        router,
+        &format!(
+            "addonName={}&kubernetesVersion={}",
+            encode_label(addon_name),
+            encode_label(kubernetes_version)
+        ),
+    )
+    .await;
+    assert_eq!(
+        listed.status, 200,
+        "setup DescribeAddonVersions({addon_name}): got {listed:?}"
+    );
+    let addon_version = listed.body["addons"][0]["addonVersions"][0]["addonVersion"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("setup {addon_name}: expected a published build, got {:?}", listed.body)
+        })
+        .to_owned();
+    let answer = call(
+        router,
+        REGION,
+        "GET",
+        &format!(
+            "/addons/configuration-schemas?addonName={}&addonVersion={}",
+            encode_label(addon_name),
+            encode_label(&addon_version)
+        ),
+        "",
+    )
+    .await;
+    assert_eq!(
+        answer.status, 200,
+        "setup DescribeAddonConfiguration({addon_name}, {addon_version}): got {answer:?}"
+    );
+    let document: serde_json::Value = serde_json::from_str(
+        answer.body["configurationSchema"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a configurationSchema, got {:?}", answer.body)),
+    )
+    .unwrap_or_else(|error| panic!("{addon_name}: configurationSchema must be JSON: {error}"));
+    !schema_root(&document)["properties"][property].is_null()
 }
 
 // ---------------------------------------------------------------------------
@@ -415,11 +474,14 @@ async fn a_configuration_document_is_read_in_either_format_and_held_to_the_schem
     let created = create_cluster(&router, cluster).await;
     assert_eq!(created.status, 200, "setup CreateCluster: got {created:?}");
 
-    // `priorityClassName` is one of the keys every published add-on's schema
-    // declares and takes a string (source: the common properties
-    // `DescribeAddonConfiguration` publishes, read in this crate's `addon_versions`
-    // suite), so the rows below can set it, mistype it and misspell it in both
-    // document formats.
+    // `priorityClassName` is one of the keys the published add-on schemas that
+    // expose the Kubernetes placement values at their root declare, and it takes a
+    // string (source: the common properties `DescribeAddonConfiguration`
+    // publishes, read in this crate's `addon_versions` suite), so the rows below
+    // can set it, mistype it and misspell it in both document formats. Which
+    // add-ons declare it is read out of the published documents themselves
+    // ([`declares_root_key`]).
+    const DECLARED_KEY: &str = "priorityClassName";
     const UNDECLARED: &str = "$.notAProperty: is not defined in the schema and the schema does \
                               not allow additional properties";
     let rows = vec![
@@ -477,12 +539,19 @@ async fn a_configuration_document_is_read_in_either_format_and_held_to_the_schem
     ];
 
     // Every row installs a DIFFERENT add-on, because one name installs at most
-    // once per cluster and an accepted row writes a record.
-    let published =
-        published_with_owner(&router, "aws", &default_cluster_version(&router).await).await;
+    // once per cluster and an accepted row writes a record — and every one of them
+    // is an add-on whose published document declares the key the rows set.
+    let kubernetes_version = default_cluster_version(&router).await;
+    let mut published = Vec::new();
+    for addon in published_with_owner(&router, "aws", &kubernetes_version).await {
+        if declares_root_key(&router, &addon, &kubernetes_version, DECLARED_KEY).await {
+            published.push(addon);
+        }
+    }
     assert!(
         published.len() >= rows.len(),
-        "setup: the catalog must publish at least {} Amazon EKS add-ons, got {}",
+        "setup: the catalog must publish at least {} Amazon EKS add-ons declaring \
+         {DECLARED_KEY}, got {}",
         rows.len(),
         published.len()
     );

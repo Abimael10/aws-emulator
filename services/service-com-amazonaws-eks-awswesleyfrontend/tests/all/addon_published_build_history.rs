@@ -7,8 +7,9 @@
 //!
 //! The RULE under test: **an add-on's published builds, and the Kubernetes
 //! versions each of them supports, are that ADD-ON's own published history — each
-//! build is offered for the Kubernetes versions Amazon EKS still offered when that
-//! build was published, and an add-on whose publisher has stopped publishing is
+//! build names the Kubernetes versions Amazon EKS publishes that build for, an
+//! unbroken run of published calendar rows ending at the newest version the build
+//! was published for, and an add-on whose publisher has stopped publishing is
 //! still listed with the builds it has while being offered for no Kubernetes
 //! version released since. The request's `kubernetesVersion` SELECTS rows out of
 //! that history: it keeps the add-ons that have a build supporting the version
@@ -127,20 +128,28 @@ async fn published_history(router: &MultiServiceRouter) -> BTreeMap<String, Publ
 }
 
 // ---------------------------------------------------------------------------
-// RULE: a build is published for the Kubernetes versions Amazon EKS still
-// OFFERED when the build was published — so no build names a version whose
-// extended support had already ended on the day the newest version it supports
-// was released, and the window of a newer build never reaches further back than
-// the window of an older one.
+// RULE: a build names the Kubernetes versions Amazon EKS publishes THAT BUILD
+// for — an unbroken run of published calendar rows, newest first, none of them
+// released after the build itself, and the window of a newer build never reaches
+// further back than the window of an older one. A version whose own support has
+// since ended is still one a build is published for: a cluster still running it
+// reads this listing to find the build it may install.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_published_build_is_offered_for_the_versions_still_offered_when_it_was_published() {
+async fn a_published_builds_versions_are_an_unbroken_run_of_the_published_calendar() {
     let router = emulator();
     let calendar = published_calendar(&router).await;
     let released: BTreeMap<&str, &CalendarRow> = calendar
         .iter()
         .map(|row| (row.cluster_version.as_str(), row))
+        .collect();
+    // Where each published version sits in the calendar, newest first, so a
+    // build's window can be held to a RUN of rows rather than to a set.
+    let calendar_position: BTreeMap<&str, usize> = calendar
+        .iter()
+        .enumerate()
+        .map(|(position, row)| (row.cluster_version.as_str(), position))
         .collect();
     let history = published_history(&router).await;
     assert!(
@@ -163,22 +172,29 @@ async fn a_published_build_is_offered_for_the_versions_still_offered_when_it_was
                 .get(newest.as_str())
                 .map(|row| row.released)
                 .unwrap_or_else(|| panic!("case {case}: the calendar publishes {newest}"));
-            for minor in supported {
+            let first_position = *calendar_position
+                .get(newest.as_str())
+                .unwrap_or_else(|| panic!("case {case}: the calendar publishes {newest}"));
+            for (step, minor) in supported.iter().enumerate() {
                 let row = released
                     .get(minor.as_str())
                     .unwrap_or_else(|| panic!("case {case}: the calendar publishes {minor}"));
-                // A version nobody can still be running is not one a new build is
-                // published for.
-                assert!(
-                    row.end_of_extended_support > published_at,
-                    "case {case}: a build published alongside {newest} must not name {minor}, \
-                     whose extended support ended first, got {supported:?}"
-                );
-                // Nor is a version released after the build was published.
+                // A version released after the build was published is not one it
+                // was published for.
                 assert!(
                     row.released <= published_at,
                     "case {case}: a build published alongside {newest} must not name {minor}, \
                      released later, got {supported:?}"
+                );
+                // And the versions it names are the calendar's own consecutive
+                // rows, newest first: a build is published for a RUN of versions,
+                // so a client reading one build learns the whole span it covers
+                // with no row missing out of the middle of it.
+                assert_eq!(
+                    calendar_position.get(minor.as_str()),
+                    Some(&(first_position + step)),
+                    "case {case}: the versions a build names are consecutive published rows \
+                     newest first, got {supported:?}"
                 );
             }
             // The window moves FORWARD along the calendar with the add-on's own
@@ -207,6 +223,29 @@ async fn a_published_build_is_offered_for_the_versions_still_offered_when_it_was
         windows.len() > 1,
         "case the published windows: a catalog that names one window for every build cannot \
          answer which versions a build was published for, got {windows:?}"
+    );
+    // And a window reaches back PAST the support calendar: a build published for a
+    // Kubernetes version whose extended support had already ended still names that
+    // version, which is what a cluster still running it installs. A catalog that
+    // cut each window at the support calendar would tell such a cluster the add-on
+    // has no build for it at all.
+    let reaches_past_support = history.values().flatten().any(|(_, supported)| {
+        let published_at = supported
+            .first()
+            .and_then(|newest| released.get(newest.as_str()))
+            .map(|row| row.released);
+        published_at.is_some_and(|published_at| {
+            supported.iter().any(|minor| {
+                released
+                    .get(minor.as_str())
+                    .is_some_and(|row| row.end_of_extended_support <= published_at)
+            })
+        })
+    });
+    assert!(
+        reaches_past_support,
+        "case the published windows: a build is published for every version it supports, \
+         out-of-support ones included, got {windows:?}"
     );
 }
 

@@ -236,7 +236,10 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
         publisher: ADDON_PUBLISHER_EKS,
         addon_type: "observability",
         default_namespace: "opentelemetry-operator-system",
-        requires_iam_permissions: false,
+        // The collector the operator runs writes the traces and metrics it
+        // gathers to AWS — X-Ray, Amazon Managed Service for Prometheus,
+        // CloudWatch — so the add-on needs IAM permissions of its own.
+        requires_iam_permissions: true,
         required_configuration: &[],
         pod_identity: &[],
         configuration_properties: &[
@@ -247,9 +250,13 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
             ("tolerations", "array"),
         ],
         schema_dialect: ADDON_SCHEMA_DIALECT_DRAFT_06,
-        first_cluster_version: None,
-        // The operator's line stays inside its 0.x series.
-        releases: &[(0, 102, 1)],
+        // The operator is offered on the Kubernetes versions its published builds
+        // name ([`ADDON_PUBLISHED_BUILDS`]), the oldest of which is this row.
+        first_cluster_version: Some("1.31"),
+        // The operator's line stays inside its 0.x series; the builds themselves
+        // are the ones [`ADDON_PUBLISHED_BUILDS`] carries rather than a build per
+        // calendar row.
+        releases: &[(0, 151, 0), (0, 156, 0)],
     },
     AddonCatalogSeed {
         // Akuity's agent, which connects the cluster to the Akuity Platform's
@@ -473,11 +480,14 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
             ),
         ],
         configuration_properties: &[
+            // The driver's chart configures its two components separately, so
+            // each component's own values — its log level, its placement and its
+            // annotations — are declared INSIDE that component
+            // ([`ADDON_NESTED_CONFIGURATION_PROPERTIES`]) and the document's root
+            // declares the components themselves beside the one switch that
+            // belongs to the driver as a whole.
             ("controller", "object"),
             ("node", "object"),
-            ("replicaCount", "integer"),
-            ("sidecars", "object"),
-            ("storageClasses", "array"),
             // The key the guide's FIPS install sets: an add-on's schema
             // declares the options that add-on itself takes.
             ("useFIPS", "boolean"),
@@ -970,15 +980,22 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
         addon_type: "storage",
         default_namespace: "trident",
         requires_iam_permissions: false,
-        required_configuration: &[],
+        // The operator cannot install the Trident driver without being told which
+        // cloud provider's storage it is managing, so the add-on is one that
+        // requires configuration.
+        required_configuration: &["cloudProvider"],
         pod_identity: &[],
         configuration_properties: &[
             ("cloudProvider", "string"),
             ("tridentDebug", "boolean"),
         ],
         schema_dialect: ADDON_SCHEMA_DIALECT_DRAFT_06,
-        first_cluster_version: None,
-        releases: &[(100, 2, 0)],
+        // NetApp has listed the operator since this Kubernetes version, which is
+        // the oldest one its published builds name ([`ADDON_PUBLISHED_BUILDS`]).
+        first_cluster_version: Some("1.27"),
+        // The operator's own `YY.MM` line, whose builds are the ones
+        // [`ADDON_PUBLISHED_BUILDS`] carries.
+        releases: &[(26, 6, 0), (26, 6, 1)],
     },
     AddonCatalogSeed {
         addon_name: "prometheus-node-exporter",
@@ -1298,20 +1315,34 @@ pub(super) fn rebuilt_addon(addon_name: &str) -> Option<&'static str> {
         .map(|(_, rebuilt)| *rebuilt)
 }
 
+/// One build in a published build table: the version the build is published as,
+/// and the OLDEST and the NEWEST Kubernetes version Amazon EKS publishes that
+/// build for. See [`ADDON_PUBLISHED_BUILDS`].
+pub(super) type AddonPublishedBuild = (&'static str, &'static str, &'static str);
+
 /// The PUBLISHED build table of an add-on whose own builds this catalog carries,
 /// as `(the add-on's name, its builds OLDEST FIRST as `(the version the build is
-/// published as, the newest Kubernetes version Amazon EKS published that build
-/// for)`)`.
+/// published as, the OLDEST Kubernetes version Amazon EKS publishes that build
+/// for, the NEWEST Kubernetes version it publishes that build for)`)`.
 ///
 /// `AddonInfo$addonVersions` is the add-on's published release HISTORY, and that
 /// history belongs to the ADD-ON: its project publishes builds on its own
 /// cadence, so the builds are reference data per add-on rather than a function of
 /// the Kubernetes version calendar. An add-on with a row here publishes exactly
 /// these builds — one build may be the only one published across several
-/// Kubernetes versions, and an add-on whose publisher has stopped publishing has
-/// NO build for a Kubernetes version released after its last one, so it is still
-/// published with the builds it has while dropping out of a listing filtered to a
-/// newer Kubernetes version (and out of an install on a cluster running one).
+/// Kubernetes versions, several builds of ONE release line may each be published
+/// for the same Kubernetes versions (which is what the `-eksbuild.N` suffix
+/// counts), and an add-on whose publisher has stopped publishing has NO build for
+/// a Kubernetes version released after its last one, so it is still published
+/// with the builds it has while dropping out of a listing filtered to a newer
+/// Kubernetes version (and out of an install on a cluster running one).
+///
+/// A build's two calendar rows are the ENDS of the Kubernetes versions that build
+/// is published for, and both are the BUILD's own: `AddonVersionInfo`'s
+/// `compatibilities` is "information about available add-on versions and
+/// compatible Kubernetes versions", so it names every version the build supports
+/// — a version whose own support has since ended included, because a cluster
+/// still running it installs this build and reads the catalog to find it.
 ///
 /// An add-on with NO row here has its builds derived along its own release line
 /// ([`AddonCatalogSeed::releases`]), one per Kubernetes version it is offered
@@ -1321,14 +1352,38 @@ pub(super) fn rebuilt_addon(addon_name: &str) -> Option<&'static str> {
 ///
 /// Source: the build table the add-on's own published listing carries. AccuKnox
 /// has published ONE build of KubeArmor, offered for the Kubernetes versions that
-/// were still in support when it was published, and none since.
-pub(super) const ADDON_PUBLISHED_BUILDS: &[(&str, &[(&str, &str)])] =
-    &[("accuknox_kubearmor", &[("v0.10.2-eksbuild.1", "1.27")])];
+/// were still in support when it was published, and none since; the ADOT operator
+/// publishes a short line of builds — two of one release, which is what its
+/// second `-eksbuild` build counts — each offered for every Kubernetes version
+/// the operator supports; and NetApp publishes its Trident operator's own
+/// `YY.MM` line, each build offered over the ten Kubernetes versions the operator
+/// supports, up to the newest version NetApp has published a build for.
+pub(super) const ADDON_PUBLISHED_BUILDS: &[(&str, &[AddonPublishedBuild])] = &[
+    (
+        "accuknox_kubearmor",
+        &[("v0.10.2-eksbuild.1", "1.23", "1.27")],
+    ),
+    (
+        "adot",
+        &[
+            ("v0.151.0-eksbuild.1", "1.31", "1.37"),
+            ("v0.151.0-eksbuild.2", "1.31", "1.37"),
+            ("v0.156.0-eksbuild.1", "1.31", "1.37"),
+        ],
+    ),
+    (
+        "netapp_trident-operator",
+        &[
+            ("v26.6.0-eksbuild.1", "1.27", "1.36"),
+            ("v26.6.1-eksbuild.1", "1.27", "1.36"),
+        ],
+    ),
+];
 
 /// The published build table of the add-on named `addon_name`, or `None` for an
 /// add-on whose builds this catalog derives along its release line. See
 /// [`ADDON_PUBLISHED_BUILDS`].
-pub(super) fn published_build_table(addon_name: &str) -> Option<&'static [(&'static str, &'static str)]> {
+pub(super) fn published_build_table(addon_name: &str) -> Option<&'static [AddonPublishedBuild]> {
     // A vendor's rebuild of an add-on is the same software, so the builds it is
     // published at are the rebuilt add-on's own.
     let published_for = rebuilt_addon(addon_name).unwrap_or(addon_name);
@@ -1689,13 +1744,15 @@ impl AddonCatalogRecord {
     ///
     /// The properties it declares are THIS BUILD's own configurable keys
     /// ([`Self::schema_properties`], each with the JSON type that key takes) —
-    /// the add-on's own ([`AddonCatalogSeed::configuration_properties`]) and the
-    /// ones every add-on's schema carries
-    /// ([`ADDON_COMMON_CONFIGURATION_PROPERTIES`]), declared where the document
-    /// of that build puts them ([`ADDON_SCHEMA_KEY_RELEASES`]). They are declared
-    /// beside the two keys the install itself takes, the namespace the add-on is
-    /// installed into and the service account it runs as, and the properties the
-    /// build cannot be installed without. A document may set no other key, which is what
+    /// the add-on's own ([`AddonCatalogSeed::configuration_properties`]) and,
+    /// for an add-on whose chart exposes them at its root, the ones every other
+    /// add-on's schema carries ([`ADDON_COMMON_CONFIGURATION_PROPERTIES`]) —
+    /// declared where the document of that build puts them
+    /// ([`ADDON_SCHEMA_KEY_RELEASES`]). Unless the add-on's document declares its
+    /// own keys alone ([`ADDON_OWN_KEYS_ONLY_SCHEMAS`]) they are declared beside
+    /// the two keys the install itself takes, the namespace the add-on is
+    /// installed into and the service account it runs as.
+    /// A document may set no other key, which is what
     /// `additionalProperties: false` states, so a client reading the schema
     /// learns exactly the configuration surface of this add-on rather than a
     /// document shared by every one of them. Its `required` list is the build's
@@ -1703,7 +1760,8 @@ impl AddonCatalogRecord {
     /// [`AddonCatalogVersionRecord::required_configuration`], which is also what
     /// makes [`AddonCatalogVersionRecord::requires_configuration`] true: a build
     /// that requires configuration publishes a schema that requires it, and one
-    /// that does not publishes a schema with nothing required.
+    /// that does not publishes a schema with no `required` keyword at all
+    /// ([`declare_required`]).
     ///
     /// The document is the ADD-ON's own, so the dialect it declares is the
     /// add-on's own too ([`AddonCatalogSeed::schema_dialect`]): a client that
@@ -1747,17 +1805,27 @@ impl AddonCatalogRecord {
         // Whether this add-on's document carries its types in a `definitions`
         // section a root `$ref` points into, or declares them at the root.
         let references_definitions = self.schema_dialect != ADDON_SCHEMA_DIALECT_2019_09;
+        // Whether the add-on's published document declares its OWN keys alone
+        // ([`ADDON_OWN_KEYS_ONLY_SCHEMAS`]): a document that configures the
+        // add-on's components separately carries the placement of each component
+        // inside that component, and declares neither of the two keys the INSTALL
+        // takes — the namespace it is installed into and the service account it
+        // runs as, which `CreateAddon` takes as members of its own rather than as
+        // configuration values.
+        let own_keys_only = declares_own_keys_alone(&self.addon_name);
         let mut definitions = ::serde_json::Map::new();
         let mut properties = ::serde_json::Map::new();
-        properties.insert(
-            "namespace".to_string(),
-            ::serde_json::json!({
-                "type": "string",
-                "default": self.default_namespace,
-                "description": "The Kubernetes namespace the add-on is installed into.",
-            }),
-        );
-        if let Some((service_account, _)) = self.pod_identity.first() {
+        if !own_keys_only {
+            properties.insert(
+                "namespace".to_string(),
+                ::serde_json::json!({
+                    "type": "string",
+                    "default": self.default_namespace,
+                    "description": "The Kubernetes namespace the add-on is installed into.",
+                }),
+            );
+        }
+        if let Some((service_account, _)) = self.pod_identity.first().filter(|_| !own_keys_only) {
             let title = schema_definition_title("serviceAccount");
             let declared = ::serde_json::json!({
                 "type": "object",
@@ -1834,30 +1902,29 @@ impl AddonCatalogRecord {
             );
         }
         if !references_definitions {
-            return ::serde_json::json!({
+            let mut document = ::serde_json::json!({
                 "$schema": self.schema_dialect,
                 "description": format!("Configurable parameters for the {}", self.addon_name),
                 "type": "object",
                 "properties": ::serde_json::Value::Object(properties),
-                "required": version.required_configuration,
                 // A key the schema does not declare is not a key this add-on
                 // takes, so a document that sets one does not satisfy the schema.
                 "additionalProperties": false,
             });
+            declare_required(&mut document, &version.required_configuration);
+            return document;
         }
         let root = schema_definition_title(&self.addon_name);
-        definitions.insert(
-            root.clone(),
-            ::serde_json::json!({
-                "type": "object",
-                "title": root,
-                "properties": ::serde_json::Value::Object(properties),
-                "required": version.required_configuration,
-                // A key the schema does not declare is not a key this add-on
-                // takes, so a document that sets one does not satisfy the schema.
-                "additionalProperties": false,
-            }),
-        );
+        let mut declared = ::serde_json::json!({
+            "type": "object",
+            "title": root,
+            "properties": ::serde_json::Value::Object(properties),
+            // A key the schema does not declare is not a key this add-on
+            // takes, so a document that sets one does not satisfy the schema.
+            "additionalProperties": false,
+        });
+        declare_required(&mut declared, &version.required_configuration);
+        definitions.insert(root.clone(), declared);
         ::serde_json::json!({
             "$schema": self.schema_dialect,
             "$ref": format!("{JSON_SCHEMA_DEFINITION_PREFIX}{root}"),
@@ -2301,6 +2368,52 @@ pub(super) fn nested_configuration_properties(
         .unwrap_or_default()
 }
 
+/// The add-ons whose published configuration document declares that add-on's OWN
+/// keys ALONE.
+///
+/// A published document is the set of values the add-on's chart exposes, and a
+/// chart that configures the add-on's components separately exposes the placement
+/// and pod-metadata values INSIDE each component — the CSI drivers' `controller`
+/// and `node` objects carry their own node selector, annotations and tolerations
+/// — so those keys are not keys of the document's root. Such a document declares
+/// neither of the two keys the INSTALL takes either: the namespace the add-on is
+/// installed into and the service account it runs as are members of
+/// `CreateAddon`'s own request (`namespaceConfig`, `podIdentityAssociations`),
+/// not configuration values a chart takes.
+///
+/// So an add-on named here publishes the keys of its own row
+/// ([`AddonCatalogSeed::configuration_properties`]) and nothing else, while every
+/// other add-on's document declares the shared placement keys
+/// ([`ADDON_COMMON_CONFIGURATION_PROPERTIES`]) at its root beside its own, which
+/// is where its chart exposes them.
+///
+/// Source: the document `aws eks describe-addon-configuration --addon-name <name>
+/// --addon-version <build>` reports for the add-on — the same source the keys
+/// themselves are taken from.
+pub(super) const ADDON_OWN_KEYS_ONLY_SCHEMAS: &[&str] = &["aws-efs-csi-driver"];
+
+/// Whether the document the add-on named `addon_name` publishes declares its own
+/// keys alone. See [`ADDON_OWN_KEYS_ONLY_SCHEMAS`].
+pub(super) fn declares_own_keys_alone(addon_name: &str) -> bool {
+    // A vendor's rebuild of an add-on is the same software, so the document its
+    // builds publish is the rebuilt add-on's own.
+    let published_for = rebuilt_addon(addon_name).unwrap_or(addon_name);
+    ADDON_OWN_KEYS_ONLY_SCHEMAS.contains(&published_for)
+}
+
+/// Declare on a published schema document the properties a build cannot be
+/// installed without — and declare NOTHING when it has none.
+///
+/// JSON Schema's `required` is the list of properties a document must set, and a
+/// build that requires none publishes no `required` keyword at all rather than an
+/// empty list: an empty list is a keyword a validator still reads, and it is not
+/// what the add-on's published document carries.
+fn declare_required(document: &mut ::serde_json::Value, required: &[String]) {
+    if !required.is_empty() {
+        document["required"] = ::serde_json::json!(required);
+    }
+}
+
 /// One configuration key an add-on declares in DIFFERENT PLACES in the documents
 /// of its own release lines: the key, where the add-on's older builds declare it,
 /// and where its builds from one release on declare it instead.
@@ -2702,6 +2815,60 @@ fn build_compatibilities(first: usize, row: usize) -> Vec<AddonCompatibilityReco
         .collect()
 }
 
+/// The Kubernetes versions a CITED published build supports, NEWEST FIRST: every
+/// calendar row from the oldest version the catalog publishes that build for
+/// through the newest one ([`ADDON_PUBLISHED_BUILDS`]).
+///
+/// `AddonVersionInfo$compatibilities` is what the BUILD supports, and a published
+/// build table states both ends of that run per build, so nothing here is derived
+/// from the support calendar: a Kubernetes version whose own support has since
+/// ended is still one the build was published for, and a cluster still running
+/// that version reads this listing to find the build it may install. That is why a
+/// build cited for a run of versions keeps the whole run, while a build DERIVED
+/// along an add-on's release line gets the window its own publication day states
+/// ([`build_compatibilities`]).
+fn cited_build_compatibilities(oldest: usize, newest: usize) -> Vec<AddonCompatibilityRecord> {
+    VERSION_CALENDAR[oldest..=newest]
+        .iter()
+        .rev()
+        .map(|(cluster_version, _, _, _)| AddonCompatibilityRecord {
+            cluster_version: (*cluster_version).to_string(),
+            platform_versions: vec![ADDON_ANY_PLATFORM_VERSION.to_string()],
+        })
+        .collect()
+}
+
+/// The keys the document an add-on publishes declares at its root, each with the
+/// JSON type that key takes, in the document's own alphabetical order.
+///
+/// They are the add-on's own keys ([`AddonCatalogSeed::configuration_properties`])
+/// — alone for an add-on whose chart exposes its placement values inside its own
+/// components ([`ADDON_OWN_KEYS_ONLY_SCHEMAS`]), and otherwise beside the shared
+/// placement keys every other add-on's chart exposes at its root
+/// ([`ADDON_COMMON_CONFIGURATION_PROPERTIES`]).
+fn published_configuration_properties(seed: &AddonCatalogSeed) -> Vec<(String, String)> {
+    let common: &[AddonSchemaProperty] = if declares_own_keys_alone(seed.addon_name) {
+        &[]
+    } else {
+        ADDON_COMMON_CONFIGURATION_PROPERTIES
+    };
+    common
+        .iter()
+        .chain(seed.configuration_properties)
+        .map(|(property, json_type)| ((*property).to_string(), (*json_type).to_string()))
+        // A `BTreeMap` so a key the row declares a type of its own for overrides
+        // the common one, and the properties come out in the schema's
+        // alphabetical order with no duplicates.
+        .collect::<BTreeMap<String, String>>()
+        .into_iter()
+        .collect()
+}
+
+/// One build of one add-on as the seed reaches it: the version it is published
+/// as, the add-on's own release it is of, and the calendar rows of the oldest and
+/// the newest Kubernetes version it is published for.
+type SeededBuild = (String, (u32, u32, u32), usize, usize);
+
 /// Build the add-on catalog this service publishes from
 /// [`published_addon_seeds`].
 ///
@@ -2710,13 +2877,15 @@ fn build_compatibilities(first: usize, row: usize) -> Vec<AddonCompatibilityReco
 /// table this catalog cannot cite — one build per Kubernetes minor version it has
 /// been OFFERED for, along its own version line ([`addon_build_version`]).
 ///
-/// Whichever way its builds are reached, a build is published for the Kubernetes
-/// versions Amazon EKS still OFFERS when that build is published: the row it was
-/// published alongside and every older row the add-on has been offered for whose
-/// support — standard or extended — had not ended by then ([`build_compatibilities`]).
-/// So a build's `compatibilities` carry one entry per Kubernetes minor version it
-/// supports, newest first, and the window moves along the calendar with the
-/// add-on's own line instead of growing without end.
+/// A build's `compatibilities` carry one entry per Kubernetes minor version it
+/// supports, newest first. A build the catalog CITES carries the two ends of that
+/// run itself, so it keeps every version it is published for — a version whose own
+/// support has since ended included, which is what a cluster still running that
+/// version installs the build on ([`cited_build_compatibilities`]). A build
+/// DERIVED along an add-on's release line has no cited run, so its window is the
+/// one its publication day states: the row it was published alongside and every
+/// older row the add-on has been offered for whose support — standard or extended
+/// — had not ended by then ([`build_compatibilities`]).
 ///
 /// Which build is the DEFAULT for a Kubernetes version is not seeded: it is the
 /// newest PUBLISHED build that supports that version, decided per read against
@@ -2742,23 +2911,32 @@ pub(super) fn seed_addon_catalog() -> Vec<AddonCatalogRecord> {
             // The add-on's own published builds, oldest first, as `(the version,
             // the release it is of, the calendar row it was published
             // alongside)`.
-            let line: Vec<(String, (u32, u32, u32), usize)> =
+            let line: Vec<SeededBuild> =
                 match published_build_table(seed.addon_name) {
                     Some(published) => published
                         .iter()
-                        .map(|(addon_version, cluster_version)| {
-                            let row = calendar_row(seed.addon_name, cluster_version);
+                        .map(|(addon_version, oldest, newest)| {
+                            let oldest_row = calendar_row(seed.addon_name, oldest);
+                            let newest_row = calendar_row(seed.addon_name, newest);
                             assert!(
-                                row >= first,
+                                oldest_row >= first,
                                 "the add-on catalog publishes {} for Kubernetes \
-                                 {cluster_version}, which is older than the first version it \
+                                 {oldest}, which is older than the first version it \
                                  offers the add-on on",
+                                seed.addon_name
+                            );
+                            assert!(
+                                newest_row >= oldest_row,
+                                "the add-on catalog publishes {} at {addon_version} for \
+                                 Kubernetes {oldest} through {newest}, which is not a run of \
+                                 calendar rows",
                                 seed.addon_name
                             );
                             (
                                 (*addon_version).to_string(),
                                 published_build_release(seed.addon_name, addon_version),
-                                row,
+                                oldest_row,
+                                newest_row,
                             )
                         })
                         .collect(),
@@ -2767,34 +2945,45 @@ pub(super) fn seed_addon_catalog() -> Vec<AddonCatalogRecord> {
                             (
                                 addon_build_version(seed, row - first),
                                 addon_build_release(seed, row - first),
+                                // A derived build's window is the one the support
+                                // calendar states for it ([`build_compatibilities`]),
+                                // which is why its ends are not carried per build.
+                                first,
                                 row,
                             )
                         })
                         .collect(),
                 };
+            let cited = published_build_table(seed.addon_name).is_some();
             let mut versions: Vec<AddonCatalogVersionRecord> = line
                 .into_iter()
-                .map(|(addon_version, release, row)| AddonCatalogVersionRecord {
-                    addon_version,
-                    release,
-                    published_at: calendar_instant(VERSION_CALENDAR[row].1),
-                    architecture: ADDON_ARCHITECTURES
-                        .iter()
-                        .map(|architecture| (*architecture).to_string())
-                        .collect(),
-                    compute_types: seed
-                        .compute_types
-                        .iter()
-                        .map(|compute_type| (*compute_type).to_string())
-                        .collect(),
-                    compatibilities: build_compatibilities(first, row),
-                    required_configuration: seed
-                        .required_configuration
-                        .iter()
-                        .map(|property| (*property).to_string())
-                        .collect(),
-                    requires_iam_permissions: seed.requires_iam_permissions,
-                })
+                .map(
+                    |(addon_version, release, oldest_row, row)| AddonCatalogVersionRecord {
+                        addon_version,
+                        release,
+                        published_at: calendar_instant(VERSION_CALENDAR[row].1),
+                        architecture: ADDON_ARCHITECTURES
+                            .iter()
+                            .map(|architecture| (*architecture).to_string())
+                            .collect(),
+                        compute_types: seed
+                            .compute_types
+                            .iter()
+                            .map(|compute_type| (*compute_type).to_string())
+                            .collect(),
+                        compatibilities: if cited {
+                            cited_build_compatibilities(oldest_row, row)
+                        } else {
+                            build_compatibilities(oldest_row, row)
+                        },
+                        required_configuration: seed
+                            .required_configuration
+                            .iter()
+                            .map(|property| (*property).to_string())
+                            .collect(),
+                        requires_iam_permissions: seed.requires_iam_permissions,
+                    },
+                )
                 .collect();
             versions.reverse();
             AddonCatalogRecord {
@@ -2829,18 +3018,7 @@ pub(super) fn seed_addon_catalog() -> Vec<AddonCatalogRecord> {
                         )
                     })
                     .collect(),
-                configuration_properties: ADDON_COMMON_CONFIGURATION_PROPERTIES
-                    .iter()
-                    .chain(seed.configuration_properties)
-                    .map(|(property, json_type)| {
-                        ((*property).to_string(), (*json_type).to_string())
-                    })
-                    // A `BTreeMap` so a key the row declares a type of its own
-                    // for overrides the common one, and the properties come out
-                    // in the schema's alphabetical order with no duplicates.
-                    .collect::<BTreeMap<String, String>>()
-                    .into_iter()
-                    .collect(),
+                configuration_properties: published_configuration_properties(seed),
                 schema_dialect: seed.schema_dialect.to_string(),
                 versions,
             }
