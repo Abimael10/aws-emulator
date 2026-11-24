@@ -229,8 +229,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     DescribeNodeConfigurationOptionsErrorModeled::ClusterSnapshotNotFoundFault(
                         ClusterSnapshotNotFoundFault {
+                            // This operation PLANS work from the snapshot it is
+                            // pointed at rather than acting on the snapshot
+                            // record, so its recorded refusal carries the
+                            // sentence that family answers with — the one
+                            // `RestoreFromClusterSnapshot` and the reserved-node
+                            // exchange reads carry — and not the one the
+                            // operations that act on a snapshot answer with. The
+                            // per-operation catalog is
+                            // [`st::ClusterSnapshotNotFoundWording`].
                             message: Some(st::cluster_snapshot_not_found_message(
-                                st::ClusterSnapshotNotFoundWording::NotFoundThenIdentifier,
+                                st::ClusterSnapshotNotFoundWording::SnapshotNotFoundThenIdentifier,
                                 input
                                     .snapshot_identifier
                                     .as_deref()

@@ -1194,8 +1194,8 @@ pub enum ClusterSnapshotNotFoundWording {
     /// `Snapshot not found: <SnapshotIdentifier>` — the same shape of sentence
     /// as [`Self::NotFoundThenIdentifier`] with the noun the service puts on the
     /// wire rather than the modelled shape's name, which is what the operations
-    /// that plan work FROM a snapshot answer: `RestoreFromClusterSnapshot` and
-    /// the reserved-node exchange reads.
+    /// that plan work FROM a snapshot answer: `RestoreFromClusterSnapshot`,
+    /// `DescribeNodeConfigurationOptions` and the reserved-node exchange reads.
     SnapshotNotFoundThenIdentifier,
 }
 
