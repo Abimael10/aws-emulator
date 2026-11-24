@@ -256,7 +256,14 @@ fn stated_refusal<O: Operation>(
 ) -> Option<(Vec<Violation>, Refused)> {
     let (violations, lists) =
         ::service_common::validation::refusing_violations_with_lists::<O>(protocol, req);
-    let stated = validation::reword_quoting(&Refusal::Invalid(violations.clone()), || lists)?;
+    // The operation is named as well as its violations: a limit this service enforces
+    // itself belongs to one operation's parameter, so the wording of such a refusal is that
+    // operation's ([`validation`] holds the table).
+    let stated = validation::reword_quoting(
+        Some(O::NAME),
+        &Refusal::Invalid(violations.clone()),
+        || lists,
+    )?;
     Some((violations, stated))
 }
 

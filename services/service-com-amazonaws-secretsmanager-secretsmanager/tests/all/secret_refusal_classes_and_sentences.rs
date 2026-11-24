@@ -1062,3 +1062,252 @@ async fn a_rotation_duration_with_nothing_to_start_it_names_both_members_that_wo
         }
     }
 }
+
+/// The published maximum of `MaxResultsBatchType`, the shape
+/// `BatchGetSecretValueRequest$MaxResults` targets (`@range` 1..20, this service's Smithy
+/// model): the page size one batched read answers with.
+const BATCH_MAX_RESULTS: i64 = 20;
+
+/// The published maximum of `SecretIdListType` (`@length` 1..20), the other way that same
+/// batch is named.
+const BATCH_IDS_MAX: usize = 20;
+
+/// The published maximum of `NonEmptyResourcePolicyType` (`@length` 1..20480) — the shape
+/// both `PutResourcePolicyRequest$ResourcePolicy` and
+/// `ValidateResourcePolicyRequest$ResourcePolicy` target, so it is the documented size
+/// limit on a resource policy document whichever of the two carries it.
+const RESOURCE_POLICY_MAX: usize = 20480;
+
+/// A valid resource policy document exactly `length` characters long, padded inside its
+/// `Sid` so the document stays a policy document at every length.
+fn policy_of_length(length: usize) -> String {
+    // A resource policy names an identity that EXISTS, which here means one of the
+    // emulator's own account (`crate::secret_policy_validation` states the same rule).
+    let principal = format!("arn:aws:iam::{}:root", ::engine::emulator_account_id());
+    let document = |sid: &str| {
+        format!(
+            "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Sid\":\"{sid}\",\
+             \"Effect\":\"Allow\",\"Principal\":{{\"AWS\":\"{principal}\"}},\
+             \"Action\":\"secretsmanager:GetSecretValue\",\"Resource\":\"*\"}}]}}"
+        )
+    };
+    let padded = document(&run("X", length.saturating_sub(document("").len())));
+    assert_eq!(
+        padded.len(),
+        length,
+        "case \"a policy document of {length} characters\": built {} instead",
+        padded.len()
+    );
+    padded
+}
+
+/// The `ResourcePolicy` a secret reads back, as the document text.
+async fn attached_policy(router: &MultiServiceRouter, name: &str, case: &str) -> String {
+    let read = ok(router, "GetResourcePolicy", json!({"SecretId": name}), case).await;
+    read.get("ResourcePolicy")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("case {case:?}: no ResourcePolicy in {read}"))
+        .to_string()
+}
+
+/// The `Sid` of the first statement of a policy document, which is what a row pads to
+/// reach a length: the attached document is re-rendered on read-back, so the statement is
+/// compared rather than the text.
+fn first_sid(document: &str, case: &str) -> String {
+    let parsed: Value = serde_json::from_str(document)
+        .unwrap_or_else(|_| panic!("case {case:?}: the policy document is JSON"));
+    parsed["Statement"][0]["Sid"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: no Sid in {parsed}"))
+        .to_string()
+}
+
+#[tokio::test]
+async fn a_limit_this_service_enforces_itself_states_that_operations_own_refusal() {
+    // Secrets Manager enforces some of its documented parameter limits in the service
+    // itself: such a request is refused with one of THAT operation's modelled errors and
+    // the sentence stating the limit — a client branching on the modelled code to page
+    // smaller or to split a document sees it — and the sentence carries nothing of what the
+    // caller sent, where the shared constraint clause both travels under a code the
+    // operation does not model and quotes the value back.
+    //
+    // The rows run over the two limits (a page size and a document size), over both
+    // members that carry a policy document, over how far past the limit the value is, and
+    // over which of the batched read's two selectors is over its bound.
+    let router = emulator();
+    create(&router, "limits", "the limits table").await;
+    let page_size_sentence = format!("Max results must not exceed {BATCH_MAX_RESULTS}.");
+    let id_list_sentence = format!(
+        "The secret ID list has too many IDs. You can include up to {BATCH_IDS_MAX} secret IDs."
+    );
+    const POLICY_SIZE_SENTENCE: &str = "ResourcePolicy exceeds size limit.";
+    let name_filter = json!([{"Key": "name", "Values": ["limits"]}]);
+    let over_long_ids: Vec<String> = (0..=BATCH_IDS_MAX)
+        .map(|index| format!("limits-{index}"))
+        .collect();
+    let over_long_policy = policy_of_length(RESOURCE_POLICY_MAX + 1);
+    let far_over_policy = policy_of_length(RESOURCE_POLICY_MAX * 2);
+
+    // Each row also names a fragment of what it sent that the refusal must not carry.
+    let rows: Vec<(String, &str, Value, &str, String, String)> = vec![
+        (
+            "a page size one past the batched read's ceiling".to_string(),
+            "BatchGetSecretValue",
+            json!({"Filters": name_filter.clone(), "MaxResults": BATCH_MAX_RESULTS + 1}),
+            STATE,
+            page_size_sentence.clone(),
+            (BATCH_MAX_RESULTS + 1).to_string(),
+        ),
+        (
+            "a page size far past that ceiling".to_string(),
+            "BatchGetSecretValue",
+            json!({"Filters": name_filter.clone(), "MaxResults": BATCH_MAX_RESULTS * 5}),
+            STATE,
+            page_size_sentence.clone(),
+            (BATCH_MAX_RESULTS * 5).to_string(),
+        ),
+        (
+            "an id list one past one batch".to_string(),
+            "BatchGetSecretValue",
+            json!({"SecretIdList": over_long_ids}),
+            PARAMETER,
+            id_list_sentence,
+            "limits-".to_string(),
+        ),
+        (
+            "a resource policy one character past the size limit".to_string(),
+            "PutResourcePolicy",
+            json!({"SecretId": "limits", "ResourcePolicy": over_long_policy.clone()}),
+            PARAMETER,
+            POLICY_SIZE_SENTENCE.to_string(),
+            "XXXXXXXX".to_string(),
+        ),
+        (
+            "a resource policy far past the size limit".to_string(),
+            "PutResourcePolicy",
+            json!({"SecretId": "limits", "ResourcePolicy": far_over_policy}),
+            PARAMETER,
+            POLICY_SIZE_SENTENCE.to_string(),
+            "XXXXXXXX".to_string(),
+        ),
+        (
+            "a policy validated one character past the size limit".to_string(),
+            "ValidateResourcePolicy",
+            json!({"SecretId": "limits", "ResourcePolicy": over_long_policy.clone()}),
+            PARAMETER,
+            POLICY_SIZE_SENTENCE.to_string(),
+            "XXXXXXXX".to_string(),
+        ),
+    ];
+    for (case, operation, body, code, message, echoed) in rows {
+        let answered = err(&router, operation, body, &case).await;
+        assert!(
+            !answered.1.contains("validation error") && !answered.1.contains(echoed.as_str()),
+            "case {case:?}: expected the service's own sentence, carrying no part of the \
+             request, got {:?}",
+            answered.1
+        );
+        refused(&case, answered, code, &message);
+    }
+
+    // The limits THEMSELVES are served: it is being past them that is refused. The page
+    // size rows run over both published ends of the batched read's range.
+    for page_size in [1, BATCH_MAX_RESULTS] {
+        let case = format!("a page size of {page_size}, inside the ceiling");
+        let read = ok(
+            &router,
+            "BatchGetSecretValue",
+            json!({"Filters": name_filter.clone(), "MaxResults": page_size}),
+            &case,
+        )
+        .await;
+        let served = read
+            .get("SecretValues")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("case {case:?}: no SecretValues in {read}"))
+            .len();
+        assert_eq!(
+            served, 1,
+            "case {case:?}: expected the one selected secret to be served, got {read}"
+        );
+    }
+    let case = "an id list at the bound of one batch";
+    let mut ids: Vec<String> = vec!["limits".to_string()];
+    ids.extend((1..BATCH_IDS_MAX).map(|index| format!("limits-{index}")));
+    ok(
+        &router,
+        "BatchGetSecretValue",
+        json!({"SecretIdList": ids}),
+        case,
+    )
+    .await;
+
+    // A document AT the size limit is attached and reads back, and the refused oversized
+    // one leaves that attachment exactly as it was.
+    let case = "a resource policy at the size limit";
+    let at_the_limit = policy_of_length(RESOURCE_POLICY_MAX);
+    ok(
+        &router,
+        "PutResourcePolicy",
+        json!({"SecretId": "limits", "ResourcePolicy": at_the_limit.clone()}),
+        case,
+    )
+    .await;
+    let validated = ok(
+        &router,
+        "ValidateResourcePolicy",
+        json!({"SecretId": "limits", "ResourcePolicy": at_the_limit.clone()}),
+        case,
+    )
+    .await;
+    assert_eq!(
+        validated.get("PolicyValidationPassed").and_then(Value::as_bool),
+        Some(true),
+        "case {case:?}: expected the document at the limit to validate, got {validated}"
+    );
+    let expected_sid = first_sid(&at_the_limit, case);
+    let stored = attached_policy(&router, "limits", case).await;
+    assert_eq!(
+        first_sid(&stored, case),
+        expected_sid,
+        "case {case:?}: expected the document at the limit to read back, got {stored:.64?}"
+    );
+    let refused_case = "an oversized attach after one that was accepted";
+    let answered = err(
+        &router,
+        "PutResourcePolicy",
+        json!({"SecretId": "limits", "ResourcePolicy": over_long_policy}),
+        refused_case,
+    )
+    .await;
+    refused(refused_case, answered, PARAMETER, POLICY_SIZE_SENTENCE);
+    let unchanged = attached_policy(&router, "limits", refused_case).await;
+    assert_eq!(
+        first_sid(&unchanged, refused_case),
+        expected_sid,
+        "case {refused_case:?}: expected the attached policy to be the accepted one, got \
+         {unchanged:.64?}"
+    );
+
+    // A maximum this service does NOT state itself keeps the shared constraint clause: the
+    // listing's own page size has a bound of its own, and a value past it is still the
+    // `ValidationException` every other declared rule is answered with.
+    let case = "the listing's page size, one past its own range";
+    let answered = err(
+        &router,
+        "ListSecrets",
+        json!({"MaxResults": MAX_RESULTS_MAX + 1}),
+        case,
+    )
+    .await;
+    refused(
+        case,
+        answered,
+        CONSTRAINT,
+        &one_violation(&format!(
+            "Value '{}' at 'maxResults' failed to satisfy constraint: Member must have value \
+             less than or equal to {MAX_RESULTS_MAX}",
+            MAX_RESULTS_MAX + 1
+        )),
+    );
+}

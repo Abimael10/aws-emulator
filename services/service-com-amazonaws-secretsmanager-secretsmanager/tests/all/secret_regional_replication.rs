@@ -20,7 +20,12 @@
 //!   cannot be used;
 //! * `RemoveRegionsFromReplication` deletes the replica, and
 //!   `StopReplicationToReplica`, called in the replica's Region, unlinks it and
-//!   leaves the secret it had become.
+//!   leaves the secret it had become — while the same call made where the secret
+//!   is NOT a replica is refused with the sentence that secret's replication state
+//!   calls for;
+//! * `PrimaryRegion` belongs to a secret that takes part in replication, so the
+//!   `primary-region` filter selects replicas and replicated primaries and never a
+//!   secret this service reports no `PrimaryRegion` for.
 //!
 //! Every test is a TABLE over the class its rule generalises: the Region a
 //! replica is placed in and how many, the form of the `SecretId`, the form of the
@@ -28,20 +33,27 @@
 //! caller asked for an overwrite.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_secretsmanager_secretsmanager::state::{
     primary_is_replicated_message, ComAmazonawsSecretsmanagerSecretsmanagerState,
-    NOT_A_REPLICA_MESSAGE, NOT_PERMITTED_ON_REPLICA_MESSAGE, REPLICATION_FAILED_PREFIX,
+    NOT_PERMITTED_ON_REPLICA_MESSAGE, NOT_PERMITTED_ON_REPLICATED_PRIMARY_MESSAGE,
+    NOT_PERMITTED_ON_STANDALONE_MESSAGE, REPLICATION_FAILED_PREFIX,
     REPLICATION_SUCCEEDED_MESSAGE, REPLICA_NAME_COLLISION_MESSAGE, REPLICA_STATUS_FAILED,
-    REPLICA_STATUS_IN_SYNC, REPLICA_SYNC_DELAY, SECRET_QUOTA,
+    REPLICA_STATUS_IN_PROGRESS, REPLICA_STATUS_IN_SYNC, SECRET_QUOTA,
 };
 use service_com_amazonaws_secretsmanager_secretsmanager::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region the primary of every secret below is created in.
 const PRIMARY_REGION: &str = "us-west-2";
+
+/// How long a wait below looks for the state it waits on before giving up, and how
+/// often it looks. The ceiling only stops a suite from hanging: what each wait
+/// looks for is the STATE the store reaches, never a span passing.
+const REPLICA_WAIT: Duration = Duration::from_secs(30);
+const LOOK_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Secrets Manager and KMS over one shared engine, behind the same
 /// `MultiServiceRouter` the production router builds: a replica names a KMS key
@@ -205,14 +217,30 @@ impl Emulator {
         replicas_of(&replicated, case)
     }
 
-    /// The replica entry for `region` once the clock has settled it, read back
+    /// The replica entry for `region` once its creation has settled, read back
     /// through `DescribeSecret` on the primary.
+    ///
+    /// Looks for the status the store OWES that replica until it has been
+    /// reported, rather than waiting a span out: the `InProgress` -> `InSync`
+    /// move is due at an instant the store recorded, and a request is what
+    /// materialises it. A replica the service could not create has nothing left
+    /// owed to it, so its `Failed` entry ends the wait too.
     async fn settled_replica(&self, name: &str, region: &str, case: &str) -> Value {
-        tokio::time::sleep(REPLICA_SYNC_DELAY + Duration::from_millis(200)).await;
-        let described = self
-            .ok("DescribeSecret", json!({"SecretId": name}), case)
-            .await;
-        replica_for(&described, region, case)
+        let deadline = Instant::now() + REPLICA_WAIT;
+        loop {
+            let described = self
+                .ok("DescribeSecret", json!({"SecretId": name}), case)
+                .await;
+            let entry = replica_for(&described, region, case);
+            if member(&entry, "Status").as_deref() != Some(REPLICA_STATUS_IN_PROGRESS) {
+                return entry;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "case {case:?}: the replica in {region} never settled, last entry {entry}"
+            );
+            tokio::time::sleep(LOOK_INTERVAL).await;
+        }
     }
 }
 
@@ -816,8 +844,8 @@ async fn stop_replication_to_replica_promotes_the_replica_it_is_called_on() {
             "case {case:?}: expected the primary to be refused, got {code} {message:?}"
         );
         assert_eq!(
-            message, NOT_A_REPLICA_MESSAGE,
-            "case {case:?}: expected the non-replica refusal sentence"
+            message, NOT_PERMITTED_ON_REPLICATED_PRIMARY_MESSAGE,
+            "case {case:?}: expected the replicated-primary refusal sentence"
         );
         let (code, _) = emulator
             .err_in(
@@ -903,5 +931,279 @@ async fn stop_replication_to_replica_promotes_the_replica_it_is_called_on() {
         emulator
             .ok("DeleteSecret", json!({"SecretId": &name}), case)
             .await;
+    }
+}
+
+/// The names `ListSecrets` answers in `region` for `filters`, in the order it
+/// answers them.
+async fn listed_names(emulator: &Emulator, region: &str, filters: Value, case: &str) -> Vec<String> {
+    let listed = emulator
+        .ok_in(region, "ListSecrets", json!({"Filters": filters}), case)
+        .await;
+    listed
+        .get("SecretList")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("case {case:?}: no SecretList in {listed}"))
+        .iter()
+        .map(|entry| text(entry, "Name", case))
+        .collect()
+}
+
+/// A `name` filter scoping a listing to the secrets of one test, beside one more
+/// filter: separate filters are ANDed, so the pair selects what both hold for.
+fn scoped(prefix: &str, key: &str, value: &str) -> Value {
+    json!([
+        {"Key": "name", "Values": [prefix]},
+        {"Key": key, "Values": [value]},
+    ])
+}
+
+#[tokio::test]
+async fn a_filter_matches_only_against_an_attribute_the_secret_carries() {
+    // A filter selects the secrets that CARRY what it names, so a secret this
+    // service reports no value of that attribute for matches no value of its key.
+    // `PrimaryRegion` is "the Region the secret is in" for a secret that takes
+    // part in replication — a replica reports its primary's Region and a
+    // replicated primary its own — and a secret with no replication has none, so
+    // it matches no `primary-region` value, the Region it happens to live in
+    // included.
+    //
+    // The rows run over the three classes of secret (a replica, the primary it
+    // tracks, and two never-replicated secrets), over the Region the listing is
+    // made in, over the Region the filter names (each of the two, and a prefix of
+    // one), and over a second key the same rule holds for: `owning-service`,
+    // which only a secret another service manages carries.
+    const AWAY_REGION: &str = "us-east-1";
+    const PREFIX: &str = "filtered/";
+    let case = "a replicated pair beside two standalone secrets";
+    let emulator = Emulator::new();
+    let replicated = format!("{PREFIX}replicated");
+    let home_standalone = format!("{PREFIX}home-standalone");
+    let away_standalone = format!("{PREFIX}away-standalone");
+    emulator.create(&replicated, "mirrored", case).await;
+    emulator.create(&home_standalone, "home", case).await;
+    emulator
+        .ok_in(
+            AWAY_REGION,
+            "CreateSecret",
+            json!({"Name": &away_standalone, "SecretString": "away"}),
+            case,
+        )
+        .await;
+    emulator
+        .replicate(&replicated, &[(AWAY_REGION, None)], false, case)
+        .await;
+    let settled = emulator
+        .settled_replica(&replicated, AWAY_REGION, case)
+        .await;
+    assert_eq!(
+        member(&settled, "Status"),
+        Some(REPLICA_STATUS_IN_SYNC.to_string()),
+        "case {case:?}: expected the replica to have settled, got {settled}"
+    );
+
+    // The secret with no replication reports no `PrimaryRegion` at all, which is
+    // the value the filter is matched against.
+    let described = emulator
+        .ok_in(
+            AWAY_REGION,
+            "DescribeSecret",
+            json!({"SecretId": &away_standalone}),
+            case,
+        )
+        .await;
+    assert!(
+        described.get("PrimaryRegion").is_none(),
+        "case {case:?}: a never-replicated secret reports no PrimaryRegion, got {described}"
+    );
+
+    let rows: Vec<(String, &str, &str, &str, Vec<String>)> = vec![
+        (
+            "primary-region = the home Region, listed away".to_string(),
+            AWAY_REGION,
+            "primary-region",
+            PRIMARY_REGION,
+            vec![replicated.clone()],
+        ),
+        (
+            "primary-region = the away Region, listed away".to_string(),
+            AWAY_REGION,
+            "primary-region",
+            AWAY_REGION,
+            Vec::new(),
+        ),
+        (
+            "primary-region = the home Region, listed at home".to_string(),
+            PRIMARY_REGION,
+            "primary-region",
+            PRIMARY_REGION,
+            vec![replicated.clone()],
+        ),
+        (
+            "primary-region = the away Region, listed at home".to_string(),
+            PRIMARY_REGION,
+            "primary-region",
+            AWAY_REGION,
+            Vec::new(),
+        ),
+        (
+            "primary-region as a prefix of the home Region, listed away".to_string(),
+            AWAY_REGION,
+            "primary-region",
+            "us-w",
+            vec![replicated.clone()],
+        ),
+        (
+            "owning-service, which no secret here carries".to_string(),
+            PRIMARY_REGION,
+            "owning-service",
+            "rds",
+            Vec::new(),
+        ),
+    ];
+    for (row, region, key, value, expected) in rows {
+        let listed = listed_names(&emulator, region, scoped(PREFIX, key, value), &row).await;
+        assert_eq!(
+            listed, expected,
+            "case {row:?}: expected {expected:?} in {region}, got {listed:?}"
+        );
+    }
+
+    // Promoting the replica ends the replication, so neither secret carries a
+    // `PrimaryRegion` any more and neither matches any value of the filter.
+    let promoted = "the promoted secret and the primary it left";
+    emulator
+        .ok_in(
+            AWAY_REGION,
+            "StopReplicationToReplica",
+            json!({"SecretId": &replicated}),
+            promoted,
+        )
+        .await;
+    for (region, value) in [
+        (AWAY_REGION, PRIMARY_REGION),
+        (AWAY_REGION, AWAY_REGION),
+        (PRIMARY_REGION, PRIMARY_REGION),
+    ] {
+        let row = format!("after the promotion: primary-region = {value}, listed in {region}");
+        let listed =
+            listed_names(&emulator, region, scoped(PREFIX, "primary-region", value), &row).await;
+        assert!(
+            listed.is_empty(),
+            "case {row:?}: expected no secret to match, got {listed:?}"
+        );
+    }
+    // The secrets themselves are still there: it is the ATTRIBUTE that is gone.
+    let still_held = listed_names(
+        &emulator,
+        AWAY_REGION,
+        json!([{"Key": "name", "Values": [PREFIX]}]),
+        promoted,
+    )
+    .await;
+    assert_eq!(
+        still_held,
+        vec![away_standalone.clone(), replicated.clone()],
+        "case {promoted:?}: expected both secrets of the away Region to be listed, got \
+         {still_held:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_promotion_refusal_states_which_class_of_secret_it_was_called_on() {
+    // `StopReplicationToReplica` is the replica-side promotion, and the refusal it
+    // answers where the secret is NOT a replica says which class of secret that
+    // is: a primary that still HAS a replica is sent to the replica's Region, and
+    // a secret with no replica at all is told its class has no promotion to
+    // perform — there is no Region to send it to. The ladder below walks one
+    // secret through every state it reaches: standalone, replicated primary
+    // (before and after the clock settles the replica), the replica itself, and
+    // the two standalone secrets the promotion leaves behind.
+    const AWAY_REGION: &str = "us-east-1";
+    let case = "one secret through every replication state";
+    let emulator = Emulator::new();
+    let name = "promotion/ladder";
+    emulator.create(name, "stored", case).await;
+
+    let standalone = format!("{case}: never replicated");
+    let (code, message) = emulator
+        .err_in(
+            PRIMARY_REGION,
+            "StopReplicationToReplica",
+            json!({"SecretId": name}),
+            &standalone,
+        )
+        .await;
+    assert_eq!(
+        (code.as_str(), message.as_str()),
+        (
+            "InvalidParameterException",
+            NOT_PERMITTED_ON_STANDALONE_MESSAGE
+        ),
+        "case {standalone:?}: expected the standalone refusal, got {code} {message:?}"
+    );
+
+    emulator
+        .replicate(name, &[(AWAY_REGION, None)], false, case)
+        .await;
+    for state in ["a replica still InProgress", "a replica settled InSync"] {
+        if state.ends_with("InSync") {
+            let settled = emulator.settled_replica(name, AWAY_REGION, case).await;
+            assert_eq!(
+                member(&settled, "Status"),
+                Some(REPLICA_STATUS_IN_SYNC.to_string()),
+                "case {state:?}: expected the replica to have settled, got {settled}"
+            );
+        }
+        let row = format!("{case}: {state}");
+        let (code, message) = emulator
+            .err_in(
+                PRIMARY_REGION,
+                "StopReplicationToReplica",
+                json!({"SecretId": name}),
+                &row,
+            )
+            .await;
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            (
+                "InvalidParameterException",
+                NOT_PERMITTED_ON_REPLICATED_PRIMARY_MESSAGE
+            ),
+            "case {row:?}: expected the replicated-primary refusal, got {code} {message:?}"
+        );
+    }
+
+    // The call made where the rule sends it IS served, and both secrets it leaves
+    // are standalone: each answers the standalone sentence from then on.
+    emulator
+        .ok_in(
+            AWAY_REGION,
+            "StopReplicationToReplica",
+            json!({"SecretId": name}),
+            case,
+        )
+        .await;
+    for (region, state) in [
+        (AWAY_REGION, "the promoted secret"),
+        (PRIMARY_REGION, "the primary its replica left"),
+    ] {
+        let row = format!("{case}: {state}");
+        let (code, message) = emulator
+            .err_in(
+                region,
+                "StopReplicationToReplica",
+                json!({"SecretId": name}),
+                &row,
+            )
+            .await;
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            (
+                "InvalidParameterException",
+                NOT_PERMITTED_ON_STANDALONE_MESSAGE
+            ),
+            "case {row:?}: expected the standalone refusal, got {code} {message:?}"
+        );
     }
 }

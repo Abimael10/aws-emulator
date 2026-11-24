@@ -1301,7 +1301,11 @@ async fn list_secrets_filters_by_every_documented_filter_key() {
     // and `all` breaks the value into words and searches every attribute, not
     // case-sensitive. The two keys that search text — description and `all` —
     // match a prefix of any WORD of what they search, which is the unit a search
-    // of a sentence selects by. A value prefixed `!` negates the match.
+    // of a sentence selects by. A value prefixed `!` negates the match. Every key
+    // matches against the attribute as the service REPORTS it, so an attribute a
+    // secret carries no value for — a `PrimaryRegion` on a secret with no
+    // replication, an `owning-service` on one no service manages — matches no
+    // value of its key.
     for (case, key, value, expected) in [
         ("name, prefix", "name", "alpha", vec!["alpha/one"]),
         ("name, case-sensitive", "name", "ALPHA", vec![]),
@@ -1326,10 +1330,10 @@ async fn list_secrets_filters_by_every_documented_filter_key() {
         ("tag-key", "tag-key", "env", vec!["alpha/one"]),
         ("tag-value", "tag-value", "pro", vec!["alpha/one"]),
         (
-            "primary-region",
+            "primary-region, which no secret here takes part in replication to carry",
             "primary-region",
             "us-west",
-            vec!["alpha/one", "beta/two", "gamma/three"],
+            vec![],
         ),
         ("owning-service", "owning-service", "secretsmanager", vec![]),
         ("all, over the name", "all", "beta", vec!["beta/two"]),

@@ -369,24 +369,6 @@ pub const NO_ROTATION_FUNCTION_MESSAGE: &str =
 pub const ROTATION_IN_PROGRESS_MESSAGE: &str =
     "A previous rotation isn't complete. That rotation will be reattempted.";
 
-/// The `InvalidParameterException` message `StopReplicationToReplica` refuses a
-/// `SecretId` with that, in the Region the request is signed for, names a secret
-/// which is NOT a replica — a replication primary, or a standalone secret that
-/// has no replicas at all.
-///
-/// The operation has to be called "from the Region in which you want to promote
-/// the replica to a primary secret" (`StopReplicationToReplica`, this service's
-/// Smithy model), so the refusal states both halves of that rule: the class of
-/// secret the call is not permitted on, and the Region the call has to be made in
-/// instead. It is the mirror of [`NOT_PERMITTED_ON_REPLICA_MESSAGE`], which says
-/// the same two things for a write made on a replica.
-///
-/// ONE fixed text: no secret name, ARN or Region from the request or from the
-/// store is interpolated into it, and every secret refused for not being a
-/// replica here — holding replicas or not — carries exactly this text.
-pub const NOT_A_REPLICA_MESSAGE: &str =
-    "Operation not permitted on a primary secret. Call must be made in replica secret's region.";
-
 /// The `InvalidParameterException` message for a `RecoveryWindowInDays` outside
 /// the documented range, stating that constraint: "The number of days from 7 to
 /// 30 that Secrets Manager waits before permanently deleting the secret."
@@ -1014,6 +996,11 @@ pub fn matches_filter(view: SecretView<'_>, filter: &Filter) -> bool {
 /// description is a sentence, and the word is the unit a search of one selects by.
 /// `all` searches the words of every attribute, and — "breaks the filter value
 /// string into words" — all of the words of its own value have to be found.
+///
+/// Every key matches against the attribute as this service REPORTS it, and an
+/// attribute a secret has no value for matches no value of its key: a filter
+/// selects the secrets that carry what it names, so one that stood in for an
+/// absent attribute would select secrets the caller did not ask for.
 fn matches_filter_value(view: SecretView<'_>, key: &str, value: &str) -> bool {
     let SecretView { secret, content } = view;
     match key {
@@ -1032,13 +1019,13 @@ fn matches_filter_value(view: SecretView<'_>, key: &str, value: &str) -> bool {
             .iter()
             .filter_map(|tag| tag.value.as_deref())
             .any(|tag_value| tag_value.starts_with(value)),
-        // The Region the secret's primary is in, which for a replica is another
-        // Region than its own and for every other secret is its own.
+        // The Region the secret's primary is in, which is what this service
+        // REPORTS as that secret's `PrimaryRegion` ([`Secret::primary_region_out`]):
+        // a secret that takes no part in replication has none, so it matches no
+        // value of this filter — including the Region it happens to live in.
         "primary-region" => secret
-            .replica_of
-            .as_deref()
-            .unwrap_or(&secret.region)
-            .starts_with(value),
+            .primary_region_out()
+            .is_some_and(|primary| primary.starts_with(value)),
         "owning-service" => content
             .owning_service
             .as_deref()
@@ -1131,6 +1118,26 @@ pub const MALFORMED_POLICY_MESSAGE: &str = VALIDATE_SYNTAX_ERROR_MESSAGE;
 /// validation channel ([`BROAD_ACCESS_CHECK_MESSAGE`]).
 pub const PUBLIC_POLICY_MESSAGE: &str =
     "You can not attach a resource policy that grants Public access to your secret.";
+
+/// How long a resource policy document this service accepts may be.
+///
+/// `NonEmptyResourcePolicyType` — what both `PutResourcePolicyRequest$ResourcePolicy`
+/// and `ValidateResourcePolicyRequest$ResourcePolicy` target — is modelled with a
+/// maximum length of 20480 (this service's Smithy model), which is the documented
+/// Secrets Manager limit on a resource policy.
+pub const RESOURCE_POLICY_CHARS: usize = 20480;
+
+/// What this service says about a resource policy document longer than
+/// [`RESOURCE_POLICY_CHARS`]: the parameter is the document's size, so the refusal is
+/// `InvalidParameterException` — "The parameter name or value is invalid." (this
+/// service's Smithy model) — one of the modelled errors of every operation that takes a
+/// policy document.
+///
+/// One fixed sentence stating the rule, naming no part of the document: a document that
+/// is too long is by definition longer than the member may hold, so echoing it would put
+/// in a response — which a client logs and attaches to a ticket — exactly the material
+/// the service refused to store.
+pub const RESOURCE_POLICY_TOO_LONG_MESSAGE: &str = "ResourcePolicy exceeds size limit.";
 
 /// The policy elements a statement can name a principal under. A principal is
 /// either the bare wildcard string or a map from principal type to one or more

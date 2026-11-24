@@ -584,6 +584,23 @@ pub(crate) fn too_many_ids_message() -> String {
     )
 }
 
+/// The `InvalidRequestException` message for a `MaxResults` above the page size this
+/// operation answers with, stating the bound it exceeded and echoing nothing the caller
+/// sent.
+///
+/// The bound is this read's one batch (see [`crate::state::SECRETS_PER_BATCH`]), which is
+/// also the maximum `MaxResultsBatchType` declares: "The number of results to include in
+/// the response" cannot be more than the "up to 20 secrets" the operation reads
+/// (`BatchGetSecretValueRequest$MaxResults`, this service's Smithy model). Stated by the
+/// operation rather than as a shape-constraint clause, because it is this service's own
+/// page-size rule and a client pages by catching it ([`crate::service`] states where).
+pub(crate) fn max_results_above_batch_message() -> String {
+    format!(
+        "Max results must not exceed {}.",
+        crate::state::SECRETS_PER_BATCH
+    )
+}
+
 /// `InvalidParameterException` — "the parameter name or value is invalid" — for a
 /// request whose selection parameters cannot hold together.
 fn invalid_parameter(message: impl Into<String>) -> BatchGetSecretValueError {

@@ -49,12 +49,58 @@ pub const REPLICA_NAME_COLLISION_MESSAGE: &str =
 /// A replica tracks its primary, so the primary is where a value, a tag, a policy
 /// or a schedule is changed — which is what the second sentence tells the caller
 /// to do: make the call in the primary's Region. This is the mirror of the
-/// refusal [`NOT_A_REPLICA_MESSAGE`] states for the promotion call made on a
-/// secret that is not a replica: the same error class, and one fixed text naming
-/// the class of secret the call is not permitted on and the Region it has to be
-/// made in instead, carrying no secret name, ARN or Region of its own.
+/// refusal [`NOT_PERMITTED_ON_REPLICATED_PRIMARY_MESSAGE`] states for the
+/// promotion call made on a replicated primary: the same error class, and one
+/// fixed text naming the class of secret the call is not permitted on and the
+/// Region it has to be made in instead, carrying no secret name, ARN or Region of
+/// its own.
 pub const NOT_PERMITTED_ON_REPLICA_MESSAGE: &str =
     "Operation not permitted on a replica secret. Call must be made in primary secret's region.";
+
+/// The `InvalidParameterException` message `StopReplicationToReplica` refuses a
+/// `SecretId` with that, in the Region the request is signed for, names a secret
+/// which is NOT a replica, and which still HAS a replica of its own somewhere.
+///
+/// The operation has to be called "from the Region in which you want to promote
+/// the replica to a primary secret" (`StopReplicationToReplica`, this service's
+/// Smithy model), so the refusal of a replicated primary states both halves of
+/// that rule: the class of secret the call is not permitted on, and the Region
+/// the call has to be made in instead. It is the mirror of
+/// [`NOT_PERMITTED_ON_REPLICA_MESSAGE`], which says the same two things for a
+/// write made on a replica.
+///
+/// ONE fixed text: no secret name, ARN or Region from the request or from the
+/// store is interpolated into it.
+pub const NOT_PERMITTED_ON_REPLICATED_PRIMARY_MESSAGE: &str =
+    "Operation not permitted on a primary secret. Call must be made in replica secret's region.";
+
+/// The same refusal for a secret that takes NO part in replication here: a
+/// standalone secret, and one just promoted to standalone by this very operation.
+///
+/// There is no replica Region to redirect such a caller to, so the refusal names
+/// the class of secret alone — sending it to "the replica secret's region" would
+/// name a Region that holds nothing of this secret. ONE fixed text, interpolating
+/// nothing.
+pub const NOT_PERMITTED_ON_STANDALONE_MESSAGE: &str =
+    "Operation not permitted on a primary/standalone secret.";
+
+/// Which of the two the promotion refuses `secret` with: the redirection for a
+/// primary that still has a replica to promote somewhere
+/// ([`NOT_PERMITTED_ON_REPLICATED_PRIMARY_MESSAGE`]), and the standalone sentence
+/// for one that has none ([`NOT_PERMITTED_ON_STANDALONE_MESSAGE`]).
+///
+/// Read off the secret's replication state, so the two states a caller cannot act
+/// on in the same way are told apart: a replica recorded `Failed` exists as a
+/// secret in no Region ([`Replica::is_live`]), so a secret whose only replication
+/// attempt failed is standalone here too.
+#[must_use]
+pub fn not_a_replica_message(secret: &Secret) -> &'static str {
+    if secret.has_live_replica() {
+        NOT_PERMITTED_ON_REPLICATED_PRIMARY_MESSAGE
+    } else {
+        NOT_PERMITTED_ON_STANDALONE_MESSAGE
+    }
+}
 
 /// The `InvalidParameterException` message `DeleteSecret` refuses a primary that
 /// still has replicas with: "You can't delete a primary secret that is replicated
@@ -119,6 +165,17 @@ pub fn arn_region(arn: &str) -> Option<&str> {
 }
 
 impl Secret {
+    /// Whether this secret is replicated RIGHT NOW: it holds at least one replica
+    /// that exists as a secret in its Region ([`Replica::is_live`]).
+    ///
+    /// Not the same as holding a replication entry: an entry recorded `Failed`
+    /// names a Region where no secret of this one was created, so a secret whose
+    /// only replication attempt failed is replicated nowhere.
+    #[must_use]
+    pub fn has_live_replica(&self) -> bool {
+        self.replicas.iter().any(Replica::is_live)
+    }
+
     /// The Regions this secret still has replicas in, in the order it holds them:
     /// what a caller has to remove before the secret itself can be deleted.
     pub fn replica_regions(&self) -> Vec<String> {

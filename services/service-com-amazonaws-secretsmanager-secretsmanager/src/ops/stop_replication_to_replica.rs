@@ -209,12 +209,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The secret this Region holds under that id is the PRIMARY (or a
         // standalone secret, which is a primary with no replicas), not a
-        // replica, so there is no link to a primary to remove here.
+        // replica, so there is no link to a primary to remove here. Which of the
+        // two it is decides the sentence: a primary that still has a replica
+        // somewhere is told where the call belongs, and one that has none is told
+        // that this class of secret has no promotion to perform.
         if !secret.is_replica() {
             return Err(
                 StopReplicationToReplicaErrorModeled::InvalidParameterException(
                     InvalidParameterException {
-                        message: Some(crate::state::NOT_A_REPLICA_MESSAGE.to_string()),
+                        message: Some(crate::state::not_a_replica_message(secret).to_string()),
                     },
                 )
                 .into(),

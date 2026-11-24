@@ -26,8 +26,9 @@
 //! * a `Name` the service cannot use carries the one sentence stating what a name may be
 //!   built from ([`crate::state::INVALID_SECRET_NAME_MESSAGE`]), the same sentence the
 //!   create's own charset check answers with, so one unusable name reads the same whether
-//!   the boundary or the handler refused it; and a `SecretIdList` longer than one batch
-//!   states the bound as the batched read's own parameter refusal;
+//!   the boundary or the handler refused it; and a value past one of the maximums this
+//!   service enforces ITSELF ([`STATED_MAXIMUMS`]) states that operation's own modelled
+//!   refusal instead of a constraint clause;
 //! * a constraint one of a LIST member's elements broke is stated at that member, carrying
 //!   the element shape's whole declared constraint set ([`element_set`]) and the list the
 //!   REQUEST held there, where the framework reports the offending element alone and the one
@@ -72,9 +73,15 @@ static WITHHELD_MEMBERS: LazyLock<WithheldMembers> =
 /// clause must not move it.
 const CONSTRAINT_CODE: &str = "ValidationException";
 
-/// The code the batched read's parameter refusal travels under: "The parameter name or
+/// The code a parameter refusal of this service travels under: "The parameter name or
 /// value is invalid." (`InvalidParameterException`, this service's Smithy model).
 const PARAMETER_CODE: &str = "InvalidParameterException";
+
+/// The code a refusal about the REQUEST travels under: "You provided a parameter value
+/// that is not valid for the current state of the resource."
+/// (`InvalidRequestException`, this service's Smithy model) — the class the batched read's
+/// page-size rule is answered in.
+const REQUEST_CODE: &str = "InvalidRequestException";
 
 /// How many bytes of a rejected value a clause of this service echoes before the rest is
 /// elided.
@@ -88,16 +95,107 @@ const ELISION: &str = " ...";
 /// path, so the name rule below reaches nothing else.
 const NAME_PATH: &str = "name";
 
-/// The path the batched read's id list is reported at.
-const SECRET_ID_LIST_PATH: &str = "secretIdList";
+/// One MAXIMUM this service refuses in its OWN words rather than with the shared
+/// constraint clause: the operation whose input declares it, the member path the boundary
+/// walk reports it at, the modelled error code the refusal travels under, and the sentence
+/// it states.
+///
+/// Secrets Manager enforces some of its documented parameter limits in the service itself:
+/// such a request is answered with one of THAT OPERATION's modelled errors and a sentence
+/// stating the rule, so a client that branches on the modelled code to page smaller or to
+/// split a document sees it — where the shared `ValidationException` envelope is a code the
+/// operation does not model at all, and states the value it refused. Every other bound this
+/// model declares keeps that shared clause, so only the maximums the service states itself
+/// are listed in [`STATED_MAXIMUMS`].
+///
+/// A MAXIMUM, not a minimum: each sentence says the value is past a documented ceiling, so
+/// it is answered for a value that is too large or too long and never for one below a
+/// floor, which keeps its own clause.
+struct StatedMaximum {
+    operation: &'static str,
+    path: &'static str,
+    code: &'static str,
+    /// The sentence, built where that operation's own refusals are worded.
+    message: fn() -> String,
+}
+
+/// Every maximum of this service stated that way, keyed by the operation as well as the
+/// member: a limit belongs to the parameter of ONE operation, and the same member name on
+/// another operation (a page size with a bound of its own) keeps the shared clause.
+const STATED_MAXIMUMS: &[StatedMaximum] = &[
+    // The batched read's id list and its page size: both bound by the one batch that read
+    // answers, and both modelled errors of that operation.
+    StatedMaximum {
+        operation: "BatchGetSecretValue",
+        path: "secretIdList",
+        code: PARAMETER_CODE,
+        message: crate::ops::batch_get_secret_value::too_many_ids_message,
+    },
+    StatedMaximum {
+        operation: "BatchGetSecretValue",
+        path: "maxResults",
+        code: REQUEST_CODE,
+        message: crate::ops::batch_get_secret_value::max_results_above_batch_message,
+    },
+    // A resource policy document past the size limit Secrets Manager documents for one
+    // (`crate::state::RESOURCE_POLICY_CHARS`), at both members that carry such a document —
+    // the limit is the DOCUMENT's, so the attach and the pre-flight validation stand or
+    // fall by it alike, and neither quotes the document back.
+    StatedMaximum {
+        operation: "PutResourcePolicy",
+        path: "resourcePolicy",
+        code: PARAMETER_CODE,
+        message: resource_policy_too_long_message,
+    },
+    StatedMaximum {
+        operation: "ValidateResourcePolicy",
+        path: "resourcePolicy",
+        code: PARAMETER_CODE,
+        message: resource_policy_too_long_message,
+    },
+];
+
+/// The sentence a document past [`crate::state::RESOURCE_POLICY_CHARS`] is refused with,
+/// as a function so [`STATED_MAXIMUMS`] can name it beside the ones that state a bound.
+fn resource_policy_too_long_message() -> String {
+    crate::state::RESOURCE_POLICY_TOO_LONG_MESSAGE.to_string()
+}
+
+/// Whether `kind` is a value past a MAXIMUM the model declares — too long, or too large.
+fn past_a_maximum(kind: &ViolationKind) -> bool {
+    matches!(
+        kind,
+        ViolationKind::MaxLength(_) | ViolationKind::MaxValue(_)
+    )
+}
+
+/// How `operation` states a maximum one of `violations` broke, or `None` when it states
+/// none — which leaves the shared constraint clause to answer.
+fn stated_maximum(operation: Option<&str>, violations: &[Violation]) -> Option<Refused> {
+    let operation = operation?;
+    let stated = STATED_MAXIMUMS.iter().find(|maximum| {
+        maximum.operation == operation
+            && violations.iter().any(|violation| {
+                violation.path == maximum.path && past_a_maximum(&violation.kind)
+            })
+    })?;
+    Some(Refused {
+        code: stated.code.to_string(),
+        message: (stated.message)(),
+    })
+}
 
 /// How this service words `refusal`, or `None` to keep the framework's own wording — for the
 /// seam that is handed the violations ALONE, with no request to read a list out of.
 pub(super) fn reword(refusal: &Refusal) -> Option<Refused> {
-    reword_quoting(refusal, HashMap::new)
+    reword_quoting(None, refusal, HashMap::new)
 }
 
 /// How this service words `refusal`, or `None` to keep the framework's own wording.
+///
+/// `operation` is the modelled operation the request named, or `None` where the seam does
+/// not know it: a limit this service enforces itself belongs to one operation's parameter
+/// ([`STATED_MAXIMUMS`]), so a refusal whose operation is unknown keeps the shared clause.
 ///
 /// `lists` yields every list of scalar elements the REQUEST carried, keyed by the member path
 /// the walk reports that list at and already rendered
@@ -106,23 +204,19 @@ pub(super) fn reword(refusal: &Refusal) -> Option<Refused> {
 /// violation found on a list ELEMENT, so a refusal that has none never walks the request
 /// again, and the request-less seam passes one that yields nothing.
 pub(super) fn reword_quoting(
+    operation: Option<&str>,
     refusal: &Refusal,
     lists: impl FnOnce() -> HashMap<String, String>,
 ) -> Option<Refused> {
     let Refusal::Invalid(violations) = refusal else {
         return None;
     };
-    // Secrets Manager answers a `SecretIdList` longer than one batch with
-    // `InvalidParameterException` and a sentence stating the bound, and a client reading
-    // the batched API branches on that modelled code rather than on a constraint refusal.
-    if violations.iter().any(|violation| {
-        violation.path == SECRET_ID_LIST_PATH
-            && matches!(violation.kind, ViolationKind::MaxLength(_))
-    }) {
-        return Some(Refused {
-            code: PARAMETER_CODE.to_string(),
-            message: crate::ops::batch_get_secret_value::too_many_ids_message(),
-        });
+    // A documented limit this service enforces itself is answered with the operation's own
+    // modelled error and the sentence stating that limit ([`STATED_MAXIMUMS`]), never with
+    // the shared constraint clause: the clause carries a code the operation does not model
+    // and echoes the value the service refused.
+    if let Some(stated) = stated_maximum(operation, violations) {
+        return Some(stated);
     }
     // A name outside what a name may be is one refusal with one sentence, whichever bound
     // it fell outside. An ABSENT name is not an unusable one — it is a member the shape
@@ -269,6 +363,116 @@ mod tests {
         reword(&Refusal::Invalid(vec![violation]))
             .expect("this service words every constraint class it is handed")
             .message
+    }
+
+    /// What `operation` answers one violation with.
+    fn answered(operation: &str, violation: Violation) -> Refused {
+        reword_quoting(
+            Some(operation),
+            &Refusal::Invalid(vec![violation]),
+            HashMap::new,
+        )
+        .expect("this service words every constraint class it is handed")
+    }
+
+    /// RULE: a maximum this service enforces ITSELF is stated as that operation's own
+    /// modelled refusal with the sentence stating the limit, while every other declared
+    /// bound — the same member name on an operation with a bound of its own, and the
+    /// MINIMUM end of the same member — keeps the shared constraint clause.
+    ///
+    /// The rows run over both limits, over both members a policy document reaches, over
+    /// the two constraint classes a maximum is declared in (`@range` and `@length`), and
+    /// over the two contrasts.
+    #[test]
+    fn a_maximum_the_service_states_itself_is_that_operations_own_refusal() {
+        let policy = crate::state::RESOURCE_POLICY_TOO_LONG_MESSAGE.to_string();
+        let rows: Vec<(&str, &str, Violation, &str, String)> = vec![
+            (
+                "the batched read's page size",
+                "BatchGetSecretValue",
+                violation(
+                    "maxResults",
+                    ViolationKind::MaxValue("20".to_string()),
+                    Some("21"),
+                ),
+                REQUEST_CODE,
+                crate::ops::batch_get_secret_value::max_results_above_batch_message(),
+            ),
+            (
+                "the batched read's id list",
+                "BatchGetSecretValue",
+                violation("secretIdList", ViolationKind::MaxLength(20), Some("[a, b]")),
+                PARAMETER_CODE,
+                crate::ops::batch_get_secret_value::too_many_ids_message(),
+            ),
+            (
+                "an attached policy document",
+                "PutResourcePolicy",
+                violation(
+                    "resourcePolicy",
+                    ViolationKind::MaxLength(20480),
+                    Some("{\"Version\""),
+                ),
+                PARAMETER_CODE,
+                policy.clone(),
+            ),
+            (
+                "a validated policy document",
+                "ValidateResourcePolicy",
+                violation(
+                    "resourcePolicy",
+                    ViolationKind::MaxLength(20480),
+                    Some("{\"Version\""),
+                ),
+                PARAMETER_CODE,
+                policy,
+            ),
+        ];
+        for (case, operation, broken, code, message) in rows {
+            let value = broken.value.clone();
+            let stated = answered(operation, broken);
+            assert_eq!(
+                (stated.code.as_str(), stated.message.as_str()),
+                (code, message.as_str()),
+                "case {case:?}: expected the operation's own refusal, got {stated:?}"
+            );
+            if let Some(value) = value {
+                assert!(
+                    !stated.message.contains(&value),
+                    "case {case:?}: expected the sentence to carry no part of the value, got \
+                     {:?}",
+                    stated.message
+                );
+            }
+        }
+
+        // The contrasts: the listing's page size has a maximum of its own that this service
+        // does not state itself, and the MINIMUM end of a member whose maximum it does
+        // state is not that sentence either.
+        let listing = answered(
+            "ListSecrets",
+            violation(
+                "maxResults",
+                ViolationKind::MaxValue("100".to_string()),
+                Some("101"),
+            ),
+        );
+        assert_eq!(
+            listing.code, CONSTRAINT_CODE,
+            "case \"the listing's page size\": expected the shared clause, got {listing:?}"
+        );
+        let below = answered(
+            "BatchGetSecretValue",
+            violation(
+                "maxResults",
+                ViolationKind::MinValue("1".to_string()),
+                Some("0"),
+            ),
+        );
+        assert_eq!(
+            below.code, CONSTRAINT_CODE,
+            "case \"a page size below its minimum\": expected the shared clause, got {below:?}"
+        );
     }
 
     #[test]

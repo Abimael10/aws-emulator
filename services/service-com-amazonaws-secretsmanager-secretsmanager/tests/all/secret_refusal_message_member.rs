@@ -22,7 +22,8 @@
 //!   (`StopReplicationToReplica`, this service's Smithy model). Each half of that
 //!   pair is refused with one fixed text stating the class of secret the call is
 //!   not permitted on AND the Region it has to be made in instead — and the same
-//!   call made on the other side is served.
+//!   call made on the other side is served. A secret with no replica at all has no
+//!   other Region to be named, so its refusal states its class alone.
 //!
 //! The rows of the first table span the error SHAPES a refusal belongs to (three
 //! the model declares and the one it does not), the operations that raise them, and
@@ -44,10 +45,14 @@ const PRIMARY_REGION: &str = "us-west-2";
 const REPLICA_REGION: &str = "us-east-1";
 
 /// What `StopReplicationToReplica` answers for a `SecretId` that, in the signed
-/// Region, names a secret which is not a replica. Pinned as a literal rather than
-/// read from the crate, so the table states the text itself.
+/// Region, names a secret which is not a replica but still HAS one. Pinned as a
+/// literal rather than read from the crate, so the table states the text itself.
 const NOT_A_REPLICA: &str =
     "Operation not permitted on a primary secret. Call must be made in replica secret's region.";
+
+/// What it answers for one that is not a replica and has none either: no Region
+/// holds a replica of it, so the sentence names its class and redirects nowhere.
+const STANDALONE: &str = "Operation not permitted on a primary/standalone secret.";
 
 /// What a write answers for a `SecretId` that, in the signed Region, names a
 /// replica: the other half of the same rule, naming the other Region.
@@ -221,11 +226,11 @@ fn refusal_rows() -> Vec<RefusalRow> {
             message: SECRET_NOT_FOUND,
         },
         RefusalRow {
-            case: "the promotion call made on a secret that is not a replica",
+            case: "the promotion call made on a standalone secret",
             operation: "StopReplicationToReplica",
             body: |name| json!({"SecretId": name}),
             code: "InvalidParameterException",
-            message: NOT_A_REPLICA,
+            message: STANDALONE,
         },
         RefusalRow {
             case: "a rotation of a secret that has no rotation function",
