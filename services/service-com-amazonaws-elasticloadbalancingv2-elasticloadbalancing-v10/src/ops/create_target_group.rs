@@ -751,6 +751,11 @@ fn health_check_config(
         port,
         path,
         interval_seconds,
+        // WHETHER that cadence is one this request asked for: the member the caller sent,
+        // and not the documented default above. What the group reports is the same either
+        // way; what differs is the span this emulator's own clock leaves between two checks
+        // of a registration (`crate::state::target_health::health_check_interval`).
+        interval_configured: input.health_check_interval_seconds.is_some(),
         timeout_seconds,
         healthy_threshold,
         unhealthy_threshold,

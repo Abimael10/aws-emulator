@@ -1766,6 +1766,8 @@ mod tests {
             health_check: super::super::HealthCheckConfig {
                 enabled: true,
                 interval_seconds: i32::try_from(PROBE_INTERVAL.as_secs()).unwrap_or(5),
+                // The cadence these rows ASK for, so the checks are spaced by it.
+                interval_configured: true,
                 healthy_threshold: PROBE_THRESHOLD,
                 unhealthy_threshold: PROBE_THRESHOLD,
                 ..super::super::HealthCheckConfig::default()

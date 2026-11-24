@@ -722,6 +722,21 @@ pub struct HealthCheckConfig {
     pub port: Option<String>,
     pub path: Option<String>,
     pub interval_seconds: i32,
+    /// Whether the CADENCE above is one a caller asked for, rather than the documented
+    /// default the create settled it at.
+    ///
+    /// Read where this emulator's own clock spaces the checks of a registration
+    /// ([`target_health::health_check_interval`]): a cadence a request named is the one a
+    /// client asked to observe, while a defaulted one is a span nobody asked for. It
+    /// changes nothing a read reports — `HealthCheckIntervalSeconds` answers
+    /// [`Self::interval_seconds`] either way.
+    ///
+    /// NOT derivable from [`Self::interval_seconds`], and deliberately so: a group a caller
+    /// wrote the documented default ONTO carries the same number as one that was never
+    /// written, and the difference between them is which of the two asked for that cadence.
+    /// So this is a fact about the REQUESTS this group has taken, which only the writes that
+    /// take them can set.
+    pub interval_configured: bool,
     pub timeout_seconds: i32,
     pub healthy_threshold: i32,
     pub unhealthy_threshold: i32,

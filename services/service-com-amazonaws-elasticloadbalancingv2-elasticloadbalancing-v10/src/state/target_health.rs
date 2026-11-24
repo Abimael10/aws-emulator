@@ -32,10 +32,11 @@
 //! registration none of them has been made of is one whose health the load balancer has not
 //! determined yet, and one whose checks are failing is never reported healthy on the way to its
 //! verdict. The first check is owed at the instant checking begins and every later one comes one
-//! `HealthCheckIntervalSeconds` after the last ([`health_check_interval`]), the cadence the
-//! caller configured, so a verdict is reached no sooner than the threshold times that interval:
-//! a registration is never declared unhealthy faster than the schedule asked for could have
-//! decided it. WHY those checks failed
+//! `HealthCheckIntervalSeconds` after the last ([`health_check_interval`]) where a caller asked
+//! for that cadence, and otherwise one span of this emulator's own transitions after it, so a
+//! verdict is reached no sooner than the schedule the caller asked for could have decided it and
+//! a group nobody configured a cadence for settles like every other clock-owed step of this
+//! emulator. WHY those checks failed
 //! is reported with the verdict ([`CheckFailure`]): a check the target answered with a status
 //! its group's `Matcher` does not accept is the model's own `Target.ResponseCodeMismatch`, one
 //! that came back with an error or with an answer that is no response at all is its
@@ -107,21 +108,38 @@ pub fn deregistration_delay(group: &TargetGroupRecord) -> Duration {
         })
 }
 
-/// The span between two health checks of one registration of `group`: the group's own
-/// `HealthCheckIntervalSeconds` — "the approximate amount of time, in seconds, between
-/// health checks of an individual target".
+/// The span between two health checks of one registration of `group`: the cadence the CALLER
+/// asked this group's checks to run at — its `HealthCheckIntervalSeconds`, "the approximate
+/// amount of time, in seconds, between health checks of an individual target" — else the span
+/// this emulator owes a transition of its own ([`SETTLE_AFTER`]).
 ///
-/// A DURATION the caller configures, so it keeps the value the target group reports for it
-/// rather than being shortened to a span this emulator chooses: the whole point of the
-/// member is that a client can ask for the cadence it needs and then observe exactly it, and
-/// the cadence is what decides when a verdict is in — `UnhealthyThresholdCount` consecutive
-/// failing checks cannot be before that many intervals have passed.
+/// A cadence a request NAMED is a duration the caller configured, so it keeps the value the
+/// target group reports for it rather than being shortened: the whole point of the member is
+/// that a client can ask for the cadence it needs and then observe exactly it, and the cadence
+/// is what decides when a verdict is in — `UnhealthyThresholdCount` consecutive failing checks
+/// cannot be before that many intervals have passed.
+///
+/// A cadence NOBODY asked for is a different thing: it is the value `CreateTargetGroup` settled
+/// from the member's documented default, so the wait between two checks of such a group is a
+/// span this emulator chooses, and it chooses the one it gives every other transition its own
+/// clock owes ([`SETTLE_AFTER`], the span this crate settles a load balancer's provisioning, a
+/// registration's own and a gone host's drain in — CHOSEN, with no documented duration behind
+/// it). The verdict is still a number of CHECKS away — the two thresholds are counts, not
+/// durations, and they stand as the group reports them — so a group left at its defaults
+/// reaches `unhealthy` after as many failing checks as `UnhealthyThresholdCount` asks for and
+/// returns to `healthy` after as many passing ones, in the span this emulator settles a
+/// transition in rather than the minutes the documented cadence would take. What a READ reports
+/// is untouched: `HealthCheckIntervalSeconds` answers the documented default for such a group,
+/// because that is the value AWS carries it at.
 ///
 /// BOUNDED by the member's own documented range ("the range is 5-300"), which is the range a
-/// write of it is refused outside: the span is arithmetic on the clock, so it is held to what
-/// a target group could legitimately carry rather than to whatever a stored number says. A
-/// group carrying no interval at all is checked at the shortest cadence the member allows.
+/// write of it is refused outside: the span is arithmetic on the clock, so a configured cadence
+/// is held to what a target group could legitimately carry rather than to whatever a stored
+/// number says.
 pub fn health_check_interval(group: &TargetGroupRecord) -> Duration {
+    if !group.health_check.interval_configured {
+        return SETTLE_AFTER;
+    }
     let configured = group.health_check.interval_seconds.clamp(
         MIN_HEALTH_CHECK_INTERVAL_SECONDS,
         MAX_HEALTH_CHECK_INTERVAL_SECONDS,
@@ -905,6 +923,58 @@ mod tests {
         group
     }
 
+    /// RULE: the span between two checks of a registration is the cadence the CALLER asked
+    /// the group's checks to run at, held inside the range `HealthCheckIntervalSeconds`
+    /// publishes; a group no caller asked a cadence of is checked at the span this emulator
+    /// owes a transition of its own.
+    ///
+    /// The rows span what the rule generalises over: whether the cadence was asked for at
+    /// all, and — for one that was — each published bound of the member, one value past each
+    /// of them, and a figure no write could have stored.
+    #[test]
+    fn the_cadence_is_the_one_asked_for_bounded_by_the_members_own_range() {
+        let rows: [(&str, bool, i32, Duration); 8] = [
+            ("no cadence asked for, left at the documented default", false, 30, SETTLE_AFTER),
+            ("no cadence asked for by a group carrying the shortest", false, 5, SETTLE_AFTER),
+            (
+                "the shortest cadence the member admits",
+                true,
+                MIN_HEALTH_CHECK_INTERVAL_SECONDS,
+                Duration::from_secs(5),
+            ),
+            (
+                "the longest cadence the member admits",
+                true,
+                MAX_HEALTH_CHECK_INTERVAL_SECONDS,
+                Duration::from_secs(300),
+            ),
+            (
+                "one second under the shortest",
+                true,
+                MIN_HEALTH_CHECK_INTERVAL_SECONDS - 1,
+                Duration::from_secs(5),
+            ),
+            (
+                "one second over the longest",
+                true,
+                MAX_HEALTH_CHECK_INTERVAL_SECONDS + 1,
+                Duration::from_secs(300),
+            ),
+            ("a cadence of no time at all", true, 0, Duration::from_secs(5)),
+            ("a cadence no write could have stored", true, -7, Duration::from_secs(5)),
+        ];
+        for (case, asked_for, stored, expected) in rows {
+            let mut group = group_with(None);
+            group.health_check.interval_configured = asked_for;
+            group.health_check.interval_seconds = stored;
+            let interval = health_check_interval(&group);
+            assert_eq!(
+                interval, expected,
+                "case {case:?}: expected the checks {expected:?} apart, got {interval:?}"
+            );
+        }
+    }
+
     /// The drain is the configured value, bounded by the attribute's documented range —
     /// so a figure no write of the attribute could have stored cannot become a span, and
     /// no value makes the clock arithmetic leave what it can represent.
@@ -989,6 +1059,8 @@ mod tests {
         ];
         for (case, pending, draining, expected) in rows {
             let mut group = group_with(None);
+            // A cadence the caller ASKED for, which is the one the checks are spaced by.
+            group.health_check.interval_configured = true;
             group.health_check.interval_seconds = 300;
             let key: TargetKey = ("10.0.0.7".to_string(), Some(80));
             group.targets.insert(
@@ -1180,6 +1252,8 @@ mod tests {
         for (case, checks, looks, expected) in rows {
             let mut group = group_with(None);
             group.health_check.enabled = true;
+            // A cadence the caller ASKED for, which is the one the checks are spaced by.
+            group.health_check.interval_configured = true;
             group.health_check.interval_seconds = 5;
             group.health_check.healthy_threshold = 2;
             group.health_check.unhealthy_threshold = 2;

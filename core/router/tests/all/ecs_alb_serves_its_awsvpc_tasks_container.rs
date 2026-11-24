@@ -313,7 +313,15 @@ async fn ec2(router: &MultiServiceRouter, action: &str, params: &[(&str, &str)])
 }
 
 /// Drive one awsQuery action against the ELBv2 model that must succeed, and answer its body.
-async fn elbv2(router: &MultiServiceRouter, action: &str, params: &[(&str, &str)]) -> String {
+///
+/// `pub(crate)` for the reason [`emulator`] gives: a sibling suite measuring another rule of this
+/// topology drives Elastic Load Balancing v2 through this one call rather than keeping a second
+/// awsQuery sender of its own.
+pub(crate) async fn elbv2(
+    router: &MultiServiceRouter,
+    action: &str,
+    params: &[(&str, &str)],
+) -> String {
     let (status, body) = send(
         router,
         "elasticloadbalancingv2",
@@ -378,10 +386,10 @@ pub(crate) async fn ecs_ok(router: &MultiServiceRouter, operation: &str, body: V
 /// balancers' own security group, and the group the tasks are placed in — which admits the load
 /// balancers' checks and traffic on both ports a row may serve on.
 pub(crate) struct Network {
-    vpc: String,
-    subnets: Vec<String>,
-    load_balancer_group: String,
-    task_group: String,
+    pub(crate) vpc: String,
+    pub(crate) subnets: Vec<String>,
+    pub(crate) load_balancer_group: String,
+    pub(crate) task_group: String,
 }
 
 /// Create that network through EC2 itself, so every id asserted against is one EC2 minted.

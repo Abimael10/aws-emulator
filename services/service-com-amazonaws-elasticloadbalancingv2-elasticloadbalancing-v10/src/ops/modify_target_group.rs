@@ -343,6 +343,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if let Some(interval) = input.health_check_interval_seconds {
             group.health_check.interval_seconds = interval;
+            // A cadence this request ASKED for, so it is the one the checks of this group
+            // are spaced by from here on, whatever the create settled
+            // (`crate::state::target_health::health_check_interval`).
+            group.health_check.interval_configured = true;
             // The spacing of the checks is what decides when each registration's next one
             // comes due, and the one this modify stores applies from now on: a registration
             // whose pending check was scheduled under the OLD spacing is re-based, so a
