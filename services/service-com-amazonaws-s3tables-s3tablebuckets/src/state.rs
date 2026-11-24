@@ -33,6 +33,14 @@ pub use maintenance_jobs::*;
 mod replication_status;
 pub use replication_status::*;
 
+/// Whether the IAM role a replication configuration names can replicate at all:
+/// whether the replication principal can assume it and whether it is allowed
+/// the reads and writes replication performs. Named rather than glob-imported,
+/// for the same reason as [`authorization`]: a read of the replication status
+/// reads `crate::state::replication_role::engine_refusals(..)` and the question
+/// is visible at the call site.
+pub mod replication_role;
+
 /// Whether the policies in force — the calling principal's own identity-based
 /// IAM documents and the resource-based policy on what the request addresses —
 /// allow the action a request asks for. Named rather than glob-imported, so the

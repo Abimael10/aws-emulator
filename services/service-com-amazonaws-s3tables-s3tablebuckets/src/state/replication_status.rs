@@ -16,9 +16,10 @@
 //! Nothing a READ does here is written: a destination's state is DERIVED from
 //! records this store already holds — the replication configuration that covers
 //! the table, the table itself, the destination table bucket and the replica in
-//! it — plus the clock, exactly as a maintenance job's status is
-//! ([`super::maintenance_jobs`]). So two reads of a table nobody reconfigured
-//! answer the same, and a read never moves a destination's state.
+//! it — plus what the account's IAM holds about the configuration's role
+//! ([`super::replication_role`]) and the clock, exactly as a maintenance job's
+//! status is ([`super::maintenance_jobs`]). So two reads of a table nobody
+//! reconfigured answer the same, and a read never moves a destination's state.
 
 use std::time::{Duration, SystemTime};
 
@@ -102,8 +103,11 @@ pub struct ReplicationDestinationStatus {
     /// member is left out rather than claiming an update nothing copied.
     pub last_successful_update: Option<ReplicatedUpdate>,
     /// Why replication to this destination cannot proceed, set for exactly the
-    /// destinations in [`ReplicationState::Failed`].
-    pub failure_message: Option<&'static str>,
+    /// destinations in [`ReplicationState::Failed`]. Owned, because the reason a
+    /// role withholds the replication names that role
+    /// ([`super::replication_role`]), while the reason a destination table
+    /// bucket is not held is this service's own fixed sentence.
+    pub failure_message: Option<String>,
 }
 
 impl ComAmazonawsS3tablesS3tablebucketsState {
@@ -216,11 +220,19 @@ impl ComAmazonawsS3tablesS3tablebucketsState {
     /// configuration and in one stable order. A destination is pending until
     /// the destination table bucket holds the replica and the replication of
     /// the table's current state to it is due, completed once both hold, and
-    /// failed when the store holds no such destination table bucket at all.
+    /// failed when replication to it cannot proceed at all: when the
+    /// configuration's role withholds it (`role_refusals`, which the caller
+    /// asks the account's IAM for — [`super::replication_role`]) or when the
+    /// store holds no such destination table bucket.
+    ///
+    /// `role_refusals` is handed in rather than read here because the records it
+    /// rests on belong to another service's store, whose guard is taken with no
+    /// guard of this one held.
     pub fn table_replication_status(
         &self,
         table: &Table,
         at: SystemTime,
+        role_refusals: &super::replication_role::ReplicationRoleRefusals,
     ) -> Option<Vec<ReplicationDestinationStatus>> {
         let configuration = self.replicating_configuration(table)?;
         let location = self.tables_by_arn.get(&table.table_arn)?;
@@ -239,23 +251,10 @@ impl ComAmazonawsS3tablesS3tablebucketsState {
                 .iter()
                 .flat_map(|rule| rule.destinations.iter())
                 .map(|destination| {
-                    // A destination table bucket this store does not hold
-                    // cannot be written to, so replication to it never
-                    // completes: that is the modeled failed state, and the
-                    // failure it states is that class of fact about the
-                    // destination.
-                    let Some(bucket) = self.table_buckets.get(destination) else {
-                        return ReplicationDestinationStatus {
-                            destination_table_bucket_arn: destination.clone(),
-                            destination_table_arn: None,
-                            state: ReplicationState::Failed,
-                            last_successful_update: None,
-                            failure_message: Some(BUCKET_NOT_FOUND_MESSAGE),
-                        };
-                    };
-                    let replica = bucket
-                        .namespaces
-                        .get(&location.namespace)
+                    let replica = self
+                        .table_buckets
+                        .get(destination)
+                        .and_then(|bucket| bucket.namespaces.get(&location.namespace))
                         .and_then(|namespace| namespace.tables.get(&location.name))
                         // The REPLICA, not merely a table standing under the
                         // same name: a table a caller created at the
@@ -265,6 +264,39 @@ impl ComAmazonawsS3tablesS3tablebucketsState {
                             held.managed_by_service.as_deref() == Some(REPLICATION_SERVICE_PRINCIPAL)
                         })
                         .map(|held| held.table_arn.clone());
+                    // The ROLE first: replication is carried out acting as the
+                    // configuration's role, so a role the replication principal
+                    // cannot assume, or one that may not make the reads and
+                    // writes replication performs, is a replication that can
+                    // never copy anything to this destination — the modeled
+                    // failed state is terminal for it, whatever the clock says,
+                    // and the failure it states is what IAM answered about that
+                    // role. The replica the destination holds is still reported,
+                    // because that is a record this store holds; what the
+                    // failure says is that nothing is being copied into it.
+                    if let Some(refusal) = role_refusals.refusal_for(destination) {
+                        return ReplicationDestinationStatus {
+                            destination_table_bucket_arn: destination.clone(),
+                            destination_table_arn: replica,
+                            state: ReplicationState::Failed,
+                            last_successful_update: None,
+                            failure_message: Some(refusal.to_string()),
+                        };
+                    }
+                    // A destination table bucket this store does not hold
+                    // cannot be written to, so replication to it never
+                    // completes: that is the modeled failed state, and the
+                    // failure it states is that class of fact about the
+                    // destination.
+                    if !self.table_buckets.contains_key(destination) {
+                        return ReplicationDestinationStatus {
+                            destination_table_bucket_arn: destination.clone(),
+                            destination_table_arn: None,
+                            state: ReplicationState::Failed,
+                            last_successful_update: None,
+                            failure_message: Some(BUCKET_NOT_FOUND_MESSAGE.to_string()),
+                        };
+                    }
                     // A replication is reported completed only when BOTH hold:
                     // the destination holds the replica, which is what a
                     // completed replication leaves behind there, and the
@@ -294,8 +326,9 @@ impl ComAmazonawsS3tablesS3tablebucketsState {
                                 metadata_location,
                                 timestamp: completes_at,
                             }),
-                        // Nothing refuses a destination this store holds, so
-                        // such a destination carries no failure to state.
+                        // Nothing refuses a destination this store holds and
+                        // whose role withholds nothing, so such a destination
+                        // carries no failure to state.
                         failure_message: None,
                     }
                 })

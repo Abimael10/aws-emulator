@@ -263,6 +263,51 @@ pub(crate) fn statement(effect: &str, action: &str, resource: &str) -> String {
     .to_string()
 }
 
+/// Create an IAM role carrying the trust policy `trust` and one inline policy
+/// per document in `policies`, and answer the ARN IAM minted for it.
+///
+/// The CreateRole-plus-PutRolePolicy half every suite that needs a role of its
+/// own performs, held here once: [`assumed_role`] goes on to assume the role it
+/// makes, while a suite about a role a SERVICE acts as
+/// (`table_replication_role_backfill.rs`) only needs the role to exist with the
+/// documents it carries.
+pub(crate) async fn created_role(
+    aws: &Emulator,
+    role_name: &str,
+    trust: &str,
+    policies: &[String],
+) -> String {
+    let created = aws
+        .query(
+            "iam",
+            "2010-05-08",
+            "CreateRole",
+            &[
+                ("RoleName", role_name.to_string()),
+                ("AssumeRolePolicyDocument", trust.to_string()),
+            ],
+        )
+        .await;
+    // SEVERAL inline policies, so a decision taken over the union of the
+    // documents in force is distinguishable from one taken inside a single
+    // document.
+    for (index, policy) in policies.iter().enumerate() {
+        aws.query(
+            "iam",
+            "2010-05-08",
+            "PutRolePolicy",
+            &[
+                ("RoleName", role_name.to_string()),
+                ("PolicyName", format!("inline-{index}")),
+                ("PolicyDocument", policy.clone()),
+            ],
+        )
+        .await;
+    }
+    xml_element(&created, "Arn")
+        .unwrap_or_else(|| panic!("CreateRole answers the role's Arn, got {created}"))
+}
+
 /// Create an IAM role carrying one inline policy per document in `policies`,
 /// assume it through STS, and answer the session's access key id with the
 /// session ARN.
@@ -281,39 +326,14 @@ pub(crate) async fn assumed_role(
         }],
     })
     .to_string();
-    aws.query(
-        "iam",
-        "2010-05-08",
-        "CreateRole",
-        &[
-            ("RoleName", role_name.to_string()),
-            ("AssumeRolePolicyDocument", trust),
-        ],
-    )
-    .await;
-    // SEVERAL inline policies, so a decision taken over the union of the
-    // documents in force is distinguishable from one taken inside a single
-    // document.
-    for (index, policy) in policies.iter().enumerate() {
-        aws.query(
-            "iam",
-            "2010-05-08",
-            "PutRolePolicy",
-            &[
-                ("RoleName", role_name.to_string()),
-                ("PolicyName", format!("inline-{index}")),
-                ("PolicyDocument", policy.clone()),
-            ],
-        )
-        .await;
-    }
+    let role_arn = created_role(aws, role_name, &trust, policies).await;
     let assumed = aws
         .query(
             "sts",
             "2011-06-15",
             "AssumeRole",
             &[
-                ("RoleArn", format!("arn:aws:iam::{account}:role/{role_name}")),
+                ("RoleArn", role_arn),
                 ("RoleSessionName", SESSION.to_string()),
             ],
         )

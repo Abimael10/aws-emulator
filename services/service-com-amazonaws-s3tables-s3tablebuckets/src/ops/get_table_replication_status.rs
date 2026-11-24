@@ -152,7 +152,7 @@ fn wire_value(
                 timestamp: ::aws_smithy_types::DateTime::from(update.timestamp),
             }
         }),
-        failure_message: status.failure_message.map(str::to_string),
+        failure_message: status.failure_message.clone(),
     }
 }
 
@@ -208,36 +208,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // A pure read: every destination's state is derived from the
-        // configuration that replicates the table, the destination table bucket
-        // and the clock, and nothing in the store is touched — so two reads of
-        // a table nobody reconfigured answer the same.
+        // configuration that replicates the table, the destination table
+        // bucket, what the account's IAM holds about the configuration's role
+        // and the clock, and nothing in either store is touched — so two reads
+        // of a table nobody reconfigured answer the same.
         let at = ::std::time::SystemTime::now();
-        let store = state.lock();
-        let table = match store.table_by_arn(&input.table_arn) {
-            Some(table) => table,
-            // A `tableArn` names a table INSIDE a table bucket, so which of the
-            // two the store does not hold is which resource the refusal is
-            // about: an ARN whose table bucket this account holds no bucket for
-            // is stated with the bucket's own sentence, and one whose bucket
-            // holds no table under the id with the table's.
-            None => {
+        // What the configuration replicating this table rests on, read under
+        // this service's own guard and nothing else: the table's own ARN, the
+        // role replication is carried out as, and the destinations the rules
+        // name.
+        let (source_table_arn, role, named_destinations) = {
+            let store = state.lock();
+            let Some(table) = store.table_by_arn(&input.table_arn) else {
+                // A `tableArn` names a table INSIDE a table bucket, so which of
+                // the two the store does not hold is which resource the refusal
+                // is about: an ARN whose table bucket this account holds no
+                // bucket for is stated with the bucket's own sentence, and one
+                // whose bucket holds no table under the id with the table's.
                 return Err(not_found(
                     if store.table_buckets.contains_key(bucket_of(&input.table_arn)) {
                         crate::state::TABLE_NOT_FOUND_MESSAGE
                     } else {
                         crate::state::BUCKET_NOT_FOUND_MESSAGE
                     },
-                ))
-            }
+                ));
+            };
+            // The response's `destinations` is required and the model bounds it
+            // at one destination at least (`@length(min: 1, max: 5)`): a table
+            // nothing replicates has no destination to report, so the read is
+            // refused with the modeled not-found rather than answered with an
+            // empty list, which is how a client observes that the table is not
+            // replicated.
+            let Some(configuration) = store.replicating_configuration(table) else {
+                return Err(not_found(
+                    crate::state::REPLICATION_CONFIGURATION_NOT_FOUND_MESSAGE,
+                ));
+            };
+            (
+                table.table_arn.clone(),
+                configuration.role.clone(),
+                configuration
+                    .rules
+                    .iter()
+                    .flat_map(|rule| rule.destinations.iter().cloned())
+                    .collect::<Vec<String>>(),
+            )
         };
 
-        // The response's `destinations` is required and the model bounds it at
-        // one destination at least (`@length(min: 1, max: 5)`): a table nothing
-        // replicates has no destination to report, so the read is refused with
-        // the modeled not-found rather than answered with an empty list, which
-        // is how a client observes that the table is not replicated.
+        // Whether the account's IAM answers that the role cannot replicate —
+        // the replication principal cannot assume it, or it may not make the
+        // reads and writes replication performs. Asked with NO guard of this
+        // service's store held, and it writes to neither store.
+        let role_refusals = crate::state::replication_role::engine_refusals(
+            &*self.engine,
+            &role,
+            &source_table_arn,
+            &named_destinations,
+        );
+
+        let store = state.lock();
+        let table = store
+            .table_by_arn(&input.table_arn)
+            // Reachable only if the table was removed between the two reads
+            // above, which is the state a caller that deleted it is in.
+            .ok_or_else(|| not_found(crate::state::TABLE_NOT_FOUND_MESSAGE))?;
         let destinations = store
-            .table_replication_status(table, at)
+            .table_replication_status(table, at, &role_refusals)
             .ok_or_else(|| not_found(crate::state::REPLICATION_CONFIGURATION_NOT_FOUND_MESSAGE))?;
 
         Ok(GetTableReplicationStatusOutput {
