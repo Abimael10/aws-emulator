@@ -26,15 +26,19 @@
 //! * a plan carries the instant it was last written — the create that stored it
 //!   until an update rewrites it — so a read reports when its configuration last
 //!   changed, and an update rewrites only the members its body states
-//!   ([`RestoreTestingPlanRecord::apply_update`]).
+//!   ([`RestoreTestingPlanRecord::apply_update`]);
+//! * a plan stops being held when it is taken out of the store
+//!   ([`ComAmazonawsBackupCryocontrollerusermanagerState::remove_restore_testing_plan`]),
+//!   which a plan that still holds restore testing selections bars
+//!   ([`restore_testing_plan_selections_exist`]).
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use super::ComAmazonawsBackupCryocontrollerusermanagerState;
 use crate::ops::types::{
-    InvalidParameterValueException, RestoreTestingPlanForGet, RestoreTestingPlanForList,
-    RestoreTestingPlanForUpdate, RestoreTestingRecoveryPointSelection,
+    InvalidParameterValueException, InvalidRequestException, RestoreTestingPlanForGet,
+    RestoreTestingPlanForList, RestoreTestingPlanForUpdate, RestoreTestingRecoveryPointSelection,
 };
 
 /// The most restore testing plans this emulator keeps.
@@ -69,6 +73,37 @@ pub const MAX_SELECTION_WINDOW_DAYS: i32 = 365;
 /// The most characters a `RestoreTestingPlanName` may carry: "Maximum length is
 /// 50" (model doc for `CreateRestoreTestingPlanOutput$RestoreTestingPlanName`).
 pub const MAX_RESTORE_TESTING_PLAN_NAME_LENGTH: usize = 50;
+
+/// `Code` for "the restore testing plan this delete addresses still holds
+/// restore testing selections, which have to be deleted first" — the restore
+/// testing plan's own token for the condition the BACKUP plan's delete states
+/// with its own ([`super::ERROR_CODE_PLAN_SELECTIONS_EXIST`]), so a client that
+/// branches on it tells the two resources' deletes apart.
+pub const ERROR_CODE_RESTORE_TESTING_PLAN_SELECTIONS_EXIST: &str = "ERROR_RT_9201";
+
+/// The sentence this service states for a restore testing plan delete the plan's
+/// own selections still bar — FIXED text: it names neither the plan nor how many
+/// selections bar the delete, only what has to be deleted first. "Deletion can
+/// only successfully occur if all associated restore testing selections are
+/// deleted first" (model doc for `DeleteRestoreTestingPlan`), worded as this
+/// service words the same condition for a backup plan
+/// ([`super::MESSAGE_PLAN_SELECTIONS_EXIST`]). Its token is
+/// [`ERROR_CODE_RESTORE_TESTING_PLAN_SELECTIONS_EXIST`].
+pub const MESSAGE_RESTORE_TESTING_PLAN_SELECTIONS_EXIST: &str =
+    "Related restore testing selections must be deleted prior to restore testing plan deletion";
+
+/// The modelled refusal for a restore testing plan delete the plan's own restore
+/// testing selections still bar — see
+/// [`MESSAGE_RESTORE_TESTING_PLAN_SELECTIONS_EXIST`], with the condition's own
+/// token. ONE builder for the class, so the plan's STATE is stated the same way
+/// wherever a delete is refused for it.
+pub fn restore_testing_plan_selections_exist() -> InvalidRequestException {
+    InvalidRequestException {
+        code: Some(ERROR_CODE_RESTORE_TESTING_PLAN_SELECTIONS_EXIST.to_string()),
+        message: Some(MESSAGE_RESTORE_TESTING_PLAN_SELECTIONS_EXIST.to_string()),
+        ..Default::default()
+    }
+}
 
 /// A restore testing plan: what `CreateRestoreTestingPlan` stores and
 /// `GetRestoreTestingPlan` reports.
@@ -296,6 +331,35 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
         self.restore_testing_plans
             .get_mut(name)
             .ok_or_else(super::restore_testing_plan_not_found)
+    }
+
+    /// Take the restore testing plan a `RestoreTestingPlanName` addresses OUT of
+    /// the store, or answer the modelled refusal for a plan whose own restore
+    /// testing selections still bar its deletion.
+    ///
+    /// The ONE removal step, so the resource a delete reports gone is gone from
+    /// the store every later read and mutation of that name resolves against:
+    /// after it, the name answers the plan's not-found condition
+    /// ([`super::restore_testing_plan_not_found`]) and is free for a create
+    /// again — which mints another plan, with its own ARN.
+    ///
+    /// "Deletion can only successfully occur if all associated restore testing
+    /// selections are deleted first" (model doc for `DeleteRestoreTestingPlan`),
+    /// so a plan that still holds one is left exactly as it was and the call is
+    /// refused ([`restore_testing_plan_selections_exist`]).
+    ///
+    /// Otherwise the removal is IDEMPOTENT: `None` says the account held no plan
+    /// under that name, which is the state the caller asked for, so a repeat of
+    /// the call is not a different answer — and the operation carries no modelled
+    /// not-found error to state one with.
+    pub fn remove_restore_testing_plan(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<RestoreTestingPlanRecord>, InvalidRequestException> {
+        if self.restore_testing_selections_of_plan(name).next().is_some() {
+            return Err(restore_testing_plan_selections_exist());
+        }
+        Ok(self.restore_testing_plans.remove(name))
     }
 
     /// The plan a repeated `CreatorRequestId` replays: "This identifies the
