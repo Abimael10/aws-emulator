@@ -172,7 +172,6 @@ pub fn stream_session(
 #[must_use]
 pub fn announced_stream_session(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
-    state: &ComAmazonawsIvsAmazoninteractivevideoserviceState,
     record: StreamSessionRecord,
 ) -> StreamSession {
     let ingest_configurations = record.ingest_configuration.clone().map(|ingest| {
@@ -187,7 +186,7 @@ pub fn announced_stream_session(
         stream_id: Some(record.stream_id),
         start_time: Some(::aws_smithy_types::DateTime::from(record.start_time)),
         end_time: record.end_time.map(::aws_smithy_types::DateTime::from),
-        channel: Some(announced_channel(ctx, state, record.channel)),
+        channel: Some(announced_channel(ctx, record.channel)),
         ingest_configuration: record.ingest_configuration,
         ingest_configurations,
         recording_configuration: record.recording_configuration,

@@ -160,7 +160,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The record the store holds, announced to THIS request: the playback URL
             // names the address this caller reached the emulator at, because that is the
             // address the channel is played back from.
-            channel: Some(crate::state::announced_channel(ctx, &store, channel)),
+            channel: Some(crate::state::announced_channel(ctx, channel)),
         })
     }
 }

@@ -19,10 +19,11 @@ use regex::Regex;
 use sha2::{Digest, Sha256};
 use smithy_server_runtime::{Violation, ViolationKind};
 
-/// The two addresses a channel announces — the ingest server a client contributes to and
-/// the playback URL a player fetches, both of them names in this emulator's own zone —
-/// kept in one module beside the state they are built from, and re-exported here so a
-/// handler reaches them where it reaches the rest of this service's rules.
+/// The two addresses a channel announces — the ingest server a client contributes to, a
+/// name in this emulator's own zone, and the playback URL a player fetches, rooted on the
+/// address that player reached this emulator at — kept in one module beside the state they
+/// are built from, and re-exported here so a handler reaches them where it reaches the rest
+/// of this service's rules.
 mod channel_endpoints;
 
 /// The ad marker a broadcasting channel's playlist carries, and the rule

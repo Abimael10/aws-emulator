@@ -64,7 +64,12 @@ const MAX_SEGMENTS: usize = 3;
 /// The most media bytes one open segment accumulates before it is closed whatever the
 /// timestamps say, so one publisher holds a bounded amount of this process's memory
 /// however it encodes — at most this times [`MAX_SEGMENTS`] per broadcasting channel.
-const MAX_SEGMENT_BYTES: usize = 1024 * 1024;
+///
+/// It is also the most one ingested MESSAGE may carry, because a message larger than a
+/// whole segment could be packaged nowhere: the contribute plane reads it as the cap a
+/// publisher is disconnected for exceeding ([`super::publish_media`]), and
+/// [`ChannelPlaylist::append`] drops any message past it that reaches it anyway.
+pub const MAX_SEGMENT_BYTES: usize = 1024 * 1024;
 
 /// The FLV file header every packaged segment begins with: the signature `FLV`, version 1,
 /// the audio and video flags, the 9-byte header length, and the first back-pointer — the

@@ -127,6 +127,31 @@ impl Ivs {
         write(&mut store)
     }
 
+    /// The `host:port` of the SOCKET this deployment's contribute plane answers on, which
+    /// is where a publisher that holds a port opens its connection.
+    ///
+    /// A deployment detail, not an announced value: what the control plane announces is the
+    /// contribute HOST (`announced_channel_endpoints.rs`), and the port a client appends to
+    /// it is its protocol's. A suite that drives a real encoder over a real socket needs the
+    /// socket, and this is where the plane records it.
+    pub(crate) fn contribute_socket(&self) -> String {
+        self.with_store(|store| {
+            store
+                .ingest_plane
+                .as_ref()
+                .map(|plane| plane.authority().to_string())
+        })
+        .expect("a created channel has opened this deployment's contribute plane")
+    }
+
+    /// The register of the data planes this emulator has opened a listener for, as an
+    /// IN-PROCESS client of one reads it: a client handed an address by the control plane
+    /// resolves it here and is served by that plane's own handler, in this process.
+    pub(crate) fn dialable_planes(&self) -> ::service_common::dialable_data_planes::DialablePlanes {
+        ::service_common::dialable_data_planes::DialablePlanes::of(&*self.engine)
+            .expect("the shared engine vends the register of its open planes")
+    }
+
     pub(crate) async fn call(&self, operation: &str, body: &Value) -> Reply {
         self.call_as(operation, body, None, AUTHORIZATION).await
     }
@@ -222,6 +247,67 @@ impl Ivs {
         text(&self.create(request).await["channel"], "arn")
     }
 }
+
+/// Complete the CLIENT half of an RTMP handshake on `conn`, the way an encoder dialing a
+/// channel's contribute plane opens one, and answer the bytes that followed it — the input
+/// the client session reads next. `Err` carries what went wrong instead.
+///
+/// The one handshake of this crate's suites, shared rather than copied: it is generic over
+/// the stream, so the publisher that dials the plane's SOCKET
+/// (`live_stream_reads.rs`) and the in-process client that opens a connection to an
+/// address composed from the ANNOUNCED host (`announced_channel_endpoints.rs`) run the same
+/// one. The protocol itself is the maintained implementation of it (`rml_rtmp`).
+pub(crate) async fn rtmp_handshake<Conn>(conn: &mut Conn) -> Result<Vec<u8>, String>
+where
+    Conn: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut handshake = Handshake::new(PeerType::Client);
+    let opening = handshake
+        .generate_outbound_p0_and_p1()
+        .map_err(|error| format!("the client handshake must open: {error:?}"))?;
+    conn.write_all(&opening)
+        .await
+        .map_err(|error| format!("the handshake must be written: {error}"))?;
+    let mut arriving = vec![0_u8; HANDSHAKE_READ_BYTES];
+    loop {
+        let read = tokio::time::timeout(HANDSHAKE_DEADLINE, conn.read(&mut arriving))
+            .await
+            .map_err(|_| "the ingest server did not answer within the deadline".to_string())?
+            .map_err(|error| format!("the ingest connection must be readable: {error}"))?;
+        if read == 0 {
+            return Err("the ingest server closed the connection".to_string());
+        }
+        match handshake.process_bytes(&arriving[..read]) {
+            Ok(HandshakeProcessResult::InProgress { response_bytes }) => {
+                conn.write_all(&response_bytes)
+                    .await
+                    .map_err(|error| format!("the handshake must be written: {error}"))?;
+            }
+            Ok(HandshakeProcessResult::Completed {
+                response_bytes,
+                remaining_bytes,
+            }) => {
+                conn.write_all(&response_bytes)
+                    .await
+                    .map_err(|error| format!("the handshake must be written: {error}"))?;
+                return Ok(remaining_bytes);
+            }
+            Err(error) => return Err(format!("the ingest handshake failed: {error:?}")),
+        }
+    }
+}
+
+/// How much of the handshake is read at a time.
+const HANDSHAKE_READ_BYTES: usize = 16 * 1024;
+
+/// How long one read of the handshake may block before the caller gives up on it.
+///
+/// Generous on purpose: it bounds the plane having answered at all rather than how fast this
+/// host runs, so a loaded machine cannot fail a case a fast one passes.
+const HANDSHAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A string member, read as the empty string when absent — which is what a client
 /// sees for a member the wire omits.

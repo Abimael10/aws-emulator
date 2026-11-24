@@ -34,7 +34,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use service_com_amazonaws_ivs_amazoninteractivevideoservice::state;
 
-use super::announced_channel_endpoints::announced_port;
 // The one harness for this crate's suites, declared in `channel_lifecycle.rs` and
 // shared by every suite here rather than copied: it owns the router, the request
 // envelope, the reply shape and the store access the seeding below writes through.
@@ -613,39 +612,17 @@ impl Publisher {
     /// what the ingest server said when it refused the publish (or when the connection
     /// ended without one).
     async fn publishing(authority: &str, stream_key: &str) -> Result<Self, String> {
-        use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
         use rml_rtmp::sessions::{ClientSession, ClientSessionConfig, PublishRequestType};
 
-        // The announced host is one of this machine's own spellings (asserted by
-        // `announced_channel_endpoints.rs`), so the encoder's connection is this
-        // emulator's own loopback port.
-        let port = announced_port("a publisher", authority);
+        // The contribute socket is bound on one of this machine's own interfaces, so the
+        // encoder's connection is this emulator's own loopback port.
+        let port = authority_port(authority);
         let mut conn = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
             .await
-            .map_err(|error| format!("the announced address {authority} must accept a connection: {error}"))?;
-        let mut handshake = Handshake::new(PeerType::Client);
-        let opening = handshake
-            .generate_outbound_p0_and_p1()
-            .map_err(|error| format!("the client handshake must open: {error:?}"))?;
-        conn.write_all(&opening)
-            .await
-            .map_err(|error| format!("the handshake must be written: {error}"))?;
-        let leftover = loop {
-            let arriving = read_some(&mut conn).await?;
-            match handshake.process_bytes(&arriving) {
-                Ok(HandshakeProcessResult::InProgress { response_bytes }) => {
-                    write_all(&mut conn, &response_bytes).await?;
-                }
-                Ok(HandshakeProcessResult::Completed {
-                    response_bytes,
-                    remaining_bytes,
-                }) => {
-                    write_all(&mut conn, &response_bytes).await?;
-                    break remaining_bytes;
-                }
-                Err(error) => return Err(format!("the ingest handshake failed: {error:?}")),
-            }
-        };
+            .map_err(|error| format!("the contribute socket {authority} must accept a connection: {error}"))?;
+        // The one handshake of this crate's suites, shared with the suite that opens an
+        // in-process connection to an address composed from the announced host.
+        let leftover = super::channel_lifecycle::rtmp_handshake(&mut conn).await?;
         let (session, initial) = ClientSession::new(ClientSessionConfig::new())
             .map_err(|error| format!("the client session must start: {error:?}"))?;
         let mut publisher = Self {
@@ -935,13 +912,26 @@ where
     }
 }
 
-/// The address a created channel announces as its ingest server, and the stream key the
-/// create minted for it.
-fn announced_ingest(created: &Value) -> (String, String) {
+/// The SOCKET a publisher on this machine dials this deployment's contribute plane at, and
+/// the stream key the create minted for the channel it publishes to.
+///
+/// The channel's announced `ingestEndpoint` is the HOST of that plane — the value a client
+/// appends its protocol's port to, whose composed address `announced_channel_endpoints.rs`
+/// proves is served — and the socket is the port the core bound for it, which is what a
+/// publisher holding a socket of its own connects to.
+fn contribute_target(ivs: &Ivs, created: &Value) -> (String, String) {
     (
-        text(&created["channel"], "ingestEndpoint"),
+        ivs.contribute_socket(),
         text(&created["streamKey"], "value"),
     )
+}
+
+/// The port one `host:port` authority names, read through the workspace's one reading of an
+/// authority.
+fn authority_port(authority: &str) -> u16 {
+    ::service_common::data_plane_addressing::addressed_port(Some(authority))
+        .and_then(|port| u16::try_from(port).ok())
+        .unwrap_or_else(|| panic!("a dialable authority carries a port, got {authority:?}"))
 }
 
 /// RULE, first leg: a publish on the announced contribute address, authenticated by a
@@ -966,7 +956,7 @@ async fn a_publish_on_the_announced_address_brings_its_own_channel_live() {
     let mut publishers: Vec<Publisher> = Vec::new();
     for (case, request) in creates {
         let created = ivs.create(request).await;
-        let (ingest, key) = announced_ingest(&created);
+        let (ingest, key) = contribute_target(&ivs, &created);
         channels.push((case.to_string(), text(&created["channel"], "arn"), key.clone()));
 
         // Nothing is publishing yet, so nothing is live.
@@ -1088,7 +1078,7 @@ async fn a_publish_on_the_announced_address_brings_its_own_channel_live() {
 async fn a_publish_presenting_a_key_no_channel_minted_is_refused() {
     let ivs = Ivs::new();
     let created = ivs.create(json!({ "name": "guarded" })).await;
-    let (ingest, key) = announced_ingest(&created);
+    let (ingest, key) = contribute_target(&ivs, &created);
     let arn = text(&created["channel"], "arn");
     let deleted = ivs.create(json!({ "name": "deleted-key" })).await;
     let deleted_key = text(&deleted["streamKey"], "value");
@@ -1165,7 +1155,7 @@ async fn a_publish_presenting_a_key_no_channel_minted_is_refused() {
 async fn the_announced_playback_url_serves_a_playlist_once_segments_are_packaged() {
     let ivs = Ivs::new();
     let created = ivs.create(json!({ "name": "played-back" })).await;
-    let (ingest, key) = announced_ingest(&created);
+    let (ingest, key) = contribute_target(&ivs, &created);
     let arn = text(&created["channel"], "arn");
     let playback = text(&created["channel"], "playbackUrl");
 
@@ -1279,7 +1269,7 @@ async fn the_announced_playback_url_serves_a_playlist_once_segments_are_packaged
 async fn stopping_a_stream_disconnects_its_publisher_and_closes_the_session() {
     let ivs = Ivs::new();
     let created = ivs.create(json!({ "name": "stopped" })).await;
-    let (ingest, key) = announced_ingest(&created);
+    let (ingest, key) = contribute_target(&ivs, &created);
     let arn = text(&created["channel"], "arn");
 
     let mut publisher = Publisher::publishing(&ingest, &key)
@@ -1369,6 +1359,65 @@ async fn stopping_a_stream_disconnects_its_publisher_and_closes_the_session() {
         "a stream id this channel never had names no session, got {} {}",
         unknown.status, unknown.body
     );
+}
+
+/// RULE: an admitted publish may only send what the plane could serve — a message larger
+/// than one segment of the live window may hold is packaged nowhere, so its publisher is
+/// disconnected instead of growing this store with media nothing keeps.
+///
+/// Rows differ along what the rule generalises over: the size of one ingested message, at
+/// the published bound and one byte past it. What an accepted message costs is bounded by
+/// the live window itself (`playback_plane`'s own suite covers that window).
+#[tokio::test]
+async fn a_message_larger_than_a_segment_disconnects_its_publisher() {
+    // The bound itself, read from where it is stated rather than copied: the most media
+    // bytes one packaged segment holds, and therefore the most one ingested message may
+    // carry.
+    let cap = state::MAX_SEGMENT_BYTES;
+
+    let ivs = Ivs::new();
+    let created = ivs.create(json!({ "name": "bounded-ingest" })).await;
+    let arn = text(&created["channel"], "arn");
+    let key = text(&created["streamKey"], "value");
+    let publish = ivs
+        .with_store_mut(|store| state::accept_publish(store, &key))
+        .expect("the channel's own stream key admits a publish");
+
+    let rows: [(&str, usize, bool); 3] = [
+        ("one byte", 1, true),
+        ("a message filling a whole segment", cap, true),
+        ("one byte past a whole segment", cap + 1, false),
+    ];
+    for (case, size, served) in rows {
+        let payload = vec![0x27_u8; size];
+        let keeps_serving = ivs.with_store_mut(|store| {
+            state::publish_media(store, &publish, state::MediaKind::Video, 0, &payload)
+        });
+        assert_eq!(
+            keeps_serving,
+            served,
+            "case {case:?}: expected the publisher to be {}, got {keeps_serving}",
+            match served {
+                true => "served",
+                false => "disconnected",
+            }
+        );
+        // The refusal is the publisher's alone: the broadcast it brought up is untouched, so
+        // the channel is still live and still reports the stream the publish started.
+        let reply = get_stream(&ivs, &arn).await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case:?}: the channel stays live while its publisher is connected, got \
+             {} {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            text(&reply.body["stream"], "streamId"),
+            publish.stream_id,
+            "case {case:?}: the channel reports the stream the publish started, got {}",
+            reply.body["stream"]
+        );
+    }
 }
 
 /// A URL beside `url`: the same address and directory, with `name` as the file — which is

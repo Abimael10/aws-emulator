@@ -8,13 +8,17 @@
 //! ingest server, used when you set up streaming software"
 //! (`smithy_query(query="shape",shape="Channel")`) — a value whose whole purpose is to be
 //! DIALED: a broadcaster points its encoder at `rtmps://<ingestEndpoint>:443/app/<streamKey>`
-//! and expects the handshake to complete and the channel to go live. A name in a zone that
-//! resolves to nothing on this machine, or an address nothing listens on, is the one thing
-//! such a member must never be. So this service opens a socket of the EMULATOR's own through
-//! the core ([`::emulator_server::Listeners::tcp_plaintext`], which owns the socket, the bind
+//! and expects the handshake to complete and the channel to go live. So this service opens a
+//! socket of the EMULATOR's own through the core
+//! ([`::emulator_server::Listeners::tcp_plaintext`], which owns the socket, the bind
 //! interface, the port range, the TLS, the handshake deadline, the idle timeout and the
-//! connection caps) and announces the `host:port` that socket answers on
-//! ([`super::announced_ingest_endpoint`]).
+//! connection caps) and serves the SAME handler at both ends of the address the control
+//! plane announces ([`super::announced_ingest_endpoint`]): the core's socket, and a
+//! connection an in-process client of this emulator opens to that announced NAME on each
+//! port a contribution is dialed on ([`::service_common::dialable_data_planes`], the tree's
+//! one register of the planes it has opened). The member itself carries only the host,
+//! because the client composes the port ([`super::CONTRIBUTE_PORTS`]) — so what is recorded
+//! there is every address a client composes from the value it was handed.
 //!
 //! ONE socket serves the whole account, because AWS publishes one ingest server per account
 //! rather than one per channel, and WHICH channel a connection publishes to is carried by
@@ -42,16 +46,27 @@ use super::*;
 /// The wire an encoder publishes over, served on the socket this module opens.
 mod rtmp_wire;
 
+/// The service that opened the socket, as the register of the planes this emulator serves
+/// in process names it: this service's own SigV4 signing name, because the contribute plane
+/// is the IVS data plane.
+const SIGNING_NAME: &str = "ivs";
+
 /// The socket the contribute plane answers on, as the control plane publishes it.
 ///
 /// Dropping it closes the port and severs every connection on it, so it is held on the
 /// store for as long as this deployment serves channels.
 pub struct IngestPlane {
-    /// The `host:port` the core says the socket is dialable at, which is the value every
-    /// channel announces as its ingest server.
+    /// The `host:port` the core says the socket is dialable at — where a publisher on this
+    /// machine opens its connection. The NAME the control plane announces for this plane is
+    /// composed per request ([`super::announced_ingest_endpoint`]).
     authority: String,
     /// The socket itself. Never read: it is held because dropping it closes the port.
     _listener: ::emulator_server::ResourceListener,
+    /// The record that resolves this plane for an in-process client opening a connection to
+    /// an address composed from the announced contribute name. Never read: it is held
+    /// because dropping it withdraws those addresses, exactly as dropping the listener
+    /// closes the port. `None` on an engine that vends no such register.
+    _planes: Option<::service_common::dialable_data_planes::OpenedPlanes>,
 }
 
 /// Written by hand rather than derived: a listener handle carries no `Debug`, and what is
@@ -66,7 +81,8 @@ impl std::fmt::Debug for IngestPlane {
 }
 
 impl IngestPlane {
-    /// The `host:port` an encoder dials this plane at.
+    /// The `host:port` of the SOCKET this plane answers on, which is where a publisher that
+    /// holds a port of its own dials it.
     #[must_use]
     pub fn authority(&self) -> &str {
         &self.authority
@@ -75,13 +91,14 @@ impl IngestPlane {
 
 /// The `host:port` the contribute plane answers on, OPENING its socket on first use, or
 /// `None` when this engine vends no listener surface or the core could not bind — in which
-/// case the caller announces the address it would have before this plane existed.
+/// case there is no plane and the announced contribute name is a name nothing answers at,
+/// which is the honest report of a plane that could not be served.
 ///
 /// Idempotent and it disturbs no connection: the first socket is kept, so every channel of
-/// this deployment is announced the same ingest server and a broadcaster may cache the
-/// value the way AWS's own documentation tells it to. The store guard is taken and released
-/// around the bind rather than held across it, because a lock held across an await would
-/// make this future non-`Send`.
+/// this deployment is served by one contribute plane and a broadcaster may cache the
+/// announced value the way AWS's own documentation tells it to. The store guard is taken and
+/// released around the bind rather than held across it, because a lock held across an await
+/// would make this future non-`Send`.
 pub async fn ensure_ingest_plane<Eng: Send + Sync + 'static>(
     engine: &Eng,
     state: &::engine::ServiceState<ComAmazonawsIvsAmazoninteractivevideoserviceState>,
@@ -91,39 +108,85 @@ pub async fn ensure_ingest_plane<Eng: Send + Sync + 'static>(
     }
     let shared = (engine as &dyn ::std::any::Any).downcast_ref::<::engine::InMemoryEngine>()?;
     let listeners = shared.listeners();
-    let handler = rtmp_wire::RtmpIngest {
+    let handler = ::std::sync::Arc::new(rtmp_wire::RtmpIngest {
         state: state.clone(),
         // The core's own TLS server, lent to this plaintext socket so an `rtmps://`
         // publisher's handshake is terminated by the core rather than here. An emulator
         // that could prepare none serves the publishers that dial in the clear alone.
         upgrader: listeners.tls_upgrader().ok(),
-    };
+    });
+    // ONE handler at both ends of this plane's addresses: the core's socket, and the
+    // connections an in-process client opens to the announced name. Byte 0 is the handler's
+    // on both, because the encryption of a contribution is negotiated by the protocol
+    // itself rather than by the transport.
+    let served = ::service_common::dialable_data_planes::served_in_process(
+        ::std::sync::Arc::clone(&handler),
+        None,
+    );
+    let listening = ::service_common::dialable_data_planes::SharedHandler(handler);
     // Opened on a task of its OWN, so a runtime that cannot bind a socket at all — one
     // built with no IO driver, which is what a host driving this emulator in process may
     // hand a request — leaves this call without an address instead of taking the request
     // down with it.
-    let opened = ::tokio::spawn(async move { listeners.tcp_plaintext(handler).await.ok() }).await;
+    let opened = ::tokio::spawn(async move { listeners.tcp_plaintext(listening).await.ok() }).await;
     let listener = opened.ok().flatten()?;
     // The address the CORE says the listener is dialable at, read through the one shared
     // reading of it: a wildcard bind has no single address to dial and is published as
     // loopback, and an IPv6 bind keeps its brackets.
     let authority = ::service_common::data_plane_addressing::listener_authority(&listener);
+    let announced = contribute_host_on_this_machine();
     let mut store = state.lock();
     // Another call may have opened one while this one was binding; keep the first, so an
     // announced address never changes under a broadcaster. Dropping the loser closes its
-    // own port.
+    // own port, and it has recorded nothing: the addresses of the announced NAME are the
+    // same keys for every call of this deployment, so only the call that WINS may record
+    // them — a loser that had recorded them first would withdraw the winner's records when
+    // its own handle dropped, and the announced host would resolve to nothing while the
+    // winner's plane was still listening.
     if let Some(open) = store.ingest_plane.as_ref() {
         return Some(open.authority().to_string());
+    }
+    // Every address a client composes from the announced contribute name, beside the
+    // socket's own: the name on each port the plane's own wires are dialed on. A connection
+    // opened to one of them in this process is served by the very handler the socket's are.
+    // Recorded under this service's own store guard, which is the order the register
+    // documents for a publisher.
+    //
+    // The register and this store are ONE engine's: the records are read back out of the
+    // same shared engine this store lives in
+    // (`::service_common::dialable_data_planes::DialablePlanes::of(engine)`), so another
+    // engine in this process resolves none of them and shares no plane with this one, and
+    // the guard taken above is that engine's single IVS store rather than one of several.
+    // The name itself carries the label minted for the ACCOUNT
+    // ([`contribute_host_on_this_machine`]), so a deployment serving another account
+    // announces — and records — a different host.
+    let addresses: Vec<String> = ::std::iter::once(authority.clone())
+        .chain(CONTRIBUTE_PORTS.iter().map(|port| {
+            ::service_common::data_plane_addressing::host_port_authority(&announced, *port)
+        }))
+        .collect();
+    let registered = ::service_common::dialable_data_planes::DialablePlanes::of(engine)
+        .map(|planes| planes.opening(addresses, SIGNING_NAME, &served));
+    if registered.is_none() {
+        // An engine that vends no register leaves the announced name resolving to nothing
+        // for an in-process client, which is a deployment fact worth being able to read off
+        // a log rather than an absence that looks like a successful record.
+        ::tracing::debug!(
+            %announced,
+            "this engine vends no register of open planes: the contribute name is reachable \
+             at the socket alone"
+        );
     }
     store.ingest_plane = Some(IngestPlane {
         authority: authority.clone(),
         _listener: listener,
+        _planes: registered,
     });
     drop(store);
     ::tracing::info!(
         %authority,
-        "opened the IVS contribute plane: channels announce this address as their ingest \
-         server"
+        %announced,
+        "opened the IVS contribute plane: channels announce this name as their ingest server"
     );
     Some(authority)
 }
@@ -214,12 +277,23 @@ pub fn publish_metadata(
 }
 
 /// Package one ingested message into the broadcast's playlist, and answer whether that
-/// broadcast is STILL the channel's live one.
+/// broadcast is STILL the channel's live one and this publisher may keep sending.
 ///
-/// `false` is a publisher whose broadcast has ended underneath it — `StopStream`
-/// disconnects the incoming stream, and `DeleteChannel` takes the channel with it — so the
-/// caller closes the connection, which is what disconnecting an ingest session means on the
-/// wire.
+/// `false` is a publisher the ingest server disconnects, which is what the caller then does
+/// on the wire. Two reasons for it:
+///
+/// * the broadcast has ended underneath it — `StopStream` disconnects the incoming stream,
+///   and `DeleteChannel` takes the channel with it;
+/// * the message is LARGER than a segment of the live window may hold
+///   ([`super::playback_plane::MAX_SEGMENT_BYTES`]), so nothing could package it. A
+///   publisher sending one is sending media this plane cannot serve, and is disconnected
+///   rather than left sending bytes nothing keeps.
+///
+/// What an accepted message costs this store is bounded by the playlist's own live window
+/// and by nothing here: [`super::ChannelPlaylist::append`] holds at most
+/// [`super::playback_plane::MAX_SEGMENT_BYTES`] per segment and drops the oldest segment
+/// once the window is full, so one broadcasting channel retains a bounded amount of media
+/// however long its publisher keeps sending.
 pub fn publish_media(
     state: &mut ComAmazonawsIvsAmazoninteractivevideoserviceState,
     publish: &AcceptedPublish,
@@ -227,6 +301,9 @@ pub fn publish_media(
     timestamp: u32,
     payload: &[u8],
 ) -> bool {
+    if payload.len() > super::playback_plane::MAX_SEGMENT_BYTES {
+        return false;
+    }
     let live = live_stream(state, &publish.channel_arn)
         .and_then(|stream| stream.stream_id)
         .is_some_and(|stream_id| stream_id == publish.stream_id);
