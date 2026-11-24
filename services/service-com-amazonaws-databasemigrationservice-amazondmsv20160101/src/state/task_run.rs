@@ -88,6 +88,17 @@ pub const FULL_LOAD_OBJECT_NAME: &str = "LOAD00000001.csv";
 /// source — the same `LOAD` sequence, whatever number each file carries.
 const FULL_LOAD_OBJECT_PREFIX: &str = "LOAD";
 
+/// The media type the write of a full-load file DECLARES to its Amazon S3 target.
+///
+/// A full-load file is an opaque stream of bytes to the object store whatever data format
+/// the target endpoint renders it in, so the write states the generic binary media type
+/// registered for exactly that (RFC 2046 §4.5.1, `application/octet-stream`) rather than a
+/// type derived from the file's name or its rows. `PutObject$ContentType` is bound to
+/// `Content-Type`, and Amazon S3 keeps the media type a write declares and reports it
+/// verbatim on a later `GetObject` or `HeadObject`, so this is what a client reading one of
+/// these files is told — never the store's own default for a write that declares nothing.
+pub const FULL_LOAD_OBJECT_MEDIA_TYPE: &str = "application/octet-stream";
+
 /// The most tables ONE full load moves.
 ///
 /// A RESOURCE GUARD, not a published DMS quota: each table is read into memory and written
@@ -672,6 +683,9 @@ async fn load_table(
         .put_object()
         .bucket(&target.bucket)
         .key(&key)
+        // The write STATES the media type of what it wrote, so the store records it rather
+        // than its own default for a write that states none.
+        .content_type(FULL_LOAD_OBJECT_MEDIA_TYPE)
         .body(::aws_sdk_s3::primitives::ByteStream::from(rows))
         .send()
         .await;
