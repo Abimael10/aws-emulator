@@ -392,9 +392,9 @@ async fn each_catalogued_service_is_reported_for_the_region_asked_about() {
                     service.manages_endpoints
                 );
                 assert_eq!(
-                    service.payer_responsibility.as_deref(),
-                    Some("ServiceOwner"),
-                    "case {case:?}: expected the one PayerResponsibility member, got {:?}",
+                    service.payer_responsibility, None,
+                    "case {case:?}: a service Amazon Web Services offers carries no payer \
+                     responsibility an owner configured, got {:?}",
                     service.payer_responsibility
                 );
                 // "The supported IP address types" follows the way THIS endpoint service is

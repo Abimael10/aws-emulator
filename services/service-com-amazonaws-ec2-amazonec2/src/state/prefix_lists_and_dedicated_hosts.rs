@@ -3233,7 +3233,13 @@ pub fn endpoint_services_in_region(region: &str) -> Vec<EndpointServiceRecord> {
             // caller creates is the caller's.
             acceptance_required: false,
             manages_vpc_endpoints: false,
-            payer_responsibility: Some(PAYER_RESPONSIBILITY_SERVICE_OWNER.to_string()),
+            // "The payer responsibility" (`ServiceDetail$PayerResponsibility`) says which side
+            // of a connection was made to pay for the data it carries, which is something the
+            // OWNER of an endpoint service configured. A service Amazon Web Services offers in
+            // the Region has no such configuration to report — the consumer's endpoint is the
+            // consumer's — so the member is left out rather than answered with an enum value
+            // nothing decided.
+            payer_responsibility: None,
             // There is a name to verify only where the service publishes one, so this follows
             // the member above rather than the endpoint type on its own.
             private_dns_name_verification_state: (interface && offering.private_dns)

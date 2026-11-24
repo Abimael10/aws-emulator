@@ -47,6 +47,7 @@ mod newest_generation_graviton_rows;
 mod previous_generation_rows;
 mod seventh_generation_graphics_rows;
 mod storage_optimized_graviton_rows;
+mod xen_high_memory_rows;
 mod xen_storage_optimized_rows;
 
 /// The EBS-optimized performance AWS publishes for one instance type: the two bandwidth and
@@ -4795,7 +4796,8 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
 /// fourth generation families on the Xen hypervisor and the memory optimized ones with local
 /// NVMe devices, the seventh generation graphics family, the block storage optimized memory
 /// one on the newest AWS Graviton hardware, the two storage optimized families on the Xen
-/// hypervisor and the two Intel storage optimized ones. A row is reached by its instance type
+/// hypervisor, the two Intel storage optimized ones and the two high-memory families on the
+/// Xen hypervisor. A row is reached by its instance type
 /// alone, so which table it is written in is nothing but where the figures of one group of
 /// families are kept together.
 fn published_rows() -> impl Iterator<Item = &'static PublishedInstanceTypeFacts> {
@@ -4827,6 +4829,7 @@ fn published_rows() -> impl Iterator<Item = &'static PublishedInstanceTypeFacts>
         )
         .chain(xen_storage_optimized_rows::XEN_STORAGE_OPTIMIZED_INSTANCE_TYPE_FACTS)
         .chain(intel_storage_optimized_rows::INTEL_STORAGE_OPTIMIZED_INSTANCE_TYPE_FACTS)
+        .chain(xen_high_memory_rows::XEN_HIGH_MEMORY_INSTANCE_TYPE_FACTS)
 }
 
 /// The published facts of `instance_type`, or `None` where the catalog holds no row for it
