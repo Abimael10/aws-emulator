@@ -1547,4 +1547,18 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
         self.foundation_model_agreements
             .insert(model_id.to_string())
     }
+
+    /// Withdraw this account's acceptance of the published model `model_id`'s agreement,
+    /// reporting whether an acceptance was HELD to withdraw.
+    ///
+    /// The inverse of [`Self::accept_foundation_model_agreement`], and the write
+    /// `DeleteFoundationModelAgreement` makes: once it is gone the model's terms are
+    /// outstanding again ([`Self::foundation_model_agreement_outstanding`]), so the read of
+    /// the model's availability reports the account entitled to it no longer.
+    ///
+    /// `false` means the account held no agreement for that model, which is what tells a
+    /// deleting request there was no agreement to delete.
+    pub fn withdraw_foundation_model_agreement(&mut self, model_id: &str) -> bool {
+        self.foundation_model_agreements.remove(model_id)
+    }
 }

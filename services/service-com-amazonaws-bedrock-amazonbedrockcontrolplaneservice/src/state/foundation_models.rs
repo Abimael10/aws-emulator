@@ -2682,6 +2682,17 @@ pub fn foundation_model_agreement_conflict_message(model_id: &str) -> String {
     format!("An agreement already exists for the model {model_id}.")
 }
 
+/// How a request to DELETE the agreement of a model whose agreement this account does not
+/// hold is refused: there is no agreement of that model for this request to delete.
+///
+/// The counterpart of [`foundation_model_agreement_conflict_message`], worded off the same
+/// fact — whether the account holds the agreement of the model the request named — and
+/// naming that model and nothing else.
+#[must_use]
+pub fn foundation_model_agreement_not_found_message(model_id: &str) -> String {
+    format!("No agreement exists for the model {model_id}.")
+}
+
 /// `AgreementStatus` — the agreement this account needs for the model is in place, which
 /// includes a model that needs none.
 pub const AGREEMENT_STATUS_AVAILABLE: &str = "AVAILABLE";

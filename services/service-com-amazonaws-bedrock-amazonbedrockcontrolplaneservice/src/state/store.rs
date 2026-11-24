@@ -486,7 +486,9 @@ pub struct ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// What [`Self::foundation_model_agreement_outstanding`] narrows the PUBLISHED statement
     /// that a model is offered under a provider's own terms
     /// ([`model_agreement_outstanding`]) by: the terms of a model in here have been accepted,
-    /// so `GetFoundationModelAvailability` reports the account entitled to it.
+    /// so `GetFoundationModelAvailability` reports the account entitled to it — until
+    /// `DeleteFoundationModelAgreement` withdraws that acceptance again
+    /// ([`Self::withdraw_foundation_model_agreement`]).
     ///
     /// Account-level, not keyed by region, for the reason
     /// [`Self::model_invocation_logging`] is not: this store models the one account the

@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteFoundationModelAgreement
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteFoundationModelAgreement`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteFoundationModelAgreement::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Withdraws, FOR THIS ACCOUNT, the acceptance of the agreement one published foundation
+//! model is offered under — the record `CreateFoundationModelAgreement` wrote
+//! ([`crate::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::foundation_model_agreements`])
+//! — so `GetFoundationModelAvailability` reports the model's terms outstanding again and
+//! the offer of them is there to be accepted once more. Answers 202 as the model binds it,
+//! with no body members.
+//!
+//! `modelId` is read exactly as the other two operations of this surface read it, because
+//! all three ask the same question of the member — which agreement-bearing model does this
+//! id name ([`crate::state::FoundationModelCatalog::agreement_bearing_model`]): only a
+//! model the published catalog offers under a provider's own terms
+//! ([`crate::state::model_offered_under_agreement`]) has an agreement at all, and every
+//! other id — a model AWS publishes itself, reached under no provider's terms, a model this
+//! service recognises and offers no longer, offered under nothing at all, and an id naming
+//! no model of this catalog — is a value this surface cannot read as the identifier of an
+//! agreement-bearing model, which is the INPUT fault this service states once
+//! ([`crate::state::INVALID_MODEL_IDENTIFIER_MESSAGE`]): 400 `ValidationException`.
+//!
+//! What the 404 class reports here is the AGREEMENT, which — unlike the terms a model is
+//! published under — is a resource the account either holds or does not: an
+//! agreement-bearing model whose agreement this account never accepted has none for this
+//! request to delete, which is `ResourceNotFoundException` carrying
+//! [`crate::state::foundation_model_agreement_not_found_message`]. Each refusal leaves the
+//! acceptances the store holds exactly as they were.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +164,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteFoundationModelAgreement` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteFoundationModelAgreementErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteFoundationModelAgreement"))
+        // An agreement is held by the ACCOUNT, so nothing of the request beyond the model it
+        // names decides this call.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteFoundationModelAgreementErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the foundation model catalog is not available on this engine"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut store = state.lock();
+
+        // Which agreement-bearing model this id names, read exactly as the offers listing
+        // and the acceptance read it
+        // ([`crate::state::FoundationModelCatalog::agreement_bearing_model`]): `modelId` is a
+        // `BedrockModelId`, so it names a base model by its id alone, in the qualified form
+        // that pattern admits — the id followed by the `:`-separated qualifiers, which name a
+        // variant of the same published model. An id that names no model offered under a
+        // provider's own terms names no agreement this request could delete, which is the
+        // INPUT fault this service states once rather than a resource it reports missing.
+        let Some(model) = store
+            .foundation_models
+            .agreement_bearing_model(&input.model_id)
+            .copied()
+        else {
+            return Err(
+                DeleteFoundationModelAgreementErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::INVALID_MODEL_IDENTIFIER_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The withdrawal itself, taken against the PUBLISHED model the id resolved to, so a
+        // `:`-qualified variant withdraws the agreement of the model it is a variant of. An
+        // account that holds no agreement of that model has none to delete: the AGREEMENT is
+        // the resource this request addresses, so its absence is what this operation reports
+        // missing, and the acceptances the store holds are left exactly as they were.
+        if !store.withdraw_foundation_model_agreement(model.model_id) {
+            return Err(
+                DeleteFoundationModelAgreementErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            crate::state::foundation_model_agreement_not_found_message(
+                                &input.model_id,
+                            ),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        Ok(DeleteFoundationModelAgreementOutput {})
     }
 }

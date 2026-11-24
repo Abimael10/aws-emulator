@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! `ListFoundationModelAgreementOffers` and `CreateFoundationModelAgreement` end to end over
-//! HTTP, through the same `MultiServiceRouter` the emulator boots.
+//! `ListFoundationModelAgreementOffers`, `CreateFoundationModelAgreement` and
+//! `DeleteFoundationModelAgreement` end to end over HTTP, through the same
+//! `MultiServiceRouter` the emulator boots.
 //!
 //! # The rule
 //!
@@ -26,11 +27,18 @@
 //! model, and a model whose agreement the account already holds each accept nothing and
 //! leave the account's standing as it was.
 //!
-//! The last two tables walk the reading of `modelId` both operations share over its WHOLE
-//! class: every id this service recognises and offers no longer, every model AWS publishes
-//! itself and ids naming no catalogued model, each in both forms `BedrockModelId` admits,
-//! against both operations — and over what else is wrong with the request, which is what
-//! shows the identifier is read before any of it.
+//! **Withdrawing an agreement** is the write that undoes it: `DeleteFoundationModelAgreement`
+//! deletes the acceptance the account holds for the model it names, which returns that
+//! model's terms to outstanding and leaves the offer of them there to be accepted again. The
+//! AGREEMENT is the resource that request addresses, so an agreement-bearing model whose
+//! agreement the account does not hold has none to delete — the one case on this surface
+//! that reports a resource missing.
+//!
+//! The last two tables walk the reading of `modelId` all three operations share over its
+//! WHOLE class: every id this service recognises and offers no longer, every model AWS
+//! publishes itself and ids naming no catalogued model, each in both forms `BedrockModelId`
+//! admits, against every operation that takes the member — and over what else is wrong with
+//! the request, which is what shows the identifier is read before any of it.
 //!
 //! # What the tables below generalise over
 //!
@@ -463,6 +471,18 @@ async fn accept(emulator: &Emulator, model_id: &str, offer_token: &str) -> Reply
             ACCEPT_URI,
             Some(json!({ "modelId": model_id, "offerToken": offer_token })),
         )
+        .await
+}
+
+/// The URI `DeleteFoundationModelAgreement` is bound to
+/// (`smithy_query(query="operation",operation="DeleteFoundationModelAgreement")`: POST
+/// `/delete-foundation-model-agreement`, success code 202, no output members).
+const WITHDRAW_URI: &str = "/delete-foundation-model-agreement";
+
+/// `POST /delete-foundation-model-agreement` with the `modelId` a row names.
+async fn withdraw(emulator: &Emulator, model_id: &str) -> Reply {
+    emulator
+        .call("POST", WITHDRAW_URI, Some(json!({ "modelId": model_id })))
         .await
 }
 
@@ -904,10 +924,10 @@ fn ids_naming_no_agreement_bearing_model() -> Vec<(String, String)> {
 /// under, so a `modelId` that names no model this service offers under a provider's own terms
 /// — offered no longer, published by AWS itself, or naming no catalogued model at all — is a
 /// value it cannot read as the identifier of an agreement-bearing model: 400
-/// `ValidationException` with the fixed invalid-identifier sentence, from BOTH operations
-/// that take the member, and never a report that a resource is missing.
+/// `ValidationException` with the fixed invalid-identifier sentence, from EVERY operation
+/// that takes the member, and never a report that a resource is missing.
 #[tokio::test]
-async fn neither_agreement_operation_reads_an_id_that_names_no_agreement_bearing_model() {
+async fn no_agreement_operation_reads_an_id_that_names_no_agreement_bearing_model() {
     let emulator = emulator();
     // The two conditions that could otherwise decide the answer are satisfied first: the
     // account's acknowledgement is on record, and the token carried is a real offer's.
@@ -922,10 +942,15 @@ async fn neither_agreement_operation_reads_an_id_that_names_no_agreement_bearing
             let reply = offers(&emulator, &model_id, offer_type).await;
             assert_invalid_identifier(&case, &reply);
         }
-        // And accepting an agreement of it.
-        let case = format!("{case}: accepting an agreement");
+        // Accepting an agreement of it.
+        let accepting = format!("{case}: accepting an agreement");
         let reply = accept(&emulator, &model_id, &token).await;
-        assert_invalid_identifier(&case, &reply);
+        assert_invalid_identifier(&accepting, &reply);
+        // And withdrawing one: the id is unreadable here for the same reason, so the answer
+        // is the same input fault rather than an agreement reported missing.
+        let withdrawing = format!("{case}: withdrawing an agreement");
+        let reply = withdraw(&emulator, &model_id).await;
+        assert_invalid_identifier(&withdrawing, &reply);
     }
 
     // The same surface goes on serving the model that IS offered under a provider's terms, so
@@ -978,6 +1003,11 @@ async fn an_id_naming_no_agreement_bearing_model_is_refused_before_anything_else
             let reply = accept(&emulator, &model_id, carried).await;
             assert_invalid_identifier(&case, &reply);
         }
+        // The withdrawal reads the identifier before it looks for the agreement, so an id it
+        // cannot read is that input fault and not an agreement this account does not hold.
+        let case = format!("{case} withdrawn while the account holds no agreement");
+        let reply = withdraw(&emulator, &model_id).await;
+        assert_invalid_identifier(&case, &reply);
     }
 
     // None of those requests accepted anything: the offered model's terms are still
@@ -994,4 +1024,169 @@ async fn an_id_naming_no_agreement_bearing_model_is_refused_before_anything_else
         "case {}: the offer of a model whose terms are unaccepted is still listed",
         offered.model_id
     );
+}
+
+// =======================================================================================
+// `DeleteFoundationModelAgreement`: withdrawing the acceptance the account holds
+// =======================================================================================
+
+/// RULE: deleting a model's agreement withdraws the acceptance the account holds for it, so
+/// the model's terms are outstanding again and its offer is there to be accepted once more —
+/// whichever spelling of the id the withdrawal names, and whichever spelling accepted it.
+/// The withdrawal answers 202 with no body members and is the inverse of the acceptance, so
+/// the two round-trip.
+#[tokio::test]
+async fn withdrawing_an_agreement_returns_a_models_terms_to_outstanding() {
+    let emulator = emulator();
+    submit_use_case(&emulator).await;
+
+    let models = agreement_models();
+    assert!(
+        models.len() > 1,
+        "the catalog must carry models offered under an agreement, got {}",
+        models.len()
+    );
+    for (index, model) in models.iter().enumerate() {
+        // The rows alternate over the two spellings `BedrockModelId` admits, on either side
+        // of the round trip: a `:`-qualified id names a variant of the published model, so
+        // the agreement either spelling addresses is that model's.
+        let variant = format!("{}:24k", model.model_id);
+        let qualifiable = model.model_id.matches(':').count() < 2;
+        let (accepted_as, withdrawn_as) = match index % 3 {
+            1 if qualifiable => (variant.clone(), model.model_id.to_string()),
+            2 if qualifiable => (model.model_id.to_string(), variant.clone()),
+            _ => (model.model_id.to_string(), model.model_id.to_string()),
+        };
+        let case = format!(
+            "{} accepted as {accepted_as} and withdrawn as {withdrawn_as}",
+            model.model_id
+        );
+
+        let token = offer_token_of(&emulator, model.model_id).await;
+        let accepted = accept(&emulator, &accepted_as, &token).await;
+        assert_eq!(
+            accepted.status, 202,
+            "case {case}: the agreement must be accepted first, got {} {:?}",
+            accepted.status, accepted.body
+        );
+        assert_standing(&emulator, &case, model.model_id, ENTITLED).await;
+
+        let reply = withdraw(&emulator, &withdrawn_as).await;
+        assert_eq!(
+            reply.status, 202,
+            "case {case}: a withdrawn agreement answers 202, got {} {:?}",
+            reply.status, reply.body
+        );
+        assert!(
+            reply
+                .body
+                .as_object()
+                .is_none_or(serde_json::Map::is_empty),
+            "case {case}: the withdrawal reports no members, got {:?}",
+            reply.body
+        );
+
+        // The withdrawal is state: the standing read reports the model's terms outstanding
+        // again, and the offer of them is listed for the account to accept once more.
+        assert_standing(&emulator, &case, model.model_id, OUTSTANDING).await;
+        assert!(
+            !reported(&offers(&emulator, model.model_id, None).await).is_empty(),
+            "case {case}: the offer of a model whose agreement was withdrawn is listed again"
+        );
+
+        // The agreement is gone, so there is none left for a second withdrawal to delete —
+        // and the account can accept the same terms again, which is the round trip.
+        let again = withdraw(&emulator, &withdrawn_as).await;
+        assert_eq!(
+            (again.status, code(&again)),
+            (404, "ResourceNotFoundException"),
+            "case {case}: a second withdrawal finds no agreement, got {} {} {:?}",
+            again.status,
+            code(&again),
+            again.body
+        );
+        assert_eq!(
+            message(&case, &again),
+            bedrock::state::foundation_model_agreement_not_found_message(&withdrawn_as),
+            "case {case}: the refusal must state the agreement it did not find, got {:?}",
+            again.body
+        );
+        let reaccepted = accept(&emulator, &accepted_as, &token).await;
+        assert_eq!(
+            reaccepted.status, 202,
+            "case {case}: the same terms must be acceptable again, got {} {:?}",
+            reaccepted.status, reaccepted.body
+        );
+        assert_standing(&emulator, &case, model.model_id, ENTITLED).await;
+    }
+}
+
+/// RULE: a withdrawal addresses the AGREEMENT this account holds, so an agreement-bearing
+/// model whose agreement it never accepted has none to delete — 404
+/// `ResourceNotFoundException` — and that refusal deletes nothing: the agreements the account
+/// does hold, and every other model's standing, are left exactly as they were.
+#[tokio::test]
+async fn withdrawing_an_agreement_the_account_does_not_hold_deletes_nothing() {
+    let emulator = emulator();
+    submit_use_case(&emulator).await;
+
+    let models = agreement_models();
+    // Two agreement-bearing models of DIFFERENT providers, read off the catalog: the one
+    // whose agreement the account accepts, and one it leaves alone.
+    let held = models[0];
+    let unheld = models
+        .iter()
+        .find(|row| row.provider_name != held.provider_name)
+        .expect("the catalog must carry agreement-bearing models of two providers");
+    let token = offer_token_of(&emulator, held.model_id).await;
+    let accepted = accept(&emulator, held.model_id, &token).await;
+    assert_eq!(
+        accepted.status, 202,
+        "case {}: the agreement must be accepted first, got {} {:?}",
+        held.model_id, accepted.status, accepted.body
+    );
+
+    // The rows differ along WHY this account holds no agreement of the model named: it never
+    // accepted one, it accepted another model's, and — twice over — the request is repeated,
+    // because a refusal records nothing.
+    for attempt in 1..=2 {
+        for model_id in [
+            unheld.model_id.to_string(),
+            format!("{}:24k", unheld.model_id),
+        ] {
+            let case = format!("{model_id} unheld, attempt {attempt}");
+            let reply = withdraw(&emulator, &model_id).await;
+            assert_eq!(
+                (reply.status, code(&reply)),
+                (404, "ResourceNotFoundException"),
+                "case {case}: expected 404 ResourceNotFoundException, got {} {} {:?}",
+                reply.status,
+                code(&reply),
+                reply.body
+            );
+            assert_eq!(
+                message(&case, &reply),
+                bedrock::state::foundation_model_agreement_not_found_message(&model_id),
+                "case {case}: the refusal must state the agreement it did not find, got {:?}",
+                reply.body
+            );
+        }
+    }
+
+    // Nothing was deleted: the accepted agreement still stands, and the model whose
+    // withdrawal was refused is still offered its terms.
+    assert_standing(
+        &emulator,
+        "after every refused withdrawal",
+        held.model_id,
+        ENTITLED,
+    )
+    .await;
+    assert_standing(
+        &emulator,
+        "after every refused withdrawal",
+        unheld.model_id,
+        OUTSTANDING,
+    )
+    .await;
 }
