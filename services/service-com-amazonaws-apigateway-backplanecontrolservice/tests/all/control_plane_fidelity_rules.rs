@@ -50,22 +50,34 @@ use crate::rest_api_lifecycle::{
 use crate::stage_invoke_identity_policy::{given_policy, given_user, Entity, USER_KEY_ID};
 use crate::stage_lifecycle::{create_deployment, get_stage};
 use crate::stage_request_validation::create_model;
+use crate::stage_variable_value_refusal::invalid_stage_variable_value;
 
-/// The sentence a stage variable outside the sets the member publishes is refused with,
-/// written out here rather than imported from the implementation: a test that asserts the
-/// handler's own constant passes for whatever wording the handler happens to carry, so the
-/// text is pinned literally and a change to it has to be made here too.
+/// The sentence a stage variable whose NAME is outside the set the member publishes is
+/// refused with, written out here rather than imported from the implementation: a test that
+/// asserts the handler's own constant passes for whatever wording the handler happens to
+/// carry, so the text is pinned literally and a change to it has to be made here too.
 ///
 /// Source: the rule the member's own documentation states — "Variable names can have
 /// alphanumeric and underscore characters, and the values must match
 /// `[A-Za-z0-9-._~:/?#&=,]+`" (`smithy_query(query="doc", shape="CreateStageRequest",
 /// member="variables")`).
-const INVALID_STAGE_VARIABLE: &str = "Variable names can have alphanumeric and underscore \
-                                     characters, and the values must match \
-                                     [A-Za-z0-9-._~:/?#&=,]+";
+const INVALID_STAGE_VARIABLE_NAME: &str = "Variable names can have alphanumeric and underscore \
+                                           characters, and the values must match \
+                                           [A-Za-z0-9-._~:/?#&=,]+";
+
+/// Which half of a stage variable a row breaks, and so which refusal it earns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Broken {
+    /// Both halves are inside their sets, so the variable is stored.
+    Neither,
+    /// The NAME is outside its set, which earns the member's rule sentence.
+    Name,
+    /// The VALUE is outside its set, which earns the key-naming value refusal.
+    Value,
+}
 
 /// The sentence a PRIVATE api's deployment is refused with while it carries no resource
-/// policy, written out here for the reason [`INVALID_STAGE_VARIABLE`] gives.
+/// policy, written out here for the reason [`INVALID_STAGE_VARIABLE_NAME`] gives.
 const PRIVATE_API_WITHOUT_RESOURCE_POLICY: &str =
     "Private REST API doesn't have a resource policy attached to it";
 
@@ -785,34 +797,39 @@ async fn a_stage_variable_is_drawn_from_the_sets_the_member_publishes() {
     // (`smithy_query(query="doc", shape="CreateStageRequest", member="variables")`). Each
     // published pattern is a `+`, so neither half may be empty. Rows span every punctuation
     // mark the VALUE set admits, a name spelled with underscores and digits, and the ways
-    // either half falls outside its set; `refused` is set where the request must earn the
-    // member's own contract sentence, which is the rule the documentation states and
-    // interpolates nothing from the request.
-    type Row<'a> = (&'a str, &'a str, &'a str, bool);
+    // either half falls outside its set; which HALF a row breaks decides the sentence it
+    // earns — a NAME outside its set earns the member's own rule sentence, a VALUE outside
+    // its set earns the refusal that names the map key it was set under.
+    type Row<'a> = (&'a str, &'a str, &'a str, Broken);
     let rows: Vec<Row<'_>> = vec![
-        ("a plain name and value", "backend", "beta", false),
+        ("a plain name and value", "backend", "beta", Broken::Neither),
         (
             "every punctuation mark the value set admits",
             "opaque",
             "v1-._~:/?#&=,9",
-            false,
+            Broken::Neither,
         ),
-        ("a name with underscores and digits", "lambda_arn_2", "handler-2", false),
+        (
+            "a name with underscores and digits",
+            "lambda_arn_2",
+            "handler-2",
+            Broken::Neither,
+        ),
         (
             "an ARN as the value",
             "lambdaArn",
             "arn:aws:lambda:us-east-1:000000000000:function:f",
-            false,
+            Broken::Neither,
         ),
-        ("a single-character name and value", "s", "a", false),
-        ("an empty value", "emptyVar", "", true),
-        ("a space in the value", "greeting", "hello world", true),
-        ("a quote in the value", "quoted", "it's", true),
-        ("a percent escape in the value", "escaped", "a%20b", true),
-        ("a non-ASCII value", "city", "münchen", true),
-        ("a hyphen in the name", "stage-name", "prod", true),
-        ("a dot in the name", "stage.name", "prod", true),
-        ("an empty name", "", "prod", true),
+        ("a single-character name and value", "s", "a", Broken::Neither),
+        ("an empty value", "emptyVar", "", Broken::Value),
+        ("a space in the value", "greeting", "hello world", Broken::Value),
+        ("a quote in the value", "quoted", "it's", Broken::Value),
+        ("a percent escape in the value", "escaped", "a%20b", Broken::Value),
+        ("a non-ASCII value", "city", "münchen", Broken::Value),
+        ("a hyphen in the name", "stage-name", "prod", Broken::Name),
+        ("a dot in the name", "stage.name", "prod", Broken::Name),
+        ("an empty name", "", "prod", Broken::Name),
     ];
     let staged = create_stage(&gateway, &api, "patched", &deployment, &json!({})).await;
     assert_eq!(
@@ -820,8 +837,13 @@ async fn a_stage_variable_is_drawn_from_the_sets_the_member_publishes() {
         "case CreateStage(patched): expected 201, got {} with {:?}",
         staged.status, staged.body
     );
-    for (index, (case, name, value, refused)) in rows.iter().enumerate() {
+    for (index, (case, name, value, broken)) in rows.iter().enumerate() {
         let stage = format!("v{index}");
+        let expected_message = match broken {
+            Broken::Neither => None,
+            Broken::Name => Some(INVALID_STAGE_VARIABLE_NAME.to_string()),
+            Broken::Value => Some(invalid_stage_variable_value(name)),
+        };
         let answer = create_stage(
             &gateway,
             &api,
@@ -830,14 +852,14 @@ async fn a_stage_variable_is_drawn_from_the_sets_the_member_publishes() {
             &json!({ "variables": { *name: *value } }),
         )
         .await;
-        if *refused {
+        if let Some(expected) = &expected_message {
             assert_failure(&answer, 400, "BadRequestException", case);
-            // The member's own contract sentence, and the same one whichever half broke
-            // it: nothing of the request is in it.
+            // The sentence of the half that broke: the member's rule for a NAME, the
+            // key-naming value refusal for a VALUE.
             assert_eq!(
                 answer.body["message"].as_str(),
-                Some(INVALID_STAGE_VARIABLE),
-                "case {case}: expected the stage-variable contract sentence, got {:?}",
+                Some(expected.as_str()),
+                "case {case}: expected {expected:?}, got {:?}",
                 answer.body["message"]
             );
             // A refused create stored nothing: the stage it named resolves to nothing.
@@ -875,7 +897,7 @@ async fn a_stage_variable_is_drawn_from_the_sets_the_member_publishes() {
                 })),
             )
             .await;
-        if *refused {
+        if let Some(expected) = &expected_message {
             assert_failure(
                 &patched,
                 400,
@@ -884,9 +906,8 @@ async fn a_stage_variable_is_drawn_from_the_sets_the_member_publishes() {
             );
             assert_eq!(
                 patched.body["message"].as_str(),
-                Some(INVALID_STAGE_VARIABLE),
-                "case {case} / UpdateStage: expected the stage-variable contract sentence, \
-                 got {:?}",
+                Some(expected.as_str()),
+                "case {case} / UpdateStage: expected {expected:?}, got {:?}",
                 patched.body["message"]
             );
         } else {

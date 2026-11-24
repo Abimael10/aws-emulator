@@ -3801,6 +3801,12 @@ const STAGE_VARIABLE_VALUE_PUNCTUATION: &str = "-._~:/?#&=,";
 /// nor an empty value is one — a variable the stage could resolve to nothing is refused
 /// rather than stored.
 ///
+/// WHICH HALF broke its set decides the sentence: a value outside its set earns the
+/// value-rejection message, which NAMES THE MAP KEY it was set under
+/// ([`invalid_stage_variable_value`]), while a name outside its set earns the
+/// name/pattern sentence ([`INVALID_STAGE_VARIABLE_NAME`]). The name is checked first, so
+/// a variable whose name is not a name is reported as such rather than by its value.
+///
 /// One check for every place a stage variable rides on a request — `CreateStage`, the
 /// stage `CreateDeployment` creates, a patch of `/variables/{name}` and a canary's
 /// `stageVariableOverrides` — so one value is refused the same way wherever it was set.
@@ -3809,30 +3815,55 @@ pub fn bound_stage_variable(name: &str, value: &str) -> Result<(), String> {
         && name
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || character == '_');
+    if !named {
+        return Err(INVALID_STAGE_VARIABLE_NAME.to_string());
+    }
     let valued = !value.is_empty()
         && value.chars().all(|character| {
             character.is_ascii_alphanumeric()
                 || STAGE_VARIABLE_VALUE_PUNCTUATION.contains(character)
         });
-    if !named || !valued {
-        return Err(INVALID_STAGE_VARIABLE.to_string());
+    if !valued {
+        return Err(invalid_stage_variable_value(name));
     }
     Ok(())
 }
 
-/// The `BadRequestException` message for a stage variable outside the sets the member
-/// publishes — a name, a value, or both.
+/// The `BadRequestException` message for a stage variable whose NAME is outside the set
+/// the member publishes for a name.
 ///
 /// It STATES THE RULE AWS DOCUMENTS for the member, quoted: "Variable names can have
 /// alphanumeric and underscore characters, and the values must match
 /// `[A-Za-z0-9-._~:/?#&=,]+`" (`smithy_query(query="doc", shape="CreateStageRequest",
-/// member="variables")`). ONE sentence for the whole contract, the way this service states
-/// its sibling contracts ([`invalid_tag`] covers every tag rule at once), and entirely
-/// fixed text: neither the name nor the value is quoted back, so nothing of one request is
-/// in it.
-pub const INVALID_STAGE_VARIABLE: &str =
+/// member="variables")`), and is entirely fixed text: the rejected name is not quoted
+/// back, so nothing of one request is in it. The VALUE half of the same member has a
+/// refusal of its own ([`invalid_stage_variable_value`]).
+pub const INVALID_STAGE_VARIABLE_NAME: &str =
     "Variable names can have alphanumeric and underscore characters, and the values must \
      match [A-Za-z0-9-._~:/?#&=,]+";
+
+/// The `BadRequestException` message for a stage variable whose VALUE is outside the set
+/// the service stores a value from — the empty string included.
+///
+/// API Gateway reports the value separately from the name and names the MAP KEY the
+/// rejected value was set under, then lists the characters a value may be spelled from:
+/// `Invalid stage variable value of key <key>.  Please use values with alphanumeric
+/// characters and the symbols ' ', -', '.', '_', ':', '/', '?', '&', '=', and ','.` so the
+/// message is BUILT FROM THE REQUEST — the key is the only variable part and is taken from
+/// the map the call carried, everything else is fixed text (the double space after the
+/// period and the unbalanced `-'` are AWS's own and are reproduced as served). An operator
+/// reading it can tell WHICH of a stage's variables was rejected, which is what a sentence
+/// stating only the rule cannot say.
+///
+/// Shared, so every call that sets a stage variable — a create, the stage a deployment
+/// creates, a `/variables/{name}` patch, a canary's overrides — names the offending key the
+/// same way.
+pub fn invalid_stage_variable_value(key: &str) -> String {
+    format!(
+        "Invalid stage variable value of key {key}.  Please use values with alphanumeric \
+         characters and the symbols ' ', -', '.', '_', ':', '/', '?', '&', '=', and ','."
+    )
+}
 
 /// The `NotFoundException` message for a `restApiId` that names no stored API.
 ///
