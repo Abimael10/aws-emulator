@@ -54,6 +54,13 @@ use service_com_amazonaws_endusermessaging_endusermessaging::state::{
 };
 use service_com_amazonaws_endusermessaging_endusermessaging::EmulatedService;
 
+/// WHICH default attributes the template holds — the service's own attribute names,
+/// types and categories — named independently of this crate's own table. Declared
+/// here because this crate's one test target declares its suites directly under
+/// `tests/all/`.
+#[path = "brand_profile_default_attributes/service_template.rs"]
+mod service_template;
+
 /// This service's sigv4 signing name, from the model (`OPERATIONS.md`, "Wire protocol").
 const SIGNING_NAME: &str = "end-user-messaging";
 
