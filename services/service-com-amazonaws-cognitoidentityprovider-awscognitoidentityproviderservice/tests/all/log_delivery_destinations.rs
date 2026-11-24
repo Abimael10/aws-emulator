@@ -40,18 +40,18 @@ use crate::log_delivery_configuration::{
 };
 
 /// The Region every request below is signed for, and the one each destination ARN names.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// What Amazon Cognito answers for a destination it cannot resolve: fixed text, with
 /// neither the pool nor the ARN interpolated into it.
 const INVALID_DESTINATION: &str = "Invalid destination in the input.";
 
 /// A log group CloudWatch Logs really holds, and one nothing ever created.
-const HELD_LOG_GROUP: &str = "/aws/cognito/held-pool";
+pub(crate) const HELD_LOG_GROUP: &str = "/aws/cognito/held-pool";
 const ABSENT_LOG_GROUP: &str = "/aws/cognito/never-created";
 
 /// A Firehose stream Amazon Data Firehose really holds, and one nothing ever created.
-const HELD_STREAM: &str = "cognito-held-stream";
+pub(crate) const HELD_STREAM: &str = "cognito-held-stream";
 const ABSENT_STREAM: &str = "cognito-never-created-stream";
 
 /// A bucket Amazon S3 really holds, and one nothing ever created.
@@ -60,7 +60,7 @@ const ABSENT_BUCKET: &str = "cognito-never-created-logs";
 
 /// The bucket the held Firehose stream delivers to: a stream is created against an Amazon
 /// S3 destination of its own, which Firehose resolves the same way.
-const STREAM_SINK_BUCKET: &str = "cognito-firehose-sink";
+pub(crate) const STREAM_SINK_BUCKET: &str = "cognito-firehose-sink";
 
 /// The role the held Firehose stream assumes. No IAM service is mounted here, so this
 /// names the role form Firehose documents without asserting anything about IAM.
@@ -68,7 +68,7 @@ const STREAM_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/firehose-delivery"
 
 /// One emulator with the cognito-idp service and the three services that own a log
 /// delivery destination, all on one shared engine.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.register_service(
@@ -124,7 +124,7 @@ async fn json_rpc(
 }
 
 /// Create the CloudWatch Logs log group `name`, through CloudWatch Logs' own wire.
-async fn given_log_group(router: &MultiServiceRouter, name: &str) {
+pub(crate) async fn given_log_group(router: &MultiServiceRouter, name: &str) {
     let (status, payload) = json_rpc(
         router,
         "logs",
@@ -159,7 +159,7 @@ async fn delete_log_group(router: &MultiServiceRouter, name: &str) {
 ///
 /// Path style, and with no `CreateBucketConfiguration`: an absent `LocationConstraint`
 /// places the bucket in [`REGION`], which is the Region every request here is signed for.
-async fn given_bucket(router: &MultiServiceRouter, name: &str) {
+pub(crate) async fn given_bucket(router: &MultiServiceRouter, name: &str) {
     let request = http::Request::builder()
         .method("PUT")
         .uri(format!("/{name}"))
@@ -184,7 +184,7 @@ async fn given_bucket(router: &MultiServiceRouter, name: &str) {
 }
 
 /// Create the Amazon Data Firehose stream `name`, delivering to [`STREAM_SINK_BUCKET`].
-async fn given_delivery_stream(router: &MultiServiceRouter, name: &str) {
+pub(crate) async fn given_delivery_stream(router: &MultiServiceRouter, name: &str) {
     let (status, payload) = json_rpc(
         router,
         "firehose",
@@ -207,7 +207,7 @@ async fn given_delivery_stream(router: &MultiServiceRouter, name: &str) {
 
 /// The `CloudWatchLogsConfiguration.LogGroupArn` of the log group `name`, in the account
 /// this emulator serves — which is the account every pool created here is in.
-fn log_group_arn(name: &str) -> String {
+pub(crate) fn log_group_arn(name: &str) -> String {
     log_group_arn_in_account(account(), name)
 }
 
@@ -282,24 +282,24 @@ async fn refused_as_an_invalid_destination(
 }
 
 /// The `FirehoseConfiguration.StreamArn` of the delivery stream `name`.
-fn stream_arn(name: &str) -> String {
+pub(crate) fn stream_arn(name: &str) -> String {
     format!("arn:aws:firehose:{REGION}:{}:deliverystream/{name}", account())
 }
 
 /// The `S3Configuration.BucketArn` of the bucket `name`. `S3ArnType`'s pattern carries no
 /// Region and no account.
-fn bucket_arn(name: &str) -> String {
+pub(crate) fn bucket_arn(name: &str) -> String {
     format!("arn:aws:s3:::{name}")
 }
 
 /// The account every emulated ARN names.
-fn account() -> &'static str {
+pub(crate) fn account() -> &'static str {
     engine::EMULATOR_ACCOUNT_ID
 }
 
 /// A `userAuthEvents` entry delivering to `destination`, at the level that source's
 /// documentation recommends.
-fn user_auth_events(destination: Value) -> Value {
+pub(crate) fn user_auth_events(destination: Value) -> Value {
     let mut entry = json!({ "LogLevel": "INFO", "EventSource": "userAuthEvents" });
     if let (Some(target), Some(members)) = (entry.as_object_mut(), destination.as_object()) {
         for (name, value) in members {
@@ -321,7 +321,11 @@ async fn given_destinations(router: &MultiServiceRouter) -> String {
 }
 
 /// Set `log_configurations` on `user_pool_id` and return the status and body.
-async fn set(router: &MultiServiceRouter, user_pool_id: &str, log_configurations: &Value) -> (u16, Value) {
+pub(crate) async fn set(
+    router: &MultiServiceRouter,
+    user_pool_id: &str,
+    log_configurations: &Value,
+) -> (u16, Value) {
     call(
         router,
         "SetLogDeliveryConfiguration",

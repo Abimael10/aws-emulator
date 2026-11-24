@@ -10,6 +10,13 @@
 //! own member documents of the resource ([`log_destinations`]) — so a refused
 //! request leaves the pool's logging configuration exactly as it was.
 //!
+//! An ACCEPTED destination is also AUTHORIZED: the exported records are written by the
+//! log delivery service, and what lets it write into an Amazon S3 destination is that
+//! bucket's own policy, which Amazon S3 owns. So a set that accepts an `S3Configuration`
+//! writes the delivery's grants into that bucket's policy
+//! ([`s3_delivery_grants`]), rather than reporting a log export whose delivery nothing
+//! could ever authorise.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -93,6 +100,11 @@ use super::types::*;
 // child declaration.
 #[path = "set_log_delivery_configuration/log_destinations.rs"]
 mod log_destinations;
+
+// What an ACCEPTED Amazon S3 destination grants the log delivery service on that bucket's
+// own policy, written where Amazon S3 holds it. Same `#[path]`, for the same reason.
+#[path = "set_log_delivery_configuration/s3_delivery_grants.rs"]
+mod s3_delivery_grants;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -210,19 +222,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        let mut guard = state.lock();
-        let pool = guard
-            .pool_mut(&input.user_pool_id)
-            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
-
-        // A SET replaces the collection: what the pool reports from here on is
-        // exactly what this request carried, empty collection included.
-        pool.log_configurations = input.log_configurations;
-
         // The response renders the STORED configuration, which is also what
-        // `GetLogDeliveryConfiguration` reads back.
+        // `GetLogDeliveryConfiguration` reads back. The guard is released with it in
+        // hand: writing the delivery's grants onto a destination bucket is an await.
+        let stored = {
+            let mut guard = state.lock();
+            let pool = guard
+                .pool_mut(&input.user_pool_id)
+                .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+
+            // A SET replaces the collection: what the pool reports from here on is
+            // exactly what this request carried, empty collection included.
+            pool.log_configurations = input.log_configurations;
+            pool.to_log_delivery_configuration()
+        };
+
+        // The permissions the log delivery service needs to write the exported records
+        // live on the destination bucket, which Amazon S3 owns: an accepted Amazon S3
+        // destination is granted there.
+        s3_delivery_grants::grant_s3_log_export_delivery(
+            ctx,
+            &log_destinations::ConfiguredPool {
+                region: &pool_region,
+                account: &pool_account,
+            },
+            &stored.log_configurations,
+        )
+        .await;
+
         Ok(SetLogDeliveryConfigurationOutput {
-            log_delivery_configuration: Some(pool.to_log_delivery_configuration()),
+            log_delivery_configuration: Some(stored),
         })
     }
 }

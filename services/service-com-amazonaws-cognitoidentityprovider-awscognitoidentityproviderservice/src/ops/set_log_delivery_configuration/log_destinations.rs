@@ -59,7 +59,7 @@ const DELIVERY_STREAM_RESOURCE_TYPE: &str = "deliverystream";
 
 /// The ARN vendor of Amazon S3, whose bucket ARNs name no resource type at all: the
 /// resource field of `arn:<partition>:s3:::<bucket>` IS the bucket.
-const S3_ARN_NAMESPACE: &str = "s3";
+pub(super) const S3_ARN_NAMESPACE: &str = "s3";
 
 /// The user pool a collection is being set on, as destination resolution reads it.
 ///
@@ -206,9 +206,10 @@ async fn bucket_is_absent(
     let Some(arn) = arn else {
         return true;
     };
-    let Some(bucket) = s3_bucket(arn) else {
+    let Some(destination) = s3_destination(arn) else {
         return true;
     };
+    let bucket = destination.bucket;
     // "All bucket names in the response begin with the specified bucket name prefix"
     // (`ListBucketsRequest$Prefix`), so the bucket this ARN names is the one the answer
     // carries under exactly that name.
@@ -255,15 +256,32 @@ fn log_group_of_account<'a>(arn: &'a str, pool_account: &str) -> Option<&'a str>
     (::service_common::arn::parse(arn)?.account == pool_account).then_some(name)
 }
 
-/// The bucket an `S3ConfigurationType.BucketArn` names.
+/// The Amazon S3 location an `S3ConfigurationType.BucketArn` names: the bucket, and the
+/// partition its ARN places it in.
+///
+/// Both are read ONCE, here: the bucket is what the destination is resolved against
+/// ([`bucket_is_absent`]) and the partition is what the ARNs of the delivery's grants on
+/// that bucket are in ([`super::s3_delivery_grants`]), so the two readings of one
+/// destination cannot disagree.
+pub(super) struct S3Destination<'a> {
+    /// The partition segment of the ARN the request carried.
+    pub(super) partition: &'a str,
+    /// The bucket the exported logs are written to.
+    pub(super) bucket: &'a str,
+}
+
+/// The [`S3Destination`] an `S3ConfigurationType.BucketArn` names.
 ///
 /// `S3ArnType`'s pattern is `^arn:[\w+=/,.@-]+:[\w+=/,.@-]+:::[\w+=/,.@-]+…$` — no Region
 /// and no account — so the resource field is the bucket itself. A value carrying a `/`
 /// addresses an object under a bucket rather than the bucket a log export is written to,
 /// and so names no destination.
-fn s3_bucket(arn: &str) -> Option<&str> {
+pub(super) fn s3_destination(arn: &str) -> Option<S3Destination<'_>> {
     let parsed = ::service_common::arn::parse_of(arn, S3_ARN_NAMESPACE)?;
-    (!parsed.resource.contains('/')).then_some(parsed.resource)
+    (!parsed.resource.contains('/')).then_some(S3Destination {
+        partition: parsed.partition,
+        bucket: parsed.resource,
+    })
 }
 
 /// The Region the client resolving `arn` is pointed at: the Region `arn` itself names, and
@@ -273,7 +291,7 @@ fn s3_bucket(arn: &str) -> Option<&str> {
 /// readings narrow it ([`service_common::arn::region_of`] and
 /// [`service_common::arn::region_label`]), and a value outside that grammar falls back to
 /// this service's own default rather than to caller text.
-fn destination_region<'a>(arn: &'a str, vendor: &str, pool_region: &'a str) -> &'a str {
+pub(super) fn destination_region<'a>(arn: &'a str, vendor: &str, pool_region: &'a str) -> &'a str {
     ::service_common::arn::region_of(arn, vendor)
         .or_else(|| ::service_common::arn::region_label(pool_region))
         .unwrap_or(crate::state::DEFAULT_REGION)
@@ -350,28 +368,17 @@ fn firehose_client(
     ::aws_sdk_firehose::Client::from_conf(config)
 }
 
-/// Amazon S3's client for `region`, over the same in-process callback and under the same
-/// client policy as [`logs_client`].
+/// Amazon S3's client for `region`, over the same in-process callback.
 ///
-/// Path style, because the emulator serves one endpoint for every service: the bucket
-/// travels in the path rather than in a per-bucket host the router could not resolve.
+/// The tree's ONE construction of that client (`service_common::s3_client`), so this crate
+/// configures the hop no differently from every other service that reaches the account's
+/// object store — and the read of a bucket here and the write of its policy
+/// ([`super::s3_delivery_grants`]) travel over one client.
 fn s3_client(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     region: &str,
 ) -> ::aws_sdk_s3::Client {
-    let config = ::aws_sdk_s3::Config::builder()
-        .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
-        .http_client(ctx.callback().http_client())
-        .credentials_provider(ctx.callback().aws_credentials_provider())
-        .region(::aws_sdk_s3::config::Region::new(region.to_string()))
-        .endpoint_url(format!("https://{S3_ARN_NAMESPACE}.{region}.amazonaws.com"))
-        .force_path_style(true)
-        .retry_config(::aws_sdk_s3::config::retry::RetryConfig::disabled())
-        .timeout_config(::aws_sdk_s3::config::timeout::TimeoutConfig::disabled())
-        .identity_cache(::aws_sdk_s3::config::IdentityCache::no_cache())
-        .stalled_stream_protection(::aws_sdk_s3::config::StalledStreamProtectionConfig::disabled())
-        .build();
-    ::aws_sdk_s3::Client::from_conf(config)
+    ::service_common::s3_client::s3_client(ctx.callback(), region)
 }
 
 #[cfg(test)]
@@ -451,12 +458,23 @@ mod tests {
             );
         }
 
-        // (case, the ARN, the bucket it names)
-        let buckets: [(&str, &str, Option<&str>); 4] = [
+        // (case, the ARN, the partition and bucket it names)
+        type BucketRow<'a> = (&'a str, &'a str, Option<(&'a str, &'a str)>);
+        let buckets: [BucketRow<'_>; 6] = [
             (
                 "a bucket ARN",
                 "arn:aws:s3:::cognito-user-pool-logs",
-                Some("cognito-user-pool-logs"),
+                Some(("aws", "cognito-user-pool-logs")),
+            ),
+            (
+                "another partition",
+                "arn:aws-us-gov:s3:::cognito-user-pool-logs",
+                Some(("aws-us-gov", "cognito-user-pool-logs")),
+            ),
+            (
+                "a bucket name with dots",
+                "arn:aws-cn:s3:::cognito.user.pool.logs",
+                Some(("aws-cn", "cognito.user.pool.logs")),
             ),
             (
                 "an object ARN under a bucket",
@@ -471,10 +489,12 @@ mod tests {
             ("not an ARN at all", "cognito-user-pool-logs", None),
         ];
         for (case, arn, expected) in buckets {
-            let actual = s3_bucket(arn);
+            let actual = s3_destination(arn)
+                .map(|destination| (destination.partition, destination.bucket));
             assert_eq!(
                 actual, expected,
-                "case {case:?}: expected the bucket {expected:?}, got {actual:?}"
+                "case {case:?}: expected the partition and bucket {expected:?}, \
+                 got {actual:?}"
             );
         }
     }
