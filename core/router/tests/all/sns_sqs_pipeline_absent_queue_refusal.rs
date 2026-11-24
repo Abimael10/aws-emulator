@@ -41,7 +41,12 @@ use crate::cloudwatch_alarm_action_reaches_its_subscribed_queue::{
 use crate::query_wire::{element, form_encode};
 
 /// The Region the whole wiring of this suite lives in, and the one every call is signed for.
-const REGION: &str = "us-east-1";
+///
+/// `pub(crate)`, with the readings and the table below, because the sibling suite that takes the
+/// same refusal after a BATCHED fan-out and on the AWS Query form wire
+/// (`sns_fan_out_teardown_absence_sentence`) asserts the same rule: a suite that re-types the
+/// harness asserts something slightly different from the one beside it.
+pub(crate) const REGION: &str = "us-east-1";
 
 /// Amazon SQS's own sentence for a queue the account does not hold, written out here rather
 /// than read off the service, so what this suite asserts is AWS's text and not the emulator's
@@ -54,20 +59,20 @@ const REGION: &str = "us-east-1";
 /// model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`)
 /// fixes no message text, so the served sentence is the requirement; it names no queue, so it
 /// has no variable part.
-const AWS_SENTENCE: &str = "The specified queue does not exist.";
+pub(crate) const AWS_SENTENCE: &str = "The specified queue does not exist.";
 
 /// The class the refusal names, as the `awsJson1_0` discriminator carries it, and the status
 /// the model binds to it (`httpError: 400`).
-const QUEUE_DOES_NOT_EXIST: &str = "QueueDoesNotExist";
-const REFUSAL_STATUS: u16 = 400;
+pub(crate) const QUEUE_DOES_NOT_EXIST: &str = "QueueDoesNotExist";
+pub(crate) const REFUSAL_STATUS: u16 = 400;
 
 /// The legacy query code and fault side reported beside that class, from the model's
 /// `awsQueryError` trait — the pair an `awsQueryCompatible` service reports on every error, and
 /// the code a client reads as `Error.Code`.
-const NON_EXISTENT_QUEUE_REPORT: &str = "AWS.SimpleQueueService.NonExistentQueue;Sender";
+pub(crate) const NON_EXISTENT_QUEUE_REPORT: &str = "AWS.SimpleQueueService.NonExistentQueue;Sender";
 
 /// The response header that report arrives in.
-const QUERY_ERROR_HEADER: &str = "x-amzn-query-error";
+pub(crate) const QUERY_ERROR_HEADER: &str = "x-amzn-query-error";
 
 /// The request header a query-compatible SDK opts into the legacy error report with, and the
 /// value it sends.
@@ -77,13 +82,13 @@ const QUERY_MODE_ON: &str = "true";
 /// The dialect one call is made in: a native JSON client sends no opt-in, a query-compatible
 /// one sends the header above.
 #[derive(Debug, Clone, Copy)]
-enum Dialect {
+pub(crate) enum Dialect {
     Native,
     QueryCompatible,
 }
 
 impl Dialect {
-    fn opt_in(self) -> Option<&'static str> {
+    pub(crate) fn opt_in(self) -> Option<&'static str> {
         match self {
             Self::Native => None,
             Self::QueryCompatible => Some(QUERY_MODE_ON),
@@ -94,7 +99,7 @@ impl Dialect {
 /// One Amazon SQS call (`awsJson1_0`, `AmazonSQS.<Operation>`), as its HTTP status, its response
 /// headers and its parsed body — the seam a refusal is read through, so nothing here asserts a
 /// status of its own.
-async fn sqs_answer(
+pub(crate) async fn sqs_answer(
     router: &MultiServiceRouter,
     operation: &str,
     body: &Value,
@@ -125,7 +130,12 @@ async fn sqs_answer(
 }
 
 /// The same call, which must be served.
-async fn sqs_ok(router: &MultiServiceRouter, case: &str, operation: &str, body: &Value) -> Value {
+pub(crate) async fn sqs_ok(
+    router: &MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    body: &Value,
+) -> Value {
     let (status, _, parsed) = sqs_answer(router, operation, body, Dialect::Native).await;
     assert_eq!(
         status, 200,
@@ -167,7 +177,7 @@ async fn sns(
 }
 
 /// The class a refusal names: the `__type` discriminator's own local name.
-fn class_of(body: &Value) -> String {
+pub(crate) fn class_of(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or("<no __type>")
@@ -178,7 +188,7 @@ fn class_of(body: &Value) -> String {
 }
 
 /// The sentence a refusal carries, under either spelling of the member.
-fn message_of(body: &Value) -> String {
+pub(crate) fn message_of(body: &Value) -> String {
     body.get("message")
         .or_else(|| body.get("Message"))
         .and_then(Value::as_str)
@@ -187,7 +197,7 @@ fn message_of(body: &Value) -> String {
 }
 
 /// The value of one response header, or `None` when the answer carries none.
-fn header_of(headers: &http::HeaderMap, name: &str) -> Option<String> {
+pub(crate) fn header_of(headers: &http::HeaderMap, name: &str) -> Option<String> {
     headers
         .get(name)
         .and_then(|value| value.to_str().ok())
@@ -196,7 +206,7 @@ fn header_of(headers: &http::HeaderMap, name: &str) -> Option<String> {
 
 /// The url the same endpoint and account would address the queue called `name` at, built off a
 /// url this emulator itself minted so no row writes the address form by hand.
-fn url_of_name(minted: &str, name: &str) -> String {
+pub(crate) fn url_of_name(minted: &str, name: &str) -> String {
     match minted.rfind('/') {
         Some(cut) => format!("{}/{name}", &minted[..cut]),
         None => format!("{minted}/{name}"),
@@ -211,7 +221,7 @@ fn url_of_name(minted: &str, name: &str) -> String {
 /// (`smithy_query(query="digest",
 /// model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`)
 /// that takes a `QueueUrl` and can be called with no other resource of its own.
-fn url_requests(url: &str) -> Vec<(&'static str, Value)> {
+pub(crate) fn url_requests(url: &str) -> Vec<(&'static str, Value)> {
     vec![
         ("SendMessage", json!({"QueueUrl": url, "MessageBody": "gone"})),
         (
@@ -231,6 +241,12 @@ fn url_requests(url: &str) -> Vec<(&'static str, Value)> {
         (
             "ChangeMessageVisibility",
             json!({"QueueUrl": url, "ReceiptHandle": "not-a-handle", "VisibilityTimeout": 30}),
+        ),
+        (
+            "ChangeMessageVisibilityBatch",
+            json!({"QueueUrl": url,
+                   "Entries": [{"Id": "one", "ReceiptHandle": "not-a-handle",
+                                "VisibilityTimeout": 30}]}),
         ),
         (
             "GetQueueAttributes",
@@ -254,7 +270,7 @@ fn url_requests(url: &str) -> Vec<(&'static str, Value)> {
 /// Assert one answer is the absence refusal, whole: the status, the class, the legacy report
 /// beside it, and AWS's fixed sentence — and that the sentence interpolated nothing of the
 /// request.
-fn assert_absence_refusal(
+pub(crate) fn assert_absence_refusal(
     case: &str,
     operation: &str,
     dialect: Dialect,
