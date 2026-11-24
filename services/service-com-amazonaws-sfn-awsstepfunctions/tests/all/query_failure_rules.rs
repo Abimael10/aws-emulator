@@ -7,9 +7,11 @@
 //!
 //! The rules under test:
 //!
-//! 1. the context object's `$$.State` carries the attempt the state is on: `RetryCount`
-//!    is present on every attempt — zero on the first, which a `Retry` has re-run no
-//!    times — and moves on with each attempt a retrier re-ran;
+//! 1. the context object's `$$.State` carries the attempt the state is on where the
+//!    state's kind can be retried at all: `RetryCount` is present on every attempt of
+//!    such a state — zero on the first, which a `Retry` has re-run no times — moves on
+//!    with each attempt a retrier re-ran, and is absent from the context object of a
+//!    state kind the language gives no `Retry`;
 //! 2. a `Fail` state's `Error`/`Cause` written as JSON null declares no value for it —
 //!    null is the absence of a value, so the execution surfaces the same absent error
 //!    an omitted member does, and a `Catch` naming an error does not match it;
@@ -95,22 +97,41 @@ fn output(described: &Value) -> Value {
 // 1. `$$.State.RetryCount` is the attempt the state is on
 // ---------------------------------------------------------------------------
 
-/// `$$.State` carries `RetryCount` on every attempt — zero on the one no `Retry` re-ran
-/// — beside the state's name and entry instant.
+/// `$$.State` carries `RetryCount` on every attempt of a state that can be retried —
+/// zero on the one no `Retry` re-ran — beside the state's name and entry instant, and
+/// carries none for a state kind that cannot be retried at all.
 ///
-/// The rows vary the dimension the rule generalises over: how many attempts the state
-/// has taken by the time the context object is read — none (the first attempt of a
-/// state with no `Retry` at all, and the first attempt of one that declares one) and
-/// one (the attempt a retrier re-ran).
+/// The rows vary the two dimensions the rule generalises over: the KIND of the state
+/// reading the context object (one the Amazon States Language gives `Retry` to, and one
+/// it does not) and how many attempts that state has taken by the time the object is
+/// read — none (the first attempt) and one (the attempt a retrier re-ran).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_context_object_carries_the_attempt_the_state_is_on() {
     // (case, the state that reads `$$.State`, the attempt the member must report)
     let rows: Vec<(&str, Value, Option<u64>)> = vec![
         (
-            "a state with no Retry at all",
+            // A `Pass` state is of a kind the language gives no `Retry`, so nothing can
+            // re-run it and its context object reports no attempt.
+            "a state of a kind that cannot be retried",
             json!({
                 "Type": "Pass",
                 "Parameters": { "state.$": "$$.State" },
+                "End": true,
+            }),
+            None,
+        ),
+        (
+            // A `Map` state's kind carries `Retry`, so its context object reports the
+            // attempt it is on even where the state declares no retrier of its own.
+            "the first attempt of a retriable state declaring no Retry",
+            json!({
+                "Type": "Map",
+                "ItemSelector": { "state.$": "$$.State" },
+                "ItemProcessor": {
+                    "StartAt": "Each",
+                    "States": { "Each": { "Type": "Pass", "End": true } }
+                },
+                "OutputPath": "$[0]",
                 "End": true,
             }),
             Some(0),

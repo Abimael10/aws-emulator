@@ -961,8 +961,9 @@ async fn the_context_object_a_cause_quotes_keeps_its_member_order() {
             previous = at;
         }
         // And the state's own members, which are the attempt being run: its name, the
-        // instant it was entered, and the attempt it is on — zero for a state no `Retry`
-        // has re-run, PRESENT either way.
+        // instant it was entered, and — for a state of a kind the language gives a
+        // `Retry` — the attempt it is on, zero for one no retrier has re-run. A kind
+        // that cannot be retried at all reports no such attempt.
         let state_at = cause.find("\"State\":{").unwrap_or_else(|| {
             panic!("case {case:?}: expected the cause to carry the state's members, got {cause:?}")
         });
@@ -972,9 +973,22 @@ async fn the_context_object_a_cause_quotes_keeps_its_member_order() {
             state.starts_with(&opening),
             "case {case:?}: expected the state's members to open {opening:?}, got {state:?}"
         );
+        // The kinds the Amazon States Language gives `Retry` to, which are the kinds
+        // whose context object reports an attempt
+        // (`smithy_query` models no context object; the field is the language's).
+        let retriable = matches!(
+            row.state.get("Type").and_then(Value::as_str),
+            Some("Task" | "Map" | "Parallel")
+        );
+        assert_eq!(
+            state.contains("\"RetryCount\":"),
+            retriable,
+            "case {case:?}: expected the attempt the state is on to be reported for a state \
+             that can be retried and for no other (retriable: {retriable}), got {state:?}"
+        );
         assert!(
-            state.contains("\"RetryCount\":0"),
-            "case {case:?}: expected the state to report the attempt it is on, got {state:?}"
+            !retriable || state.contains("\"RetryCount\":0"),
+            "case {case:?}: expected the attempt no retrier re-ran to be zero, got {state:?}"
         );
     }
 }

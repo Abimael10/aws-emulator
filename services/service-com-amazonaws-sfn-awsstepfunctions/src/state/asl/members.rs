@@ -165,6 +165,18 @@ pub(super) fn executable_members(state_type: &str) -> &'static [&'static str] {
     }
 }
 
+/// Whether a state of `state_type` can be RETRIED: whether the Amazon States Language
+/// gives that type a `Retry` field at all.
+///
+/// Read off the one catalog of what a type may carry ([`executable_members`]) rather
+/// than listed a second time beside it, so a type that gains or loses the field gains
+/// or loses it here too. It is what decides whether the context object of a state of
+/// that type carries the attempt it is on ([`Interpreter::context_for`]): a state
+/// nothing can re-run has no attempt to report.
+pub(super) fn can_retry(state_type: &str) -> bool {
+    executable_members(state_type).contains(&"Retry")
+}
+
 /// The members a `Task` state whose `Resource` names a SERVICE INTEGRATION may
 /// carry: the ones that decide the request the call carries, what becomes of its
 /// answer, and how a failed call is handled.

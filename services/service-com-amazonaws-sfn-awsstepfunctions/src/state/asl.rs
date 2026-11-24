@@ -4229,9 +4229,11 @@ fn errors_match(entry: &Map<String, Value>, error: &str) -> bool {
 /// `context` with `$$.State.RetryCount` set to the attempt the state is on, for an
 /// attempt a `Retry` re-ran.
 ///
-/// The member is PRESENT on every attempt ([`Interpreter::context_for`] writes it, zero
-/// on the first), so this only has to move it on for an attempt after the first: the
-/// attempt a state is on is what a field reading it resolves.
+/// The member is PRESENT on every attempt of a state kind that can be retried
+/// ([`Interpreter::context_for`] writes it, zero on the first), so this only has to move
+/// it on for an attempt after the first: the attempt a state is on is what a field
+/// reading it resolves. It is asked only by the state kinds the language gives a `Retry`
+/// to, which are exactly the kinds whose context object carries the member.
 fn with_retry_count(context: &Value, attempt: u64) -> Value {
     let mut context = context.clone();
     if attempt == 0 {

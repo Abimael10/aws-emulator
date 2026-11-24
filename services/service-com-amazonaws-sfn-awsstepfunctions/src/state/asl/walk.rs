@@ -672,7 +672,7 @@ impl Interpreter<'_> {
             .at(at));
         }
 
-        let context = self.context_for(scope, name, at);
+        let context = self.context_for(scope, name, state_type, at);
         // The variables in scope for THIS state, installed on the thread for its turn:
         // a JSONPath reference reads one as the first term of a path, and the paths of
         // this state are evaluated by plain functions the walk reaches through several
@@ -1306,19 +1306,38 @@ impl Interpreter<'_> {
         // Both bounds are read from the state's effective INPUT, which is what their
         // `*Path` forms are reference paths into — not from the `Parameters` document
         // built below.
-        let timeout_seconds = self
+        let timeout_seconds = match self
             .task_seconds(state, language, "TimeoutSeconds", &effective, context)
-            .map_err(|failure| failure.at(at))?;
-        let heartbeat_seconds = self
+        {
+            Ok(seconds) => seconds,
+            Err(failure) => {
+                return self.caught_field_failure(
+                    name, state, language, raw, &effective, failure, context, at,
+                )
+            }
+        };
+        let heartbeat_seconds = match self
             .task_seconds(state, language, "HeartbeatSeconds", &effective, context)
-            .map_err(|failure| failure.at(at))?;
+        {
+            Ok(seconds) => seconds,
+            Err(failure) => {
+                return self.caught_field_failure(
+                    name, state, language, raw, &effective, failure, context, at,
+                )
+            }
+        };
         // "Parameters ... Used to create a collection of key-value pairs that will be
         // passed as input" — `Arguments` in JSONata: the document the template builds
         // IS what the worker is handed, and without one the state's effective input
         // is.
-        let input = self
-            .task_request(state, language, &effective, context)
-            .map_err(|failure| failure.at(at))?;
+        let input = match self.task_request(state, language, &effective, context) {
+            Ok(input) => input,
+            Err(failure) => {
+                return self.caught_field_failure(
+                    name, state, language, raw, &effective, failure, context, at,
+                )
+            }
+        };
         // "GetActivityTask ... used by workers to retrieve a task (with the specified
         // activity ARN) which has been scheduled for execution by a running state
         // machine": the task is queued UNDER the activity, so a `Resource` naming one
@@ -1481,6 +1500,52 @@ impl Interpreter<'_> {
         }
     }
 
+    /// What a `Task` state answers a FIELD of its own it could not read with: the
+    /// state's own `Catch`, exactly as it answers a failure of its work with.
+    ///
+    /// A field is read while the state is being EXECUTED, so a field that could not be
+    /// read is that STATE's error and the state's own error handling answers for it: an
+    /// expression that misevaluated in one ([`QUERY_EVALUATION_ERROR`]) is as ordinary
+    /// an error of the state as the failure of the work the field would have bounded,
+    /// and only an error no catcher names ends the execution. [`RUNTIME_ERROR`] is
+    /// carried through unanswered whatever the state declares, because no retrier or
+    /// catcher matches it ([`errors_match`]).
+    ///
+    /// The state is ENTERED first, because it was: the event a catcher leaves it by
+    /// pairs with the one it was entered at, which is also the event the diagnosis names.
+    ///
+    /// It is the `Catch` half alone that answers here, because this is the path of a task
+    /// an activity's WORKER answers: such a task's retriers are spent by the store as
+    /// each attempt's task closes ([`ActivityTask::retries_taken`]), so the
+    /// walk runs no retry loop around it to re-run the field read in. The task whose work
+    /// this emulator performs itself reads its fields INSIDE that loop
+    /// ([`Interpreter::task_state`]), where a `Retry` answers for them as well.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn caught_field_failure(
+        &mut self,
+        name: &str,
+        state: &Map<String, Value>,
+        language: &'static str,
+        raw: &Value,
+        effective: &Value,
+        failure: Failure,
+        context: &Value,
+        at: Duration,
+    ) -> Result<StateStep, Fault> {
+        self.push_entered("TaskStateEntered", name, at, raw);
+        self.catch_or_fail(
+            (name, "TaskStateExited"),
+            state,
+            language,
+            raw,
+            effective,
+            failure,
+            NO_OTHER_ERRORS,
+            context,
+            at,
+        )
+    }
+
     /// What a FIELD of a state whose value is of a kind the language does not accept
     /// there reports: the field, what it must carry, and the value found.
     ///
@@ -1539,13 +1604,23 @@ impl Interpreter<'_> {
     /// The context object (`$$`) a state reads: the run's own members, plus the state
     /// it is being read in and the `Map` item being iterated, when there is one.
     ///
-    /// `$$.State` carries the members the service supplies for the attempt being run:
-    /// the state's name, the instant it was entered, and the attempt it is on. RECORDED
-    /// shape: `RetryCount` is PRESENT on every attempt — zero on the first, which has
-    /// been retried no times — so a field reading it resolves whatever attempt the state
-    /// is on, and the member is in the object a diagnosis about an unresolved context
-    /// path quotes ([`with_retry_count`] writes the attempt a `Retry` re-ran).
-    pub(super) fn context_for(&self, scope: &Scope, name: &str, at: Duration) -> Value {
+    /// `$$.State` carries the members the service supplies for the state being run: its
+    /// name, the instant it was entered, and — for a state kind that CAN be retried —
+    /// the attempt it is on. RECORDED shape: `RetryCount` is a member of the context
+    /// object of a state whose type may declare a `Retry` ([`executable_members`] is
+    /// which those are: the types the Amazon States Language gives that field), present
+    /// on every attempt of one and zero on the first, which has been retried no times;
+    /// a state that cannot be retried at all carries no such member, so the object a
+    /// state of that kind resolves — and the one a diagnosis about an unresolved context
+    /// path quotes — is its name and its entry instant alone. [`with_retry_count`]
+    /// writes the attempt a `Retry` re-ran.
+    pub(super) fn context_for(
+        &self,
+        scope: &Scope,
+        name: &str,
+        state_type: &str,
+        at: Duration,
+    ) -> Value {
         let mut context = self.base_context.clone();
         if let Some(object) = context.as_object_mut() {
             let mut state = Map::new();
@@ -1554,7 +1629,9 @@ impl Interpreter<'_> {
                 "EnteredTime".to_string(),
                 serde_json::json!(iso(self.start + at)),
             );
-            state.insert("RetryCount".to_string(), serde_json::json!(self.retry_count));
+            if can_retry(state_type) {
+                state.insert("RetryCount".to_string(), serde_json::json!(self.retry_count));
+            }
             object.insert("State".to_string(), Value::Object(state));
             if let Some(item) = &scope.map_item {
                 object.insert("Map".to_string(), serde_json::json!({ "Item": item }));
@@ -2389,39 +2466,6 @@ impl Interpreter<'_> {
         let call = super::super::integration::read(resource).map_err(|why| {
             self.task_fault(name, &work, runtime(format!("state '{name}': {why}")), at)
         })?;
-        // "TimeoutSeconds […] If the task runs longer than the specified seconds,
-        // this state fails with a States.Timeout error name": the span it bounds is
-        // the call's own, so the member is what the WAIT for the answer is bounded
-        // by (`integration::Tasks::perform`), not merely what the span is compared
-        // with afterwards. A state that declares none leaves the emulator's own
-        // ceiling as the only bound.
-        //
-        // It is read through the SAME reader an activity task's bounds are read
-        // with, which holds the member to the "positive integer" of seconds the
-        // language defines: a figure that is not one is a defect in the definition,
-        // and reading it as a whole number of seconds is what makes converting it to
-        // a `Duration` total for every value a caller can write.
-        let within = self
-            .task_seconds(state, language, "TimeoutSeconds", &effective, context)
-            .map_err(|failure| self.task_fault(name, &work, failure, at))?
-            .map(Duration::from_secs);
-        let heartbeat = self
-            .task_seconds(state, language, "HeartbeatSeconds", &effective, context)
-            .map_err(|failure| self.task_fault(name, &work, failure, at))?;
-        // "HeartbeatSeconds […] If more time than the specified seconds elapses between
-        // heartbeats from the task, this state fails with a States.Timeout error name":
-        // the heartbeats of a task are sent by whoever is DOING its work. The work of a
-        // service integration this emulator performs itself sends none, so the window the
-        // member declares closes at its own length and what bounds such a task is
-        // whichever of the two spans the state declared runs out first. A CALLBACK task's
-        // work is somebody ELSE's — whoever the token went to — so the window of one is
-        // bounded below instead, from the last heartbeat quoting its token
-        // ([`super::super::integration::Alive`]). Each member is still REPORTED as the
-        // definition wrote it either way.
-        let bounded = match (within, heartbeat.map(Duration::from_secs)) {
-            (Some(timeout), Some(heartbeat)) => Some(timeout.min(heartbeat)),
-            (timeout, heartbeat) => timeout.or(heartbeat),
-        };
         // The job a run-a-job integration started has ENDED: what it ended as is this
         // state's own outcome, so the state reports it instead of starting the job a
         // second time. The events up to here are the ones the call that parked the
@@ -2581,6 +2625,61 @@ impl Interpreter<'_> {
             let attempt_context = match &token {
                 Some(token) => with_task_token(&attempt_context, token),
                 None => attempt_context,
+            };
+            // "TimeoutSeconds […] If the task runs longer than the specified seconds,
+            // this state fails with a States.Timeout error name": the span it bounds is
+            // the call's own, so the member is what the WAIT for the answer is bounded
+            // by (`integration::Tasks::perform`), not merely what the span is compared
+            // with afterwards. A state that declares none leaves the emulator's own
+            // ceiling as the only bound.
+            //
+            // It is read through the SAME reader an activity task's bounds are read
+            // with, which holds the member to the "positive integer" of seconds the
+            // language defines: a figure that is not one is a defect in the definition,
+            // and reading it as a whole number of seconds is what makes converting it to
+            // a `Duration` total for every value a caller can write.
+            //
+            // Read HERE, inside the ATTEMPT and against that attempt's own context, for
+            // the same reason the request below is: the two bounds are fields of this
+            // state, so a field this attempt could not read is the attempt's own failure
+            // and the state answers for it through its `Retry` and `Catch` like any
+            // other error of its work — which is what makes an expression that
+            // misevaluated in one of them ([`QUERY_EVALUATION_ERROR`]) an ordinary
+            // state error rather than a fault that ends the execution.
+            let within = match me.task_seconds(
+                state,
+                language,
+                "TimeoutSeconds",
+                &effective,
+                &attempt_context,
+            ) {
+                Ok(seconds) => seconds.map(Duration::from_secs),
+                Err(failure) => return (Err(failure), at),
+            };
+            let heartbeat = match me.task_seconds(
+                state,
+                language,
+                "HeartbeatSeconds",
+                &effective,
+                &attempt_context,
+            ) {
+                Ok(seconds) => seconds,
+                Err(failure) => return (Err(failure), at),
+            };
+            // "HeartbeatSeconds […] If more time than the specified seconds elapses
+            // between heartbeats from the task, this state fails with a States.Timeout
+            // error name": the heartbeats of a task are sent by whoever is DOING its
+            // work. The work of a service integration this emulator performs itself
+            // sends none, so the window the member declares closes at its own length and
+            // what bounds such a task is whichever of the two spans the state declared
+            // runs out first. A CALLBACK task's work is somebody ELSE's — whoever the
+            // token went to — so the window of one is bounded below instead, from the
+            // last heartbeat quoting its token
+            // ([`super::super::integration::Alive`]). Each member is still REPORTED as
+            // the definition wrote it either way.
+            let bounded = match (within, heartbeat.map(Duration::from_secs)) {
+                (Some(timeout), Some(heartbeat)) => Some(timeout.min(heartbeat)),
+                (timeout, heartbeat) => timeout.or(heartbeat),
             };
             // Resolving what the work is handed is the INTERPRETER's own step, taken
             // before anything is handed over: a template or a path that cannot be

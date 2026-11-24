@@ -143,8 +143,8 @@ pub fn test_state(test: &StateTest<'_>) -> Trial {
         // `TimeoutSeconds` around it: nothing here bounds the span the state runs in.
         timeout_left: None,
         timed_out: false,
-        // The state is tested as the attempt the request says it is on, which is what
-        // it reads through `$$.State.RetryCount`.
+        // The state is tested as the attempt the request says it is on, which is what a
+        // state of a kind that can be retried reads through `$$.State.RetryCount`.
         retry_count: test.retries_taken,
         steps: Vec::new(),
         // `TestState` keeps no history: the state under test is the first thing this
@@ -252,7 +252,7 @@ impl Interpreter<'_> {
     pub(super) fn trial(&mut self, test: &StateTest<'_>, raw: &Value, mut inspection: Inspection) -> Trial {
         let state = test.state;
         let state_type = state.get("Type").and_then(Value::as_str).unwrap_or_default();
-        let context = self.context_for(&Scope::default(), test.name, Duration::ZERO);
+        let context = self.context_for(&Scope::default(), test.name, state_type, Duration::ZERO);
         // "The set will include variables assigned in the state and variables set up as
         // test state input": the request's own set is in scope for the paths of the
         // state under test, installed for this trial exactly as it is for a state of a
