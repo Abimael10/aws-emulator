@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetKeepJobFlowAliveWhenNoSteps
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetKeepJobFlowAliveWhenNoSteps`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetKeepJobFlowAliveWhenNoSteps::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes `KeepJobFlowAliveWhenNoSteps` on every cluster (job flow) the request names, so a
+//! later `DescribeCluster` reports its complement as `AutoTerminate` and the cluster's own
+//! shutdown follows the new value: one that no longer stays up shuts itself down once its
+//! step queue has run, and one that now stays up does not. Every id is resolved before
+//! anything is changed, so a request naming an unknown cluster changes nothing and is
+//! refused.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +156,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetKeepJobFlowAliveWhenNoSteps` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetKeepJobFlowAliveWhenNoStepsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetKeepJobFlowAliveWhenNoSteps"))
+        let now = ::std::time::SystemTime::now();
+
+        // CHOSEN by analogy, not documented for this operation: EMR's `TerminateJobFlows`
+        // publishes "The maximum number of clusters allowed is 10" for the same kind of
+        // per-request batch of job flow ids, and this operation's own model publishes no
+        // bound at all. The same number caps this batch so neither pass below can be
+        // driven to arbitrary length while holding the shared lock; it is refused BEFORE
+        // the store is reached.
+        if input.job_flow_ids.len() > crate::state::MAX_TERMINATE_JOB_FLOW_IDS {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "JobFlowIds carries {} ids; at most {} clusters are allowed in one request",
+                input.job_flow_ids.len(),
+                crate::state::MAX_TERMINATE_JOB_FLOW_IDS
+            )));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                SetKeepJobFlowAliveWhenNoStepsErrorModeled::InternalServerError(
+                    InternalServerError {},
+                )
+                .into(),
+            );
+        };
+        let mut store = state.lock();
+
+        // Resolve every id BEFORE changing anything, so a request naming one unknown id
+        // changes no cluster at all. This operation models no client error, so the refusal
+        // is the 400 `ValidationException` channel, and the sentence is this legacy
+        // job-flow surface's own, which is CONSTANT: it names no id
+        // ([`crate::state::unknown_job_flow_message`]), exactly as the `JobFlowIds`
+        // operation beside it (`SetTerminationProtection`) words it.
+        for job_flow_id in &input.job_flow_ids {
+            if !store.clusters.contains_key(job_flow_id) {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    crate::state::unknown_job_flow_message(),
+                ));
+            }
+        }
+
+        // "If you want a transient cluster that shuts down after the last of the current
+        // executing steps are completed, you can configure SetKeepJobFlowAliveWhenNoSteps
+        // to false. If you want a long running cluster, configure
+        // SetKeepJobFlowAliveWhenNoSteps to true" (this operation's doc): what this call
+        // writes is the cluster's own setting — the one a described cluster reports the
+        // complement of ("specifies whether the cluster should terminate after completing
+        // all steps", `Cluster$AutoTerminate`) and the one the cluster's self-shutdown is
+        // owed from ([`crate::state::ClusterRecord::auto_terminate_due_at`]).
+        let keep_alive = input.keep_job_flow_alive_when_no_steps;
+        for job_flow_id in &input.job_flow_ids {
+            if let Some(cluster) = store.cluster_mut(job_flow_id, now) {
+                // The instant the caller asked for the shutdown is recorded only where the
+                // setting CHANGES, so asking again for what the cluster is already doing
+                // neither postpones a shutdown already owed nor arms one afresh.
+                if cluster.instances.keep_job_flow_alive_when_no_steps != keep_alive {
+                    cluster.auto_terminate_since = (!keep_alive).then_some(now);
+                }
+                cluster.instances.keep_job_flow_alive_when_no_steps = keep_alive;
+                cluster.auto_terminate = !keep_alive;
+            }
+        }
+        drop(store);
+
+        // The self-shutdown this call may have armed — and every state the clock owes a
+        // cluster on the way through it — is announced on the default event bus as it
+        // happens, exactly as the shutdown a caller asks for outright is.
+        let region = crate::state::request_region(ctx.parts());
+        crate::state::settle_cluster_events(&self.engine, ctx, &region);
+
+        Ok(SetKeepJobFlowAliveWhenNoStepsOutput)
     }
 }

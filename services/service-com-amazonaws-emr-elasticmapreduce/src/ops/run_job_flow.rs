@@ -803,6 +803,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // steps" (Cluster$AutoTerminate) — the complement of the request's
             // KeepJobFlowAliveWhenNoSteps.
             auto_terminate: !instances.keep_job_flow_alive_when_no_steps,
+            // No caller has asked this cluster to stop staying up: whatever shutdown it is
+            // owed is its launch's own (`crate::state::ClusterRecord::auto_terminate_since`).
+            auto_terminate_since: None,
             step_concurrency_level,
             ebs_root_volume_size: input.ebs_root_volume_size,
             ebs_root_volume_iops: input.ebs_root_volume_iops,

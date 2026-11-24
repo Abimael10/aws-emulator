@@ -3004,6 +3004,15 @@ pub struct ClusterRecord {
     pub repo_upgrade_on_boot: Option<String>,
     pub visible_to_all_users: bool,
     pub auto_terminate: bool,
+    /// When a CALLER last asked this cluster to stop staying up — the instant
+    /// `SetKeepJobFlowAliveWhenNoSteps` turned [`Self::auto_terminate`] on — and `None` for a
+    /// cluster whose transience is its launch's own or that is staying up.
+    ///
+    /// The shutdown such a cluster is owed is counted from one [`TRANSITION_SPAN`] after that
+    /// instant as well as from its queue ([`Self::auto_terminate_due_at`]), so a caller
+    /// reading straight after the call still sees the cluster up, and a call that asks again
+    /// for what the cluster is already doing postpones nothing.
+    pub auto_terminate_since: Option<SystemTime>,
     pub step_concurrency_level: i32,
     pub ebs_root_volume_size: Option<i32>,
     pub ebs_root_volume_iops: Option<i32>,
@@ -3214,9 +3223,20 @@ impl ClusterRecord {
     /// the instant the cluster became ready to run steps when it has none — so the cluster
     /// reports the same timeline however often it is read. A cluster still running a step is
     /// owed nothing yet, which is also what makes a step submitted to a transient cluster
-    /// hold its shutdown off until that step has run.
+    /// hold its shutdown off until that step has run. A cluster a CALLER asked to stop
+    /// staying up is owed it from that call too ([`Self::auto_terminate_since`]), so the
+    /// shutdown it brings never falls before the call that asked for it.
+    ///
+    /// Being UP is what the shutdown waits on, and a cluster that is up reports one of the
+    /// two states the clock brings it to — `RUNNING`, or `WAITING` for one that was staying
+    /// up when the caller asked it to stop — so either is owed the shutdown.
     pub(crate) fn auto_terminate_due_at(&self) -> Option<SystemTime> {
-        if !self.auto_terminate || self.status.state != cluster_state::RUNNING {
+        if !self.auto_terminate
+            || !matches!(
+                self.status.state.as_str(),
+                cluster_state::RUNNING | cluster_state::WAITING
+            )
+        {
             return None;
         }
         // A cluster that has just become ready has been ready for no time at all, so the
@@ -3230,6 +3250,12 @@ impl ClusterRecord {
             .ready_date_time
             .unwrap_or(self.status.creation_date_time)
             + TRANSITION_SPAN;
+        // A caller that asked this cluster to stop staying up asked for it at THAT instant,
+        // so the shutdown is owed a span after the call rather than from an instant already
+        // past: the cluster is still up for a caller that reads it straight afterwards.
+        if let Some(asked_at) = self.auto_terminate_since {
+            finished = finished.max(asked_at + TRANSITION_SPAN);
+        }
         for step in &self.steps {
             if !step.is_terminal() {
                 return None;
