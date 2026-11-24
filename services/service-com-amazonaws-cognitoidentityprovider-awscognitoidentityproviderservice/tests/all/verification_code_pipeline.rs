@@ -1288,8 +1288,8 @@ async fn an_email_one_time_password_signs_the_user_in_once() {
         "case \"the same code again\": an answered session is spent, got {replay}"
     );
 
-    // A challenge whose window has closed is refused as an expired CODE: that window is
-    // what bounds the one-time password.
+    // A challenge whose window has closed is refused on the SESSION: the window belongs
+    // to the session, not to the code it delivered.
     let (expiring_session, _) = start(&emulator, &client_id).await;
     let expiring = session_code(&engine, &expiring_session).expect("the challenge delivers a code");
     expire_session(&engine, &expiring_session);
@@ -1312,8 +1312,14 @@ async fn an_email_one_time_password_signs_the_user_in_once() {
     );
     assert_eq!(
         error_code(&payload),
-        "ExpiredCodeException",
-        "case \"a session whose window closed\": expected ExpiredCodeException, got \
+        "NotAuthorizedException",
+        "case \"a session whose window closed\": expected NotAuthorizedException, got \
+         {payload}"
+    );
+    assert_eq!(
+        payload["message"].as_str(),
+        Some("Invalid session for the user, session is expired."),
+        "case \"a session whose window closed\": expected the session-expired sentence, got \
          {payload}"
     );
 }

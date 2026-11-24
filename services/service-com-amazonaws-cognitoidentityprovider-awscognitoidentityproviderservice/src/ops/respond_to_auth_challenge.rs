@@ -7,8 +7,9 @@
 //!
 //! The `Session` names the stored challenge and the user it was started for. An
 //! `EMAIL_OTP` response is checked against the code that challenge DELIVERED: a wrong
-//! code is refused `CodeMismatchException`, a session whose window has closed
-//! `ExpiredCodeException`. A `NEW_PASSWORD_REQUIRED` response carries the password the
+//! code is refused `CodeMismatchException`, while a session whose window has closed is
+//! refused on the SESSION with `NotAuthorizedException` before the answer is read at
+//! all. A `NEW_PASSWORD_REQUIRED` response carries the password the
 //! user chooses, which is stored as its permanent one against the same rule
 //! `AdminRespondToAuthChallenge` holds such a response to
 //! ([`crate::state::answer_new_password_challenge`]). A response accepted once completes
@@ -521,18 +522,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RespondToAuthChal
             // authorizes nothing.
             let session = match guard.session(&session_token, now) {
                 crate::state::SessionLookup::Found(session) => session,
-                // A challenge that delivered a code is answerable exactly while its
-                // session lasts, so a closed window is that CODE's expiry: "this exception
-                // is thrown if a code has expired" (`ExpiredCodeException`). A challenge
-                // that delivered none has no code to expire, so its session expiry is
-                // reported as the session's.
-                crate::state::SessionLookup::Expired(expired) => {
-                    return Err(if expired.code.is_some() {
-                        expired_code()
-                    } else {
-                        expired_session()
-                    });
-                }
+                // A session whose validity window has closed is refused ON THE
+                // SESSION, whatever the challenge it was waiting on and whether or
+                // not that challenge delivered a code: the window is the app
+                // client's `AuthSessionValidity`, "the duration, in minutes, of that
+                // session token" (`CreateUserPoolClient.AuthSessionValidity` in this
+                // service's model), so what has lapsed is the session rather than
+                // anything the response carries — reported as the session's expiry
+                // ([`expired_session`]), the refusal the administrative response
+                // operation gives the same state, and decided before the answer is
+                // looked at at all.
+                crate::state::SessionLookup::Expired(_) => return Err(expired_session()),
                 // A session an earlier response already answered is a REPLAY: its
                 // challenge is over, which is a different answer from the one a value
                 // this emulator never handed out gets. A spent session of ANOTHER app
@@ -1184,15 +1184,6 @@ fn invalid_challenge_state() -> RespondToAuthChallengeError {
     .into()
 }
 
-/// This operation's `ExpiredCodeException`: "this exception is thrown if a code has
-/// expired" (this service's model).
-fn expired_code() -> RespondToAuthChallengeError {
-    RespondToAuthChallengeErrorModeled::ExpiredCodeException(ExpiredCodeException {
-        message: Some(crate::state::EXPIRED_CODE_MESSAGE.to_string()),
-    })
-    .into()
-}
-
 /// The refusal for a `Session` an earlier response already answered.
 fn session_already_used() -> RespondToAuthChallengeError {
     not_authorized(crate::state::SESSION_ALREADY_USED_MESSAGE)
@@ -1229,8 +1220,10 @@ fn invalid_session() -> RespondToAuthChallengeError {
     .into()
 }
 
-/// The refusal for a `Session` whose validity window has closed with no code
-/// outstanding on it.
+/// The refusal for a `Session` whose validity window has closed, whichever challenge
+/// it was waiting on: the window belongs to the session
+/// ([`crate::state::SESSION_EXPIRED_MESSAGE`]), so a response past it is refused on the
+/// session and never on the answer it carries.
 fn expired_session() -> RespondToAuthChallengeError {
     not_authorized(crate::state::SESSION_EXPIRED_MESSAGE)
 }
