@@ -7,14 +7,13 @@
 //! serialization, the modelled-constraint walk and the handlers — so what is asserted is what
 //! a signed AWS SDK request observes.
 //!
-//! The rule under test: which not-found sentence a refusal carries follows the ROUTE's own
-//! recorded contract. A READ addressed by a configuration's own ARN — over BOTH
-//! configuration families — reports the ARN it could not resolve, quoted and by itself:
-//! "The resource ARN '<arn>' was not found." Every other lookup of a distribution
-//! configuration — its delete, its update and a tagging write on it — reports it as the
-//! required resource it is, naming the kind its ARN identifies: "The following required
-//! resource 'DistributionConfiguration' cannot be found: '<arn>'." The second test pins that
-//! boundary on the sibling INFRASTRUCTURE configuration.
+//! The rule under test: which not-found sentence a refusal carries follows the RESOURCE the
+//! ARN identifies. EVERY lookup of a distribution configuration — its read, its delete, its
+//! update and a tagging write on it — reports it as the required resource it is, naming the
+//! kind its ARN identifies: "The following required resource 'DistributionConfiguration'
+//! cannot be found: '<arn>'." The ARN-only sentence "The resource ARN '<arn>' was not
+//! found." belongs to the sibling INFRASTRUCTURE configuration's own read and delete, which
+//! the second test pins.
 //!
 //! The rows span what the rule generalises over: which operation performs the lookup, why the
 //! ARN resolves to nothing (never created, deleted after an accepted update, a name that only
@@ -187,8 +186,8 @@ async fn create_distribution(router: &MultiServiceRouter, region: &str, name: &s
 }
 
 /// Every lookup of the distribution configuration `arn`, as (operation, method, uri, body,
-/// the sentence a configuration it cannot resolve is reported in) — the READ reports the ARN
-/// alone, and every other route names the kind.
+/// the sentence a configuration it cannot resolve is reported in) — every route of this
+/// family names the kind its ARN identifies.
 fn distribution_lookups(
     region: &str,
     arn: &str,
@@ -201,7 +200,7 @@ fn distribution_lookups(
             "GET",
             format!("/GetDistributionConfiguration?distributionConfigurationArn={arn}"),
             None,
-            arn_sentence(arn),
+            kind.clone(),
         ),
         (
             "DeleteDistributionConfiguration".to_string(),
@@ -267,9 +266,8 @@ async fn assert_every_lookup_reports_it_missing(
 }
 
 /// RULE: a distribution configuration the calling Region holds nothing under is reported
-/// missing by every lookup of it, whatever the reason it resolves to nothing — its READ
-/// quoting the ARN it could not resolve, and its other routes naming the kind that ARN
-/// identifies.
+/// missing by every lookup of it, whatever the reason it resolves to nothing, each naming
+/// the kind that ARN identifies.
 #[tokio::test]
 async fn every_lookup_of_a_missing_distribution_configuration_reports_it_missing() {
     let router = emulator();
@@ -380,8 +378,7 @@ async fn every_lookup_of_a_missing_distribution_configuration_reports_it_missing
 }
 
 /// RULE's boundary: the sibling INFRASTRUCTURE configuration's read is reported by its ARN
-/// alone, exactly as the distribution configuration's is, and so is its delete — while a
-/// tagging write on either names the kind.
+/// alone, and so is its delete — while a tagging write on either names the kind.
 #[tokio::test]
 async fn the_infrastructure_configuration_is_still_reported_by_its_arn_alone() {
     let router = emulator();

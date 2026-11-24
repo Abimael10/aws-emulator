@@ -10,17 +10,17 @@
 //! The rule under test: when an ARN a request carries resolves to no resource of the
 //! calling Region — because it was deleted, or was never created, or belongs to another
 //! Region — the call is answered with the not-found error this service models
-//! (`ResourceNotFoundException`, HTTP 404), and WHICH SENTENCE it carries is the recorded
-//! contract of the ROUTE that looked it up:
+//! (`ResourceNotFoundException`, HTTP 404), and WHICH SENTENCE it carries follows the
+//! RESOURCE the ARN identifies:
 //!
-//! * a READ addressed by a CONFIGURATION's own ARN — either family — and the INFRASTRUCTURE
-//!   configuration's delete with them, report the ARN the request carried, quoted: "The
+//! * a call addressed by the INFRASTRUCTURE configuration's own ARN — its read and its
+//!   delete — reports the ARN the request carried, quoted: "The
 //!   resource ARN '<arn>' was not found.", which names no kind.
 //! * everywhere else — the components, recipes, pipelines, images, workflows, and the
-//!   distribution configuration whichever other route looks one up (a delete, an update, a
-//!   policy write, a tagging write or a reference) — the required resource it is: "The
-//!   following required resource '<Kind>' cannot be found: '<arn>'.", naming the kind the ARN
-//!   identifies.
+//!   distribution configuration on every route that looks one up (a read, a delete, an
+//!   update, a policy write, a tagging write or a reference) — the required resource it is:
+//!   "The following required resource '<Kind>' cannot be found: '<arn>'.", naming the kind
+//!   the ARN identifies.
 //!
 //! The TAG LISTING is the one lookup answered by another layer and so by another class: it
 //! reports an ARN that resolves to nothing as the resource-tagging layer's own
@@ -505,14 +505,14 @@ fn lookups_of(case: &str, region: &'static str, resource_type: &'static str, arn
             );
         }
         "DistributionConfiguration" => {
-            // A READ addressed by a configuration's own ARN reports that ARN alone, over both
-            // configuration families; this family's delete and its update name the kind.
+            // Every route of this family names the kind its ARN identifies; the ARN-only
+            // sentence belongs to the sibling infrastructure configuration.
             push(
                 "GetDistributionConfiguration",
                 "GET",
                 format!("/GetDistributionConfiguration?distributionConfigurationArn={arn}"),
                 None,
-                MissingReport::ConfigurationArn,
+                MissingReport::RequiredResource,
             );
             push(
                 "DeleteDistributionConfiguration",

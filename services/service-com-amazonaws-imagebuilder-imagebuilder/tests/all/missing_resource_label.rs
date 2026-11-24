@@ -12,8 +12,8 @@
 //! (`ResourceNotFoundException`, HTTP 404; `smithy_query(query="shape",shape="ResourceNotFoundException")`
 //! gives the shape and no message text) and reports it as the required resource it is, naming
 //! the KIND that ARN identifies: "The following required resource '<Kind>' cannot be found:
-//! '<arn>'." — whichever route performed the lookup. The READS of the two CONFIGURATION
-//! families, and the INFRASTRUCTURE configuration's delete, are the recorded exception: they
+//! '<arn>'." — whichever route performed the lookup. The INFRASTRUCTURE configuration's own
+//! read and delete are the recorded exception: they
 //! quote the ARN alone, "The resource ARN '<arn>' was not found.", naming no kind.
 //!
 //! The rows span what the rule generalises over: the kind the ARN names (every kind of the
@@ -174,8 +174,8 @@ fn arn(region: &str, resource: &str) -> String {
 }
 
 /// RULE: the read of an ARN this Region holds nothing under names the KIND that ARN identifies,
-/// for every kind this service mints one for — the two CONFIGURATION families' own reads being
-/// the recorded exception, which quote the ARN alone.
+/// for every kind this service mints one for — the INFRASTRUCTURE configuration's own read being
+/// the recorded exception, which quotes the ARN alone.
 #[tokio::test]
 async fn a_read_of_an_absent_arn_names_the_kind_the_arn_identifies() {
     let router = emulator();
@@ -196,7 +196,7 @@ async fn a_read_of_an_absent_arn_names_the_kind_the_arn_identifies() {
         (
             "a distribution configuration nothing created",
             format!("/GetDistributionConfiguration?distributionConfigurationArn={distribution}"),
-            arn_sentence(&distribution),
+            kind_sentence("DistributionConfiguration", &distribution),
         ),
         (
             "a component build version nothing created",
@@ -278,8 +278,8 @@ async fn create_distribution(
 }
 
 /// RULE applied to the whole lifecycle of a distribution configuration: while it is stored
-/// every read answers it, and once it is gone every route that looks it up reports it missing
-/// — its READ quoting the ARN alone, and its other routes naming the kind its ARN identifies.
+/// every read answers it, and once it is gone every route that looks it up reports it missing,
+/// each naming the kind its ARN identifies.
 #[tokio::test]
 async fn every_lookup_of_a_gone_distribution_configuration_reports_it_missing() {
     let router = emulator();
@@ -353,7 +353,7 @@ async fn every_lookup_of_a_gone_distribution_configuration_reports_it_missing() 
                 "GET",
                 read.clone(),
                 None,
-                arn_sentence(&stored),
+                kind.clone(),
             ),
             (
                 "DeleteDistributionConfiguration",

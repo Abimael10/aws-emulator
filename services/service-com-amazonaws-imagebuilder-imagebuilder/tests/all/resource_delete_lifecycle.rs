@@ -248,9 +248,8 @@ fn required_resource_message(resource_type: &str, arn: &str) -> String {
     format!("The following required resource '{resource_type}' cannot be found: '{arn}'.")
 }
 
-/// The not-found report a READ addressed by a CONFIGURATION's own ARN carries, quoting the
-/// ARN the request named: both configuration families' reads, and the INFRASTRUCTURE
-/// configuration's delete, word it this way.
+/// The not-found report the INFRASTRUCTURE configuration's own routes carry, quoting the
+/// ARN the request named: its read and its delete word it this way.
 fn configuration_not_found_message(arn: &str) -> String {
     format!("The resource ARN '{arn}' was not found.")
 }
@@ -477,7 +476,7 @@ async fn a_resource_a_pipeline_reaches_is_deleted_only_once_the_pipeline_is_gone
                 read: "/GetDistributionConfiguration?distributionConfigurationArn=",
                 echoed: "distributionConfigurationArn",
                 dependency: dependency_message(&distribution),
-                missing: configuration_not_found_message(&distribution),
+                missing: required_resource_message("DistributionConfiguration", &distribution),
                 missing_on_delete: required_resource_message(
                     "DistributionConfiguration",
                     &distribution,
