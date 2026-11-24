@@ -61,6 +61,9 @@ pub mod encryption_key;
 /// See the module docs: the asynchronous EXECUTION of a flow this plane owns, and the
 /// status machine a start, a read and a stop of one move.
 pub mod flow_execution;
+/// See the module docs: what happened during one flow execution, which is what a listing of
+/// its events reports.
+pub mod flow_execution_event;
 /// See the module docs: the flow an alias routes to, and the path a request's input
 /// travels through that flow's own definition.
 pub mod flow_invocation;

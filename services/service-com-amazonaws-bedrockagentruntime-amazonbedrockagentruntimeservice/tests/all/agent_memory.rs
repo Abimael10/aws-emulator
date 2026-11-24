@@ -455,7 +455,7 @@ impl Emulator {
 }
 
 /// One form field, percent-encoded the way an awsQuery body carries it.
-fn form_encoded(value: &str) -> String {
+pub(crate) fn form_encoded(value: &str) -> String {
     let mut encoded = String::new();
     for byte in value.bytes() {
         match byte {

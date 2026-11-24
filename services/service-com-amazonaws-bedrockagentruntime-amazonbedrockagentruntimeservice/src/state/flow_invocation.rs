@@ -38,7 +38,10 @@
 //! The walk also records, for each hop it takes, the two field names the connection it
 //! followed carries ([`CarriedBy`]), because those are what a TRACE of the run reports: the
 //! output of the source node the value left by and the input of the target it arrived at,
-//! both read from the stored flow rather than invented.
+//! both read from the stored flow rather than invented. The whole walk is reported the same
+//! way ([`FlowRunTrace`]): where the input entered, which field of which node each value
+//! left by and arrived at, and the node a failed walk is about — which is what the EVENTS of
+//! a persisted run are composed from (`super::flow_execution_event`).
 //!
 //! READ-ONLY for everything a later caller can observe: the one write on its path is the
 //! build-time plane materialising the status transitions its own clock had already made
@@ -211,6 +214,58 @@ pub struct FlowRun {
     /// or the other inside its stream ([`run`]), while an EXECUTION records which of them the
     /// run came to as its own status.
     pub outcome: Result<Vec<FlowOutputValue>, String>,
+    /// What the walk of that definition really did, node by node ([`FlowRunTrace`]), so an
+    /// operation that PERSISTS a run can report the events of it afterwards.
+    pub trace: FlowRunTrace,
+}
+
+/// What one walk of a flow's definition did: where the input entered, which field of which
+/// node each value left by and arrived at, and the node a failed walk is about.
+///
+/// Every member is read from the STORED definition — the node names, the field names, the
+/// expression a target input extracts with, the declared IO types — so an operation that
+/// reports the steps of a run reports what the flow itself says they were, and nothing a
+/// request happened to word.
+#[derive(Debug, Clone)]
+pub struct FlowRunTrace {
+    /// The flow input node the run's input entered at.
+    pub input_node: String,
+    /// The field the document entered as: the input node's own declared output, which is
+    /// what the flow's input schema names the value that enters there. `None` for an input
+    /// node whose definition declares no output, which names no field for it.
+    pub input_field: Option<String>,
+    /// The declared `FlowNodeIODataType` of [`FlowRunTrace::input_field`], when there is one.
+    pub input_field_type: Option<String>,
+    /// The document the run entered the flow with.
+    pub document: Document,
+    /// One entry per hop the walk took out of the input node, ordered by the node the hop
+    /// reached — the order the walk delivers its outputs in.
+    pub hops: Vec<FlowRunHop>,
+    /// The node a failed walk is about: the one whose kind nothing in this emulator performs
+    /// the work of. `None` when the failure is about the flow's own wiring rather than one of
+    /// its nodes, so nothing ran and no node of it failed.
+    pub failed_node: Option<String>,
+}
+
+/// One hop of a walk: the node the value reached, and the fields of both ends the connection
+/// named, as the stored definition declares them.
+#[derive(Debug, Clone)]
+pub struct FlowRunHop {
+    /// The node the hop reached.
+    pub target_node: String,
+    /// The source node's output the value left by, for a connection that names it.
+    pub source_output: Option<String>,
+    /// The target node's input the value arrived at, for a connection that names it.
+    pub target_input: Option<String>,
+    /// The expression that input extracts its data with, as the target node declares it.
+    pub target_input_expression: Option<String>,
+    /// The declared `FlowNodeIODataType` of that input.
+    pub target_input_type: Option<String>,
+    /// The declared `FlowNodeInputCategory` of that input, for one the target node puts in a
+    /// category. Both planes spell the two enums identically
+    /// (`smithy_query(query="shape",shape="FlowNodeIODataType,FlowNodeInputCategory")` in
+    /// either model), so what the definition declares is what a reader of the run reports.
+    pub target_input_category: Option<String>,
 }
 
 /// [`run`], reporting the identities the run was resolved against beside its outcome.
@@ -277,18 +332,13 @@ pub fn run_resolved<Eng: Send + Sync + 'static>(
              is no node for the input to enter at"
         )));
     };
-    let outcome = match walk(definition, input_node, document) {
-        Ok(outputs) => Ok(outputs),
-        // The walk could compute no value for a node of the flow's own definition: the run's
-        // outcome, not a refusal of the call (see [`FlowRun::outcome`]).
-        Err(FlowRefusal::Unservable(message)) => Err(message),
-        Err(refusal) => return Err(refusal),
-    };
+    let walked = walk(definition, input_node, document)?;
     Ok(FlowRun {
         flow_id: flow_id.to_string(),
         alias_id,
         flow_version: routed,
-        outcome,
+        outcome: walked.outcome,
+        trace: walked.trace,
     })
 }
 
@@ -377,6 +427,17 @@ fn names_this_place(identifier: &str, account: &str, region: &str) -> bool {
         && named.account == account
 }
 
+/// What one walk came to, and the trace of the steps it took ([`FlowRunTrace`]).
+///
+/// The outcome is the RUN's — the values it delivered, or the sentence saying what it could
+/// compute no value for — because a path the walk cannot compute is something the run came
+/// to rather than a refusal of the call that started it; the trace is recorded either way,
+/// so the steps a failed run did take are reported too.
+struct Walked {
+    outcome: Result<Vec<FlowOutputValue>, String>,
+    trace: FlowRunTrace,
+}
+
 /// The values the request's document reaches the flow's output nodes with.
 ///
 /// The walk is one hop by construction: the input node's `Data` connections are followed,
@@ -386,63 +447,104 @@ fn walk(
     definition: &FlowDefinition,
     input_node: &str,
     document: &Document,
-) -> Result<Vec<FlowOutputValue>, FlowRefusal> {
+) -> Result<Walked, FlowRefusal> {
     let nodes = definition.nodes.as_deref().unwrap_or_default();
-    let node_type = |name: &str| {
-        nodes
-            .iter()
-            .find(|node| node.name == name)
-            .map(|node| node.r#type.clone())
-    };
-    let Some(entry_type) = node_type(input_node) else {
+    let node_named = |name: &str| nodes.iter().find(|node| node.name == name);
+    let Some(entry) = node_named(input_node) else {
         return Err(FlowRefusal::InputNodeUnavailable(input_node.to_string()));
     };
-    if entry_type != INPUT_NODE {
+    if entry.r#type != INPUT_NODE {
         return Err(FlowRefusal::InputNodeUnavailable(input_node.to_string()));
     }
+
+    // The field the flow's input arrived as, read from the input node's own declared output:
+    // that is what the flow's input schema names the value entering there.
+    let entry_output = entry.outputs.as_deref().unwrap_or_default().first();
+    let mut trace = FlowRunTrace {
+        input_node: input_node.to_string(),
+        input_field: entry_output.map(|output| output.name.clone()),
+        input_field_type: entry_output.map(|output| output.r#type.clone()),
+        document: document.clone(),
+        hops: Vec::new(),
+        failed_node: None,
+    };
 
     let mut reached: Vec<FlowOutputValue> = Vec::new();
     for connection in definition.connections.as_deref().unwrap_or_default() {
         if connection.source != input_node || connection.r#type != DATA_CONNECTION {
             continue;
         }
-        let Some(target_type) = node_type(&connection.target) else {
-            return Err(FlowRefusal::Unservable(format!(
-                "the connection {} leaves {input_node} for the node {}, which the flow does \
-                 not hold",
-                connection.name, connection.target
-            )));
+        let Some(target) = node_named(&connection.target) else {
+            // The connection leaves for a node the flow does not hold, so NOTHING ran and no
+            // node of the flow is what the failure is about.
+            return Ok(Walked {
+                outcome: Err(format!(
+                    "the connection {} leaves {input_node} for the node {}, which the flow \
+                     does not hold",
+                    connection.name, connection.target
+                )),
+                trace,
+            });
         };
-        if target_type != OUTPUT_NODE {
-            return Err(FlowRefusal::Unservable(unservable_node(
-                &connection.target,
-                &target_type,
-            )));
+        if target.r#type != OUTPUT_NODE {
+            trace.failed_node = Some(connection.target.clone());
+            return Ok(Walked {
+                outcome: Err(unservable_node(&connection.target, &target.r#type)),
+                trace,
+            });
         }
+        let carried_by = match connection.configuration.as_ref() {
+            Some(::service_com_amazonaws_bedrockagent_amazonbedrockagentbuildtimelambda::ops::types::FlowConnectionConfiguration::Data(data)) => {
+                Some(CarriedBy {
+                    source_output: data.source_output.clone(),
+                    target_input: data.target_input.clone(),
+                })
+            }
+            _ => None,
+        };
+        // The target's own declaration of the input the value arrived at: the expression it
+        // extracts data with and its declared type, both the flow's rather than invented.
+        let declared = carried_by.as_ref().and_then(|carried| {
+            target
+                .inputs
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .find(|input| input.name == carried.target_input)
+        });
+        trace.hops.push(FlowRunHop {
+            target_node: connection.target.clone(),
+            source_output: carried_by.as_ref().map(|carried| carried.source_output.clone()),
+            target_input: carried_by.as_ref().map(|carried| carried.target_input.clone()),
+            target_input_expression: declared.map(|input| input.expression.clone()),
+            target_input_type: declared.map(|input| input.r#type.clone()),
+            target_input_category: declared.and_then(|input| input.category.clone()),
+        });
         reached.push(FlowOutputValue {
             node_name: connection.target.clone(),
             document: document.clone(),
-            carried_by: match connection.configuration.as_ref() {
-                Some(::service_com_amazonaws_bedrockagent_amazonbedrockagentbuildtimelambda::ops::types::FlowConnectionConfiguration::Data(data)) => {
-                    Some(CarriedBy {
-                        source_output: data.source_output.clone(),
-                        target_input: data.target_input.clone(),
-                    })
-                }
-                _ => None,
-            },
+            carried_by,
         });
     }
     if reached.is_empty() {
-        return Err(FlowRefusal::Unservable(format!(
-            "the flow's input node {input_node} is connected to no node of type \
-             {OUTPUT_NODE}, so the input this invocation carries reaches no output"
-        )));
+        return Ok(Walked {
+            outcome: Err(format!(
+                "the flow's input node {input_node} is connected to no node of type \
+                 {OUTPUT_NODE}, so the input this invocation carries reaches no output"
+            )),
+            trace,
+        });
     }
     // One order for one flow: an invocation of the same flow always delivers its outputs
-    // the same way round.
+    // the same way round, and the trace of the run follows the same order.
     reached.sort_by(|left, right| left.node_name.cmp(&right.node_name));
-    Ok(reached)
+    trace
+        .hops
+        .sort_by(|left, right| left.target_node.cmp(&right.target_node));
+    Ok(Walked {
+        outcome: Ok(reached),
+        trace,
+    })
 }
 
 /// The sentence a node this service cannot run earns: what the node is, and that nothing

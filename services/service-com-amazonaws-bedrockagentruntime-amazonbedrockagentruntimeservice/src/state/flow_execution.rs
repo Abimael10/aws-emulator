@@ -131,6 +131,12 @@ pub struct FlowExecution {
     /// to `Failed` and only then. It is what the read of a failed execution reports as the
     /// error of its run.
     pub failure: Option<String>,
+    /// The trace of the run the start made: where its input entered the flow, which field of
+    /// which node each value left by and arrived at, and the node a failed run is about.
+    /// `ListFlowExecutionEvents` composes the events of this execution from it
+    /// ([`super::flow_execution_event`]), so every event it reports is a step this run really
+    /// took through the stored flow.
+    pub trace: super::flow_invocation::FlowRunTrace,
     pub status: FlowExecutionStatus,
     /// Set when the execution reached a terminal status, and only then — the member is
     /// "only populated when the execution has completed, failed, timed out, or been

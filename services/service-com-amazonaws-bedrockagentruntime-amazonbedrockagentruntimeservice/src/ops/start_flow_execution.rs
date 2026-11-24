@@ -276,6 +276,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             completes_at: started + executions::FLOW_EXECUTION_SPAN,
             completes_as,
             failure,
+            // The steps the run really took, recorded beside its outcome so the events of
+            // this execution are read back from the run rather than composed afresh.
+            trace: run.trace,
             status: executions::FlowExecutionStatus::Running,
             ended_at: None,
             order,

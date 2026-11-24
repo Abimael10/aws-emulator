@@ -223,7 +223,7 @@ impl Emulator {
     }
 
     /// Create a flow carrying `definition` and answer its minted `(flowId, flowArn)`.
-    async fn create_flow(&self, name: &str, definition: Value) -> (String, String) {
+    pub(crate) async fn create_flow(&self, name: &str, definition: Value) -> (String, String) {
         let reply = self
             .bedrock(
                 ACCOUNT_KEY,
@@ -251,7 +251,7 @@ impl Emulator {
 
     /// Prepare the flow and move the outcome the clock owes into the past, so it stands at
     /// `Prepared` without the test sleeping for the span.
-    async fn prepare_flow(&self, case: &str, flow_id: &str) {
+    pub(crate) async fn prepare_flow(&self, case: &str, flow_id: &str) {
         let reply = self
             .bedrock(
                 ACCOUNT_KEY,
@@ -281,7 +281,12 @@ impl Emulator {
 
     /// Create an alias on `flow_id` routing to `flow_version`, and answer its
     /// `(aliasId, aliasArn)`.
-    async fn create_flow_alias(&self, case: &str, flow_id: &str, flow_version: &str) -> (String, String) {
+    pub(crate) async fn create_flow_alias(
+        &self,
+        case: &str,
+        flow_id: &str,
+        flow_version: &str,
+    ) -> (String, String) {
         self.create_named_flow_alias(case, flow_id, "probe-alias", flow_version)
             .await
     }
@@ -394,7 +399,7 @@ impl Emulator {
 /// A passthrough flow definition: one `Input` node wired straight to one `Output` node. The
 /// node types, the union keys and the IO data types are the build-time model's own
 /// `FlowNodeType` / `FlowNodeConfiguration` / `FlowNodeIODataType` values.
-fn passthrough_definition() -> Value {
+pub(crate) fn passthrough_definition() -> Value {
     json!({
         "nodes": [
             {
@@ -424,7 +429,7 @@ fn passthrough_definition() -> Value {
 
 /// The same `Input` fanned out to TWO `Output` nodes, so one invocation delivers two
 /// outputs.
-fn fan_out_definition() -> Value {
+pub(crate) fn fan_out_definition() -> Value {
     json!({
         "nodes": [
             {
@@ -466,7 +471,7 @@ fn fan_out_definition() -> Value {
 }
 
 /// One `InvokeFlow` request body entering the flow at `node` with `document`.
-fn flow_request(node: &str, document: Value) -> Value {
+pub(crate) fn flow_request(node: &str, document: Value) -> Value {
     json!({ "inputs": [{ "nodeName": node, "nodeOutputName": "document", "content": { "document": document } }] })
 }
 
@@ -1742,7 +1747,7 @@ async fn an_identifier_naming_another_place_runs_no_flow() {
 
 /// A flow or alias ARN as a client percent-encodes a non-greedy `@httpLabel`: an ARN carries
 /// `:` and `/`, which would otherwise split the path segment.
-fn label(identifier: &str) -> String {
+pub(crate) fn label(identifier: &str) -> String {
     identifier.replace(':', "%3A").replace('/', "%2F")
 }
 
@@ -1755,14 +1760,14 @@ fn label(identifier: &str) -> String {
 /// The fixed text this plane states when the EXECUTION a request addresses is one it holds
 /// nothing for: the frame the whole flow surface words an unresolved resource with, closing
 /// in the type of resource that did not resolve.
-fn execution_not_found() -> String {
+pub(crate) fn execution_not_found() -> String {
     flow_resource_not_found(FLOW_EXECUTION)
 }
 
 impl Emulator {
     /// One `StartFlowExecution` call over the modelled URI, entering the flow at `node` with
     /// `document` and under `name` when one is given.
-    async fn start_flow_execution(
+    pub(crate) async fn start_flow_execution(
         &self,
         flow: &str,
         alias: &str,
@@ -1788,7 +1793,12 @@ impl Emulator {
     }
 
     /// One `GetFlowExecution` call over the modelled URI.
-    async fn get_flow_execution(&self, flow: &str, alias: &str, execution: &str) -> Reply {
+    pub(crate) async fn get_flow_execution(
+        &self,
+        flow: &str,
+        alias: &str,
+        execution: &str,
+    ) -> Reply {
         self.bedrock(
             ACCOUNT_KEY,
             "GET",
@@ -1821,7 +1831,7 @@ impl Emulator {
 
     /// A flow created, prepared and aliased, ready to be executed: its
     /// `(flowId, flowArn, aliasId, aliasArn)`.
-    async fn executable_flow(
+    pub(crate) async fn executable_flow(
         &self,
         case: &str,
         name: &str,
@@ -1836,7 +1846,7 @@ impl Emulator {
     /// Move every running execution's completion into the past by exactly the span it was
     /// given, so the status the clock owes is due and the run reads as having finished at
     /// the instant it started — the test drives the clock rather than waiting for it.
-    fn finish_running_executions(&self) {
+    pub(crate) fn finish_running_executions(&self) {
         let state = runtime_state::service_state(&*self.engine)
             .expect("this service's store is on the shared engine");
         let mut store = state.lock();
@@ -1850,7 +1860,7 @@ impl Emulator {
 
 /// The execution ARN this emulator mints for `name` on `alias_id` of `flow_id`, as the
 /// modelled `FlowExecutionIdentifier` spells one.
-fn execution_arn(flow_id: &str, alias_id: &str, name: &str) -> String {
+pub(crate) fn execution_arn(flow_id: &str, alias_id: &str, name: &str) -> String {
     format!("arn:aws:bedrock:{REGION}:{ACCOUNT}:flow/{flow_id}/alias/{alias_id}/execution/{name}")
 }
 
@@ -1863,7 +1873,7 @@ fn cannot_be_aborted(name: &str, status: &str) -> String {
 /// The instant a member the model marks `@timestampFormat("date-time")` carries: on this
 /// service's restJson1 wire it travels as an RFC 3339 string, never as a bare epoch number
 /// (`tests/all/date_time_wire_form.rs` pins that rule for the session plane).
-fn flow_execution_instant(case: &str, member: &str, value: &Value) -> (i64, u32) {
+pub(crate) fn flow_execution_instant(case: &str, member: &str, value: &Value) -> (i64, u32) {
     let rendered = value.as_str().unwrap_or_else(|| {
         panic!("case {case:?}: {member} must be an RFC 3339 string, got {value:?}")
     });
@@ -2983,7 +2993,7 @@ async fn a_start_names_the_type_of_the_resource_that_did_not_resolve() {
 /// of, so no value can be computed for the run that reaches it. The build-time plane PREPARES
 /// it like any other flow: it carries a starting node, an ending node, and a connection
 /// feeding every node input.
-fn prompt_node_definition() -> Value {
+pub(crate) fn prompt_node_definition() -> Value {
     json!({
         "nodes": [
             {

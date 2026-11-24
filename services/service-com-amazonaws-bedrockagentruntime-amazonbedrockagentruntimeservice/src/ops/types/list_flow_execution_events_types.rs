@@ -44,13 +44,32 @@ pub enum FlowExecutionEvent {
     nodeDependencyEvent(NodeDependencyEvent),
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentruntime#FlowExecutionInputEvent")]
+/// `FlowExecutionInputEvent`. Its schema and codec come from [`session_schema_and_codec!`]
+/// rather than `#[smithy_macros::smithy(shape = ...)]` because `timestamp` carries
+/// `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape",shape="FlowExecutionInputEvent")`), which the derive does not
+/// put on a member schema — see `types/date_time_wire.rs` for that whole story. Every event
+/// shape this service reports carries the same member, and so the same treatment.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire names,
+/// same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct FlowExecutionInputEvent {
     pub node_name: String,
     pub timestamp: ::aws_smithy_types::DateTime,
     pub fields: Vec<FlowInputField>,
 }
+
+session_schema_and_codec!(
+    FlowExecutionInputEvent,
+    FLOW_EXECUTION_INPUT_EVENT_SCHEMA,
+    "com.amazonaws.bedrockagentruntime#FlowExecutionInputEvent",
+    "com.amazonaws.bedrockagentruntime",
+    "FlowExecutionInputEvent",
+    (M_NODE_NAME, node_name, "nodeName", 0, req, string),
+    (M_TIMESTAMP, timestamp, "timestamp", 1, req, date_time),
+    (M_FIELDS, fields, "fields", 2, req, list_of(FlowInputField)),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentruntime#FlowInputField")]
 #[derive(Debug, Clone)]
@@ -66,13 +85,25 @@ pub enum FlowExecutionContent {
     Document(::aws_smithy_types::Document),
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentruntime#FlowExecutionOutputEvent")]
+/// `FlowExecutionOutputEvent`. Schema and codec as [`FlowExecutionInputEvent`]'s, and for the
+/// same reason.
 #[derive(Debug, Clone)]
 pub struct FlowExecutionOutputEvent {
     pub node_name: String,
     pub timestamp: ::aws_smithy_types::DateTime,
     pub fields: Vec<FlowOutputField>,
 }
+
+session_schema_and_codec!(
+    FlowExecutionOutputEvent,
+    FLOW_EXECUTION_OUTPUT_EVENT_SCHEMA,
+    "com.amazonaws.bedrockagentruntime#FlowExecutionOutputEvent",
+    "com.amazonaws.bedrockagentruntime",
+    "FlowExecutionOutputEvent",
+    (M_NODE_NAME, node_name, "nodeName", 0, req, string),
+    (M_TIMESTAMP, timestamp, "timestamp", 1, req, date_time),
+    (M_FIELDS, fields, "fields", 2, req, list_of(FlowOutputField)),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentruntime#FlowOutputField")]
 #[derive(Debug, Clone)]
@@ -81,13 +112,25 @@ pub struct FlowOutputField {
     pub content: FlowExecutionContent,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentruntime#NodeInputEvent")]
+/// `NodeInputEvent`. Schema and codec as [`FlowExecutionInputEvent`]'s, and for the same
+/// reason.
 #[derive(Debug, Clone)]
 pub struct NodeInputEvent {
     pub node_name: String,
     pub timestamp: ::aws_smithy_types::DateTime,
     pub fields: Vec<NodeInputField>,
 }
+
+session_schema_and_codec!(
+    NodeInputEvent,
+    NODE_INPUT_EVENT_SCHEMA,
+    "com.amazonaws.bedrockagentruntime#NodeInputEvent",
+    "com.amazonaws.bedrockagentruntime",
+    "NodeInputEvent",
+    (M_NODE_NAME, node_name, "nodeName", 0, req, string),
+    (M_TIMESTAMP, timestamp, "timestamp", 1, req, date_time),
+    (M_FIELDS, fields, "fields", 2, req, list_of(NodeInputField)),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentruntime#NodeInputField")]
 #[derive(Debug, Clone)]
@@ -123,13 +166,25 @@ pub struct NodeInputExecutionChainItem {
     pub r#type: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentruntime#NodeOutputEvent")]
+/// `NodeOutputEvent`. Schema and codec as [`FlowExecutionInputEvent`]'s, and for the same
+/// reason.
 #[derive(Debug, Clone)]
 pub struct NodeOutputEvent {
     pub node_name: String,
     pub timestamp: ::aws_smithy_types::DateTime,
     pub fields: Vec<NodeOutputField>,
 }
+
+session_schema_and_codec!(
+    NodeOutputEvent,
+    NODE_OUTPUT_EVENT_SCHEMA,
+    "com.amazonaws.bedrockagentruntime#NodeOutputEvent",
+    "com.amazonaws.bedrockagentruntime",
+    "NodeOutputEvent",
+    (M_NODE_NAME, node_name, "nodeName", 0, req, string),
+    (M_TIMESTAMP, timestamp, "timestamp", 1, req, date_time),
+    (M_FIELDS, fields, "fields", 2, req, list_of(NodeOutputField)),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentruntime#NodeOutputField")]
 #[derive(Debug, Clone)]
@@ -161,7 +216,8 @@ pub struct SatisfiedCondition {
     pub condition_name: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentruntime#NodeFailureEvent")]
+/// `NodeFailureEvent`. Schema and codec as [`FlowExecutionInputEvent`]'s, and for the same
+/// reason.
 #[derive(Debug, Clone)]
 pub struct NodeFailureEvent {
     pub node_name: String,
@@ -170,13 +226,37 @@ pub struct NodeFailureEvent {
     pub error_message: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentruntime#FlowFailureEvent")]
+session_schema_and_codec!(
+    NodeFailureEvent,
+    NODE_FAILURE_EVENT_SCHEMA,
+    "com.amazonaws.bedrockagentruntime#NodeFailureEvent",
+    "com.amazonaws.bedrockagentruntime",
+    "NodeFailureEvent",
+    (M_NODE_NAME, node_name, "nodeName", 0, req, string),
+    (M_TIMESTAMP, timestamp, "timestamp", 1, req, date_time),
+    (M_ERROR_CODE, error_code, "errorCode", 2, req, string),
+    (M_ERROR_MESSAGE, error_message, "errorMessage", 3, req, string),
+);
+
+/// `FlowFailureEvent`. Schema and codec as [`FlowExecutionInputEvent`]'s, and for the same
+/// reason.
 #[derive(Debug, Clone)]
 pub struct FlowFailureEvent {
     pub timestamp: ::aws_smithy_types::DateTime,
     pub error_code: String,
     pub error_message: String,
 }
+
+session_schema_and_codec!(
+    FlowFailureEvent,
+    FLOW_FAILURE_EVENT_SCHEMA,
+    "com.amazonaws.bedrockagentruntime#FlowFailureEvent",
+    "com.amazonaws.bedrockagentruntime",
+    "FlowFailureEvent",
+    (M_TIMESTAMP, timestamp, "timestamp", 0, req, date_time),
+    (M_ERROR_CODE, error_code, "errorCode", 1, req, string),
+    (M_ERROR_MESSAGE, error_message, "errorMessage", 2, req, string),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentruntime#NodeActionEvent")]
 #[derive(Debug, Clone)]
