@@ -634,8 +634,27 @@ pub(crate) async fn create_service(
     .await;
 }
 
-/// The `(Id, State)` of every registration `group` reports.
-pub(crate) async fn health(router: &MultiServiceRouter, group: &str) -> Vec<(String, String)> {
+/// One registration as `DescribeTargetHealth` reports it: the address it names, the port it
+/// receives traffic on, the state its checks reached and — for a state the model gives them —
+/// that state's reason code and description, each read as empty where the answer carries none.
+///
+/// `pub(crate)` for the reason [`emulator`] gives: the whole description belongs to the suite
+/// that owns this topology's fixtures, so a sibling suite whose rule turns on the REASON a
+/// verdict carries reads it through this rather than keeping a reader of its own.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ReportedHealth {
+    pub(crate) id: String,
+    pub(crate) port: String,
+    pub(crate) state: String,
+    pub(crate) reason: String,
+    pub(crate) description: String,
+}
+
+/// Every registration `group` reports, in the order the answer carries them.
+pub(crate) async fn reported_health(
+    router: &MultiServiceRouter,
+    group: &str,
+) -> Vec<ReportedHealth> {
     let body = elbv2(router, "DescribeTargetHealth", &[("TargetGroupArn", group)]).await;
     members_of(&body)
         .into_iter()
@@ -646,8 +665,25 @@ pub(crate) async fn health(router: &MultiServiceRouter, group: &str) -> Vec<(Str
                     .next()
                     .unwrap_or_default()
             };
-            (text("Id"), text("State"))
+            ReportedHealth {
+                id: text("Id"),
+                port: text("Port"),
+                state: text("State"),
+                reason: text("Reason"),
+                description: text("Description"),
+            }
         })
+        .collect()
+}
+
+/// The `(Id, State)` of every registration `group` reports — the two members most rows of this
+/// topology judge a registration by, read through the ONE reading of the answer
+/// ([`reported_health`]).
+pub(crate) async fn health(router: &MultiServiceRouter, group: &str) -> Vec<(String, String)> {
+    reported_health(router, group)
+        .await
+        .into_iter()
+        .map(|entry| (entry.id, entry.state))
         .collect()
 }
 
